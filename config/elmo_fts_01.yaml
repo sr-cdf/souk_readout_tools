@@ -1,0 +1,107 @@
+config_id: "elmo_fts_01"
+config_created_by: "Sam R"
+config_creation_date: "2024-08-27"
+config_comments: "First test of triggered stream for FTS testing in Elmo"
+
+rfsoc_host:
+  hardware_id: "Cardiff's SOUK KRM board, KRC-4700 KIT"
+  address: "krm4"
+  request_port: 8888
+  stream_port: 9999
+  clock_source: "internal"
+  trigger_source_pin: 0
+  comments:
+
+firmware:
+  fw_config_file: "/home/casper/src/souk-firmware/software/control_sw/config/souk-single-pipeline-krm-2G.yaml"    
+  pipeline_id: 0
+  dac0_tile: 0
+  dac0_block: 0
+  dac1_tile: 0
+  dac1_block: 2
+  adc_tile: 0
+  adc_block: 0
+  dac_fullscale_bits: 16
+  adc_fullscale_bits: 16
+  dac_physical_bits: 14
+  adc_physical_bits: 14
+  dac0_dbfs_to_dbm: -6.0
+  dac1_dbfs_to_dbm: -6.0
+  adc_dbm_to_dbfs: +12
+  vop_current_fullscale: 20000
+  defaults:
+    sync_delay: 6225
+    acc_len: 1000
+    internal_loopback: false
+    psb_scale: 2
+    psb_fftshift: 0b0
+    pfb_fftshift: 0b0
+    nyquist_zone: 1
+    dsa: 0
+    vop: 20000 # WARNING: not rated above 20000uA in gen3 devices with 2.5 V_dac_vtt, anything upto max 40500uA adds nonlinearity
+    dac_mixer_scale_1p0: false # WARNING: using 1p0 may add nonlinearity
+    adc_mixer_scale_1p0: false # WARNING: using 1p0 may add nonlinearity
+    dac_qmc_gain: 1 # WARNING UNTESTED. Gain correction factor. Range: 0 to 2.0 (Exclusive)
+    dac_qmc_offset: 0 # WARNING UNTESTED. Offset correction factor is adding a fixed LSB value to the sampled signal.
+    dac_qmc_phase: 0 # WARNING UNTESTED. Phase correction factor. Range: +/- 26.5 degrees (Exclusive)
+    adc_qmc_gain: 1 # WARNING UNTESTED. Gain correction factor. Range: 0 to 2.0 (Exclusive)
+    adc_qmc_offset: 0 # WARNING UNTESTED. Offset correction factor is adding a fixed LSB value to the sampled signal.
+    adc_qmc_phase: 0 # WARNING UNTESTED. Phase correction factor. Range: +/- 26.5 degrees (Exclusive)
+    frequencies: []
+    amplitudes: []
+    phases: []
+  gpio_0: 'misc_input'
+  gpio_1: 'misc_input'
+  gpio_2: 'misc_input'
+  gpio_3: 'misc_input'
+  gpio_4: 'nc'
+  gpio_5: 'nc'
+  gpio_6: 'new_accumulation_pulse_output'
+  gpio_7: 'pps_input'
+  comments:
+
+rf_frontend:
+  connected: true
+  hardware_id: "Oxford RF Breadboard"
+  tx_combiner_loss_db: 0
+  rx_combiner_loss_db: 0
+  tx_attenuator_value_db: 0
+  rx_attenuator_value_db: 
+  tx_if_s21_db: +2.2
+  rx_if_s21_db: +16.99
+  tx_rf_s21_db: +2.62
+  rx_rf_s21_db: +7.64
+  tx_mixer_conversion_loss_db: 5.91
+  rx_mixer_conversion_loss_db: 5.30
+  tx_mixer_lo_frequency_hz: 4000000000 
+  rx_mixer_lo_frequency_hz: 4000000000
+  tx_mixer_sideband: -1
+  rx_mixer_sideband: -1  
+  loopback: false
+  comments: 
+
+cryostat:
+  connected: false
+  cryostat_id: "elmo"
+  input_channel_id: "ch1"
+  output_channel_id: "ch1"
+  input_s21_db: -33
+  output_s21_db: +32
+  lna_model:
+  lna_bias:
+  thermometry_log_file:
+  optical_setup:
+  filter_stack:
+  comments:
+
+detector:
+  connected: false
+  chip_id:
+  channel_id:
+  box_id:
+  resonance_frequencies_file:
+  drive_powers_file:
+  detector_layout_file:
+  comments:
+
+

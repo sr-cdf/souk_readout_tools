@@ -1,0 +1,52 @@
+#################################
+#
+# To install the systemd service:
+# 
+# Copy the service file to the systemd service directory with 
+# sudo cp readout_server.service /etc/systemd/system/
+# 
+# Reload the systemd manager configuration with 
+# sudo systemctl daemon-reload
+# 
+# Start the service with 
+# sudo systemctl start readout_server
+# 
+# Enable the service to start on boot with 
+# sudo systemctl enable readout_server
+# 
+# Verify the service is running with 
+# sudo systemctl status readout_server
+# 
+# You can also stop the service with 
+# sudo systemctl stop readout_server
+#
+# and disable it with 
+# sudo systemctl disable readout_server
+# 
+# For more information on systemd services, refer to the official documentation: https://www.freedesktop.org/software/system
+# 
+# The server process name is set to readout_daemon when started in this way.
+#
+# System log identifier is readout_server
+#
+###################################
+
+
+[Unit]
+Description=MKID Readout System Server
+After=networking.service krc-utils.service
+Requires=networking.service krc-utils.service
+
+[Service]
+SyslogIdentifier=readout_server
+WorkingDirectory=/home/casper/src/souk_readout_tools
+Environment=READOUT_SERVER_NAME=readout_daemon
+ExecStart=/home/casper/py38venv/bin/python3 readout_server.py
+Restart=always
+RestartSec=5
+User=root
+Environment=PYTHONUNBUFFERED=1
+Nice=-20
+
+[Install]
+WantedBy=multi-user.target

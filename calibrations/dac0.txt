@@ -1,0 +1,12 @@
+#
+# First calibration of the CARDIFF KRM board DAC0 output
+#
+# DAC clock = 4096MHz
+# Interpolation = 2x
+# Effective sample rate: 2048 MHz
+# DUC fine mixer frequency = 1024MHz
+# Nyquist Zone = 1
+# DAC Mode = C2R
+#
+# Frequency_Hz Power_dBm
+500e6 -5.9
