@@ -27,7 +27,7 @@ def calc_tone_powers(amps,
     #convert to numpy array
     amps=np.atleast_1d(amps)
     #convert to shifted PSB units
-    psb_shift_units = amps / 2**((bin(psb_fftshift).count('1'))-1)
+    psb_shift_units = amps / 2**((bin(psb_fftshift).count('1'))+1)
     #convert to scaled PSB units
     psb_scale_units = psb_shift_units * psb_scale
     #convert to digital units for the DAC 
@@ -217,7 +217,7 @@ def calc_adc_input_power(accumulated_iq_level,adc_dbm_to_dbfs,mixer_qmc_gain,mix
     
     sig_dbm = sig_dbfs + adc_dbm_to_dbfs
 
-    print('\n'.join([str(i) for i in (accumulated_iq_levels,acc_i_out,acc_q_out,rx_mix_i_out,rx_mix_q_out,pfb_i_out,pfb_q_out,adc_i_amp,adc_q_amp,adc_amp,ddc_amp,sig_rms,sig_dbfs,sig_dbm)]))
+    # print('\n'.join([str(i) for i in (accumulated_iq_levels,acc_i_out,acc_q_out,rx_mix_i_out,rx_mix_q_out,pfb_i_out,pfb_q_out,adc_i_amp,adc_q_amp,adc_amp,ddc_amp,sig_rms,sig_dbfs,sig_dbm)]))
 
     return sig_dbm
 

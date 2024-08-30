@@ -375,15 +375,23 @@ class ReadoutClient:
         return data_dict
 
     @staticmethod
-    def export_samples(filename, sample_data, num_tones_to_save=None,file_format='npy'):
+    def export_samples(filename, sample_data, num_tones_to_save=None,file_format=None):
         if num_tones_to_save is None:
             num_tones_to_save = 2048
 
+        if file_format is None:
+            try:
+                file_format = filename.split('.')[-1]
+            except IndexError:
+                raise ValueError("No file format provided and unable to determine from filename.")
+
         if 'data_raw' in sample_data.keys():
             data_dict = ReadoutClient.parse_samples(sample_data,num_tones=num_tones_to_save)
+        else:
+            data_dict = sample_data
 
         if file_format == 'npy':
-            np.save(filename.rstrip('.npy') + '.npy', data_dict)
+            np.save(filename.rstrip('npy') + 'npy', data_dict)
 
         elif file_format == 'json':
             # Convert numpy arrays to lists for JSON serialization, including nested arrays
@@ -399,11 +407,11 @@ class ReadoutClient:
                 else:
                     json_data_dict[key] = value
 
-            with open(filename.rstrip('.json') + '.json', 'w') as file:
+            with open(filename.rstrip('json') + 'json', 'w') as file:
                 json.dump(json_data_dict, file, indent=4)
 
         elif file_format == 'csv':
-            with open(filename.rstrip('.csv') + '.csv', mode='w', newline='') as file:
+            with open(filename.rstrip('csv') + 'csv', mode='w', newline='') as file:
                 writer = csv.writer(file)
                 # Write the metadata
                 writer.writerow(['# date', data_dict['date']])
@@ -1053,6 +1061,20 @@ class ReadoutClient:
             raise ValueError(f"Invalid file format {filename.split('.')[-1]}")
         return data_dict
 
+    @staticmethod
+    def generate_random_phases(freqs):
+        """
+        Generate random phases for a set of frequencies.
+        """
+        return np.random.uniform(0,2*np.pi,len(freqs))
+    
+    @staticmethod
+    def generate_newman_phases(freqs):
+        """
+        Generate the Newman phases for a set of frequencies.
+        """
+        n=len(freqs)
+        return np.pi*np.arange(n)**2/n
 
 
 
