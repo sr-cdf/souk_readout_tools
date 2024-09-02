@@ -542,6 +542,15 @@ class ReadoutClient:
         }
         return self.send_request(message)
 
+    def get_sweep_progress(self):
+        message = {'request': 'get_sweep_progress'}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            return response['progress']
+        else:
+            print(f"Error getting sweep progress: {response['message']}")
+            return response
+
     def get_sweep_data(self):
         message = {'request': 'get_sweep_data'}
         response = self.send_request(message)
@@ -600,7 +609,8 @@ class ReadoutClient:
     def export_sweep(filename, sweep_data, file_format='npy'):
         if 'sweep_eq' not in sweep_data.keys():
             sweep_dict = ReadoutClient.parse_sweep_data(sweep_data)
-
+        else:
+            sweep_dict = sweep_data
 
         if file_format == 'npy':
             np.save(filename.rstrip('.npy') + '.npy', sweep_dict)

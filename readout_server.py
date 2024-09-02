@@ -117,6 +117,7 @@ class ReadoutServer:
         self.r_fast = None
         self.latest_sweep_data = {'f':None,'z':None,'e':None}
         self.latest_sweep_data_valid = False
+        self.sweep_progress = 0
 
         #initialize server
         self.config_file = config_file
@@ -184,6 +185,7 @@ class ReadoutServer:
         self.r_fast = None
         self.latest_sweep_data = {'f':None,'z':None,'e':None}
         self.latest_sweep_data_valid = False
+        self.sweep_progress = 0
         
         #load config
         self.config_file = config_file
@@ -478,7 +480,10 @@ class ReadoutServer:
                         await self.send_response(writer, {'status': 'success', 'message': 'Sweep in progress'})
                     else:
                         await self.send_response(writer, {'status': 'error', 'message': 'Sweep already in progress'})
-                    
+                
+                elif request == 'get_sweep_progress':
+                    await self.send_response(writer, {'status': 'success', 'progress': self.sweep_progress})
+
                 elif request == 'get_sweep_data':
                     if self.latest_sweep_data_valid:
                         sweep_f = self.latest_sweep_data['f']
@@ -841,13 +846,14 @@ class ReadoutServer:
                     acc_counts[p,s] = cnt
                     sweep_data[:,p,s] = data[::2]+1j*data[1::2]
                     acc_errs[p,s] = err
+                self.sweep_progress = float(p/(num_points-1))
                 await asyncio.sleep(0.001)
 
             print('reset initial freqs:',initial_freqs)
             firmware_lib.set_tone_frequencies(self.r,self.config,initial_freqs,autosync=True)
 
-            sweep_responses = np.mean(sweep_data.real,axis=1) + 1j*np.mean(sweep_data.imag,axis=1)
-            sweep_stds = np.std(sweep_data.real,axis=1) + 1j*np.std(sweep_data.imag,axis=1)
+            sweep_responses = np.mean(sweep_data.real,axis=2) + 1j*np.mean(sweep_data.imag,axis=2)
+            sweep_stds = np.std(sweep_data.real,axis=2) + 1j*np.std(sweep_data.imag,axis=2)
 
             results = {
                 'sweep_frequencies': sweepfreqs,
