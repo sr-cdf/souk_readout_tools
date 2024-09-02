@@ -509,11 +509,13 @@ class ReadoutClient:
         if response['status'] != 'success':
             print(f"Error setting tone frequencies: {response['message']}")
             return response
+        centers=np.atleast_1d(centers)
+        spans=np.atleast_1d(spans)
         
         message = {
             'request': 'sweep',
-            'centers': centers,
-            'spans': spans,
+            'centers': centers.tolist(),
+            'spans': spans.tolist(),
             'points': points,
             'samples_per_point': samples_per_point,
             'direction': direction
@@ -526,6 +528,8 @@ class ReadoutClient:
         if response['status'] != 'success':
             print(f"Error setting tone frequencies: {response['message']}")
             return response
+        centers=np.atleast_1d(centers)
+        spans=np.atleast_1d(spans)
 
         message = {
             'request': 'retune',
