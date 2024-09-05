@@ -751,7 +751,7 @@ def get_tone_amplitudes(r,config_dict,num_tones=None):
     scaling_rx = _invert_format_amp_scale(scaling_rx, r.mixer._n_scale_bits)
     return scaling_tx[:num_tones]
 
-def set_tone_amplitudes(r, config_dict, tone_amplitudes):
+def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
     """
     Set the tone amplitude scale factors in the RFSOC.
     """
@@ -761,6 +761,13 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes):
     for i in range(min(r.mixer._n_parallel_chans, num_tones)):   
         r.mixer.write(f'tx_lo{i}_scale', scaling[i::r.mixer._n_parallel_chans].tobytes())
         r.mixer.write(f'rx_lo{i}_scale', scaling[i::r.mixer._n_parallel_chans].tobytes())
+
+    if autosync:
+        time.sleep(autosync_time_delay)
+        r.sync.arm_sync(wait=False)
+        time.sleep(autosync_time_delay)
+        r.sync.sw_sync()
+
     return
 
 def get_tone_phases(r, config_dict, num_tones=None):

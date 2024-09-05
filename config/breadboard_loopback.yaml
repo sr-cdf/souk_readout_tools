@@ -34,8 +34,8 @@ firmware:
     sync_delay: 6225
     acc_len: 1000
     internal_loopback: false
-    psb_scale: 2
-    psb_fftshift: 0b0
+    psb_scale: 32
+    psb_fftshift: 0b111111
     pfb_fftshift: 0b1111111
     nyquist_zone: 1
     dsa: 0
