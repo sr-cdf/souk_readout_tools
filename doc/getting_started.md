@@ -56,7 +56,7 @@ Install the required packages:
 
 ## 3. Prepare a configuration file:
 
-A basic configuration file with the minimum required parameters is provided in [config/default_config.yaml]('config/default_config.yaml'). This should be used as a template to create a new configuration file with the correct parameters for your setup.
+A basic configuration file with the minimum required parameters is provided in [config/template_config.yaml]('config/template_config.yaml'). This should be used as a template to create a new configuration file with the correct parameters for your setup.
 
 Copy the default configuration file to a new file:
 
