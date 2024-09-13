@@ -56,7 +56,7 @@ Install the required packages:
 
 ## 3. Prepare a configuration file:
 
-A basic configuration file with the minimum required parameters is provided in [config/template_config.yaml]('config/template_config.yaml'). This should be used as a template to create a new configuration file with the correct parameters for your setup.
+A basic configuration file with the minimum required parameters is provided in [config/template_config.yaml](../config/template_config.yaml). This should be used as a template to create a new configuration file with the correct parameters for your setup.
 
 Copy the default configuration file to a new file:
 
@@ -66,7 +66,7 @@ Edit the new configuration file with the correct parameters for your setup.
 
 Important parameters are the RFSoC IP address, the analog frontend configuration, cryostat configuration, and detector information.
 
-The file [config/config.yaml]('config/config.yaml') is a symbolic link and can be used to point to the latest configuration file. In Windows, the symbolic link may simply contain the path to the configuration file.
+The file [config/config.yaml](../config/config.yaml) is a symbolic link and can be used to point to the latest configuration file. In Windows, the symbolic link may simply contain the path to the configuration file.
 
 ## 4. Start the client:
 
