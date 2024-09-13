@@ -115,7 +115,7 @@ class ReadoutServer:
         #firmware interface attributes
         self.r = None
         self.r_fast = None
-        self.latest_sweep_data = {'f':None,'z':None,'e':None}
+        self.latest_sweep_results = {}
         self.latest_sweep_data_valid = False
         self.sweep_progress = 0
 
@@ -183,7 +183,7 @@ class ReadoutServer:
         #firmware interface attributes
         self.r = None
         self.r_fast = None
-        self.latest_sweep_data = {'f':None,'z':None,'e':None}
+        self.latest_sweep_results = {}
         self.latest_sweep_data_valid = False
         self.sweep_progress = 0
         
@@ -482,13 +482,16 @@ class ReadoutServer:
                         await self.send_response(writer, {'status': 'error', 'message': 'Sweep already in progress'})
                 
                 elif request == 'get_sweep_progress':
-                    await self.send_response(writer, {'status': 'success', 'progress': self.sweep_progress})
-
+                    if self.sweep_task is not None and not self.sweep_task.done():
+                        await self.send_response(writer, {'status': 'success', 'progress': self.sweep_progress})
+                    else:
+                        await self.send_response(writer, {'status': 'success', 'progress': 'cancelled'})
+                    
                 elif request == 'get_sweep_data':
                     if self.latest_sweep_data_valid:
-                        sweep_f = self.latest_sweep_data['f']
-                        sweep_z = self.latest_sweep_data['z']
-                        sweep_e = self.latest_sweep_data['e']
+                        sweep_f = self.latest_sweep_results['sweep_frequencies']
+                        sweep_z = self.latest_sweep_results['sweep_responses']
+                        sweep_e = self.latest_sweep_results['sweep_stds']
                         # data = '#Sweep file\n'
                         # data = f'# date: {time.strftime("%Y-%m-%d %H:%M:%S %Z")}\n'
                         # data += f'# num_tones: {len(sweep_f)}\n'
@@ -514,6 +517,7 @@ class ReadoutServer:
                         data={'date': time.strftime("%Y-%m-%d %H:%M:%S UTC%z"),
                               'num_tones': len(sweep_f),
                               'num_points': len(sweep_f[0]),
+                              'samples_per_point': self.latest_sweep_results['samples_per_point'],
                               'sweep': sweep,
                               'system_information': self.get_system_information()}
                         
@@ -524,13 +528,15 @@ class ReadoutServer:
                 
                 elif request == 'get_sweep_txt':
                     if self.latest_sweep_data_valid:
-                        sweep_f = self.latest_sweep_data['f']
-                        sweep_z = self.latest_sweep_data['z']
-                        sweep_e = self.latest_sweep_data['e']
+                        sweep_f = self.latest_sweep_results['sweep_frequencies']
+                        sweep_z = self.latest_sweep_results['sweep_responses']
+                        sweep_e = self.latest_sweep_results['sweep_stds']
                         data = '# Sweep file\n'
                         data += f'# date: {time.strftime("%Y-%m-%d %H:%M:%S %Z")}\n'
                         data += f'# num_tones: {len(sweep_f)}\n'
                         data += f'# num_points: {len(sweep_f[0])}\n'
+                        data += f'# samples_per_point: {self.latest_sweep_results["samples_per_point"]}\n'
+                        
                         data += '# system_info: '+str(self.get_system_information()) +'\n'
                         data += '#' + ' '.join([f'sweep_f_{k:04d} sweep_i_{k:04d} sweep_q_{k:04d} err_i_{k:04d} err_q_{k:04d}' for k in range(len(sweep_f))]) + '\n'
 
@@ -855,7 +861,7 @@ class ReadoutServer:
             sweep_responses = np.mean(sweep_data.real,axis=2) + 1j*np.mean(sweep_data.imag,axis=2)
             sweep_stds = np.std(sweep_data.real,axis=2) + 1j*np.std(sweep_data.imag,axis=2)
 
-            results = {
+            self.latest_sweep_results = {
                 'sweep_frequencies': sweepfreqs,
                 'sweep_responses': sweep_responses,
                 'sweep_stds': sweep_stds,
@@ -865,13 +871,23 @@ class ReadoutServer:
                 'accumulation_errors': acc_errs
                 }
             # results = firmware_lib.perform_sweep(self.r,self.r_fast, self.config, center, span, points, samples_per_point, direction)
-            self.latest_sweep_data['f'] = results['sweep_frequencies']
-            self.latest_sweep_data['z'] = results['sweep_responses']
-            self.latest_sweep_data['e'] = results['sweep_stds']
+            #self.latest_sweep_data['f'] = results['sweep_frequencies']
+            #self.latest_sweep_data['z'] = results['sweep_responses']
+            #self.latest_sweep_data['e'] = results['sweep_stds']
             self.latest_sweep_data_valid = True
 
         except asyncio.CancelledError:
-            print('ayncio cancelled')
+            print('ayncio sweep cancelled')
+            self.latest_sweep_results = {
+                'sweep_frequencies': sweepfreqs,
+                'sweep_responses': sweep_responses,
+                'sweep_stds': sweep_stds,
+                'samples_per_point': samples_per_point,
+                'samples_per_second': firmware_lib.get_sample_rate(self.r_fast),
+                'accumulation_counts': acc_counts,
+                'accumulation_errors': acc_errs
+                }
+
             firmware_lib.set_tone_frequencies(self.r,self.config,initial_freqs,autosync=True)
 
             pass
@@ -889,9 +905,13 @@ class ReadoutServer:
             
             await self.sweep(center, span, points, samples_per_point, direction)
 
-            sweep_f = self.latest_sweep_data['f']
-            sweep_z = self.latest_sweep_data['z']
-            sweep_e = self.latest_sweep_data['e']
+            # sweep_f = self.latest_sweep_data['f']
+            # sweep_z = self.latest_sweep_data['z']
+            # sweep_e = self.latest_sweep_data['e']
+
+            sweep_f = self.latest_sweep_results['sweep_frequencies']
+            sweep_z = self.latest_sweep_results['sweep_responses']
+            sweep_e = self.latest_sweep_results['sweep_stds']
 
             retune_freqs = np.zeros_like(sweep_f[:,0])
 

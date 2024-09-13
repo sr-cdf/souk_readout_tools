@@ -34,9 +34,9 @@ firmware:
     sync_delay: 6225
     acc_len: 1000
     internal_loopback: false
-    psb_scale: 32
-    psb_fftshift: 0b111111
-    pfb_fftshift: 0b1111111
+    psb_scale: 1.0
+    psb_fftshift: 0b11111111
+    pfb_fftshift: 0b11111111
     nyquist_zone: 1
     dsa: 0
     vop: 20000 # WARNING: not rated above 20000uA in gen3 devices with 2.5 V_dac_vtt, anything upto max 40500uA adds nonlinearity

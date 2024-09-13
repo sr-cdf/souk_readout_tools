@@ -161,7 +161,7 @@ And to get the detailed output of the tone powers through the system:
 In [12]: client.get_tone_powers(detailed_output=True)
 ```
 
-The phase offsets of the tones can be set with the `set_tone_phases` method. The phases are in radians and are applied at the firmware mixer LO stage. Adjustments for later conversion stages are not currently accounted for, although they ought to be. Crest factor of the output waveform can be minimised by setting the phases to random values but the preferred method is to use Newman's quadratic multisine phase offset method as this avoids random variations in peak power when re-setting tones. Use `generate_random_phases(num_tones)` or `generate_newman_phases(num_tones)` to generate the phase offsets and apply them:
+The phase offsets of the tones can be set with the `set_tone_phases` method. The phases are in radians and are applied at the firmware mixer LO stage.  Crest factor of the output waveform can be minimised by setting the phases to random values but the preferred method is to use Newman's quadratic multisine phase offset method as this avoids random variations in peak power when re-setting tones. Use `generate_newman_phases(frequencies)` to generate the phase offsets and apply them:
 
 ```
 In [13]: num_tones = len(client.get_tone_frequencies())

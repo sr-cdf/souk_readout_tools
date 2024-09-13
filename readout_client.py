@@ -586,6 +586,8 @@ class ReadoutClient:
         date = sweep_data['date']
         num_tones = int(sweep_data['num_tones'])
         num_points = int(sweep_data['num_points'])
+        samples_per_point = int(sweep_data['samples_per_point'])
+        
         sweep_f = np.array([sweep_data['sweep'][f'{i:04d}']['f'] for i in range(num_tones)])
         sweep_i = np.array([sweep_data['sweep'][f'{i:04d}']['i'] for i in range(num_tones)])
         sweep_q = np.array([sweep_data['sweep'][f'{i:04d}']['q'] for i in range(num_tones)])
@@ -596,6 +598,7 @@ class ReadoutClient:
         data_dict = {'date': date,
                         'num_tones': num_tones,
                         'num_points': num_points,
+                        'samples_per_point': samples_per_point,
                         'system_information': info,
                         'sweep_f': sweep_f,
                         'sweep_i': sweep_i,
@@ -607,13 +610,16 @@ class ReadoutClient:
 
     @staticmethod
     def export_sweep(filename, sweep_data, file_format='npy'):
+        if not os.path.exists(os.path.dirname(filename)):
+            os.makedirs(os.path.dirname(filename))
+
         if 'sweep_eq' not in sweep_data.keys():
             sweep_dict = ReadoutClient.parse_sweep_data(sweep_data)
         else:
             sweep_dict = sweep_data
 
         if file_format == 'npy':
-            np.save(filename.rstrip('.npy') + '.npy', sweep_dict)
+            np.save(filename.replace('.npy', '')+'.npy', sweep_dict)
 
         elif file_format == 'json':
             # Convert numpy arrays to lists for JSON serialization, including nested arrays
@@ -629,16 +635,17 @@ class ReadoutClient:
                 else:
                     json_data_dict[key] = value
 
-            with open(filename.rstrip('.json') + '.json', 'w') as file:
+            with open(filename.replace('.json', '')+'.json', 'w') as file:
                 json.dump(json_data_dict, file, indent=4)
 
 
         elif file_format == 'csv':
-            with open(filename.rstrip('.csv') + '.csv', mode='w', newline='') as file:
+            with open(filename.replace('.csv', '') + '.csv', mode='w', newline='') as file:
                 writer = csv.writer(file)
                 writer.writerow(['# date', sweep_dict['date']])
                 writer.writerow(['# num_tones', sweep_dict['num_tones']])
                 writer.writerow(['# num_points', sweep_dict['num_points']])
+                writer.writerow(['# samples_per_point', sweep_dict['samples_per_point']])
                 for key,value in sweep_dict['system_information'].items():
                     writer.writerow([f'# {key}', value])
                 header = []
@@ -708,6 +715,8 @@ class ReadoutClient:
             data = np.genfromtxt(filename, delimiter=',',names=True,skip_header=header_lines)
             num_tones = sweep_dict['num_tones']
             num_points = sweep_dict['num_points']
+            #samples_per_point = sweep_dict['samples_per_point']
+            
             sweep_f = np.array([data[f'sweep_f_{i:04d}'] for i in range(num_tones)])
             sweep_i = np.array([data[f'sweep_i_{i:04d}'] for i in range(num_tones)])
             sweep_q = np.array([data[f'sweep_q_{i:04d}'] for i in range(num_tones)])
@@ -1086,9 +1095,18 @@ class ReadoutClient:
     def generate_newman_phases(freqs):
         """
         Generate the Newman phases for a set of frequencies.
+
+        If frequencies are exactly evenly spaced, the crest factor is minimised.
+
+        If the frequency spacing is not exactly equal, the phases are offset to account for the spacing. For largely varying spacings, this method is pretty much the same as picking random frequencies.
+
         """
         n=len(freqs)
-        return np.pi*np.arange(n)**2/n
+        freqs=np.atleast_1d(freqs)
+        freqssorted = np.sort(freqs)
+        k = (freqs-freqssorted[0]) / (freqssorted[-1] - freqssorted[0])*(len(freqs)-1)
+        #k should range from 0 to n-1, and elements are proportional to the frequencies
+        return np.pi*k**2/n
 
 
 
