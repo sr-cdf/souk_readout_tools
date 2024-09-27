@@ -36,7 +36,7 @@ def wideband_sweep(config_file = '../config/config.yaml', bandwidth_hz = 2048e6,
     client = readout_client.ReadoutClient(config_file)
 
     p = client.get_sweep_progress()
-    if p=='cancelled':
+    if p==0.0:
         pass
     elif p != 1.0:
         print(f'There is already a sweep in progress ({p*100:.3f}%), please wait for it to finish before starting a new one.')
@@ -59,9 +59,10 @@ def wideband_sweep(config_file = '../config/config.yaml', bandwidth_hz = 2048e6,
     sweep_points = int(bandwidth_hz / step_size_hz / num_tones) 
     sweep_span = spacings * (sweep_points-1)/(sweep_points)
 
-    
-    small_offsets = np.random.uniform(-sweep_span/sweep_points/20,+sweep_span/sweep_points/20,num_tones) # the offsets is less than 10% of the step size
-    small_offsets = np.around(small_offsets) # round to nearest integer
+    # np.random.seed(0)
+    # small_offsets = np.random.uniform(-sweep_span/sweep_points/20,+sweep_span/sweep_points/20,num_tones) # the offsets is less than 10% of the step size
+    small_offsets = np.random.uniform(-sweep_span/sweep_points/2,+sweep_span/sweep_points/2,num_tones) # the largest combined offset is <= 100% of the step size
+    # small_offsets = np.around(small_offsets) # round to nearest integer
     freqs += small_offsets
 
     
@@ -98,7 +99,7 @@ def wideband_sweep(config_file = '../config/config.yaml', bandwidth_hz = 2048e6,
         p=client.get_sweep_progress()
         print(f'Sweep progress: {100*p:.3f}%',end='\r',flush=True)
         if p==1.0: break
-        else: time.sleep(1)
+        else: time.sleep(1.0)
 
     s = client.parse_sweep_data(client.get_sweep_data())
     f = s['sweep_f'].T
@@ -145,6 +146,8 @@ def wideband_sweep(config_file = '../config/config.yaml', bandwidth_hz = 2048e6,
         fig.supxlabel('Frequency (MHz)')
         s1.set_ylabel('Power (dB)')
         s2.set_ylabel('Phase (rad)')
+        s1.set_ylim(np.min(logmag),np.max(logmag))
+        s2.set_ylim(np.min(uphase),np.max(uphase))
         plt.show()
 
     

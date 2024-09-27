@@ -66,6 +66,7 @@ import time
 import os
 import traceback
 import csv
+import base64
 
 class ReadoutClient:
     def __init__(self,config_file='config/config.yaml'):
@@ -555,17 +556,24 @@ class ReadoutClient:
         message = {'request': 'get_sweep_data'}
         response = self.send_request(message)
         if response['status'] == 'success':
-            # data_str = response['data']
-            # data_arr = np.genfromtxt(io.StringIO(data_str),comments='#')
-            # data_dic = {'sweep_f': data_arr[:,0::5],
-            #             'sweep_z': data_arr[:,1::5]+1j*data_arr[:,2::5],
-            #             'sweep_e': data_arr[:,3::5]+1j*data_arr[:,4::5]}
-            # comments = [i for i in data_str.split('\n') if i.startswith('#')]
-            # data_dic['date'] = comments[1].lstrip('# date')
-            # data_dic['num_tones'] = int(comments[2].lstrip('# num_tones'))
-            # data_dic['num_points'] = int(comments[3].lstrip('# num_points'))
             sweep_data = response['data']
             return sweep_data
+        else:
+            print(f"Error getting sweep_data: {response['message']}")
+            return response
+
+    def get_sweep_raw_samples(self):
+        message = {'request': 'get_sweep_raw_samples'}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            sweep_data = response['data']
+            # return np.array(sweep_data['data_i'])+1j*np.array(sweep_data['data_q'])
+            samples,points,tones = sweep_data['samples'],sweep_data['points'],sweep_data['tones']
+            data_i_bytes = base64.b64decode(sweep_data['data_i'])
+            data_q_bytes = base64.b64decode(sweep_data['data_q'])
+            data_i = np.frombuffer(data_i_bytes, dtype='float64').reshape((samples,points,tones))
+            data_q = np.frombuffer(data_q_bytes, dtype='float64').reshape((samples,points,tones))
+            return data_i+1j*data_q
         else:
             print(f"Error getting sweep_data: {response['message']}")
             return response
@@ -588,11 +596,22 @@ class ReadoutClient:
         num_points = int(sweep_data['num_points'])
         samples_per_point = int(sweep_data['samples_per_point'])
         
-        sweep_f = np.array([sweep_data['sweep'][f'{i:04d}']['f'] for i in range(num_tones)])
-        sweep_i = np.array([sweep_data['sweep'][f'{i:04d}']['i'] for i in range(num_tones)])
-        sweep_q = np.array([sweep_data['sweep'][f'{i:04d}']['q'] for i in range(num_tones)])
-        err_i = np.array([sweep_data['sweep'][f'{i:04d}']['ei'] for i in range(num_tones)])
-        err_q = np.array([sweep_data['sweep'][f'{i:04d}']['eq'] for i in range(num_tones)])
+        sweep_f_bytes = base64.b64decode(sweep_data['sweep']['f'])
+        sweep_z_bytes = base64.b64decode(sweep_data['sweep']['z'])
+        sweep_e_bytes = base64.b64decode(sweep_data['sweep']['e'])
+        sweep_f = np.frombuffer(sweep_f_bytes, dtype='f8').reshape((num_tones, num_points))
+        sweep_z = np.frombuffer(sweep_z_bytes, dtype='complex128').reshape((num_tones, num_points))
+        sweep_e = np.frombuffer(sweep_e_bytes, dtype='complex128').reshape((num_tones, num_points))
+        sweep_i = sweep_z.real
+        sweep_q = sweep_z.imag
+        err_i = sweep_e.real
+        err_q = sweep_e.imag
+
+        # sweep_f = np.array([sweep_data['sweep'][f'{i:04d}']['f'] for i in range(num_tones)])
+        # sweep_i = np.array([sweep_data['sweep'][f'{i:04d}']['i'] for i in range(num_tones)])
+        # sweep_q = np.array([sweep_data['sweep'][f'{i:04d}']['q'] for i in range(num_tones)])
+        # err_i = np.array([sweep_data['sweep'][f'{i:04d}']['ei'] for i in range(num_tones)])
+        # err_q = np.array([sweep_data['sweep'][f'{i:04d}']['eq'] for i in range(num_tones)])
         # sweep_z = sweep_i + 1j*sweep_q
         # sweep_e = err_i + 1j*err_q
         data_dict = {'date': date,

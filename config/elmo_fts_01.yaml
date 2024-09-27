@@ -39,6 +39,8 @@ firmware:
     nyquist_zone: 1
     dsa: 0
     vop: 20000 # WARNING: not rated above 20000uA in gen3 devices with 2.5 V_dac_vtt, anything upto max 40500uA adds nonlinearity
+    dac_duc_mixer_frequency_hz: 1024000000
+    adc_ddc_mixer_frequency_hz: -1024000000
     dac_mixer_scale_1p0: false # WARNING: using 1p0 may add nonlinearity
     adc_mixer_scale_1p0: false # WARNING: using 1p0 may add nonlinearity
     dac_qmc_gain: 1 # WARNING UNTESTED. Gain correction factor. Range: 0 to 2.0 (Exclusive)

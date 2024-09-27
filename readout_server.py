@@ -22,6 +22,36 @@ Version: 0.1
 
 """
 
+
+
+import asyncio, contextvars, functools
+import json
+import struct
+import yaml
+import socket
+import os
+import traceback
+import sys
+print(sys.version)
+import numpy as np
+import base64
+
+import firmware_lib
+
+import time
+
+#STREAM FLAGS 
+FLAG_SERVER_REQUEST = 0
+FLAG_SET_FREQS = 1
+FLAG_SET_AMPS = 2
+FLAG_SET_PHASES = 3
+FLAG_CAL_FREEZE = 4
+FLAG_5 = 5
+FLAG_6 = 6
+FLAG_7 = 7
+
+
+
 def check_if_running_on_rfsoc_arm():
     """
     Check if the script is running on the RFSoC ARM processor.
@@ -51,33 +81,6 @@ def get_host_ips():
     from subprocess import check_output
     host_ips = check_output(['hostname', '--all-ip-addresses']).strip().decode()
     return host_ips
-
-
-
-import asyncio, contextvars, functools
-import json
-import struct
-import yaml
-import socket
-import os
-import traceback
-import sys
-print(sys.version)
-import numpy as np
-
-import firmware_lib
-
-import time
-
-#STREAM FLAGS 
-FLAG_SERVER_REQUEST = 0
-FLAG_SET_FREQS = 1
-FLAG_SET_AMPS = 2
-FLAG_SET_PHASES = 3
-FLAG_CAL_FREEZE = 4
-FLAG_5 = 5
-FLAG_6 = 6
-FLAG_7 = 7
 
 
 class ReadoutServer:
@@ -117,7 +120,7 @@ class ReadoutServer:
         self.r_fast = None
         self.latest_sweep_results = {}
         self.latest_sweep_data_valid = False
-        self.sweep_progress = 0
+        self.sweep_progress = 0.0
 
         #initialize server
         self.config_file = config_file
@@ -149,7 +152,7 @@ class ReadoutServer:
         """
         Save a configuration file.
         """
-        with open(config_filename, 'w') as file:
+        with open( config_filename, 'w') as file:
             file.write(config_contents)
         os.chmod(config_filename, 0o666)
         return
@@ -185,7 +188,7 @@ class ReadoutServer:
         self.r_fast = None
         self.latest_sweep_results = {}
         self.latest_sweep_data_valid = False
-        self.sweep_progress = 0
+        self.sweep_progress = 0.0
         
         #load config
         self.config_file = config_file
@@ -205,7 +208,7 @@ class ReadoutServer:
             self.init_firmware()
         
         system_information = self.get_system_information()
-        print(system_information)
+        # print(system_information)
         return
    
              
@@ -279,7 +282,8 @@ class ReadoutServer:
 
         try:
             while True:
-                raw_msglen = await reader.readexactly(4)
+                raw_msglen = await reader.read(4)
+                # raw_msglen = await reader.readexactly(4)
                 if not raw_msglen:
                     break
                 self.stream_flags[FLAG_SERVER_REQUEST].set()
@@ -482,41 +486,30 @@ class ReadoutServer:
                         await self.send_response(writer, {'status': 'error', 'message': 'Sweep already in progress'})
                 
                 elif request == 'get_sweep_progress':
-                    if self.sweep_task is not None and not self.sweep_task.done():
                         await self.send_response(writer, {'status': 'success', 'progress': self.sweep_progress})
-                    else:
-                        await self.send_response(writer, {'status': 'success', 'progress': 'cancelled'})
                     
                 elif request == 'get_sweep_data':
                     if self.latest_sweep_data_valid:
-                        sweep_f = self.latest_sweep_results['sweep_frequencies']
-                        sweep_z = self.latest_sweep_results['sweep_responses']
-                        sweep_e = self.latest_sweep_results['sweep_stds']
-                        # data = '#Sweep file\n'
-                        # data = f'# date: {time.strftime("%Y-%m-%d %H:%M:%S %Z")}\n'
-                        # data += f'# num_tones: {len(sweep_f)}\n'
-                        # data += f'# num_points: {len(sweep_f[0])}\n'
-                        # data += '# system_info: "+str(self.get_system_information())'
-                        # data += '#' + ' '.join([f'sweep_f_{k:04d} sweep_i_{k:04d} sweep_q_{k:04d} err_i_{k:04d} err_q_{k:04d}' for k in range(len(sweep_f))]) + '\n'
-
-                        # for j in range(len(sweep_f[0])):
-                        #     for i in range(len(sweep_f)):
-                        #         data += f'{sweep_f[i][j]:.6f} {sweep_z[i][j].real:.6f} {sweep_z[i][j].imag:.6f} {sweep_e[i][j].real:.6f} {sweep_e[i][j].imag:.6f} '
-                        #     data += '\n'
-                        
+                        sweep_f = self.latest_sweep_results['sweep_frequencies'].astype('f8')
+                        sweep_z = self.latest_sweep_results['sweep_responses'].astype('complex128')
+                        sweep_e = self.latest_sweep_results['sweep_stds'].astype('complex128')
                         sweep = {}
-                        for i in range(len(sweep_f)):
-                            tone={}
-                            tone['f'] = sweep_f[i].tolist()
-                            tone['i'] = sweep_z[i].real.tolist()
-                            tone['q'] = sweep_z[i].imag.tolist()
-                            tone['ei'] = sweep_e[i].real.tolist()
-                            tone['eq'] = sweep_e[i].imag.tolist()
-                            sweep[f'{i:04d}'] = tone
+                        sweep['f'] = base64.b64encode(sweep_f.tobytes()).decode()
+                        sweep['z'] = base64.b64encode(sweep_z.tobytes()).decode()
+                        sweep['e'] = base64.b64encode(sweep_e.tobytes()).decode()
+
+                        # for i in range(len(sweep_f[0])):
+                        #     tone={}
+                        #     tone['f'] = sweep_f[:,i].tolist()
+                        #     tone['i'] = sweep_z[:,i].real.tolist()
+                        #     tone['q'] = sweep_z[:,i].imag.tolist()
+                        #     tone['ei'] = sweep_e[:,i].real.tolist()
+                        #     tone['eq'] = sweep_e[:,i].imag.tolist()
+                        #     sweep[f'{i:04d}'] = tone
 
                         data={'date': time.strftime("%Y-%m-%d %H:%M:%S UTC%z"),
-                              'num_tones': len(sweep_f),
-                              'num_points': len(sweep_f[0]),
+                              'num_tones': len(sweep_f[0]),
+                              'num_points': len(sweep_f),
                               'samples_per_point': self.latest_sweep_results['samples_per_point'],
                               'sweep': sweep,
                               'system_information': self.get_system_information()}
@@ -526,6 +519,28 @@ class ReadoutServer:
                     else:
                         await self.send_response(writer, {'status': 'error', 'message': 'No valid sweep data available yet, please perform a sweep first'})
                 
+                elif request == 'get_sweep_raw_samples':
+                    if self.latest_sweep_data_valid:
+                        sweep_z = self.latest_sweep_data['sweep_data']
+                        samples,points,tones = sweep_z.shape
+
+                        # data_i = sweep_z.real.tolist()
+                        # data_q = sweep_z.imag.tolist()
+                        data_i = base64.b64encode(sweep_z.real.astype('float64').tobytes()).decode()
+                        data_q = base64.b64encode(sweep_z.imag.astype('float64').tobytes()).decode()
+                        data = {'samples':samples,
+                                'points':points,
+                                'tones':tones,
+                                'data_i': data_i,
+                                'data_q': data_q}
+                        
+                        await self.send_response(writer, {'status': 'success', 'data': data})
+                    else:
+                        await self.send_response(writer, {'status': 'error', 'message': 'No valid sweep data available yet, please perform a sweep first'})
+                
+
+
+
                 elif request == 'get_sweep_txt':
                     if self.latest_sweep_data_valid:
                         sweep_f = self.latest_sweep_results['sweep_frequencies']
@@ -533,15 +548,15 @@ class ReadoutServer:
                         sweep_e = self.latest_sweep_results['sweep_stds']
                         data = '# Sweep file\n'
                         data += f'# date: {time.strftime("%Y-%m-%d %H:%M:%S %Z")}\n'
-                        data += f'# num_tones: {len(sweep_f)}\n'
-                        data += f'# num_points: {len(sweep_f[0])}\n'
+                        data += f'# num_tones: {len(sweep_f[0])}\n'
+                        data += f'# num_points: {len(sweep_f)}\n'
                         data += f'# samples_per_point: {self.latest_sweep_results["samples_per_point"]}\n'
                         
                         data += '# system_info: '+str(self.get_system_information()) +'\n'
                         data += '#' + ' '.join([f'sweep_f_{k:04d} sweep_i_{k:04d} sweep_q_{k:04d} err_i_{k:04d} err_q_{k:04d}' for k in range(len(sweep_f))]) + '\n'
 
-                        for j in range(len(sweep_f[0])):
-                            for i in range(len(sweep_f)):
+                        for j in range(len(sweep_f)):
+                            for i in range(len(sweep_f[0])):
                                 data += f'{sweep_f[i][j]:.6f} {sweep_z[i][j].real:.6f} {sweep_z[i][j].imag:.6f} {sweep_e[i][j].real:.6f} {sweep_e[i][j].imag:.6f} '
                             data += '\n'
                         
@@ -569,6 +584,7 @@ class ReadoutServer:
                     if self.sweep_task:
                         self.sweep_task.cancel()
                         self.sweep_task = None
+                        self.sweep_progress=0.0
                     for task in self.tasks:
                         task.cancel()
                     self.tasks = []
@@ -582,12 +598,13 @@ class ReadoutServer:
                 
 
         except asyncio.IncompleteReadError:
-            print(f"request client disconnected: {addr} (IncompleteReadError)")
+            print(f"request client disconnected unexpectedly: {addr} (IncompleteReadError)")
         except Exception as e:
             print(f"Error handling request client {addr}: {e}")
             print(traceback.format_exc())
             await self.send_response(writer, {'status': 'error', 'message': f'Error handling request: {e}'})
         finally:
+            print(f"request client disconnected: {addr}")
             if writer in self.request_clients:
                 self.request_clients.remove(writer)
             writer.close()
@@ -798,6 +815,7 @@ class ReadoutServer:
         try:
             
             self.latest_sweep_data_valid = False
+            self.sweep_progress = 0.0
             
             centers = np.atleast_1d(centers)
             spans = np.atleast_1d(spans)
@@ -808,58 +826,93 @@ class ReadoutServer:
             samples_per_point=int(samples_per_point)
             assert direction in ('up','down')
 
-            num_tones = len(centers) 
-            channels = np.arange(num_tones,dtype=int)
-            sweepfreqs = np.zeros((num_tones,num_points),dtype=float)
-            for t in range(num_tones):
-                cf=centers[t]
-                sp=spans[t]
-                sweepfreqs[t] = np.linspace(cf-sp/2.,cf+sp/2.,num_points)
-                if direction=='down':
-                    sweepfreqs[t] = sweepfreqs[t][::-1]
-
-            acc_counts = np.zeros((num_points,samples_per_point),dtype=int)
-            sweep_data = np.zeros((num_tones,num_points,samples_per_point),dtype=complex)
-            acc_errs = np.zeros((num_points,samples_per_point),dtype=bool)
-
             # after the sweep, the tones should be set back to their original frequencies.
             # unless the number of tones has changed, or the tones were not within the span of the sweep.
             # in which case they should be set to the center frequencies.
             initial_freqs = firmware_lib.get_tone_frequencies(self.r, self.config)
-            print('initial freqs:',initial_freqs)
             if len(initial_freqs)!=len(centers):
                 initial_freqs = centers
-                print('initial freqs updated:',initial_freqs)
             for i in range(len(centers)):
                 if initial_freqs[i]<centers[i]-spans[i]/2. or initial_freqs[i]>centers[i]+spans[i]/2.:
                     initial_freqs[i] = centers[i]
-                    print('initial freqs updated2:',initial_freqs)
-            firmware_lib.set_tone_frequencies(self.r,self.config,centers,autosync=True)
-            print('initial_freqs:',initial_freqs)
 
+            print('Setting initial tone frequencies')
+            firmware_lib.set_tone_frequencies(self.r,self.config,centers,autosync=True)
+
+            print('Preparing sweep')
+            num_tones = len(centers) 
+            channels = np.arange(num_tones,dtype=int)
+            sweepfreqs = np.zeros((num_points,num_tones),dtype=float)
+            for t in range(num_tones):
+                cf=centers[t]
+                sp=spans[t]
+                if direction == 'up':
+                    sweepfreqs[:,t] = np.linspace(cf-sp/2.,cf+sp/2.,num_points)
+                elif direction=='down':
+                    sweepfreqs[:,t] = np.linspace(cf-sp/2.,cf+sp/2.,num_points)[::-1]
+            
+            print('Preparing faster sweep settings')
             fast_read_params = firmware_lib.get_fast_read_params(self.r_fast) 
+            # fast_write_params = []
+            # for p in range(num_points):
+            #     fast_write_params.append(firmware_lib.prepare_tone_frequency_settings_fast(self.r, self.config, sweepfreqs[p]))
+            fast_sweep_params = firmware_lib.prepare_sweep_settings_fast(self.r_fast,self.config,sweepfreqs)
+            
+            print('Starting sweep')
+            acc_counts = np.zeros((samples_per_point,num_points),dtype=int)
+            sweep_data = np.zeros((samples_per_point,num_points,num_tones),dtype=complex)
+            acc_errs = np.zeros((samples_per_point,num_points),dtype=bool)
+
             for p in range(num_points):
-                print('sweeping: setting tone frequencies',sweepfreqs[:,p])
-                firmware_lib.set_tone_frequencies(self.r,
-                                    self.config,
-                                    sweepfreqs[:,p],
-                                    autosync=True)
-                print('sweeping: getting_samples')
+                # print('sweeping: setting tone frequencies',sweepfreqs[p])
+                
+                # #slowest method
+                # firmware_lib.set_tone_frequencies(self.r,
+                #                     self.config,
+                #                     sweepfreqs[p],
+                #                     autosync=True)
+                
+                # #fast method (fast_write_mixer)
+                # firmware_lib.set_tone_frequencies_fast(self.r,
+                #                     self.r_fast,
+                #                     self.config,
+                #                     sweepfreqs[p],
+                #                     autosync=True)
+                
+                # #faster method (fast_write_mixer and skip unnecessary chanmap updates)
+                # firmware_lib.apply_tone_frequency_settings_fast(self.r,
+                #                                                 self.r_fast,
+                #                                                 fast_write_params[p],
+                #                                                 autosync=True)
+
+
+                # even faster method (fast_write_mixer, skip unnecessary chanmap updates and vectorised preparation of tone frequency settings)      
+                firmware_lib.apply_sweep_step_fast(self.r,
+                                                   self.r_fast,
+                                                   fast_sweep_params,
+                                                   p,
+                                                   autosync=True)
+                
+                firmware_lib._wait_for_acc(self.r,0,0.001)
+                
+                # print('sweeping: getting_samples')
                 for s in range(samples_per_point):
                     cnt,data,err = firmware_lib.read_accumulated_data_fast(
                                                             fast_read_params,
                                                             num_tones=num_tones)
-                    acc_counts[p,s] = cnt
-                    sweep_data[:,p,s] = data[::2]+1j*data[1::2]
-                    acc_errs[p,s] = err
-                self.sweep_progress = float(p/(num_points-1))
-                await asyncio.sleep(0.001)
+                    acc_counts[s,p] = cnt
+                    sweep_data[s,p] = data[::2]+1j*data[1::2]
+                    acc_errs[s,p] = err
+                # time.sleep(0.001)
 
-            print('reset initial freqs:',initial_freqs)
+                self.sweep_progress = float(p/(num_points-1))
+                await asyncio.sleep(0.0001)
+
+            # print('reset initial freqs:',initial_freqs)
             firmware_lib.set_tone_frequencies(self.r,self.config,initial_freqs,autosync=True)
 
-            sweep_responses = np.mean(sweep_data.real,axis=2) + 1j*np.mean(sweep_data.imag,axis=2)
-            sweep_stds = np.std(sweep_data.real,axis=2) + 1j*np.std(sweep_data.imag,axis=2)
+            sweep_responses = np.mean(sweep_data.real,axis=0) + 1j*np.mean(sweep_data.imag,axis=0)
+            sweep_stds = np.std(sweep_data.real,axis=0) + 1j*np.std(sweep_data.imag,axis=0)
 
             self.latest_sweep_results = {
                 'sweep_frequencies': sweepfreqs,
@@ -869,6 +922,9 @@ class ReadoutServer:
                 'samples_per_second': firmware_lib.get_sample_rate(self.r_fast),
                 'accumulation_counts': acc_counts,
                 'accumulation_errors': acc_errs
+                }
+            self.latest_sweep_data = {
+                'sweep_data': sweep_data
                 }
             # results = firmware_lib.perform_sweep(self.r,self.r_fast, self.config, center, span, points, samples_per_point, direction)
             #self.latest_sweep_data['f'] = results['sweep_frequencies']
@@ -878,6 +934,7 @@ class ReadoutServer:
 
         except asyncio.CancelledError:
             print('ayncio sweep cancelled')
+            firmware_lib.set_tone_frequencies(self.r,self.config,initial_freqs,autosync=True)
             self.latest_sweep_results = {
                 'sweep_frequencies': sweepfreqs,
                 'sweep_responses': sweep_responses,
@@ -888,10 +945,9 @@ class ReadoutServer:
                 'accumulation_errors': acc_errs
                 }
 
-            firmware_lib.set_tone_frequencies(self.r,self.config,initial_freqs,autosync=True)
-
             pass
         except Exception as e:
+            self.sweep_progress = float(1.0)
             print(f"Error performing sweep: {e}")
             print(traceback.format_exc())
         
@@ -913,25 +969,25 @@ class ReadoutServer:
             sweep_z = self.latest_sweep_results['sweep_responses']
             sweep_e = self.latest_sweep_results['sweep_stds']
 
-            retune_freqs = np.zeros_like(sweep_f[:,0])
+            retune_freqs = np.zeros_like(sweep_f[0])
 
             if method == 'max_gradient':
                 for t in range(len(center)):
-                    freqs = sweep_f[t]
-                    grads = np.abs(np.gradient(sweep_z[t]))
+                    freqs = sweep_f[:,t]
+                    grads = np.abs(np.gradient(sweep_z[:,t]))
                     max_grad = np.argmax(grads)
                     retune_freqs[t] = freqs[max_grad]
             elif method == 'min_mag':
                 for t in range(len(center)):
-                    freqs = sweep_f[t]
-                    mags = np.abs(sweep_z[t])
+                    freqs = sweep_f[:,t]
+                    mags = np.abs(sweep_z[:,t])
                     min_mag = np.argmin(mags)
                     retune_freqs[t] = freqs[min_mag]
 
             print('Retune freqs:',retune_freqs)
 
             firmware_lib.set_tone_frequencies(self.r,self.config,retune_freqs)
-            print('New frequencies:',firmware_lib.get_tone_frequencies(self.r,self.config))
+            # print('New frequencies:',firmware_lib.get_tone_frequencies(self.r,self.config))
 
             # results = firmware_lib.perform_retune(self.r,self.r_fast, self.config, center, span, points, samples_per_point, direction, method)
             # self.latest_sweep_data['f'] = results['sweep_frequencies']
@@ -979,6 +1035,5 @@ if __name__ == '__main__':
     check_if_running_on_rfsoc_arm()
     process_name = set_process_name()
     host_ips = get_host_ips()
-
     readout_server = ReadoutServer('config/config.yaml')
     asyncio.run(readout_server.main())

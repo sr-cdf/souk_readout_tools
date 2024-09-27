@@ -92,7 +92,7 @@ def calc_tone_amplitudes(powers_dbm,
     """
     Calculate tone amplitudes from desired powers.
     Accounts for scaling in the firmware, DAC DUC Mixer, VOP, rf frontend and cryostat.
-    Requires a calibration of the DAC output power to convert from dBFS to dBm, defaulting to 0 dBFS = -7.8 dBm if unavailable.
+    Requires a calibration of the DAC output power to convert from dBFS to dBm, defaulting to 0 dBFS = -6.0 dBm if unavailable.
     """
     #convert to numpy array
     output_powers_dbm = np.atleast_1d(powers_dbm)
