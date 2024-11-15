@@ -14,10 +14,11 @@ def _initialize_user_data():
     if not os.path.exists(user_data_dir):
         os.makedirs(user_data_dir, exist_ok=True)
         print(f"Created user data directory at {user_data_dir}")
-    # Use importlib_resources.files() to get the path to the 'data' directory in the package
-    data_package = files('souk_readout_tools').joinpath('data')
-    shutil.copytree(str(data_package), user_data_dir, dirs_exist_ok=True)
-    #print(f"Copied default data to {user_data_dir}")
+        # Use importlib_resources.files() to get the path to the 'data' directory in the package
+        data_package = files('souk_readout_tools').joinpath('data')
+        shutil.copytree(str(data_package), user_data_dir, dirs_exist_ok=True)
+        print(f"Copied default data to {user_data_dir}")
+        print(f"{data_package}")
     
 
 

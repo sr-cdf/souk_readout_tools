@@ -35,7 +35,6 @@ else:
 # Define common dependencies
 install_requires = [
     'importlib_resources',
-    'wheel',
     'numpy',
     'matplotlib',
     'pyyaml'
@@ -88,7 +87,7 @@ if install_server:
 
 setup(
     name='souk_readout_tools',
-    version='1.0.0',
+    version='1.0.1',
     description='Tools for the SOUK readout',
     author='Sam Rowe',
     author_email='sam.rowe@astro.cf.ac.uk',

@@ -1,5 +1,1 @@
-importlib_resources
-pyyaml
-ipython
-numpy
-matplotlib
+wheel

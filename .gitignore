@@ -6,5 +6,5 @@ venv/
 env/
 
 *.egg-info/
-
+.eggs/
 
