@@ -37,7 +37,8 @@ install_requires = [
     'importlib_resources',
     'numpy',
     'matplotlib',
-    'pyyaml'
+    'pyyaml',
+    'ipython'
     # Add other common dependencies here
 ]
 
