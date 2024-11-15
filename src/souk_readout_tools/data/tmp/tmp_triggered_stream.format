@@ -1,4 +1,0 @@
-num_tones: 2048
-format: "<i4"
-total_bytes_per_sample: 16384
-ordering: "I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, Q_tone1_sample0,..."
