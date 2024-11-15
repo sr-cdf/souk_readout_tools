@@ -1,0 +1,81 @@
+{
+    "date": "2024-08-20 16:37:53 UTC+0100",
+    "num_tones": 16,
+    "sample_rate": 500.0,
+    "format": "<i4",
+    "index_err": 41,
+    "index_cnt": 40,
+    "index_flag_7": 39,
+    "index_flag_6": 38,
+    "index_flag_5": 37,
+    "index_flag_4": 36,
+    "index_flag_3": 35,
+    "index_flag_2": 34,
+    "index_flag_1": 33,
+    "index_flag_0": 32,
+    "ordering": "I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, Q_tone1_sample0,..flags, cnt, err .",
+    "system_information": {
+        "fpga_status": {
+            "programmed": true,
+            "timestamp": "2024-08-20T16:37:52.128094",
+            "host": "localhost.localdomain:localhost",
+            "antname": null,
+            "sw_version": "0.1",
+            "fw_version": "7.3.0.1",
+            "fw_type": 2,
+            "fw_build_time": "2024-07-24T12:17:48",
+            "fw_supported": true
+        },
+        "pipeline_id": 0,
+        "output_mode": "PSB",
+        "sync_delay": 6225,
+        "acc_len": 1000,
+        "acc_freq": 500.0,
+        "internal_loopback": false,
+        "psb_scale": 2.0,
+        "psb_fftshift": 0,
+        "pfb_fftshift": 511,
+        "dsa": "0",
+        "vop_dac0": "19993",
+        "vop_dac1": "19993",
+        "nyquist_zone_adc": 1,
+        "nyquist_zone_dac0": 1,
+        "nyquist_zone_dac1": 1,
+        "mixer_scale_1p0_dac0": false,
+        "mixer_scale_1p0_dac1": false,
+        "mixer_scale_1p0_adc": false,
+        "mixer_qmc_settings_dac0": {
+            "EnablePhase": 0.0,
+            "EnableGain": 0.0,
+            "GainCorrectionFactor": 0.0,
+            "PhaseCorrectionFactor": 0.0,
+            "OffsetCorrectionFactor": 0.0,
+            "EventSource": 0.0
+        },
+        "mixer_qmc_settings_dac1": {
+            "EnablePhase": 0.0,
+            "EnableGain": 0.0,
+            "GainCorrectionFactor": 0.0,
+            "PhaseCorrectionFactor": 0.0,
+            "OffsetCorrectionFactor": 0.0,
+            "EventSource": 0.0
+        },
+        "mixer_qmc_settings_adc": {
+            "EnablePhase": 0.0,
+            "EnableGain": 0.0,
+            "GainCorrectionFactor": 0.0,
+            "PhaseCorrectionFactor": 0.0,
+            "OffsetCorrectionFactor": 0.0,
+            "EventSource": 0.0
+        },
+        "tone_frequencies": [
+            1952500000.0
+        ],
+        "tone_amplitudes": [
+            0.999755859375
+        ],
+        "tone_phases": [
+            0.0
+        ]
+    }
+}

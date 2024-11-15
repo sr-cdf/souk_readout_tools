@@ -1,4 +1,10 @@
 __pycache__/
-tmp/
+
 doc/.ipynb_checkpoints/
-client_venv/
+
+venv/
+env/
+
+*.egg-info/
+
+

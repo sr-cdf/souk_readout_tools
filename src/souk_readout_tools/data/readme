@@ -1,0 +1,3 @@
+This directory is for storing the souk_readout_tools run-time data.
+
+It is not safe for user storage as any files may be overwritten automatically.
