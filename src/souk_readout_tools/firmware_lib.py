@@ -7,6 +7,7 @@ This module provides a set of functions that are used by the readout server to i
 import warnings
 import numpy as np
 import time
+import os
 #import asyncio
 
 try:
@@ -17,6 +18,7 @@ except ImportError:
     
 from souk_readout_tools import calibration
 
+USER_DIR = os.path.expanduser('~/.souk_readout_tools/')
 
 autosync_time_delay = 0.001 #seconds
 
@@ -1977,7 +1979,7 @@ def get_tone_powers(r,config_dict,detailed_output=False):
         dac_dbfs_to_dbm = 0
     elif isinstance(dac_dbfs_to_dbm,str):
         #perform nearest neighbour interpolation on calibration data if filenames stored in config file directly
-        cal_f,cal_db = np.loadtxt(dac_dbfs_to_dbm,ndmin=2).T
+        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,dac_dbfs_to_dbm),ndmin=2).T
         dac_dbfs_to_dbm = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
     elif not np.isscalar(dac_dbfs_to_dbm):
         #perform nearest neighbour interpolation on calibration data if arrays stored in config file directly
@@ -1987,7 +1989,7 @@ def get_tone_powers(r,config_dict,detailed_output=False):
     if tx_combiner_loss_db is None:
         tx_combiner_loss_db = 0
     elif isinstance(tx_combiner_loss_db,str):
-        cal_f,cal_db = np.loadtxt(tx_combiner_loss_db,ndmin=2).T
+        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_combiner_loss_db),ndmin=2).T
         tx_combiner_loss_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
     elif not np.isscalar(tx_combiner_loss_db):
         cal_f,cal_db = np.array(tx_combiner_loss_db,ndmin=2).T
@@ -1999,7 +2001,7 @@ def get_tone_powers(r,config_dict,detailed_output=False):
     if tx_if_s21_db is None:
         tx_if_s21_db = 0
     elif isinstance(tx_if_s21_db,str):
-        cal_f,cal_db = np.loadtxt(tx_if_s21_db,ndmin=2).T
+        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_if_s21_db),ndmin=2).T
         tx_if_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
     elif not np.isscalar(tx_if_s21_db):
         cal_f,cal_db = np.array(tx_if_s21_db,ndmin=2).T
@@ -2008,7 +2010,7 @@ def get_tone_powers(r,config_dict,detailed_output=False):
     if tx_mixer_conversion_loss_db is None:
         tx_mixer_conversion_loss_db = 0
     elif isinstance(tx_mixer_conversion_loss_db,str):
-        cal_f,cal_db = np.loadtxt(tx_mixer_conversion_loss_db,ndmin=2).T
+        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_mixer_conversion_loss_db),ndmin=2).T
         tx_mixer_conversion_loss_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
     elif not np.isscalar(tx_mixer_conversion_loss_db):
         cal_f,cal_db = np.array(tx_mixer_conversion_loss_db,ndmin=2).T
@@ -2017,7 +2019,7 @@ def get_tone_powers(r,config_dict,detailed_output=False):
     if tx_rf_s21_db is None:
         tx_rf_s21_db = 0
     elif isinstance(tx_rf_s21_db,str):
-        cal_f,cal_db = np.loadtxt(tx_rf_s21_db,ndmin=2).T
+        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_rf_s21_db),ndmin=2).T
         tx_rf_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
     elif not np.isscalar(tx_rf_s21_db):
         cal_f,cal_db = np.array(tx_rf_s21_db,ndmin=2).T
@@ -2026,7 +2028,7 @@ def get_tone_powers(r,config_dict,detailed_output=False):
     if cryostat_input_s21_db is None:
         cryostat_input_s21_db = 0
     elif isinstance(cryostat_input_s21_db,str):
-        cal_f,cal_db = np.loadtxt(cryostat_input_s21_db,ndmin=2).T
+        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,cryostat_input_s21_db),ndmin=2).T
         cryostat_input_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
     elif not np.isscalar(cryostat_input_s21_db):
         cal_f,cal_db = np.array(cryostat_input_s21_db,ndmin=2).T
@@ -2099,7 +2101,7 @@ def set_tone_powers(r,config_dict,powers_dbm):
         dac_dbfs_to_dbm = 0
     elif isinstance(dac_dbfs_to_dbm,str):
         #perform nearest neighbour interpolation on calibration data if filenames stored in config file directly
-        cal_f,cal_db = np.loadtxt(dac_dbfs_to_dbm,ndmin=2).T
+        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,dac_dbfs_to_dbm),ndmin=2).T
         dac_dbfs_to_dbm = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
     elif not np.isscalar(dac_dbfs_to_dbm):
         #perform nearest neighbour interpolation on calibration data if arrays stored in config file directly
@@ -2109,7 +2111,7 @@ def set_tone_powers(r,config_dict,powers_dbm):
     if tx_combiner_loss_db is None:
         tx_combiner_loss_db = 0
     elif isinstance(tx_combiner_loss_db,str):
-        cal_f,cal_db = np.loadtxt(tx_combiner_loss_db,ndmin=2).T
+        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_combiner_loss_db),ndmin=2).T
         tx_combiner_loss_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
     elif not np.isscalar(tx_combiner_loss_db):
         cal_f,cal_db = np.array(tx_combiner_loss_db,ndmin=2).T
@@ -2121,7 +2123,7 @@ def set_tone_powers(r,config_dict,powers_dbm):
     if tx_if_s21_db is None:
         tx_if_s21_db = 0
     elif isinstance(tx_if_s21_db,str):
-        cal_f,cal_db = np.loadtxt(tx_if_s21_db,ndmin=2).T
+        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_if_s21_db),ndmin=2).T
         tx_if_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
     elif not np.isscalar(tx_if_s21_db):
         cal_f,cal_db = np.array(tx_if_s21_db,ndmin=2).T
@@ -2130,7 +2132,7 @@ def set_tone_powers(r,config_dict,powers_dbm):
     if tx_mixer_conversion_loss_db is None:
         tx_mixer_conversion_loss_db = 0
     elif isinstance(tx_mixer_conversion_loss_db,str):
-        cal_f,cal_db = np.loadtxt(tx_mixer_conversion_loss_db,ndmin=2).T
+        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_mixer_conversion_loss_db),ndmin=2).T
         tx_mixer_conversion_loss_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
     elif not np.isscalar(tx_mixer_conversion_loss_db):
         cal_f,cal_db = np.array(tx_mixer_conversion_loss_db,ndmin=2).T
@@ -2139,7 +2141,7 @@ def set_tone_powers(r,config_dict,powers_dbm):
     if tx_rf_s21_db is None:
         tx_rf_s21_db = 0
     elif isinstance(tx_rf_s21_db,str):
-        cal_f,cal_db = np.loadtxt(tx_rf_s21_db,ndmin=2).T
+        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_rf_s21_db),ndmin=2).T
         tx_rf_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
     elif not np.isscalar(tx_rf_s21_db):
         cal_f,cal_db = np.array(tx_rf_s21_db,ndmin=2).T
@@ -2148,7 +2150,7 @@ def set_tone_powers(r,config_dict,powers_dbm):
     if cryostat_input_s21_db is None:
         cryostat_input_s21_db = 0
     elif isinstance(cryostat_input_s21_db,str):
-        cal_f,cal_db = np.loadtxt(cryostat_input_s21_db,ndmin=2).T
+        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,cryostat_input_s21_db),ndmin=2).T
         cryostat_input_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
     elif not np.isscalar(cryostat_input_s21_db):
         cal_f,cal_db = np.array(cryostat_input_s21_db,ndmin=2).T
