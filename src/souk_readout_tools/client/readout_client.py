@@ -174,6 +174,9 @@ class ReadoutClient:
             self.config_file = destination_file
             self.config = yaml.safe_load(config_contents)
             print(f'Config loaded {self.config_file}')
+            with open(DEFAULT_CONFIG,'w') as file:
+                file.write(os.path.abspath(self.config_file))
+
             
         else:
             return response
