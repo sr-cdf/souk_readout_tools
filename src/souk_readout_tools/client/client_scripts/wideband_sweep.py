@@ -14,7 +14,7 @@ import time
 import souk_readout_tools
  
 
-def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = None, step_size_hz = 10000, num_tones = 1024, samples_per_point = 10, phase_correction = True, filename = None, filetype = 'npy', plot_data = True):
+def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = None, step_size_hz = 10000, num_tones = 1024, samples_per_point = 10, ignore_phase_correction = False, filename = None, filetype = 'npy', plot_data = True):
     """
     Perform a wideband sweep of the system.
     
@@ -25,20 +25,11 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
         step_size_hz (float): Step size of the sweep, number of actual sweep steps will equal (bandwidth / step_size / num_tones)
         num_tones (int): Number of tones to use in the sweep, default is 1024, using more tones require fewer sweep steps
         samples_per_point (int): Number of samples to integrate per sweep point, default is 10
-        no_phase_correction (bool): Do not correct for phase jumps at filterbank channel edges
-        directory (str): Directory where the file will be saved, default is ./tmp
+        ignore_phase_correction (bool): Do not correct for phase jumps at filterbank channel edges. Default is False, meaning the phase correction is applied by default)
         filename (str): Filename to save the data to, default is tmp_wideband_sweep
         filetype (str): Type of file to save, default is .npy
         plot_data (bool): Plot the data after saving
     """
-    filename = 'tmp_wideband_sweep.npy' 
-
-    if bandwidth_hz is None:
-        bandwidth_hz = 2048e6
-    if center_freq_hz is None:
-        center_freq_hz = 2976e6
-    #step_size_hz = 10000
-    #num_tones = 1024,
 
     client = souk_readout_tools.client.ReadoutClient(config_file)
     
@@ -49,13 +40,6 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
     else:
         #else push the specified config to the rfsoc
         client.push_config()
-
-        ##if given, push to the rfsoc, but check first if its already running with that config
-        #client_config_id = client.config['config']['config_id']    
-        #client.pull_config()
-        #server_config_id = client.config['config']['config_id']
-        #if server_config_id != client_config_id:
-        #    client.push_config()
     
 
     p = client.get_sweep_progress()
@@ -84,15 +68,25 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
     rfmax = dacmax if not udc else max(lo+dacmax*sb, lo-dacmax*sb,lo+dacmin*sb,lo-dacmin*sb) 
     rfmin = dacmin if not udc else min(lo+dacmax*sb, lo-dacmax*sb,lo+dacmin*sb,lo-dacmin*sb)
 
+    if bandwidth_hz is None:
+        bandwidth_hz=rfmax-rfmin
+
+    if center_freq_hz is None:
+        center_freq_hz = (rfmax+rfmin)/2
+
+
     fmin = center_freq_hz - bandwidth_hz/2
     fmax = center_freq_hz + bandwidth_hz/2
 
     if (fmin < rfmin) or (fmax>rfmax):
-        raise ValueError(f'Attempting to sweep out of band ({rfmin/1e6} - {rfmax/1e6} MHz)')
+        raise ValueError(f'Attempting to sweep out of band (band = {rfmin/1e6} - {rfmax/1e6} MHz, requested {fmin/1e6} - {fmax/1e6} MHz)')
     
 
     freqs,spacings = np.linspace(fmin, fmax, num_tones, endpoint=False, retstep=True)
     
+    if spacings <= dacclk/txnfft:
+        raise ValueError(f'Tone spacing must be greater than {dacclk/txnfft} Hz but it is {spacings}. Try fewer tones or wider bandwidth.') 
+
     # sweep_points = 41 # not too many as its currently quite slow
     sweep_points = int(bandwidth_hz / step_size_hz / num_tones) 
     sweep_span = spacings * (sweep_points-1)/(sweep_points)
@@ -143,14 +137,12 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
     f = s['sweep_f'].T
     z = s['sweep_i'].T+1j*s['sweep_q'].T
 
-    if phase_correction:
-        #TODO: get the following constants from the sytem info or config file
+    if not ignore_phase_correction:
         rffreqs = f
         iffreqs = sb*(rffreqs-lo)
         bbfreqs = iffreqs - dacduc
         bbbins = bbfreqs/(dacclk)*txnfft
         filterbank_bin_numbers = np.around(bbbins)
-        #filterbank_bin_numbers = np.around(((4e9 - f)-1024e6)/1024e6*4096)
         z[filterbank_bin_numbers%2==1]*=np.exp(1j*np.pi)
 
     phi = np.unwrap(np.angle(np.ravel(z.T)))
@@ -160,13 +152,13 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
     s['sweep_i'] = np.real(z).T
     s['sweep_q'] = np.imag(z).T
     
-    
     if filename is None:
         filename = os.path.expanduser('~/.souk_readout_tools/tmp/tmp_wideband_sweep')
     filename = os.path.abspath(filename)
     if not os.path.exists(os.path.dirname(filename)):
         os.makedirs(os.path.dirname(filename))
     client.export_sweep(filename, s, filetype)
+    print('Wideband sweep exported to:',filename+'.'+filetype)
 
     if plot_data:
         si = s['sweep_i'].T
@@ -199,16 +191,14 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
 def main():
 
     parser = argparse.ArgumentParser(description='Sweep out the full bandwidth of the system eith multiple tones to save time')
-    parser.add_argument('-C', '--config_file', type=str, default=None, help='Path to the configuration file, default is None')
-    parser.add_argument('-b', '--bandwidth_hz', type=float, default=2048e6, help='Total bandwidth to measure, default is 2024 MHz')
-    parser.add_argument('-c', '--center_freq_hz', type=float, default=2976e6, help='Center frequency of the weep, default is 3072 MHz')
-    parser.add_argument('-s', '--step_size_hz', type=float, default=10000, help='Step size of the sweep, number of actual sweep steps will equal (bandwidth / step_size / num_tones')
+    parser.add_argument('-C', '--config_file', type=str, default=None, help='Path to the configuration file, default is to search ~/.souk_readout_tools/config/default_config.lnk')
+    parser.add_argument('-b', '--bandwidth_hz', type=float, default=None, help='Total bandwidth to measure, default is the bandwidth defined in the config MHz')
+    parser.add_argument('-c', '--center_freq_hz', type=float, default=None, help='Center frequency of the sweep, default is the band center defined by the config')
+    parser.add_argument('-s', '--step_size_hz', type=float, default=10000, help='Step size of the sweep in hz, number of actual sweep steps will equal (bandwidth / step_size / num_tones')
     parser.add_argument('-n', '--num_tones', type=int, default=1024, help='Number of tones to use in the sweep, default is 1024, using more tones require fewer sweep steps')
     parser.add_argument('-p', '--samples_per_point', type=int, default=10, help='Number of samples to integrate per sweep point, default is 10')    
-    parser.add_argument('-x', '--no_phase_correction', action='store_true', help='Do not correct for phase jumps at filterbank channel edges')    
-    
-    parser.add_argument('-d', '--directory', type=str, default='../tmp', help='Directory where the file will be saved, default is ./tmp')
-    parser.add_argument('-f', '--filename', type=str, default='tmp_wideband_sweep.npy', help='Filename to save the data to, default is tmp_wideband_sweep')
+    parser.add_argument('-i', '--ignore_phase_correction', action='store_true', help='Do not correct for phase jumps at filterbank channel edges, ')    
+    parser.add_argument('-f', '--filename', type=str, default=None, help='Filename to save the data to, default is ~/.souk_readout_tools/tmp/tmp_wideband_sweep.npy')
     parser.add_argument('-t', '--filetype', type=str, default='npy', help='Type of file to save, default is .npy')
     parser.add_argument('-P', '--plot_data', action='store_true', help='Plot the data after saving')
 
@@ -234,7 +224,7 @@ def main():
                        step_size_hz = args.step_size_hz,
                          num_tones = args.num_tones,
                            samples_per_point = args.samples_per_point,
-                             phase_correction = not args.no_phase_correction,
+                             ignore_phase_correction = args.ignore_phase_correction,
                                  filename = args.filename,
                                    filetype = args.filetype,
                                      plot_data = args.plot_data)
