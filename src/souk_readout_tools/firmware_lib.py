@@ -190,11 +190,42 @@ def create_fast_readout_interface(fw_config_file):
     r_fast = SoukMkidReadout('localhost',configfile=fw_config_file,local=True)
     return r_fast
 
-def needs_programming(r):
+def needs_programming(r,config_dict):
+    
+    currentfpg = r.fpgfile
+    try:
+        currentfpg = os.readlink(currentfpg)
+    except OSError:
+        pass
+    with open(config_dict['firmware']['fw_config_file'],'r') as file:
+        newfpg = yaml.safe_load(file)['fpgfile']
+    newfpg = newfpg.replace('../','').replace('./','/home/casper/src/souk-firmware/')
+    try:
+        newfpg = os.readlink(newfpg)
+    except OSError:
+        pass
+        
+    newfpg = os.path.basename(newfpg)
+    currentfpg = os.path.basename(currentfpg)
+
+    print('************************************************')
+    print('needs_programming?')
+    print('current fpg:',currentfpg)
+    print('new fpg:',newfpg)
+    print('************************************************')
+
+    if newfpg != currentfpg:
+        print('yes, current fpg is not the requested one')
+        return True
+    
     if not hasattr(r, 'accumulators'):
+        print('yes, accumulators not found')
         return True
+    
     if not r.fpga.is_programmed():
+        print('yes, FPGA is not programmed')
         return True
+    print('no')
     return False
 
 def reload_firmware(config_dict): 

@@ -91,6 +91,8 @@ class ReadoutClient:
             with open(config_file,'r') as file:
                 config = yaml.safe_load(file)
         print(f'Config file loaded: {config_file}')
+        with open(DEFAULT_CONFIG,'w') as file:
+            file.write(os.path.abspath(config_file))
         self.config = config
         self.config_file = config_file
         self.request_server_address = self.config['rfsoc_host']['address']

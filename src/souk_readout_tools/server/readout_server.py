@@ -121,12 +121,18 @@ class ReadoutServer:
         If no config file is give, it is read from ~/.souk_readout_tools/config/config.yaml
         The server will then start the request server and stream server, and create tasks for streaming and triggered streaming.
         """
+        
+        print('************************************************')
+        print('__init__')
+        print('config_file:',config_file)
+        print('************************************************')
         check_if_running_on_rfsoc_arm()
         self.process_name = set_process_name()
         self.ip_addresses = get_host_ips()
         
         #server attributes
         self.config = None
+        self.config_file = None
         self.request_clients = []
         self.stream_clients = []
         self.sweep_task = None
@@ -146,15 +152,97 @@ class ReadoutServer:
         self.sweep_progress = 0.0
 
         #initialize server
-        self.config_file = config_file
-        self.init_server(self.config_file)
+        self.init_server(config_file, init_firmware=False)
+        
+
+    def init_server(self, config_file,init_firmware=False):
+        """
+        Initialize the server with the specified configuration file.
+        This function is called when the server is started or reset, and when the firmware is reprogrammed.
+        """
+        print('************************************************')
+        print('init_server')
+        print('config_file:',config_file)
+        print('init_firmware:',init_firmware)
+        print('************************************************')
+
+        #server attributes
+        self.config = None
+        self.config_file = None
+        self.request_clients = []
+        self.stream_clients = []
+        self.sweep_task = None
+        self.stream_task = None
+        self.triggered_stream_task = None
+        self.stream_enabled = asyncio.Event()
+        self.triggered_stream_enabled = False
+        self.tasks = []
+        self.stream_flags = [asyncio.Event() for _ in range(8)]
+
+        #firmware interface attributes
+        self.r = None
+        self.r_fast = None
+        self.latest_sweep_results = {}
+        self.latest_sweep_data_valid = False
+        self.sweep_progress = 0.0
+        
+        #load config
+        self.load_config(config_file)
+        self.server_address = '0.0.0.0'
+        self.request_server_port = self.config['rfsoc_host']['request_port']
+        self.stream_server_port = self.config['rfsoc_host']['stream_port']
+        self.trigger_source_pin = self.config['rfsoc_host']['trigger_source_pin']
+        
+        #interface with firmware
+        fw_config_file = self.config['firmware']['fw_config_file']
+        self.r = firmware_lib.create_standard_readout_interface(fw_config_file)
+        self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file)
+        
+        #program firmware if necessary
+        if firmware_lib.needs_programming(self.r,self.config):
+            print('init_server needs programming')
+            print(self.r.fpgfile)
+            self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
+        if init_firmware:
+            print(self.r.fpgfile)
+            firmware_lib.initialise_firmware(self.r,self.config)
+        
+        system_information = self.get_system_information()
+        # print(system_information)
+        return
+   
+             
+    def init_firmware(self,config_file=None):
+        """
+        Restart the firmware.
+        This function is called when the firmware needs to be reprogrammed or reinitialised.
+        """
+        print('************************************************')
+        print('init_firmware')
+        print('config_file:',config_file)
+        print('************************************************')
+
+        if config_file is None:
+            #simple reload of the same firmware, eg: hard reset
+            self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
+            return
+        else:
+            #reload with new firmware, reinitialise server, eg: firmware update
+            self.load_config(config_file)
+            r, r_fast = firmware_lib.reload_firmware(self.config)
+            self.init_server(self.config_file)
+            return
         
 
     def load_config(self, config_file):
         """
         Load a new configuration file.
-        Does not reload the firmware.
+        Does not reload or initialise the firmware.
         """
+        print('************************************************')
+        print('load_config')
+        print('config_file:',config_file)
+        print('************************************************')
         if config_file is None:
             config_file = DEFAULT_CONFIG
         if not os.path.exists(config_file):
@@ -163,6 +251,7 @@ class ReadoutServer:
         with open(config_file, 'r') as file:
             config = yaml.safe_load(file)
         if type(config) is str:
+            #file contains a link to a config file
             config_file = config
             if not os.path.exists(config_file):
                 #print(f'Linked config file not found {config_file}, searching in {USER_CONFIG_DIR}')
@@ -173,14 +262,19 @@ class ReadoutServer:
         print(f'Found config file: {config_file}')
         self.config = config
         self.config_file = config_file
+
         return config
     
     def set_config(self, config_filename, config_contents,default=True):
         """
-        Apply a new configuration.
+        Apply a new configuration and re-initialise the firmware
         If default is true, overwrites the default_config.lnk so that this config is persistent
         """
-        
+        print('************************************************')
+        print('set_config')
+        print('config_filename:',config_filename)
+        print('************************************************')
+
         filename = os.path.join(USER_CONFIG_DIR, os.path.basename(config_filename))
         with open( filename, 'w') as file:
             file.write(yaml.dump(config_contents,sort_keys=False))
@@ -189,7 +283,12 @@ class ReadoutServer:
             os.chown(filename,int(os.getenv("SUDO_UID")),int(os.getenv("SUDO_GID")))
         print(f'Saved config to {filename}')
         
-        self.load_config(filename)
+        print('************************************************')
+        print('set_config')
+        print('filename:',filename)
+        print('************************************************')
+
+        self.init_server(filename,init_firmware=True)
 
         if default:
             defaultname = os.path.join(USER_CONFIG_DIR,'default_config.lnk')
@@ -207,97 +306,10 @@ class ReadoutServer:
             if SUDO:
                 os.chown(defaultname,int(os.getenv("SUDO_UID")),int(os.getenv("SUDO_GID")))
 
+
+
         return
-    
-    #def set_default_config(self,config_filename,config_contents=None):
-    #    """
-    #    Set the default config file by linking the given filename to ~/.souk_readout_tools/config/config.yaml
-    #    """
-    #
-    #    if config_contents is None:
-    #        config_contents = self.config
-    #    self.save_config(config_filename,config_contents)
-    #
-    #    target = os.path.join(USER_CONFIG_DIR,os.path.basename(config_filename))
-    #    linkname = os.path.join(USER_CONFIG_DIR,'config.yaml')
-    #    prevname = os.path.join(USER_CONFIG_DIR,'previous_default.yaml')
-    #     
-    #    shutil.copy(linkname, prevname, follow_symlinks=True)
-    #    os.chmod(prevname, 0o664)
-    #    if SUDO:
-    #        os.chown(prevname,int(os.getenv("SUDO_UID")),int(os.getenv("SUDO_GID")))
-    #    os.unlink(linkname)
-    #    #os.symlink(target, linkname)       
-    #    with open(linkname,'w') as file:
-    #        file.write(target)
-    #    os.chmod(linkname, 0o664)
-    #    if SUDO:
-    #        os.chown(linkname,int(os.getenv("SUDO_UID")),int(os.getenv("SUDO_GID")))
-    #    return
         
-    def init_server(self, config_file):
-        """
-        Initialize the server with the specified configuration file.
-        This function is called when the server is started or reset, and when the firmware is reprogrammed.
-        """
-
-        #server attributes
-        self.config = None
-        self.request_clients = []
-        self.stream_clients = []
-        self.sweep_task = None
-        self.stream_task = None
-        self.triggered_stream_task = None
-        self.stream_enabled = asyncio.Event()
-        self.triggered_stream_enabled = False
-        self.tasks = []
-        self.stream_flags = [asyncio.Event() for _ in range(8)]
-
-
-        #firmware interface attributes
-        self.r = None
-        self.r_fast = None
-        self.latest_sweep_results = {}
-        self.latest_sweep_data_valid = False
-        self.sweep_progress = 0.0
-        
-        #load config
-        self.config_file = config_file
-        self.load_config(config_file)
-        self.server_address = '0.0.0.0'
-        self.request_server_port = self.config['rfsoc_host']['request_port']
-        self.stream_server_port = self.config['rfsoc_host']['stream_port']
-        self.trigger_source_pin = self.config['rfsoc_host']['trigger_source_pin']
-        
-        #interface with firmware
-        fw_config_file = self.config['firmware']['fw_config_file']
-        self.r = firmware_lib.create_standard_readout_interface(fw_config_file)
-        self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file)
-        
-        #program firmware if necessary
-        if firmware_lib.needs_programming(self.r):
-            self.init_firmware()
-        
-        system_information = self.get_system_information()
-        # print(system_information)
-        return
-   
-             
-    def init_firmware(self,config_file=None):
-        """
-        Restart the firmware.
-        This function is called when the firmware needs to be reprogrammed or reinitialised.
-        """
-        if config_file is None:
-            #simple reload of the same firmware, eg: hard reset
-            self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
-            return
-        else:
-            #reload with new firmware, reinitialise server, eg: firmware update
-            self.load_config(config_file)
-            r, r_fast = firmware_lib.reload_firmware(self.config)
-            self.init_server(self.config_file)
-            return
 
     def get_system_information(self):
         """
@@ -378,7 +390,7 @@ class ReadoutServer:
                     if not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
-                        self.init_server(config_file)
+                        self.init_server(config_file,init_firmware=True)
                         await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'initialise_firmware':
@@ -395,7 +407,6 @@ class ReadoutServer:
                     config_filename = message.get('config_filename')
                     config_contents = message.get('config_contents')
                     self.set_config(config_filename, yaml.safe_load(config_contents), default=True)
-                    self.init_firmware(config_filename)
                     await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'pull_config':
