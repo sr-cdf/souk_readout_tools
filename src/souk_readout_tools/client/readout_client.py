@@ -70,6 +70,8 @@ import base64
 
 USER_CALIBRATIONS_DIR = os.path.expanduser('~/.souk_readout_tools/calibrations')
 USER_CONFIG_DIR = os.path.expanduser('~/.souk_readout_tools/config')
+USER_TMP_DIR = os.path.expanduser('~/.souk_readout_tools/tmp')
+
 DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR,'default_config.lnk')
 
 class ReadoutClient:
@@ -824,10 +826,9 @@ class ReadoutClient:
         view = memoryview(data)
         iq_data=None
         if filename is None:
-            filename ='./tmp/tmp_stream'
-        if not os.path.exists('./tmp'):
-            os.makedirs('./tmp')
-
+            filename =os.path.join(USER_TMP_DIR,'tmp_stream')
+        if not os.path.exists(os.path.dirname(filename)):
+            os.makedirs(os.path.dirname(filename))
         info = self.get_system_information()
 
         metadata = {}
@@ -915,9 +916,9 @@ class ReadoutClient:
         data = bytearray(4096*4 + 10*4)
         view = memoryview(data)
         if filename is None:
-            filename ='./tmp/tmp_triggered_stream'
-        if not os.path.exists('./tmp'):
-            os.makedirs('./tmp')
+            filename =os.path.join(USER_TMP_DIR,'tmp_triggered_stream')
+        if not os.path.exists(os.path.dirname(filename)):
+            os.makedirs(os.path.dirname(filename))
 
         info = self.get_system_information()
 
