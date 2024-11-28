@@ -1,5 +1,7 @@
 import sys
 import os
+import traceback
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
@@ -423,6 +425,8 @@ class ResonanceFinder(QMainWindow):
         self.open_button = QPushButton("Open")
         self.open_button.clicked.connect(self.openFile)
         self.file_label = QLabel("No file loaded")
+        self.file_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
         open_hbox = QHBoxLayout()
         open_hbox.addWidget(self.open_button)
         open_hbox.addWidget(self.file_label)
@@ -528,7 +532,7 @@ class ResonanceFinder(QMainWindow):
 
 
         # Selection Mode Checkbox
-        self.selection_mode_checkbox = QCheckBox("Enable click and drag in figure for multiple selection")
+        self.selection_mode_checkbox = QCheckBox("Enable click and drag in figure for multiple selection (pan and zoom buttons must be disabled)")
         self.selection_mode_checkbox.stateChanged.connect(self.toggleSelectionMode)
 
         # Add groupboxes to vbox
@@ -1207,47 +1211,69 @@ class ResonanceFinder(QMainWindow):
             self, "Open Sweep File", last_dir, "All Files (*)", options=options)
 
         if filename:
-            self.file_label.setText(os.path.abspath(filename))
             try:
                 self.loadRawData(filename)
-            except:
-                QMessageBox.warning(self, "Error", "Failed to load file: " + filename)
+            except Exception as e:
+
+                tb=traceback.format_exc()
+
+                QMessageBox.warning(self, "Error", "Failed to load file: " + filename + f'\n\n{e}\n\n{tb}')
                 return
-            self.settings.setValue("lastFile", os.path.abspath(filename))
+
         else:
             self.file_label.setText("No file loaded")
 
     def loadRawData(self, filename):
         # Load data from file
-        try:
-            # try load numpy
-            data = np.load(filename,allow_pickle=True).item()
-            print(filename)
+        if os.path.splitext(filename)[-1] == '.fits':
             try:
-                #try load readout_client sweep
-                print(data.keys())
-                f = data['sweep_f']
-                z = data['sweep_i']+1j*data['sweep_q']
-                if f.ndim>1:
-                    ss=np.argsort(f.ravel())
-                    self.frequencies=f.ravel()[ss]
-                    self.s21_complex=z.ravel()[ss]
-                    
-            except Exception as e:
-                print(f'not a readout_client sweep file: {e}')
-        except Exception as e:
-            print(f'not a npy file {e}')
-            try:
-                data = np.loadtxt(filename, delimiter=',')
-                self.frequencies = data[:, 0]
-                self.s21_complex = data[:, 1] + 1j * data[:, 2]
-            except Exception as e:
-                print(f'not a txt file with columns = f,i,q: {e}')
+                from astropy.io import fits
+            except ImportError as e:
+                QMessageBox.warning(self, "Error", "Cannot open fits file, please try:\npip install astropy")
                 raise(e)
+
+            try:
+                hdu,data = fits.open(filename)
+                f = data.data['Freq']
+                z = data.data['ReS21'] + 1j*data.data['ImS21']
+            except Exception as e:
+                QMessageBox.warning(self, "Error", "Failed to interpret file as a sweep: "+filename)
+                raise(e)
+            ss=np.argsort(f.ravel())
+            self.frequencies = f.ravel()[ss]
+            self.s21_complex = z.ravel()[ss]
+            print(f'loaded {len(self.frequencies)} points, shape={f.shape}')
+            
+        else:
+            try:
+                # try load numpy
+                data = np.load(filename,allow_pickle=True).item()
+                print(filename)
+                try:
+                    #try load readout_client sweep
+                    print(data.keys())
+                    f = data['sweep_f']
+                    z = data['sweep_i']+1j*data['sweep_q']
+                    if f.ndim>1:
+                        ss=np.argsort(f.ravel())
+                        self.frequencies=f.ravel()[ss]
+                        self.s21_complex=z.ravel()[ss]
+                        
+                except Exception as e:
+                    print(f'not a readout_client sweep file: {e}')
+            except Exception as e:
+                print(f'not a npy file {e}')
+                try:
+                    data = np.loadtxt(filename, delimiter=',')
+                    self.frequencies = data[:, 0]
+                    self.s21_complex = data[:, 1] + 1j * data[:, 2]
+                except Exception as e:
+                    print(f'not a txt file with columns = f,i,q: {e}')                    
+                    raise(e)
+                
+
                 
         
-        self.file_label.setText(filename)
-
         self.frequency_stepsize = np.mean(np.diff(self.frequencies))
         self.magnitude = np.abs(self.s21_complex)
         self.log_magnitude = 20*np.log10(self.magnitude)
@@ -1263,6 +1289,9 @@ class ResonanceFinder(QMainWindow):
         self.updateZoomPlots()
         self.updateMarkers()
         self.updateNavigationButtons()
+        self.settings.setValue("lastFile", os.path.abspath(filename))
+        self.file_label.setText(os.path.abspath(filename))
+
                                    
 
     def plotRawData(self):
@@ -1684,7 +1713,7 @@ class ResonanceFinder(QMainWindow):
         else:
             id_text = "Do Not Save"
         analysis_text = f"Resonance ID: {id_text}\n"
-        analysis_text += f"Frequency: {f / 1e6:.6f} MHz\n"
+        analysis_text += f"Frequency [MHz]: {f / 1e6:.6f} MHz\n"
         q_value = resonance.analysis.get('q', None)
         if q_value is not None:
             analysis_text += f"Q-factor: {q_value:.1f}\n"
@@ -1693,9 +1722,15 @@ class ResonanceFinder(QMainWindow):
 
         fwhm_value = resonance.analysis.get('fwhm', None)
         if fwhm_value is not None:
-            analysis_text += f"FWHM: {fwhm_value / 1e3:.3f} kHz\n"
+            analysis_text += f"FWHM [kHz]: {fwhm_value / 1e3:.3f} kHz\n"
         else:
-            analysis_text += "FWHM: N/A\n"
+            analysis_text += "FWHM [kHz]: N/A\n"
+
+        depth_value = resonance.analysis.get('dip_depth', None)
+        if depth_value is not None:
+            analysis_text += f"Depth [dB]: {depth_value:.3f}\n"
+        else:
+            analysis_text += "Depth [dB]: N/A\n"
 
         self.analysis_text.setText(analysis_text)
 
@@ -1850,18 +1885,39 @@ class ResonanceFinder(QMainWindow):
 
     def saveResonances(self):
         options = QFileDialog.Options()
-        default_filename = os.path.splitext(os.path.basename(self.file_label.text()))[0] + ".resonances"
+        default_ext = ".resonances"
+        if os.path.splitext(self.file_label.text())[-1] == '.fits':
+            default_ext = '.txt'
+        default_filename = os.path.splitext(self.file_label.text())[0] + default_ext
         filename, _ = QFileDialog.getSaveFileName(self, "Save Resonances", default_filename,
-                                                "Resonance Files (*.resonances);;All Files (*)", options=options)
+                                                "Resonance Files (*.resonances);;KIDLAB Toneslist Files (*.txt);;All Files (*)", options=options)
         if filename:
             try:
-                with open(filename, 'w') as f:
-                    # f.write("ID,Frequency(Hz),Q-factor,FWHM(Hz)\n")
-                    f.write("#ID,Frequency(Hz)\n")
-                    for resonance in self.resonances:
-                        if resonance.save and resonance.id is not None:
-                            f.write(f"{resonance.id},{resonance.frequency}\n")
-                                    # f"{resonance.analysis.get('q', 0)},{resonance.analysis.get('fwhm', 0)}\n")
+                if filename.endswith('.resonances'):
+
+                    with open(filename, 'w') as f:
+                        # f.write("ID,Frequency(Hz),Q-factor,FWHM(Hz)\n")
+                        f.write("#ID,Frequency(Hz)\n")
+                        for resonance in self.resonances:
+                            if resonance.save and resonance.id is not None:
+                                f.write(f"{resonance.id},{resonance.frequency}\n")
+                                        # f"{resonance.analysis.get('q', 0)},{resonance.analysis.get('fwhm', 0)}\n")
+
+                elif filename.endswith('.txt'):
+                    with open(filename, 'w') as f:
+                        f.write("Name\tFreq\tOffset att\tAll\tNone\r\n")
+                        for resonance in self.resonances:
+                            if resonance.save and resonance.id is not None:
+                                f.write('K%03d\t%f\t%f\t%d\t%d\r\n'%(resonance.id,resonance.frequency,0,1,0))
+
+                else:
+                    with open(filename, 'w') as f:
+                        # f.write("ID,Frequency(Hz),Q-factor,FWHM(Hz)\n")
+                        f.write("#ID,Frequency(Hz)\n")
+                        for resonance in self.resonances:
+                            if resonance.save and resonance.id is not None:
+                                f.write(f"{resonance.id},{resonance.frequency}\n")
+                                        # f"{resonance.analysis.get('q', 0)},{resonance.analysis.get('fwhm', 0)}\n")
                 QMessageBox.information(self, "Save Resonances", f"Resonances saved to {filename}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to save resonances: {e}")
