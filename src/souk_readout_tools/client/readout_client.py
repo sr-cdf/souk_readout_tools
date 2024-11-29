@@ -663,9 +663,9 @@ class ReadoutClient:
         sweep_f_bytes = base64.b64decode(sweep_data['sweep']['f'])
         sweep_z_bytes = base64.b64decode(sweep_data['sweep']['z'])
         sweep_e_bytes = base64.b64decode(sweep_data['sweep']['e'])
-        sweep_f = np.frombuffer(sweep_f_bytes, dtype='f8').reshape((num_tones, num_points))
-        sweep_z = np.frombuffer(sweep_z_bytes, dtype='complex128').reshape((num_tones, num_points))
-        sweep_e = np.frombuffer(sweep_e_bytes, dtype='complex128').reshape((num_tones, num_points))
+        sweep_f = np.frombuffer(sweep_f_bytes, dtype='f8').reshape((num_points, num_tones))
+        sweep_z = np.frombuffer(sweep_z_bytes, dtype='complex128').reshape((num_points, num_tones))
+        sweep_e = np.frombuffer(sweep_e_bytes, dtype='complex128').reshape((num_points, num_tones))
         sweep_i = sweep_z.real
         sweep_q = sweep_z.imag
         err_i = sweep_e.real
