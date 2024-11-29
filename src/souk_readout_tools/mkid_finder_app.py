@@ -2,6 +2,12 @@ import sys
 import os
 import traceback
 
+try:
+    import importlib.resources as pkg_resources  # Python 3.9+
+except ImportError:
+    import importlib_resources as pkg_resources  # Python < 3.9
+
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
@@ -2056,6 +2062,7 @@ class ResonanceFinder(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(str(pkg_resources.path("souk_readout_tools","mkid_finder_app.png"))))
     window = ResonanceFinder()
     window.show()
     app.exec_()

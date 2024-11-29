@@ -99,6 +99,7 @@ setup(
     packages=packages,
     package_dir={'':'src'},
     include_package_data=True,
+    package_data={'souk_readout_tools': ['mkid_finder_app.png','mkid_finder_app.ico']},
     install_requires=install_requires,
     entry_points=entry_points,
     classifiers=[
