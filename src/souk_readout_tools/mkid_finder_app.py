@@ -3,9 +3,9 @@ import os
 import traceback
 
 try:
-    import importlib.resources as pkg_resources  # Python 3.9+
+    from importlib.resources import  files  # Python 3.9+
 except ImportError:
-    import importlib_resources as pkg_resources  # Python < 3.9
+    from importlib_resources import  files  # Python < 3.9
 
 
 import numpy as np
@@ -2062,11 +2062,11 @@ class ResonanceFinder(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    
-    if sys.platform == 'nt':
-        app.setWindowIcon(QIcon(str(pkg_resources.path("souk_readout_tools","mkid_finder_app.ico"))))
+
+    if sys.platform in ['nt','win32']:
+        app.setWindowIcon(QIcon(str(files("souk_readout_tools").joinpath("mkid_finder_app.ico"))))
     else:
-        app.setWindowIcon(QIcon(str(pkg_resources.path("souk_readout_tools","mkid_finder_app.png"))))
+        app.setWindowIcon(QIcon(str(files("souk_readout_tools").joinpath("mkid_finder_app.png"))))
     
     window = ResonanceFinder()
     window.show()
