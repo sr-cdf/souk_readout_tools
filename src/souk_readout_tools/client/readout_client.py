@@ -652,8 +652,7 @@ class ReadoutClient:
             print(f"Error getting sweep_data: {response['message']}")
             return response
 
-    @staticmethod
-    def parse_sweep_data(sweep_data):
+    def parse_sweep_data(self,sweep_data, apply_phase_correction=True):
         info = sweep_data['system_information']
         date = sweep_data['date']
         num_tones = int(sweep_data['num_tones'])
@@ -666,6 +665,27 @@ class ReadoutClient:
         sweep_f = np.frombuffer(sweep_f_bytes, dtype='f8').reshape((num_points, num_tones))
         sweep_z = np.frombuffer(sweep_z_bytes, dtype='complex128').reshape((num_points, num_tones))
         sweep_e = np.frombuffer(sweep_e_bytes, dtype='complex128').reshape((num_points, num_tones))
+
+        if apply_phase_correction:
+                
+                udc = self.config['rf_frontend']['connected']
+                lo = self.config['rf_frontend']['tx_mixer_lo_frequency_hz'] if udc else 0.0
+                sb = self.config['rf_frontend']['tx_mixer_sideband'] if udc else 1
+                
+                adcclk = info['adc_clk_hz']
+                dacclk = adcclk
+                dacduc = info['dac_duc_mixer_frequency_hz']
+                dacnyq = info['nyquist_zone_dac0']
+                txnfft = 8192
+                rxnfft = 8192
+
+                rffreqs = sweep_f
+                iffreqs = sb*(rffreqs-lo)
+                bbfreqs = iffreqs - dacduc
+                bbbins  = bbfreqs/(dacclk)*txnfft
+                filterbank_bin_numbers = np.around(bbbins)
+                sweep_z[filterbank_bin_numbers%2==1]*=np.exp(1j*np.pi)
+
         sweep_i = sweep_z.real
         sweep_q = sweep_z.imag
         err_i = sweep_e.real
