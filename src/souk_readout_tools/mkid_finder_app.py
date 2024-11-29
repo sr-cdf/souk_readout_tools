@@ -2062,7 +2062,12 @@ class ResonanceFinder(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon(str(pkg_resources.path("souk_readout_tools","mkid_finder_app.png"))))
+    
+    if sys.platform == 'nt':
+        app.setWindowIcon(QIcon(str(pkg_resources.path("souk_readout_tools","mkid_finder_app.ico"))))
+    else:
+        app.setWindowIcon(QIcon(str(pkg_resources.path("souk_readout_tools","mkid_finder_app.png"))))
+    
     window = ResonanceFinder()
     window.show()
     app.exec_()
