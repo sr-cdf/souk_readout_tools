@@ -1885,12 +1885,16 @@ class ResonanceFinder(QMainWindow):
 
     def saveResonances(self):
         options = QFileDialog.Options()
-        default_ext = ".resonances"
         if os.path.splitext(self.file_label.text())[-1] == '.fits':
             default_ext = '.txt'
-        default_filename = os.path.splitext(self.file_label.text())[0] + default_ext
-        filename, _ = QFileDialog.getSaveFileName(self, "Save Resonances", default_filename,
-                                                "Resonance Files (*.resonances);;KIDLAB Toneslist Files (*.txt);;All Files (*)", options=options)
+            default_filename = os.path.splitext(self.file_label.text())[0] + default_ext
+            filename, _ = QFileDialog.getSaveFileName(self, "Save Resonances", default_filename,
+                                                    "KIDLAB Toneslist Files (*.txt);;Resonance Files (*.resonances);;All Files (*)", options=options)
+        else:
+            default_ext = ".resonances"
+            default_filename = os.path.splitext(self.file_label.text())[0] + default_ext
+            filename, _ = QFileDialog.getSaveFileName(self, "Save Resonances", default_filename,
+                                                    "Resonance Files (*.resonances);;KIDLAB Toneslist Files (*.txt);;All Files (*)", options=options)
         if filename:
             try:
                 if filename.endswith('.resonances'):
