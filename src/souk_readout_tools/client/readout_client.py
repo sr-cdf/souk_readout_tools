@@ -67,6 +67,7 @@ import os
 import traceback
 import csv
 import base64
+from scipy import signal
 
 USER_CALIBRATIONS_DIR = os.path.expanduser('~/.souk_readout_tools/calibrations')
 USER_CONFIG_DIR = os.path.expanduser('~/.souk_readout_tools/config')
@@ -1210,6 +1211,87 @@ class ReadoutClient:
         #k should range from 0 to n-1, and elements are proportional to the frequencies
         return np.pi*k**2/n
 
+    @staticmethod
+    def calculate_frequency_and_dissipation_noise(sweep_frequencies,sweep_complex_data,timestream_tone_frequency,timestream_complex_data,smooth_window_hz=1000):
+        """
+        Calculate the fractional frequency and dissipation noise timestreams from a sweep and complex timestream data.
+        Valid only for small frequency and dissipation shifts close to the tone frequency.
+
+        Parameters
+        ----------
+        sweep_frequencies : array
+            The frequencies of the tone in the sweep.
+        sweep_complex_data : array
+            The complex data of the tone in the sweep.
+        timestream_tone_frequency : float
+            The frequency of the tone in the timestream
+        timestream_complex_data : array
+            The complex timestream data.
+        smooth_window_hz : float, optional
+            The window size for a Savitzky-Golay filter with poly-order=1. The default is 1000 Hz.
+            The filter is applied to the sweep data to improve the estimate of the gradient.
+            Timestram data is not smoothed.        
+
+        Returns
+        -------
+        fractional_frequency_noise : array
+            The fractional frequency noise timestream.
+        fractional_dissipation_noise : array
+            The fractional dissipation noise timestream.
+        si0 : float
+            The in-phase component of the smoothed sweep at the tone frequency.
+        sq0 : float
+            The quadrature component of the smoothed sweep at the tone frequency.
+        didf : float
+            The gradient of the in-phase component of the smoothed sweep at the tone frequency.
+        dqdf : float
+            The gradient of the quadrature component of the smoothed sweep at the tone frequency.
+        """
+        
+        # # Find the index of the tone frequency in the sweep frequencies
+        # tone_index = np.argmin(np.abs(sweep_frequencies-tone_frequency))
+        # Note: now using interpolation instead of finding the closest frequency
+
+        # Shorthands for the real and imaginary parts of the sweep and timestream data
+        si = sweep_complex_data.real
+        sq = sweep_complex_data.imag
+        ti = timestream_complex_data.real
+        tq = timestream_complex_data.imag
+
+        #smooth the sweep data
+        if smooth_window_hz:
+            window_samples = max(3,int(smooth_window_hz/(sweep_frequencies[1]-sweep_frequencies[0])))
+            si = signal.savgol_filter(si, window_samples,1)
+            sq = signal.savgol_filter(sq, window_samples,1)
+            sz = si+1j*sq
+        else:
+            sz = sweep_complex_data
+        
+        # Calculate the gradient of the complex sweep data wrt the sweep frequencies 
+        grad = np.gradient(sz,sweep_frequencies)
+
+        # Calculate values at the tone frequency (with interpolation)
+        # i0 = si[tone_index]
+        # q0 = sq[tone_index]
+        # didf = grad[tone_index].real
+        # dqdf = grad[tone_index].imag
+        si0 = np.interp(timestream_tone_frequency,sweep_frequencies,sz.real)
+        sq0 = np.interp(timestream_tone_frequency,sweep_frequencies,sz.imag)
+        didf = np.interp(timestream_tone_frequency,sweep_frequencies,grad.real)
+        dqdf = np.interp(timestream_tone_frequency,sweep_frequencies,grad.imag)
+
+
+        #Compute the frequency and dissipation timestreams
+        divisor = didf**2 + dqdf**2
+        frequency_noise = ((si0 - ti) * didf + (sq0 - tq) * dqdf) / divisor
+        dissipation_noise = ((sq0 - tq) * didf - (si0 - ti) * dqdf) / divisor
+
+        #Scale by the tone frequency to get fractional frequency and fractional dissipation
+        fractional_frequency_noise = frequency_noise/timestream_tone_frequency
+        fractional_dissipation_noise = dissipation_noise/timestream_tone_frequency
+
+        return fractional_frequency_noise, fractional_dissipation_noise, si0, sq0, didf, dqdf
+    
 
 
 if __name__=='__main__':
