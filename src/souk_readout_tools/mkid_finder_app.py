@@ -1884,7 +1884,7 @@ class ResonanceFinder(QMainWindow):
         self.zoom_filt_canvas.draw_idle()
 
     def saveResonances(self):
-        newline = os.linesep
+        
         options = QFileDialog.Options()
         if os.path.splitext(self.file_label.text())[-1] == '.fits':
             default_ext = '.txt'
@@ -1901,28 +1901,28 @@ class ResonanceFinder(QMainWindow):
                 if filename.endswith('.resonances'):
 
                     with open(filename, 'w') as f:
-                        # f.write(f"ID,Frequency(Hz),Q-factor,FWHM(Hz)\{newline}")
-                        f.write(f"#ID,Frequency(Hz){newline}")
+                        # f.write("ID,Frequency(Hz),Q-factor,FWHM(Hz)\n")
+                        f.write("#ID,Frequency(Hz)\n")
                         for resonance in self.resonances:
                             if resonance.save and resonance.id is not None:
-                                f.write(f"{resonance.id},{resonance.frequency}{newline}")
-                                        # f"{resonance.analysis.get('q', 0)},{resonance.analysis.get('fwhm', 0)}{newline}")
+                                f.write(f"{resonance.id},{resonance.frequency}\n")
+                                        # f"{resonance.analysis.get('q', 0)},{resonance.analysis.get('fwhm', 0)}\n")
 
                 elif filename.endswith('.txt'):
                     with open(filename, 'w') as f:
-                        f.write(f"Name\tFreq\tOffset att\tAll\tNone{newline}")
+                        f.write("Name\tFreq\tOffset att\tAll\tNone\n")
                         for resonance in self.resonances:
                             if resonance.save and resonance.id is not None:
-                                f.write(f'K%03d\t%f\t%f\t%d\t%d{newline}'%(resonance.id,resonance.frequency,0,1,0))
+                                f.write('K%03d\t%f\t%f\t%d\t%d\n'%(resonance.id,resonance.frequency,0,1,0))
 
                 else:
                     with open(filename, 'w') as f:
-                        # f.write("ID,Frequency(Hz),Q-factor,FWHM(Hz){newline}")
-                        f.write(f"#ID,Frequency(Hz){newline}")
+                        # f.write("ID,Frequency(Hz),Q-factor,FWHM(Hz)\n")
+                        f.write("#ID,Frequency(Hz)\n")
                         for resonance in self.resonances:
                             if resonance.save and resonance.id is not None:
-                                f.write(f"{resonance.id},{resonance.frequency}{newline}")
-                                        # f"{resonance.analysis.get('q', 0)},{resonance.analysis.get('fwhm', 0)}{newline}")
+                                f.write(f"{resonance.id},{resonance.frequency}\n")
+                                        # f"{resonance.analysis.get('q', 0)},{resonance.analysis.get('fwhm', 0)}\n")
                 QMessageBox.information(self, "Save Resonances", f"Resonances saved to {filename}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to save resonances: {e}")
