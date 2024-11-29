@@ -79,10 +79,11 @@ entry_points = {'console_scripts': [],
 if install_client:
     entry_points['console_scripts'].extend([
         'souk-connection-test=souk_readout_tools.client.client_scripts.souk_connection_test:main',
-        'souk-wideband_sweep=souk_readout_tools.client.client_scripts.wideband_sweep:main'
+        'souk-wideband_sweep=souk_readout_tools.client.client_scripts.wideband_sweep:main',
+        'souk-mkid-finder-app=souk_readout_tools.mkid_finder_app:main'
     ])
     entry_points['gui_scripts'].extend([
-        'souk-mkid-finder=souk_readout_tools.client.mkid_finder_app.mkid_finder_app:main'
+        'souk-mkid-finder=souk_readout_tools.mkid_finder_app:main'
     ])
 
 if install_server:
