@@ -583,6 +583,16 @@ class ReadoutServer:
                     result = {'pfb_fft_shift': pfb_fft_shift, 'dsp_ovf': dsp, 'adc_levels': adc}
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
+                elif request == 'fix_dac_saturation':
+                    psb_scale, dsp, dac = firmware_lib.fix_dac_saturation(self.r_fast,self.config)
+                    result = {'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+                
+                elif request == 'fix_adc_saturation':
+                    dsa,fftshift, dsp_ovf, levels = firmware_lib.fix_adc_saturation(self.r,self.config)
+                    resuilt = {'dsa': dsa, 'fftshift': fftshift, 'dsp_ovf': dsp_ovf, 'adc_levels': levels}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
                 elif request == 'get_samples':
                     num_samples = message.get('num_samples')
                     task = asyncio.create_task(self.get_samples(writer, num_samples))

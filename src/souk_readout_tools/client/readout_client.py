@@ -341,6 +341,12 @@ class ReadoutClient:
     def optimise_rx_snr(self):
         return self.send_request({'request': 'optimise_rx_snr'})
 
+    def fix_dac_saturation(self):
+        return self.send_request({'request': 'fix_dac_saturation'})
+    
+    def fix_adc_saturation(self):
+        return self.send_request({'request': 'fix_adc_saturation'})
+
     def enable_stream(self):
         message = {'request': 'enable_stream'}
         return self.send_request(message)

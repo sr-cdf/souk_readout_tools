@@ -1916,7 +1916,9 @@ def fix_dac_saturation(r,config_dict=None):
     psb_scale = lower_bound *0.90
     r.psbscale.set_scale(psb_scale)
     time.sleep(0.1)
-    return psb_scale, check_output_saturation(r,iterations=50)
+    check,levels=check_output_saturation(r,iterations=50)
+
+    return psb_scale, check_dsp_overflow(r,0.5)[1], levels
     
 
 
@@ -2069,10 +2071,11 @@ def maximise_rx_power(r,config_dict,headroom_db = 0.5):
     return best_dsa,best_fftshift, check_dsp_overflow(r,0.5)[1], levels
 
 def fix_adc_saturation(r,config_dict):
-    maximise_rx_power(r,config_dict)
+    best_dsa,best_fftshift, dsp_ovf, adc_levels = maximise_rx_power(r,config_dict)
     check,levels = check_input_saturation(r,iterations=50)
     if check:
         raise ValueError('ADC saturation detected at maximum attenuation')
+    return best_dsa,best_fftshift, dsp_ovf, levels
 
 def optimise_rx_snr(r,config_dict=None):
     init_adc_saturation, init_adc_levels = check_input_saturation(r,iterations=50)
