@@ -563,6 +563,26 @@ class ReadoutServer:
                     result,details = firmware_lib.check_dsp_overflow(self.r,duration_s=duration_s)
                     await self.send_response(writer, {'status': 'success', 'result': result, 'details': details})
 
+                elif request == 'maximise_tx_power':
+                    amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.maximise_tx_power(self.r_fast,self.config)
+                    result = {'amps': amps.tolist(), 'psb_fft_shift': psb_fft_shift, 'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+                
+                elif request == 'maximise_rx_power':
+                    dsa,pfb_fft_shift,dsp,adc = firmware_lib.maximise_rx_power(self.r,self.config)
+                    result = {'dsa': dsa, 'pfb_fft_shift': pfb_fft_shift, 'dsp_ovf': dsp, 'adc_levels': adc}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+                
+                elif request == 'optimise_tx_snr':
+                    amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.optimise_tx_snr(self.r_fast,self.config)
+                    result = {'amps': amps.tolist(), 'psb_fft_shift': psb_fft_shift, 'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+                
+                elif request == 'optimise_rx_snr':
+                    pfb_fft_shift,dsp,adc = firmware_lib.optimise_rx_snr(self.r,self.config)
+                    result = {'pfb_fft_shift': pfb_fft_shift, 'dsp_ovf': dsp, 'adc_levels': adc}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
                 elif request == 'get_samples':
                     num_samples = message.get('num_samples')
                     task = asyncio.create_task(self.get_samples(writer, num_samples))

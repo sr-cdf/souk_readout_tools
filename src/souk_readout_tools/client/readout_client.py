@@ -328,6 +328,18 @@ class ReadoutClient:
     def check_dsp_overflow(self,duration_s=0.2):
         message = {'request': 'check_dsp_overflow','duration_s':duration_s}
         return self.send_request(message)
+    
+    def maximise_tx_power(self):
+        return self.send_request({'request': 'maximise_tx_power'})
+    
+    def maximise_rx_power(self):
+        return self.send_request({'request': 'maximise_rx_power'})
+    
+    def optimise_tx_snr(self):
+        return self.send_request({'request': 'optimise_tx_snr'})
+    
+    def optimise_rx_snr(self):
+        return self.send_request({'request': 'optimise_rx_snr'})
 
     def enable_stream(self):
         message = {'request': 'enable_stream'}

@@ -1774,17 +1774,17 @@ def check_dsp_overflow(r,duration_s=0.1):
     return any_overflow, details
 
 
-def maximise_tx_power(r,config_dict):
+def maximise_tx_power(r,config_dict=None):
     """
     Maximise the tx amplitudes, psb fft shift and psb scale, avoiding saturation.
     """
-    init_dac_saturation, init_dac_levels = check_output_saturation(r,iterations=1)
+    init_dac_saturation, init_dac_levels = check_output_saturation(r,iterations=50)
     if init_dac_saturation:
         raise ValueError('DAC saturation detected prior to optimisation')
     init_amps = get_tone_amplitudes(r,config_dict)
     init_psb_scale = r.psbscale.get_scale()
     init_psb_fftshift = r.psb.get_fftshift()
-    init_tone_powers,init_tone_powers_details = get_tone_powers(r,config_dict,detailed_output=True)
+    # init_tone_powers,init_tone_powers_details = get_tone_powers(r,config_dict,detailed_output=True)
 
     #maximise amps 
     max_amp = 1-2**-12
@@ -1793,6 +1793,7 @@ def maximise_tx_power(r,config_dict):
         raise ValueError('Tone powers are all zero')
     amps_gain = max_amp/amps_max
     amps = init_amps*amps_gain
+    print('Maximise amplitudes:',amps)
     set_tone_amplitudes(r,config_dict,amps)
     time.sleep(0.01)
 
@@ -1802,71 +1803,142 @@ def maximise_tx_power(r,config_dict):
     for i,shift in enumerate(psb_fftshifts):
         r.psb.set_fftshift(shift)
         time.sleep(0.01)
-        dsp_overflow, dsp_overflow_details = check_dsp_overflow(r)
+        dsp_overflow, dsp_overflow_details = check_dsp_overflow(r,0.5)
         psb_ovf = dsp_overflow_details['psb_ovf_delta']
         psb_fft_overflow.append(psb_ovf)
-    best_fftshift = psb_fftshifts[np.argmin(psb_fft_overflow)+1] # assume higher power from lower fftshift and add one stage for headroom
+        print('Maximise fftshift:',format(shift,'#016b'),psb_ovf)
+
+    best_fftshift = psb_fftshifts[np.argmin(psb_fft_overflow)] # assume higher power from lower fftshift 
     fftshift_gain = (best_fftshift+1) /(init_psb_fftshift+1) #assume shift stages are all ones.
     r.psb.set_fftshift(best_fftshift)
+    print('Best FFT Shift set:',format(best_fftshift,'#016b'))
+
     time.sleep(0.01)
 
-    #adjust psb scale to up the power until overflow
+    #adjust psb scale to up until just before overflow
     scalemax=255
     scalemin=1/256
-    tolerance = 0.1
-    check = check_dsp_overflow(r)[1]['psbscale_ovf_delta']
+    tolerance = 0.1 #10% of lower bound
+    check = check_dsp_overflow(r,0.5)[1]['psbscale_ovf_delta']
     high=scalemax
     low=scalemin
-    while high-low >tolerance:
+    while (high-low) > tolerance*low:
         mid = (high+low)/2
         r.psbscale.set_scale(mid)
         time.sleep(0.01)
-        check = check_dsp_overflow(r)[1]['psbscale_ovf_delta']
+        check = check_dsp_overflow(r,0.5)[1]['psbscale_ovf_delta']
+        print('Maximise psb_scale:',mid,check)
         if check:
             high=mid
         else:
             low=mid
-    psb_scale = low*0.9
+    psb_scale = low*0.90
     r.psbscale.set_scale(psb_scale)
 
     #check for DAC saturation and reduce scale if so
-    dac_saturation = check_output_saturation(r,iterations=10)[0]
+    dac_saturation = check_output_saturation(r,iterations=50)[0]
     high = psb_scale
     low = 1/256
     tolerance = 0.1
     if dac_saturation:
-        while high-low >tolerance:
+        while high-low >tolerance*low:
             mid = (high+low)/2
             r.psbscale.set_scale(mid)
             time.sleep(0.01)
             check = check_output_saturation(r,iterations=10)[0]
+            print('DAC saturation... Reduce psb_scale:',mid,check)
             if check:
                 high=mid
             else:
                 low=mid
-        psb_scale = low*0.9
+        psb_scale = low*0.90
         r.psbscale.set_scale(psb_scale)
 
-    return amps, best_fftshift, psb_scale, check_dsp_overflow(r)[1], check_output_saturation(r,iterations=10)[1]
+    return amps, best_fftshift, psb_scale, check_dsp_overflow(r,0.5)[1], check_output_saturation(r,iterations=50)[1]
+
+def fix_dac_saturation(r,config_dict=None):
+    init_amps = get_tone_amplitudes(r,config_dict)
+    init_psb_fftshift = r.psb.get_fftshift()
+    init_psb_scale = r.psbscale.get_scale()
+    min_value = 1/256
+    max_value = 255
+    lower_bound = min_value
+    upper_bound = init_psb_scale
+    current_value = init_psb_scale
+    precision = 0.05
+
+    # Check if the current value causes saturation
+    check,levels=check_output_saturation(r,iterations=50)
+    if check:
+        # Exponential Reduction Phase
+        last_saturated_value = current_value
+        while True:
+            # Reduce current_value exponentially
+            print('DAC Saturation... Reduce psb_scale: ', current_value,levels)
+            current_value /= 2
+            if current_value < min_value:
+                current_value = min_value
+                r.psbscale.set_scale(current_value)
+                time.sleep(0.1)
+                check,levels=check_output_saturation(r,iterations=50)
+                if check:
+                    # Saturation cannot be avoided
+                    return min_value
+                else:
+                    lower_bound = min_value
+                    break
+            r.psbscale.set_scale(current_value)
+            time.sleep(0.1)
+            check,levels=check_output_saturation(r,iterations=50)
+            if check:
+                last_saturated_value = current_value
+            else:
+                lower_bound = current_value
+                upper_bound = last_saturated_value
+                break
+    else:
+        pass
+
+    # Binary Search Phase
+    while upper_bound - lower_bound > precision*lower_bound:
+        
+        mid_value = (lower_bound + upper_bound) / 2
+        r.psbscale.set_scale(mid_value)
+        time.sleep(0.1)
+        check,levels=check_output_saturation(r,iterations=50)
+        print('Increase psb_scale with Binary Search: ', mid_value,levels)
+        if check:
+            upper_bound = mid_value
+        else:
+            lower_bound = mid_value
+
+    # Set the parameter to the highest non-saturating value
+    psb_scale = lower_bound *0.90
+    r.psbscale.set_scale(psb_scale)
+    time.sleep(0.1)
+    return psb_scale, check_output_saturation(r,iterations=50)
+    
 
 
-
-def optimise_tx_snr(r,config_dict):
+def optimise_tx_snr(r,config_dict=None):
     """
-    Optimise the tx amplitudes, psb fft shift and psb scale.
+    Optimise the tx amplitudes, psb fft shift and psb scale. Maintain the same power but maximise the SNR.
 
-    Rescale the tx amplitudes to maximum level and adjust the psb 
-    fft shift and psb scale to maintain constant power.
+    Rescale the tx amplitudes to the maximum possible and then the psb fft shift to get the highest gain.
+    Then adjust psb scale to return to the original poers.
     """
     #get initial levels and settings
-    init_dac_saturation, init_dac_levels = check_output_saturation(r,iterations=1)
+    init_dac_saturation, init_dac_levels = check_output_saturation(r,iterations=50)
     if init_dac_saturation:
         raise ValueError('DAC saturation detected prior to optimisation')
     init_amps = get_tone_amplitudes(r,config_dict)
     init_psb_scale = r.psbscale.get_scale()
     init_psb_fftshift = r.psb.get_fftshift()
-    init_tone_powers,init_tone_powers_details = get_tone_powers(r,config_dict,detailed_output=True)
-
+    if config_dict is not None:
+        init_tone_powers,init_tone_powers_details = get_tone_powers(r,config_dict,detailed_output=True)
+    else:
+        init_tone_powers = None
+        init_tone_powers_details = None
 
     #rescale amps 
     max_amp = 1-2**-12
@@ -1875,6 +1947,7 @@ def optimise_tx_snr(r,config_dict):
         raise ValueError('Tone powers are all zero')
     amps_gain = max_amp/amps_max
     amps = init_amps*amps_gain
+    print('Maximise amplitudes:',amps)
     set_tone_amplitudes(r,config_dict,amps)
 
     #adjust fft shift
@@ -1883,12 +1956,15 @@ def optimise_tx_snr(r,config_dict):
     for i,shift in enumerate(psb_fftshifts):
         r.psb.set_fftshift(shift)
         time.sleep(0.01)
-        dsp_overflow, dsp_overflow_details = check_dsp_overflow(r)
+        dsp_overflow, dsp_overflow_details = check_dsp_overflow(r,0.5)
         psb_ovf = dsp_overflow_details['psb_ovf_delta']
         psb_fft_overflow.append(psb_ovf)
-    best_fftshift = psb_fftshifts[np.argmin(psb_fft_overflow)+1] # assume higher power from lower fftshift and add one stage for headroom
+        print('Maximise fftshift:',format(shift,'#016b'),psb_ovf)
+    best_fftshift = psb_fftshifts[np.argmin(psb_fft_overflow)] # assume higher power from lower fftshift 
     fftshift_gain = (best_fftshift+1) /(init_psb_fftshift+1) #assume shift stages are all ones.
     r.psb.set_fftshift(best_fftshift)
+    print('Best FFT Shift set:',format(best_fftshift,'#016b'))
+
     time.sleep(0.01)
     
     #adjust psb scale to compensate for change in amps and fftshift
@@ -1898,21 +1974,143 @@ def optimise_tx_snr(r,config_dict):
     time.sleep(0.01)
     
     #check not overflowing and revert if so.
-    dsp_overflow, dsp_overflow_details = check_dsp_overflow(r)
-    dac_saturation, dac_levels = check_output_saturation(r,iterations=1)
+    dsp_overflow, dsp_overflow_details = check_dsp_overflow(r,0.5)
+    dac_saturation, dac_levels = check_output_saturation(r,iterations=50)
     if dac_saturation or dsp_overflow_details['psb_ovf_delta'] or dsp_overflow_details['psbscale_ovf_delta']:
+        print('DAC or DSP Saturated... reverting to initial settings')
         set_tone_amplitudes(r,config_dict,init_amps)
         r.psb.set_fftshift(init_psb_fftshift)
         r.psbscale.set_scale(init_psb_scale)
         raise ValueError('TX DSP overflow detected')
     
-    tone_powers,tone_powers_details = get_tone_powers(r,config_dict,detailed_output=True)
+    if config_dict is not None:
+        tone_powers,tone_powers_details = get_tone_powers(r,config_dict,detailed_output=True)
+    else:
+        tone_powers = None
+        tone_powers_details = None
     
-    return amps, best_fftshift, psb_scale, tone_powers_details,init_amps, init_psb_fftshift, init_psb_scale,init_tone_powers_details
-    
+    return amps, best_fftshift, psb_scale, dsp_overflow_details, dac_levels
 
-def optimise_rx_snr(r,config_dict,desired_power_dbm,iterations=10):
-    pass
+
+def maximise_rx_power(r,config_dict,headroom_db = 0.5):
+    adc_tile = int(config_dict['firmware']['adc_tile'])
+    adc_block = int(config_dict['firmware']['adc_block'])
+    init_adc_saturation, init_adc_levels = check_input_saturation(r,iterations=50)
+    if init_adc_saturation:
+        raise ValueError('ADC saturation detected prior to optimisation')
+    init_pfb_fftshift = r.pfb.get_fftshift()
+
+    init_dsa = float(r.rfdc.core.get_dsa(adc_tile,adc_block)['dsa'])
+
+    #adjust dsa to down until just before saturation
+    dsamax=27
+    dsamin=0
+    step_size = 0.25
+
+    # Generate array of possible attenuation values
+    attenuations = np.arange(dsamin, dsamax + step_size, step_size)
+    num_steps = len(attenuations)
+    
+    # Initialize binary search indices
+    low_idx = 0
+    high_idx = num_steps - 1
+    best_dsa = dsamin  # Initialize best attenuation
+    
+    # Function to set DSA and check saturation
+    def set_and_check(att_value):
+        r.rfdc.core.set_dsa(adc_tile, adc_block, att_value)
+        time.sleep(0.1)  # Allow system to stabilize
+        check, levels = check_input_saturation(r, iterations=50)
+        print('Set DSA:',att_value,'Saturated:',check, levels)
+        return check, levels
+    
+    # First, check if minimum attenuation causes saturation
+    check, levels = set_and_check(dsamin)
+    if not check:
+        # No saturation at minimum attenuation; no need to increase attenuation
+        print(f"No saturation detected at minimum attenuation: {dsamin} dB")
+        best_dsa = dsamin
+    else:
+        # Binary Search Phase
+        while low_idx <= high_idx:
+            mid_idx = (low_idx + high_idx) // 2
+            mid_att = attenuations[mid_idx]
+            
+            # Set attenuation to mid_att and check saturation
+            check, levels = set_and_check(mid_att)
+            print(f"Checking attenuation: {mid_att} dB, Saturated: {check}")
+            
+            if check:
+                # Saturated: Need to increase attenuation
+                low_idx = mid_idx + 1
+            else:
+                # Not saturated: Record this as best_dsa and try to find a higher attenuation
+                best_dsa = mid_att
+                high_idx = mid_idx - 1
+        
+        # After binary search, best_dsa holds the maximum attenuation without saturation
+        print(f"Optimal attenuation found: {best_dsa} dB")
+    
+        best_dsa = min(best_dsa + headroom_db, dsamax)
+        print(f"Setting DSA to: {best_dsa} dB, to give headroom of {headroom_db} dB")
+        r.rfdc.core.set_dsa(adc_tile, adc_block, best_dsa)
+        time.sleep(0.1)
+
+    check, levels = check_input_saturation(r, iterations=50)
+    maxlevel = np.max(np.abs([levels['imax_fs'],levels['imin_fs'],levels['qmax_fs'],levels['qmin_fs']]))
+    print(f'Current ADC Headroom = {20*np.log10(maxlevel)} dB')
+
+    #adjust fft shift to maximise the gain
+    pfb_fft_overflow = []
+    pfb_fftshifts = (2**np.arange(14)-1).astype(int)
+    for i,shift in enumerate(pfb_fftshifts):
+        r.pfb.set_fftshift(shift)
+        time.sleep(0.01)
+        dsp_overflow, dsp_overflow_details = check_dsp_overflow(r,0.5)
+        pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
+        pfb_fft_overflow.append(pfb_ovf)
+        print('Maximise fftshift:',format(shift,'#016b'),pfb_ovf)
+
+    best_fftshift = pfb_fftshifts[np.argmin(pfb_fft_overflow)] # assume higher power from lower fftshift 
+    fftshift_gain = (best_fftshift+1) /(init_pfb_fftshift+1) #assume shift stages are all ones.
+    r.pfb.set_fftshift(best_fftshift)
+    print('Best FFT Shift set:',format(best_fftshift,'#016b'))
+    time.sleep(0.01)
+    return best_dsa,best_fftshift, check_dsp_overflow(r,0.5)[1], levels
+
+def fix_adc_saturation(r,config_dict):
+    maximise_rx_power(r,config_dict)
+    check,levels = check_input_saturation(r,iterations=50)
+    if check:
+        raise ValueError('ADC saturation detected at maximum attenuation')
+
+def optimise_rx_snr(r,config_dict=None):
+    init_adc_saturation, init_adc_levels = check_input_saturation(r,iterations=50)
+    if init_adc_saturation:
+        raise ValueError('ADC saturation detected prior to optimisation')
+    
+    #adjust fft shift
+    init_pfb_fftshift = r.pfb.get_fftshift()
+
+    pfb_fft_overflow = []
+    pfb_fftshifts = (2**np.arange(14)-1).astype(int)
+    for i,shift in enumerate(pfb_fftshifts):
+        r.pfb.set_fftshift(shift)
+        time.sleep(0.01)
+        dsp_overflow, dsp_overflow_details = check_dsp_overflow(r,0.5)
+        pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
+        pfb_fft_overflow.append(pfb_ovf)
+        print(i,shift,pfb_ovf)
+    best_fftshift = pfb_fftshifts[np.argmin(pfb_fft_overflow)] # assume higher power from lower fftshift 
+    fftshift_gain = (best_fftshift+1) /(init_pfb_fftshift+1) #assume shift stages are all ones.
+    r.pfb.set_fftshift(best_fftshift)
+    print('Best FFT Shift set:',format(best_fftshift,'#016b'))
+    time.sleep(0.01)
+    check,levels = check_input_saturation(r,iterations=50)
+    return best_fftshift, check_dsp_overflow(r,0.5)[1],levels
+
+
+
 
 def read_accumulated_data(r,num_tones=None):
     """
