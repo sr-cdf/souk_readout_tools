@@ -1808,7 +1808,7 @@ def maximise_tx_power(r,config_dict=None):
         psb_fft_overflow.append(psb_ovf)
         print('Maximise fftshift:',format(shift,'#016b'),psb_ovf)
 
-    best_fftshift = psb_fftshifts[np.argmin(psb_fft_overflow)] # assume higher power from lower fftshift 
+    best_fftshift = int(psb_fftshifts[np.argmin(psb_fft_overflow)]) # assume higher power from lower fftshift 
     fftshift_gain = (best_fftshift+1) /(init_psb_fftshift+1) #assume shift stages are all ones.
     r.psb.set_fftshift(best_fftshift)
     print('Best FFT Shift set:',format(best_fftshift,'#016b'))
@@ -1960,7 +1960,7 @@ def optimise_tx_snr(r,config_dict=None):
         psb_ovf = dsp_overflow_details['psb_ovf_delta']
         psb_fft_overflow.append(psb_ovf)
         print('Maximise fftshift:',format(shift,'#016b'),psb_ovf)
-    best_fftshift = psb_fftshifts[np.argmin(psb_fft_overflow)] # assume higher power from lower fftshift 
+    best_fftshift = int(psb_fftshifts[np.argmin(psb_fft_overflow)]) # assume higher power from lower fftshift 
     fftshift_gain = (best_fftshift+1) /(init_psb_fftshift+1) #assume shift stages are all ones.
     r.psb.set_fftshift(best_fftshift)
     print('Best FFT Shift set:',format(best_fftshift,'#016b'))
@@ -2071,7 +2071,7 @@ def maximise_rx_power(r,config_dict,headroom_db = 0.5):
         pfb_fft_overflow.append(pfb_ovf)
         print('Maximise fftshift:',format(shift,'#016b'),pfb_ovf)
 
-    best_fftshift = pfb_fftshifts[np.argmin(pfb_fft_overflow)] # assume higher power from lower fftshift 
+    best_fftshift = int(pfb_fftshifts[np.argmin(pfb_fft_overflow)]) # assume higher power from lower fftshift 
     fftshift_gain = (best_fftshift+1) /(init_pfb_fftshift+1) #assume shift stages are all ones.
     r.pfb.set_fftshift(best_fftshift)
     print('Best FFT Shift set:',format(best_fftshift,'#016b'))
@@ -2101,7 +2101,7 @@ def optimise_rx_snr(r,config_dict=None):
         pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
         pfb_fft_overflow.append(pfb_ovf)
         print(i,shift,pfb_ovf)
-    best_fftshift = pfb_fftshifts[np.argmin(pfb_fft_overflow)] # assume higher power from lower fftshift 
+    best_fftshift = int(pfb_fftshifts[np.argmin(pfb_fft_overflow)]) # assume higher power from lower fftshift 
     fftshift_gain = (best_fftshift+1) /(init_pfb_fftshift+1) #assume shift stages are all ones.
     r.pfb.set_fftshift(best_fftshift)
     print('Best FFT Shift set:',format(best_fftshift,'#016b'))
