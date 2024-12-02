@@ -590,7 +590,7 @@ class ReadoutServer:
                 
                 elif request == 'fix_adc_saturation':
                     dsa,fftshift, dsp_ovf, levels = firmware_lib.fix_adc_saturation(self.r,self.config)
-                    resuilt = {'dsa': dsa, 'fftshift': fftshift, 'dsp_ovf': dsp_ovf, 'adc_levels': levels}
+                    result = {'dsa': dsa, 'fftshift': fftshift, 'dsp_ovf': dsp_ovf, 'adc_levels': levels}
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'get_samples':
