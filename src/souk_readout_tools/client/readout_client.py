@@ -654,8 +654,8 @@ class ReadoutClient:
             samples,points,tones = sweep_data['samples'],sweep_data['points'],sweep_data['tones']
             data_i_bytes = base64.b64decode(sweep_data['data_i'])
             data_q_bytes = base64.b64decode(sweep_data['data_q'])
-            data_i = np.frombuffer(data_i_bytes, dtype='float64').reshape((samples,points,tones))
-            data_q = np.frombuffer(data_q_bytes, dtype='float64').reshape((samples,points,tones))
+            data_i = np.frombuffer(data_i_bytes, dtype='float64').reshape((samples,points,tones)).copy()
+            data_q = np.frombuffer(data_q_bytes, dtype='float64').reshape((samples,points,tones)).copy()
             return data_i+1j*data_q
         else:
             print(f"Error getting sweep_data: {response['message']}")
@@ -681,9 +681,9 @@ class ReadoutClient:
         sweep_f_bytes = base64.b64decode(sweep_data['sweep']['f'])
         sweep_z_bytes = base64.b64decode(sweep_data['sweep']['z'])
         sweep_e_bytes = base64.b64decode(sweep_data['sweep']['e'])
-        sweep_f = np.frombuffer(sweep_f_bytes, dtype='f8').reshape((num_points, num_tones))
-        sweep_z = np.frombuffer(sweep_z_bytes, dtype='complex128').reshape((num_points, num_tones))
-        sweep_e = np.frombuffer(sweep_e_bytes, dtype='complex128').reshape((num_points, num_tones))
+        sweep_f = np.frombuffer(sweep_f_bytes, dtype='f8').reshape((num_points, num_tones)).copy()
+        sweep_z = np.frombuffer(sweep_z_bytes, dtype='complex128').reshape((num_points, num_tones)).copy()
+        sweep_e = np.frombuffer(sweep_e_bytes, dtype='complex128').reshape((num_points, num_tones)).copy()
 
         if apply_phase_correction:
                 
