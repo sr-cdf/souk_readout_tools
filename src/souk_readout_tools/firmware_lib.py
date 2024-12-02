@@ -377,6 +377,7 @@ def get_system_information(r,config_dict):
 
     info = {}
     info['fpga_status'] = r.fpga.get_status()[0]
+    info['fpg_file'] = r.fpgfile
     info['pipeline_id'] = r.pipeline_id
     info['adc_clk_hz'] = r.adc_clk_hz
     info['output_mode'] = r.output.get_status()[0]['mode']
