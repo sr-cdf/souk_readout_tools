@@ -1934,11 +1934,6 @@ def optimise_tx_snr(r,config_dict=None):
     init_amps = get_tone_amplitudes(r,config_dict)
     init_psb_scale = r.psbscale.get_scale()
     init_psb_fftshift = r.psb.get_fftshift()
-    if config_dict is not None:
-        init_tone_powers,init_tone_powers_details = get_tone_powers(r,config_dict,detailed_output=True)
-    else:
-        init_tone_powers = None
-        init_tone_powers_details = None
 
     #rescale amps 
     max_amp = 1-2**-12
@@ -1983,11 +1978,6 @@ def optimise_tx_snr(r,config_dict=None):
         r.psbscale.set_scale(init_psb_scale)
         raise ValueError('TX DSP overflow detected')
     
-    if config_dict is not None:
-        tone_powers,tone_powers_details = get_tone_powers(r,config_dict,detailed_output=True)
-    else:
-        tone_powers = None
-        tone_powers_details = None
     
     return amps, best_fftshift, psb_scale, dsp_overflow_details, dac_levels
 
