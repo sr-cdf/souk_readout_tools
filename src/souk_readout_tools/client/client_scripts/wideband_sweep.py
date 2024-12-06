@@ -158,25 +158,23 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
         if p==1.0: break
         else: time.sleep(1.0)
 
-    s = client.parse_sweep_data(client.get_sweep_data())
-    f = s['sweep_f'].T
-    z = s['sweep_i'].T+1j*s['sweep_q'].T
+    s = client.parse_sweep_data(client.get_sweep_data(),apply_phase_correction=not ignore_phase_correction)
+    f = s['sweep_f']
+    z = s['sweep_i']+1j*s['sweep_q']
 
-    if not ignore_phase_correction:
-        rffreqs = f
-        iffreqs = sb*(rffreqs-lo)
-        bbfreqs = iffreqs - dacduc
-        bbbins = bbfreqs/(dacclk)*txnfft
-        filterbank_bin_numbers = np.around(bbbins)
-        z[filterbank_bin_numbers%2==1]*=np.exp(1j*np.pi)
+    #remove slope from phase
+    fcat = np.ravel(f.T)
+    zcat = np.ravel(z.T)
+    phicat = np.angle(zcat)
+    slope = np.nanmedian(np.gradient(phicat,fcat))
+    zcat *= np.exp(-1j*(slope*fcat))
 
-    phi = np.unwrap(np.angle(np.ravel(z.T)))
-    slope = np.nanmedian(np.gradient(phi,np.ravel(f.T)))
-    z *= np.exp(-1j*(slope*f+np.pi))
+    s['sweep_f'] = fcat
+    s['sweep_i'] = np.real(zcat)
+    s['sweep_q'] = np.imag(zcat)
+    s['sweep_ei'] = np.ravel(s['sweep_ei'].T)
+    s['sweep_eq'] = np.ravel(s['sweep_eq'].T)
 
-    s['sweep_i'] = np.real(z).T
-    s['sweep_q'] = np.imag(z).T
-    
     if filename is None:
         filename = os.path.expanduser('~/.souk_readout_tools/tmp/tmp_wideband_sweep')
     filename = os.path.abspath(filename)
@@ -186,23 +184,25 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
     print('Wideband sweep exported to:',filename+'.'+filetype)
 
     if plot_data:
-        si = s['sweep_i'].T
-        sq = s['sweep_q'].T
-        logmag = 20*np.log10(abs(z))
-        uphase = np.unwrap(np.angle(np.ravel(z.T))).reshape(z.T.shape).T
+        sf = s['sweep_f']
+        si = s['sweep_i']
+        sq = s['sweep_q']
+        sz = si+1j*sq
+        logmag = 20*np.log10(abs(sz))
+        uphase = np.unwrap(np.angle(sz))
 
-        ei = s['sweep_ei'].T #/ np.sqrt(s['samples_per_point'])
-        eq = s['sweep_eq'].T #/ np.sqrt(s['samples_per_point'])
-        emag = 1/abs(z)*np.sqrt((si*ei)**2 + (sq*ei)**2)
-        elogmag = 20/np.abs(z)/np.log(10)*emag
+        ei = s['sweep_ei'] #/ np.sqrt(s['samples_per_point'])
+        eq = s['sweep_eq'] #/ np.sqrt(s['samples_per_point'])
+        emag = 1/abs(sz)*np.sqrt((si*ei)**2 + (sq*ei)**2)
+        elogmag = 20/np.abs(sz)/np.log(10)*emag
         ephi = 1/(si**2+sq**2) * np.sqrt((sq*ei)**2+(si*eq)**2)
         
         import matplotlib.pyplot as plt
         fig,(s1,s2) = plt.subplots(2,1,sharex=True)
         #s1.plot(f/1e6, logmag)
         #s2.plot(f/1e6, uphase)
-        s1.errorbar(np.ravel(f)/1e6, np.ravel(logmag), yerr=np.ravel(elogmag), fmt='.', ecolor='red')
-        s2.errorbar(np.ravel(f)/1e6, np.ravel(uphase), yerr=np.ravel(ephi), fmt='.', ecolor='red')
+        s1.errorbar(sf/1e6, logmag, yerr=elogmag, fmt='.', ecolor='red')
+        s2.errorbar(sf/1e6, uphase, yerr=ephi, fmt='.', ecolor='red')
         fig.supxlabel('Frequency (MHz)')
         s1.set_ylabel('Power (dB)')
         s2.set_ylabel('Phase (rad)')

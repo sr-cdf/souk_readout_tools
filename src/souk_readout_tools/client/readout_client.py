@@ -687,6 +687,7 @@ class ReadoutClient:
 
         if apply_phase_correction:
                 
+                #get bin indexes
                 udc = self.config['rf_frontend']['connected']
                 lo = self.config['rf_frontend']['tx_mixer_lo_frequency_hz'] if udc else 0.0
                 sb = self.config['rf_frontend']['tx_mixer_sideband'] if udc else 1
@@ -697,11 +698,22 @@ class ReadoutClient:
                 dacnyq = info['nyquist_zone_dac0']
                 txnfft = 8192
                 rxnfft = 8192
+                bin_freqs = np.fft.fftfreq(txnfft, 1.0/(dacclk))
+                sorted_indices = np.argsort(bin_freqs)
+                bin_freqs_sorted = bin_freqs[sorted_indices]
 
                 rffreqs = sweep_f
                 iffreqs = sb*(rffreqs-lo)
                 bbfreqs = iffreqs - dacduc
-                bbbins  = bbfreqs/(dacclk)*txnfft
+                bbflat = np.ravel(bbfreqs.swapaxes(0,1))
+                idx = np.searchsorted(bin_freqs_sorted, bbflat)
+                idx = np.clip(idx, 1, 8192 - 1)
+                left = bin_freqs_sorted[idx - 1]
+                right = bin_freqs_sorted[idx]
+                closer_on_right = (bbflat - left) > (right - bbflat)
+                final_indices = sorted_indices[idx - 1 + closer_on_right.astype(int)]
+                bbbins = final_indices.reshape(bbfreqs.swapaxes(0,1).shape).swapaxes(0,1)
+    
                 filterbank_bin_numbers = np.around(bbbins)
                 sweep_z[filterbank_bin_numbers%2==1]*=np.exp(1j*np.pi)
 
