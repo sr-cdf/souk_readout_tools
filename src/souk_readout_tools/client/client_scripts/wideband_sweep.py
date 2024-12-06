@@ -64,9 +64,17 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
 
     dacmin = (dacduc - dacclk/2) + dacclk*(dacnyq-1)
     dacmax = (dacduc + dacclk/2) + dacclk*(dacnyq-1)
-
-    rfmax = dacmax if not udc else max(lo+dacmax*sb, lo-dacmax*sb,lo+dacmin*sb,lo-dacmin*sb) 
-    rfmin = dacmin if not udc else min(lo+dacmax*sb, lo-dacmax*sb,lo+dacmin*sb,lo-dacmin*sb)
+    rfmin = dacmin
+    rfmax = dacmax
+    if udc:
+        if sb==1:
+            rfmin = lo + dacmin
+            rfmax = lo + dacmax
+        elif sb==-1:
+            rfmin = lo - dacmax
+            rfmax = lo - dacmin
+        else:
+            raise ValueError(f"Invalid sideband value {sb}, should be +1 for USB or -1 for LSB")
 
     if bandwidth_hz is None:
         bandwidth_hz=rfmax-rfmin
@@ -101,6 +109,23 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
     center_freqs = freqs + np.floor(sweep_points/2)*spacings/sweep_points
     tone_amplitudes = np.ones(num_tones) # set_amplitudes to max
     tone_phases = client.generate_newman_phases(center_freqs)
+
+    print('udc:',udc)
+    print('lo:',lo)
+    print('sb:',sb)
+    print('dacduc:',dacduc)
+    print('dacclk:',dacclk)
+    print('dacnyq:',dacnyq)
+    print('txnfft:',txnfft)
+    print('rxnfft:',rxnfft)
+    print('dacmin:',dacmin)
+    print('dacmax:',dacmax)
+    print('rfmin:',rfmin)
+    print('rfmax:',rfmax)
+    print('bandwidth:',bandwidth_hz)
+    print('freqs:',freqs)
+    print(center_freqs)
+    print(center_freqs.min(),center_freqs.max())
 
     client.set_tone_frequencies(center_freqs)
     client.set_tone_amplitudes(tone_amplitudes)
