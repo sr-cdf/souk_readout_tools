@@ -1224,6 +1224,7 @@ class ResonanceFinder(QMainWindow):
                 tb=traceback.format_exc()
 
                 QMessageBox.warning(self, "Error", "Failed to load file: " + filename + f'\n\n{e}\n\n{tb}')
+                self.file_label.setText("Problem loading file")    
                 return
 
         else:
