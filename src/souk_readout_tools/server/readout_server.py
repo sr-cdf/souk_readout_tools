@@ -564,7 +564,7 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success', 'result': result, 'details': details})
 
                 elif request == 'maximise_tx_power':
-                    amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.maximise_tx_power(self.r_fast,self.config)
+                    amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.maximise_tx_power(self.r,self.config)
                     result = {'amps': amps.tolist(), 'psb_fft_shift': psb_fft_shift, 'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
                     await self.send_response(writer, {'status': 'success', 'result': result})
                 
