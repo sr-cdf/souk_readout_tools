@@ -18,6 +18,17 @@ except ImportError:
     
 from souk_readout_tools import calibration
 
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
 USER_DIR = os.path.expanduser('~/.souk_readout_tools/')
 
 autosync_time_delay = 0.001 #seconds
@@ -228,6 +239,20 @@ def needs_programming(r,config_dict):
     print('no')
     return False
 
+def needs_initialising(r,config_dict):
+    """
+    Check if the firmware needs to be initialised.
+    """
+    print('************************************************')
+    print('needs_initialising?')
+    print('************************************************')
+
+    if not hasattr(r, 'accumulators'):
+        print('yes, accumulators not found')
+        return True
+    print('no')
+    return False
+
 def reload_firmware(config_dict): 
     fw_config_file = config_dict['firmware']['fw_config_file']
     r = create_standard_readout_interface(fw_config_file)
@@ -388,20 +413,45 @@ def get_system_information(r,config_dict):
     info['psb_scale'] = r.psbscale.get_scale()
     info['psb_fftshift'] = r.psb.get_fftshift()
     info['pfb_fftshift'] = r.pfb.get_fftshift()
-    info['dsa'] = r.rfdc.core.get_dsa(adc_tile,adc_block)['dsa']
-    info['vop_dac0'] = r.rfdc.core.get_output_current(dac0_tile,dac0_block)['current']
-    info['vop_dac1'] = r.rfdc.core.get_output_current(dac1_tile,dac1_block)['current']
-    info['dac_duc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)['Freq'])*1e6
-    info['adc_ddc_mix_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['Freq'])*1e6
-    info['nyquist_zone_adc'] = r.rfdc.core.get_nyquist_zone(adc_tile,adc_block,r.rfdc.core.ADC_TILE)
-    info['nyquist_zone_dac0'] = r.rfdc.core.get_nyquist_zone(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)
-    info['nyquist_zone_dac1'] = r.rfdc.core.get_nyquist_zone(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE)
-    info['mixer_scale_1p0_dac0'] = r.rfdc.core.get_mixer_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0
-    info['mixer_scale_1p0_dac1'] = r.rfdc.core.get_mixer_settings(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0
-    info['mixer_scale_1p0_adc'] = r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0
-    info['mixer_qmc_settings_dac0'] = r.rfdc.core.get_qmc_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)
-    info['mixer_qmc_settings_dac1'] = r.rfdc.core.get_qmc_settings(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE)
-    info['mixer_qmc_settings_adc'] = r.rfdc.core.get_qmc_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)
+
+    #rfdc info will be missing keys if the dac and adc tiles/blocks are not set to match those in the firmware
+    #lets check we can read dsa on the adc and vop on each dac before trying to read them
+
+    correct_adc = r.rfdc.core.get_dsa(adc_tile,adc_block).get('dsa',None) is not None
+    correct_dac0 = r.rfdc.core.get_output_current(dac0_tile,dac0_block).get('current',None) is not None
+    correct_dac1 = r.rfdc.core.get_output_current(dac1_tile,dac1_block).get('current',None) is not None
+    if correct_adc and correct_dac0 and correct_dac1:
+        info['dsa'] = r.rfdc.core.get_dsa(adc_tile,adc_block)['dsa']
+        info['vop_dac0'] = r.rfdc.core.get_output_current(dac0_tile,dac0_block)['current']
+        info['vop_dac1'] = r.rfdc.core.get_output_current(dac1_tile,dac1_block)['current']
+        info['dac_duc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)['Freq'])*1e6
+        info['adc_ddc_mix_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['Freq'])*1e6
+        info['nyquist_zone_adc'] = r.rfdc.core.get_nyquist_zone(adc_tile,adc_block,r.rfdc.core.ADC_TILE)
+        info['nyquist_zone_dac0'] = r.rfdc.core.get_nyquist_zone(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)
+        info['nyquist_zone_dac1'] = r.rfdc.core.get_nyquist_zone(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE)
+        info['mixer_scale_1p0_dac0'] = r.rfdc.core.get_mixer_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0
+        info['mixer_scale_1p0_dac1'] = r.rfdc.core.get_mixer_settings(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0
+        info['mixer_scale_1p0_adc'] = r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0
+        info['mixer_qmc_settings_dac0'] = r.rfdc.core.get_qmc_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)
+        info['mixer_qmc_settings_dac1'] = r.rfdc.core.get_qmc_settings(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE)
+        info['mixer_qmc_settings_adc'] = r.rfdc.core.get_qmc_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)
+    else:
+        info['dsa'] = 0
+        info['vop_dac0'] = 0
+        info['vop_dac1'] = 0
+        info['dac_duc_mixer_frequency_hz'] = 0
+        info['adc_ddc_mix_frequency_hz'] = 0
+        info['nyquist_zone_adc'] = 1
+        info['nyquist_zone_dac0'] = 1
+        info['nyquist_zone_dac1'] = 1
+        info['mixer_scale_1p0_dac0'] = None
+        info['mixer_scale_1p0_dac1'] = None
+        info['mixer_scale_1p0_adc'] = None
+        info['mixer_qmc_settings_dac0'] = None
+        info['mixer_qmc_settings_dac1'] = None
+        info['mixer_qmc_settings_adc'] = None
+        print(bcolors.FAIL+'CRITICAL WARNING - RFDC settings not found, check that the DAC and ADC tiles/blocks are set correctly in the config to match the firmware'+bcolors.ENDC)
+        print('Continuing regardless but the system will not work.')
     info['tone_frequencies'] = get_tone_frequencies(r,config_dict).tolist()
     info['tone_amplitudes'] = get_tone_amplitudes(r,config_dict).tolist()
     info['tone_phases'] = get_tone_phases(r,config_dict).tolist()
@@ -410,6 +460,17 @@ def get_system_information(r,config_dict):
         print(f'{key}: {value}\n')
 
     return info
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
 def read_parameter(r, param_name):
     if hasattr(r, param_name):
@@ -557,6 +618,14 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
     ddc_settings = r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)
     dac_nyquist_zone = r.rfdc.core.get_nyquist_zone(dac_tile,dac_block,r.rfdc.core.DAC_TILE)
     adc_nyquist_zone = r.rfdc.core.get_nyquist_zone(adc_tile,adc_block,r.rfdc.core.ADC_TILE)
+    if dac_nyquist_zone is None:
+        print(bcolors.FAIL+'CRITICAL WARNING, misconfigured DAC tile/block, nyquist zone not found, assuming zone 1'+bcolors.ENDC)
+        dac_nyquist_zone = 1
+    if adc_nyquist_zone is None:
+        print(bcolors.FAIL+'CRITICAL WARNING, misconfigured ADC tile/block, nyquist zone not found, assuming zone 1'+bcolors.ENDC)
+        adc_nyquist_zone = 1
+
+
 
     #read mixer lo phase_increment values
     phase_inc_tx   = np.frombuffer(r.mixer.read(f'tx_lo{p}_phase_inc',4*nc),dtype='>i4')
@@ -606,26 +675,25 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
     dbb_freqs_rx = rx_bin_centers_hz + offset_freqs_hz_rx[:num_tones_rx]
 
     #get the analog output/input frequencies
-    duc_freqs = dbb_freqs_tx + 1e6*duc_settings['Freq']
-    ddc_freqs = dbb_freqs_rx - 1e6*ddc_settings['Freq']
-
-    #adjust for the given selection of nyquist zone.
     if dac_nyquist_zone == 1:
-        dac_out_freqs = duc_freqs
+        duc_freqs = dbb_freqs_tx + 1e6*duc_settings.get('Freq',0)
     elif dac_nyquist_zone == 2:
-        dac_out_freqs = 2*r.adc_clk_hz - duc_freqs
-    else:
-        raise ValueError(f'Invalid DAC nyquist zone ({dac_nyquist_zone})')
+        duc_freqs = dbb_freqs_tx - 1e6*duc_settings.get('Freq',0)
     if adc_nyquist_zone == 1:
-        adc_in_freqs = ddc_freqs
+        ddc_freqs = dbb_freqs_rx - 1e6*ddc_settings.get('Freq',0)
     elif adc_nyquist_zone == 2:
-        adc_in_freqs = 2*r.adc_clk_hz - ddc_freqs
-    else:
-        raise ValueError(f'Invalid ADC nyquist zone ({adc_nyquist_zone})')
-    
+        ddc_freqs = dbb_freqs_rx + 1e6*ddc_settings.get('Freq',0)
+
+    dac_out_freqs = np.abs(duc_freqs)
+    adc_in_freqs = np.abs(ddc_freqs)
+
     #get the rf frequencies given any analog up/down conversion
-    udc_freqs_tx = udc_lo_frequency + udc_sideband * dac_out_freqs 
-    udc_freqs_rx = udc_lo_frequency + udc_sideband * adc_in_freqs    
+    if udc_connected:
+        udc_freqs_tx = udc_lo_frequency + udc_sideband * dac_out_freqs 
+        udc_freqs_rx = udc_lo_frequency + udc_sideband * adc_in_freqs    
+    else:
+        udc_freqs_tx = dac_out_freqs
+        udc_freqs_rx = adc_in_freqs
     
     output_freqs = udc_freqs_tx if udc_connected else dac_out_freqs
     if detailed_output:
@@ -683,8 +751,18 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies):
     all_rx_bin_centers_hz = np.fft.fftfreq(N_RX_FFT, 1. / r.adc_clk_hz)
     duc_settings = r.rfdc.core.get_mixer_settings(dac_tile,dac_block,r.rfdc.core.DAC_TILE)
     ddc_settings = r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)
+    duc_frequency = duc_settings['Freq']*1e6
+    ddc_frequency = ddc_settings['Freq']*1e6
+
     dac_nyquist_zone = r.rfdc.core.get_nyquist_zone(dac_tile,dac_block,r.rfdc.core.DAC_TILE)
     adc_nyquist_zone = r.rfdc.core.get_nyquist_zone(adc_tile,adc_block,r.rfdc.core.ADC_TILE)
+    if dac_nyquist_zone is None:
+        print(bcolors.FAIL+'CRITICAL WARNING, misconfigured DAC tile/block, nyquist zone not found, assuming zone 1'+bcolors.ENDC)
+        dac_nyquist_zone = 1
+    if adc_nyquist_zone is None:
+        print(bcolors.FAIL+'CRITICAL WARNING, misconfigured ADC tile/block, nyquist zone not found, assuming zone 1'+bcolors.ENDC)
+        adc_nyquist_zone = 1
+
     chanmap_psb = np.full(r.psb_chanselect.n_chans_out, -1, dtype=int)
     chanmap_pfb  = np.full(r.chanselect.n_chans_out, -1, dtype=int)
     num_tones = len(tone_frequencies)
@@ -697,24 +775,24 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies):
     else:
         dac_out_freqs = tone_frequencies
         adc_in_freqs = tone_frequencies
-    
+
+    duc_freqs = dac_out_freqs
+    ddc_freqs = adc_in_freqs
+
     #get the DAC/ADC digitial frequencies given the Nyquist zone
     if dac_nyquist_zone == 1:
-        duc_freqs = dac_out_freqs
+        dbb_freqs_tx = duc_freqs - duc_frequency
     elif dac_nyquist_zone == 2:
-        duc_freqs = 2*r.adc_clk_hz - dac_out_freqs
+        dbb_freqs_tx = duc_freqs + duc_frequency
     else:
         raise ValueError(f'Invalid DAC nyquist zone ({dac_nyquist_zone})')
+
     if adc_nyquist_zone == 1:
-        ddc_freqs = adc_in_freqs
+        dbb_freqs_rx = ddc_freqs + ddc_frequency
     elif adc_nyquist_zone == 2:
-        ddc_freqs = 2*r.adc_clk_hz - adc_in_freqs
+        dbb_freqs_rx = ddc_freqs - ddc_frequency
     else:
         raise ValueError(f'Invalid ADC nyquist zone ({adc_nyquist_zone})')
-
-    #get the digital baseband frequencies given the DUC/DDC settings
-    dbb_freqs_tx = duc_freqs - 1e6*duc_settings['Freq']
-    dbb_freqs_rx = ddc_freqs + 1e6*ddc_settings['Freq']
 
     #check all tones are in within the baseband bandwidth
     txbbmin=np.min(all_tx_bin_centers_hz)
@@ -723,13 +801,13 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies):
     rxbbmax=np.max(all_rx_bin_centers_hz)+fft_rbw_hz
 
     if (dbb_freqs_tx > txbbmax).any():
-        raise ValueError(f'TX frequencies exceed baseband bandwidth')
+        raise ValueError(f'TX frequencies exceed baseband bandwidth: dbb_freqs_tx={dbb_freqs_tx}')
     if (dbb_freqs_tx < txbbmin).any():
-        raise ValueError(f'TX frequencies exceed baseband bandwidth')
+        raise ValueError(f'TX frequencies exceed baseband bandwidth: dbb_freqs_tx={dbb_freqs_tx}')
     if (dbb_freqs_rx > rxbbmax).any():
-        raise ValueError(f'RX frequencies exceed baseband bandwidth')
+        raise ValueError(f'RX frequencies exceed baseband bandwidth: dbb_freqs_rx={dbb_freqs_rx}')
     if (dbb_freqs_rx < rxbbmin).any():
-        raise ValueError(f'RX frequencies exceed baseband bandwidth')
+        raise ValueError(f'RX frequencies exceed baseband bandwidth: dbb_freqs_rx={dbb_freqs_rx}')
 
     #get the nearest filterbank center frequencies for each tone
     # Calculate the distance from each frequency to all bin centers
@@ -874,26 +952,25 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,detail
     else:
         dac_out_freqs = tone_frequencies
         adc_in_freqs = tone_frequencies
-    
+
+    duc_freqs = dac_out_freqs
+    ddc_freqs = adc_in_freqs
+
     #get the DAC/ADC digitial frequencies given the Nyquist zone
     if dac_nyquist_zone == 1:
-        duc_freqs = dac_out_freqs
+        dbb_freqs_tx = duc_freqs - duc_frequency
     elif dac_nyquist_zone == 2:
-        duc_freqs = 2*r.adc_clk_hz - dac_out_freqs
+        dbb_freqs_tx = duc_freqs + duc_frequency
     else:
         raise ValueError(f'Invalid DAC nyquist zone ({dac_nyquist_zone})')
+
     if adc_nyquist_zone == 1:
-        ddc_freqs = adc_in_freqs
+        dbb_freqs_rx = ddc_freqs + ddc_frequency
     elif adc_nyquist_zone == 2:
-        ddc_freqs = 2*r.adc_clk_hz - adc_in_freqs
+        dbb_freqs_rx = ddc_freqs - ddc_frequency
     else:
         raise ValueError(f'Invalid ADC nyquist zone ({adc_nyquist_zone})')
 
-    #get the digital baseband frequencies given the DUC/DDC settings
-    # dbb_freqs_tx = duc_freqs - 1e6*duc_settings['Freq']
-    # dbb_freqs_rx = ddc_freqs + 1e6*ddc_settings['Freq']
-    dbb_freqs_tx = duc_freqs - duc_frequency
-    dbb_freqs_rx = ddc_freqs + ddc_frequency
 
     #check all tones are in within the baseband bandwidth
     txbbmin=np.min(all_tx_bin_centers_hz)
@@ -902,13 +979,13 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,detail
     rxbbmax=np.max(all_rx_bin_centers_hz)+fft_rbw_hz
 
     if (dbb_freqs_tx > txbbmax).any():
-        raise ValueError(f'TX frequencies exceed baseband bandwidth')
+        raise ValueError(f'TX frequencies exceed baseband bandwidth: dbb_freqs_tx={dbb_freqs_tx}')
     if (dbb_freqs_tx < txbbmin).any():
-        raise ValueError(f'TX frequencies exceed baseband bandwidth')
+        raise ValueError(f'TX frequencies exceed baseband bandwidth: dbb_freqs_tx={dbb_freqs_tx}')
     if (dbb_freqs_rx > rxbbmax).any():
-        raise ValueError(f'RX frequencies exceed baseband bandwidth')
+        raise ValueError(f'RX frequencies exceed baseband bandwidth: dbb_freqs_rx={dbb_freqs_rx}')
     if (dbb_freqs_rx < rxbbmin).any():
-        raise ValueError(f'RX frequencies exceed baseband bandwidth')
+        raise ValueError(f'RX frequencies exceed baseband bandwidth: dbb_freqs_rx={dbb_freqs_rx}')
 
     #get the nearest filterbank center frequencies for each tone
     # Calculate the distance from each frequency to all bin centers
@@ -1013,32 +1090,32 @@ def prepare_sweep_settings_fast(r, config_dict, sweep_frequencies, detailed_outp
     ri_steps_rx_formatted_padded = np.zeros((num_points,nc),dtype='<u4')+65535
     
     #get the DAC/ADC analog frequencies given any analog up/down conversion
+    #get the DAC/ADC analog frequencies given any analog up/down conversion
     if udc_connected:
-        dac_out_freqs = (sweep_frequencies - udc_lo_frequency) / udc_sideband
-        adc_in_freqs = (sweep_frequencies - udc_lo_frequency) / udc_sideband
+        dac_out_freqs = (tone_frequencies - udc_lo_frequency) / udc_sideband
+        adc_in_freqs = (tone_frequencies - udc_lo_frequency) / udc_sideband
     else:
-        dac_out_freqs = sweep_frequencies
-        adc_in_freqs = sweep_frequencies
-    
+        dac_out_freqs = tone_frequencies
+        adc_in_freqs = tone_frequencies
+
+    duc_freqs = dac_out_freqs
+    ddc_freqs = adc_in_freqs
+
     #get the DAC/ADC digitial frequencies given the Nyquist zone
     if dac_nyquist_zone == 1:
-        duc_freqs = dac_out_freqs
+        dbb_freqs_tx = duc_freqs - duc_frequency
     elif dac_nyquist_zone == 2:
-        duc_freqs = 2*r.adc_clk_hz - dac_out_freqs
+        dbb_freqs_tx = duc_freqs + duc_frequency
     else:
         raise ValueError(f'Invalid DAC nyquist zone ({dac_nyquist_zone})')
+
     if adc_nyquist_zone == 1:
-        ddc_freqs = adc_in_freqs
+        dbb_freqs_rx = ddc_freqs + ddc_frequency
     elif adc_nyquist_zone == 2:
-        ddc_freqs = 2*r.adc_clk_hz - adc_in_freqs
+        dbb_freqs_rx = ddc_freqs - ddc_frequency
     else:
         raise ValueError(f'Invalid ADC nyquist zone ({adc_nyquist_zone})')
-        
-    #get the digital baseband frequencies given the DUC/DDC settings
-    # dbb_freqs_tx = duc_freqs - 1e6*duc_settings['Freq']
-    # dbb_freqs_rx = ddc_freqs + 1e6*ddc_settings['Freq']
-    dbb_freqs_tx = duc_freqs - duc_frequency
-    dbb_freqs_rx = ddc_freqs + ddc_frequency
+
 
     #check all tones are in within the baseband bandwidth
     txbbmin=np.min(all_tx_bin_centers_hz)
@@ -1047,13 +1124,13 @@ def prepare_sweep_settings_fast(r, config_dict, sweep_frequencies, detailed_outp
     rxbbmax=np.max(all_rx_bin_centers_hz)+fft_rbw_hz
 
     if (dbb_freqs_tx > txbbmax).any():
-        raise ValueError(f'TX frequencies exceed baseband bandwidth')
+        raise ValueError(f'TX frequencies exceed baseband bandwidth: dbb_freqs_tx={dbb_freqs_tx}')
     if (dbb_freqs_tx < txbbmin).any():
-        raise ValueError(f'TX frequencies exceed baseband bandwidth')
+        raise ValueError(f'TX frequencies exceed baseband bandwidth: dbb_freqs_tx={dbb_freqs_tx}')
     if (dbb_freqs_rx > rxbbmax).any():
-        raise ValueError(f'RX frequencies exceed baseband bandwidth')
+        raise ValueError(f'RX frequencies exceed baseband bandwidth: dbb_freqs_rx={dbb_freqs_rx}')
     if (dbb_freqs_rx < rxbbmin).any():
-        raise ValueError(f'RX frequencies exceed baseband bandwidth')
+        raise ValueError(f'RX frequencies exceed baseband bandwidth: dbb_freqs_rx={dbb_freqs_rx}')
     
     # tx_nearest_bins = np.zeros(dbb_freqs_tx.shape,dtype=int)
     # tx_freq_offsets_hz =np.zeros_like(dbb_freqs_tx)

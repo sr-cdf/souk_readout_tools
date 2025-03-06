@@ -257,7 +257,10 @@ class ReadoutClient:
         response = self.send_request(message)
         if response['status'] == 'success':
             self.system_information = response['data']
-        return response['data']
+            return response['data']
+        else:
+            print(f"Error getting system information: {response['message']}")
+            return response
 
     def set_parameter(self, param_name, param_value):
         message = {'request': 'set', 'param': param_name, 'value': param_value}

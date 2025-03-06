@@ -38,7 +38,8 @@ install_requires = [
     'numpy',
     'matplotlib',
     'pyyaml',
-    'ipython'
+    'ipython',
+    'scipy'
     # Add other common dependencies here
 ]
 
@@ -51,7 +52,7 @@ client_dependencies = [
 
 # Define server-specific dependencies
 server_dependencies = [
-    'souk_mkid_readout'  
+    "souk_mkid_readout  @ file://localhost//home/casper/src/souk-firmware/software/control_sw",
 ]
 
 # Conditionally add client or server dependencies

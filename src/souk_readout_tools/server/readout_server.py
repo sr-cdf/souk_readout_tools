@@ -203,7 +203,10 @@ class ReadoutServer:
             print('init_server needs programming')
             print(self.r.fpgfile)
             self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
-        if init_firmware:
+        
+        #initialise firmware if necessary
+        if init_firmware or firmware_lib.needs_initialising(self.r,self.config):
+            print('init_server needs initialising')
             print(self.r.fpgfile)
             firmware_lib.initialise_firmware(self.r,self.config)
         
