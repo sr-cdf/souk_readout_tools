@@ -1089,8 +1089,8 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
     offset_freqs_hz_rx_ri    = phase_steps_rx * fft_rbw_hz / 2 / np.pi
     
     #get the filterbank channels
-    chanmap_psb  = r.psb_chanselect.get_channel_outmap()
-    chanmap_pfb  = r.chanselect.get_channel_outmap()
+    chanmap_psb  = psb_chanselect_get_channel_outmap(r)
+    chanmap_pfb  = chanselect_get_channel_outmap(r)
     psb_chans_active = np.nonzero(chanmap_psb+1)[0]
     pfb_chans_active = np.nonzero(chanmap_pfb+1)[0]
     psb_channels = psb_chans_active[np.argsort(chanmap_psb[psb_chans_active])]
@@ -1339,9 +1339,9 @@ def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True):
         num_tones = r.mixer.n_chans
 
     if not chanmap_psb is None:
-        r.psb_chanselect.set_channel_outmap(np.copy(chanmap_psb))
+        psb_chanselect_set_channel_outmap(r,np.copy(chanmap_psb))
     if not chanmap_pfb is None:
-        r.chanselect.set_channel_outmap(np.copy(chanmap_pfb))
+        chanselect_set_channel_outmap(r,np.copy(chanmap_pfb))
 
     # for i in range(min(r.mixer._n_parallel_chans, num_tones)):   
     #     if not phase_incs_tx is None:
@@ -1722,14 +1722,17 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
     c2=not skip_chanmap_pfb[step_index]
     if c1:
         print('set chanmap 1 (out)')
-        r_fast.psb_chanselect.set_channel_outmap(np.copy(chanmap_psb[step_index]))
+        # r_fast.psb_chanselect.set_channel_outmap(np.copy(chanmap_psb[step_index]))
+        psb_chanselect_set_channel_outmap(r_fast,np.copy(chanmap_psb[step_index]))
+        
         # while not (r.psb_chanselect.get_channel_outmap()==chanmap_psb[step_index]).all():
         #     print('waiting for psb chanmap to update')
         #     time.sleep(0.001)
         # print('psb chanmap updated')
     if c2:
         print('set chanmap 2 (in)')
-        r_fast.chanselect.set_channel_outmap(np.copy(chanmap_pfb[step_index]))
+        # r_fast.chanselect.set_channel_outmap(np.copy(chanmap_pfb[step_index]))
+        chanselect_set_channel_outmap(r_fast,np.copy(chanmap_pfb[step_index]))
         # while not (r.chanselect.get_channel_outmap()==chanmap_pfb[step_index]).all():
         #     print('waiting for pfb chanmap to update')
         #     time.sleep(0.001)
@@ -1971,10 +1974,10 @@ def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, 
 
     if c1 is not None:
         # print('chanmap_psb set')
-        r.psb_chanselect.set_channel_outmap(np.copy(chanmap_psb))
+        psb_chanselect_set_channel_outmap(r_fast,np.copy(chanmap_psb))
     if c2 is not None:
         # print('chanmap_pfb set')
-        r.chanselect.set_channel_outmap(np.copy(chanmap_pfb))
+        chanselect_set_channel_outmap(r_fast,np.copy(chanmap_pfb))
     # if c1 or c2:
     #     # print('chanmap set')
     #     r.sync.arm_sync(wait=False)
@@ -2177,8 +2180,8 @@ def get_tone_amplitudes(r,config_dict,num_tones=None):
     """
     if num_tones is None:
         #get the number of active filterbanck channels (assumes anything not -1 is a channel)
-        chanmap_psb  = r.psb_chanselect.get_channel_outmap()
-        chanmap_pfb  = r.chanselect.get_channel_outmap()
+        chanmap_psb  = psb_chanselect_get_channel_outmap(r)
+        chanmap_pfb  = chanselect_get_channel_outmap(r)
         psb_chans_active = np.nonzero(chanmap_psb+1)[0]
         pfb_chans_active = np.nonzero(chanmap_pfb+1)[0]
         if np.all(chanmap_psb == 2047):
@@ -2238,8 +2241,8 @@ def get_tone_phases(r, config_dict, num_tones=None):
     """
     if num_tones is None:
         #get the number of active filterbanck channels (assumes anything not -1 is a channel)
-        chanmap_psb  = r.psb_chanselect.get_channel_outmap()
-        chanmap_pfb  = r.chanselect.get_channel_outmap()
+        chanmap_psb  = psb_chanselect_get_channel_outmap(r)
+        chanmap_pfb  = chanselect_get_channel_outmap(r)
         psb_chans_active = np.nonzero(chanmap_psb+1)[0]
         pfb_chans_active = np.nonzero(chanmap_pfb+1)[0] 
         if np.all(chanmap_psb == 2047):
@@ -2288,6 +2291,237 @@ def set_tone_phases(r, config_dict, tone_phases, autosync=True):
     #     time.sleep(autosync_time_delay)
     #     r.sync.sw_sync()
     return
+
+
+
+
+
+def psb_chanselect_set_channel_outmap(r, outmap):
+    """
+    *** vectorised version of set_channel_outmap for psb_chanselect***
+    
+    Remap the channels such that the channel outmap[i]
+    emerges out of the reorder map in position i.
+
+    The provided map must be `r.psb_chanselect.n_chans_out` elements long, else
+    `ValueError` is raised
+
+    :param outmap: The outmap to which data should be mapped. I.e., if
+        `outmap[0] = 16`, then the first channel out of the reorder block
+        will be channel 16. 
+    :type outmap: list of int
+
+    """
+    # default to outputting last input
+    # serial_maps = (r.psb_chanselect.n_chans_in - 1) * np.ones([r.psb_chanselect._expansion_factor, r.psb_chanselect._reorder_depth])
+    if not hasattr(r.psb_chanselect,'_serial_maps_convenience'):
+        r.psb_chanselect._serial_maps_convenience = (r.psb_chanselect.n_chans_in - 1) * np.ones([r.psb_chanselect._expansion_factor, r.psb_chanselect._reorder_depth])
+    serial_maps = r.psb_chanselect._serial_maps_convenience
+
+    outmap = np.array(outmap, dtype=int)
+    nout = len(outmap)
+
+    # outchans = np.arange(r.psb_chanselect.n_chans_out)
+    if not hasattr(r.psb_chanselect,'_outchans_convenience'):
+        r.psb_chanselect._outchans_convenience = np.arange(r.psb_chanselect.n_chans_out)
+    outchans = r.psb_chanselect._outchans_convenience
+    # Which parallel path does a given output channel
+    # map to
+    # block_id = (outchans // r.psb_chanselect.n_parallel_samples) % r.psb_chanselect._expansion_factor
+    if not hasattr(r.psb_chanselect,'_block_id_convenience'):
+        r.psb_chanselect._block_id_convenience = (outchans // r.psb_chanselect.n_parallel_samples) % r.psb_chanselect._expansion_factor
+    block_id = r.psb_chanselect._block_id_convenience
+    # Which serial position in this path does a channel map to
+    # block_s_offset = (outchans // r.psb_chanselect.n_parallel_chans_out)
+    if not hasattr(r.psb_chanselect,'_block_s_offset_convenience'):
+        r.psb_chanselect._block_s_offset_convenience = (outchans // r.psb_chanselect.n_parallel_chans_out)
+    block_s_offset = r.psb_chanselect._block_s_offset_convenience
+    
+    # Which parallel position in this word in this path
+    # block_p_offset = (outchans % r.psb_chanselect.n_parallel_samples)
+    if not hasattr(r.psb_chanselect,'_block_p_offset_convenience'):
+        r.psb_chanselect._block_p_offset_convenience = (outchans % r.psb_chanselect.n_parallel_samples)
+    block_p_offset = r.psb_chanselect._block_p_offset_convenience
+
+    # Combined position in a block
+    # block_offset = block_s_offset * r.psb_chanselect.n_parallel_samples + block_p_offset
+    if not hasattr(r.psb_chanselect,'_block_offset_convenience'):
+        r.psb_chanselect._block_offset_convenience = block_s_offset * r.psb_chanselect.n_parallel_samples + block_p_offset
+    block_offset = r.psb_chanselect._block_offset_convenience
+
+    # We want the user-select channel to end up in position `block_offset` of the block `block_id`
+    # for i in range(nout):
+    #     serial_maps[block_id[i], block_offset[i]] = outmap[i]
+    serial_maps[block_id[:nout], block_offset[:nout]] = outmap[:nout]
+
+    serial_maps = np.array(serial_maps, dtype=r.psb_chanselect._map_format)
+
+    for i in range(r.psb_chanselect._expansion_factor):
+        r.psb_chanselect.write(f'map{i}_{r.psb_chanselect._map_reg}', serial_maps[i].tobytes())
+
+
+
+def psb_chanselect_get_channel_outmap(r):
+        """
+        *** vectorised version of get_channel_outmap for psb_chanselect***
+
+        Read the currently loaded reorder map.
+
+        :return: The reorder map currently loaded. Entry `i` in this map is the
+            channel number which emerges in the `i`th output position.
+        :rtype: list
+        """
+        nbytes = r.psb_chanselect._reorder_depth * np.dtype(r.psb_chanselect._map_format).itemsize
+        serial_maps = np.zeros([r.psb_chanselect._expansion_factor, r.psb_chanselect._reorder_depth])
+        for i in range(r.psb_chanselect._expansion_factor):
+            serial_maps[i] = np.frombuffer(r.psb_chanselect.read(f'map{i}_{r.psb_chanselect._map_reg}', nbytes), dtype=r.psb_chanselect._map_format)
+
+        ##not used:
+        ## # Which serial position in each path does a channel map to
+        ## block_s_offset = serial_maps // r.psb_chanselect.n_parallel_samples
+        ## # Which parallel position in this word in this path
+        ## block_p_offset = serial_maps % r.psb_chanselect.n_parallel_samples
+
+
+        # outmap = np.zeros(r.psb_chanselect.n_chans_out, dtype=int)
+        # for i in range(r.psb_chanselect._expansion_factor):
+        #     for j in range(r.psb_chanselect._reorder_depth):
+        #         s_off = j // r.psb_chanselect.n_parallel_samples
+        #         p_off = j % r.psb_chanselect.n_parallel_samples
+        #         outmap[i * r.psb_chanselect.n_parallel_samples + s_off*r.psb_chanselect.n_parallel_chans_out + p_off] = serial_maps[i, j]
+
+        #i, j = np.indices((r.psb_chanselect.expansion_factor, r.psb_chanselect.reorder_depth))
+        if not hasattr(r.psb_chanselect,'_i_j_convenience'):
+            r.psb_chanselect._i_j_convenience = np.indices((r.psb_chanselect._expansion_factor, r.psb_chanselect._reorder_depth))
+        i, j = r.psb_chanselect._i_j_convenience
+
+        # s_off = j // r.psb_chanselect.n_parallel_samples
+        if not hasattr(r.psb_chanselect,'_s_off_convenience'):
+            r.psb_chanselect._s_off_convenience = j // r.psb_chanselect.n_parallel_samples
+        s_off = r.psb_chanselect._s_off_convenience
+
+        # p_off = j % r.psb_chanselect.n_parallel_samples
+        if not hasattr(r.psb_chanselect,'_p_off_convenience'):
+            r.psb_chanselect._p_off_convenience = j % r.psb_chanselect.n_parallel_samples
+        p_off = r.psb_chanselect._p_off_convenience
+        
+        #indices = i * r.psb_chanselect.n_parallel_samples + s_off * r.psb_chanselect.n_parallel_chans_out + p_off
+        if not hasattr(r.psb_chanselect,'_indices_convenience'):
+            r.psb_chanselect._indices_convenience = i * r.psb_chanselect.n_parallel_samples + s_off * r.psb_chanselect.n_parallel_chans_out + p_off
+        indices = r.psb_chanselect._indices_convenience
+
+        outmap = np.zeros(r.psb_chanselect.n_chans_out, dtype=int)
+        outmap[indices.ravel()] = serial_maps.ravel()
+
+
+        return outmap
+
+
+
+def chanselect_set_channel_outmap(r, outmap, descramble_input=None):
+    """
+    *** vectorised version of set_channel_outmap for chanselect***
+
+    Remap the channels such that the channel outmap[i]
+    emerges out of the reorder map in position i.
+
+    The provided map must be `r.chanselect.n_chans_out` elements long, else
+    `ValueError` is raised
+
+    :param outmap: The outmap to which data should be mapped. I.e., if
+        `outmap[0] = 16`, then the first channel out of the reorder block
+        will be channel 16. 
+    :type outmap: list of int
+
+    :param descramble_input: If True, descramble the provided channel map.
+        If not provided, descramble if the _descramble_default attribute is True.
+    :type descramble_input: bool
+
+    """
+
+    outmap = np.array(outmap, dtype=int)
+
+    serial_map = np.zeros(r.chanselect._reorder_depth)
+
+    #  parallel_map = (r.chanselect._reduction_factor + 1) * np.ones(r.chanselect._reorder_depth)
+    if not hasattr(r.chanselect,'_parallel_map_convenience'):
+        r.chanselect._parallel_map_convenience = (r.chanselect._reduction_factor + 1) * np.ones(r.chanselect._reorder_depth)
+    parallel_map = r.chanselect._parallel_map_convenience.copy()
+    
+    nout = len(outmap)
+    outmap_isnt_n1 = outmap != -1
+    if descramble_input or (descramble_input is None and r.chanselect._descramble_default):
+        #for i in range(nout):
+        #    if outmap[i] == -1:
+        #        continue
+        #    outmap[i] = r.chanselect._descramble_order[outmap[i]]
+        outmap[outmap_isnt_n1] = r.chanselect._descramble_order[outmap[outmap_isnt_n1]]
+
+    # block_id = np.zeros(nout)
+    # block_s_offset = np.zeros(nout)
+    # block_p_offset = np.zeros(nout)
+
+    # block_id[:] = outmap // r.chanselect.n_parallel_chans_in
+    # block_s_offset[:] = (outmap % r.chanselect.n_parallel_chans_in) % r.chanselect.n_parallel_samples
+    # block_p_offset[:] = (outmap % r.chanselect.n_parallel_chans_in) // r.chanselect.n_parallel_samples
+
+    block_id = outmap // r.chanselect.n_parallel_chans_in
+    opp      = outmap % r.chanselect.n_parallel_chans_in
+    block_s_offset = (opp) % r.chanselect.n_parallel_samples
+    block_p_offset = (opp) // r.chanselect.n_parallel_samples
+
+    serial_map[0:nout] = (block_id * r.chanselect.n_parallel_samples) + block_s_offset
+
+    # parallel_map[0:nout] = block_p_offset
+    # parallel_map[0:nout][outmap == -1] = r.chanselect._reduction_factor + 1
+
+    parallel_map[:nout] = np.where(outmap_isnt_n1, block_p_offset, r.chanselect._reduction_factor + 1
+)
+
+
+    r.chanselect.write(f'map0_{r.chanselect._map_reg}', serial_map.astype(r.chanselect._map_format).tobytes())
+    r.chanselect.write('pmap', parallel_map.astype(r.chanselect._pmap_format).tobytes())
+
+
+
+def chanselect_get_channel_outmap(r, descramble_input=None):
+    """
+    Read the currently loaded reorder map.
+
+    :param descramble_input: If True, descramble the recovered channel map.
+        If not provided, descramble if the _descramble_default attribute is True.
+    :type descramble_input: bool
+
+    :return: The reorder map currently loaded. Entry `i` in this map is the
+        channel number which emerges in the `i`th output position.
+    :rtype: list
+    """
+
+    nbytes = r.chanselect._reorder_depth * np.dtype(r.chanselect._map_format).itemsize
+    serial_map = np.frombuffer(r.chanselect.read(f'map0_{r.chanselect._map_reg}', nbytes), dtype=r.chanselect._map_format)
+    nbytes = r.chanselect._reorder_depth * np.dtype(r.chanselect._pmap_format).itemsize
+    parallel_map = np.frombuffer(r.chanselect.read('pmap', nbytes), dtype=r.chanselect._pmap_format)
+
+    block_id = serial_map // r.chanselect.n_parallel_samples
+    block_s_offset = serial_map % r.chanselect.n_parallel_samples
+    block_p_offset = parallel_map
+
+    outmap = r.chanselect.n_parallel_chans_in * block_id + block_s_offset + (r.chanselect.n_parallel_samples * block_p_offset)
+    outmap[parallel_map == r.chanselect._reduction_factor + 1] = -1
+    if descramble_input or (descramble_input is None and r.chanselect._descramble_default):
+        # for i in range(len(outmap)):
+        #     if outmap[i] == -1:
+        #         continue
+        #     outmap[i] = r.chanselect._scramble_order[outmap[i]]
+        
+        outmap_isnt_n1 = outmap != -1
+        outmap[outmap_isnt_n1] = r.chanselect._scramble_order[outmap[outmap_isnt_n1]]
+        
+    return outmap
+
+
+
+
 
 def check_input_saturation(r,iterations=1,saturation_bits=adc_saturation_bits,threshold=0.95):
     """
