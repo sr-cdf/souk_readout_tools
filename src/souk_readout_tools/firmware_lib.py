@@ -8,6 +8,7 @@ import warnings
 import numpy as np
 import time
 import os
+import yaml
 #import asyncio
 
 try:
@@ -574,6 +575,436 @@ def set_nyquist_zone(r,config_dict,nyquist_zone,inv_sinc=False):
         
     return
 
+def read_raw_control_buffer_data(r,buf,los=['tx','rx']):
+    """
+    From FW V7.5, all tone parameter settings are applied in one contiguous buffer and updates 
+    to all tone parameters can now be written in one chunk.
+
+    There are actually two consecutive buffers which can be switched between, so any updates 
+    are applied instantly as opposed to register-by-register.
+
+    There are still seperate buffers for tx and rx settings.
+
+    Parameters:
+    r: readout object
+    buf: int, index of buffer to read from, 0 or 1.
+    los: list of strings, either 'tx' or 'rx' to read the control values for the respective LO
+
+    Returns a dictionary of the lo control values with the following keys:
+    - 'tx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling' 
+    - 'rx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling'
+    Each of these keys contains a numpy array with the values for each tone in firmware format
+    
+    """
+    formatted_lo_control_values={'tx':{},'rx':{}}
+        
+    if buf not in [0,1]:
+        raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
+    
+    for lo in los:
+        if lo not in ['tx','rx']:
+            raise ValueError(f"Only LOs 'rx' and 'tx' are understood. Not {lo}.")
+   
+        
+        n_tone = r.mixer.n_chans
+        # In set_freqs, n_tone = n_chans and tones are interleaved in groups of _n_parallel_chans.
+        # Each register slice written by set_freqs comes from one parallel stream and has length equal to n_serial_chans.
+        Np = r.mixer._n_parallel_chans
+        Ns = r.mixer._n_serial_chans    # number of tone samples per parallel slice
+
+        # Prepare arrays to hold the interlaced results.
+        all_phase_steps_int = np.empty(n_tone, dtype=np.int64)
+        all_ri_steps_int = np.empty(n_tone, dtype=np.int64)
+        all_phase_offsets_int = np.empty(n_tone, dtype=np.int64)
+        all_scaling_int = np.empty(n_tone, dtype=np.int64)
+
+        # Each parallel stream slice has been written to register: f'{lo}_lo{i}_control'
+        # at an offset of: 4 * _CONTROL_N_WORDS * (buf * _n_serial_chans + i)
+        # and with a length of: 4 * _CONTROL_N_WORDS * s bytes.
+        slice_len_bytes = 4 * r.mixer._CONTROL_N_WORDS * Ns
+
+        for i in range(Np):
+            offset = 4 * r.mixer._CONTROL_N_WORDS * (buf * r.mixer._n_serial_chans + i)
+            reg = f'{lo}_lo{i}_control'
+            data = r.mixer.read(reg, slice_len_bytes, offset=offset)
+            # Unpack as a uint32 array (big-endian). Total element count should be s * _CONTROL_N_WORDS.
+            arr = np.frombuffer(data, dtype='>u4')
+            # Reshape into (N, _CONTROL_N_WORDS): one row per tone in this slice.
+            arr = arr.reshape((Ns, r.mixer._CONTROL_N_WORDS))
+            # The fields are fixed:
+            #   Column 0: phase increment
+            #   Column 1: RI step
+            #   Column 2: phase offset
+            #   Column 3: amplitude scale
+            # Place these values into the full arrays in positions corresponding to this parallel index.
+            all_phase_steps_int[i::Np] = arr[:, r.mixer._PHASE_INC_WORD_OFFSET]
+            all_ri_steps_int[i::Np] = arr[:, r.mixer._RI_STEP_WORD_OFFSET]
+            all_phase_offsets_int[i::Np] = arr[:, r.mixer._PHASE_OFFSET_WORD_OFFSET]
+            all_scaling_int[i::Np] = arr[:, r.mixer._SCALE_WORD_OFFSET]
+
+
+        # # From set_freqs, phase_steps (which become phase_inc here) were computed as:
+        # #   phase_steps = (freq / fft_rbw_hz) * 2π
+        # # So we invert that to recover the frequency:
+        # fft_period_s = r.mixer._n_upstream_chans / r.mixer._upstream_oversample_factor / sample_rate_hz
+        # fft_rbw_hz = 1. / fft_period_s
+        # freqs_hz = (phase_steps / (2 * np.pi)) * fft_rbw_hz
+
+        formatted_lo_control_values[lo]={
+            'formatted_phase_steps': all_phase_steps_int,
+            'formatted_ri_steps': all_ri_steps_int,
+            'formatted_phase_offsets': all_phase_offsets_int,
+            'formatted_scaling': all_scaling_int
+        }
+    return formatted_lo_control_values
+
+
+def read_raw_control_buffer_data_fast(r_fast,buf,los=['tx','rx']):
+    """
+    From FW V7.5, all tone parameter settings are applied in one contiguous buffer and updates 
+    to all tone parameters can now be written in one chunk.
+
+    There are actually two consecutive buffers which can be switched between, so any updates 
+    are applied instantly as opposed to register-by-register.
+
+    There are still seperate buffers for tx and rx settings.
+
+    Parameters:
+    r: readout object
+    buf: int, index of buffer to read from, 0 or 1.
+    los: list of strings, either 'tx' or 'rx' to read the control values for the respective LO
+
+    Returns a dictionary of the lo control values with the following keys:
+    - 'tx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling' 
+    - 'rx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling'
+    Each of these keys contains a numpy array with the values for each tone in firmware format
+    
+    """
+    formatted_lo_control_values={'tx':{},'rx':{}}
+        
+    if buf not in [0,1]:
+        raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
+    
+    for lo in los:
+        if lo not in ['tx','rx']:
+            raise ValueError(f"Only LOs 'rx' and 'tx' are understood. Not {lo}.")
+        
+        offset = 0x80000 if lo=='rx' else 0x90000
+        offset += 0x8000*buf
+        length = 0x8000
+        data = r_fast.mixer.host.transport.axil_mm[int(offset):int(offset+length)]
+        arr = np.frombuffer(data, dtype='<u4')
+        all_phase_steps_int = arr[r_fast.mixer._PHASE_INC_WORD_OFFSET::4]
+        all_ri_steps_int = arr[r_fast.mixer._RI_STEP_WORD_OFFSET::4]
+        all_phase_offsets_int = arr[r_fast.mixer._PHASE_OFFSET_WORD_OFFSET::4]
+        all_scaling_int = arr[r_fast.mixer._SCALE_WORD_OFFSET::4]
+
+        formatted_lo_control_values[lo]={
+            'formatted_phase_steps': all_phase_steps_int,
+            'formatted_ri_steps': all_ri_steps_int,
+            'formatted_phase_offsets': all_phase_offsets_int,
+            'formatted_scaling': all_scaling_int
+        }
+    return formatted_lo_control_values
+
+
+def interpret_raw_control_buffer_data(r,formatted_lo_control_values):
+    """
+    Interpret the values read from the lo control buffer.
+
+    Parameters:
+    r: readout object
+    formatted_lo_control_values: dictionary with keys 'tx' and 'rx'
+     - 'tx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling'
+     - 'rx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling'
+
+    Returns:
+    lo_control_values: dictionary with keys 'tx' and 'rx'
+     - 'tx': dictionary with keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+     - 'rx': dictionary with keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+
+    """
+    lo_control_values = {'tx':{},'rx':{}}
+    for lo in ['tx','rx']:
+        if lo not in formatted_lo_control_values.keys():
+            raise ValueError(f"Only LOs 'rx' and 'tx' are understood. Not {lo}.")
+        try:
+            all_phase_steps_int = formatted_lo_control_values[lo]['formatted_phase_steps']
+            all_ri_steps_int = formatted_lo_control_values[lo]['formatted_ri_steps']
+            all_phase_offsets_int = formatted_lo_control_values[lo]['formatted_phase_offsets']
+            all_scaling_int = formatted_lo_control_values[lo]['formatted_scaling']
+    
+            phase_steps = _invert_format_phase_steps(all_phase_steps_int.ravel(), r.mixer._phase_bp)
+            ri_steps = uint2cplx(all_ri_steps_int,r.mixer._n_ri_step_bits)
+            phase_offsets = _invert_format_phase_offsets(all_phase_offsets_int.ravel(), r.mixer._phase_offset_bp)
+            scaling = _invert_format_amp_scale(all_scaling_int.ravel(), r.mixer._n_scale_bits)
+
+            lo_control_values[lo]['phase_steps'] = phase_steps
+            lo_control_values[lo]['ri_steps'] = ri_steps
+            lo_control_values[lo]['phase_offsets'] = phase_offsets
+            lo_control_values[lo]['scaling'] = scaling
+        except KeyError as e:
+            continue
+
+    return lo_control_values
+
+
+
+
+def prepare_control_buffer_data(r,buf,lo_control_values):
+    """
+    Prepare a formatted control buffer to write to the firmware.
+
+    Parameters:
+    r: readout object
+    buf: int, index of buffer to write to, 0 or 1.
+    lo_control_values: dictionary with keys 'tx' and 'rx'
+     - 'tx': dictionary with keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+     - 'rx': dictionary with keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+    
+     returns a numpy array of the formatted control buffer.
+
+     If any keys not given, the values are read from the specified control buffer.
+    """
+    
+    if buf not in [0,1]:
+        raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
+    v={'tx':{},'rx':{}}    
+    for lo in ['tx','rx']:
+        if lo not in lo_control_values.keys():
+            raise ValueError(f"Only LOs 'rx' and 'tx' are understood. Not {lo}.")
+        phase_steps = lo_control_values[lo].get('phase_steps')
+        ri_steps = lo_control_values[lo].get('ri_steps')
+        phase_offsets = lo_control_values[lo].get('phase_offsets')
+        scaling = lo_control_values[lo].get('scaling')
+        if any([i is None for i in [phase_steps,ri_steps,phase_offsets,scaling]]):
+            existing = interpret_raw_control_buffer_data(r, read_raw_control_buffer_data(r,buf,los=[lo]))
+            if phase_steps is None:
+                phase_steps = existing[lo]['phase_steps']
+            if ri_steps is None:
+                ri_steps = existing[lo]['ri_steps']
+            if phase_offsets is None:
+                phase_offsets = existing[lo]['phase_offsets']
+            if scaling is None:
+                scaling = existing[lo]['scaling']
+        
+        phase_steps_formatted = _format_phase_steps(phase_steps, r.mixer._phase_bp)
+        phase_offsets_formatted = _format_phase_offsets(phase_offsets, r.mixer._phase_offset_bp)
+        ri_steps_formatted = cplx2uint(ri_steps,r.mixer._n_ri_step_bits)
+        scaling_formatted = _format_amp_scale(scaling, r.mixer._n_scale_bits) 
+
+        n_tone = r.mixer.n_chans
+
+        if len(phase_steps_formatted) != n_tone:
+            phase_steps_formatted = np.concatenate([phase_steps_formatted, np.zeros(n_tone - len(phase_steps_formatted), dtype=phase_steps_formatted.dtype)])
+        if len(phase_offsets_formatted) != n_tone:
+            phase_offsets_formatted = np.concatenate([phase_offsets_formatted, np.zeros(n_tone - len(phase_offsets_formatted), dtype=phase_offsets_formatted.dtype)])
+        if len(ri_steps_formatted) != n_tone:
+            ri_steps_formatted = np.concatenate([ri_steps_formatted, np.zeros(n_tone - len(ri_steps_formatted), dtype=ri_steps_formatted.dtype)])
+        if len(scaling_formatted) != n_tone:
+            scaling_formatted = np.concatenate([scaling_formatted, np.zeros(n_tone - len(scaling_formatted), dtype=scaling_formatted.dtype)])
+        
+        v[lo] = np.zeros(int(np.ceil(n_tone / r.mixer._n_parallel_chans)) * r.mixer._CONTROL_N_WORDS, dtype='>u4')
+        for i in range(min(r.mixer._n_parallel_chans, n_tone)):
+            v[lo][r.mixer._SCALE_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = scaling_formatted[i::r.mixer._n_parallel_chans]
+            v[lo][r.mixer._PHASE_INC_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = phase_steps_formatted[i::r.mixer._n_parallel_chans]
+            v[lo][r.mixer._PHASE_OFFSET_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = phase_offsets_formatted[i::r.mixer._n_parallel_chans]
+            v[lo][r.mixer._RI_STEP_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = ri_steps_formatted[i::r.mixer._n_parallel_chans]
+    return v
+    
+def prepare_control_buffer_data_fast(r,buf,lo_control_values):
+    """
+    faster version of prepare_control_buffer
+    not yet implemented
+    """
+    return prepare_control_buffer_data(r,buf,lo_control_values)
+
+def write_control_buffer_data(r,buf,v):
+    """
+    Write a formatted control buffer to the firmware.
+    Parameters:
+    r: readout object
+    buf: int, index of buffer to write to, 0 or 1.
+    v: numpy array of the formatted control buffer.
+    
+    """
+    n_tone = r.mixer.n_chans
+    if buf not in [0,1]:
+        raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
+    for lo in ['tx','rx']:    
+        for i in range(min(r.mixer._n_parallel_chans, n_tone)):
+            reg = f'{lo}_lo{i}_control'
+            offset = 4 * r.mixer._CONTROL_N_WORDS * (buf * r.mixer._n_serial_chans + i)
+            r.mixer.write(reg, v[lo].tobytes(),offset=offset)
+    return
+
+def write_control_buffer_data_fast(r_fast,buf,v):
+    """
+    Write a formatted control buffer to the firmware.
+    Parameters:
+    r: readout object
+    buf: int, index of buffer to write to, 0 or 1.
+    v: numpy array of the formatted control buffer.
+    
+    """
+    n_tone = r_fast.mixer.n_chans
+    if buf not in [0,1]:
+        raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
+    for lo in ['tx','rx']:    
+        start=0x80000 if lo=='rx' else 0x90000
+        start+= 0x8000*buf
+        length=0x8000
+        r_fast.mixer.host.transport.axil_mm[int(start):int(start+length)] = v[lo].astype('<u4').tobytes()
+    return
+        
+
+def write_to_current_control_buffer(r,formatted_lo_control_values):
+    """
+    Write pre-formatted values to the current lo control buffer.
+
+    Parameters:
+    r: readout object
+    formatted_lo_control_values: dictionary with keys 'tx' and 'rx'
+     - 'tx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling'
+     - 'rx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling'
+
+    """
+    # Get the current buffer index
+    buf = r.mixer.get_current_buffer()
+    if buf is None:
+        raise RuntimeError('No current buffer found in mixer, cannot write frequencies')
+    # Write to the current buffer
+    write_control_buffer_data(r,buf,formatted_lo_control_values)
+
+def write_to_next_control_buffer(r,formatted_lo_control_values):
+    """
+    Write values to the next lo control buffer.
+
+    Parameters:
+    r: readout object
+    formatted_lo_control_values: dictionary with keys 'tx' and 'rx'
+     - 'tx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling'
+     - 'rx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling'
+    # Note that this will not be applied until the buffer is switched.
+    # This is useful for preparing the next buffer while the current one is being used.
+    """
+    # Get the next buffer index
+    buf = r.mixer.get_current_buffer()
+    if buf is None:
+        raise RuntimeError('No next buffer found in mixer, cannot write frequencies')
+    next_buffer = (buf + 1) % 2
+    # Write to the next buffer
+    write_control_buffer_data(r,next_buffer,formatted_lo_control_values)
+
+def read_from_current_control_buffer(r,los=['tx','rx']):
+    """
+    Read the current lo control buffer, and return interepted values.
+
+    Parameters:
+    r: readout object
+    los: list of strings, either 'tx' or 'rx' to read the control values for the respective LO
+
+    Returns a dictionary of the lo control values with the following keys:
+    - 'tx': dictionary with keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+    - 'rx': dictionary with keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+    Each of these keys contains a numpy array with the values for each tone.
+    
+    """
+    buf = r.mixer.get_current_buffer()
+    if buf is None:
+        raise RuntimeError('No current buffer found in mixer, cannot read frequencies')
+    return interpret_raw_control_buffer_data(r,read_raw_control_buffer_data(r,buf,los=los))
+
+def read_from_next_control_buffer(r,los=['tx','rx']):
+    """
+    Read the next lo control buffer, and return interepted values.
+
+    Parameters:
+    r: readout object
+    los: list of strings, either 'tx' or 'rx' to read the control values for the respective LO
+    Returns a dictionary of the lo control values with the following
+    keys:
+    - 'tx': dictionary with keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+    - 'rx': dictionary with keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+    Each of these keys contains a numpy array with the values for each tone.
+    
+    """
+    buf = r.mixer.get_current_buffer()
+    if buf is None:
+        raise RuntimeError('No next buffer found in mixer, cannot read frequencies')
+    next_buffer = (buf + 1) % 2
+    return interpret_raw_control_buffer_data(r,read_raw_control_buffer_data(r,next_buffer,los=los))
+
+
+def switch_control_buffer(r):
+    """
+    Switch the current lo control buffer.
+
+    Parameters:
+    r: readout object
+
+    """
+    buf = r.mixer.get_current_buffer()
+    next_buffer = (buf + 1) % 2
+    r.mixer.set_current_buffer(next_buffer)
+    return next_buffer
+
+def set_control_buffer_idx(r,buf):
+    """
+    Set the current lo control buffer.
+
+    Parameters:
+    r: readout object
+    buf: int, index of buffer to set, 0 or 1.
+
+    """
+    if buf not in [0,1]:
+        raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
+    r.mixer.set_current_buffer(buf)
+    return buf
+
+def set_control_buffer_idx_fast(r_fast,buf):
+    """
+    Set the current lo control buffer.
+
+    Parameters:
+    r: readout object
+    buf: int, index of buffer to set, 0 or 1.
+
+    """
+    r_fast.mixer.set_current_buffer(buf)
+    return
+
+
+def get_control_buffer_idx(r):
+    """
+    Get the index of the current control buffer
+    Parameters:
+    r: readout object
+    Returns:
+    buf: int, index of current buffer, 0 or 1.
+
+    """
+    buf = r.mixer.get_current_buffer()
+    if buf is None:
+        raise RuntimeError('No current buffer found in mixer, cannot read frequencies')
+    return buf
+
+def get_next_buffer_idx(r):
+    """
+    Get the index of the next control buffer
+    Parameters:
+    r: readout object
+    Returns:
+    buf: int, index of next buffer, 0 or 1.
+
+    """
+    buf = r.mixer.get_current_buffer()
+    if buf is None:
+        raise RuntimeError('No current buffer found in mixer, cannot read frequencies')
+    next_buffer = (buf + 1) % 2
+    return next_buffer
+
 
 def get_tone_frequencies(r, config_dict, detailed_output=False):
     """
@@ -625,20 +1056,28 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
         print(bcolors.FAIL+'CRITICAL WARNING, misconfigured ADC tile/block, nyquist zone not found, assuming zone 1'+bcolors.ENDC)
         adc_nyquist_zone = 1
 
-
-
-    #read mixer lo phase_increment values
-    phase_inc_tx   = np.frombuffer(r.mixer.read(f'tx_lo{p}_phase_inc',4*nc),dtype='>i4')
-    phase_inc_rx   = np.frombuffer(r.mixer.read(f'rx_lo{p}_phase_inc',4*nc),dtype='>i4')
-    phase_inc_tx   = _invert_format_phase_steps(phase_inc_tx,r.mixer._phase_bp)
-    phase_inc_rx   = _invert_format_phase_steps(phase_inc_rx,r.mixer._phase_bp)
     
-    #read mixer lo ri_step values
-    ri_steps_tx    = np.frombuffer(r.mixer.read(f'tx_lo{p}_ri_step',4*nc),dtype='>u4')
-    ri_steps_rx    = np.frombuffer(r.mixer.read(f'rx_lo{p}_ri_step',4*nc),dtype='>u4')
-    ri_steps_tx    = uint2cplx(ri_steps_tx, r.mixer._n_ri_step_bits)
-    ri_steps_rx    = uint2cplx(ri_steps_rx, r.mixer._n_ri_step_bits)
+    # moved to single control buffer in v7.5
+    # #read mixer lo phase_increment values
+    # phase_inc_tx   = np.frombuffer(r.mixer.read(f'tx_lo{p}_phase_inc',4*nc),dtype='>i4')
+    # phase_inc_rx   = np.frombuffer(r.mixer.read(f'rx_lo{p}_phase_inc',4*nc),dtype='>i4')
+    # phase_inc_tx   = _invert_format_phase_steps(phase_inc_tx,r.mixer._phase_bp)
+    # phase_inc_rx   = _invert_format_phase_steps(phase_inc_rx,r.mixer._phase_bp)
     
+    # #read mixer lo ri_step values
+    # ri_steps_tx    = np.frombuffer(r.mixer.read(f'tx_lo{p}_ri_step',4*nc),dtype='>u4')
+    # ri_steps_rx    = np.frombuffer(r.mixer.read(f'rx_lo{p}_ri_step',4*nc),dtype='>u4')
+    # ri_steps_tx    = uint2cplx(ri_steps_tx, r.mixer._n_ri_step_bits)
+    # ri_steps_rx    = uint2cplx(ri_steps_rx, r.mixer._n_ri_step_bits)
+    
+
+    lo_control_values = read_from_current_control_buffer(r)
+
+    phase_inc_tx = lo_control_values['tx']['phase_steps']
+    phase_inc_rx = lo_control_values['rx']['phase_steps']
+    ri_steps_tx = lo_control_values['tx']['ri_steps']
+    ri_steps_rx = lo_control_values['rx']['ri_steps']
+
     #convert to ri_steps to phase angles
     phase_steps_tx = np.angle(ri_steps_tx)
     phase_steps_rx = np.angle(ri_steps_rx)
@@ -827,23 +1266,36 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies):
     ri_steps_tx = np.cos(phase_incs_tx) + 1j*np.sin(phase_incs_tx)
     ri_steps_rx = np.cos(phase_incs_rx) + 1j*np.sin(phase_incs_rx)
     
-    #format the phase increments and ri steps for the mixer LOs
-    phase_incs_tx_formatted = _format_phase_steps(phase_incs_tx,r.mixer._phase_bp)
-    phase_incs_rx_formatted = _format_phase_steps(phase_incs_rx,r.mixer._phase_bp)
-    ri_steps_tx_formatted = cplx2uint(ri_steps_tx, r.mixer._n_ri_step_bits)
-    ri_steps_rx_formatted = cplx2uint(ri_steps_rx, r.mixer._n_ri_step_bits)
+    #prepare the formatted lo control buffer values
+    buf = get_next_buffer_idx(r)
+    v = prepare_control_buffer_data(r,buf,{'tx':{'phase_steps':phase_incs_tx,
+                                            'ri_steps':ri_steps_tx},
+                                      'rx':{'phase_steps':phase_incs_rx,
+                                            'ri_steps':ri_steps_rx}})
+    
+    # phase_incs_tx_formatted = _format_phase_steps(phase_incs_tx,r.mixer._phase_bp)
+    # phase_incs_rx_formatted = _format_phase_steps(phase_incs_rx,r.mixer._phase_bp)
+    # ri_steps_tx_formatted = cplx2uint(ri_steps_tx, r.mixer._n_ri_step_bits)
+    # ri_steps_rx_formatted = cplx2uint(ri_steps_rx, r.mixer._n_ri_step_bits)
 
     #set the filterbank channel maps
     chanmap_psb[tx_nearest_bins] = channels
     chanmap_pfb[channels] = rx_nearest_bins
 
-    tone_settings_dict = {'phase_incs_tx_formatted':phase_incs_tx_formatted,
-                         'phase_incs_rx_formatted':phase_incs_rx_formatted,
-                         'ri_steps_tx_formatted':ri_steps_tx_formatted,
-                         'ri_steps_rx_formatted':ri_steps_rx_formatted,
-                         'chanmap_psb':chanmap_psb,
-                         'chanmap_pfb':chanmap_pfb,
-                         'num_tones':num_tones}
+    # tone_settings_dict = {'phase_incs_tx_formatted':phase_incs_tx_formatted,
+    #                       'phase_incs_rx_formatted':phase_incs_rx_formatted,
+    #                       'ri_steps_tx_formatted':ri_steps_tx_formatted,
+    #                       'ri_steps_rx_formatted':ri_steps_rx_formatted,
+    #                       'chanmap_psb':chanmap_psb,
+    #                       'chanmap_pfb':chanmap_pfb,
+    #                       'num_tones':num_tones}
+    
+    tone_settings_dict = {'control_buffer_data':v,
+                          'control_buffer_index':buf,
+                          'chanmap_psb':chanmap_psb,
+                          'chanmap_pfb':chanmap_pfb,
+                          'num_tones':num_tones}
+
     
     details = {'tx':{},'rx':{},'num_tones':num_tones}
     details['tx']['digital_baseband_freq'] = dbb_freqs_tx.tolist()
@@ -867,41 +1319,51 @@ def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True):
     Keys in the dictionary may be:
     'phase_incs_tx', 'phase_incs_rx', 'ri_steps_tx', 'ri_steps_rx', 'chanmap_psb', 'chanmap_pfb', 'num_tones
     """
-    phase_incs_tx = tone_settings_dict.get('phase_incs_tx_formatted')
-    phase_incs_rx = tone_settings_dict.get('phase_incs_rx_formatted')
-    ri_steps_tx   = tone_settings_dict.get('ri_steps_tx_formatted')
-    ri_steps_rx   = tone_settings_dict.get('ri_steps_rx_formatted')
+    # phase_incs_tx = tone_settings_dict.get('phase_incs_tx_formatted')
+    # phase_incs_rx = tone_settings_dict.get('phase_incs_rx_formatted')
+    # ri_steps_tx   = tone_settings_dict.get('ri_steps_tx_formatted')
+    # ri_steps_rx   = tone_settings_dict.get('ri_steps_rx_formatted')
+    # phase_offsets_tx = tone_settings_dict.get('phase_offsets_tx_formatted')
+    # phase_offsets_rx = tone_settings_dict.get('phase_offsets_rx_formatted')
+    # scaling_tx = tone_settings_dict.get('scaling_tx_formatted')
+    # scaling_rx = tone_settings_dict.get('scaling_rx_formatted')
+
+    v = tone_settings_dict.get('control_buffer_data')
+    buf = tone_settings_dict.get('control_buffer_index')
     chanmap_psb   = tone_settings_dict.get('chanmap_psb')
     chanmap_pfb   = tone_settings_dict.get('chanmap_pfb')
     num_tones     = tone_settings_dict.get('num_tones')
 
     if num_tones is None:
-        num_tones = max((len(phase_incs_tx),len(phase_incs_tx),len(ri_steps_tx),len(ri_steps_tx),))
+        # num_tones = max((len(phase_incs_tx),len(phase_incs_tx),len(ri_steps_tx),len(ri_steps_tx),))
+        num_tones = r.mixer.n_chans
 
     if not chanmap_psb is None:
         r.psb_chanselect.set_channel_outmap(np.copy(chanmap_psb))
     if not chanmap_pfb is None:
         r.chanselect.set_channel_outmap(np.copy(chanmap_pfb))
 
-    for i in range(min(r.mixer._n_parallel_chans, num_tones)):   
-        if not phase_incs_tx is None:
-            r.mixer.write(f'tx_lo{i}_phase_inc', phase_incs_tx[i::r.mixer._n_parallel_chans].tobytes())
-        if not ri_steps_tx is None:
-            r.mixer.write(f'tx_lo{i}_ri_step',     ri_steps_tx[i::r.mixer._n_parallel_chans].tobytes())
-        if not phase_incs_rx is None:
-            r.mixer.write(f'rx_lo{i}_phase_inc', phase_incs_rx[i::r.mixer._n_parallel_chans].tobytes())
-        if not ri_steps_rx is None:
-            r.mixer.write(f'rx_lo{i}_ri_step',     ri_steps_rx[i::r.mixer._n_parallel_chans].tobytes())
+    # for i in range(min(r.mixer._n_parallel_chans, num_tones)):   
+    #     if not phase_incs_tx is None:
+    #         r.mixer.write(f'tx_lo{i}_phase_inc', phase_incs_tx[i::r.mixer._n_parallel_chans].tobytes())
+    #     if not ri_steps_tx is None:
+    #         r.mixer.write(f'tx_lo{i}_ri_step',     ri_steps_tx[i::r.mixer._n_parallel_chans].tobytes())
+    #     if not phase_incs_rx is None:
+    #         r.mixer.write(f'rx_lo{i}_phase_inc', phase_incs_rx[i::r.mixer._n_parallel_chans].tobytes())
+    #     if not ri_steps_rx is None:
+    #         r.mixer.write(f'rx_lo{i}_ri_step',     ri_steps_rx[i::r.mixer._n_parallel_chans].tobytes())
     
-    if autosync:
-        # time.sleep(autosync_time_delay)
-        r.sync.arm_sync(wait=False)
-        time.sleep(autosync_time_delay)
-        r.sync.sw_sync()
+    # if autosync:
+    #     # time.sleep(autosync_time_delay)
+    #     r.sync.arm_sync(wait=False)
+    #     time.sleep(autosync_time_delay)
+    #     r.sync.sw_sync()
 
+    write_control_buffer_data(r,buf,v)
+    set_control_buffer_idx(r,buf)
     return
 
-def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,detailed_output=False):
+def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, detailed_output=False):
     """
     Prepare the tone frequency settings for applying to the RFSOC.
 
@@ -1004,30 +1466,38 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,detail
     ri_steps_tx = np.cos(phase_incs_tx) + 1j*np.sin(phase_incs_tx)
     ri_steps_rx = np.cos(phase_incs_rx) + 1j*np.sin(phase_incs_rx)
     
-    #zero pad out to nchans
-    phase_incs_tx = np.pad(phase_incs_tx, (0,nc-len(phase_incs_tx)), 'constant', constant_values=(0,0))
-    phase_incs_rx = np.pad(phase_incs_rx, (0,nc-len(phase_incs_rx)), 'constant', constant_values=(0,0))
-    ri_steps_tx = np.pad(ri_steps_tx, (0,nc-len(ri_steps_tx)), 'constant', constant_values=(0,0))
-    ri_steps_rx = np.pad(ri_steps_rx, (0,nc-len(ri_steps_rx)), 'constant', constant_values=(0,0))
+    # #zero pad out to nchans
+    # phase_incs_tx = np.pad(phase_incs_tx, (0,nc-len(phase_incs_tx)), 'constant', constant_values=(0,0))
+    # phase_incs_rx = np.pad(phase_incs_rx, (0,nc-len(phase_incs_rx)), 'constant', constant_values=(0,0))
+    # ri_steps_tx = np.pad(ri_steps_tx, (0,nc-len(ri_steps_tx)), 'constant', constant_values=(0,0))
+    # ri_steps_rx = np.pad(ri_steps_rx, (0,nc-len(ri_steps_rx)), 'constant', constant_values=(0,0))
 
-
-    #format the phase increments and ri steps for the mixer LOs
-    phase_incs_tx_formatted = _format_phase_steps(phase_incs_tx,r.mixer._phase_bp,fmt='<i4')
-    phase_incs_rx_formatted = _format_phase_steps(phase_incs_rx,r.mixer._phase_bp,fmt='<i4')
-    ri_steps_tx_formatted = cplx2uint(ri_steps_tx, r.mixer._n_ri_step_bits,fmt='<u4')
-    ri_steps_rx_formatted = cplx2uint(ri_steps_rx, r.mixer._n_ri_step_bits,fmt='<u4')
+    v = prepare_control_buffer_data_fast(r,0,{'tx':{'phase_steps':phase_incs_tx,
+                                            'ri_steps':ri_steps_tx},
+                                      'rx':{'phase_steps':phase_incs_rx,
+                                            'ri_steps':ri_steps_rx}})
+    # #format the phase increments and ri steps for the mixer LOs
+    # phase_incs_tx_formatted = _format_phase_steps(phase_incs_tx,r.mixer._phase_bp,fmt='<i4')
+    # phase_incs_rx_formatted = _format_phase_steps(phase_incs_rx,r.mixer._phase_bp,fmt='<i4')
+    # ri_steps_tx_formatted = cplx2uint(ri_steps_tx, r.mixer._n_ri_step_bits,fmt='<u4')
+    # ri_steps_rx_formatted = cplx2uint(ri_steps_rx, r.mixer._n_ri_step_bits,fmt='<u4')
 
     #set the filterbank channel maps
     chanmap_psb[tx_nearest_bins] = channels
     chanmap_pfb[channels] = rx_nearest_bins
 
-    tone_settings_dict = {'phase_incs_tx_formatted':phase_incs_tx_formatted,
-                         'phase_incs_rx_formatted':phase_incs_rx_formatted,
-                         'ri_steps_tx_formatted':ri_steps_tx_formatted,
-                         'ri_steps_rx_formatted':ri_steps_rx_formatted,
-                         'chanmap_psb':chanmap_psb,
-                         'chanmap_pfb':chanmap_pfb,
-                         'num_tones':num_tones}
+    # tone_settings_dict = {'phase_incs_tx_formatted':phase_incs_tx_formatted,
+    #                      'phase_incs_rx_formatted':phase_incs_rx_formatted,
+    #                      'ri_steps_tx_formatted':ri_steps_tx_formatted,
+    #                      'ri_steps_rx_formatted':ri_steps_rx_formatted,
+    #                      'chanmap_psb':chanmap_psb,
+    #                      'chanmap_pfb':chanmap_pfb,
+    #                      'num_tones':num_tones}
+    tone_settings_dict = {'control_buffer_data':v,
+                            'control_buffer_index':0,
+                            'chanmap_psb':chanmap_psb,
+                            'chanmap_pfb':chanmap_pfb,
+                            'num_tones':num_tones}
     
     if detailed_output:
         details = {'tx':{},'rx':{},'num_tones':num_tones}
@@ -1048,7 +1518,7 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,detail
         return tone_settings_dict
 
 
-def prepare_sweep_settings_fast(r, config_dict, sweep_frequencies, detailed_output=False):
+def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, detailed_output=False):
     num_points,num_tones = sweep_frequencies.shape
     channels = np.arange(num_tones)
     points = np.arange(num_points)
@@ -1070,33 +1540,34 @@ def prepare_sweep_settings_fast(r, config_dict, sweep_frequencies, detailed_outp
     adc_nyquist_zone = config_dict['firmware']['defaults']['nyquist_zone']
 
     #constants
-    nc = r.mixer.n_chans
-    fft_period_s = r.mixer._n_upstream_chans / r.mixer._upstream_oversample_factor / r.adc_clk_hz
+    nc = r_fast.mixer.n_chans
+    fft_period_s = r_fast.mixer._n_upstream_chans / r_fast.mixer._upstream_oversample_factor / r_fast.adc_clk_hz
     fft_rbw_hz = 1./fft_period_s
     fft_tx_nbins = 2 * N_TX_FFT
     fft_rx_nbins = N_RX_FFT
-    all_tx_bin_centers_hz = np.fft.fftfreq(fft_tx_nbins, 1. / r.adc_clk_hz)
-    all_rx_bin_centers_hz = np.fft.fftfreq(fft_rx_nbins, 1. / r.adc_clk_hz)
+    all_tx_bin_centers_hz = np.fft.fftfreq(fft_tx_nbins, 1. / r_fast.adc_clk_hz)
+    all_rx_bin_centers_hz = np.fft.fftfreq(fft_rx_nbins, 1. / r_fast.adc_clk_hz)
 
-    chanmap_psb = np.full((num_points,r.psb_chanselect.n_chans_out), -1, dtype=int)
-    chanmap_pfb  = np.full((num_points,r.chanselect.n_chans_out), -1, dtype=int)
+    chanmap_psb = np.full((num_points,r_fast.psb_chanselect.n_chans_out), -1, dtype=int)
+    chanmap_pfb  = np.full((num_points,r_fast.chanselect.n_chans_out), -1, dtype=int)
 
     skip_chanmap_psb=np.zeros(num_points,dtype=bool)
     skip_chanmap_pfb=np.zeros(num_points,dtype=bool)
 
-    phase_incs_tx_formatted_padded = np.zeros((num_points,nc),dtype='<i4')+32767
-    phase_incs_rx_formatted_padded = np.zeros((num_points,nc),dtype='<i4')+32767
-    ri_steps_tx_formatted_padded = np.zeros((num_points,nc),dtype='<u4')+65535
-    ri_steps_rx_formatted_padded = np.zeros((num_points,nc),dtype='<u4')+65535
-    
+    # phase_incs_tx_formatted_padded = np.zeros((num_points,nc),dtype='<i4')+32767
+    # phase_incs_rx_formatted_padded = np.zeros((num_points,nc),dtype='<i4')+32767
+    # ri_steps_tx_formatted_padded = np.zeros((num_points,nc),dtype='<u4')+65535
+    # ri_steps_rx_formatted_padded = np.zeros((num_points,nc),dtype='<u4')+65535
+        
+
     #get the DAC/ADC analog frequencies given any analog up/down conversion
     #get the DAC/ADC analog frequencies given any analog up/down conversion
     if udc_connected:
-        dac_out_freqs = (tone_frequencies - udc_lo_frequency) / udc_sideband
-        adc_in_freqs = (tone_frequencies - udc_lo_frequency) / udc_sideband
+        dac_out_freqs = (sweep_frequencies - udc_lo_frequency) / udc_sideband
+        adc_in_freqs = (sweep_frequencies - udc_lo_frequency) / udc_sideband
     else:
-        dac_out_freqs = tone_frequencies
-        adc_in_freqs = tone_frequencies
+        dac_out_freqs = sweep_frequencies
+        adc_in_freqs = sweep_frequencies
 
     duc_freqs = dac_out_freqs
     ddc_freqs = adc_in_freqs
@@ -1147,18 +1618,18 @@ def prepare_sweep_settings_fast(r, config_dict, sweep_frequencies, detailed_outp
     #         rx_freq_offsets_hz[p,c] = dbb_freqs_rx[p,c] - all_rx_bin_centers_hz[rx_nearest_bins[p,c]]
 
     # get the nearest filterbank center frequencies for each tone
-    tx_nearest_bins =  np.round(np.clip(dbb_freqs_tx/r.adc_clk_hz*fft_tx_nbins,-fft_tx_nbins/2,fft_tx_nbins/2-1)).astype(int)
+    tx_nearest_bins =  np.round(np.clip(dbb_freqs_tx/r_fast.adc_clk_hz*fft_tx_nbins,-fft_tx_nbins/2,fft_tx_nbins/2-1)).astype(int)
     tx_neg_bins = tx_nearest_bins<0
     tx_nearest_bins[tx_neg_bins] += fft_tx_nbins
-    rx_nearest_bins =  np.round(np.clip(dbb_freqs_rx/r.adc_clk_hz*fft_rx_nbins,-fft_rx_nbins/2,fft_rx_nbins/2-1)).astype(int)
+    rx_nearest_bins =  np.round(np.clip(dbb_freqs_rx/r_fast.adc_clk_hz*fft_rx_nbins,-fft_rx_nbins/2,fft_rx_nbins/2-1)).astype(int)
     rx_neg_bins = rx_nearest_bins<0
     rx_nearest_bins[rx_neg_bins] += fft_rx_nbins
         
     # #get the offsets between the digital baseband and the filterbank center frequencies
-    tx_freq_offsets_hz = dbb_freqs_tx - tx_nearest_bins/fft_tx_nbins*r.adc_clk_hz
-    tx_freq_offsets_hz[tx_neg_bins] += r.adc_clk_hz
-    rx_freq_offsets_hz = dbb_freqs_rx - rx_nearest_bins/fft_rx_nbins*r.adc_clk_hz
-    rx_freq_offsets_hz[rx_neg_bins] += r.adc_clk_hz
+    tx_freq_offsets_hz = dbb_freqs_tx - tx_nearest_bins/fft_tx_nbins*r_fast.adc_clk_hz
+    tx_freq_offsets_hz[tx_neg_bins] += r_fast.adc_clk_hz
+    rx_freq_offsets_hz = dbb_freqs_rx - rx_nearest_bins/fft_rx_nbins*r_fast.adc_clk_hz
+    rx_freq_offsets_hz[rx_neg_bins] += r_fast.adc_clk_hz
 
     #get the phase increments and ri steps for the mixer LOs
     phase_incs_tx = tx_freq_offsets_hz / fft_rbw_hz * 2 * np.pi
@@ -1168,19 +1639,39 @@ def prepare_sweep_settings_fast(r, config_dict, sweep_frequencies, detailed_outp
     # ri_steps_tx = np.exp(1j*phase_incs_tx)
     # ri_steps_rx = np.exp(1j*phase_incs_rx)
     
-    #format the phase increments and ri steps for the mixer LOs
-    phase_incs_tx_formatted = _format_phase_steps(phase_incs_tx,r.mixer._phase_bp,fmt='<i4')
-    phase_incs_rx_formatted = _format_phase_steps(phase_incs_rx,r.mixer._phase_bp,fmt='<i4')
-    ri_steps_tx_formatted = cplx2uint(ri_steps_tx, r.mixer._n_ri_step_bits,fmt='<u4')
-    ri_steps_rx_formatted = cplx2uint(ri_steps_rx, r.mixer._n_ri_step_bits,fmt='<u4')
+    print('phase_incs_tx',phase_incs_tx.shape,'\n',phase_incs_tx)
+    print('phase_incs_rx',phase_incs_rx.shape,'\n',phase_incs_rx)
+    print('ri_steps_tx',ri_steps_tx.shape,'\n',ri_steps_tx)
+    print('ri_steps_rx',ri_steps_rx.shape,'\n',ri_steps_rx)
+
+    # #format the phase increments and ri steps for the mixer LOs
+    # phase_incs_tx_formatted = _format_phase_steps(phase_incs_tx,r.mixer._phase_bp,fmt='<i4')
+    # phase_incs_rx_formatted = _format_phase_steps(phase_incs_rx,r.mixer._phase_bp,fmt='<i4')
+    # ri_steps_tx_formatted = cplx2uint(ri_steps_tx, r.mixer._n_ri_step_bits,fmt='<u4')
+    # ri_steps_rx_formatted = cplx2uint(ri_steps_rx, r.mixer._n_ri_step_bits,fmt='<u4')
+
+    
+    # v0 = prepare_control_buffer_data_fast(r,0,{'tx':{'phase_steps':phase_incs_tx[0],
+    #                                         'ri_steps':ri_steps_tx[0]},
+    #                                   'rx':{'phase_steps':phase_incs_rx[0],
+    #                                         'ri_steps':ri_steps_rx[0]}})
+    
+    # allv = np.zeros((num_points, len(v0)),dtype=v0.dtype)
+    allv={}
+    allbuf = np.zeros((num_points,),dtype=int)
+    allbuf[1::2] = 1
 
     for p in points:
-        #zero pad out to nchans for the fast write
-        phase_incs_tx_formatted_padded[p,:len(phase_incs_tx_formatted[p])] = phase_incs_tx_formatted[p]
-        phase_incs_rx_formatted_padded[p,:len(phase_incs_rx_formatted[p])] = phase_incs_rx_formatted[p]
-        ri_steps_tx_formatted_padded[p,:len(ri_steps_tx_formatted[p])] = ri_steps_tx_formatted[p]
-        ri_steps_rx_formatted_padded[p,:len(ri_steps_rx_formatted[p])] = ri_steps_rx_formatted[p]
-
+        # #zero pad out to nchans for the fast write
+        # phase_incs_tx_formatted_padded[p,:len(phase_incs_tx_formatted[p])] = phase_incs_tx_formatted[p]
+        # phase_incs_rx_formatted_padded[p,:len(phase_incs_rx_formatted[p])] = phase_incs_rx_formatted[p]
+        # ri_steps_tx_formatted_padded[p,:len(ri_steps_tx_formatted[p])] = ri_steps_tx_formatted[p]
+        # ri_steps_rx_formatted_padded[p,:len(ri_steps_rx_formatted[p])] = ri_steps_rx_formatted[p]
+        print('prep_sweep, prep_buf',p)
+        allv[p] = prepare_control_buffer_data_fast(r_fast,allbuf[p],{'tx':{'phase_steps':phase_incs_tx[p],
+                                            'ri_steps':ri_steps_tx[p]},
+                                            'rx':{'phase_steps':phase_incs_rx[p],
+                                            'ri_steps':ri_steps_rx[p]}})
         #set the filterbank channel maps
         chanmap_psb[p,tx_nearest_bins[p]] = channels
         chanmap_pfb[p,channels] = rx_nearest_bins[p]
@@ -1193,23 +1684,34 @@ def prepare_sweep_settings_fast(r, config_dict, sweep_frequencies, detailed_outp
         if (chanmap_pfb[p] == chanmap_pfb[p-1]).all():
             skip_chanmap_pfb[p]=True
 
-    sweep_settings_dict = {'phase_incs_tx_formatted':phase_incs_tx_formatted_padded,
-                         'phase_incs_rx_formatted':phase_incs_rx_formatted_padded,
-                         'ri_steps_tx_formatted':ri_steps_tx_formatted_padded,
-                         'ri_steps_rx_formatted':ri_steps_rx_formatted_padded,
-                         'chanmap_psb':chanmap_psb,
-                         'chanmap_pfb':chanmap_pfb,
-                         'skip_chanmap_psb':skip_chanmap_psb,
-                         'skip_chanmap_pfb':skip_chanmap_pfb,
-                         'num_tones':num_tones}
+    # sweep_settings_dict = {'phase_incs_tx_formatted':phase_incs_tx_formatted_padded,
+    #                      'phase_incs_rx_formatted':phase_incs_rx_formatted_padded,
+    #                      'ri_steps_tx_formatted':ri_steps_tx_formatted_padded,
+    #                      'ri_steps_rx_formatted':ri_steps_rx_formatted_padded,
+    #                      'chanmap_psb':chanmap_psb,
+    #                      'chanmap_pfb':chanmap_pfb,
+    #                      'skip_chanmap_psb':skip_chanmap_psb,
+    #                      'skip_chanmap_pfb':skip_chanmap_pfb,
+    #                      'num_tones':num_tones}
+
+    sweep_settings_dict = {'control_buffer_data':allv,
+                            'control_buffer_index':allbuf,
+                            'chanmap_psb':chanmap_psb,
+                            'chanmap_pfb':chanmap_pfb,
+                            'skip_chanmap_psb':skip_chanmap_psb,
+                            'skip_chanmap_pfb':skip_chanmap_pfb,
+                            'num_tones':num_tones}
 
     return sweep_settings_dict
 
 def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
-    phase_incs_tx_formatted = sweep_settings.get('phase_incs_tx_formatted')
-    phase_incs_rx_formatted = sweep_settings.get('phase_incs_rx_formatted')
-    ri_steps_tx_formatted   = sweep_settings.get('ri_steps_tx_formatted')
-    ri_steps_rx_formatted   = sweep_settings.get('ri_steps_rx_formatted')
+    # phase_incs_tx_formatted = sweep_settings.get('phase_incs_tx_formatted')
+    # phase_incs_rx_formatted = sweep_settings.get('phase_incs_rx_formatted')
+    # ri_steps_tx_formatted   = sweep_settings.get('ri_steps_tx_formatted')
+    # ri_steps_rx_formatted   = sweep_settings.get('ri_steps_rx_formatted')
+    print('apply_step', step_index)
+    allv= sweep_settings.get('control_buffer_data')
+    allbuf = sweep_settings.get('control_buffer_index')
     chanmap_psb   = sweep_settings.get('chanmap_psb')
     chanmap_pfb   = sweep_settings.get('chanmap_pfb')
     skip_chanmap_psb = sweep_settings.get('skip_chanmap_psb')
@@ -1219,13 +1721,15 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
     c1=not skip_chanmap_psb[step_index]
     c2=not skip_chanmap_pfb[step_index]
     if c1:
-        r.psb_chanselect.set_channel_outmap(np.copy(chanmap_psb[step_index]))
+        print('set chanmap 1 (out)')
+        r_fast.psb_chanselect.set_channel_outmap(np.copy(chanmap_psb[step_index]))
         # while not (r.psb_chanselect.get_channel_outmap()==chanmap_psb[step_index]).all():
         #     print('waiting for psb chanmap to update')
         #     time.sleep(0.001)
         # print('psb chanmap updated')
     if c2:
-        r.chanselect.set_channel_outmap(np.copy(chanmap_pfb[step_index]))
+        print('set chanmap 2 (in)')
+        r_fast.chanselect.set_channel_outmap(np.copy(chanmap_pfb[step_index]))
         # while not (r.chanselect.get_channel_outmap()==chanmap_pfb[step_index]).all():
         #     print('waiting for pfb chanmap to update')
         #     time.sleep(0.001)
@@ -1235,224 +1739,230 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
     #     r.sync.arm_sync(wait=False)
     #     time.sleep(1)
     #     r.sync.sw_sync()
+    print('apply_step, write_buf',step_index)
+    write_control_buffer_data_fast(r_fast,allbuf[step_index],allv[step_index])
+    
+    print('apply_step, set_buf',step_index)
+    set_control_buffer_idx_fast(r_fast,allbuf[step_index])
 
+    # fast_write_mixer(r_fast, 
+    #                   phase_incs_tx_formatted[step_index],
+    #                     phase_incs_rx_formatted[step_index],
+    #                       ri_steps_tx_formatted[step_index],
+    #                         ri_steps_rx_formatted[step_index])
 
-
-    fast_write_mixer(r_fast, 
-                      phase_incs_tx_formatted[step_index],
-                        phase_incs_rx_formatted[step_index],
-                          ri_steps_tx_formatted[step_index],
-                            ri_steps_rx_formatted[step_index])
-
-    if autosync:
-        # time.sleep(autosync_time_delay)
-        r_fast.sync.arm_sync(wait=False)
-        time.sleep(autosync_time_delay)
-        r_fast.sync.sw_sync()
+    # if autosync:
+    #     # time.sleep(autosync_time_delay)
+    #     r_fast.sync.arm_sync(wait=False)
+    #     time.sleep(autosync_time_delay)
+    #     r_fast.sync.sw_sync()
 
     return
 
-def get_bram_addresses_mixer(r_fast):
-    phase_addrs_tx = []
-    phase_addrs_rx = []
-    ri_step_addrs_tx = []
-    ri_step_addrs_rx = []
-    nbytes = r_fast.mixer._n_serial_chans * 4 # phases in 4 byte words
-    for i in range(r_fast.mixer._n_parallel_chans):
-        ramname = f'{r_fast.mixer.prefix}tx_lo{i}_phase_inc'
-        phase_addrs_tx += [r_fast.mixer.host.transport._get_device_address(ramname)]
-        ramname = f'{r_fast.mixer.prefix}rx_lo{i}_phase_inc'
-        phase_addrs_rx += [r_fast.mixer.host.transport._get_device_address(ramname)]
-        ramname = f'{r_fast.mixer.prefix}tx_lo{i}_ri_step'
-        ri_step_addrs_tx += [r_fast.mixer.host.transport._get_device_address(ramname)]
-        ramname = f'{r_fast.mixer.prefix}rx_lo{i}_ri_step'
-        ri_step_addrs_rx += [r_fast.mixer.host.transport._get_device_address(ramname)]
-    bram_addresses_mixer = {'phase_addrs_tx':phase_addrs_tx,
-                            'phase_addrs_rx':phase_addrs_rx,
-                            'ri_step_addrs_tx':ri_step_addrs_tx,
-                            'ri_step_addrs_rx':ri_step_addrs_rx,
-                            'nbytes':nbytes}
-    return bram_addresses_mixer
+# def get_bram_addresses_mixer(r_fast):
+#     phase_addrs_tx = []
+#     phase_addrs_rx = []
+#     ri_step_addrs_tx = []
+#     ri_step_addrs_rx = []
+#     nbytes = r_fast.mixer._n_serial_chans * 4 # phases in 4 byte words
+#     for i in range(r_fast.mixer._n_parallel_chans):
+#         ramname = f'{r_fast.mixer.prefix}tx_lo{i}_phase_inc'
+#         phase_addrs_tx += [r_fast.mixer.host.transport._get_device_address(ramname)]
+#         ramname = f'{r_fast.mixer.prefix}rx_lo{i}_phase_inc'
+#         phase_addrs_rx += [r_fast.mixer.host.transport._get_device_address(ramname)]
+#         ramname = f'{r_fast.mixer.prefix}tx_lo{i}_ri_step'
+#         ri_step_addrs_tx += [r_fast.mixer.host.transport._get_device_address(ramname)]
+#         ramname = f'{r_fast.mixer.prefix}rx_lo{i}_ri_step'
+#         ri_step_addrs_rx += [r_fast.mixer.host.transport._get_device_address(ramname)]
+#     bram_addresses_mixer = {'phase_addrs_tx':phase_addrs_tx,
+#                             'phase_addrs_rx':phase_addrs_rx,
+#                             'ri_step_addrs_tx':ri_step_addrs_tx,
+#                             'ri_step_addrs_rx':ri_step_addrs_rx,
+#                             'nbytes':nbytes}
+#     return bram_addresses_mixer
 
-def fast_write_mixer(r_fast, phase_incs_tx_formatted,phase_incs_rx_formatted,ri_steps_tx_formatted,ri_steps_rx_formatted):
+# def fast_write_mixer(r_fast, phase_incs_tx_formatted,phase_incs_rx_formatted,ri_steps_tx_formatted,ri_steps_rx_formatted):
 
-    if not hasattr(r_fast,'bram_addresses_mixer'):
-        r_fast.bram_addresses_mixer = get_bram_addresses_mixer(r_fast)
+#     if not hasattr(r_fast,'bram_addresses_mixer'):
+#         r_fast.bram_addresses_mixer = get_bram_addresses_mixer(r_fast)
 
-    phase_addrs_tx = r_fast.bram_addresses_mixer['phase_addrs_tx']
-    phase_addrs_rx = r_fast.bram_addresses_mixer['phase_addrs_rx']
-    ri_step_addrs_tx = r_fast.bram_addresses_mixer['ri_step_addrs_tx']
-    ri_step_addrs_rx = r_fast.bram_addresses_mixer['ri_step_addrs_rx']
-    nbytes = r_fast.bram_addresses_mixer['nbytes']
+#     phase_addrs_tx = r_fast.bram_addresses_mixer['phase_addrs_tx']
+#     phase_addrs_rx = r_fast.bram_addresses_mixer['phase_addrs_rx']
+#     ri_step_addrs_tx = r_fast.bram_addresses_mixer['ri_step_addrs_tx']
+#     ri_step_addrs_rx = r_fast.bram_addresses_mixer['ri_step_addrs_rx']
+#     nbytes = r_fast.bram_addresses_mixer['nbytes']
     
-    phase_incs_tx_formatted=phase_incs_tx_formatted.reshape(r_fast.mixer._n_parallel_chans, r_fast.mixer._n_serial_chans)
-    phase_incs_rx_formatted=phase_incs_rx_formatted.reshape(r_fast.mixer._n_parallel_chans, r_fast.mixer._n_serial_chans)
-    ri_steps_tx_formatted=ri_steps_tx_formatted.reshape(r_fast.mixer._n_parallel_chans, r_fast.mixer._n_serial_chans)
-    ri_steps_rx_formatted=ri_steps_rx_formatted.reshape(r_fast.mixer._n_parallel_chans, r_fast.mixer._n_serial_chans)
+#     phase_incs_tx_formatted=phase_incs_tx_formatted.reshape(r_fast.mixer._n_parallel_chans, r_fast.mixer._n_serial_chans)
+#     phase_incs_rx_formatted=phase_incs_rx_formatted.reshape(r_fast.mixer._n_parallel_chans, r_fast.mixer._n_serial_chans)
+#     ri_steps_tx_formatted=ri_steps_tx_formatted.reshape(r_fast.mixer._n_parallel_chans, r_fast.mixer._n_serial_chans)
+#     ri_steps_rx_formatted=ri_steps_rx_formatted.reshape(r_fast.mixer._n_parallel_chans, r_fast.mixer._n_serial_chans)
     
-    # Seemingly can't write more than 512 bytes in one go.
-    # Assume nbytes is a multiple of 512
-    # n_write = (nbytes // 512)
-    maxwrite=512
-    n_write = (nbytes // maxwrite)
-    write_idxs = np.arange(n_write)
-    readback_delay = 0.00001
-    max_retries = 1000
-    for i in range(len(phase_addrs_tx)):
-        phase_incs_tx_bytes = phase_incs_tx_formatted[i].tobytes()
-        phase_incs_rx_bytes = phase_incs_rx_formatted[i].tobytes()
-        ri_steps_tx_bytes = ri_steps_tx_formatted[i].tobytes()
-        ri_steps_rx_bytes = ri_steps_rx_formatted[i].tobytes()
-        for j in write_idxs:
-            raw = phase_incs_tx_bytes[j*maxwrite:(j+1)*maxwrite]
-            r_fast.mixer.host.transport.axil_mm[phase_addrs_tx[i]+j*maxwrite:phase_addrs_tx[i] +(j+1)*maxwrite] = raw
-            time.sleep(readback_delay)
-            ret = r_fast.mixer.host.transport.axil_mm[phase_addrs_tx[i]+j*maxwrite:phase_addrs_tx[i] +(j+1)*maxwrite]
-            retry_count=0
-            while ret!=raw:
-                #retry write
-                retry_count+=1
-                r_fast.mixer.host.transport.axil_mm[phase_addrs_tx[i]+j*maxwrite:phase_addrs_tx[i] +(j+1)*maxwrite] = raw
-                time.sleep(readback_delay*retry_count)
-                ret = r_fast.mixer.host.transport.axil_mm[phase_addrs_tx[i]+j*maxwrite:phase_addrs_tx[i] +(j+1)*maxwrite]
-                if retry_count>max_retries:
-                    raise IOError(f'Failed to write phase_incs_tx {j} to BRAM after {max_retries} tries')
-        for j in write_idxs:
-            raw = phase_incs_rx_bytes[j*maxwrite:(j+1)*maxwrite]
-            r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite] = raw
-            time.sleep(readback_delay)
-            ret = r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite]
-            retry_count=0
-            while ret!=raw:
-                #retry write
-                retry_count+=1
-                r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite] = raw
-                time.sleep(readback_delay*retry_count)
-                ret = r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite]
-                if retry_count>max_retries:
-                    raise IOError(f'Failed to write phase_incs_rx {j} to BRAM after {max_retries} tries')
-        for j in write_idxs:
-            raw = ri_steps_tx_bytes[j*maxwrite:(j+1)*maxwrite]
-            r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite] = raw
-            time.sleep(readback_delay)
-            ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite]
-            retry_count=0
-            while ret!=raw:
-                #retry write
-                retry_count+=1
-                r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite] = raw
-                time.sleep(readback_delay*retry_count)
-                ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite]
-                if retry_count>max_retries:
-                    raise IOError(f'Failed to write ri_steps_tx {j} to BRAM after {max_retries} tries')
-        for j in write_idxs:
-            raw = ri_steps_rx_bytes[j*maxwrite:(j+1)*maxwrite]
-            r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite] = raw
-            time.sleep(readback_delay)
-            ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite]
-            retry_count=0
-            while ret!=raw:
-                #retry write
-                retry_count+=1
-                r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite] = raw
-                time.sleep(readback_delay*retry_count)
-                ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite]
-                if retry_count>max_retries:
-                    raise IOError(f'Failed to write ri_steps_rx {j} to BRAM after {max_retries} tries')
+#     # Seemingly can't write more than 512 bytes in one go.
+#     # Assume nbytes is a multiple of 512
+#     # n_write = (nbytes // 512)
+#     maxwrite=512
+#     n_write = (nbytes // maxwrite)
+#     write_idxs = np.arange(n_write)
+#     readback_delay = 0.00001
+#     max_retries = 1000
+#     for i in range(len(phase_addrs_tx)):
+#         phase_incs_tx_bytes = phase_incs_tx_formatted[i].tobytes()
+#         phase_incs_rx_bytes = phase_incs_rx_formatted[i].tobytes()
+#         ri_steps_tx_bytes = ri_steps_tx_formatted[i].tobytes()
+#         ri_steps_rx_bytes = ri_steps_rx_formatted[i].tobytes()
+#         for j in write_idxs:
+#             raw = phase_incs_tx_bytes[j*maxwrite:(j+1)*maxwrite]
+#             r_fast.mixer.host.transport.axil_mm[phase_addrs_tx[i]+j*maxwrite:phase_addrs_tx[i] +(j+1)*maxwrite] = raw
+#             time.sleep(readback_delay)
+#             ret = r_fast.mixer.host.transport.axil_mm[phase_addrs_tx[i]+j*maxwrite:phase_addrs_tx[i] +(j+1)*maxwrite]
+#             retry_count=0
+#             while ret!=raw:
+#                 #retry write
+#                 retry_count+=1
+#                 r_fast.mixer.host.transport.axil_mm[phase_addrs_tx[i]+j*maxwrite:phase_addrs_tx[i] +(j+1)*maxwrite] = raw
+#                 time.sleep(readback_delay*retry_count)
+#                 ret = r_fast.mixer.host.transport.axil_mm[phase_addrs_tx[i]+j*maxwrite:phase_addrs_tx[i] +(j+1)*maxwrite]
+#                 if retry_count>max_retries:
+#                     raise IOError(f'Failed to write phase_incs_tx {j} to BRAM after {max_retries} tries')
+#         for j in write_idxs:
+#             raw = phase_incs_rx_bytes[j*maxwrite:(j+1)*maxwrite]
+#             r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite] = raw
+#             time.sleep(readback_delay)
+#             ret = r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite]
+#             retry_count=0
+#             while ret!=raw:
+#                 #retry write
+#                 retry_count+=1
+#                 r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite] = raw
+#                 time.sleep(readback_delay*retry_count)
+#                 ret = r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite]
+#                 if retry_count>max_retries:
+#                     raise IOError(f'Failed to write phase_incs_rx {j} to BRAM after {max_retries} tries')
+#         for j in write_idxs:
+#             raw = ri_steps_tx_bytes[j*maxwrite:(j+1)*maxwrite]
+#             r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite] = raw
+#             time.sleep(readback_delay)
+#             ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite]
+#             retry_count=0
+#             while ret!=raw:
+#                 #retry write
+#                 retry_count+=1
+#                 r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite] = raw
+#                 time.sleep(readback_delay*retry_count)
+#                 ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite]
+#                 if retry_count>max_retries:
+#                     raise IOError(f'Failed to write ri_steps_tx {j} to BRAM after {max_retries} tries')
+#         for j in write_idxs:
+#             raw = ri_steps_rx_bytes[j*maxwrite:(j+1)*maxwrite]
+#             r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite] = raw
+#             time.sleep(readback_delay)
+#             ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite]
+#             retry_count=0
+#             while ret!=raw:
+#                 #retry write
+#                 retry_count+=1
+#                 r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite] = raw
+#                 time.sleep(readback_delay*retry_count)
+#                 ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite]
+#                 if retry_count>max_retries:
+#                     raise IOError(f'Failed to write ri_steps_rx {j} to BRAM after {max_retries} tries')
             
-    #     for j in write_idxs:
-    #         raw = phase_incs_rx_bytes[j*maxwrite:(j+1)*maxwrite]
-    #         r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite] = raw
-    #         time.sleep(0.00001)
-    #         ret = r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite]
-    #         if ret==raw:
-    #             pass #print(f'phase_incs_rx {j:2d} write successful')
-    #         else:
-    #             # print(f'phase_incs_rx {j:2d} write failed')
-    #             for xx in range(10):
-    #                 # print('retrying write', xx)
-    #                 r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite] = raw
-    #                 time.sleep(0.00001)
-    #                 ret = r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite]
-    #                 if ret==raw:
-    #                     # print('retry successful')
-    #                     break
-    #             if xx==9:
-    #                 print('\t\t\t\tretry failed')
+#     #     for j in write_idxs:
+#     #         raw = phase_incs_rx_bytes[j*maxwrite:(j+1)*maxwrite]
+#     #         r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite] = raw
+#     #         time.sleep(0.00001)
+#     #         ret = r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite]
+#     #         if ret==raw:
+#     #             pass #print(f'phase_incs_rx {j:2d} write successful')
+#     #         else:
+#     #             # print(f'phase_incs_rx {j:2d} write failed')
+#     #             for xx in range(10):
+#     #                 # print('retrying write', xx)
+#     #                 r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite] = raw
+#     #                 time.sleep(0.00001)
+#     #                 ret = r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*maxwrite:phase_addrs_rx[i] +(j+1)*maxwrite]
+#     #                 if ret==raw:
+#     #                     # print('retry successful')
+#     #                     break
+#     #             if xx==9:
+#     #                 print('\t\t\t\tretry failed')
             
-    #         # while r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*512:phase_addrs_rx[i] +(j+1)*512] != raw:
-    #         #     time.sleep(0.00001)
-    #         #     r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*512:phase_addrs_rx[i] +(j+1)*512]=raw
+#     #         # while r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*512:phase_addrs_rx[i] +(j+1)*512] != raw:
+#     #         #     time.sleep(0.00001)
+#     #         #     r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*512:phase_addrs_rx[i] +(j+1)*512]=raw
                 
-    #         # r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*512:phase_addrs_rx[i] +(j+1)*512] = phase_incs_rx_bytes[j*512:(j+1)*512]
-    #         # # while not (np.frombuffer(r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*512:phase_addrs_rx[i] +(j+1)*512],dtype='<i4').copy() == np.frombuffer(phase_incs_rx_bytes[j*512:(j+1)*512],dtype='<i4').copy()).all():
-    #         # #     print('waiting for phase_incs_rx to update')
-    #         # #     time.sleep(0.001)
-    #         # r_fast.mv_as_int[(ri_step_addrs_tx[i]+j*512)//4:(ri_step_addrs_tx[i] +(j+1)*512)//4] = memoryview(ri_steps_tx_bytes[(j*512):((j+1)*512)]).cast('I')
-    #     for j in write_idxs:
-    #         raw = ri_steps_tx_bytes[j*maxwrite:(j+1)*maxwrite]
-    #         r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite] = raw
-    #         time.sleep(0.00001)
-    #         ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite]
-    #         if ret==raw:
-    #             pass #print(f'ri_steps_tx   {j:2d} write successful')
-    #         else:
-    #             # print(f'ri_steps_tx   {j:2d} write failed')
-    #             for xx in range(10):
-    #                 # print('retrying write', xx)
-    #                 r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite] = raw
-    #                 time.sleep(0.00001)
-    #                 ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite]
-    #                 if ret==raw:
-    #                     # print('retry successful')
-    #                     break
-    #             if xx==9:
-    #                 print('\t\t\t\tretry failed')
-    #         # while r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*512:ri_step_addrs_tx[i] +(j+1)*512] != raw:
-    #         #     time.sleep(0.00001)
-    #         #     r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*512:ri_step_addrs_tx[i] +(j+1)*512]=raw
+#     #         # r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*512:phase_addrs_rx[i] +(j+1)*512] = phase_incs_rx_bytes[j*512:(j+1)*512]
+#     #         # # while not (np.frombuffer(r_fast.mixer.host.transport.axil_mm[phase_addrs_rx[i]+j*512:phase_addrs_rx[i] +(j+1)*512],dtype='<i4').copy() == np.frombuffer(phase_incs_rx_bytes[j*512:(j+1)*512],dtype='<i4').copy()).all():
+#     #         # #     print('waiting for phase_incs_rx to update')
+#     #         # #     time.sleep(0.001)
+#     #         # r_fast.mv_as_int[(ri_step_addrs_tx[i]+j*512)//4:(ri_step_addrs_tx[i] +(j+1)*512)//4] = memoryview(ri_steps_tx_bytes[(j*512):((j+1)*512)]).cast('I')
+#     #     for j in write_idxs:
+#     #         raw = ri_steps_tx_bytes[j*maxwrite:(j+1)*maxwrite]
+#     #         r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite] = raw
+#     #         time.sleep(0.00001)
+#     #         ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite]
+#     #         if ret==raw:
+#     #             pass #print(f'ri_steps_tx   {j:2d} write successful')
+#     #         else:
+#     #             # print(f'ri_steps_tx   {j:2d} write failed')
+#     #             for xx in range(10):
+#     #                 # print('retrying write', xx)
+#     #                 r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite] = raw
+#     #                 time.sleep(0.00001)
+#     #                 ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*maxwrite:ri_step_addrs_tx[i] +(j+1)*maxwrite]
+#     #                 if ret==raw:
+#     #                     # print('retry successful')
+#     #                     break
+#     #             if xx==9:
+#     #                 print('\t\t\t\tretry failed')
+#     #         # while r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*512:ri_step_addrs_tx[i] +(j+1)*512] != raw:
+#     #         #     time.sleep(0.00001)
+#     #         #     r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*512:ri_step_addrs_tx[i] +(j+1)*512]=raw
                 
-    #         # r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*512:ri_step_addrs_tx[i] +(j+1)*512] = ri_steps_tx_bytes[j*512:(j+1)*512]
-    #         # # while not (np.frombuffer(r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*512:ri_step_addrs_tx[i] +(j+1)*512],dtype='<i4').copy() == np.frombuffer(ri_steps_tx_bytes[j*512:(j+1)*512],dtype='<i4').copy()).all():
-    #         # #     print('waiting for ri_steps_tx to update')
-    #         # #     time.sleep(0.001)
-    #         # r_fast.mv_as_int[(ri_step_addrs_rx[i]+j*512)//4:(ri_step_addrs_rx[i] +(j+1)*512)//4] = memoryview(ri_steps_rx_bytes[(j*512):((j+1)*512)]).cast('I')
-    #     for j in write_idxs:
-    #         raw = ri_steps_rx_bytes[j*maxwrite:(j+1)*maxwrite]
-    #         r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite] = raw
-    #         time.sleep(0.00001)
-    #         ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite]
-    #         if ret==raw:
-    #             pass #print(f'ri_steps_rx   {j:2d} write successful')
-    #         else:
-    #             # print(f'ri_steps_rx   {j:2d} write failed')
-    #             for xx in range(10):
-    #                 # print('retrying write', xx)
-    #                 r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite] = raw
-    #                 time.sleep(0.00001)
-    #                 ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite]
-    #                 if ret==raw:
-    #                     # print('retry successful')
-    #                     break
-    #             if xx==9:
-    #                 print('\t\t\t\tretry failed')
-    #         # while r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*512:ri_step_addrs_rx[i] +(j+1)*512] != raw:
-    #         #     time.sleep(0.00001)
-    #         #     r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*512:ri_step_addrs_rx[i] +(j+1)*512]=raw
+#     #         # r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*512:ri_step_addrs_tx[i] +(j+1)*512] = ri_steps_tx_bytes[j*512:(j+1)*512]
+#     #         # # while not (np.frombuffer(r_fast.mixer.host.transport.axil_mm[ri_step_addrs_tx[i]+j*512:ri_step_addrs_tx[i] +(j+1)*512],dtype='<i4').copy() == np.frombuffer(ri_steps_tx_bytes[j*512:(j+1)*512],dtype='<i4').copy()).all():
+#     #         # #     print('waiting for ri_steps_tx to update')
+#     #         # #     time.sleep(0.001)
+#     #         # r_fast.mv_as_int[(ri_step_addrs_rx[i]+j*512)//4:(ri_step_addrs_rx[i] +(j+1)*512)//4] = memoryview(ri_steps_rx_bytes[(j*512):((j+1)*512)]).cast('I')
+#     #     for j in write_idxs:
+#     #         raw = ri_steps_rx_bytes[j*maxwrite:(j+1)*maxwrite]
+#     #         r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite] = raw
+#     #         time.sleep(0.00001)
+#     #         ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite]
+#     #         if ret==raw:
+#     #             pass #print(f'ri_steps_rx   {j:2d} write successful')
+#     #         else:
+#     #             # print(f'ri_steps_rx   {j:2d} write failed')
+#     #             for xx in range(10):
+#     #                 # print('retrying write', xx)
+#     #                 r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite] = raw
+#     #                 time.sleep(0.00001)
+#     #                 ret = r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*maxwrite:ri_step_addrs_rx[i] +(j+1)*maxwrite]
+#     #                 if ret==raw:
+#     #                     # print('retry successful')
+#     #                     break
+#     #             if xx==9:
+#     #                 print('\t\t\t\tretry failed')
+#     #         # while r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*512:ri_step_addrs_rx[i] +(j+1)*512] != raw:
+#     #         #     time.sleep(0.00001)
+#     #         #     r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*512:ri_step_addrs_rx[i] +(j+1)*512]=raw
                 
-    #         # r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*512:ri_step_addrs_rx[i] +(j+1)*512] = ri_steps_rx_bytes[j*512:(j+1)*512]
-    #         # # while not (np.frombuffer(r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*512:ri_step_addrs_rx[i] +(j+1)*512],dtype='<i4').copy() == np.frombuffer(ri_steps_rx_bytes[j*512:(j+1)*512],dtype='<i4').copy()).all():
-    #         # #     print('waiting for ri_steps_rx to update')
-    #         # #     time.sleep(0.001)
-    # # r_fast.mixer.host.transport.axil_mm.flush()
+#     #         # r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*512:ri_step_addrs_rx[i] +(j+1)*512] = ri_steps_rx_bytes[j*512:(j+1)*512]
+#     #         # # while not (np.frombuffer(r_fast.mixer.host.transport.axil_mm[ri_step_addrs_rx[i]+j*512:ri_step_addrs_rx[i] +(j+1)*512],dtype='<i4').copy() == np.frombuffer(ri_steps_rx_bytes[j*512:(j+1)*512],dtype='<i4').copy()).all():
+#     #         # #     print('waiting for ri_steps_rx to update')
+#     #         # #     time.sleep(0.001)
+#     # # r_fast.mixer.host.transport.axil_mm.flush()
 
 
 
 def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, autosync=True):
-    phase_incs_tx_formatted = fast_tone_frequency_settings.get('phase_incs_tx_formatted')
-    phase_incs_rx_formatted = fast_tone_frequency_settings.get('phase_incs_rx_formatted')
-    ri_steps_tx_formatted   = fast_tone_frequency_settings.get('ri_steps_tx_formatted')
-    ri_steps_rx_formatted   = fast_tone_frequency_settings.get('ri_steps_rx_formatted')
+    
+    v=fast_tone_frequency_settings.get('control_buffer_data')
+    buf = fast_tone_frequency_settings.get('control_buffer_index')
+    # phase_incs_tx_formatted = fast_tone_frequency_settings.get('phase_incs_tx_formatted')
+    # phase_incs_rx_formatted = fast_tone_frequency_settings.get('phase_incs_rx_formatted')
+    # ri_steps_tx_formatted   = fast_tone_frequency_settings.get('ri_steps_tx_formatted')
+    # ri_steps_rx_formatted   = fast_tone_frequency_settings.get('ri_steps_rx_formatted')
     chanmap_psb   = fast_tone_frequency_settings.get('chanmap_psb')
     chanmap_pfb   = fast_tone_frequency_settings.get('chanmap_pfb')
     # num_tones     = fast_tone_frequency_settings.get('num_tones')
@@ -1471,17 +1981,20 @@ def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, 
     #     time.sleep(1)
     #     r.sync.sw_sync()
 
-    fast_write_mixer(r_fast,
-                      phase_incs_tx_formatted,
-                        phase_incs_rx_formatted,
-                          ri_steps_tx_formatted,
-                            ri_steps_rx_formatted)
+    write_control_buffer_data_fast(r_fast,buf,v)
+    set_control_buffer_idx_fast(r_fast,buf)
 
-    if autosync:
-        # time.sleep(autosync_time_delay)
-        r_fast.sync.arm_sync(wait=False)
-        time.sleep(autosync_time_delay)
-        r_fast.sync.sw_sync()
+    # fast_write_mixer(r_fast,
+    #                   phase_incs_tx_formatted,
+    #                     phase_incs_rx_formatted,
+    #                       ri_steps_tx_formatted,
+    #                         ri_steps_rx_formatted)
+
+    # if autosync:
+    #     # time.sleep(autosync_time_delay)
+    #     r_fast.sync.arm_sync(wait=False)
+    #     time.sleep(autosync_time_delay)
+    #     r_fast.sync.sw_sync()
 
 
 def set_tone_frequencies(r, config_dict, tone_frequencies, autosync=True, detailed_output=False):
@@ -1679,13 +2192,16 @@ def get_tone_amplitudes(r,config_dict,num_tones=None):
     if num_tones == 0:
         return np.array([],dtype=float)
     
-    scaling_tx = np.zeros(num_tones_tx,dtype='>u4')
-    scaling_rx = np.zeros(num_tones_rx,dtype='>u4')
-    for i in range(min(r.mixer._n_parallel_chans, num_tones)):   
-        scaling_tx[i::r.mixer._n_parallel_chans] = np.frombuffer(r.mixer.read(f'tx_lo{i}_scale',4*num_tones_tx),dtype='>u4')
-        scaling_rx[i::r.mixer._n_parallel_chans] = np.frombuffer(r.mixer.read(f'rx_lo{i}_scale',4*num_tones_rx),dtype='>u4')
-    scaling_tx = _invert_format_amp_scale(scaling_tx, r.mixer._n_scale_bits)
-    scaling_rx = _invert_format_amp_scale(scaling_rx, r.mixer._n_scale_bits)
+    control_buffer = read_from_current_control_buffer(r)
+    scaling_tx = control_buffer['tx']['scaling']
+    scaling_rx = control_buffer['rx']['scaling']
+    # scaling_tx = np.zeros(num_tones_tx,dtype='>u4')
+    # scaling_rx = np.zeros(num_tones_rx,dtype='>u4')
+    # for i in range(min(r.mixer._n_parallel_chans, num_tones)):   
+    #     scaling_tx[i::r.mixer._n_parallel_chans] = np.frombuffer(r.mixer.read(f'tx_lo{i}_scale',4*num_tones_tx),dtype='>u4')
+    #     scaling_rx[i::r.mixer._n_parallel_chans] = np.frombuffer(r.mixer.read(f'rx_lo{i}_scale',4*num_tones_rx),dtype='>u4')
+    # scaling_tx = _invert_format_amp_scale(scaling_tx, r.mixer._n_scale_bits)
+    # scaling_rx = _invert_format_amp_scale(scaling_rx, r.mixer._n_scale_bits)
     return scaling_tx[:num_tones]
 
 def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
@@ -1694,16 +2210,24 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
     """
     tone_amplitudes = np.atleast_1d(tone_amplitudes)
     num_tones = len(tone_amplitudes)
-    scaling = _format_amp_scale(tone_amplitudes, r.mixer._n_scale_bits)
-    for i in range(min(r.mixer._n_parallel_chans, num_tones)):   
-        r.mixer.write(f'tx_lo{i}_scale', scaling[i::r.mixer._n_parallel_chans].tobytes())
-        r.mixer.write(f'rx_lo{i}_scale', scaling[i::r.mixer._n_parallel_chans].tobytes())
 
-    if autosync:
-        # time.sleep(autosync_time_delay)
-        r.sync.arm_sync(wait=False)
-        time.sleep(autosync_time_delay)
-        r.sync.sw_sync()
+    buf = get_control_buffer_idx(r)
+    v = prepare_control_buffer_data(r,buf,{'tx':{'scaling':tone_amplitudes},
+                                    'rx':{'scaling':tone_amplitudes}})
+    
+    write_control_buffer_data(r,buf,v)
+
+
+    # scaling = _format_amp_scale(tone_amplitudes, r.mixer._n_scale_bits)
+    # for i in range(min(r.mixer._n_parallel_chans, num_tones)):   
+    #     r.mixer.write(f'tx_lo{i}_scale', scaling[i::r.mixer._n_parallel_chans].tobytes())
+    #     r.mixer.write(f'rx_lo{i}_scale', scaling[i::r.mixer._n_parallel_chans].tobytes())
+
+    # if autosync:
+    #     # time.sleep(autosync_time_delay)
+    #     r.sync.arm_sync(wait=False)
+    #     time.sleep(autosync_time_delay)
+    #     r.sync.sw_sync()
 
     return
 
@@ -1729,13 +2253,17 @@ def get_tone_phases(r, config_dict, num_tones=None):
     if num_tones == 0:
         return np.array([],dtype=float)
     
-    phase_offsets_tx = np.zeros(num_tones_tx,dtype='>i4')
-    phase_offsets_rx = np.zeros(num_tones_rx,dtype='>i4')
-    for i in range(min(r.mixer._n_parallel_chans, num_tones)):   
-        phase_offsets_tx[i::r.mixer._n_parallel_chans] = np.frombuffer(r.mixer.read(f'tx_lo{i}_phase_offset',4*num_tones_tx),dtype='>i4')
-        phase_offsets_rx[i::r.mixer._n_parallel_chans] = np.frombuffer(r.mixer.read(f'rx_lo{i}_phase_offset',4*num_tones_rx),dtype='>i4')
-    phase_offsets_tx = _invert_format_phase_offsets(phase_offsets_tx, r.mixer._phase_offset_bp)
-    phase_offsets_rx = _invert_format_phase_offsets(phase_offsets_rx, r.mixer._phase_offset_bp)
+    control_buffer = read_from_current_control_buffer(r)
+    phase_offsets_tx = control_buffer['tx']['phase_offsets']
+    phase_offsets_rx = control_buffer['rx']['phase_offsets']
+
+    # phase_offsets_tx = np.zeros(num_tones_tx,dtype='>i4')
+    # phase_offsets_rx = np.zeros(num_tones_rx,dtype='>i4')
+    # for i in range(min(r.mixer._n_parallel_chans, num_tones)):   
+    #     phase_offsets_tx[i::r.mixer._n_parallel_chans] = np.frombuffer(r.mixer.read(f'tx_lo{i}_phase_offset',4*num_tones_tx),dtype='>i4')
+    #     phase_offsets_rx[i::r.mixer._n_parallel_chans] = np.frombuffer(r.mixer.read(f'rx_lo{i}_phase_offset',4*num_tones_rx),dtype='>i4')
+    # phase_offsets_tx = _invert_format_phase_offsets(phase_offsets_tx, r.mixer._phase_offset_bp)
+    # phase_offsets_rx = _invert_format_phase_offsets(phase_offsets_rx, r.mixer._phase_offset_bp)
     return phase_offsets_tx[:num_tones]
 
 def set_tone_phases(r, config_dict, tone_phases, autosync=True):
@@ -1744,15 +2272,21 @@ def set_tone_phases(r, config_dict, tone_phases, autosync=True):
     """
     tone_phases = np.atleast_1d(tone_phases)
     num_tones = len(tone_phases)
-    phase_offsets = _format_phase_offsets(tone_phases,r.mixer._phase_offset_bp)
-    for i in range(min(r.mixer._n_parallel_chans, num_tones)):
-        r.mixer.write(f'tx_lo{i}_phase_offset', phase_offsets[i::r.mixer._n_parallel_chans].tobytes())
-        r.mixer.write(f'rx_lo{i}_phase_offset', phase_offsets[i::r.mixer._n_parallel_chans].tobytes())
-    if autosync:
-        # time.sleep(autosync_time_delay)
-        r.sync.arm_sync(wait=False)
-        time.sleep(autosync_time_delay)
-        r.sync.sw_sync()
+    buf = get_control_buffer_idx(r)
+    v = prepare_control_buffer_data(r,buf,{'tx':{'phase_offsets':tone_phases},
+                                    'rx':{'phase_offsets':tone_phases}})
+    
+    write_control_buffer_data(r,buf,v)
+    
+    # phase_offsets = _format_phase_offsets(tone_phases,r.mixer._phase_offset_bp)
+    # for i in range(min(r.mixer._n_parallel_chans, num_tones)):
+    #     r.mixer.write(f'tx_lo{i}_phase_offset', phase_offsets[i::r.mixer._n_parallel_chans].tobytes())
+    #     r.mixer.write(f'rx_lo{i}_phase_offset', phase_offsets[i::r.mixer._n_parallel_chans].tobytes())
+    # if autosync:
+    #     # time.sleep(autosync_time_delay)
+    #     r.sync.arm_sync(wait=False)
+    #     time.sleep(autosync_time_delay)
+    #     r.sync.sw_sync()
     return
 
 def check_input_saturation(r,iterations=1,saturation_bits=adc_saturation_bits,threshold=0.95):
