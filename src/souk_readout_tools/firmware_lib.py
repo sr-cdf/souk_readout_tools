@@ -1824,14 +1824,15 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
         #     time.sleep(0.001)
         # print('pfb chanmap updated')
 
-    print('apply_step, write_buf',step_index)
+    print('apply_step, write_buf',step_index, allbuf[step_index])
     write_control_buffer_data_fast(r_fast,allbuf[step_index],allv[step_index],alli[step_index])
     
-    # print('apply_step, set_buf',step_index)
+    print('apply_step, set_buf',step_index,allbuf[step_index])
     set_control_buffer_idx_fast(r_fast,allbuf[step_index])
 
-    # if c1 or c2:
-    #     _wait_for_acc(r_fast,0,0.0001)
+
+    if c1 or c2:
+        _wait_for_acc(r_fast,0,0.0001)
 
 
     # fast_write_mixer(r_fast, 
@@ -2295,15 +2296,19 @@ def get_tone_amplitudes(r,config_dict,num_tones=None):
 def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
     """
     Set the tone amplitude scale factors in the RFSOC.
+
+    Currently sets both halfs of the double buffer to the same value.
+    This is not ideal, but for now it will do.
     """
     tone_amplitudes = np.atleast_1d(tone_amplitudes)
     num_tones = len(tone_amplitudes)
 
-    buf = get_control_buffer_idx(r)
-    v = prepare_control_buffer_data(r,buf,{'tx':{'scaling':tone_amplitudes},
+    # buf = get_control_buffer_idx(r)
+    for buf in [0,1]:
+        v = prepare_control_buffer_data(r,buf,{'tx':{'scaling':tone_amplitudes},
                                     'rx':{'scaling':tone_amplitudes}})
     
-    write_control_buffer_data(r,buf,v)
+        write_control_buffer_data(r,buf,v)
 
 
     # scaling = _format_amp_scale(tone_amplitudes, r.mixer._n_scale_bits)

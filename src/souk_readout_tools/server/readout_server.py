@@ -1032,7 +1032,7 @@ class ReadoutServer:
                     firmware_lib._wait_for_acc(self.r_fast,0,0.0001)
 
                 
-                # print('sweeping: getting_samples')
+                print('sweeping: getting_samples')
                 for s in range(samples_per_point):
                     cnt,data,err = firmware_lib.read_accumulated_data_fast(
                                                             fast_read_params,
