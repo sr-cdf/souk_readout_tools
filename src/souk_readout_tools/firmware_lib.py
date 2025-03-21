@@ -812,12 +812,75 @@ def prepare_control_buffer_data(r,buf,lo_control_values):
             v[lo][r.mixer._RI_STEP_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = ri_steps_formatted[i::r.mixer._n_parallel_chans]
     return v
     
-def prepare_control_buffer_data_fast(r,buf,lo_control_values):
+def prepare_control_buffer_data_fast(r_fast,buf,lo_control_values):
     """
-    faster version of prepare_control_buffer
-    not yet implemented
+    Faster version of prepare_control_buffer 
+
+    Does not prepare the full buffer, only returns the given formatted values and their indices
+
+    Parameters:
+    r: readout object
+    buf: int, index of buffer to write to, 0 or 1.
+    lo_control_values: dictionary with keys 'tx' and 'rx'
+     - 'tx': dictionary with optional keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+     - 'rx': dictionary with optional keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+    
+    Returns:
+    v: dictionary with keys 'tx' and 'rx'
+     - 'tx': numpy array of the formatted control buffer for tx
+     - 'rx': numpy array of the formatted control buffer for rx
+    i: dictionary with keys 'tx' and 'rx'
+     - 'tx': numpy array of the indices for the formatted control buffer for tx
+     - 'rx': numpy array of the indices for the formatted control buffer for rx
+
     """
-    return prepare_control_buffer_data(r,buf,lo_control_values)
+    # if not hasattr(r_fast.mixer,'tx_lo_control_buffer_mv'):
+    #     r_fast.mixer.tx_lo_control_buffer = np.frombuffer(memoryview(r_fast.mixer.host.transport.axil_mm[0x90000:0x100000]),dtype='<u4')
+    # if not hasattr(r_fast.mixer,'rx_lo_control_buffer_mv'):
+    #     r_fast.mixer.rx_lo_control_buffer = np.frombuffer(memoryview(r_fast.mixer.host.transport.axil_mm[0x80000:0x90000]),dtype='<u4')
+    if not hasattr(r_fast.mixer,'tx_lo_control_buffer_mv'):
+        r_fast.mixer.tx_lo_control_buffer = np.frombuffer(memoryview(r_fast.mixer.host.transport.axil_mm),dtype='<u4')
+    if not hasattr(r_fast.mixer,'rx_lo_control_buffer_mv'):
+        r_fast.mixer.rx_lo_control_buffer = np.frombuffer(memoryview(r_fast.mixer.host.transport.axil_mm),dtype='<u4')
+    v={}  
+    i={}  
+    for lo in ['tx','rx']:
+        if lo not in lo_control_values.keys():
+            raise ValueError(f"Only LOs 'rx' and 'tx' are understood. Not {lo}.")
+        phase_steps = lo_control_values[lo].get('phase_steps')
+        ri_steps = lo_control_values[lo].get('ri_steps')
+        phase_offsets = lo_control_values[lo].get('phase_offsets')
+        scaling = lo_control_values[lo].get('scaling')
+
+        phase_steps_formatted = _format_phase_steps(phase_steps, r_fast.mixer._phase_bp) if phase_steps is not None else []
+        phase_offsets_formatted = _format_phase_offsets(phase_offsets, r_fast.mixer._phase_offset_bp) if phase_offsets is not None else []
+        ri_steps_formatted = cplx2uint(ri_steps,r_fast.mixer._n_ri_step_bits) if ri_steps is not None else []
+        scaling_formatted = _format_amp_scale(scaling, r_fast.mixer._n_scale_bits) if scaling is not None else []
+
+        n_phase_steps = len(phase_steps_formatted)
+        n_phase_offsets = len(phase_offsets_formatted)
+        n_ri_steps = len(ri_steps_formatted)
+        n_scaling = len(scaling_formatted) 
+        
+        # v[lo] = np.zeros(int(np.ceil(n_tone / r.mixer._n_parallel_chans)) * r.mixer._CONTROL_N_WORDS, dtype='>u4')
+        # for i in range(min(r.mixer._n_parallel_chans, n_tone)):
+        #     v[lo][r.mixer._SCALE_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = scaling_formatted[i::r.mixer._n_parallel_chans]
+        #     v[lo][r.mixer._PHASE_INC_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = phase_steps_formatted[i::r.mixer._n_parallel_chans]
+        #     v[lo][r.mixer._PHASE_OFFSET_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = phase_offsets_formatted[i::r.mixer._n_parallel_chans]
+        #     v[lo][r.mixer._RI_STEP_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = ri_steps_formatted[i::r.mixer._n_parallel_chans]
+
+        v[lo] = np.empty(n_phase_steps+n_phase_offsets+n_ri_steps+n_scaling, dtype='>u4')
+        v[lo][0:n_phase_steps] = phase_steps_formatted
+        v[lo][n_phase_steps:n_phase_steps+n_phase_offsets] = phase_offsets_formatted
+        v[lo][n_phase_steps+n_phase_offsets:n_phase_steps+n_phase_offsets+n_ri_steps] = ri_steps_formatted
+        v[lo][n_phase_steps+n_phase_offsets+n_ri_steps:n_phase_steps+n_phase_offsets+n_ri_steps+n_scaling] = scaling_formatted
+
+        i[lo] = np.empty(n_phase_steps+n_phase_offsets+n_ri_steps+n_scaling, dtype=int)
+        i[lo][0:n_phase_steps] = np.arange(n_phase_steps)*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._PHASE_INC_WORD_OFFSET
+        i[lo][n_phase_steps:n_phase_steps+n_phase_offsets] = np.arange(n_phase_offsets)*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._PHASE_OFFSET_WORD_OFFSET
+        i[lo][n_phase_steps+n_phase_offsets:n_phase_steps+n_phase_offsets+n_ri_steps] = np.arange(n_ri_steps)*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._RI_STEP_WORD_OFFSET
+        i[lo][n_phase_steps+n_phase_offsets+n_ri_steps:n_phase_steps+n_phase_offsets+n_ri_steps+n_scaling] = np.arange(n_scaling)*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._SCALE_WORD_OFFSET
+    return v, i
 
 def write_control_buffer_data(r,buf,v):
     """
@@ -838,23 +901,41 @@ def write_control_buffer_data(r,buf,v):
             r.mixer.write(reg, v[lo].tobytes(),offset=offset)
     return
 
-def write_control_buffer_data_fast(r_fast,buf,v):
+def write_control_buffer_data_fast(r_fast,buf,v,indices):
     """
     Write a formatted control buffer to the firmware.
     Parameters:
     r: readout object
     buf: int, index of buffer to write to, 0 or 1.
-    v: numpy array of the formatted control buffer.
+    v: dictionary with keys 'tx' and 'rx'
+        - 'tx': numpy array of the formatted control buffer values for tx
+        - 'rx': numpy array of the formatted control buffer values for rx
+    
+    indices: dictionary with keys 'tx' and 'rx'
+        - 'tx': numpy array of the indices for the formatted control buffer for tx
+        - 'rx': numpy array of the indices for the formatted control buffer for rx
     
     """
     n_tone = r_fast.mixer.n_chans
     if buf not in [0,1]:
         raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
-    for lo in ['tx','rx']:    
-        start=0x80000 if lo=='rx' else 0x90000
-        start+= 0x8000*buf
-        length=0x8000
-        r_fast.mixer.host.transport.axil_mm[int(start):int(start+length)] = v[lo].astype('<u4').tobytes()
+    
+    if indices is None:
+        for lo in ['tx','rx']:    
+            start=0x80000 if lo=='rx' else 0x90000
+            start+= 0x8000*buf
+            length=0x8000
+            r_fast.mixer.host.transport.axil_mm[int(start):int(start+length)] = v[lo].astype('<u4').tobytes()
+    else:
+        # for lo in ['tx','rx']:     
+            # start=0x80000 if lo=='rx' else 0x90000
+            # start+= 0x8000*buf
+            # r_fast.mixer.host.transport.axil_mm[start+indices[lo]] = v[lo].astype('<u4').tobytes()
+        start_tx = 0x90000//4 + 0x8000*buf//4
+        start_rx = 0x80000//4 + 0x8000*buf//4
+        r_fast.mixer.tx_lo_control_buffer[start_tx+indices['tx']] = v['tx'].astype('<u4')
+        r_fast.mixer.rx_lo_control_buffer[start_rx+indices['rx']] = v['rx'].astype('<u4')
+            
     return
         
 
@@ -1290,7 +1371,7 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies):
     #                       'chanmap_pfb':chanmap_pfb,
     #                       'num_tones':num_tones}
     
-    tone_settings_dict = {'control_buffer_data':v,
+    tone_settings_dict = {'control_buffer_data_values':v,
                           'control_buffer_index':buf,
                           'chanmap_psb':chanmap_psb,
                           'chanmap_pfb':chanmap_pfb,
@@ -1328,7 +1409,7 @@ def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True):
     # scaling_tx = tone_settings_dict.get('scaling_tx_formatted')
     # scaling_rx = tone_settings_dict.get('scaling_rx_formatted')
 
-    v = tone_settings_dict.get('control_buffer_data')
+    v = tone_settings_dict.get('control_buffer_data_values')
     buf = tone_settings_dict.get('control_buffer_index')
     chanmap_psb   = tone_settings_dict.get('chanmap_psb')
     chanmap_pfb   = tone_settings_dict.get('chanmap_pfb')
@@ -1472,7 +1553,7 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, detai
     # ri_steps_tx = np.pad(ri_steps_tx, (0,nc-len(ri_steps_tx)), 'constant', constant_values=(0,0))
     # ri_steps_rx = np.pad(ri_steps_rx, (0,nc-len(ri_steps_rx)), 'constant', constant_values=(0,0))
 
-    v = prepare_control_buffer_data_fast(r,0,{'tx':{'phase_steps':phase_incs_tx,
+    v,i = prepare_control_buffer_data_fast(r,0,{'tx':{'phase_steps':phase_incs_tx,
                                             'ri_steps':ri_steps_tx},
                                       'rx':{'phase_steps':phase_incs_rx,
                                             'ri_steps':ri_steps_rx}})
@@ -1493,7 +1574,8 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, detai
     #                      'chanmap_psb':chanmap_psb,
     #                      'chanmap_pfb':chanmap_pfb,
     #                      'num_tones':num_tones}
-    tone_settings_dict = {'control_buffer_data':v,
+    tone_settings_dict = {'control_buffer_data_values':v,
+                            'control_buffer_data_indices':i,
                             'control_buffer_index':0,
                             'chanmap_psb':chanmap_psb,
                             'chanmap_pfb':chanmap_pfb,
@@ -1658,6 +1740,7 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, detailed
     
     # allv = np.zeros((num_points, len(v0)),dtype=v0.dtype)
     allv={}
+    alli={}
     allbuf = np.zeros((num_points,),dtype=int)
     allbuf[1::2] = 1
 
@@ -1668,10 +1751,11 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, detailed
         # ri_steps_tx_formatted_padded[p,:len(ri_steps_tx_formatted[p])] = ri_steps_tx_formatted[p]
         # ri_steps_rx_formatted_padded[p,:len(ri_steps_rx_formatted[p])] = ri_steps_rx_formatted[p]
         print('prep_sweep, prep_buf',p)
-        allv[p] = prepare_control_buffer_data_fast(r_fast,allbuf[p],{'tx':{'phase_steps':phase_incs_tx[p],
-                                            'ri_steps':ri_steps_tx[p]},
-                                            'rx':{'phase_steps':phase_incs_rx[p],
-                                            'ri_steps':ri_steps_rx[p]}})
+        allv[p], alli[p] = prepare_control_buffer_data_fast(r_fast,allbuf[p],
+                                                            {'tx':{'phase_steps':phase_incs_tx[p],
+                                                                   'ri_steps':ri_steps_tx[p]},
+                                                             'rx':{'phase_steps':phase_incs_rx[p],
+                                                                   'ri_steps':ri_steps_rx[p]}})
         #set the filterbank channel maps
         chanmap_psb[p,tx_nearest_bins[p]] = channels
         chanmap_pfb[p,channels] = rx_nearest_bins[p]
@@ -1694,7 +1778,8 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, detailed
     #                      'skip_chanmap_pfb':skip_chanmap_pfb,
     #                      'num_tones':num_tones}
 
-    sweep_settings_dict = {'control_buffer_data':allv,
+    sweep_settings_dict = {'control_buffer_data_values':allv,
+                            'control_buffer_data_indices':alli,
                             'control_buffer_index':allbuf,
                             'chanmap_psb':chanmap_psb,
                             'chanmap_pfb':chanmap_pfb,
@@ -1710,7 +1795,8 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
     # ri_steps_tx_formatted   = sweep_settings.get('ri_steps_tx_formatted')
     # ri_steps_rx_formatted   = sweep_settings.get('ri_steps_rx_formatted')
     print('apply_step', step_index)
-    allv= sweep_settings.get('control_buffer_data')
+    allv= sweep_settings.get('control_buffer_data_values')
+    alli= sweep_settings.get('control_buffer_data_indices')
     allbuf = sweep_settings.get('control_buffer_index')
     chanmap_psb   = sweep_settings.get('chanmap_psb')
     chanmap_pfb   = sweep_settings.get('chanmap_pfb')
@@ -1723,7 +1809,7 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
     if c1:
         print('set chanmap 1 (out)')
         # r_fast.psb_chanselect.set_channel_outmap(np.copy(chanmap_psb[step_index]))
-        psb_chanselect_set_channel_outmap(r_fast,np.copy(chanmap_psb[step_index]))
+        psb_chanselect_set_channel_outmap(r_fast,chanmap_psb[step_index])
         
         # while not (r.psb_chanselect.get_channel_outmap()==chanmap_psb[step_index]).all():
         #     print('waiting for psb chanmap to update')
@@ -1732,21 +1818,21 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
     if c2:
         print('set chanmap 2 (in)')
         # r_fast.chanselect.set_channel_outmap(np.copy(chanmap_pfb[step_index]))
-        chanselect_set_channel_outmap(r_fast,np.copy(chanmap_pfb[step_index]))
+        chanselect_set_channel_outmap(r_fast,chanmap_pfb[step_index])
         # while not (r.chanselect.get_channel_outmap()==chanmap_pfb[step_index]).all():
         #     print('waiting for pfb chanmap to update')
         #     time.sleep(0.001)
         # print('pfb chanmap updated')
-    # if c1 or c2:
-    #     print('\n\n\nchanmap set\n\n\n')
-    #     r.sync.arm_sync(wait=False)
-    #     time.sleep(1)
-    #     r.sync.sw_sync()
+
     print('apply_step, write_buf',step_index)
-    write_control_buffer_data_fast(r_fast,allbuf[step_index],allv[step_index])
+    write_control_buffer_data_fast(r_fast,allbuf[step_index],allv[step_index],alli[step_index])
     
-    print('apply_step, set_buf',step_index)
+    # print('apply_step, set_buf',step_index)
     set_control_buffer_idx_fast(r_fast,allbuf[step_index])
+
+    # if c1 or c2:
+    #     _wait_for_acc(r_fast,0,0.0001)
+
 
     # fast_write_mixer(r_fast, 
     #                   phase_incs_tx_formatted[step_index],
@@ -1960,7 +2046,8 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
 
 def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, autosync=True):
     
-    v=fast_tone_frequency_settings.get('control_buffer_data')
+    v=fast_tone_frequency_settings.get('control_buffer_data_values')
+    i=fast_tone_frequency_settings.get('control_buffer_data_indices')
     buf = fast_tone_frequency_settings.get('control_buffer_index')
     # phase_incs_tx_formatted = fast_tone_frequency_settings.get('phase_incs_tx_formatted')
     # phase_incs_rx_formatted = fast_tone_frequency_settings.get('phase_incs_rx_formatted')
@@ -1974,18 +2061,16 @@ def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, 
 
     if c1 is not None:
         # print('chanmap_psb set')
-        psb_chanselect_set_channel_outmap(r_fast,np.copy(chanmap_psb))
+        psb_chanselect_set_channel_outmap(r_fast,chanmap_psb)
     if c2 is not None:
         # print('chanmap_pfb set')
-        chanselect_set_channel_outmap(r_fast,np.copy(chanmap_pfb))
-    # if c1 or c2:
-    #     # print('chanmap set')
-    #     r.sync.arm_sync(wait=False)
-    #     time.sleep(1)
-    #     r.sync.sw_sync()
+        chanselect_set_channel_outmap(r_fast,chanmap_pfb)
+    
 
-    write_control_buffer_data_fast(r_fast,buf,v)
+    write_control_buffer_data_fast(r_fast,buf,v,i)
     set_control_buffer_idx_fast(r_fast,buf)
+    if c1 or c2:
+        _wait_for_acc(r_fast,0,0.0001)
 
     # fast_write_mixer(r_fast,
     #                   phase_incs_tx_formatted,
@@ -2325,8 +2410,7 @@ def psb_chanselect_set_channel_outmap(r, outmap):
     if not hasattr(r.psb_chanselect,'_outchans_convenience'):
         r.psb_chanselect._outchans_convenience = np.arange(r.psb_chanselect.n_chans_out)
     outchans = r.psb_chanselect._outchans_convenience
-    # Which parallel path does a given output channel
-    # map to
+    # Which parallel path does a given output channel map to
     # block_id = (outchans // r.psb_chanselect.n_parallel_samples) % r.psb_chanselect._expansion_factor
     if not hasattr(r.psb_chanselect,'_block_id_convenience'):
         r.psb_chanselect._block_id_convenience = (outchans // r.psb_chanselect.n_parallel_samples) % r.psb_chanselect._expansion_factor
@@ -2353,11 +2437,15 @@ def psb_chanselect_set_channel_outmap(r, outmap):
     # for i in range(nout):
     #     serial_maps[block_id[i], block_offset[i]] = outmap[i]
     serial_maps[block_id[:nout], block_offset[:nout]] = outmap[:nout]
-
     serial_maps = np.array(serial_maps, dtype=r.psb_chanselect._map_format)
-
+    
     for i in range(r.psb_chanselect._expansion_factor):
-        r.psb_chanselect.write(f'map{i}_{r.psb_chanselect._map_reg}', serial_maps[i].tobytes())
+        try:
+            # if using fast firmware interface
+            offset=r.psb_chanselect.host.transport._get_device_address(f'{r.psb_chanselect.prefix}map{i}_{r.psb_chanselect._map_reg}')
+            r.psb_chanselect.host.transport.axil_mm[offset:offset+len(serial_maps[i].tobytes())]=serial_maps[i].astype('<i4').tobytes()
+        except AttributeError:
+            r.psb_chanselect.write(f'map{i}_{r.psb_chanselect._map_reg}', serial_maps[i].tobytes())
 
 
 
@@ -2475,12 +2563,18 @@ def chanselect_set_channel_outmap(r, outmap, descramble_input=None):
     # parallel_map[0:nout] = block_p_offset
     # parallel_map[0:nout][outmap == -1] = r.chanselect._reduction_factor + 1
 
-    parallel_map[:nout] = np.where(outmap_isnt_n1, block_p_offset, r.chanselect._reduction_factor + 1
-)
+    parallel_map[:nout] = np.where(outmap_isnt_n1, block_p_offset, r.chanselect._reduction_factor + 1)
 
 
-    r.chanselect.write(f'map0_{r.chanselect._map_reg}', serial_map.astype(r.chanselect._map_format).tobytes())
-    r.chanselect.write('pmap', parallel_map.astype(r.chanselect._pmap_format).tobytes())
+    try:
+        # if using fast firmware interface
+        addr = r.chanselect.host.transport._get_device_address(f'{r.chanselect.prefix}map0_{r.chanselect._map_reg}')
+        r.chanselect.host.transport.axil_mm[addr:addr+len(serial_map)*4]= serial_map.astype('<i4').tobytes()
+        addr = r.chanselect.host.transport._get_device_address(f'{r.chanselect.prefix}pmap')
+        r.chanselect.host.transport.axil_mm[addr:addr+len(parallel_map)*4]= parallel_map.astype('<i4').tobytes()
+    except AttributeError:
+        r.chanselect.write(f'map0_{r.chanselect._map_reg}', serial_map.astype(r.chanselect._map_format).tobytes())
+        r.chanselect.write('pmap', parallel_map.astype(r.chanselect._pmap_format).tobytes())
 
 
 

@@ -1026,7 +1026,11 @@ class ReadoutServer:
                                                    p,
                                                    autosync=True)
                 
-                firmware_lib._wait_for_acc(self.r,0,0.001)
+                # must wait for everything to settle.
+                # one acc is enough at 500 samps/sec
+                for _ in range(1):
+                    firmware_lib._wait_for_acc(self.r_fast,0,0.0001)
+
                 
                 # print('sweeping: getting_samples')
                 for s in range(samples_per_point):
