@@ -9,6 +9,7 @@ import numpy as np
 import time
 import os
 import yaml
+import struct
 #import asyncio
 
 try:
@@ -1915,7 +1916,8 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
     print('apply_step, set_buf',step_index,allbuf[step_index])
     set_control_buffer_idx_fast(r_fast,allbuf[step_index])
 
-
+    force_sync_fast(r_fast)
+    
     if c1 or c2:
         _wait_for_acc(r_fast,0,0.0001)
 
@@ -3584,9 +3586,52 @@ def set_tone_powers(r,config_dict,powers_dbm):
     return amp_details 
 
 
+def force_sync_fast(r_fast,wait_s=0.0001):
+    regname = 'p0_sync_ctrl'
+    if not hasattr(r_fast,'_p0_sync_ctrl_addr'):
+        setattr(r_fast, '_p0_sync_ctrl_addr',r_fast.sync.host.transport._get_device_address(regname))
+        setattr(r_fast, '_p0_sync_ctrl_arm_bit', 1<<r_fast.sync.OFFSET_ARM_SYNC_OUT)
+        setattr(r_fast, '_p0_sync_ctrl_sync_bit', 1<<r_fast.sync.OFFSET_MAN_SYNC)
+                
+    #arm_sync
+    addr = r_fast._p0_sync_ctrl_addr
+    mm = r_fast.sync.host.transport.axil_mm
+    (value,) = struct.unpack('<I',mm[addr:addr+4])
+    
+    #set 0
+    value &= ~r_fast._p0_sync_ctrl_arm_bit
+    mm[addr:addr+4] = struct.pack('<I',value)
+    #set 1
+    value |= r_fast._p0_sync_ctrl_arm_bit
+    mm[addr:addr+4] = struct.pack('<I',value)
+    #set 0
+    value &= ~r_fast._p0_sync_ctrl_arm_bit
+    mm[addr:addr+4] = struct.pack('<I',value)
 
+    # change_reg_bits_fast(addr, 0, r_fast.sync.OFFSET_ARM_SYNC_OUT)
+    # change_reg_bits(addr, 1, r_fast.sync.OFFSET_ARM_SYNC_OUT)
+    # change_reg_bits(addr, 0, r_fast.sync.OFFSET_ARM_SYNC_OUT)
 
+    #wait
+    time.sleep(wait_s)
+    
+    #manual sync
+    #set0
+    value &= ~r_fast._p0_sync_ctrl_sync_bit
+    mm[addr:addr+4] = struct.pack('<I',value)
+    #set 1
+    value |= r_fast._p0_sync_ctrl_sync_bit
+    mm[addr:addr+4] = struct.pack('<I',value)
+    #set 0
+    value &= ~r_fast._p0_sync_ctrl_sync_bit
+    mm[addr:addr+4] = struct.pack('<I',value)
+    
+    # change_reg_bits('ctrl', 0, r_fast.sync.OFFSET_MAN_SYNC)
+    # change_reg_bits('ctrl', 1, r_fast.sync.OFFSET_MAN_SYNC)
+    # change_reg_bits('ctrl', 0, r_fast.sync.OFFSET_MAN_SYNC)
 
+    return 
 
+    
 #include private functions when import * for debugging, to be removed later
 __all__ = list(globals().keys())
