@@ -34,10 +34,10 @@ USER_DIR = os.path.expanduser('~/.souk_readout_tools/')
 
 autosync_time_delay = 0.001 #seconds
 
-adc_saturation_bits = 16 # note the adc gives 16 bit data but is a 14 bit converter
-dac_saturation_bits = 16 # note the dac takes 16 bit data but is a 14 bit converter
+adc_saturation_bits = 16 # note the adc gives 16 bit data but is a 12 or 14 bit converter
+dac_saturation_bits = 16 # note the dac takes 16 bit data but is a 12 or 14 bit converter
 
-def cplx2uint(d,nbits,fmt='>u4'):
+def cplx2uint(d,nbits):
     """
     Vectorized: Convert a floating point real, imag pair
         to a UFix<nbits>_<nbits-1> CASPER-standard complex number.
@@ -54,7 +54,7 @@ def cplx2uint(d,nbits,fmt='>u4'):
     imag[imag > tnm1bm1] = tnm1bm1 
     real[real<0] += tnb
     imag[imag<0] += tnb
-    return ((real << nbits) + imag).astype(fmt)
+    return ((real << nbits) + imag)
 
 def uint2cplx(d, nbits):
     """
@@ -82,20 +82,21 @@ def _format_phase_steps(phase, phase_bp, fmt='>i4'):
         :param phase_bp: binary points of the phase accumulator
         :type phase_bp: int
 
+        :param fmt: format of the integer to be written to firmware, 
+            use >u4 for standard interface or <u4 for fast local mmap-based interface
+        :type fmt: str
+        
         :return: phase_int -- the integers to be written
             to firmware. Is either an integer (if `phase'
             is an integer. Else an array of integers.)
-        :rtype: int (or array(dtype=int))
-
-    fmt should be '>i4' with the standard firmware interface or '<i4' with the fast mmap-ed interface
-    
+        :rtype: int (or array(dtype=<fmt>))    
      """
     phase_scaled = phase / np.pi
     phase_scaled = ((phase_scaled + 1) % 2) - 1
-    phase_int = (phase_scaled * (2**phase_bp)).astype(fmt)
-    return phase_int
+    phase_int = (phase_scaled * (2**phase_bp))
+    return phase_int.astype(fmt)
 
-def _format_phase_offsets(phase_offsets, phase_offset_bp):
+def _format_phase_offsets(phase_offsets, phase_offset_bp,fmt='>i4'):
     """
     Vectorised: Given a desired phase offset, format as appropriate
         integers which are interpretable by the mixer firmware
@@ -106,17 +107,44 @@ def _format_phase_offsets(phase_offsets, phase_offset_bp):
         :param phase_offset_bp: binary points of the phase offset
         :type phase_offset_bp: int
 
+        :param fmt: format of the integer to be written to firmware, 
+            use >u4 for standard interface or <u4 for fast local mmap-based interface
+        :type fmt: str
+
         :return: phase_offset_int -- the integers to be written
             to firmware. Is either an integer (if `phase_offset'
             is an integer. Else an array of integers.
-        :rtype: int (or array(dtype=int))
+        :rtype: int (or array(dtype=<fmt>))
      """
     phase_offset_scaled = phase_offsets / np.pi
     phase_offset_scaled = ((phase_offset_scaled + 1) % 2) - 1
-    phase_offset_int = (phase_offset_scaled * (2**phase_offset_bp)).astype('>i4')
-    return phase_offset_int
+    phase_offset_int = (phase_offset_scaled * (2**phase_offset_bp))
+    return phase_offset_int.astype(fmt)
 
-def _format_amp_scale(amplitude_scale_factors,n_scale_bits):
+def _format_ri_steps(ri_steps, ri_step_bp,fmt='>u4'):
+    """
+    Vectorised: Given a desired RI step, format as appropriate
+        integers which are interpretable by the mixer firmware
+
+        :param ri_steps: RI step[s] to step per parallel sample, in radians
+        :type ri_steps: float, or array of floats
+
+        :param ri_step_bp: binary points of the RI step
+        :type ri_step_bp: int
+
+        :param fmt: format of the integer to be written to firmware, 
+            use >u4 for standard interface or <u4 for fast local mmap-based interface
+        :type fmt: str
+
+        :return: ri_steps_int -- the integers to be written
+            to firmware. Is either an integer (if `ri_steps'
+            is an integer. Else an array of integers.)
+        :rtype: int (or array(dtype=<fmt>))
+    """
+    return  cplx2uint(ri_steps, ri_step_bp).astype(fmt)
+
+
+def _format_amp_scale(amplitude_scale_factors,n_scale_bits,fmt='>u4'):
     """
     Vectorised:    Given a desired scale factor, format as an appropriate
         integer which is interpretable by the mixer firmware.
@@ -127,6 +155,11 @@ def _format_amp_scale(amplitude_scale_factors,n_scale_bits):
         :param n_scale_bits: Number of bits to use for the scale factor
         :type n_scale_bits: int
 
+        :param fmt: format of the integer to be written to firmware, 
+            use >u4 for standard interface or <u4 for fast local mmap-based interface
+        :type fmt: str
+
+
         :return: Integer scale[s]
         :rtype: array of ints
     """
@@ -135,41 +168,55 @@ def _format_amp_scale(amplitude_scale_factors,n_scale_bits):
     # saturate
     scale_max = 2**n_scale_bits - 1
     v[v > scale_max] = scale_max
-    return v.astype('>u4')
+    return v.astype(fmt)
 
-def _invert_format_phase_steps(phase_int,phase_bp):
+
+
+def _invert_format_phase_steps(phase_int,phase_bp,fmt='>i4'):
     """
     Vectorised: Given a phase step integer, or array of integers, as read from the firmware,
-      invert the formatting applied by `_format_phase_steps'
+        invert the formatting applied by `_format_phase_steps'
+        fmt should be '>i4' with the standard firmware interface or '<i4' with the fast mmap-ed interface
     """
-    phase_scaled = phase_int.astype(float) / (2**phase_bp)
+    phase_scaled = phase_int.view(fmt).astype(float) / (2**phase_bp)
     #dont need to invert this: phase_scaled = ((phase_scaled + 1) % 2) - 1
     phase = phase_scaled * np.pi
     return phase
 
-def _invert_format_phase_offsets(phase_offset_int,phase_offset_bp):
+def _invert_format_phase_offsets(phase_offset_int,phase_offset_bp,fmt='>i4'):
     """
     Vectorised: Given a phase offset integer or array of integers, as read from the firmware,
-      invert the formatting applied by `_format_phase_offsets'
+        invert the formatting applied by `_format_phase_offsets'
+        fmt should be '>i4' with the standard firmware interface or '<i4' with the fast mmap-ed interface
+
     """
-    phase_offset_scaled = phase_offset_int.astype(float) / (2**phase_offset_bp)
+    phase_offset_scaled = phase_offset_int.view(fmt).astype(float) / (2**phase_offset_bp)
     #dont need to invert this: phase_offset_scaled = ((phase_offset_scaled + 1) % 2) - 1
     phase_offset = phase_offset_scaled * np.pi
     return phase_offset
 
-def _invert_format_amp_scale(scale_factors_int,n_scale_bits):
+def _invert_format_ri_steps(ri_steps_int, ri_step_bp, fmt='>u4'):
+    """
+    Vectorised: Given a RI step integer or array of integers, as read from the firmware,
+        invert the formatting applied by `_format_ri_steps'
+        fmt should be '>u4' with the standard firmware interface or '<u4' with the fast mmap-ed interface
+    """
+    ri_steps = uint2cplx(ri_steps_int.view(fmt), ri_step_bp)
+    return ri_steps
+
+def _invert_format_amp_scale(scale_factors_int,n_scale_bits,fmt='>u4'):
     """
     Vectorised: Given a scale factor integer or array of integers, as read from the firmware,
         invert the formatting applied by `_format_amp_scale'
+        fmt should be '>u4' with the standard firmware interface or '<u4' with the fast mmap-ed interface
     """
-    scale_factors = scale_factors_int.astype(float) / 2**n_scale_bits
+    scale_factors = scale_factors_int.view(fmt).astype(float) / 2**n_scale_bits
     return scale_factors
 
 
 def _wait_for_acc(r,accnum=0,poll_period_s=0.1):
     return r.accumulators[accnum]._wait_for_acc(poll_period_s)
     
-
 def _blocking_sleep(duration, get_now=time.perf_counter):
     now = get_now()
     end = now + duration
@@ -613,10 +660,10 @@ def read_raw_control_buffer_data(r,buf,los=['tx','rx']):
         Ns = r.mixer._n_serial_chans    # number of tone samples per parallel slice
 
         # Prepare arrays to hold the interlaced results.
-        all_phase_steps_int = np.empty(n_tone, dtype=np.int64)
-        all_ri_steps_int = np.empty(n_tone, dtype=np.int64)
-        all_phase_offsets_int = np.empty(n_tone, dtype=np.int64)
-        all_scaling_int = np.empty(n_tone, dtype=np.int64)
+        all_phase_steps_int = np.empty(n_tone, dtype='>u4')
+        all_ri_steps_int = np.empty(n_tone, dtype='>u4')
+        all_phase_offsets_int = np.empty(n_tone, dtype='>u4')
+        all_scaling_int = np.empty(n_tone, dtype='>u4')
 
         # Each parallel stream slice has been written to register: f'{lo}_lo{i}_control'
         # at an offset of: 4 * _CONTROL_N_WORDS * (buf * _n_serial_chans + i)
@@ -735,7 +782,7 @@ def interpret_raw_control_buffer_data(r,formatted_lo_control_values):
             all_scaling_int = formatted_lo_control_values[lo]['formatted_scaling']
     
             phase_steps = _invert_format_phase_steps(all_phase_steps_int.ravel(), r.mixer._phase_bp)
-            ri_steps = uint2cplx(all_ri_steps_int,r.mixer._n_ri_step_bits)
+            ri_steps = _invert_format_ri_steps(all_ri_steps_int,r.mixer._n_ri_step_bits)
             phase_offsets = _invert_format_phase_offsets(all_phase_offsets_int.ravel(), r.mixer._phase_offset_bp)
             scaling = _invert_format_amp_scale(all_scaling_int.ravel(), r.mixer._n_scale_bits)
 
@@ -749,7 +796,45 @@ def interpret_raw_control_buffer_data(r,formatted_lo_control_values):
     return lo_control_values
 
 
+def interpret_raw_control_buffer_data_fast(r_fast,formatted_lo_control_values):
+    """
+    Interpret the values read from the lo control buffer.
 
+    Parameters:
+    r_fast: readout object
+    formatted_lo_control_values: dictionary with keys 'tx' and 'rx'
+     - 'tx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling'
+     - 'rx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling'
+
+    Returns:
+    lo_control_values: dictionary with keys 'tx' and 'rx'
+     - 'tx': dictionary with keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+     - 'rx': dictionary with keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+
+    """
+    lo_control_values = {'tx':{},'rx':{}}
+    for lo in ['tx','rx']:
+        if lo not in formatted_lo_control_values.keys():
+            raise ValueError(f"Only LOs 'rx' and 'tx' are understood. Not {lo}.")
+        try:
+            all_phase_steps_int = formatted_lo_control_values[lo]['formatted_phase_steps']
+            all_ri_steps_int = formatted_lo_control_values[lo]['formatted_ri_steps']
+            all_phase_offsets_int = formatted_lo_control_values[lo]['formatted_phase_offsets']
+            all_scaling_int = formatted_lo_control_values[lo]['formatted_scaling']
+    
+            phase_steps = _invert_format_phase_steps(all_phase_steps_int.ravel(), r_fast.mixer._phase_bp,fmt='<i4')
+            ri_steps = _invert_format_ri_steps(all_ri_steps_int,r_fast.mixer._n_ri_step_bits,fmt='<u4')
+            phase_offsets = _invert_format_phase_offsets(all_phase_offsets_int.ravel(), r_fast.mixer._phase_offset_bp,fmt='<i4')
+            scaling = _invert_format_amp_scale(all_scaling_int.ravel(), r_fast.mixer._n_scale_bits,fmt='<u4')
+
+            lo_control_values[lo]['phase_steps'] = phase_steps
+            lo_control_values[lo]['ri_steps'] = ri_steps
+            lo_control_values[lo]['phase_offsets'] = phase_offsets
+            lo_control_values[lo]['scaling'] = scaling
+        except KeyError as e:
+            continue
+
+    return lo_control_values        
 
 def prepare_control_buffer_data(r,buf,lo_control_values):
     """
@@ -788,10 +873,10 @@ def prepare_control_buffer_data(r,buf,lo_control_values):
             if scaling is None:
                 scaling = existing[lo]['scaling']
         
-        phase_steps_formatted = _format_phase_steps(phase_steps, r.mixer._phase_bp)
-        phase_offsets_formatted = _format_phase_offsets(phase_offsets, r.mixer._phase_offset_bp)
-        ri_steps_formatted = cplx2uint(ri_steps,r.mixer._n_ri_step_bits)
-        scaling_formatted = _format_amp_scale(scaling, r.mixer._n_scale_bits) 
+        phase_steps_formatted = _format_phase_steps(phase_steps, r.mixer._phase_bp,fmt='<i4')
+        phase_offsets_formatted = _format_phase_offsets(phase_offsets, r.mixer._phase_offset_bp,fmt='<i4')
+        ri_steps_formatted = _format_ri_steps(ri_steps,r.mixer._n_ri_step_bits,fmt='<u4')
+        scaling_formatted = _format_amp_scale(scaling, r.mixer._n_scale_bits,fmt='<u4') 
 
         n_tone = r.mixer.n_chans
 
@@ -852,10 +937,10 @@ def prepare_control_buffer_data_fast(r_fast,buf,lo_control_values):
         phase_offsets = lo_control_values[lo].get('phase_offsets')
         scaling = lo_control_values[lo].get('scaling')
 
-        phase_steps_formatted = _format_phase_steps(phase_steps, r_fast.mixer._phase_bp) if phase_steps is not None else []
-        phase_offsets_formatted = _format_phase_offsets(phase_offsets, r_fast.mixer._phase_offset_bp) if phase_offsets is not None else []
-        ri_steps_formatted = cplx2uint(ri_steps,r_fast.mixer._n_ri_step_bits) if ri_steps is not None else []
-        scaling_formatted = _format_amp_scale(scaling, r_fast.mixer._n_scale_bits) if scaling is not None else []
+        phase_steps_formatted = _format_phase_steps(phase_steps, r_fast.mixer._phase_bp,fmt='<i4') if phase_steps is not None else []
+        phase_offsets_formatted = _format_phase_offsets(phase_offsets, r_fast.mixer._phase_offset_bp,fmt='<i4') if phase_offsets is not None else []
+        ri_steps_formatted = _format_ri_steps(ri_steps,r_fast.mixer._n_ri_step_bits,fmt='<u4') if ri_steps is not None else []
+        scaling_formatted = _format_amp_scale(scaling, r_fast.mixer._n_scale_bits,fmt='<u4') if scaling is not None else []
 
         n_phase_steps = len(phase_steps_formatted)
         n_phase_offsets = len(phase_offsets_formatted)
@@ -2298,7 +2383,7 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
     Set the tone amplitude scale factors in the RFSOC.
 
     Currently sets both halfs of the double buffer to the same value.
-    This is not ideal, but for now it will do.
+    This is not ideal, but for now it will 
     """
     tone_amplitudes = np.atleast_1d(tone_amplitudes)
     num_tones = len(tone_amplitudes)
