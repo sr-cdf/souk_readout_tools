@@ -1916,7 +1916,7 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
     print('apply_step, set_buf',step_index,allbuf[step_index])
     set_control_buffer_idx_fast(r_fast,allbuf[step_index])
 
-    force_sync_fast(r_fast)
+    force_sync_fast(r_fast,0.00001)
     
     if c1 or c2:
         _wait_for_acc(r_fast,0,0.0001)
