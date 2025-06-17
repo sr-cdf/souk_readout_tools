@@ -59,13 +59,23 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
     dacclk = adcclk
     dacduc = info['dac_duc_mixer_frequency_hz']
     dacnyq = info['nyquist_zone_dac0']
+    dacint = 2
     txnfft = 8192
     rxnfft = 8192
+    
+    #dbbmin = -dacclk/dacint/2
+    #dbbmax = +dacclk/dacint/2
 
-    dacmin = (dacduc - dacclk/2) + dacclk*(dacnyq-1)
-    dacmax = (dacduc + dacclk/2) + dacclk*(dacnyq-1)
+    dbbmin = -dacclk/2
+    dbbmax = +dacclk/2
+
+    dacmin = min(abs([dbbmin+dacduc,dbbmax+dacduc]))
+    dacmax = max(abs([dbbmin+dacduc,dbbmax+dacduc]))
+
+    
     rfmin = dacmin
     rfmax = dacmax
+
     if udc:
         if sb==1:
             rfmin = lo + dacmin
