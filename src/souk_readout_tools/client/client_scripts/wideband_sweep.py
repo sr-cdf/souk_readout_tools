@@ -69,8 +69,8 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
     dbbmin = -dacclk/2
     dbbmax = +dacclk/2
 
-    dacmin = min(abs([dbbmin+dacduc,dbbmax+dacduc]))
-    dacmax = max(abs([dbbmin+dacduc,dbbmax+dacduc]))
+    dacmin = min([abs(dbbmin+dacduc),abs(dbbmax+dacduc)])
+    dacmax = max([abs(dbbmin+dacduc),abs(dbbmax+dacduc)])
 
     
     rfmin = dacmin
@@ -179,11 +179,11 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
     slope = np.nanmedian(np.gradient(phicat,fcat))
     zcat *= np.exp(-1j*(slope*fcat))
 
-    s['sweep_f'] = fcat
-    s['sweep_i'] = np.real(zcat)
-    s['sweep_q'] = np.imag(zcat)
-    s['sweep_ei'] = np.ravel(s['sweep_ei'].T)
-    s['sweep_eq'] = np.ravel(s['sweep_eq'].T)
+    s['sweep_f'] = [fcat]
+    s['sweep_i'] = [np.real(zcat)]
+    s['sweep_q'] = [np.imag(zcat)]
+    s['sweep_ei'] = [np.ravel(s['sweep_ei'].T)]
+    s['sweep_eq'] = [np.ravel(s['sweep_eq'].T)]
 
     if filename is None:
         filename = os.path.expanduser('~/.souk_readout_tools/tmp/tmp_wideband_sweep')
@@ -191,18 +191,19 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
     if not os.path.exists(os.path.dirname(filename)):
         os.makedirs(os.path.dirname(filename))
     client.export_sweep(filename, s, filetype)
-    print('Wideband sweep exported to:',filename+'.'+filetype)
+    filename = filename.replace(filetype,'')+filetype
+    print('Wideband sweep exported to:',filename)
 
     if plot_data:
-        sf = s['sweep_f']
-        si = s['sweep_i']
-        sq = s['sweep_q']
+        sf = s['sweep_f'][0]
+        si = s['sweep_i'][0]
+        sq = s['sweep_q'][0]
         sz = si+1j*sq
         logmag = 20*np.log10(abs(sz))
         uphase = np.unwrap(np.angle(sz))
 
-        ei = s['sweep_ei'] #/ np.sqrt(s['samples_per_point'])
-        eq = s['sweep_eq'] #/ np.sqrt(s['samples_per_point'])
+        ei = s['sweep_ei'][0] #/ np.sqrt(s['samples_per_point'])
+        eq = s['sweep_eq'][0] #/ np.sqrt(s['samples_per_point'])
         emag = 1/abs(sz)*np.sqrt((si*ei)**2 + (sq*ei)**2)
         elogmag = 20/np.abs(sz)/np.log(10)*emag
         ephi = 1/(si**2+sq**2) * np.sqrt((sq*ei)**2+(si*eq)**2)
