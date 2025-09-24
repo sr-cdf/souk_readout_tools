@@ -68,7 +68,9 @@ import traceback
 import csv
 import base64
 from scipy import signal
-
+import pdb
+import so3g
+from spt3g import core
 USER_CALIBRATIONS_DIR = os.path.expanduser('~/.souk_readout_tools/calibrations')
 USER_CONFIG_DIR = os.path.expanduser('~/.souk_readout_tools/config')
 USER_TMP_DIR = os.path.expanduser('~/.souk_readout_tools/tmp')
@@ -687,7 +689,11 @@ class ReadoutClient:
         sweep_f = np.frombuffer(sweep_f_bytes, dtype='f8').reshape((num_points, num_tones)).copy()
         sweep_z = np.frombuffer(sweep_z_bytes, dtype='complex128').reshape((num_points, num_tones)).copy()
         sweep_e = np.frombuffer(sweep_e_bytes, dtype='complex128').reshape((num_points, num_tones)).copy()
+        #sweep_f = np.frombuffer(sweep_f_bytes, dtype='f8').reshape((num_tones, num_points)).copy()
+        #sweep_z = np.frombuffer(sweep_z_bytes, dtype='complex128').reshape((num_tones, num_points)).copy()
+        #sweep_e = np.frombuffer(sweep_e_bytes, dtype='complex128').reshape((num_tones, num_points)).copy()
 
+        
         if apply_phase_correction:
                 
                 #get bin indexes
@@ -787,7 +793,7 @@ class ReadoutClient:
                     writer.writerow([f'# {key}', value])
                 header = []
                 for k in range(len(sweep_dict['sweep_f'])):
-                    header.extend([f'sweep_f_{k:04d}', f'sweep_i_{k:04d}', f'sweep_q_{k:04d}', f'err_i_{k:04d}', f'err_q_{k:04d}'])
+                    header.extend([f'#sweep_f_{k:04d}', f'sweep_i_{k:04d}', f'sweep_q_{k:04d}', f'err_i_{k:04d}', f'err_q_{k:04d}'])
                 writer.writerow(header)
                 for j in range(len(sweep_dict['sweep_f'][0])):
                     row = []
@@ -874,6 +880,7 @@ class ReadoutClient:
 
         return sweep_dict
 
+    
 
     def receive_stream(self, num_tones=2048, filename=None,print_data=False):
         data = bytearray(2048*2*4 + 10*4)
@@ -965,6 +972,172 @@ class ReadoutClient:
                 print(f"Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
         return iq_data
 
+    def receive_stream_g3(self, num_tones=2048, filename=None,print_data=False):
+        ''' JL: Recevies a data stream and write it to a g3 file'''
+        
+        # JL: Level 1 data shows this is typically around 400
+        num_sample_rows_per_frame =400
+        
+        data = bytearray(2048*2*4 + 10*4)
+        view = memoryview(data)
+        iq_data=None
+        if filename is None:
+            filename ='./tmp/tmp_stream'
+        if not os.path.exists('./tmp'):
+            os.makedirs('./tmp')
+
+        info = self.get_system_information()
+
+        metadata = {}
+        metadata['date'] = time.strftime('%Y-%m-%d %H:%M:%S UTC%z')
+        metadata['num_tones'] = num_tones
+        metadata['sample_rate'] = self.get_sample_rate()
+        metadata['format'] = '<i4'
+        metadata['system_information'] = info
+
+        # JL setting similar to Smurf at the the moment - some of our primary names won't exist. 
+        primary_names = [
+        'UnixTime', 'FluxRampIncrement', 'FluxRampOffset', 'Counter0',
+        'Counter1', 'Counter2', 'AveragingResetBits', 'FrameCounter',
+        'TESRelaySetting']
+        primary_idxs = {name: idx for idx, name in enumerate(primary_names)}
+
+        # JL Indexing below strips the assumed .g3 extension from the supplied filename and replaces it with .json
+        # pdb.set_trace()
+        with open(filename[:-3]+'.json','w') as file:
+            json.dump(metadata,file,indent=4)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((self.stream_server_address, self.stream_server_port))
+            
+            with core.G3Writer(filename=filename) as writer:
+                print(f"Writing data to {filename}")
+                t0=time.time()
+                frame_count=0 # Counter for total number of frames (each of  length num_sample_rows_per_frame) written/
+                count = 0    # counter for total number of packets (data rows) received.
+                row_frame_count =0 # Counter for number of packets received within the frame so far.
+                ppid = os.getppid()
+                
+                while True:
+                  start = time.time() # JL will be ultimately derived from the PTP data in the packets
+                  while True:
+                      try:
+                        #quit if parent has changed, prevents zombie processes
+                        if os.getppid() != ppid:
+                            break
+
+                        # Read data length
+                        raw_datalen = s.recv(4)
+                        if not raw_datalen:
+                            continue
+                        datalen = struct.unpack('>I', raw_datalen)[0]
+                        if datalen==0:
+                            continue
+                        received_len = 0
+                        while received_len < datalen:
+                            packet_len = s.recv_into(view[received_len:], datalen - received_len)
+                            if packet_len == 0:
+                                break
+                            received_len += packet_len
+                        if received_len < datalen:
+                            print(f"Expected {datalen} bytes, but only received {received_len} bytes.")
+                            break
+
+                        #############################################
+                        # JL Pickout out data from the bufferm contruct a 1-D "row" transfomar into a column vector
+                        # then hstack to build up the 2-D data_frame_buffer
+                        # Example row structure:
+                        # i_data_0000,q_data_0000,i_data_0001,q_data_0001,i_data_0002,q_data_0002,i_data_0003,q_data_0003,i_data_0004,q_data_0004,i_data_0005,q_data_0005,i_data_0006
+                        # ,q_data_0006,packet_counter,packet_error,flag0,flag1,flag2,flag3,flag4,flag5,flag6,flag7
+                        # Number of columns in a row =
+                        # iq_data = num_tones * 2
+                        # cnt = 1
+                        # err = 1
+                        # flags = 8
+                        # = num_tones*2 + 10
+                        iq_data = np.frombuffer(data[:datalen][::1], dtype='<i4')[:2*num_tones]
+                        cnt = np.frombuffer(data[-8:-4], dtype='<i4')
+                        err = np.frombuffer(data[-4:], dtype='<i4')
+                        flags = np.frombuffer(data[-40:-8], dtype='<i4')
+                        full_row = np.concatenate((iq_data, cnt, err, flags), axis=0)
+                        full_row = full_row.reshape(-1,1) # make into column vector
+                        if row_frame_count==0:
+                            data_frame_buffer = full_row
+                        else:
+                            data_frame_buffer = np.hstack((data_frame_buffer,full_row))
+                        #print('##############################')
+                        #print(f"Frame is {data_frame_buffer}")
+                        #print("Shape is ", np.shape(data_frame_buffer)) 
+                        #print(f"Frame is {data_frame_buffer}\r", end='', flush=True)                       
+                        count+=1
+                        row_frame_count+=1
+
+                        if (row_frame_count==num_sample_rows_per_frame):
+                            # Frame is full, reset counter and exit the loop
+                            row_frame_count = 0
+                            break
+
+                        if print_data:
+                            i = np.frombuffer(data[:datalen][::2], dtype='<i4')[:num_tones]
+                            q = np.frombuffer(data[:datalen][1::2], dtype='<i4')[:num_tones]
+                            err = np.frombuffer(data[-4:], dtype='<i4')
+                            cnt = np.frombuffer(data[-8:-4], dtype='<i4')
+                            flags = np.frombuffer(data[-40:-8], dtype='<i4')
+                            iq_data=i+1j*q
+                            print(f"datalen {datalen} Received IQ data: {err} {cnt} {iq_data.tolist()}\r",end='',flush=True)
+                        
+                      except KeyboardInterrupt:
+                        break
+
+                      except Exception as e:
+                        print(f"Error receiving stream data: {e}")
+                        print(traceback.format_exc())
+                        break
+                
+                  # End of data frame buffer contruction loop
+                  fr = core.G3Frame(core.G3FrameType.Scan)
+                  sample_rate = metadata['sample_rate']
+                  #Setup the 1-D time array for the data part of the frame
+                  times =np.linspace(start,start+(num_sample_rows_per_frame)/sample_rate, num_sample_rows_per_frame) # JL Utimately will be from PTP within packets
+                  g3times = core.G3VectorTime(times * core.G3Units.s)
+
+                  chans = np.arange(num_tones)
+                  # Set up the row descriptive names for the data part of the frame
+                  names=['_']*(2*num_tones+1+1+8) # 1 cnt column, 1 err column, 8 flags
+                  names[0:2*len(chans):2] = [f'i{ch:0>4}' for ch in chans] # i followed by zero padded 4 digit channel (tone) number 
+                  names[1:2*len(chans):2] = [f'q{ch:0>4}' for ch in chans] # q followed by zero padded 4 digit channel (tone) number 
+                  names[num_tones*2] = 'cnt'
+                  names[num_tones*2+1] = 'err'
+                  names[num_tones*2+2:] = [f'flag{flag}' for flag in list(range(1,9))]  # "flag0" to "flag7"
+
+                  # Write the data frame - row names (len = 2*num_tones + 10), times (len = num_sample_rows_per_frame), 2-D data_frame_buffer  = len(row_names) * len(times).          
+                  fr['data'] = so3g.G3SuperTimestream(names, g3times, data_frame_buffer)
+                  #pdb.set_trace()
+                  # This is purely a counter of how much data is in the frame - look at cnt to see if packets have been dropped.
+                  frame_counter = np.arange(0,num_sample_rows_per_frame, dtype=int)  
+                  primary_data = np.zeros((len(primary_names), num_sample_rows_per_frame), dtype=np.int64)
+                  primary_data[primary_idxs['UnixTime'], :] = (times * 1e9).astype(int)
+                  primary_data[primary_idxs['FrameCounter'], :] = frame_counter
+                  fr['primary'] = so3g.G3SuperTimestream(primary_names, g3times, primary_data)
+
+                  fr['timing_paradigm'] = 'High Precision'
+                  fr['num_samples'] = num_sample_rows_per_frame # per frame
+                  fr['frame_num'] = frame_count # JL Numbering from 0
+                  fr['session_id'] = int(start) # Unix start time in whole seconds 
+                  fr['sostream_id'] = 'ukkid_1' # JL This ultimately comes from the OCS agent that starts up the taks
+                  fr['sostream_version'] = 2    # JL Again, should probably mean something different in our case.
+                  fr['time'] = core.G3Time(time.time() * core.G3Units.s) # JL Presumably meant to be the time when frame is written out, not the timestamp of the first element of the frame??
+                  writer(fr)
+                  frame_count+=1
+
+                
+                t1=time.time()
+                print()
+                print(f"Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
+        return iq_data
+ 
+
+    
 
     def receive_triggered_stream(self, num_tones=2048, filename=None,print_data=False):
         data = bytearray(4096*4 + 10*4)
