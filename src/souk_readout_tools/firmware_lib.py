@@ -1524,6 +1524,8 @@ def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True):
 
     write_control_buffer_data(r,buf,v)
     set_control_buffer_idx(r,buf)
+    r.sync.arm_sync(wait=False)
+    r.sync.sw_sync()
     return
 
 def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, detailed_output=False):
@@ -2164,6 +2166,10 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, autosync=True, detail
     
     tone_frequency_settings, details = prepare_tone_frequency_settings(r, config_dict, tone_frequencies)
     apply_tone_frequency_settings(r, tone_frequency_settings, autosync=autosync)
+   
+    r.sync.arm_sync(wait=False)
+    time.sleep(0.001)
+    r.sync.sw_sync()
 
     if detailed_output:
         return details
