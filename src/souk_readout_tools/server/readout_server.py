@@ -730,8 +730,9 @@ class ReadoutServer:
                         samples_per_point = message.get('samples_per_point')
                         direction = message.get('direction')
                         method = message.get('method')
+                        freq_offsets = message.get('freq_offsets', None)
                         self.sweep_task = asyncio.create_task(
-                            self.retune(centers, spans, points, samples_per_point, direction, method)
+                            self.retune(centers, spans, points, samples_per_point, direction, method, freq_offsets)
                         )
                         await self.send_response(writer, {'status': 'success', 'message': 'Retune in progress'})
                     else:
@@ -1116,13 +1117,27 @@ class ReadoutServer:
         """
         A coroutine that performs a frequency sweep, finds the resonance peaks using the specified method, and sets the tones to the peak frequencies.
         """
+       
+        center = np.atleast_1d(center)
+        span = np.atleast_1d(span)
+        if len(span)==1:
+            span = np.full(len(center),span[0])
+        assert len(center) == len(span)
+        num_points=int(points)
+        samples_per_point=int(samples_per_point)
+        assert direction in ('up','down')
+
+       
+        #handle freq_offsets, if None, all zeros, if scalar, make array of that value, if array, ensure correct length
         if freq_offsets is None:
             freq_offsets = np.zeros_like(center)
         elif np.isscalar(freq_offsets):
             freq_offsets = np.full_like(center, freq_offsets)
-        elif freq_offsets.shape != np.atleast_1d(center).shape:
+        else:
+            freq_offsets = np.atleast_1d(freq_offsets)
+        if freq_offsets.shape != center.shape:
             raise ValueError("freq_offsets must be None, a scalar, or have the same shape as centers")
-        if np.any(np.abs(freq_offsets) > span/2):
+        if np.any(np.abs(freq_offsets) > spans/2):
             print("Warning: some freq_offsets are larger than half the span, which may cause tones to be set outside the sweep range")
         
         try:

@@ -623,7 +623,9 @@ class ReadoutClient:
             freq_offsets = np.zeros_like(centers)
         elif np.isscalar(freq_offsets):
             freq_offsets = np.full_like(centers, freq_offsets)
-        elif freq_offsets.shape != centers.shape:
+        else:
+            freq_offsets = np.atleast_1d(freq_offsets)
+        if freq_offsets.shape != centers.shape:
             raise ValueError("freq_offsets must be None, a scalar, or have the same shape as centers")
 
         #warn if freq_offsets are much larger than half of the spans
