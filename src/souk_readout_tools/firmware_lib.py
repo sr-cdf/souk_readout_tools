@@ -3238,12 +3238,19 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
         }
     return results 
 
-def perform_retune(r, r_fast,config_dict, centers, spans, points, samples_per_point, direction, method,smooth_len=3):
+def perform_retune(r, r_fast,config_dict, centers, spans, points, samples_per_point, direction, method,smooth_len=3,freq_offsets=None):
     """
     A blocking call to perform a frequency retune of the RFSOC.
     SImply performs a sweep and then retunes to the frequencies of maximum gradient or minimum magnitude.
     An asynchronous version of this function is available in the readout_server code.
+    if freq_offsets is given, it is added to the retune frequencies before setting them.
     """
+    if freq_offsets is None:
+        freq_offsets = np.zeros_like(centers)
+    elif np.isscalar(freq_offsets):
+        freq_offsets = np.full_like(centers,freq_offsets)
+    elif freq_offsets.shape != np.atleast_1d(centers).shape:
+            raise ValueError("freq_offsets must be None, a scalar, or have the same shape as centers")
     
     #results = r.retune(center, span, points, samples_per_point,direction,method)
     if method not in ('max_gradient','min_mag'):
@@ -3256,14 +3263,14 @@ def perform_retune(r, r_fast,config_dict, centers, spans, points, samples_per_po
             freqs = results['sweep_frequencies'][t]
             grads = np.abs(np.gradient(results['sweep_responses'][t]))
             max_grad = np.argmax(grads)
-            retune_freqs[t] = freqs[max_grad]
+            retune_freqs[t] = freqs[max_grad] + freq_offsets[t]
     elif method == 'min_mag':
         retune_freqs = np.zeros_like(results['sweep_frequencies'])
         for t in range(len(centers)):
             freqs = results['sweep_frequencies'][t]
             mags = np.abs(results['sweep_responses'][t])
             min_mag = np.argmin(mags)
-            retune_freqs[t] = freqs[min_mag]
+            retune_freqs[t] = freqs[min_mag] + freq_offsets[t]
 
     set_tone_frequencies(r,config_dict,retune_freqs)
     results['retune_freqs'] = retune_freqs

@@ -609,7 +609,7 @@ class ReadoutClient:
         }
         return self.send_request(message)
 
-    def perform_retune(self, centers, spans, points, samples_per_point, direction='up',method='max_gradient'):
+    def perform_retune(self, centers, spans, points, samples_per_point, direction='up',method='max_gradient',freq_offsets=None):
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(centers)
         if response['status'] != 'success':
@@ -618,6 +618,19 @@ class ReadoutClient:
         centers=np.atleast_1d(centers)
         spans=np.atleast_1d(spans)
 
+        #handle freq_offsets, if None, all zeros, if scalar, make array of that value, if array, ensure correct length
+        if freq_offsets is None:
+            freq_offsets = np.zeros_like(centers)
+        elif np.isscalar(freq_offsets):
+            freq_offsets = np.full_like(centers, freq_offsets)
+        elif freq_offsets.shape != centers.shape:
+            raise ValueError("freq_offsets must be None, a scalar, or have the same shape as centers")
+
+        #warn if freq_offsets are much larger than half of the spans
+        if np.any(np.abs(freq_offsets) > spans / 2):
+            print("Info: some freq_offsets are larger than half of the spans."
+                  "Noise calculations may end up missing a corresponding sweep point.")
+
         message = {
             'request': 'retune',
             'centers': centers,
@@ -625,7 +638,8 @@ class ReadoutClient:
             'points': points,
             'samples_per_point': samples_per_point,
             'direction': direction,
-            'method': method
+            'method': method,
+            'freq_offsets': freq_offsets
         }
         return self.send_request(message)
 

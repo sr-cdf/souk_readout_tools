@@ -1112,10 +1112,19 @@ class ReadoutServer:
             print(f"Error performing sweep: {e}")
             print(traceback.format_exc())
         
-    async def retune(self, center, span, points, samples_per_point, direction, method):
+    async def retune(self, center, span, points, samples_per_point, direction, method,freq_offsets=None):
         """
         A coroutine that performs a frequency sweep, finds the resonance peaks using the specified method, and sets the tones to the peak frequencies.
         """
+        if freq_offsets is None:
+            freq_offsets = np.zeros_like(center)
+        elif np.isscalar(freq_offsets):
+            freq_offsets = np.full_like(center, freq_offsets)
+        elif freq_offsets.shape != np.atleast_1d(center).shape:
+            raise ValueError("freq_offsets must be None, a scalar, or have the same shape as centers")
+        if np.any(np.abs(freq_offsets) > span/2):
+            print("Warning: some freq_offsets are larger than half the span, which may cause tones to be set outside the sweep range")
+        
         try:
             if method not in ('max_gradient','min_mag'):
                 raise ValueError(f'Invalid retune method "{method}", must be "max_gradient" or "min_mag"')
@@ -1137,15 +1146,15 @@ class ReadoutServer:
                     freqs = sweep_f[:,t]
                     grads = np.abs(np.gradient(sweep_z[:,t]))
                     max_grad = np.argmax(grads)
-                    retune_freqs[t] = freqs[max_grad]
+                    retune_freqs[t] = freqs[max_grad] + freq_offsets[t]
             elif method == 'min_mag':
                 for t in range(len(center)):
                     freqs = sweep_f[:,t]
                     mags = np.abs(sweep_z[:,t])
                     min_mag = np.argmin(mags)
-                    retune_freqs[t] = freqs[min_mag]
+                    retune_freqs[t] = freqs[min_mag] + freq_offsets[t]
 
-            print('Retune freqs:',retune_freqs)
+            print('Retune freqs = found freqs + freq offsets = ',retune_freqs)
 
             firmware_lib.set_tone_frequencies(self.r,self.config,retune_freqs)
             # print('New frequencies:',firmware_lib.get_tone_frequencies(self.r,self.config))
