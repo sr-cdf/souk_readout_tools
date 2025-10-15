@@ -838,14 +838,15 @@ class ReadoutClient:
                         header_lines+=1
                         key = line.split(',')[0].lstrip('# ')
                         value = line[line.find(',')+1:].strip()
-                        if key=='date':
-                            value = value
-                        elif value.startswith('"') and value.endswith('"'):
-                            value = eval(value[1:-1])
+                        if value.startswith('"') and value.endswith('"'):
+                            try:
+                                value = eval(value[1:-1])
+                            except:
+                                value=value
                         else:
                             try:
                                 value = eval(value)
-                            except NameError:
+                            except:
                                 value = value
                         sweep_dict[key] = value
 

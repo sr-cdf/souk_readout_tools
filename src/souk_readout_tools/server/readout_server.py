@@ -30,6 +30,7 @@ import struct
 import yaml
 import socket
 import os
+import pwd
 import shutil
 import traceback
 import sys
@@ -54,23 +55,44 @@ FLAG_6 = 6
 FLAG_7 = 7
 
 
-#because we need sudo to access /dev/mem (setcap not effective)
+#Because we need sudo to access /dev/mem (setcap not effective)
+
+# Default runtime dirs (non-root)
 USER_CONFIG_DIR = os.path.expanduser('~/.souk_readout_tools/config')
 USER_CALIBRATIONS_DIR = os.path.expanduser('~/.souk_readout_tools/calibrations')
 USER_TMP_DIR = os.path.expanduser('~/.souk_readout_tools/tmp')
-USER = os.getenv('USER')
-SUDO=False
 
-if os.getuid()==0:
-    USER_CONFIG_DIR = '/home/casper/.souk_readout_tools/config'
-    USER_CALIBRATIONS_DIR = '/home/casper/.souk_readout_tools/calibrations'
-    USER_TMP_DIR = '/home/casper/.souk_readout_tools/tmp'
-    SUDO=True
-    USER = os.getenv('SUDO_USER')
+SUDO = (os.geteuid() == 0)
+
+# If root, choose the real target user and home explicitly
+TARGET_USER = 'casper'
+if SUDO:
+    # hardcode paths or derive from passwd
+    try:
+        pw = pwd.getpwnam(TARGET_USER)
+        HOME = pw.pw_dir
+        TARGET_UID, TARGET_GID = pw.pw_uid, pw.pw_gid
+    except KeyError:
+        # fallback to /home/casper if the user isn't in /etc/passwd for some reason
+        HOME = '/home/casper'
+        TARGET_UID = int(os.getenv('SUDO_UID') or 0)
+        TARGET_GID = int(os.getenv('SUDO_GID') or 0)
+
+    USER_CONFIG_DIR = os.path.join(HOME, '.souk_readout_tools', 'config')
+    USER_CALIBRATIONS_DIR = os.path.join(HOME, '.souk_readout_tools', 'calibrations')
+    USER_TMP_DIR = os.path.join(HOME, '.souk_readout_tools', 'tmp')
+else:
+    pw = pwd.getpwnam(os.getenv('USER'))
+    TARGET_UID, TARGET_GID = pw.pw_uid, pw.pw_gid
+
+
+# Ensure dirs exist
+for d in (USER_CONFIG_DIR, USER_CALIBRATIONS_DIR, USER_TMP_DIR):
+    os.makedirs(d, exist_ok=True)
+    if SUDO:
+        os.chown(d, TARGET_UID, TARGET_GID)
 
 DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR,'default_config.lnk')
-
-
 
 def check_if_running_on_rfsoc_arm():
     """
@@ -282,8 +304,10 @@ class ReadoutServer:
         with open( filename, 'w') as file:
             file.write(yaml.dump(config_contents,sort_keys=False))
         os.chmod(filename,0o664)
+
         if SUDO:
-            os.chown(filename,int(os.getenv("SUDO_UID")),int(os.getenv("SUDO_GID")))
+            os.chown(filename,int(TARGET_UID),int(TARGET_GID))
+
         print(f'Saved config to {filename}')
         
         print('************************************************')
@@ -300,14 +324,14 @@ class ReadoutServer:
             #make a note of the previous default config
             shutil.copy(defaultname, prevname) 
             if SUDO:
-                os.chown(prevname,int(os.getenv("SUDO_UID")),int(os.getenv("SUDO_GID")))
+                os.chown(prevname,int(TARGET_UID),int(TARGET_GID))
             
             #link the new default
             with open(defaultname,'w') as file:
                 file.write(filename)
             os.chmod(defaultname, 0o664)
             if SUDO:
-                os.chown(defaultname,int(os.getenv("SUDO_UID")),int(os.getenv("SUDO_GID")))
+                os.chown(defaultname,int(TARGET_UID),int(TARGET_GID))
 
 
 
@@ -428,7 +452,7 @@ class ReadoutServer:
                     with open(destination_filename,'w') as file:
                         file.write(cal_contents)
                     if SUDO:
-                        os.chown(destination_filename,int(os.getenv("SUDO_UID")),int(os.getenv("SUDO_GID")))
+                        os.chown(destination_filename,int(TARGET_UID),int(TARGET_GID))
                     await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'pull_calibration':
