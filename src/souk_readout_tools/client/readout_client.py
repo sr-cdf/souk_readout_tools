@@ -639,7 +639,7 @@ class ReadoutClient:
             'samples_per_point': samples_per_point,
             'direction': direction,
             'method': method,
-            'freq_offsets': freq_offsets
+            'freq_offsets': freq_offsets.tolist()
         }
         return self.send_request(message)
 
