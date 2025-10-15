@@ -103,6 +103,7 @@ class Resonance:
             q_factor = self.frequency / fwhm
             mask = (frequencies < self.frequency + 10*fwhm/2) & (frequencies > self.frequency - 10*fwhm/2) 
             dip_depth = max(logmag_data[mask]) - min(logmag_data[mask])
+            
         except Exception as e:
             print(f"Error in analyse method: {e}")
             width_hz = frequency_step
@@ -110,9 +111,17 @@ class Resonance:
             q_factor = self.frequency / fwhm
             dip_depth = 0
         
+        qc = q_factor/(1-10**(-dip_depth/20)) if dip_depth > 0 else np.inf
+        qi = 1/(1/q_factor - 1/qc) if (1/q_factor - 1/qc) != 0 else np.inf
+
+        #coupling constant:
+        
+
         # Store results
         self.fwhm = fwhm
         self.q_factor = q_factor
+        self.qc = qc
+        self.qi = qi
         self.dip_depth = dip_depth
 
         # Store marker values
@@ -185,20 +194,39 @@ class DataLoader():
         return frequencies, s21_complex
 
     def load_from_npy(self, filename):
-        data = np.load(filename,allow_pickle=True).item()
         print(filename)
-        try:
+        data = np.load(filename,allow_pickle=True)
+        if data.dtype == np.object_:
             #try load readout_client sweep
-            print(data.keys())
-            f = data['sweep_f']
-            z = data['sweep_i']+1j*data['sweep_q']    
-        except Exception as e:
-                QMessageBox.warning(None, "Error", "Failed to interpret file as a sweep: "+filename)
-                raise(e)
-        ss=np.argsort(f.ravel())
-        frequencies=f.ravel()[ss]
-        s21_complex=z.ravel()[ss]
-        return frequencies, s21_complex
+            data = data.item()
+            try:
+                print(data.keys())
+                f = data['sweep_f']
+                z = data['sweep_i']+1j*data['sweep_q']    
+            except Exception as e:
+                    QMessageBox.warning(None, "Error", "Failed to interpret file as a sweep: "+filename)
+                    raise(e)
+            ss=np.argsort(f.ravel())
+            frequencies=f.ravel()[ss]
+            s21_complex=z.ravel()[ss]
+            return frequencies, s21_complex
+        elif data.ndim == 2 and data.shape[0] == 2:
+            f = data[0].real
+            z = data[1]
+            ss=np.argsort(f.ravel())
+            frequencies=f.ravel()[ss]
+            s21_complex=z.ravel()[ss]
+            return frequencies, s21_complex
+        elif data.ndim == 2 and data.shape[0] == 3:
+            f = data[0]
+            z = data[1]+1j*data[2]
+            ss=np.argsort(f.ravel())
+            frequencies=f.ravel()[ss]
+            s21_complex=z.ravel()[ss]
+            return frequencies, s21_complex
+        else:
+            QMessageBox.warning(None, "Error", "Failed to interpret file as a sweep: "+filename)
+            raise ValueError('format of data in npy file not understood')
 
     def load_from_txt(self, filename):
         try:
@@ -1130,7 +1158,23 @@ class ResonanceFinderApp(QMainWindow):
         q_item.setText(f"{q_value:.1f}" if q_value is not None else "N/A")
 
 
+        # Qc
+        qc_item = self.resonances_table.item(row, 6)
+        if qc_item is None:
+            qc_item = QTableWidgetItem()
+            qc_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            self.resonances_table.setItem(row, 6, qc_item)
+        qc_value = resonance.qc
+        qc_item.setText(f"{qc_value:.1f}" if qc_value is not None else "N/A")
 
+        # Qi
+        qi_item = self.resonances_table.item(row, 7)
+        if qi_item is None:
+            qi_item = QTableWidgetItem()
+            qi_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            self.resonances_table.setItem(row, 7, qi_item)
+        qi_value = resonance.qi
+        qi_item.setText(f"{qi_value:.1f}" if qi_value is not None else "N/A")
         
 
     def onSaveCheckboxChanged(self,state):
@@ -1685,8 +1729,8 @@ class ResonanceFinderApp(QMainWindow):
         print('refreshActiveResonanceLabel')
         if self.active_resonance_index is not None:
             resonance = self.resonances[self.active_resonance_index]
-            self.label_analysis.setText(f'Active Resonance: {resonance.name}\nFrequency: {resonance.frequency/1e6:.6f} MHz\nDip depth: {resonance.dip_depth:.3f} dB\nFWHM: {resonance.fwhm:.3f} Hz\nQ: {resonance.q_factor:.3f}\nSave: {resonance.save}')
-            
+            self.label_analysis.setText(f'Active Resonance: {resonance.name}\nFrequency: {resonance.frequency/1e6:.6f} MHz\nDip depth: {resonance.dip_depth:.3f} dB\nFWHM: {resonance.fwhm:.3f} Hz\nQr: {resonance.q_factor:.3f}\nQc: {resonance.qc:.3f}\nQi: {resonance.qi:.3f}\nSave: {resonance.save}')
+
         else:
             if len(self.resonances) > 0:
                 self.label_analysis.setText("No active resonance\n\nPick a resonance to view")
@@ -2325,9 +2369,9 @@ class ResonanceFinderApp(QMainWindow):
         resonances_layout = QVBoxLayout()
 
         self.resonances_table = QTableWidget()
-        self.resonances_table.setColumnCount(6)
+        self.resonances_table.setColumnCount(8)
         self.resonances_table.setHorizontalHeaderLabels([
-            "Save", "ID", "Frequency (MHz)",  "FWHM (kHz)","Depth (dB)", "Q-factor"])
+            "Save", "ID", "Frequency (MHz)",  "FWHM (kHz)","Depth (dB)", "Q-factor","Q-coupling","Q-internal"])
         self.resonances_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.resonances_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.resonances_table.verticalHeader().setVisible(False)
@@ -2841,10 +2885,10 @@ class ResonanceFinderApp(QMainWindow):
                 if filename.endswith('.resonances'):
                     with open(filename, 'w') as f:
                         # f.write("ID,Frequency(Hz),Q-factor,FWHM(Hz)\n")
-                        f.write("#ID\tFrequency(Hz)\tLinewidth(Hz)\tQfactor(Qr)\tDipDepth(dB)\n")
+                        f.write("#ID\tFrequency(Hz)\tLinewidth(Hz)\tQfactor(Qr)\tQcoupling\tQinternal\tDipDepth(dB)\n")
                         for resonance in self.resonances:
                             if resonance.save and resonance.id is not None:
-                                f.write('%04d\t%16.6f\t%16.6f\t%16.6f\t%16.6f\n'%(resonance.id,resonance.frequency,resonance.fwhm,resonance.q_factor,resonance.dip_depth))
+                                f.write('%04d\t%16.6f\t%16.6f\t%16.6f\t%16.6f\t%16.6f\t%16.6f\n'%(resonance.id,resonance.frequency,resonance.fwhm,resonance.q_factor,resonance.qc,resonance.qi,resonance.dip_depth))
 
                 elif filename.endswith('.txt'):
                     with open(filename, 'w') as f:
@@ -3015,3 +3059,20 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+
+# do a butterbowrth lowpass filterdef butter_lowpass(cutoff, fs, order=5):
+def lowpass(data, cutoff, fs=1, order=5):
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    y = filtfilt(b, a, data)
+    return y
+
+def highpass(data, cutoff, fs=1, order=5):
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = butter(order, normal_cutoff, btype='high', analog=False)
+    y = filtfilt(b, a, data)
+    return y
