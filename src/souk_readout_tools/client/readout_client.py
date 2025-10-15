@@ -633,8 +633,8 @@ class ReadoutClient:
 
         message = {
             'request': 'retune',
-            'centers': centers,
-            'spans': spans,
+            'centers': centers.tolist(),
+            'spans': spans.tolist(),
             'points': points,
             'samples_per_point': samples_per_point,
             'direction': direction,
@@ -1308,7 +1308,7 @@ class ReadoutClient:
 
         #smooth the sweep data
         if smooth_window_hz:
-            window_samples = max(3,int(smooth_window_hz/(sweep_frequencies[1]-sweep_frequencies[0])))
+            window_samples = np.max([3,int(smooth_window_hz/(sweep_frequencies[1]-sweep_frequencies[0]))])
             si = signal.savgol_filter(si, window_samples,1)
             sq = signal.savgol_filter(sq, window_samples,1)
             sz = si+1j*sq
@@ -1340,7 +1340,39 @@ class ReadoutClient:
 
         return fractional_frequency_noise, fractional_dissipation_noise, si0, sq0, didf, dqdf
     
+    @staticmethod
+    def read_resonances_file(filename):
+        """
+        Read a resonances file and return columns keyed by the names that
+        numpy.genfromtxt assigns (sanitized from the file header).
+        """
+        # Let genfromtxt parse the header itself
+        data = np.genfromtxt(
+            filename,
+            delimiter='\t',
+            names=True,       # use header row for field names
+            autostrip=True,
+            dtype=None,       # let numpy auto-detect dtypes
+            encoding=None
+        )
 
+        # Build dict: use the field names that genfromtxt generated
+        resonances = {name: data[name] for name in data.dtype.names}
+        return resonances
+
+
+    def set_tones_helper(self, freqs, amps=None, phases=None):
+        if freqs is None or len(freqs) == 0:
+            raise ValueError("Frequencies must be provided and cannot be empty.")
+        if amps is None:
+            amps = np.ones_like(freqs)
+        if phases is None:
+            phases = self.generate_newman_phases(freqs)
+
+        self.set_tone_frequencies(freqs)
+        self.set_tone_amplitudes(amps)
+        self.set_tone_phases(phases)
+        return
 
 if __name__=='__main__':
     config_file = sys.argv[1]
