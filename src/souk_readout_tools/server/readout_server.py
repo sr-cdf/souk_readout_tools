@@ -1137,7 +1137,7 @@ class ReadoutServer:
             freq_offsets = np.atleast_1d(freq_offsets)
         if freq_offsets.shape != center.shape:
             raise ValueError("freq_offsets must be None, a scalar, or have the same shape as centers")
-        if np.any(np.abs(freq_offsets) > spans/2):
+        if np.any(np.abs(freq_offsets) > span/2):
             print("Warning: some freq_offsets are larger than half the span, which may cause tones to be set outside the sweep range")
         
         try:
