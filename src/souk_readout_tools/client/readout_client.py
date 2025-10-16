@@ -598,7 +598,7 @@ class ReadoutClient:
             return response
         centers=np.atleast_1d(centers)
         spans=np.atleast_1d(spans)
-        
+
         message = {
             'request': 'sweep',
             'centers': centers.tolist(),
@@ -609,7 +609,7 @@ class ReadoutClient:
         }
         return self.send_request(message)
 
-    def perform_retune(self, centers, spans, points, samples_per_point, direction='up',method='max_gradient',freq_offsets=None):
+    def perform_retune(self, centers, spans, points, samples_per_point, direction='up', method='max_gradient', freq_offsets=None):
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(centers)
         if response['status'] != 'success':
@@ -627,6 +627,8 @@ class ReadoutClient:
             freq_offsets = np.atleast_1d(freq_offsets)
         if freq_offsets.shape != centers.shape:
             raise ValueError("freq_offsets must be None, a scalar, or have the same shape as centers")
+
+        assert method in ['max_gradient','min_mag'], "method must be 'max_gradient' or 'min_mag'"
 
         #warn if freq_offsets are much larger than half of the spans
         if np.any(np.abs(freq_offsets) > spans / 2):
