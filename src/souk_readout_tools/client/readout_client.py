@@ -692,7 +692,7 @@ class ReadoutClient:
             print(f"Error getting sweep_data: {response['message']}")
             return response
 
-    def parse_sweep_data(self,sweep_data, apply_phase_correction=True):
+    def parse_sweep_data(self,sweep_data, apply_phase_correction=False):
         info = sweep_data['system_information']
         date = sweep_data['date']
         num_tones = int(sweep_data['num_tones'])
