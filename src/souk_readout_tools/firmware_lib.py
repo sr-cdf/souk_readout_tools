@@ -3232,11 +3232,13 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
     
     sweep_responses = np.mean(sweep_data.real,axis=1) + 1j*np.mean(sweep_data.imag,axis=1)
     sweep_stds = np.std(sweep_data.real,axis=1) + 1j*np.std(sweep_data.imag,axis=1)
+    sweep_sems = np.std(sweep_data.real,axis=1)/np.sqrt(samples_per_point) + 1j*np.std(sweep_data.imag,axis=1)/np.sqrt(samples_per_point)
 
     results = {
         'sweep_frequencies': sweepfreqs,
         'sweep_responses': sweep_responses,
         'sweep_stds': sweep_stds,
+        'sweep_sems': sweep_sems,
         'samples_per_point': samples_per_point,
         'samples_per_second': get_sample_rate(r_fast),
         'accumulation_counts': acc_counts,

@@ -649,7 +649,7 @@ class ReadoutServer:
                     if self.latest_sweep_data_valid:
                         sweep_f = self.latest_sweep_results['sweep_frequencies'].astype('f8')
                         sweep_z = self.latest_sweep_results['sweep_responses'].astype('complex128')
-                        sweep_e = self.latest_sweep_results['sweep_stds'].astype('complex128')
+                        sweep_e = self.latest_sweep_results['sweep_sems'].astype('complex128')
                         sweep = {}
                         sweep['f'] = base64.b64encode(sweep_f.tobytes()).decode()
                         sweep['z'] = base64.b64encode(sweep_z.tobytes()).decode()
@@ -702,7 +702,7 @@ class ReadoutServer:
                     if self.latest_sweep_data_valid:
                         sweep_f = self.latest_sweep_results['sweep_frequencies']
                         sweep_z = self.latest_sweep_results['sweep_responses']
-                        sweep_e = self.latest_sweep_results['sweep_stds']
+                        sweep_e = self.latest_sweep_results['sweep_sems']
                         data = '# Sweep file\n'
                         data += f'# date: {time.strftime("%Y-%m-%d %H:%M:%S %Z")}\n'
                         data += f'# num_tones: {len(sweep_f[0])}\n'
@@ -1075,11 +1075,13 @@ class ReadoutServer:
 
             sweep_responses = np.mean(sweep_data.real,axis=0) + 1j*np.mean(sweep_data.imag,axis=0)
             sweep_stds = np.std(sweep_data.real,axis=0) + 1j*np.std(sweep_data.imag,axis=0)
+            sweep_sems = np.std(sweep_data.real,axis=0)/np.sqrt(samples_per_point) + 1j*np.std(sweep_data.imag,axis=0)/np.sqrt(samples_per_point)
 
             self.latest_sweep_results = {
                 'sweep_frequencies': sweepfreqs,
                 'sweep_responses': sweep_responses,
                 'sweep_stds': sweep_stds,
+                'sweep_sems': sweep_sems,
                 'samples_per_point': samples_per_point,
                 'samples_per_second': firmware_lib.get_sample_rate(self.r_fast),
                 'accumulation_counts': acc_counts,
@@ -1101,6 +1103,7 @@ class ReadoutServer:
                 'sweep_frequencies': sweepfreqs,
                 'sweep_responses': sweep_responses,
                 'sweep_stds': sweep_stds,
+                'sweep_sems': sweep_sems,
                 'samples_per_point': samples_per_point,
                 'samples_per_second': firmware_lib.get_sample_rate(self.r_fast),
                 'accumulation_counts': acc_counts,
@@ -1152,7 +1155,7 @@ class ReadoutServer:
 
             sweep_f = self.latest_sweep_results['sweep_frequencies']
             sweep_z = self.latest_sweep_results['sweep_responses']
-            sweep_e = self.latest_sweep_results['sweep_stds']
+            sweep_e = self.latest_sweep_results['sweep_sems']
 
             retune_freqs = np.zeros_like(sweep_f[0])
 
