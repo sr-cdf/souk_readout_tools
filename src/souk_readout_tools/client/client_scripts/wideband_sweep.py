@@ -204,7 +204,7 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
 
         ei = s['sweep_ei'][0] #/ np.sqrt(s['samples_per_point'])
         eq = s['sweep_eq'][0] #/ np.sqrt(s['samples_per_point'])
-        emag = 1/abs(sz)*np.sqrt((si*ei)**2 + (sq*ei)**2)
+        emag = 1/abs(sz)*np.sqrt((si*ei)**2 + (sq*eq)**2)
         elogmag = 20/np.abs(sz)/np.log(10)*emag
         ephi = 1/(si**2+sq**2) * np.sqrt((sq*ei)**2+(si*eq)**2)
         
