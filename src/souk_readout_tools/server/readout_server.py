@@ -861,6 +861,16 @@ class ReadoutServer:
         
         try:
             fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
+            
+            # warm up a bit to avoid initial delays
+            rate = firmware_lib.get_sample_rate(self.r_fast)
+            if rate>100:
+                prev_cnt=0
+                iter=0
+                for j in range(50):
+                    payload, cnt, err =  self.prepare_frame(fast_read_params)
+                    continue
+            
             err_count=0
             prev_cnt=0
             for _ in range(num_samples):
