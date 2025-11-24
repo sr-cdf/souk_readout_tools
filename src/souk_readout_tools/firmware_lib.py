@@ -2819,7 +2819,7 @@ def check_adc_over_range(r,detailed_output=False):
         print(r.rfdc.get_status())
     
     
-    return any_over, ovr_flag_dict if detailed_output else any_over
+    return (any_over, ovr_flag_dict) if detailed_output else any_over
 
 def check_adc_threshold(r,detailed_output=False):
     """
@@ -2833,7 +2833,7 @@ def check_adc_threshold(r,detailed_output=False):
     if thresh_exceeded:
         print('ADC Over Threshold Flag Detected')
         print(r.rfdc.get_status())
-    return thresh_exceeded, ovr_flag_dict if detailed_output else thresh_exceeded
+    return (thresh_exceeded, ovr_flag_dict) if detailed_output else thresh_exceeded
 
 def reset_adc_over_range(r):
     """
