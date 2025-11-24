@@ -2452,7 +2452,7 @@ def set_tone_phases(r, config_dict, tone_phases, autosync=True):
 
 
 
-def psb_chanselect_set_channel_outmap(r, outmap):
+def psb_chanselect_set_channel_outmap_pre79(r, outmap):
     """
     *** vectorised version of set_channel_outmap for psb_chanselect***
     
@@ -2520,7 +2520,7 @@ def psb_chanselect_set_channel_outmap(r, outmap):
 
 
 
-def psb_chanselect_get_channel_outmap(r):
+def psb_chanselect_get_channel_outmap_pre79(r):
         """
         *** vectorised version of get_channel_outmap for psb_chanselect***
 
@@ -2576,6 +2576,61 @@ def psb_chanselect_get_channel_outmap(r):
         return outmap
 
 
+
+
+def psb_chanselect_set_channel_outmap_post79(r, outmap):
+    """
+    for now we just call the built in function
+
+    plan to vectorise it for speed later
+
+    """
+    r.psb_chanselect.set_channel_outmap(outmap)
+
+
+def psb_chanselect_get_channel_outmap_post79(r):
+        """
+        for now we just call the built in function
+        plan to vectorise it for speed later
+        """
+        return r.psb_chanselect.get_channel_outmap()
+
+def psb_chanselect_set_channel_outmap(r, outmap, descramble_input=None):
+    """
+    Wrapper to select pre-v7.9 or post-v7.9 version of psb_chanselect_set_channel_outmap
+    """
+    #are we pre v7.9?
+    pre79 = type(r.psb_chanselect) == souk_mkid_readout.blocks.chanreorder.ChanReorderMultiSampleIn
+
+    # #are we post 79?
+    # post79 = type(r.psb_chanselect) == souk_mkid_readout.blocks.chanreorder.VaccReorderMultiSampleIn
+
+    # #could also check the firmware version in the fpga but that would require a register read:
+    # pre79 = r.fpga.get_firmware_version() < ('7','9','0','0')
+    
+    if pre79:
+        psb_chanselect_set_channel_outmap_pre79(r, outmap)
+    else:
+        psb_chanselect_set_channel_outmap_post79(r, outmap)
+
+def psb_chanselect_get_channel_outmap(r, descramble_input=None):
+    """
+    Wrapper to select pre-79 or post-79 version of psb_chanselect_get_channel_outmap
+    """
+    #are we pre v7.9?
+    pre79 = type(r.psb_chanselect) == souk_mkid_readout.blocks.chanreorder.ChanReorderMultiSampleIn
+
+    # #are we post 79?
+    # post79 = type(r.psb_chanselect) == souk_mkid_readout.blocks.chanreorder.VaccReorderMultiSampleIn
+
+    # #could also check the firmware version in the fpga but that would require a register read
+    # pre79 = r.fpga.get_firmware_version() < ('7','9','0','0')
+
+    if r.psb_chanselect._firmware_version_major < 79:
+        return psb_chanselect_get_channel_outmap_pre79(r)
+    else:
+        return psb_chanselect_get_channel_outmap_post79(r)
+    
 
 def chanselect_set_channel_outmap(r, outmap, descramble_input=None):
     """
@@ -2748,6 +2803,47 @@ def check_output_saturation(r,iterations=1,saturation_bits=dac_saturation_bits,t
                'threshold':threshold}
     return any_saturation, details
 
+def check_adc_over_range(r,detailed_output=False):
+    """
+    Check to see if the ADC block has gone over range.
+    """
+
+    ovr_flag_dict = r.rfdc.get_rts_flags()
+    ovr_range = ovr_flag_dict['rts_over_range']
+    ovr_volt  = ovr_flag_dict['rts_over_voltage']
+    ovr_cm_over = ovr_flag_dict['rts_over_cm_over_voltage']
+    ovr_cm_under = ovr_flag_dict['rts_over_cm_under_voltage']
+    any_over = ovr_range | ovr_volt | ovr_cm_over | ovr_cm_under
+    if any_over:
+        print('ADC Over Range Flag Detected')
+        print(r.rfdc.get_status())
+    
+    
+    return any_over, ovr_flag_dict if detailed_output else any_over
+
+def check_adc_threshold(r,detailed_output=False):
+    """
+    Check to see if the ADC block has exceeded the threshold.
+    """
+
+    ovr_flag_dict = r.rfdc.get_rts_flags()
+    ovr_thresh1 = ovr_flag_dict['rts_over_threshold1']
+    ovr_thresh2  = ovr_flag_dict['rts_over_threshold2']
+    thresh_exceeded = ovr_thresh1 | ovr_thresh2
+    if thresh_exceeded:
+        print('ADC Over Threshold Flag Detected')
+        print(r.rfdc.get_status())
+    return thresh_exceeded, ovr_flag_dict if detailed_output else thresh_exceeded
+
+def reset_adc_over_range(r):
+    """
+    Reset the ADC over voltage / over range flags.
+    """
+    r.rfdc.reset_rts_flags(over_range=True, over_voltage=True)
+    ovr,flags = r.rfdc.check_adc_over_range(r,detailed_output=True)
+    if ovr:
+        raise RuntimeError('Failed to reset ADC over range flags, check signal level.')
+    return 
     
 def check_dsp_overflow(r,duration_s=0.1):
     """
@@ -3656,6 +3752,29 @@ def get_closest_bin_indices(freqs_hz, bin_centers_hz):
         return int(closest)
     return closest
 
+
+def get_burst(r):
+    """
+    Get a burst of data on a channel
+    In practice the bursts are taken from the accunmulator in the same way as regular samples
+    """
+    return r.accumulators[0].get_new_burst()
+
+def get_burst_mode(r):
+    """
+    Get the burst mode setting
+    """
+    burst_mode = r.accumulators[0].get_burst_mode()
+    return burst_mode
     
+def set_burst_mode(r,mode):
+    """
+    Set the burst mode setting
+    """
+    r.accumulators[0].set_burst_mode(mode)
+    return
+
+
+
 #include private functions when import * for debugging, to be removed later
 __all__ = list(globals().keys())

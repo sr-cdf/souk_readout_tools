@@ -496,7 +496,10 @@ class ReadoutServer:
                         else:
                             self.stream_flags[FLAG_CAL_FREEZE].clear()
                         response = {'status': 'success', 'value': value}
-                    
+                    elif param_name == 'burst_mode':
+                        value = firmware_lib.get_burst_mode(self.r)
+                        response = {'status': 'success', 'value': value}
+
                     await self.send_response(writer, response)
 
                 elif request == 'set':
@@ -549,6 +552,12 @@ class ReadoutServer:
                         firmware_lib.set_cal_freeze(self.r, self.config, param_value)
                         response = {'status': 'success'}
                     
+                    elif param_name == 'burst_mode':
+                        firmware_lib.set_burst_mode(self.r, param_value)
+                        response = {'status': 'success'}
+                    
+
+
                     await self.send_response(writer, response)
 
 

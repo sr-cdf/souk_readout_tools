@@ -1378,6 +1378,106 @@ class ReadoutClient:
         self.set_tone_phases(phases)
         return
 
+
+
+    def get_burst(self, num_bursts=10, tone_index=0):
+        if tone_index != 0:
+            raise NotImplementedError("Burst mode with tone_index other than 0 is not yet implemented.")
+        bm = self.get_parameter('burst_mode')
+        self.set_parameter('burst_mode', True)
+        bursts = self.get_samples(num_samples=num_bursts,incl_system_info=True)
+        self.set_parameter('burst_mode', bm)
+        bursts['sample_rate'] = float(bursts['sample_rate'])*float(bursts['system_information']['acc_len'])
+        bursts['num_bursts'] = num_bursts
+        bursts['tone_index'] = tone_index
+        return bursts
+
+    @staticmethod
+    def parse_burst( burst_data):
+        num_bursts = burst_data['num_bursts']
+        num_samples = 2048
+        tone_index = burst_data['tone_index']
+        sample_rate = burst_data['sample_rate']
+        info = burst_data['system_information']
+        data_raw = burst_data['data_raw']
+        datalen = num_samples*2*4 + 10*4
+        i_data = np.zeros((num_bursts,num_samples),dtype='<i4')
+        q_data = np.zeros((num_bursts,num_samples),dtype='<i4')
+        cnt = np.zeros(num_bursts,dtype=int)
+        err = np.zeros(num_bursts,dtype=int)
+        flags = np.zeros((num_bursts,8),dtype=int)
+        for j in range(num_bursts):
+            packet_offset = j*datalen
+            all_data = np.frombuffer(data_raw[packet_offset:packet_offset+datalen],dtype='<i4')
+            i_data[j] = all_data[::2][:num_samples]
+            q_data[j] = all_data[1::2][:num_samples]
+            err[j] = all_data[-1]
+            cnt[j] = all_data[-2]
+            flags[j] = all_data[-10:-2]
+        bursts_z = i_data + 1j*q_data
+        data_dict = {'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
+                    'num_bursts':num_bursts,
+                    'num_samples':num_samples,
+                    'tone_index':tone_index,
+                    'sample_rate':sample_rate,
+                    'system_information':info,
+                    'bursts_z':bursts_z,
+                    'packet_counter':cnt,
+                    'packet_error':err,
+                    'stream_flags':{f'flag{i}':flags[:,i] for i in range(8)}
+                    }
+
+        return data_dict
+
+        
+    @staticmethod
+    def export_burst(filename, burst_data, file_format='npy'):
+        if not os.path.exists(os.path.dirname(filename)):
+            os.makedirs(os.path.dirname(filename))
+
+        if 'bursts_z' not in burst_data.keys():
+            burst_dict = ReadoutClient.parse_burst_data(burst_data)
+        else:
+            burst_dict = burst_data
+
+        if file_format == 'npy':
+            np.save(filename.replace('.npy', '')+'.npy', burst_dict)
+
+        elif file_format == 'json':
+            # Convert numpy arrays to lists for JSON serialization, including nested arrays
+            json_data_dict = {}
+            for key, value in burst_dict.items():
+                if isinstance(value, np.ndarray):
+                    json_data_dict[key] = value.tolist()
+                else:
+                    json_data_dict[key] = value
+
+            with open(filename.replace('.json', '')+'.json', 'w') as file:
+                json.dump(json_data_dict, file, indent=4)
+
+        else:
+            raise ValueError(f"Invalid file_format {file_format}. Must be one of 'json' or 'npy'.")
+
+    @staticmethod
+    def import_burst(filename):
+        burst_dict={}
+        if filename.endswith('.npy'):
+            burst_dict = np.load(filename,allow_pickle=True).item()
+
+        elif filename.endswith('.json'):
+            with open(filename,'r') as file:
+                burst_dict = json.load(file)
+                for item in burst_dict:
+                    if isinstance(burst_dict[item],list):
+                        burst_dict[item] = np.array(burst_dict[item])
+
+        else:
+            raise ValueError(f"Invalid file format {filename.split('.')[-1]}")
+
+        return burst_dict   
+
+
+
 if __name__=='__main__':
     config_file = sys.argv[1]
     if not config_file:
