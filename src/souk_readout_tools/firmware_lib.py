@@ -2840,7 +2840,7 @@ def reset_adc_over_range(r):
     Reset the ADC over voltage / over range flags.
     """
     r.rfdc.reset_rts_flags(over_range=True, over_voltage=True)
-    ovr,flags = r.rfdc.check_adc_over_range(r,detailed_output=True)
+    ovr,flags = check_adc_over_range(r,detailed_output=True)
     if ovr:
         raise RuntimeError('Failed to reset ADC over range flags, check signal level.')
     return 
