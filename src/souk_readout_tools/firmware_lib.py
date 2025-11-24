@@ -2626,7 +2626,7 @@ def psb_chanselect_get_channel_outmap(r, descramble_input=None):
     # #could also check the firmware version in the fpga but that would require a register read
     # pre79 = r.fpga.get_firmware_version() < ('7','9','0','0')
 
-    if r.psb_chanselect._firmware_version_major < 79:
+    if pre79:
         return psb_chanselect_get_channel_outmap_pre79(r)
     else:
         return psb_chanselect_get_channel_outmap_post79(r)
