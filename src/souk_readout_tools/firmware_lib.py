@@ -2593,7 +2593,7 @@ def psb_chanselect_get_channel_outmap_post79(r):
         for now we just call the built in function
         plan to vectorise it for speed later
         """
-        return r.psb_chanselect.get_channel_outmap()
+        return np.array(r.psb_chanselect.get_channel_outmap(),dtype=r.psb_chanselect._map_format)
 
 def psb_chanselect_set_channel_outmap(r, outmap, descramble_input=None):
     """
@@ -3764,7 +3764,7 @@ def get_burst_mode(r):
     """
     Get the burst mode setting
     """
-    burst_mode = r.accumulators[0].get_burst_mode()
+    burst_mode = r.accumulators[0].is_burst_mode()
     return burst_mode
     
 def set_burst_mode(r,mode):
