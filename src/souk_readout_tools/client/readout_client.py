@@ -1256,12 +1256,17 @@ class ReadoutClient:
         If the frequency spacing is not exactly equal, the phases are offset to account for the spacing. For largely varying spacings, this method is pretty much the same as picking random frequencies.
 
         """
-        n=len(freqs)
-        freqs=np.atleast_1d(freqs)
-        freqssorted = np.sort(freqs)
-        k = (freqs-freqssorted[0]) / (freqssorted[-1] - freqssorted[0])*(len(freqs)-1)
-        #k should range from 0 to n-1, and elements are proportional to the frequencies
-        return np.pi*k**2/n
+        if len(freqs)==0:
+            return np.array([])
+        elif len(freqs)==1:
+            return np.array([0.0])
+        else:
+            n=len(freqs)
+            freqs=np.atleast_1d(freqs)
+            freqssorted = np.sort(freqs)
+            k = (freqs-freqssorted[0]) / (freqssorted[-1] - freqssorted[0])*(len(freqs)-1)
+            #k should range from 0 to n-1, and elements are proportional to the frequencies
+            return np.pi*k**2/n
 
     @staticmethod
     def calculate_frequency_and_dissipation_noise(sweep_frequencies,sweep_complex_data,timestream_tone_frequency,timestream_complex_data,smooth_window_hz=1000):
