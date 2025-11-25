@@ -828,7 +828,7 @@ class ReadoutServer:
             print(f"Error sending response: {response} \n {e}")
             print(traceback.format_exc())
     
-    def prepare_frame(self,fast_read_params):
+    def prepare_frame(self,fast_read_params,burst=False):
         """
         Prepare a frame for sending to a client.
         """
@@ -836,7 +836,7 @@ class ReadoutServer:
         # # cnt = await firmware_lib._wait_for_acc(fast_read_params['acc'],0.0001)
         # cnt = firmware_lib._wait_for_acc(fast_read_params['acc'],0.0001)
 
-        cnt,data,err = firmware_lib.read_accumulated_data_fast(fast_read_params)
+        cnt,data,err = firmware_lib.read_accumulated_data_fast(fast_read_params,burst=burst)
        
         # frame=data
         frame = np.zeros(len(data)+num_headers,dtype='<i4')
@@ -886,11 +886,7 @@ class ReadoutServer:
                 #cnt,data,err = firmware_lib.read_accumulated_data_fast(self.r_fast,fast_read_params)
                 # # data_bytes = data.tobytes()
 
-                if burst:
-                    # need to trigger the burst before getting the data
-                    firmware_lib.trigger_burst(self.r_fast)
-
-                payload, cnt, err =  self.prepare_frame(fast_read_params)
+                payload, cnt, err =  self.prepare_frame(fast_read_params,burst=burst)
                 
                 writer.write(payload)
                 await writer.drain()

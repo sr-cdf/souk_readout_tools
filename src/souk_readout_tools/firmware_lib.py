@@ -3246,7 +3246,7 @@ def get_fast_read_params(r_fast):
     
     return params
 
-def read_accumulated_data_fast(fast_read_params,num_tones=None):
+def read_accumulated_data_fast(fast_read_params,num_tones=None,burst=False):
     """
     Read one sample of accumulated data from the RFSOC 
     utilising the faster katcp local memory transport.
@@ -3258,9 +3258,11 @@ def read_accumulated_data_fast(fast_read_params,num_tones=None):
     base_addr=fast_read_params['base_addr']
     err = False
 
-
-    # acc._wait_for_acc(0.00001)
-    start_acc_cnt = _blocking_wait_for_acc(acc,0.00001)
+    if burst:
+        start_acc_cnt = trigger_burst(acc)
+    else:
+        # acc._wait_for_acc(0.00001)
+        start_acc_cnt = _blocking_wait_for_acc(acc,0.00001)
 
     if nbranch==1:
         raw = acc.host.transport.axil_mm[base_addr:base_addr + nbytes]
@@ -3270,6 +3272,8 @@ def read_accumulated_data_fast(fast_read_params,num_tones=None):
         for i in range(nbranch):
             raw = acc.host.transport.axil_mm[addrs[i]:addrs[i] + nbytes]
             dout[i::nbranch] = np.frombuffer(raw, dtype='<i4')
+    
+    
     stop_acc_cnt = acc.get_acc_cnt()
     if start_acc_cnt != stop_acc_cnt:
         acc.logger.warning('Accumulation counter changed while reading data!')
@@ -3780,16 +3784,16 @@ def set_burst_mode(r,mode):
     r.accumulators[0].set_burst_mode(mode)
     return
 
-def trigger_burst(r):
+def trigger_burst(acc):
     """
     Trigger a burst
     """
-    c0 = r.accumulators[0].get_acc_cnt()
-    r.accumulators[0]._trigger_burst()
-    c1 = r.accumulators[0].get_acc_cnt()
+    c0 = acc.get_acc_cnt()
+    acc._trigger_burst()
+    c1 = acc.get_acc_cnt()
     if c0 != c1:
-        r.accumulators[0].logger.warning('Accumulation count changed while arming burst')
-    return
+        acc.logger.warning('Accumulation count changed while arming burst')
+    return c1
 
 
 #include private functions when import * for debugging, to be removed later
