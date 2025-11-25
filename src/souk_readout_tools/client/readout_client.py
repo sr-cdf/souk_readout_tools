@@ -376,13 +376,13 @@ class ReadoutClient:
     def set_cal_freeze(self,freeze):
         return self.set_parameter('cal_freeze',freeze)
 
-    def get_samples(self, num_samples,incl_system_info=True):
+    def get_samples(self, num_samples,incl_system_info=True,burst=False):
         """
         Acquire num_samples samples from the readout server and return concatenated raw data.
         """
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((self.request_server_address, self.request_server_port))
-            message = {'request': 'get_samples', 'num_samples': num_samples}
+            message = {'request': 'get_samples', 'num_samples': num_samples, 'burst': burst}
             # Send message length
             message_data = json.dumps(message).encode()
             message_len = struct.pack('>I', len(message_data))
@@ -432,6 +432,7 @@ class ReadoutClient:
         data_raw = sample_data['data_raw']
         sample_rate = sample_data['sample_rate']
         info = sample_data['system_information']
+        burst= sample_data.get('burst',False)
         datalen = 2048*2*4 + 10*4
         num_samples = len(data_raw)//datalen
         i_data = np.zeros((num_samples,num_tones),dtype='<i4')
@@ -452,6 +453,7 @@ class ReadoutClient:
                     'num_samples':num_samples,
                     'sample_rate':sample_rate,
                     'system_information':info,
+                    'burst': burst,
                     'i_data':{f'{i:04d}':i_data[:,i] for i in range(num_tones)},
                     'q_data':{f'{i:04d}':q_data[:,i] for i in range(num_tones)},
                     'packet_counter':cnt,
@@ -1390,7 +1392,7 @@ class ReadoutClient:
             raise NotImplementedError("Burst mode with tone_index other than 0 is not yet implemented.")
         bm = self.get_parameter('burst_mode')
         self.set_parameter('burst_mode', True)
-        bursts = self.get_samples(num_samples=num_bursts,incl_system_info=True)
+        bursts = self.get_samples(num_samples=num_bursts,incl_system_info=True,burst=True)
         self.set_parameter('burst_mode', bm)
         bursts['sample_rate'] = float(bursts['sample_rate'])*float(bursts['system_information']['acc_len'])
         bursts['num_bursts'] = num_bursts

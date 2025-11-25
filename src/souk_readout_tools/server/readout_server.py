@@ -631,7 +631,8 @@ class ReadoutServer:
 
                 elif request == 'get_samples':
                     num_samples = message.get('num_samples')
-                    task = asyncio.create_task(self.get_samples(writer, num_samples))
+                    burst = message.get('burst', False)
+                    task = asyncio.create_task(self.get_samples(writer, num_samples, burst=burst))
                     self.tasks.append(task)
                 
                 elif request == 'sweep':
