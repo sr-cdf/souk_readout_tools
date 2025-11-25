@@ -225,11 +225,13 @@ def _blocking_sleep(duration, get_now=time.perf_counter):
         now = get_now()
 
 
-def _blocking_wait_for_acc(acc,poll_period_s=0.1):
+def _blocking_wait_for_acc(acc,poll_period_s=0.1,timeout=1):
     """
     Function to wait for the next accumulation.
     Uses a blocking sleep method to improve performance (by reducing context switches?).
+    If no acc counts detected within timeout seconds, raises TimeoutError.
     """
+    t0=0
     cnt0 = acc.get_acc_cnt()
     cnt1 = acc.get_acc_cnt()
     # Counter overflow protection
@@ -238,6 +240,9 @@ def _blocking_wait_for_acc(acc,poll_period_s=0.1):
     while cnt1 < ((cnt0+1) % (2**32)):
         # #time.sleep(poll_period_s)
         _blocking_sleep(poll_period_s)
+        t0+=poll_period_s
+        if t0 > timeout:
+            raise TimeoutError(f'Timeout waiting for accumulation (firmware_lib._blocking_wait_for_acc: {timeout}s)')
         cnt1 = acc.get_acc_cnt()
     return cnt1
 
