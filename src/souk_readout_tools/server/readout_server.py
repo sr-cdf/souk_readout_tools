@@ -862,7 +862,7 @@ class ReadoutServer:
         return payload,cnt,err
     
 
-    async def get_samples(self, writer, num_samples):
+    async def get_samples(self, writer, num_samples,burst=False):
         
         """
         A coroutine that gets a fixed number of samples from the firmware and sends them to a client through the request channel.
@@ -873,7 +873,7 @@ class ReadoutServer:
             
             # warm up a bit to avoid initial delays
             rate = firmware_lib.get_sample_rate(self.r_fast)
-            if rate>100:
+            if (rate>100) and not burst:
                 prev_cnt=0
                 iter=0
                 for j in range(50):
@@ -885,7 +885,13 @@ class ReadoutServer:
             for _ in range(num_samples):
                 #cnt,data,err = firmware_lib.read_accumulated_data_fast(self.r_fast,fast_read_params)
                 # # data_bytes = data.tobytes()
+
+                if burst:
+                    # need to trigger the burst before getting the data
+                    firmware_lib.trigger_burst(self.r_fast)
+
                 payload, cnt, err =  self.prepare_frame(fast_read_params)
+                
                 writer.write(payload)
                 await writer.drain()
                 # await asyncio.sleep(0.0001)  

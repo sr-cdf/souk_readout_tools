@@ -3760,6 +3760,7 @@ def get_burst(r):
     """
     return r.accumulators[0].get_new_burst()
 
+
 def get_burst_mode(r):
     """
     Get the burst mode setting
@@ -3774,6 +3775,16 @@ def set_burst_mode(r,mode):
     r.accumulators[0].set_burst_mode(mode)
     return
 
+def trigger_burst(r):
+    """
+    Trigger a burst
+    """
+    c0 = r.accumulators[0].get_acc_cnt()
+    r.accumulators[0]._trigger_burst()
+    c1 = r.accumulators[0].get_acc_cnt()
+    if c0 != c1:
+        r.accumulators[0].logger.warning('Accumulation count changed while arming burst')
+    return
 
 
 #include private functions when import * for debugging, to be removed later
