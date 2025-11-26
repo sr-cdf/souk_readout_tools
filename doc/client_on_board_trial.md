@@ -20,7 +20,9 @@ means "physically located on the RFSoC board" so it is not confused with any
 
 1. **Base OS**: the RFSoC ships with Ubuntu 18.04 LTS. Keep the existing
   service virtualenv (`/home/casper/py38venv`, Python 3.8) untouched because
-  the server hard-depends on that runtime.
+  the server hard-depends on that runtime. The login scripts auto-activate this
+  venv on boot, so run `deactivate` before switching into the Python 3.10 client
+  environment.
 2. **Client Python**: install Python 3.10 specifically for the client. On
   Ubuntu 18.04 the simplest route is the deadsnakes PPA:
   ```bash
@@ -30,7 +32,10 @@ means "physically located on the RFSoC board" so it is not confused with any
   python3.10 -m venv /home/casper/venvs/souk-client-py310
   source /home/casper/venvs/souk-client-py310/bin/activate
   ```
-  Always run client commands inside this Python 3.10 environment.
+  Always run client commands inside this Python 3.10 environment. To avoid
+  forgetting the switch, add a shell alias such as
+  `alias souk-client='deactivate >/dev/null 2>&1; source /home/casper/venvs/souk-client-py310/bin/activate'`
+  to `.bashrc` and start each client session with `souk-client`.
 3. **System packages (headless)**: avoid GUI stacks entirely. Install only the
   math/plotting prerequisites SciPy and matplotlib need when driven by the Agg
   backend:
@@ -144,3 +149,107 @@ observes partially-written files and can reload safely without service stops.
 
 Document any findings from the trial here so we can decide on a production-grade
 solution.
+
+## Step-by-step commands to run on the RFSoC
+
+The checklist below walks through the exact shell commands needed on the RFSoC
+ARM cores. Run them sequentially, adjusting paths if your filesystem layout
+differs.
+
+1. **Log in and confirm environment**
+  ```bash
+  ssh casper@<rfsoc-hostname>
+  lsb_release -a
+  source /home/casper/py38venv/bin/activate
+  python -V  # expect 3.8.x
+  deactivate
+  ```
+
+2. **Install Python 3.10 toolchain**
+  ```bash
+  sudo add-apt-repository ppa:deadsnakes/ppa
+  sudo apt update
+  sudo apt install python3.10 python3.10-venv python3.10-dev
+  python3.10 -m venv /home/casper/venvs/souk-client-py310
+  source /home/casper/venvs/souk-client-py310/bin/activate
+  python -V  # expect 3.10.x
+  echo 'export MPLBACKEND=Agg' >> /home/casper/venvs/souk-client-py310/bin/activate
+  deactivate
+  echo "alias souk-client='deactivate >/dev/null 2>&1; source /home/casper/venvs/souk-client-py310/bin/activate'" >> ~/.bashrc
+  source ~/.bashrc
+  souk-client
+  ```
+
+3. **Install headless math/plotting dependencies**
+  ```bash
+  sudo apt install build-essential libopenblas-dev liblapack-dev \
+      libatlas-base-dev libfreetype6-dev libpng-dev pkg-config
+  ```
+
+4. **Fetch the repo and branch**
+  ```bash
+  cd /home/casper/src
+  git clone git@github.com:sr-cdf/souk_readout_tools.git  # skip if exists
+  cd souk_readout_tools
+  git fetch origin client-on-board-trial
+  git checkout client-on-board-trial
+  ```
+
+5. **Install the client package**
+  ```bash
+  souk-client  # ensures Python 3.10 env is active
+  export INSTALL_CLIENT=true
+  pip install --upgrade pip
+  pip install -e .
+  python -c "import souk_readout_tools.client.readout_client as c; print(c.__file__)"
+  ```
+
+6. **Prepare config files**
+  ```bash
+  mkdir -p ~/.config/souk_readout_tools
+  cp src/souk_readout_tools/data/config/config.yaml ~/.config/souk_readout_tools/
+  sed -i 's/address:.*/address: 127.0.0.1/' ~/.config/souk_readout_tools/config.yaml
+  sed -i 's#data_dir:.*#data_dir: /mnt/data/souk#' ~/.config/souk_readout_tools/config.yaml
+  export SOUK_CONFIG=~/.config/souk_readout_tools/config.yaml
+  ```
+
+7. **Use RPCs for config/calibration changes**
+  ```bash
+  python - <<'PY'
+  from souk_readout_tools.client.readout_client import ReadoutClient
+  client = ReadoutClient(config_file=None)
+  client.pull_config()
+  PY
+  # edit ~/.config/souk_readout_tools/config.yaml as needed
+  python - <<'PY'
+  from souk_readout_tools.client.readout_client import ReadoutClient
+  client = ReadoutClient()
+  client.push_config()
+  PY
+  ```
+
+8. **Run smoke tests**
+  ```bash
+  python -m souk_readout_tools.client.client_scripts.souk_connection_test \
+       --config ~/.config/souk_readout_tools/config.yaml
+
+  python -m souk_readout_tools.client.client_scripts.receive_stream \
+       --config ~/.config/souk_readout_tools/config.yaml \
+       --duration 30 \
+       --output /mnt/data/souk/test_capture.h5
+  ```
+
+9. **Monitor resources**
+  ```bash
+  htop
+  df -h /
+  df -h /mnt/data
+  ```
+
+10. **Deactivate client env when done**
+   ```bash
+   deactivate
+   ```
+
+Record observations from each step back in this document so the team can refine
+the deployment plan.
