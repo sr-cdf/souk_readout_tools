@@ -32,33 +32,30 @@ else:
         install_client = True
         install_server = False
 
-# Define common dependencies
+# Define common dependencies (headless-safe)
 install_requires = [
     'importlib_resources',
     'numpy',
     'matplotlib',
     'pyyaml',
     'ipython',
-    'scipy'
-    # Add other common dependencies here
+    'scipy',
 ]
 
-# Define client-specific dependencies
-client_dependencies = [
-    'pyqt5',
-    'scipy',
-    # Add client dependencies here
-]
+# Optional extras (e.g. GUI support). These are not required when running
+# headless on the RFSoC, where PyQt5 can be very difficult to build.
+extras_require = {
+    'gui': [
+        'pyqt5',
+    ],
+}
 
 # Define server-specific dependencies
 server_dependencies = [
     "souk_mkid_readout  @ file://localhost//home/casper/src/souk-firmware/software/control_sw",
 ]
 
-# Conditionally add client or server dependencies
-if install_client:
-    install_requires.extend(client_dependencies)
-
+# Conditionally add server-only dependencies
 if install_server:
     install_requires.extend(server_dependencies)
 
@@ -106,6 +103,7 @@ setup(
     include_package_data=True,
     package_data={'souk_readout_tools': ['mkid_finder_app.png','mkid_finder_app.ico']},
     install_requires=install_requires,
+    extras_require=extras_require,
     entry_points=entry_points,
     classifiers=[
         'Programming Language :: Python :: 3',

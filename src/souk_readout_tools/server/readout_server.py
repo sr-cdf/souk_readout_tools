@@ -496,7 +496,10 @@ class ReadoutServer:
                         else:
                             self.stream_flags[FLAG_CAL_FREEZE].clear()
                         response = {'status': 'success', 'value': value}
-                    
+                    elif param_name == 'burst_mode':
+                        value = firmware_lib.get_burst_mode(self.r)
+                        response = {'status': 'success', 'value': value}
+
                     await self.send_response(writer, response)
 
                 elif request == 'set':
@@ -549,6 +552,12 @@ class ReadoutServer:
                         firmware_lib.set_cal_freeze(self.r, self.config, param_value)
                         response = {'status': 'success'}
                     
+                    elif param_name == 'burst_mode':
+                        firmware_lib.set_burst_mode(self.r, param_value)
+                        response = {'status': 'success'}
+                    
+
+
                     await self.send_response(writer, response)
 
 
@@ -622,7 +631,8 @@ class ReadoutServer:
 
                 elif request == 'get_samples':
                     num_samples = message.get('num_samples')
-                    task = asyncio.create_task(self.get_samples(writer, num_samples))
+                    burst = message.get('burst', False)
+                    task = asyncio.create_task(self.get_samples(writer, num_samples, burst=burst))
                     self.tasks.append(task)
                 
                 elif request == 'sweep':
@@ -819,7 +829,7 @@ class ReadoutServer:
             print(f"Error sending response: {response} \n {e}")
             print(traceback.format_exc())
     
-    def prepare_frame(self,fast_read_params):
+    def prepare_frame(self,fast_read_params,burst=False):
         """
         Prepare a frame for sending to a client.
         """
@@ -827,7 +837,7 @@ class ReadoutServer:
         # # cnt = await firmware_lib._wait_for_acc(fast_read_params['acc'],0.0001)
         # cnt = firmware_lib._wait_for_acc(fast_read_params['acc'],0.0001)
 
-        cnt,data,err = firmware_lib.read_accumulated_data_fast(fast_read_params)
+        cnt,data,err = firmware_lib.read_accumulated_data_fast(fast_read_params,burst=burst)
        
         # frame=data
         frame = np.zeros(len(data)+num_headers,dtype='<i4')
@@ -853,7 +863,7 @@ class ReadoutServer:
         return payload,cnt,err
     
 
-    async def get_samples(self, writer, num_samples):
+    async def get_samples(self, writer, num_samples,burst=False):
         
         """
         A coroutine that gets a fixed number of samples from the firmware and sends them to a client through the request channel.
@@ -864,7 +874,7 @@ class ReadoutServer:
             
             # warm up a bit to avoid initial delays
             rate = firmware_lib.get_sample_rate(self.r_fast)
-            if rate>100:
+            if (rate>100) and not burst:
                 prev_cnt=0
                 iter=0
                 for j in range(50):
@@ -876,7 +886,9 @@ class ReadoutServer:
             for _ in range(num_samples):
                 #cnt,data,err = firmware_lib.read_accumulated_data_fast(self.r_fast,fast_read_params)
                 # # data_bytes = data.tobytes()
-                payload, cnt, err =  self.prepare_frame(fast_read_params)
+
+                payload, cnt, err =  self.prepare_frame(fast_read_params,burst=burst)
+                
                 writer.write(payload)
                 await writer.drain()
                 # await asyncio.sleep(0.0001)  
