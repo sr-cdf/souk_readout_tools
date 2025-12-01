@@ -21,20 +21,18 @@ means "physically located on the RFSoC board" so it is not confused with any
 1. **Base OS**: the RFSoC ships with Ubuntu 18.04 LTS. Keep the existing
   service virtualenv (`/home/casper/py38venv`, Python 3.8) untouched because
   the server hard-depends on that runtime. The login scripts auto-activate this
-  venv on boot, so run `deactivate` before switching into the Python 3.10 client
+  venv on boot, so run `deactivate` before switching into the separate client
   environment.
-2. **Client Python**: install Python 3.10 specifically for the client. On
-  Ubuntu 18.04 the simplest route is the deadsnakes PPA:
+2. **Client Python**: use Python 3.8 for the client as well, but in a separate
+  virtualenv so client dependencies do not interfere with the server venv:
   ```bash
-  sudo add-apt-repository ppa:deadsnakes/ppa
-  sudo apt update
-  sudo apt install python3.10 python3.10-venv python3.10-dev
-  python3.10 -m venv /home/casper/venvs/souk-client-py310
-  source /home/casper/venvs/souk-client-py310/bin/activate
+  python3 -m venv /home/casper/venvs/souk-client-py38
+  source /home/casper/venvs/souk-client-py38/bin/activate
+  python -V  # expect 3.8.x
   ```
-  Always run client commands inside this Python 3.10 environment. To avoid
+  Always run client commands inside this Python 3.8 environment. To avoid
   forgetting the switch, add a shell alias such as
-  `alias souk-client='deactivate >/dev/null 2>&1; source /home/casper/venvs/souk-client-py310/bin/activate'`
+  `alias souk-client='deactivate >/dev/null 2>&1; source /home/casper/venvs/souk-client-py38/bin/activate'`
   to `.bashrc` and start each client session with `souk-client`.
 3. **System packages (headless)**: avoid GUI stacks entirely. Install only the
   math/plotting prerequisites SciPy and matplotlib need when driven by the Agg
@@ -165,17 +163,14 @@ differs.
   deactivate
   ```
 
-2. **Install Python 3.10 toolchain**
+2. **Create client Python 3.8 virtualenv**
   ```bash
-  sudo add-apt-repository ppa:deadsnakes/ppa
-  sudo apt update
-  sudo apt install python3.10 python3.10-venv python3.10-dev
-  python3.10 -m venv /home/casper/venvs/souk-client-py310
-  source /home/casper/venvs/souk-client-py310/bin/activate
-  python -V  # expect 3.10.x
-  echo 'export MPLBACKEND=Agg' >> /home/casper/venvs/souk-client-py310/bin/activate
+  python3 -m venv /home/casper/venvs/souk-client-py38
+  source /home/casper/venvs/souk-client-py38/bin/activate
+  python -V  # expect 3.8.x
+  echo 'export MPLBACKEND=Agg' >> /home/casper/venvs/souk-client-py38/bin/activate
   deactivate
-  echo "alias souk-client='deactivate >/dev/null 2>&1; source /home/casper/venvs/souk-client-py310/bin/activate'" >> ~/.bashrc
+  echo "alias souk-client='deactivate >/dev/null 2>&1; source /home/casper/venvs/souk-client-py38/bin/activate'" >> ~/.bashrc
   source ~/.bashrc
   souk-client
   ```
@@ -197,7 +192,7 @@ differs.
 
 5. **Install the client package**
   ```bash
-  souk-client  # ensures Python 3.10 env is active
+  souk-client  # ensures Python 3.8 client env is active
   export INSTALL_CLIENT=true
   pip install --upgrade pip
   pip install -e .
