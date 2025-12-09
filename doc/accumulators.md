@@ -579,3 +579,22 @@ Decide on the tracking‑loop data architecture: either (A) keep stream frames a
 - Design the tracking task within ReadoutServer (e.g. tracking_task coroutine) that periodically reads the slow accumulator via its fast_read_params, estimates per‑tone drifts (phase/amplitude or frequency), and calls existing firmware_lib tone update helpers (set_tone_frequencies / prepare_*_fast / apply_*_fast) to adjust tones, while using stream_flags to mark frames during which retuning is in progress.
 
 - Define how clients will configure and monitor tracking: add request‑channel RPCs (e.g. enable_tracking, disable_tracking, get_tracking_status, get_tracking_config) in ReadoutServer.handle_request_client and ReadoutClient, including what status fields to expose (on/off, last update time, mean drift, slow accumulator acc_len, etc.).
+
+
+## Notes following meeting with Sam and Jamie on 2025-12-08
+
+We considered the approach to dual-accumulator support in souk_readout_tools.
+
+We are looking at adding a prepare_slow_frame method that:
+- reads the slow accumulator
+- does some optional filtering/averaging
+- decides if tone updates are needed
+- applies tone updates if needed
+- transmits updated frequencies to clients over the stream channel with a new FLAG_TRACKING_UPDATE flag set.
+- the tracking update flag indicates the data represents tone frequencies and not raw accumulator data.
+
+This would be called from within a tracking_task coroutine which runs alongside stream_data.
+
+We may want to perform some profiling to optimise the speed of the slow accumulator read and tone update path.
+
+
