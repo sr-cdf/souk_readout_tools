@@ -304,6 +304,9 @@ def needs_initialising(r,config_dict):
     if not hasattr(r, 'accumulators'):
         print('yes, accumulators not found')
         return True
+    if r.accumulators[0].get_acc_len() == 0:
+        print('yes, acc len is zero')
+        return True
     print('no')
     return False
 
