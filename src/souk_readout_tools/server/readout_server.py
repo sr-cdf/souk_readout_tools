@@ -217,8 +217,10 @@ class ReadoutServer:
         
         #interface with firmware
         fw_config_file = self.config['firmware']['fw_config_file']
-        self.r = firmware_lib.create_standard_readout_interface(fw_config_file)
-        self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file)
+        pipeline_id = self.config['firmware']['pipeline_id']
+
+        self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
+        self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
         
         #program firmware if necessary
         if firmware_lib.needs_programming(self.r,self.config):

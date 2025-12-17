@@ -242,12 +242,12 @@ def _blocking_wait_for_acc(acc,poll_period_s=0.1):
     return cnt1
 
 
-def create_standard_readout_interface(fw_config_file):
-    r = SoukMkidReadout('localhost',configfile=fw_config_file)
+def create_standard_readout_interface(fw_config_file,pipeline_id=0):
+    r = SoukMkidReadout('localhost',configfile=fw_config_file,pipeline_id=pipeline_id)
     return r
 
-def create_fast_readout_interface(fw_config_file):
-    r_fast = SoukMkidReadout('localhost',configfile=fw_config_file,local=True)
+def create_fast_readout_interface(fw_config_file,pipeline_id=0):
+    r_fast = SoukMkidReadout('localhost',configfile=fw_config_file,local=True,pipeline_id=pipeline_id)
     return r_fast
 
 def needs_programming(r,config_dict):
@@ -304,9 +304,20 @@ def needs_initialising(r,config_dict):
 
 def reload_firmware(config_dict): 
     fw_config_file = config_dict['firmware']['fw_config_file']
-    r = create_standard_readout_interface(fw_config_file)
-    r_fast = create_fast_readout_interface(fw_config_file)
+    pipeline_id = config_dict['firmware']['pipeline_id']
+    r = create_standard_readout_interface(fw_config_file,pipeline_id=pipeline_id)
+    r_fast = create_fast_readout_interface(fw_config_file,pipeline_id=pipeline_id)
     r.program()
+    
+    # validate pipeline_id: fw_type==2 for single pipeline or fw_type==3 for dual pipeline
+    fw_type = r.fpga.get_firmware_type()
+    if fw_type==2:
+        if pipeline_id!=0:
+            raise ValueError(f'Pipeline ID {pipeline_id} does not exist in type 2 single pipeline firmware: {fw_config_file}')
+    elif fw_type==3:
+        if pipeline_id not in [0,1]:
+            raise ValueError(f'Pipeline ID {pipeline_id} does not exist in type 3 dual pipeline firmware: {fw_config_file}')
+
     initialise_firmware(r,config_dict=config_dict)
     return r, r_fast
 
