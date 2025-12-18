@@ -161,6 +161,13 @@ class ReadoutClient:
         if response['status'] == 'success':
             self.pull_config()
         return response
+    
+    def initialise_pipeline(self,config_file=None):
+        message = {'request': 'initialise_pipeline', 'config_filename': config_file}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            self.pull_config()
+        return response
 
     def pull_config(self,destination_dir=None):
         if destination_dir is None:

@@ -175,13 +175,77 @@ class ReadoutServer:
 
         #initialize server
         self.init_server(config_file, init_firmware=False)
-        
+    
+    
+    def _ensure_ready(self, level="pipeline"):
+        """
+        Ensure the firmware is ready up to the requested init level.
 
-    def init_server(self, config_file,init_firmware=False):
+        level:
+          - "server": no firmware operations
+          - "firmware": (re)program if needed, then initialise shared resources
+          - "pipeline": firmware level + initialise pipeline resources
         """
-        Initialize the server with the specified configuration file.
-        This function is called when the server is started or reset, and when the firmware is reprogrammed.
+        if level not in ("server", "firmware", "pipeline"):
+            raise ValueError(f"Invalid ensure_ready level: {level}")
+
+        if level == "server":
+            return
+
+        # 1) Program firmware if needed
+        if firmware_lib.needs_programming(self.r, self.config):
+            self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
+
+        # 2) Shared resources
+        if level in ("firmware", "pipeline"):
+            if firmware_lib.needs_shared_resource_initialising(self.r, self.config):
+                firmware_lib.initialise_shared_resources(self.r, self.config)
+
+        # 3) Pipeline resources
+        if level == "pipeline":
+            if firmware_lib.needs_pipeline_initialising(self.r, self.config):
+                firmware_lib.initialise_pipeline(self.r, self.config)
+
+
+    def _force_ready(self, level='pipeline'):
         """
+        Ensure the firmware is ready up to the requested init level by applying init.
+
+        level:
+          - "server": no firmware operations
+          - "firmware": (re)program, then initialise shared resources
+          - "pipeline": firmware level + initialise pipeline resources
+        """
+        if level not in ("server", "firmware", "pipeline"):
+            raise ValueError(f"Invalid ensure_ready level: {level}")
+
+        if level == "server":
+            self.init_server(config_file=self.config, init_firmware=False)
+
+        # 1) Program firmware 
+        self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
+
+        # 2) Shared resources
+        if level in ("firmware", "pipeline"):
+            firmware_lib.initialise_shared_resources(self.r, self.config)
+
+        # 3) Pipeline resources
+        if level == "pipeline":
+            firmware_lib.initialise_pipeline(self.r, self.config)
+
+        return
+  
+
+    def init_server(self, config_file,init_firmware=False, force_firmware=False):
+        """
+        Initialize server runtime + load config + create firmware interfaces.
+        
+        If init_firmware is True, bring system to pipeline-ready state
+
+        If force_firmware is True, reprogram and bring system to pipeline-ready state
+
+        """
+
         print('************************************************')
         print('init_server')
         print('config_file:',config_file)
@@ -222,44 +286,62 @@ class ReadoutServer:
         self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
         self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
         
-        #program firmware if necessary
-        if firmware_lib.needs_programming(self.r,self.config):
-            print('init_server needs programming')
-            print(self.r.fpgfile)
-            self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
-        
-        #initialise firmware if necessary
-        if init_firmware or firmware_lib.needs_initialising(self.r,self.config):
-            print('init_server needs initialising')
-            print(self.r.fpgfile)
-            firmware_lib.initialise_firmware(self.r,self.config)
-        
+
+        if init_firmware and force_firmware:
+            init_firmware=False
+
+        if init_firmware:
+                self._ensure_ready(level="pipeline")
+
+        if force_firmware:
+                self._force_ready(level='pipeline')
+
+
+        #see if we can succesfully load system information
         system_information = self.get_system_information()
-        # print(system_information)
         return
    
              
     def init_firmware(self,config_file=None):
         """
-        Restart the firmware.
-        This function is called when the firmware needs to be reprogrammed or reinitialised.
+        Reprogram firmware (optionally using config_file), then init shared fw resources.
+        Does NOT implicitly also init pipeline unless you request ensure_ready("pipeline").
         """
         print('************************************************')
         print('init_firmware')
         print('config_file:',config_file)
         print('************************************************')
-
-        if config_file is None:
-            #simple reload of the same firmware, eg: hard reset
-            self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
-            return
-        else:
-            #reload with new firmware, reinitialise server, eg: firmware update
-            self.load_config(config_file)
-            r, r_fast = firmware_lib.reload_firmware(self.config)
-            self.init_server(self.config_file)
-            return
         
+        if config_file is not None:
+            self.load_config(config_file)
+
+        self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
+
+        self._ensure_ready(level="firmware")
+        return
+
+
+    def init_pipeline(self, config_file=None):
+        """
+        Ensure shared resources and pipeline resources are initialised.
+        Does not force a reprogram unless needs_programming() says so.
+        """
+        print('************************************************')
+        print('init_pipeline')
+        print('config_file:',config_file)
+        print('************************************************')
+
+        if config_file is not None:
+            self.load_config(config_file)
+            # rebuild interfaces in case pipeline_id / fw_config_file changed
+            fw_config_file = self.config['firmware']['fw_config_file']
+            pipeline_id = self.config['firmware']['pipeline_id']
+            self.r = firmware_lib.create_standard_readout_interface(fw_config_file, pipeline_id)
+            self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file, pipeline_id)
+
+        self._ensure_ready(level="pipeline")
+
+
 
     def load_config(self, config_file):
         """
@@ -364,6 +446,7 @@ class ReadoutServer:
             'sys.argv': sys.argv,
             'uname': os.uname().nodename+' '+os.uname().sysname+' '+os.uname().release + ' ' + os.uname().version + ' ' + os.uname().machine,
             'python_version': sys.version,
+            'server_version': 'not_implemented',
             'config_file': self.config_file,
             'request_clients': len(self.request_clients),
             'request_client_addrs': [client.get_extra_info('peername') for client in self.request_clients],
@@ -375,8 +458,11 @@ class ReadoutServer:
             'triggered_stream_enabled': self.triggered_stream_enabled,
             'sweep_task_running': self.sweep_task is not None and not self.sweep_task.done(),
             'tasks': len(self.tasks),
-            'firmware_interface_alive': bool(self.r),
-            'firmware_fast_interface_alive': bool(self.r_fast),
+            'firmware_interface_exists': bool(self.r),
+            'firmware_fast_interface_exists': bool(self.r_fast),
+            'firmware_programmed': not firmware_lib.needs_programming(self.r,self.config),
+            'firmware_shared_resources_ready': not firmware_lib.needs_shared_resource_initialising(self.r,self.config),
+            'firmware_pipeline_resources_ready': not firmware_lib.needs_pipeline_initialising(self.r,self.config),
             'system_information': self.get_system_information(),
             'latest_sweep_data_valid': self.latest_sweep_data_valid
         }
@@ -412,6 +498,29 @@ class ReadoutServer:
                     status = self.get_server_status()
                     await self.send_response(writer, {'status': 'success', 'message': status})
 
+                elif request == 'ensure_ready':
+                    level = message.get('level', 'pipeline')
+                    config_file = message.get('config_filename', None)
+                    if config_file is None:
+                        config_file = self.config_file
+                    if not os.path.exists(config_file):
+                        await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
+                    else:
+                        self.init_server(config_file,init_firmware=True)
+                        await self.send_response(writer, {'status': 'success', 'server_status': self.get_server_status()})
+
+                elif request == 'hard_reset':
+                    config_file = message.get('config_filename', None)
+                    if config_file is None:
+                        config_file = self.config_file
+                    if not os.path.exists(config_file):
+                        await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
+                    else:
+                        self._force_ready(config_file,init_firmware=True)
+                        await self.send_response(writer, {'status': 'success', 'server_status': self.get_server_status()})
+
+
+
                 elif request == 'initialise_server':
                     config_file = message.get('config_filename')
                     if config_file is None:
@@ -432,6 +541,16 @@ class ReadoutServer:
                         await self.send_response(writer, {'status': 'success'})
                         self.init_firmware(config_file) #implicitly calls init server
                 
+                elif request == 'initialise_pipeline':
+                    config_file = message.get('config_filename')
+                    if config_file is None:
+                        config_file = self.config_file
+                    if not os.path.exists(config_file):
+                        await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
+                    else:
+                        self.init_pipeline(config_file)
+                        await self.send_response(writer, {'status': 'success'})
+
                 elif request == 'push_config':
                     config_filename = message.get('config_filename')
                     config_contents = message.get('config_contents')

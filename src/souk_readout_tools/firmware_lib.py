@@ -274,42 +274,86 @@ def needs_programming(r,config_dict):
     print('new fpg:',newfpg)
     print('************************************************')
 
+    if not r.fpga.is_programmed():
+        print('yes, FPGA is not programmed')
+        return True
+
     if newfpg != currentfpg:
         print('yes, current fpg is not the requested one')
         return True
     
     if not hasattr(r, 'accumulators'):
+        # catches certain rare cases
         print('yes, accumulators not found')
         return True
     
-    if not r.fpga.is_programmed():
-        print('yes, FPGA is not programmed')
+    print('no')
+    return False
+
+def needs_shared_resource_initialising(r, config_dict):
+    """
+    True if shared resources need initialising.
+
+    checks autocorr acc_len
+      - r.autocorr.get_acc_len() == 0 => not initialised
+    """
+    print('************************************************')
+    print('needs_shared_resource_initialising?')
+    print('************************************************')
+
+    autocorr_acc_len = r.autocorr.get_acc_len()
+    if autocorr_acc_len==0:
+        print('yes, autocorr acc_len is zero')
         return True
+
+    print('no')
+    return False
+
+def needs_pipeline_initialising(r, config_dict):
+    """
+    True if pipeline resources need initialising.
+
+    checks pipeline accumulator acc_len
+      - r.accumulators[0].get_acc_len() == 0 => not initialised
+    """
+    print('************************************************')
+    print('needs_pipeline_initialising?')
+    print('************************************************')
+
+    acc_len = r.accumulators[0].get_acc_len()
+    if acc_len == 0:
+        print('yes, pipeline acc_len is zero')
+        return True
+
     print('no')
     return False
 
 def needs_initialising(r,config_dict):
     """
-    Check if the firmware needs to be initialised.
+    Deprecated function, use needs_shared_resource_initialising and needs_pipeline_initialising instead.
     """
     print('************************************************')
     print('needs_initialising?')
+    print(bcolors.FAIL+'This function is deprecated, use needs_shared_resource_initialising and needs_pipeline_initialising instead'+bcolors.ENDC)
     print('************************************************')
+    needs_initialising_shared = needs_shared_resource_initialising(r, config_dict)
+    needs_initialising_pipeline = needs_pipeline_initialising(r, config_dict)
+    return needs_initialising_shared or needs_initialising_pipeline
 
-    if not hasattr(r, 'accumulators'):
-        print('yes, accumulators not found')
-        return True
-    print('no')
-    return False
 
 def reload_firmware(config_dict): 
+    """
+    Program/reprogram and return interfaces.
+
+    IMPORTANT: Do not initialise shared or pipeline resources here.
+    """
+    print(bcolors.WARNING+'Reloading firmware: all shared/pipeline resources will need re-initialising'+bcolors.ENDC)
     fw_config_file = config_dict['firmware']['fw_config_file']
     pipeline_id = config_dict['firmware']['pipeline_id']
     r = create_standard_readout_interface(fw_config_file,pipeline_id=pipeline_id)
     r_fast = create_fast_readout_interface(fw_config_file,pipeline_id=pipeline_id)
     r.program()
-    
-    # validate pipeline_id: fw_type==2 for single pipeline or fw_type==3 for dual pipeline
+
     fw_type = r.fpga.get_firmware_type()
     if fw_type==2:
         if pipeline_id!=0:
@@ -318,10 +362,14 @@ def reload_firmware(config_dict):
         if pipeline_id not in [0,1]:
             raise ValueError(f'Pipeline ID {pipeline_id} does not exist in type 3 dual pipeline firmware: {fw_config_file}')
 
-    initialise_firmware(r,config_dict=config_dict)
     return r, r_fast
 
-def initialise_firmware(r,config_dict):
+
+
+def initialise_shared_resources(r,config_dict):
+    return
+
+def initialise_pipeline(r,config_dict):
 
     fwconf = config_dict['firmware']
     fwkeys = fwconf.keys()
