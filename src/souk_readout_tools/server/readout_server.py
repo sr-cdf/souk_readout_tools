@@ -1376,11 +1376,27 @@ class ReadoutServer:
                 stream_server.serve_forever()
             )
 
+import time
+import argparse
+
+
 def main():
+
+    parser = argparse.ArgumentParser(description="SOUK MKID readout server (RFSoC)")
+    parser.add_argument(
+        "config",
+        nargs="?",
+        default=None,
+        help="Path to config YAML (or .lnk). If omitted, uses default_config.lnk",
+    )
+    args = parser.parse_args()
+
+
+
     #check_if_running_on_rfsoc_arm()
     #process_name = set_process_name()
     #host_ips = get_host_ips()
-    readout_server = ReadoutServer()
+    readout_server = ReadoutServer(config_file=args.config)
     asyncio.run(readout_server.async_main())
 
 if __name__=="__main__":
