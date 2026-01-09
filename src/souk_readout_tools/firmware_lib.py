@@ -243,15 +243,28 @@ def _blocking_wait_for_acc(acc,poll_period_s=0.1):
 
 
 def create_standard_readout_interface(fw_config_file,pipeline_id=0):
-    r = SoukMkidReadout('localhost',configfile=fw_config_file,pipeline_id=pipeline_id)
+    try:
+        r = SoukMkidReadout('localhost',configfile=fw_config_file,pipeline_id=pipeline_id)
+    except NameError:
+        raise RuntimeError('souk_mkid_readout module not imported, cannot create readout interface')
     return r
 
 def create_fast_readout_interface(fw_config_file,pipeline_id=0):
-    r_fast = SoukMkidReadout('localhost',configfile=fw_config_file,local=True,pipeline_id=pipeline_id)
+    try:
+        r_fast = SoukMkidReadout('localhost',configfile=fw_config_file,local=True,pipeline_id=pipeline_id)
+    except NameError:
+        raise RuntimeError('souk_mkid_readout module not imported, cannot create readout interface')
     return r_fast
 
 def needs_programming(r,config_dict):
     
+    if r is None:
+        print('************************************************')
+        print('needs_programming?')
+        print('yes, readout interface is None')
+        print('************************************************')
+        return True
+
     currentfpg = r.fpgfile
     try:
         currentfpg = os.readlink(currentfpg)
@@ -300,6 +313,10 @@ def needs_shared_resource_initialising(r, config_dict):
     print('************************************************')
     print('needs_shared_resource_initialising?')
     print('************************************************')
+    
+    if r is None or not hasattr(r, "autocorr"):
+        print('yes, autocorr block missing (or interface is None)')
+        return True
 
     autocorr_acc_len = r.autocorr.get_acc_len()
     if autocorr_acc_len==0:
@@ -319,6 +336,10 @@ def needs_pipeline_initialising(r, config_dict):
     print('************************************************')
     print('needs_pipeline_initialising?')
     print('************************************************')
+    
+    if r is None or not hasattr(r, "accumulators") or len(r.accumulators) == 0:
+        print('yes, accumulators missing (or interface is None)')
+        return True
 
     acc_len = r.accumulators[0].get_acc_len()
     if acc_len == 0:
@@ -345,7 +366,7 @@ def reload_firmware(config_dict):
     """
     Program/reprogram and return interfaces.
 
-    IMPORTANT: Do not initialise shared or pipeline resources here.
+    IMPORTANT: This and any second pipeline will need initialising. Do not initialise shared or pipeline resources here.
     """
     print(bcolors.WARNING+'Reloading firmware: all shared/pipeline resources will need re-initialising'+bcolors.ENDC)
     fw_config_file = config_dict['firmware']['fw_config_file']
@@ -367,10 +388,21 @@ def reload_firmware(config_dict):
 
 
 def initialise_shared_resources(r,config_dict):
+    _shared_block_names = ['common', 'adc_snapshot', 'dac_snapshot', 'zoomfft', 'zoomacc', 'gen_cordic', 'gen_lut', 'autocorr']
+    
+    #read from config
+    ## no common block configurations in use right now
+
+    #initialise and setup blocks
+    r.initialize_shared_blocks()
+
+    #nothing to setup right now
     return
 
-def initialise_pipeline(r,config_dict):
+def initialise_pipeline_resources(r,config_dict):
+    _pipeline_block_names = ['sync', 'input', 'pfb', 'pfbtvg', 'chanselect', 'mixer', 'psb_chanselect', 'psb', 'psbscale', 'accumulator0', 'accumulator1', 'output', 'out_delay']
 
+    #read config
     fwconf = config_dict['firmware']
     fwkeys = fwconf.keys()
 
@@ -415,8 +447,7 @@ def initialise_pipeline(r,config_dict):
     dac0_calibration_file = fwconf.get('dac0_calibration_file',None)
     dac1_calibration_file = fwconf.get('dac1_calibration_file',None)
     adc_calibration_file = fwconf.get('adc_calibration_file',None)
-    
-    
+   
     sync_delay = defaults.get('sync_delay',None)
     acc_len = defaults.get('acc_len',None)
     dac_duc_mixer_frequency_hz = defaults.get('dac_duc_mixer_frequency_hz',None)
@@ -434,19 +465,17 @@ def initialise_pipeline(r,config_dict):
     amplitudes = defaults.get('amplitudes',[])
     phases = defaults.get('phases',[])
 
-    r.initialize()
+    #initialise and setup blocks
+    r.initialize_pipeline_blocks()
 
     r.output.use_psb()
 
     if sync_delay is not None:
         r.sync.set_delay(sync_delay)
-        time.sleep(autosync_time_delay)
         r.sync.arm_sync(wait=False)
-        time.sleep(autosync_time_delay)
         r.sync.sw_sync()
     if acc_len is not None:
         r.accumulators[0].set_acc_len(acc_len)
-
     if dac_duc_mixer_frequency_hz is not None:
         r.rfdc.core.set_fine_mixer_freq(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE,dac_duc_mixer_frequency_hz/1e6)
         r.rfdc.core.set_fine_mixer_freq(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE,dac_duc_mixer_frequency_hz/1e6)
@@ -489,6 +518,7 @@ def initialise_pipeline(r,config_dict):
     if phases:
         set_tone_phases(r,config_dict, phases)
     
+    #check signal levels
     dac_saturation = check_output_saturation(r,iterations=1,saturation_bits=dac_saturation_bits)
     adc_saturation = check_input_saturation(r,iterations=1,saturation_bits=adc_saturation_bits)
     dsp_overflow = check_dsp_overflow(r)
@@ -569,16 +599,6 @@ def get_system_information(r,config_dict):
 
     return info
 
-class bcolors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
 
 def read_parameter(r, param_name):
     if hasattr(r, param_name):
@@ -2753,6 +2773,7 @@ def check_input_saturation(r,iterations=1,saturation_bits=adc_saturation_bits,th
 
     TODO: extend this to check for amplifier saturation
     """
+    r.common.set_input(r.pipeline_id)
     ss_0 = r.adc_snapshot.get_snapshot() / 2**(saturation_bits-1)
     ss=np.zeros((iterations,ss_0.size),dtype=ss_0.dtype)
     ss[0]=ss_0
@@ -2782,6 +2803,7 @@ def check_output_saturation(r,iterations=1,saturation_bits=dac_saturation_bits,t
     #r.input.enable_loopback()
     #any_saturation, details = check_input_saturation(r,iterations=iterations,saturation_bits=saturation_bits)
     #r.input.disable_loopback()
+    r.common.set_input(r.pipeline_id)
     ss0_0,ss1_0 = r.dac_snapshot.get_snapshot() / 2**(saturation_bits-1)
     ss0=np.zeros((iterations,ss0_0.size),dtype=ss0_0.dtype)
     ss1=np.zeros((iterations,ss1_0.size),dtype=ss1_0.dtype)
@@ -3280,8 +3302,7 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
                              autosync=True)
         
         for s in range(samples_per_point):
-            cnt,data,err = read_accumulated_data_fast(r_fast,
-                                                      fast_read_params,
+            cnt,data,err = read_accumulated_data_fast(fast_read_params,
                                                       num_tones=num_tones)
             acc_counts[p,s] = cnt
             sweep_data[:,p,s] = data[::2]+1j*data[1::2]
@@ -3322,7 +3343,7 @@ def perform_retune(r, r_fast,config_dict, centers, spans, points, samples_per_po
     #results = r.retune(center, span, points, samples_per_point,direction,method)
     if method not in ('max_gradient','min_mag'):
         raise ValueError(f'Invalid retune method "{method}", must be "max_gradient" or "min_mag"')
-    results = perform_sweep(r,r_fast,centers, spans, points, samples_per_point, direction)
+    results = perform_sweep(r,r_fast,config_dict,centers, spans, points, samples_per_point, direction)
     
     if method == 'max_gradient':
         retune_freqs = np.zeros_like(results['sweep_frequencies'])

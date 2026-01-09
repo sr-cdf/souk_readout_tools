@@ -160,8 +160,8 @@ class ReadoutServer:
         self.sweep_task = None
         self.stream_task = None
         self.triggered_stream_task = None
-        self.stream_enabled = asyncio.Event()
-        self.triggered_stream_enabled = False
+        self.e_stream_enabled = asyncio.Event()
+        self.e_triggered_stream_enabled = asyncio.Event()
         self.tasks = []
         self.fake_trigger_event = asyncio.Event()
         self.stream_flags = [asyncio.Event() for _ in range(8)]
@@ -174,12 +174,14 @@ class ReadoutServer:
         self.sweep_progress = 0.0
 
         #initialize server
-        self.init_server(config_file, init_firmware=False)
+        self.init_server(config_file,ensure_ready=False, force_ready=False)
     
     
-    def _ensure_ready(self, level="pipeline"):
+    def ensure_ready(self, config_file=None, level="pipeline"):
         """
         Ensure the firmware is ready up to the requested init level.
+
+        Does NOT force reprogramming or reinitialisation if not needed.
 
         level:
           - "server": no firmware operations
@@ -187,29 +189,40 @@ class ReadoutServer:
           - "pipeline": firmware level + initialise pipeline resources
         """
         if level not in ("server", "firmware", "pipeline"):
-            raise ValueError(f"Invalid ensure_ready level: {level}")
+            raise ValueError(f"Invalid ready level: {level}")
+
+        self.load_config(config_file)
 
         if level == "server":
             return
 
-        # 1) Program firmware if needed
-        if firmware_lib.needs_programming(self.r, self.config):
-            self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
-
-        # 2) Shared resources
-        if level in ("firmware", "pipeline"):
+        if level == "firmware":
+            # 1) Program firmware if needed
+            if firmware_lib.needs_programming(self.r, self.config):
+                self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
+            # 2) Shared resources init if needed
             if firmware_lib.needs_shared_resource_initialising(self.r, self.config):
                 firmware_lib.initialise_shared_resources(self.r, self.config)
+            return
 
-        # 3) Pipeline resources
         if level == "pipeline":
+            # 1) Program firmware if needed
+            if firmware_lib.needs_programming(self.r, self.config):
+                self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
+            # 2) Shared resources init if needed
+            if firmware_lib.needs_shared_resource_initialising(self.r, self.config):
+                firmware_lib.initialise_shared_resources(self.r, self.config)
+            # 3) Pipeline resources init if needed
             if firmware_lib.needs_pipeline_initialising(self.r, self.config):
-                firmware_lib.initialise_pipeline(self.r, self.config)
+                firmware_lib.initialise_pipeline_resources(self.r, self.config)
+            return
 
 
-    def _force_ready(self, level='pipeline'):
+    def force_ready(self, level='pipeline'):
         """
         Ensure the firmware is ready up to the requested init level by applying init.
+
+        Forces reprogramming and reinitialisation up to the requested init level.
 
         level:
           - "server": no firmware operations
@@ -217,39 +230,45 @@ class ReadoutServer:
           - "pipeline": firmware level + initialise pipeline resources
         """
         if level not in ("server", "firmware", "pipeline"):
-            raise ValueError(f"Invalid ensure_ready level: {level}")
+            raise ValueError(f"Invalid ready level: {level}")
 
         if level == "server":
-            self.init_server(config_file=self.config, init_firmware=False)
-
-        # 1) Program firmware 
-        self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
-
-        # 2) Shared resources
-        if level in ("firmware", "pipeline"):
+            self.init_server(self.config_file,ensure_ready=False, force_ready=False)
+            return
+        
+        if level == "firmware":
+            # 1) Program firmware 
+            self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
+            # 2) Shared resources
             firmware_lib.initialise_shared_resources(self.r, self.config)
+            return
 
-        # 3) Pipeline resources
         if level == "pipeline":
-            firmware_lib.initialise_pipeline(self.r, self.config)
-
+            # 1) Program firmware 
+            self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
+            # 2) Shared resources
+            firmware_lib.initialise_shared_resources(self.r, self.config)
+            # 3) Pipeline resources
+            firmware_lib.initialise_pipeline_resources(self.r, self.config)
+            return
         return
   
 
-    def init_server(self, config_file,init_firmware=False, force_firmware=False):
+    def init_server(self, config_file,ensure_ready=False, force_ready=False):
         """
         Initialize server runtime + load config + create firmware interfaces.
         
-        If init_firmware is True, bring system to pipeline-ready state
+        If ensure_ready is True, bring system to pipeline-ready state
 
-        If force_firmware is True, reprogram and bring system to pipeline-ready state
+        If force_ready is True, reprogram and bring system to pipeline-ready state
 
         """
 
         print('************************************************')
         print('init_server')
         print('config_file:',config_file)
-        print('init_firmware:',init_firmware)
+        print('ensure_ready:',ensure_ready)
+        print('force_ready:',force_ready)
         print('************************************************')
 
         #server attributes
@@ -260,8 +279,8 @@ class ReadoutServer:
         self.sweep_task = None
         self.stream_task = None
         self.triggered_stream_task = None
-        self.stream_enabled = asyncio.Event()
-        self.triggered_stream_enabled = False
+        self.e_stream_enabled = asyncio.Event()
+        self.e_triggered_stream_enabled = asyncio.Event()
         self.tasks = []
         self.stream_flags = [asyncio.Event() for _ in range(8)]
 
@@ -287,18 +306,22 @@ class ReadoutServer:
         self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
         
 
-        if init_firmware and force_firmware:
-            init_firmware=False
+        if ensure_ready and force_ready:
+            ensure_ready=False
 
-        if init_firmware:
-                self._ensure_ready(level="pipeline")
+        if ensure_ready:
+            self.ensure_ready(level="pipeline")
 
-        if force_firmware:
-                self._force_ready(level='pipeline')
+        if force_ready:
+            self.force_ready(level='pipeline')
 
 
         #see if we can succesfully load system information
-        system_information = self.get_system_information()
+        try:
+            system_information = self.get_system_information()
+        except Exception as e:
+            print('Warning: could not get system information from firmware:',e)
+            raise e
         return
    
              
@@ -314,10 +337,8 @@ class ReadoutServer:
         
         if config_file is not None:
             self.load_config(config_file)
-
-        self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
-
-        self._ensure_ready(level="firmware")
+       
+        self.force_ready(level="firmware")
         return
 
 
@@ -325,6 +346,7 @@ class ReadoutServer:
         """
         Ensure shared resources and pipeline resources are initialised.
         Does not force a reprogram unless needs_programming() says so.
+        Does not force shared resource initialisation unless needs_shared_resource_initialising() says so.
         """
         print('************************************************')
         print('init_pipeline')
@@ -339,7 +361,14 @@ class ReadoutServer:
             self.r = firmware_lib.create_standard_readout_interface(fw_config_file, pipeline_id)
             self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file, pipeline_id)
 
-        self._ensure_ready(level="pipeline")
+        
+        #ensure pipeline is ready
+        self.ensure_ready(level="pipeline")
+    
+        #force pipeline init
+        firmware_lib.initialise_pipeline_resources(self.r, self.config)        
+
+        return
 
 
 
@@ -399,7 +428,7 @@ class ReadoutServer:
         print('filename:',filename)
         print('************************************************')
 
-        self.init_server(filename,init_firmware=True)
+        self.ensure_ready(config_file=filename, level="pipeline")
 
         if default:
             defaultname = os.path.join(USER_CONFIG_DIR,'default_config.lnk')
@@ -453,9 +482,9 @@ class ReadoutServer:
             'stream_clients': len(self.stream_clients),
             'stream_client_addrs': [client.get_extra_info('peername') for client in self.stream_clients],
             'stream_task_started': self.stream_task is not None and not self.stream_task.done(),
-            'stream_enabled': self.stream_enabled.is_set(),
+            'stream_enabled': self.e_stream_enabled.is_set(),
             'triggered_stream_task_started': self.triggered_stream_task is not None and not self.triggered_stream_task.done(),
-            'triggered_stream_enabled': self.triggered_stream_enabled,
+            'triggered_stream_enabled': self.e_triggered_stream_enabled.is_set(),
             'sweep_task_running': self.sweep_task is not None and not self.sweep_task.done(),
             'tasks': len(self.tasks),
             'firmware_interface_exists': bool(self.r),
@@ -506,7 +535,7 @@ class ReadoutServer:
                     if not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
-                        self.init_server(config_file,init_firmware=True)
+                        self.ensure_ready(config_file=config_file, level=level)
                         await self.send_response(writer, {'status': 'success', 'server_status': self.get_server_status()})
 
                 elif request == 'hard_reset':
@@ -516,10 +545,8 @@ class ReadoutServer:
                     if not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
-                        self._force_ready(config_file,init_firmware=True)
+                        self.init_server(config_file,ensure_ready=False, force_ready=True)
                         await self.send_response(writer, {'status': 'success', 'server_status': self.get_server_status()})
-
-
 
                 elif request == 'initialise_server':
                     config_file = message.get('config_filename')
@@ -528,7 +555,7 @@ class ReadoutServer:
                     if not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
-                        self.init_server(config_file,init_firmware=True)
+                        self.init_server(config_file,ensure_ready=False, force_ready=False)
                         await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'initialise_firmware':
@@ -539,7 +566,7 @@ class ReadoutServer:
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
                         await self.send_response(writer, {'status': 'success'})
-                        self.init_firmware(config_file) #implicitly calls init server
+                        self.init_firmware(config_file) 
                 
                 elif request == 'initialise_pipeline':
                     config_file = message.get('config_filename')
@@ -674,22 +701,22 @@ class ReadoutServer:
 
 
                 elif request == 'enable_stream':
-                    self.triggered_stream_enabled = False
-                    self.stream_enabled.set()
+                    self.e_triggered_stream_enabled.clear()
+                    self.e_stream_enabled.set()
                     print('Stream enabled, clients:', self.stream_clients)
                     await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'disable_stream':
-                    self.stream_enabled.clear()
+                    self.e_stream_enabled.clear()
                     await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'enable_triggered_stream':
-                    self.stream_enabled = False
-                    self.triggered_stream_enabled = True
+                    self.e_stream_enabled.clear()
+                    self.e_triggered_stream_enabled.set()
                     await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'disable_triggered_stream':
-                    self.triggered_stream_enabled = False
+                    self.e_triggered_stream_enabled.clear()
                     await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'send_fake_trigger':
@@ -1025,7 +1052,7 @@ class ReadoutServer:
         prev_cnt=0
         while True:
             try:
-                if self.stream_enabled.is_set():
+                if self.e_stream_enabled.is_set():
                     payload, cnt, err =  self.prepare_frame(fast_read_params)
                     if err:
                         err_count+=1
@@ -1061,7 +1088,7 @@ class ReadoutServer:
         fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
         while True:
             try:
-                if self.triggered_stream_enabled:
+                if self.e_triggered_stream_enabled.is_set():
                     triggered = await self.to_thread(firmware_lib.wait_for_gpio_pulse,self.r, self.trigger_source_pin,self.fake_trigger_event)
                     
                     if triggered:

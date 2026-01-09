@@ -59,6 +59,7 @@ Version: 0.1
 import socket
 import json
 import struct
+from urllib import response
 import numpy as np
 import yaml
 import sys
@@ -74,6 +75,17 @@ USER_CONFIG_DIR = os.path.expanduser('~/.souk_readout_tools/config')
 USER_TMP_DIR = os.path.expanduser('~/.souk_readout_tools/tmp')
 
 DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR,'default_config.lnk')
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
 class ReadoutClient:
     def __init__(self,config_file=None):
@@ -147,7 +159,7 @@ class ReadoutClient:
             # print(f'received: {response_data}')
             return json.loads(response_data.decode())
 
-    def initialise_server(self,config_file=None):
+    def _initialise_server(self,config_file=None):
         message = {'request': 'initialise_server','config_filename': config_file}
         response = self.send_request(message)
         if response['status'] == 'success':
@@ -155,15 +167,23 @@ class ReadoutClient:
 
         return response
 
-    def initialise_firmware(self,config_file=None):
+    def _initialise_firmware(self,config_file=None):
+        print(bcolors.WARNING + 'Warning: initialize_firmware will reset all pipelines, other clients will be affected.' + bcolors.ENDC)
         message = {'request': 'initialise_firmware', 'config_filename': config_file}
         response = self.send_request(message)
         if response['status'] == 'success':
             self.pull_config()
         return response
     
-    def initialise_pipeline(self,config_file=None):
+    def _initialise_pipeline(self,config_file=None):
         message = {'request': 'initialise_pipeline', 'config_filename': config_file}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            self.pull_config()
+        return response
+
+    def ensure_ready(self, config_file=None, level="pipeline"):
+        message = {'request': 'ensure_ready', 'config_filename': config_file, 'level': level}
         response = self.send_request(message)
         if response['status'] == 'success':
             self.pull_config()
@@ -244,7 +264,9 @@ class ReadoutClient:
             return response
 
     def hard_reset(self):
-        return self.initialise_firmware()
+        print(bcolors.WARNING + 'Warning: hard_reset will reset all pipelines, other clients will be affected.' + bcolors.ENDC)
+        message = {'request':'hard_reset'}
+        return self.send_request(message)
 
     def cancel_all_tasks(self):
         message = {'request': 'cancel'}
