@@ -1523,6 +1523,186 @@ class ReadoutClient:
         return resonances
 
 
+    def wideband_sweep(self, bandwidth_hz=None, center_freq_hz=None, step_size_hz=10000, 
+                       num_tones=1024, samples_per_point=10, apply_phase_correction=True,
+                       verbose=True):
+        """
+        Perform a wideband sweep of the system using multiple tones.
+        
+        This method configures tones across the bandwidth, performs a sweep, and returns
+        the concatenated sweep data covering the full requested bandwidth.
+        
+        Args:
+            bandwidth_hz (float): Total bandwidth to measure. Default is full available bandwidth.
+            center_freq_hz (float): Center frequency of the sweep. Default is band center.
+            step_size_hz (float): Step size of the sweep in Hz. Number of sweep steps = 
+                                  bandwidth / step_size / num_tones. Default is 10000.
+            num_tones (int): Number of tones to use in the sweep. More tones = fewer sweep 
+                             steps but wider spacing. Default is 1024.
+            samples_per_point (int): Number of samples to integrate per sweep point. Default is 10.
+            apply_phase_correction (bool): Correct for phase jumps at filterbank channel edges.
+                                           Default is True.
+            verbose (bool): Print progress information. Default is True.
+        
+        Returns:
+            dict: Sweep data dictionary with keys:
+                - 'sweep_f': Array of frequencies [1, N_total_points]
+                - 'sweep_i': Array of I values [1, N_total_points]  
+                - 'sweep_q': Array of Q values [1, N_total_points]
+                - 'sweep_ei': Array of I errors [1, N_total_points]
+                - 'sweep_eq': Array of Q errors [1, N_total_points]
+                - 'num_tones': Number of tones used
+                - 'samples_per_point': Samples per point
+                - 'system_information': System info at time of sweep
+                - Plus other metadata from parse_sweep_data
+        
+        Raises:
+            RuntimeError: If a sweep is already in progress, saturation detected, or sweep fails.
+            ValueError: If requested bandwidth is out of range or tone spacing is too small.
+        """
+        # Check if a sweep is already running
+        p = self.get_sweep_progress()
+        if p != 0.0 and p != 1.0:
+            raise RuntimeError(f'Sweep already in progress ({p*100:.3f}%), wait for it to finish.')
+        
+        info = self.get_system_information()
+        
+        # Get RF frontend configuration
+        udc = self.config['rf_frontend']['connected']
+        lo = self.config['rf_frontend']['tx_mixer_lo_frequency_hz']
+        sb = self.config['rf_frontend']['tx_mixer_sideband']
+        
+        adcclk = info['adc_clk_hz']
+        dacclk = adcclk
+        dacduc = info['dac_duc_mixer_frequency_hz']
+        txnfft = 8192
+        
+        # Calculate baseband and RF frequency limits
+        dbbmin = -dacclk / 2
+        dbbmax = +dacclk / 2
+        dacmin = min([abs(dbbmin + dacduc), abs(dbbmax + dacduc)])
+        dacmax = max([abs(dbbmin + dacduc), abs(dbbmax + dacduc)])
+        
+        rfmin = dacmin
+        rfmax = dacmax
+
+        if udc:
+            if sb == 1:
+                rfmin = lo + dacmin
+                rfmax = lo + dacmax
+            elif sb == -1:
+                rfmin = lo - dacmax
+                rfmax = lo - dacmin
+            else:
+                raise ValueError(f"Invalid sideband value {sb}, should be +1 for USB or -1 for LSB")
+
+        # Set defaults for bandwidth and center frequency
+        if bandwidth_hz is None:
+            bandwidth_hz = rfmax - rfmin
+        if center_freq_hz is None:
+            center_freq_hz = (rfmax + rfmin) / 2
+
+        fmin = center_freq_hz - bandwidth_hz / 2
+        fmax = center_freq_hz + bandwidth_hz / 2
+
+        if (fmin < rfmin) or (fmax > rfmax):
+            raise ValueError(f'Requested sweep out of band (band = {rfmin/1e6:.1f} - {rfmax/1e6:.1f} MHz, '
+                           f'requested {fmin/1e6:.1f} - {fmax/1e6:.1f} MHz)')
+
+        # Calculate tone frequencies
+        freqs, spacings = np.linspace(fmin, fmax, num_tones, endpoint=False, retstep=True)
+        
+        if spacings <= dacclk / txnfft:
+            raise ValueError(f'Tone spacing must be greater than {dacclk/txnfft:.0f} Hz but is {spacings:.0f} Hz. '
+                           f'Try fewer tones or wider bandwidth.')
+
+        sweep_points = int(bandwidth_hz / step_size_hz / num_tones)
+        sweep_span = spacings * (sweep_points - 1) / sweep_points
+
+        # Add small random offsets to avoid systematic effects
+        small_offsets = np.random.uniform(-sweep_span / sweep_points / 2, 
+                                          +sweep_span / sweep_points / 2, num_tones)
+        freqs += small_offsets
+        center_freqs = freqs + np.floor(sweep_points / 2) * spacings / sweep_points
+        
+        tone_amplitudes = np.ones(num_tones)
+        tone_phases = self.generate_newman_phases(center_freqs)
+
+        if verbose:
+            print(f'Wideband sweep configuration:')
+            print(f'  RF band: {rfmin/1e6:.1f} - {rfmax/1e6:.1f} MHz')
+            print(f'  Sweep range: {fmin/1e6:.1f} - {fmax/1e6:.1f} MHz ({bandwidth_hz/1e6:.1f} MHz)')
+            print(f'  Num tones: {num_tones}, sweep points: {sweep_points}')
+            print(f'  Total points: {num_tones * sweep_points}')
+
+        # Configure tones
+        self.set_tone_frequencies(center_freqs)
+        self.set_tone_amplitudes(tone_amplitudes)
+        self.set_tone_phases(tone_phases)
+
+        # Check for saturation/overflow before sweeping
+        outps = self.check_output_saturation()
+        inps = self.check_input_saturation()
+        dspof = self.check_dsp_overflow()
+        
+        if outps['result']:
+            raise RuntimeError(f"Output saturation detected: {outps['details']}")
+        if inps['result']:
+            raise RuntimeError(f"Input saturation detected: {inps['details']}")
+        if dspof['result']:
+            raise RuntimeError(f"DSP overflow detected: {dspof['details']}")
+
+        # Perform the sweep
+        response = self.perform_sweep(center_freqs, sweep_span,
+                                      points=sweep_points,
+                                      samples_per_point=samples_per_point,
+                                      direction='up')
+        
+        if response['status'] != 'success':
+            raise RuntimeError(f"Sweep failed: {response['message']}")
+
+        # Wait for sweep to complete
+        import time
+        while True:
+            p = self.get_sweep_progress()
+            if verbose:
+                print(f'Sweep progress: {100*p:.1f}%', end='\r', flush=True)
+            if p == 1.0:
+                break
+            time.sleep(1.0)
+        if verbose:
+            print()  # Newline after progress
+
+        # Get and parse the sweep data
+        s = self.parse_sweep_data(self.get_sweep_data(), apply_phase_correction=apply_phase_correction)
+        f = s['sweep_f']
+        z = s['sweep_i'] + 1j * s['sweep_q']
+
+        # Remove slope from phase (concatenate all tones)
+        fcat = np.ravel(f.T)
+        zcat = np.ravel(z.T)
+        phicat = np.angle(zcat)
+        slope = np.nanmedian(np.gradient(phicat, fcat))
+        zcat *= np.exp(-1j * (slope * fcat))
+
+        # Reformat as single-row arrays (like a single-tone sweep covering all frequencies)
+        s['sweep_f'] = np.array([fcat])
+        s['sweep_i'] = np.array([np.real(zcat)])
+        s['sweep_q'] = np.array([np.imag(zcat)])
+        s['sweep_ei'] = np.array([np.ravel(s['sweep_ei'].T)])
+        s['sweep_eq'] = np.array([np.ravel(s['sweep_eq'].T)])
+        
+        # Add metadata
+        s['wideband_sweep'] = True
+        s['bandwidth_hz'] = bandwidth_hz
+        s['center_freq_hz'] = center_freq_hz
+        s['step_size_hz'] = step_size_hz
+        s['num_tones_used'] = num_tones
+        s['sweep_points_per_tone'] = sweep_points
+
+        return s
+
+
     def set_tones_helper(self, freqs, amps=None, phases=None):
         if freqs is None or len(freqs) == 0:
             raise ValueError("Frequencies must be provided and cannot be empty.")
