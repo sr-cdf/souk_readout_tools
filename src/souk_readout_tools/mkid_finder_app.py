@@ -2,6 +2,11 @@ import sys
 import os
 import traceback
 import logging
+import signal
+import faulthandler
+
+# Enable faulthandler to get tracebacks on segfaults
+faulthandler.enable()
 
 try:
     from importlib.resources import files  # Python 3.9+
@@ -11,8 +16,10 @@ except ImportError:
 import numpy as np
 
 # Configure logging - set to WARNING for normal use, DEBUG for troubleshooting
+# Set MKID_FINDER_DEBUG=1 environment variable for debug output
 _log = logging.getLogger(__name__)
-_log.setLevel(logging.WARNING)  # Change to DEBUG to see all messages
+_log_level = logging.DEBUG if os.environ.get('MKID_FINDER_DEBUG') else logging.WARNING
+_log.setLevel(_log_level)
 if not _log.handlers:
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
@@ -98,7 +105,7 @@ class Resonance:
         _log.debug(f'Resonance.analyse at {frequencies[peak_idx]/1e6:.3f} MHz')
         self.peak_idx = peak_idx
         i_p1 = min(len(frequencies)-1, peak_idx + 1)
-        i_n1 = min(0, peak_idx - 1)
+        i_n1 = max(0, peak_idx - 1)
 
         self.frequency = frequencies[peak_idx]
         frequency_step = (frequencies[i_p1] - frequencies[i_n1]) / (i_p1 - i_n1)
@@ -571,7 +578,10 @@ class ResonanceFinderApp(QMainWindow):
 
     def _doCoalescedRefresh(self):
         self._refresh_pending = False
-        self.refreshUI()
+        try:
+            self.refreshUI()
+        except Exception as e:
+            _log.exception(f"Error in _doCoalescedRefresh: {e}")
 
     #get started
     def loadSettings(self):
@@ -1049,6 +1059,8 @@ class ResonanceFinderApp(QMainWindow):
             self.refreshPeakFinderLabels()
             self.refreshActiveResonanceLabel()
             self.refreshResonancesLabel()
+        except Exception as e:
+            _log.exception(f"Error in refreshUI: {e}")
         finally:
             self._in_refresh = False
 
@@ -2703,7 +2715,10 @@ class ResonanceFinderApp(QMainWindow):
         Perform any layout updates or redraws here.
         """
         _log.debug('onResizeFinished')
-        self.refreshFigures()
+        try:
+            self.refreshFigures()
+        except Exception as e:
+            _log.exception(f"Error in onResizeFinished: {e}")
 
     def onSplitterMoved(self, pos, index):
         _log.debug('onSplitterMoved')
@@ -2717,7 +2732,10 @@ class ResonanceFinderApp(QMainWindow):
         Perform any layout updates or redraws here.
         """
         _log.debug('onSplitterMoveFinished')
-        self.refreshFigures()        
+        try:
+            self.refreshFigures()
+        except Exception as e:
+            _log.exception(f"Error in onSplitterMoveFinished: {e}")        
 
     def onOpen(self):
         _log.debug('onOpen')
@@ -2867,10 +2885,13 @@ class ResonanceFinderApp(QMainWindow):
 
     def onSelectRectangle(self, eclick, erelease):
         _log.debug('onSelectRectangle')
-        ax = eclick.inaxes
-        if ax is None:
-            return
-        self.handleRectangleSelection(ax, eclick, erelease)
+        try:
+            ax = eclick.inaxes
+            if ax is None:
+                return
+            self.handleRectangleSelection(ax, eclick, erelease)
+        except Exception as e:
+            _log.exception(f"Error in onSelectRectangle: {e}")
 
 
     def handleRectangleSelection(self, ax, eclick, erelease):
@@ -2984,26 +3005,30 @@ class ResonanceFinderApp(QMainWindow):
         We’ll route the event to onAxesLeftClick or onAxesRightClick as needed.
         """
         _log.debug('onAxesButtonPress')
-        # If user is in Pan/Zoom mode, ignore
-        if event.inaxes == self.ax_raw:
-            if self.toolbar_raw.mode != '':
+        try:
+            # If user is in Pan/Zoom mode, ignore
+            # Note: Only main plots (raw/filtered) have toolbars; active plots do not
+            if event.inaxes == self.ax_raw:
+                if self.toolbar_raw.mode != '':
+                    return
+            elif event.inaxes == self.ax_filtered:
+                if self.toolbar_filtered.mode != '':
+                    return
+            elif event.inaxes == self.ax_active_raw:
+                # Active raw plot has no toolbar, so always process clicks
+                pass
+            elif event.inaxes == self.ax_active_filtered:
+                # Active filtered plot has no toolbar, so always process clicks
+                pass
+            else:
                 return
-        elif event.inaxes == self.ax_filtered:
-            if self.toolbar_filtered.mode != '':
-                return
-        elif event.inaxes == self.ax_active_raw:
-            if self.toolbar_active_raw.mode != '':
-                return
-        elif event.inaxes == self.ax_active_filtered:
-            if self.toolbar_active_filtered.mode != '':
-                return
-        else:
-            return
-        
-        if event.button == 1:   # Left-click
-            self.onAxesLeftClick(event)
-        elif event.button == 3: # Right-click
-            self.onAxesRightClick(event)
+            
+            if event.button == 1:   # Left-click
+                self.onAxesLeftClick(event)
+            elif event.button == 3: # Right-click
+                self.onAxesRightClick(event)
+        except Exception as e:
+            _log.exception(f"Error in onAxesButtonPress: {e}")
 
 
     def onAxesRightClick(self, event):
@@ -3285,6 +3310,26 @@ class SplashScreen(QSplashScreen):
 
 
 def main():
+    # Install global exception handler to prevent silent crashes
+    def exception_hook(exctype, value, tb):
+        """Global exception handler that logs exceptions instead of crashing silently."""
+        error_msg = ''.join(traceback.format_exception(exctype, value, tb))
+        _log.error(f"Unhandled exception:\n{error_msg}")
+        # Also print to stderr for visibility
+        sys.stderr.write(f"FATAL ERROR:\n{error_msg}\n")
+        sys.stderr.flush()
+        # Show message box if possible
+        try:
+            QMessageBox.critical(None, "Fatal Error", 
+                f"An unexpected error occurred:\n\n{exctype.__name__}: {value}\n\n"
+                f"See console/log for full traceback.")
+        except:
+            pass
+        # Call default handler
+        sys.__excepthook__(exctype, value, tb)
+    
+    sys.excepthook = exception_hook
+    
     app = QApplication(sys.argv)
 
     iconpng = str(files("souk_readout_tools").joinpath("mkid_finder_app.png"))
