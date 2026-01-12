@@ -203,8 +203,8 @@ class DataLoader():
             data = data.item()
             try:
                 print(data.keys())
-                f = data['sweep_f']
-                z = data['sweep_i']+1j*data['sweep_q']    
+                f = np.atleast_1d(data['sweep_f']).ravel()
+                z = np.atleast_1d(data['sweep_i']).ravel()+1j*np.atleast_1d(data['sweep_q']).ravel()    
             except Exception as e:
                     QMessageBox.warning(None, "Error", "Failed to interpret file as a sweep: "+filename)
                     raise(e)
