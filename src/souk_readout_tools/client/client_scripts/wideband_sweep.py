@@ -26,7 +26,7 @@ from souk_readout_tools.client.readout_client import ReadoutClient
 
 def wideband_sweep(config_file=None, bandwidth_hz=None, center_freq_hz=None, 
                    step_size_hz=10000, num_tones=1024, samples_per_point=10, 
-                   ignore_phase_correction=False, filename=None, filetype='npy', 
+                   ignore_phase_correction=True, filename=None, filetype='npy', 
                    plot_data=True, pipeline_id=None):
     """
     Perform a wideband sweep of the system.
@@ -42,8 +42,8 @@ def wideband_sweep(config_file=None, bandwidth_hz=None, center_freq_hz=None,
                               bandwidth / step_size / num_tones. Default is 10000.
         num_tones (int): Number of tones to use in the sweep. Default is 1024.
         samples_per_point (int): Number of samples to integrate per sweep point. Default is 10.
-        ignore_phase_correction (bool): Do not correct for phase jumps at filterbank 
-                                        channel edges. Default is False.
+        ignore_phase_correction (bool): DEPRECATED. Phase correction is no longer needed 
+                                        following firmware fixes. Default is True (no correction).
         filename (str): Filename to save the data to. Default is tmp_wideband_sweep in tmp dir.
         filetype (str): Type of file to save. Default is 'npy'.
         plot_data (bool): Plot the data after saving. Default is True.
@@ -159,7 +159,11 @@ def main():
     parser.add_argument('-p', '--samples_per_point', type=int, default=10,
                         help='Number of samples to integrate per sweep point.')
     parser.add_argument('-i', '--ignore_phase_correction', action='store_true',
-                        help='Do not correct for phase jumps at filterbank channel edges.')
+                        help='DEPRECATED (no-op). Phase correction is disabled by default '\
+                             'following firmware fixes. Kept for backward compatibility.')
+    parser.add_argument('--apply_phase_correction', action='store_true',
+                        help='DEPRECATED. Apply legacy phase correction at filterbank channel edges. '\
+                             'Not needed with current firmware.')
     parser.add_argument('-f', '--filename', type=str, default=None,
                         help='Output filename (without extension). Default: tmp_wideband_sweep in pipeline tmp dir.')
     parser.add_argument('-t', '--filetype', type=str, default='npy',
@@ -187,6 +191,12 @@ def main():
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
+    # Determine phase correction setting:
+    # - Default is no correction (ignore_phase_correction=True)
+    # - --apply_phase_correction overrides to apply correction
+    # - -i/--ignore_phase_correction is now a no-op (kept for backward compat)
+    ignore_correction = not args.apply_phase_correction  # True unless --apply_phase_correction given
+
     # Perform the sweep using the wrapper function
     try:
         wideband_sweep(
@@ -196,7 +206,7 @@ def main():
             step_size_hz=args.step_size_hz,
             num_tones=args.num_tones,
             samples_per_point=args.samples_per_point,
-            ignore_phase_correction=args.ignore_phase_correction,
+            ignore_phase_correction=ignore_correction,
             filename=args.filename,
             filetype=args.filetype,
             plot_data=args.plot_data,

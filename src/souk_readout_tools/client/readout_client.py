@@ -850,7 +850,22 @@ class ReadoutClient:
             print(f"Error getting sweep_data: {response['message']}")
             return response
 
-    def parse_sweep_data(self,sweep_data, apply_phase_correction=False):
+    def parse_sweep_data(self, sweep_data, apply_phase_correction=False):
+        """
+        Parse raw sweep data from the server into numpy arrays.
+        
+        Args:
+            sweep_data: Raw sweep data dictionary from get_sweep_data()
+            apply_phase_correction (bool): Correct for phase jumps at filterbank channel
+                                           edges. Default is False. DEPRECATED: This 
+                                           correction is no longer needed following 
+                                           firmware fixes and will be removed in a 
+                                           future version.
+        
+        Returns:
+            dict: Parsed sweep data with 'sweep_f', 'sweep_i', 'sweep_q', 'sweep_ei', 
+                  'sweep_eq' arrays and metadata.
+        """
         info = sweep_data['system_information']
         date = sweep_data['date']
         num_tones = int(sweep_data['num_tones'])
@@ -1524,7 +1539,7 @@ class ReadoutClient:
 
 
     def wideband_sweep(self, bandwidth_hz=None, center_freq_hz=None, step_size_hz=10000, 
-                       num_tones=1024, samples_per_point=10, apply_phase_correction=True,
+                       num_tones=1024, samples_per_point=10, apply_phase_correction=False,
                        verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
@@ -1540,8 +1555,9 @@ class ReadoutClient:
             num_tones (int): Number of tones to use in the sweep. More tones = fewer sweep 
                              steps but wider spacing. Default is 1024.
             samples_per_point (int): Number of samples to integrate per sweep point. Default is 10.
-            apply_phase_correction (bool): Correct for phase jumps at filterbank channel edges.
-                                           Default is True.
+            apply_phase_correction (bool): DEPRECATED. Correct for phase jumps at filterbank 
+                                           channel edges. Default is False. This correction is
+                                           no longer needed following firmware fixes.
             verbose (bool): Print progress information. Default is True.
         
         Returns:
