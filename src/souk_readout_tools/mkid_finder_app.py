@@ -1631,23 +1631,31 @@ class ResonanceFinderApp(QMainWindow):
                 return
         self.active_resonance_index = None
     
-    def setActiveResonanceIndex(self,index):
+    def setActiveResonanceIndex(self, index, refresh=True):
         _log.debug(f'setActiveResonanceIndex {index}')
+        
+        # Early exit if no change
         if index == self.active_resonance_index:
             return
-            # clamp / validate
+        
+        # Validate index
         if index is not None and (index < 0 or index >= len(self.resonances)):
             index = None
-
-        available_ids = [resonance.id for resonance in self.resonances]
-        if index not in available_ids:
-            index = None
-        for r in self.resonances:
-            r.set_active_state(r.id == index)
+        
+        # Only update the two affected resonances (old active and new active)
+        old_index = self.active_resonance_index
+        if old_index is not None and 0 <= old_index < len(self.resonances):
+            self.resonances[old_index].set_active_state(False)
+        
+        if index is not None:
+            self.resonances[index].set_active_state(True)
+        
         self.active_resonance_index = index
         _log.debug(f'active resonance index: {self.active_resonance_index}')
-        # don't call refreshActiveResonance() here
-        self.scheduleRefresh()
+        
+        # Only refresh if requested (allows batching multiple changes)
+        if refresh:
+            self.refreshActiveResonance()
 
 
         # print('setActiveResonanceIndex',index)
@@ -1860,13 +1868,15 @@ class ResonanceFinderApp(QMainWindow):
         #         selected_resonance_indexes.append(i)
         # self.selected_resonance_indexes = selected_resonance_indexes
 
-    def setSelectedResonances(self,resonance_indexes):
+    def setSelectedResonances(self, resonance_indexes, refresh=True):
         _log.debug('setSelectedResonances')
-        for i in range(len(self.resonances)):
-            resonance = self.resonances[i]
-            resonance.set_selected_state(i in resonance_indexes)
+        # Use set for O(1) lookup instead of O(n) list membership
+        index_set = set(resonance_indexes)
+        for i, resonance in enumerate(self.resonances):
+            resonance.set_selected_state(i in index_set)
         self.selected_resonance_indexes = resonance_indexes
-        self.refreshSelectedResonances()
+        if refresh:
+            self.refreshSelectedResonances()
 
     
     def refreshSelectedResonancesTable(self):
@@ -2792,45 +2802,33 @@ class ResonanceFinderApp(QMainWindow):
         self.scheduleRefresh(0)
 
     def onResonanceTableCellClicked(self, row, column):
+        # Note: selectionChanged already handles this, so we only need to
+        # ensure the active resonance is set. Don't trigger extra refresh.
         _log.debug('onResonanceTableCellClicked')
-        self.setActiveResonanceIndex(row)
-        # self.refreshUI()
-        self.scheduleRefresh(0)
+        # Already handled by onResonanceTableSelectionChanged
+        pass
 
 
     def onResonanceTableSelectionChanged(self):
         _log.debug('onResonanceTableSelectionChanged')
-        selected_resonances = self.getSelectedResonances()
         selected_indexes = [i.row() for i in self.resonances_table.selectionModel().selectedRows()]
-
-        if selected_resonances is not None:
-            if len(selected_resonances) == 0:
-                if len(selected_indexes) == 0 :
-                    pass
-                elif len(selected_indexes) == 1:
-                    self.setActiveResonanceIndex(selected_indexes[0])
-                    self.setSelectedResonances(selected_indexes)
-                elif len(selected_indexes) > 1:
-                    self.setSelectedResonances(selected_indexes)
-            else:
-                if  len(selected_indexes) > 0 :
-                    self.setSelectedResonances(selected_indexes)
-                    self.setActiveResonanceIndex(selected_indexes[-1])
-                elif len(selected_indexes) > 1:
-                    self.setSelectedResonances(selected_indexes)
+        
+        # Batch updates without triggering refreshes
+        if selected_indexes:
+            # Set active to last selected, don't refresh yet
+            self.setActiveResonanceIndex(selected_indexes[-1], refresh=False)
+            # Set selection, don't refresh yet  
+            self.setSelectedResonances(selected_indexes, refresh=False)
         else:
-            if len(selected_indexes) == 0:
-                self.setSelectedResonances(selected_indexes)
-            elif  len(selected_indexes) > 0 :
-                self.setActiveResonanceIndex(selected_indexes[-1])
-                self.setSelectedResonances(selected_indexes)
-
-            elif len(selected_indexes) > 1:
-                self.setSelectedResonances(selected_indexes)
-
-
-        # self.refreshUI()
-        self.scheduleRefresh(0)
+            self.setSelectedResonances([], refresh=False)
+        
+        # Refresh only what's needed, avoiding duplicate marker refreshes
+        self.refreshActiveResonancePlots()
+        self.refreshActiveResonanceTable()
+        self.refreshSelectedResonancesTable()
+        self.refreshMarkers()  # Only once for both active and selected
+        self.updateNavigationButtons()
+        self.refreshResonancesLabel()
 
 
 
