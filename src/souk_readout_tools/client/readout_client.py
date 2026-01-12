@@ -1732,6 +1732,102 @@ class ReadoutClient:
         self.set_tone_phases(phases)
         return
 
+    def find_resonances(self, sweep_data=None, data_format='log_magnitude', 
+                        filter_params=None, finder_params=None, **kwargs):
+        """
+        Find MKID resonances in sweep data using the peak_finder module.
+        
+        This is a convenience wrapper around the standalone peak_finder module
+        that can work with sweep data directly from wideband_sweep() or from file.
+        
+        Args:
+            sweep_data (dict, optional): Sweep data dictionary with keys 'sweep_f', 
+                'sweep_i', 'sweep_q'. If None, performs a new wideband_sweep.
+            data_format (str): Analysis format for peak finding. One of:
+                'lin_magnitude', 'log_magnitude', 'phase', 'unwrapped_phase',
+                'group_delay', 'complex_gradient'. Default is 'log_magnitude'.
+            filter_params: FilterParams instance or dict with keys:
+                - highpass_edge (float): 0-1 normalized (0 = disabled)
+                - lowpass_edge (float): 0-1 normalized (1 = disabled)
+                - median_kernel_size (int): 1 = disabled
+            finder_params: PeakFinderParams instance or dict with keys:
+                - prominence_enabled (bool), prominence_min/max (float)
+                - width_enabled (bool), width_min/max (float) in Hz
+                - distance_enabled (bool), distance_value (float) in Hz
+                - peak_direction (int): -1 for dips, +1 for peaks
+            **kwargs: Passed to wideband_sweep if sweep_data is None.
+        
+        Returns:
+            list: List of ResonanceResult objects with attributes:
+                - frequency (float): Resonance frequency in Hz
+                - fwhm (float): Full width at half maximum in Hz
+                - q_factor (float): Quality factor
+                - qc (float): Coupling Q
+                - qi (float): Internal Q
+                - dip_depth (float): Depth of resonance dip in dB
+        
+        Example:
+            >>> client = ReadoutClient()
+            >>> # Find resonances from a new sweep
+            >>> resonances = client.find_resonances()
+            >>> print([r.frequency / 1e6 for r in resonances])  # MHz
+            
+            >>> # Find resonances from existing sweep data  
+            >>> sweep = client.wideband_sweep()
+            >>> resonances = client.find_resonances(sweep)
+            
+            >>> # Customize parameters
+            >>> from souk_readout_tools.peak_finder import FilterParams, PeakFinderParams
+            >>> fp = FilterParams(highpass_edge=0.001, lowpass_edge=0.5)
+            >>> pp = PeakFinderParams(prominence_min=2.0, distance_value=50000)
+            >>> resonances = client.find_resonances(filter_params=fp, finder_params=pp)
+        """
+        from ..peak_finder import (
+            find_mkid_resonances, FilterParams, PeakFinderParams
+        )
+        
+        # Perform sweep if no data provided
+        if sweep_data is None:
+            sweep_data = self.wideband_sweep(**kwargs)
+        
+        # Extract arrays from sweep data
+        frequencies = np.ravel(sweep_data['sweep_f'])
+        i_data = np.ravel(sweep_data['sweep_i'])
+        q_data = np.ravel(sweep_data['sweep_q'])
+        s21_complex = i_data + 1j * q_data
+        
+        # Convert dicts to dataclass instances if needed
+        if isinstance(filter_params, dict):
+            filter_params = FilterParams(**filter_params)
+        if isinstance(finder_params, dict):
+            finder_params = PeakFinderParams(**finder_params)
+        
+        # Find resonances
+        resonances = find_mkid_resonances(
+            frequencies=frequencies,
+            s21_complex=s21_complex,
+            data_format=data_format,
+            filter_params=filter_params,
+            finder_params=finder_params,
+        )
+        
+        return resonances
+
+    def find_resonance_frequencies(self, sweep_data=None, **kwargs):
+        """
+        Convenience method to get just the resonance frequencies.
+        
+        Args:
+            sweep_data: Optional sweep data dict. If None, performs a sweep.
+            **kwargs: Passed to find_resonances.
+        
+        Returns:
+            np.ndarray: Array of resonance frequencies in Hz
+        """
+        resonances = self.find_resonances(sweep_data, **kwargs)
+        return np.array([r.frequency for r in resonances])
+
+
 if __name__=='__main__':
     import argparse
     parser = argparse.ArgumentParser(description="SOUK MKID readout client")

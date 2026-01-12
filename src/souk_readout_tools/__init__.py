@@ -29,6 +29,7 @@ _initialize_user_data()
 from . import calibration 
 from . import firmware_lib 
 from . import tone_list_tools
+from . import peak_finder
 
 # Conditionally expose 'client' sub-package
 import importlib.util as _importlib_util
