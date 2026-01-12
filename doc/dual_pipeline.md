@@ -88,31 +88,55 @@ firmware:
 
 ## 3. Deploy configs to the RFSoC
 
-Copy both config files to the RFSoC:
+Copy both config files to the RFSoC. Note that each pipeline now uses its own subdirectory:
 
 ```bash
-scp config_pipeline_0.yaml casper@rfsoc:~/.souk_readout_tools/config/
-scp config_pipeline_1.yaml casper@rfsoc:~/.souk_readout_tools/config/
+# Pipeline 0 configs go in pipeline_0 subdirectory
+scp config_pipeline_0.yaml casper@rfsoc:~/.souk_readout_tools/pipeline_0/config/
+
+# Pipeline 1 configs go in pipeline_1 subdirectory  
+scp config_pipeline_1.yaml casper@rfsoc:~/.souk_readout_tools/pipeline_1/config/
 ```
+
+The new directory structure for dual-pipeline operation is:
+```
+~/.souk_readout_tools/
+├── pipeline_0/
+│   ├── config/
+│   │   ├── default_config.lnk
+│   │   └── config_pipeline_0.yaml
+│   ├── calibrations/
+│   └── tmp/
+└── pipeline_1/
+    ├── config/
+    │   ├── default_config.lnk
+    │   └── config_pipeline_1.yaml
+    ├── calibrations/
+    └── tmp/
+```
+
+This ensures each pipeline instance has completely separate runtime data, avoiding race conditions or file clobbering.
 
 ---
 
 ## 4. Start two servers (one per pipeline)
 
 ### Recommended: start via the server CLI
-You can start each server instance with a different config file.
+You can start each server instance with a different config file. The `-p` / `--pipeline` flag can explicitly specify the pipeline ID:
 
 #### Terminal 1 (pipeline 0)
 ```bash
 ssh casper@rfsoc
-sudo /home/casper/py38venv/bin/souk-readout-server ~/.souk_readout_tools/config/config_pipeline_0.yaml
+sudo /home/casper/py38venv/bin/souk-readout-server -p 0 ~/.souk_readout_tools/pipeline_0/config/config_pipeline_0.yaml
 ```
 
 #### Terminal 2 (pipeline 1)
 ```bash
 ssh casper@rfsoc
-sudo /home/casper/py38venv/bin/souk-readout-server ~/.souk_readout_tools/config/config_pipeline_1.yaml
+sudo /home/casper/py38venv/bin/souk-readout-server -p 1 ~/.souk_readout_tools/pipeline_1/config/config_pipeline_1.yaml
 ```
+
+Note: If you omit `-p`, the server will extract `pipeline_id` from the config file automatically.
 
 ### Alternative: start from Python
 If you prefer launching manually from a Python session:
@@ -126,7 +150,8 @@ sudo /home/casper/py38venv/bin/python
 import asyncio
 from souk_readout_tools.server.readout_server import ReadoutServer
 
-server = ReadoutServer(config_file="/home/casper/.souk_readout_tools/config/config_pipeline_0.yaml")
+# Explicitly specify pipeline_id for clarity
+server = ReadoutServer(config_file="/home/casper/.souk_readout_tools/pipeline_0/config/config_pipeline_0.yaml", pipeline_id=0)
 asyncio.run(server.async_main())
 ```
 
@@ -136,11 +161,20 @@ Repeat in a second terminal for pipeline 1 with the pipeline 1 config.
 
 ## 5. Connect with two clients
 
-On your local machine (or wherever you run the clients):
+On your local machine (or wherever you run the clients), each client also uses pipeline-specific directories:
 
 ```python
 from souk_readout_tools.client.readout_client import ReadoutClient
 
+# Each client uses its own pipeline-specific directories:
+#   ~/.souk_readout_tools/pipeline_0/  for client0
+#   ~/.souk_readout_tools/pipeline_1/  for client1
+
+# Method 1: Specify pipeline_id explicitly (recommended for clarity)
+client0 = ReadoutClient(config_file="config_pipeline_0.yaml", pipeline_id=0)
+client1 = ReadoutClient(config_file="config_pipeline_1.yaml", pipeline_id=1)
+
+# Method 2: Let the client extract pipeline_id from the config file
 client0 = ReadoutClient(config_file="config_pipeline_0.yaml")
 client1 = ReadoutClient(config_file="config_pipeline_1.yaml")
 

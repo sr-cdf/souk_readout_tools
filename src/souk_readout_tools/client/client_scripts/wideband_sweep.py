@@ -227,7 +227,8 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
 def main():
 
     parser = argparse.ArgumentParser(description='Sweep out the full bandwidth of the system eith multiple tones to save time')
-    parser.add_argument('-C', '--config_file', type=str, default=None, help='Path to the configuration file, default is to search ~/.souk_readout_tools/config/default_config.lnk')
+    parser.add_argument('-C', '--config_file', type=str, default=None, help='Path to the configuration file, default is to search ~/.souk_readout_tools/pipeline_<id>/config/default_config.lnk')
+    parser.add_argument('--pipeline', type=int, default=None, choices=[0, 1], help='Pipeline ID (0 or 1). If omitted, extracted from config file or defaults to 0.')
     parser.add_argument('-b', '--bandwidth_hz', type=float, default=None, help='Total bandwidth to measure, default is the bandwidth defined in the config MHz')
     parser.add_argument('-c', '--center_freq_hz', type=float, default=None, help='Center frequency of the sweep, default is the band center defined by the config')
     parser.add_argument('-s', '--step_size_hz', type=float, default=10000, help='Step size of the sweep in hz, number of actual sweep steps will equal (bandwidth / step_size / num_tones')

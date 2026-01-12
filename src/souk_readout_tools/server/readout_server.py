@@ -40,6 +40,7 @@ import base64
 
 from souk_readout_tools import calibration
 from souk_readout_tools import firmware_lib
+import argparse
 
 import time
 
@@ -69,11 +70,6 @@ FLAG_7 = 7
 
 #Because we need sudo to access /dev/mem (setcap not effective)
 
-# Default runtime dirs (non-root)
-USER_CONFIG_DIR = os.path.expanduser('~/.souk_readout_tools/config')
-USER_CALIBRATIONS_DIR = os.path.expanduser('~/.souk_readout_tools/calibrations')
-USER_TMP_DIR = os.path.expanduser('~/.souk_readout_tools/tmp')
-
 SUDO = (os.geteuid() == 0)
 
 # If root, choose the real target user and home explicitly
@@ -89,22 +85,92 @@ if SUDO:
         HOME = '/home/casper'
         TARGET_UID = int(os.getenv('SUDO_UID') or 0)
         TARGET_GID = int(os.getenv('SUDO_GID') or 0)
-
-    USER_CONFIG_DIR = os.path.join(HOME, '.souk_readout_tools', 'config')
-    USER_CALIBRATIONS_DIR = os.path.join(HOME, '.souk_readout_tools', 'calibrations')
-    USER_TMP_DIR = os.path.join(HOME, '.souk_readout_tools', 'tmp')
 else:
+    HOME = os.path.expanduser('~')
     pw = pwd.getpwnam(os.getenv('USER'))
     TARGET_UID, TARGET_GID = pw.pw_uid, pw.pw_gid
 
 
-# Ensure dirs exist
-for d in (USER_CONFIG_DIR, USER_CALIBRATIONS_DIR, USER_TMP_DIR):
-    os.makedirs(d, exist_ok=True)
-    if SUDO:
-        os.chown(d, TARGET_UID, TARGET_GID)
+def get_pipeline_dirs(pipeline_id):
+    """
+    Get pipeline-specific directory paths.
+    
+    For dual-pipeline support, each pipeline uses its own subdirectory:
+      ~/.souk_readout_tools/pipeline_<id>/config/
+      ~/.souk_readout_tools/pipeline_<id>/calibrations/
+      ~/.souk_readout_tools/pipeline_<id>/tmp/
+    
+    Returns a dict with keys: 'config', 'calibrations', 'tmp', 'default_config'
+    """
+    base_dir = os.path.join(HOME, '.souk_readout_tools', f'pipeline_{pipeline_id}')
+    dirs = {
+        'base': base_dir,
+        'config': os.path.join(base_dir, 'config'),
+        'calibrations': os.path.join(base_dir, 'calibrations'),
+        'tmp': os.path.join(base_dir, 'tmp'),
+        'default_config': os.path.join(base_dir, 'config', 'default_config.lnk')
+    }
+    return dirs
 
-DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR,'default_config.lnk')
+
+def ensure_pipeline_dirs(pipeline_id):
+    """
+    Ensure pipeline-specific directories exist with correct ownership.
+    """
+    dirs = get_pipeline_dirs(pipeline_id)
+    for key in ('config', 'calibrations', 'tmp'):
+        d = dirs[key]
+        os.makedirs(d, exist_ok=True)
+        if SUDO:
+            # Also ensure parent directories have correct ownership
+            parent = os.path.dirname(d)
+            while parent and parent != HOME:
+                if os.path.exists(parent):
+                    os.chown(parent, TARGET_UID, TARGET_GID)
+                parent = os.path.dirname(parent)
+            os.chown(d, TARGET_UID, TARGET_GID)
+    return dirs
+
+
+def extract_pipeline_id_from_config(config_file):
+    """
+    Extract pipeline_id from a config file without fully loading it.
+    Returns the pipeline_id (int) or 0 if not found.
+    """
+    if config_file is None:
+        return 0
+    try:
+        # Handle .lnk files that contain a path to the real config
+        with open(config_file, 'r') as f:
+            content = yaml.safe_load(f)
+        if isinstance(content, str):
+            # It's a link file, follow it
+            linked_file = content
+            if not os.path.exists(linked_file):
+                # Try searching in standard locations
+                for pid in (0, 1):
+                    test_path = os.path.join(get_pipeline_dirs(pid)['config'], linked_file)
+                    if os.path.exists(test_path):
+                        linked_file = test_path
+                        break
+            with open(linked_file, 'r') as f:
+                content = yaml.safe_load(f)
+        if isinstance(content, dict) and 'firmware' in content:
+            return content['firmware'].get('pipeline_id', 0)
+    except Exception as e:
+        print(f"Warning: Could not extract pipeline_id from {config_file}: {e}")
+    return 0
+
+
+# Legacy module-level variables for backward compatibility
+# These will be overwritten per-instance in ReadoutServer
+USER_CONFIG_DIR = os.path.join(HOME, '.souk_readout_tools', 'pipeline_0', 'config')
+USER_CALIBRATIONS_DIR = os.path.join(HOME, '.souk_readout_tools', 'pipeline_0', 'calibrations')
+USER_TMP_DIR = os.path.join(HOME, '.souk_readout_tools', 'pipeline_0', 'tmp')
+DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR, 'default_config.lnk')
+
+# Ensure default pipeline_0 dirs exist for backward compatibility
+ensure_pipeline_dirs(0)
 
 def check_if_running_on_rfsoc_arm():
     """
@@ -148,21 +214,93 @@ class ReadoutServer:
     Tasks for continuous data streaming and triggered streaming are started automatically and enabled/disabled by request.
     """
 
-    def __init__(self, config_file=None):
+    def __init__(self, config_file=None, pipeline_id=None):
         """
         Initializes the readout server.
         The server will load the specified configuration file and create the firmware interface.
-        If no config file is give, it is read from ~/.souk_readout_tools/config/config.yaml
-        The server will then start the request server and stream server, and create tasks for streaming and triggered streaming.
+        
+        For dual-pipeline support, each pipeline uses separate directories:
+          ~/.souk_readout_tools/pipeline_0/  (for pipeline_id=0)
+          ~/.souk_readout_tools/pipeline_1/  (for pipeline_id=1)
+        
+        The pipeline_id is determined from the config file's firmware.pipeline_id value,
+        which is authoritative since it's used to create firmware interfaces.
+        
+        The explicit pipeline_id parameter is only used as a hint for locating the 
+        default config when no config_file is specified.
+        
+        Args:
+            config_file: Path to config YAML. If None, uses default_config.lnk from
+                         the pipeline directory specified by pipeline_id.
+            pipeline_id: Only used when config_file is None, to select which pipeline's
+                         default config to load. Ignored if config_file is provided
+                         (config file's pipeline_id takes precedence).
         """
         
         print('************************************************')
         print('__init__')
         print('config_file:',config_file)
+        print('pipeline_id (hint):',pipeline_id)
         print('************************************************')
         check_if_running_on_rfsoc_arm()
         self.process_name = set_process_name()
         self.ip_addresses = get_host_ips()
+        
+        # Step 1: Use pipeline_id hint to find default config if none specified
+        initial_pipeline_id = pipeline_id if pipeline_id is not None else 0
+        
+        if config_file is None:
+            # Use the hint pipeline_id to find the default config
+            hint_dirs = ensure_pipeline_dirs(initial_pipeline_id)
+            config_file = hint_dirs['default_config']
+            print(f'Loading default config file from {config_file}')
+        
+        # Step 2: Load and parse config to get the authoritative pipeline_id
+        # (We need to do this before setting up directories)
+        resolved_config_file = config_file
+        if not os.path.exists(resolved_config_file):
+            hint_dirs = get_pipeline_dirs(initial_pipeline_id)
+            resolved_config_file = os.path.join(hint_dirs['config'], config_file)
+        
+        with open(resolved_config_file, 'r') as file:
+            config = yaml.safe_load(file)
+        
+        if type(config) is str:
+            # File contains a link to another config file
+            resolved_config_file = config
+            if not os.path.exists(resolved_config_file):
+                for pid in (0, 1):
+                    test_path = os.path.join(get_pipeline_dirs(pid)['config'], resolved_config_file)
+                    if os.path.exists(test_path):
+                        resolved_config_file = test_path
+                        break
+            with open(resolved_config_file, 'r') as file:
+                config = yaml.safe_load(file)
+        
+        # Step 3: Extract pipeline_id FROM THE CONFIG (this is authoritative)
+        self.pipeline_id = config.get('firmware', {}).get('pipeline_id', 0)
+        
+        # Warn if explicit pipeline_id was provided and differs from config
+        if pipeline_id is not None and pipeline_id != self.pipeline_id:
+            print(f'{bcolors.FAIL}ERROR: Explicit pipeline_id ({pipeline_id}) differs from '
+                  f'config file pipeline_id ({self.pipeline_id}).{bcolors.ENDC}')
+            print(f'{bcolors.WARNING}Using config file pipeline_id={self.pipeline_id} '
+                  f'(this is what the firmware interfaces will use).{bcolors.ENDC}')
+        
+        print(f'Config file loaded: {resolved_config_file}')
+        print(f'Pipeline ID from config: {self.pipeline_id}')
+        
+        # Step 4: Now set up directories based on CONFIG's pipeline_id
+        self.pipeline_dirs = ensure_pipeline_dirs(self.pipeline_id)
+        self.user_config_dir = self.pipeline_dirs['config']
+        self.user_calibrations_dir = self.pipeline_dirs['calibrations']
+        self.user_tmp_dir = self.pipeline_dirs['tmp']
+        self.default_config = self.pipeline_dirs['default_config']
+        
+        print(f'Using pipeline {self.pipeline_id} directories:')
+        print(f'  config: {self.user_config_dir}')
+        print(f'  calibrations: {self.user_calibrations_dir}')
+        print(f'  tmp: {self.user_tmp_dir}')
         
         #server attributes
         self.config = None
@@ -185,8 +323,8 @@ class ReadoutServer:
         self.latest_sweep_data_valid = False
         self.sweep_progress = 0.0
 
-        #initialize server
-        self.init_server(config_file,ensure_ready=False, force_ready=False)
+        #initialize server (this will load config again, but that's fine)
+        self.init_server(resolved_config_file, ensure_ready=False, force_ready=False)
     
     
     def ensure_ready(self, config_file=None, level="pipeline"):
@@ -388,24 +526,25 @@ class ReadoutServer:
         """
         Load a new configuration file.
         Does not reload or initialise the firmware.
+        Uses pipeline-specific directories.
         """
         print('************************************************')
         print('load_config')
         print('config_file:',config_file)
         print('************************************************')
         if config_file is None:
-            config_file = DEFAULT_CONFIG
+            config_file = self.default_config
         if not os.path.exists(config_file):
-            #print(f'Config file not found {config_file}, searching in {USER_CONFIG_DIR}')
-            config_file = os.path.join(USER_CONFIG_DIR,config_file)
+            #print(f'Config file not found {config_file}, searching in {self.user_config_dir}')
+            config_file = os.path.join(self.user_config_dir, config_file)
         with open(config_file, 'r') as file:
             config = yaml.safe_load(file)
         if type(config) is str:
             #file contains a link to a config file
             config_file = config
             if not os.path.exists(config_file):
-                #print(f'Linked config file not found {config_file}, searching in {USER_CONFIG_DIR}')
-                config_file = os.path.join(USER_CONFIG_DIR,config_file)
+                #print(f'Linked config file not found {config_file}, searching in {self.user_config_dir}')
+                config_file = os.path.join(self.user_config_dir, config_file)
             #file is a link, try again using the link contents as the config file path
             with open(config_file,'r') as file:
                 config = yaml.safe_load(file)
@@ -415,17 +554,18 @@ class ReadoutServer:
 
         return config
     
-    def set_config(self, config_filename, config_contents,default=True):
+    def set_config(self, config_filename, config_contents, default=True):
         """
         Apply a new configuration and re-initialise the firmware
         If default is true, overwrites the default_config.lnk so that this config is persistent
+        Uses pipeline-specific directories.
         """
         print('************************************************')
         print('set_config')
         print('config_filename:',config_filename)
         print('************************************************')
 
-        filename = os.path.join(USER_CONFIG_DIR, os.path.basename(config_filename))
+        filename = os.path.join(self.user_config_dir, os.path.basename(config_filename))
         with open( filename, 'w') as file:
             file.write(yaml.dump(config_contents,sort_keys=False))
         os.chmod(filename,0o664)
@@ -443,13 +583,14 @@ class ReadoutServer:
         self.ensure_ready(config_file=filename, level="pipeline")
 
         if default:
-            defaultname = os.path.join(USER_CONFIG_DIR,'default_config.lnk')
-            prevname = os.path.join(USER_CONFIG_DIR,'previous_default.lnk')
+            defaultname = os.path.join(self.user_config_dir, 'default_config.lnk')
+            prevname = os.path.join(self.user_config_dir, 'previous_default.lnk')
         
             #make a note of the previous default config
-            shutil.copy(defaultname, prevname) 
-            if SUDO:
-                os.chown(prevname,int(TARGET_UID),int(TARGET_GID))
+            if os.path.exists(defaultname):
+                shutil.copy(defaultname, prevname) 
+                if SUDO:
+                    os.chown(prevname,int(TARGET_UID),int(TARGET_GID))
             
             #link the new default
             with open(defaultname,'w') as file:
@@ -482,6 +623,8 @@ class ReadoutServer:
         status = {
             'process_name': self.process_name,
             'ip_addresses': self.ip_addresses,
+            'pipeline_id': self.pipeline_id,
+            'pipeline_dirs': self.pipeline_dirs,
             'pwd': os.getcwd(),
             'sys.executable': sys.executable,
             'sys.argv': sys.argv,
@@ -1390,6 +1533,7 @@ class ReadoutServer:
 
 import time
 import argparse
+import ctypes
 
 
 def main():
@@ -1399,7 +1543,14 @@ def main():
         "config",
         nargs="?",
         default=None,
-        help="Path to config YAML (or .lnk). If omitted, uses default_config.lnk",
+        help="Path to config YAML (or .lnk). If omitted, uses default_config.lnk for the specified pipeline.",
+    )
+    parser.add_argument(
+        "-p", "--pipeline",
+        type=int,
+        default=None,
+        choices=[0, 1],
+        help="Pipeline ID (0 or 1). If omitted, extracted from config file or defaults to 0.",
     )
     args = parser.parse_args()
 
@@ -1408,7 +1559,7 @@ def main():
     #check_if_running_on_rfsoc_arm()
     #process_name = set_process_name()
     #host_ips = get_host_ips()
-    readout_server = ReadoutServer(config_file=args.config)
+    readout_server = ReadoutServer(config_file=args.config, pipeline_id=args.pipeline)
     asyncio.run(readout_server.async_main())
 
 if __name__=="__main__":

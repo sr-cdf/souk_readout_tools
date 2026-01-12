@@ -70,11 +70,79 @@ import csv
 import base64
 from scipy import signal
 
-USER_CALIBRATIONS_DIR = os.path.expanduser('~/.souk_readout_tools/calibrations')
-USER_CONFIG_DIR = os.path.expanduser('~/.souk_readout_tools/config')
-USER_TMP_DIR = os.path.expanduser('~/.souk_readout_tools/tmp')
 
-DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR,'default_config.lnk')
+def get_pipeline_dirs(pipeline_id):
+    """
+    Get pipeline-specific directory paths.
+    
+    For dual-pipeline support, each pipeline uses its own subdirectory:
+      ~/.souk_readout_tools/pipeline_<id>/config/
+      ~/.souk_readout_tools/pipeline_<id>/calibrations/
+      ~/.souk_readout_tools/pipeline_<id>/tmp/
+    
+    Returns a dict with keys: 'config', 'calibrations', 'tmp', 'default_config'
+    """
+    home = os.path.expanduser('~')
+    base_dir = os.path.join(home, '.souk_readout_tools', f'pipeline_{pipeline_id}')
+    dirs = {
+        'base': base_dir,
+        'config': os.path.join(base_dir, 'config'),
+        'calibrations': os.path.join(base_dir, 'calibrations'),
+        'tmp': os.path.join(base_dir, 'tmp'),
+        'default_config': os.path.join(base_dir, 'config', 'default_config.lnk')
+    }
+    return dirs
+
+
+def ensure_pipeline_dirs(pipeline_id):
+    """
+    Ensure pipeline-specific directories exist.
+    """
+    dirs = get_pipeline_dirs(pipeline_id)
+    for key in ('config', 'calibrations', 'tmp'):
+        os.makedirs(dirs[key], exist_ok=True)
+    return dirs
+
+
+def extract_pipeline_id_from_config(config_file):
+    """
+    Extract pipeline_id from a config file without fully loading it.
+    Returns the pipeline_id (int) or 0 if not found.
+    """
+    if config_file is None:
+        return 0
+    try:
+        # Handle .lnk files that contain a path to the real config
+        with open(config_file, 'r') as f:
+            content = yaml.safe_load(f)
+        if isinstance(content, str):
+            # It's a link file, follow it
+            linked_file = content
+            if not os.path.exists(linked_file):
+                # Try searching in standard locations
+                for pid in (0, 1):
+                    test_path = os.path.join(get_pipeline_dirs(pid)['config'], linked_file)
+                    if os.path.exists(test_path):
+                        linked_file = test_path
+                        break
+            with open(linked_file, 'r') as f:
+                content = yaml.safe_load(f)
+        if isinstance(content, dict) and 'firmware' in content:
+            return content['firmware'].get('pipeline_id', 0)
+    except Exception as e:
+        print(f"Warning: Could not extract pipeline_id from {config_file}: {e}")
+    return 0
+
+
+# Legacy module-level variables for backward compatibility
+# These will be overwritten per-instance in ReadoutClient
+USER_CALIBRATIONS_DIR = os.path.expanduser('~/.souk_readout_tools/pipeline_0/calibrations')
+USER_CONFIG_DIR = os.path.expanduser('~/.souk_readout_tools/pipeline_0/config')
+USER_TMP_DIR = os.path.expanduser('~/.souk_readout_tools/pipeline_0/tmp')
+DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR, 'default_config.lnk')
+
+# Ensure default pipeline_0 dirs exist for backward compatibility
+ensure_pipeline_dirs(0)
 
 class bcolors:
     HEADER = '\033[95m'
@@ -88,28 +156,89 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 class ReadoutClient:
-    def __init__(self,config_file=None):
+    def __init__(self, config_file=None, pipeline_id=None):
+        """
+        Initialize the ReadoutClient.
+        
+        For dual-pipeline support, each pipeline uses separate directories:
+          ~/.souk_readout_tools/pipeline_0/  (for pipeline_id=0)
+          ~/.souk_readout_tools/pipeline_1/  (for pipeline_id=1)
+        
+        The pipeline_id is determined from the config file's firmware.pipeline_id value,
+        which is authoritative since the server uses it to create firmware interfaces.
+        
+        The explicit pipeline_id parameter is only used as a hint for locating the 
+        default config when no config_file is specified.
+        
+        Args:
+            config_file: Path to config YAML. If None, uses default_config.lnk from
+                         the pipeline directory specified by pipeline_id.
+            pipeline_id: Only used when config_file is None, to select which pipeline's
+                         default config to load. Ignored if config_file is provided
+                         (config file's pipeline_id takes precedence).
+        """
+        # Step 1: If no config file specified, use pipeline_id hint to find default config
+        initial_pipeline_id = pipeline_id if pipeline_id is not None else 0
+        
         if config_file is None:
-            config_file = DEFAULT_CONFIG
-            print(f'Loading default config file from {DEFAULT_CONFIG}')
+            # Use the hint pipeline_id to find the default config
+            hint_dirs = ensure_pipeline_dirs(initial_pipeline_id)
+            config_file = hint_dirs['default_config']
+            print(f'Loading default config file from {config_file}')
+        
+        # Step 2: Load the config file (following links if necessary)
         if not os.path.exists(config_file):
-            #print(f'Config file not found {config_file}, searching in {USER_CONFIG_DIR}')
-            config_file = os.path.join(USER_CONFIG_DIR,config_file)
+            # Try searching in the hint pipeline's config dir
+            hint_dirs = get_pipeline_dirs(initial_pipeline_id)
+            config_file = os.path.join(hint_dirs['config'], config_file)
+        
         with open(config_file, 'r') as file:
             config = yaml.safe_load(file)
+        
         if type(config) is str:
+            # File contains a link to another config file
             config_file = config
             if not os.path.exists(config_file):
-                #print(f'Linked config file not found {config_file}, searching in {USER_CONFIG_DIR}')
-                config_file = os.path.join(USER_CONFIG_DIR,config_file)
-            #file is a link, try again using the link contents as the config file path
-            with open(config_file,'r') as file:
+                # Try searching in standard locations
+                for pid in (0, 1):
+                    test_path = os.path.join(get_pipeline_dirs(pid)['config'], config_file)
+                    if os.path.exists(test_path):
+                        config_file = test_path
+                        break
+            with open(config_file, 'r') as file:
                 config = yaml.safe_load(file)
+        
         print(f'Config file loaded: {config_file}')
-        with open(DEFAULT_CONFIG,'w') as file:
-            file.write(os.path.abspath(config_file))
+        
         self.config = config
         self.config_file = config_file
+        
+        # Step 3: Extract pipeline_id FROM THE CONFIG (this is authoritative)
+        self.pipeline_id = self.config.get('firmware', {}).get('pipeline_id', 0)
+        
+        # Warn if explicit pipeline_id was provided and differs from config
+        if pipeline_id is not None and pipeline_id != self.pipeline_id:
+            print(f'{bcolors.FAIL}ERROR: Explicit pipeline_id ({pipeline_id}) differs from '
+                  f'config file pipeline_id ({self.pipeline_id}).{bcolors.ENDC}')
+            print(f'{bcolors.WARNING}Using config file pipeline_id={self.pipeline_id} '
+                  f'(this is what the firmware will use).{bcolors.ENDC}')
+        
+        # Step 4: Now set up directories based on CONFIG's pipeline_id
+        self.pipeline_dirs = ensure_pipeline_dirs(self.pipeline_id)
+        self.user_config_dir = self.pipeline_dirs['config']
+        self.user_calibrations_dir = self.pipeline_dirs['calibrations']
+        self.user_tmp_dir = self.pipeline_dirs['tmp']
+        self.default_config = self.pipeline_dirs['default_config']
+        
+        print(f'Using pipeline {self.pipeline_id} directories:')
+        print(f'  config: {self.user_config_dir}')
+        print(f'  calibrations: {self.user_calibrations_dir}')
+        print(f'  tmp: {self.user_tmp_dir}')
+        
+        # Update THIS pipeline's default config link
+        with open(self.default_config, 'w') as file:
+            file.write(os.path.abspath(config_file))
+        
         self.request_server_address = self.config['rfsoc_host']['address']
         self.request_server_port = self.config['rfsoc_host']['request_port']
         self.stream_server_address = self.config['rfsoc_host']['address']
@@ -189,22 +318,22 @@ class ReadoutClient:
             self.pull_config()
         return response
 
-    def pull_config(self,destination_dir=None):
+    def pull_config(self, destination_dir=None):
         if destination_dir is None:
-            destination_dir = USER_CONFIG_DIR
+            destination_dir = self.user_config_dir
         message = {'request': 'pull_config'}
         response = self.send_request(message)
         if response['status'] == 'success':
             config_filename = response['config_filename']
             config_contents = response['config_contents']
-            destination_file = os.path.join(destination_dir,os.path.basename(config_filename))
-            with open(destination_file,'w') as file:
+            destination_file = os.path.join(destination_dir, os.path.basename(config_filename))
+            with open(destination_file, 'w') as file:
                 file.write(config_contents)
             print(f'Config file pulled from RFSoC into {destination_file}')
             self.config_file = destination_file
             self.config = yaml.safe_load(config_contents)
             print(f'Config loaded {self.config_file}')
-            with open(DEFAULT_CONFIG,'w') as file:
+            with open(self.default_config, 'w') as file:
                 file.write(os.path.abspath(self.config_file))
 
             
@@ -249,9 +378,9 @@ class ReadoutClient:
         else:
             return response
 
-    def pull_calibration(self,remote_file,destination_file=None):
+    def pull_calibration(self, remote_file, destination_file=None):
         if destination_file is None: 
-            destination_file = os.path.join(USER_CALIBRATIONS_DIR,os.path.basename(remote_file))
+            destination_file = os.path.join(self.user_calibrations_dir, os.path.basename(remote_file))
         message = {'request':'pull_calibration',
                    'cal_filename':remote_file}
         response = self.send_request(message)
@@ -923,12 +1052,12 @@ class ReadoutClient:
         return sweep_dict
 
 
-    def receive_stream(self, num_tones=2048, filename=None,print_data=False):
+    def receive_stream(self, num_tones=2048, filename=None, print_data=False):
         data = bytearray(2048*2*4 + 10*4)
         view = memoryview(data)
         iq_data=None
         if filename is None:
-            filename =os.path.join(USER_TMP_DIR,'tmp_stream')
+            filename = os.path.join(self.user_tmp_dir, 'tmp_stream')
         if not os.path.exists(os.path.dirname(filename)):
             os.makedirs(os.path.dirname(filename))
         info = self.get_system_information()
@@ -1014,11 +1143,11 @@ class ReadoutClient:
         return iq_data
 
 
-    def receive_triggered_stream(self, num_tones=2048, filename=None,print_data=False):
+    def receive_triggered_stream(self, num_tones=2048, filename=None, print_data=False):
         data = bytearray(4096*4 + 10*4)
         view = memoryview(data)
         if filename is None:
-            filename =os.path.join(USER_TMP_DIR,'tmp_triggered_stream')
+            filename = os.path.join(self.user_tmp_dir, 'tmp_triggered_stream')
         if not os.path.exists(os.path.dirname(filename)):
             os.makedirs(os.path.dirname(filename))
 
@@ -1408,11 +1537,24 @@ class ReadoutClient:
         return
 
 if __name__=='__main__':
-    config_file = sys.argv[1]
-    if not config_file:
-        print(f'No config file specified. Using default from {DEFAULT_CONFIG}.')
-        config_file = DEFAULT_CONFIG
-    client = ReadoutClient(config_file=config_file)
+    import argparse
+    parser = argparse.ArgumentParser(description="SOUK MKID readout client")
+    parser.add_argument(
+        "config",
+        nargs="?",
+        default=None,
+        help="Path to config YAML (or .lnk). If omitted, uses default_config.lnk for the specified pipeline.",
+    )
+    parser.add_argument(
+        "-p", "--pipeline",
+        type=int,
+        default=None,
+        choices=[0, 1],
+        help="Pipeline ID (0 or 1). If omitted, extracted from config file or defaults to 0.",
+    )
+    args = parser.parse_args()
+    
+    client = ReadoutClient(config_file=args.config, pipeline_id=args.pipeline)
     print('Starting triggered stream...')
     client.enable_triggered_stream()
     try:
