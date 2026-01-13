@@ -2677,6 +2677,7 @@ class ResonanceFinderApp(QMainWindow):
         self.line_raw, = self.ax_raw.plot([],[],picker=True, pickradius=5)
         self.ax_raw.set_xlabel("Frequency (MHz)")
         self.ax_raw.set_ylabel("Magnitude (dB)")
+        self.ax_raw.ticklabel_format(useOffset=False)
         self.canvas_raw = FigureCanvas(self.fig_raw)
         self.toolbar_raw = NavigationToolbar(self.canvas_raw, self)
         raw_sweep_layout.addWidget(self.toolbar_raw)
@@ -2691,6 +2692,7 @@ class ResonanceFinderApp(QMainWindow):
         self.line_filtered, = self.ax_filtered.plot([],[],picker=True, pickradius=5)
         self.ax_filtered.set_xlabel("Frequency (MHz)")
         self.ax_filtered.set_ylabel("Magnitude (dB)")
+        self.ax_filtered.ticklabel_format(useOffset=False)
         self.canvas_filtered = FigureCanvas(self.fig_filtered)
         self.toolbar_filtered = NavigationToolbar(self.canvas_filtered, self)
         filtered_sweep_layout.addWidget(self.toolbar_filtered)
@@ -2708,6 +2710,7 @@ class ResonanceFinderApp(QMainWindow):
         self.line_active_raw, = self.ax_active_raw.plot([],[],picker=True, pickradius=5)
         self.ax_active_raw.set_xlabel("Frequency (MHz)")
         self.ax_active_raw.set_ylabel("Magnitude (dB)")
+        self.ax_active_raw.ticklabel_format(useOffset=False)
         self.canvas_active_raw = FigureCanvas(self.fig_active_raw)
         zoom_raw_layout.addWidget(self.canvas_active_raw)
 
@@ -2720,6 +2723,7 @@ class ResonanceFinderApp(QMainWindow):
         self.line_active_filtered, = self.ax_active_filtered.plot([],[],picker=True, pickradius=5)
         self.ax_active_filtered.set_xlabel("Frequency (MHz)")
         self.ax_active_filtered.set_ylabel("Magnitude (dB)")
+        self.ax_active_filtered.ticklabel_format(useOffset=False)
         self.canvas_active_filtered = FigureCanvas(self.fig_active_filtered)
         zoom_filtered_layout.addWidget(self.canvas_active_filtered)
 
