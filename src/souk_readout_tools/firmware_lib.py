@@ -1417,6 +1417,8 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
     output_freqs = udc_freqs_tx if udc_connected else dac_out_freqs
     if detailed_output:
         details = {'tx':{},'rx':{}}
+        details['tx']['tone_indices'] = psb_tones_active.tolist()
+        details['tx']['filterbank_bins'] = psb_channels.tolist()
         details['tx']['mixer_lo_phase_increment'] = phase_inc_tx[psb_tones_active].tolist()
         details['tx']['mixer_lo_ri_step'] = [(i,q) for i,q in zip(ri_steps_tx[psb_tones_active].real.tolist(),ri_steps_tx[psb_tones_active].imag.tolist())]
         details['tx']['mixer_lo_phase_step'] = phase_steps_tx[psb_tones_active].tolist()
@@ -1425,6 +1427,8 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
         details['tx']['digital_baseband_freq'] = dbb_freqs_tx.tolist()
         details['tx']['analog_output_freq'] = dac_out_freqs.tolist()
         details['tx']['rf_output_freq'] = udc_freqs_tx.tolist()
+        details['rx']['tone_indices'] = pfb_chans_active.tolist()
+        details['rx']['filterbank_bins'] = pfb_channels.tolist()
         details['rx']['mixer_lo_phase_increment'] = phase_inc_rx[pfb_chans_active].tolist()
         details['rx']['mixer_lo_ri_step'] = [(i,q) for i,q in zip(ri_steps_rx[pfb_chans_active].real.tolist(),ri_steps_rx[pfb_chans_active].imag.tolist())]
         details['rx']['mixer_lo_phase_step'] = phase_steps_rx[pfb_chans_active].tolist()
