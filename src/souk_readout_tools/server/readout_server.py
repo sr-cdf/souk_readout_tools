@@ -1387,6 +1387,10 @@ class ReadoutServer:
             #     fast_write_params.append(firmware_lib.prepare_tone_frequency_settings_fast(self.r, self.config, sweepfreqs[p]))
             fast_sweep_params = firmware_lib.prepare_sweep_settings_fast(self.r_fast,self.config,sweepfreqs)
             
+            # Get tone_indices array - shape (num_points, num_tones)
+            # These may change at each sweep point as tones cross FFT bin boundaries
+            tone_indices_arr = fast_sweep_params.get('tone_indices')
+            
             print('Starting sweep')
             acc_counts = np.zeros((samples_per_point,num_points),dtype=int)
             sweep_data = np.zeros((samples_per_point,num_points,num_tones),dtype=complex)
@@ -1429,10 +1433,12 @@ class ReadoutServer:
 
                 
                 print('sweeping: getting_samples')
+                # Get tone_indices for this sweep point - may change as tones cross FFT bins
+                tone_indices_p = tone_indices_arr[p] if tone_indices_arr is not None else np.arange(num_tones)
                 for s in range(samples_per_point):
                     cnt,data,err = firmware_lib.read_accumulated_data_fast(
                                                             fast_read_params,
-                                                            num_tones=num_tones)
+                                                            tone_indices=tone_indices_p)
                     acc_counts[s,p] = cnt
                     sweep_data[s,p] = data[::2]+1j*data[1::2]
                     acc_errs[s,p] = err

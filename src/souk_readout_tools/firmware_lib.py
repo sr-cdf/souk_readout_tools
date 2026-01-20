@@ -3791,14 +3791,25 @@ def optimise_rx_snr(r,config_dict=None):
 
 
 
-def read_accumulated_data(r,num_tones=None):
+def read_accumulated_data(r, num_tones=None, tone_indices=None):
     """
     Read one sample of accumulated data from the RFSOC using the slower CASPER interface.
+    
+    :param r: Readout object
+    :param num_tones: Number of tones (deprecated, use tone_indices instead)
+    :param tone_indices: Array of output channel indices to read. With VACC, these may be
+                        non-contiguous (e.g., [0, 6, 12] instead of [0, 1, 2]).
+                        If None and num_tones is given, assumes contiguous indices [0..num_tones-1].
+    :return: Complex data array for the specified tones
     """
     data = r.accumulators[0].get_new_spectra()
-    if num_tones is None:
+    if tone_indices is not None:
+        # Extract data at specific output channel indices
+        return data[tone_indices]
+    elif num_tones is None:
         return data
     else:
+        # Legacy behavior: assume contiguous indices
         return data[:num_tones]
 
 def get_fast_read_params(r_fast):
@@ -3821,10 +3832,17 @@ def get_fast_read_params(r_fast):
     
     return params
 
-def read_accumulated_data_fast(fast_read_params,num_tones=None):
+def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=None):
     """
     Read one sample of accumulated data from the RFSOC 
     utilising the faster katcp local memory transport.
+    
+    :param fast_read_params: Parameters from get_fast_read_params()
+    :param num_tones: Number of tones (deprecated, use tone_indices instead)
+    :param tone_indices: Array of output channel indices to read. With VACC, these may be
+                        non-contiguous (e.g., [0, 6, 12] instead of [0, 1, 2]).
+                        If None and num_tones is given, assumes contiguous indices [0..num_tones-1].
+    :return: (acc_cnt, data, error_flag) where data is complex values at specified tone indices
     """
     acc=fast_read_params['acc']
     addrs=fast_read_params['addrs']
@@ -3850,9 +3868,21 @@ def read_accumulated_data_fast(fast_read_params,num_tones=None):
         acc.logger.warning('Accumulation counter changed while reading data!')
         err=True
 
-    if num_tones is None:
+    if tone_indices is not None:
+        # Extract real and imaginary parts at specific output channel indices
+        # Data is interleaved as [real0, imag0, real1, imag1, ...]
+        tone_indices = np.asarray(tone_indices)
+        real_indices = 2 * tone_indices
+        imag_indices = 2 * tone_indices + 1
+        # Interleave back to [real0, imag0, real1, imag1, ...]
+        result = np.empty(2 * len(tone_indices), dtype=dout.dtype)
+        result[0::2] = dout[real_indices]
+        result[1::2] = dout[imag_indices]
+        return start_acc_cnt, result, err
+    elif num_tones is None:
         return start_acc_cnt, dout, err
     else:
+        # Legacy behavior: assume contiguous indices
         return start_acc_cnt, dout[:2*num_tones], err
     
 
@@ -3890,15 +3920,24 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
         initial_freqs = centers
 
     fast_read_params = get_fast_read_params(r_fast) 
+    
+    # Prepare sweep settings - this computes tone_indices for each point
+    # as they may change when tones cross FFT bin boundaries
+    fast_sweep_params = prepare_sweep_settings_fast(r_fast, config_dict, sweepfreqs.T)  # transpose to (num_points, num_tones)
+    tone_indices_arr = fast_sweep_params.get('tone_indices')  # shape: (num_points, num_tones)
+    
     for p in range(num_points):
         set_tone_frequencies(r,
                              config_dict,
                              sweepfreqs[:,p],
                              autosync=True)
         
+        # Get tone_indices for this sweep point
+        tone_indices_p = tone_indices_arr[p] if tone_indices_arr is not None else np.arange(num_tones)
+        
         for s in range(samples_per_point):
             cnt,data,err = read_accumulated_data_fast(fast_read_params,
-                                                      num_tones=num_tones)
+                                                      tone_indices=tone_indices_p)
             acc_counts[p,s] = cnt
             sweep_data[:,p,s] = data[::2]+1j*data[1::2]
             acc_errs[p,s] = err
