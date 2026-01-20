@@ -977,18 +977,20 @@ def prepare_control_buffer_data(r,buf,lo_control_values):
             v[lo][r.mixer._RI_STEP_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = ri_steps_formatted[i::r.mixer._n_parallel_chans]
     return v
     
-def prepare_control_buffer_data_fast(r_fast,buf,lo_control_values):
+def prepare_control_buffer_data_fast(r_fast, buf, lo_control_values, tone_indices=None):
     """
     Faster version of prepare_control_buffer 
 
     Does not prepare the full buffer, only returns the given formatted values and their indices
 
     Parameters:
-    r: readout object
+    r_fast: readout object (fast interface)
     buf: int, index of buffer to write to, 0 or 1.
     lo_control_values: dictionary with keys 'tx' and 'rx'
      - 'tx': dictionary with optional keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
      - 'rx': dictionary with optional keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+    tone_indices: array of LO indices for the tones. If None, assumes contiguous indices starting from 0.
+                  With VACC, these may be non-contiguous.
     
     Returns:
     v: dictionary with keys 'tx' and 'rx'
@@ -1040,11 +1042,24 @@ def prepare_control_buffer_data_fast(r_fast,buf,lo_control_values):
         v[lo][n_phase_steps+n_phase_offsets:n_phase_steps+n_phase_offsets+n_ri_steps] = ri_steps_formatted
         v[lo][n_phase_steps+n_phase_offsets+n_ri_steps:n_phase_steps+n_phase_offsets+n_ri_steps+n_scaling] = scaling_formatted
 
+        # Use tone_indices if provided, otherwise fall back to contiguous indices
+        # With VACC, tone_indices may be non-contiguous (e.g., [0, 5, 10] instead of [0, 1, 2])
+        if tone_indices is not None:
+            idx_phase_steps = np.asarray(tone_indices[:n_phase_steps]) if n_phase_steps > 0 else np.array([], dtype=int)
+            idx_phase_offsets = np.asarray(tone_indices[:n_phase_offsets]) if n_phase_offsets > 0 else np.array([], dtype=int)
+            idx_ri_steps = np.asarray(tone_indices[:n_ri_steps]) if n_ri_steps > 0 else np.array([], dtype=int)
+            idx_scaling = np.asarray(tone_indices[:n_scaling]) if n_scaling > 0 else np.array([], dtype=int)
+        else:
+            idx_phase_steps = np.arange(n_phase_steps)
+            idx_phase_offsets = np.arange(n_phase_offsets)
+            idx_ri_steps = np.arange(n_ri_steps)
+            idx_scaling = np.arange(n_scaling)
+        
         i[lo] = np.empty(n_phase_steps+n_phase_offsets+n_ri_steps+n_scaling, dtype=int)
-        i[lo][0:n_phase_steps] = np.arange(n_phase_steps)*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._PHASE_INC_WORD_OFFSET
-        i[lo][n_phase_steps:n_phase_steps+n_phase_offsets] = np.arange(n_phase_offsets)*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._PHASE_OFFSET_WORD_OFFSET
-        i[lo][n_phase_steps+n_phase_offsets:n_phase_steps+n_phase_offsets+n_ri_steps] = np.arange(n_ri_steps)*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._RI_STEP_WORD_OFFSET
-        i[lo][n_phase_steps+n_phase_offsets+n_ri_steps:n_phase_steps+n_phase_offsets+n_ri_steps+n_scaling] = np.arange(n_scaling)*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._SCALE_WORD_OFFSET
+        i[lo][0:n_phase_steps] = idx_phase_steps*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._PHASE_INC_WORD_OFFSET
+        i[lo][n_phase_steps:n_phase_steps+n_phase_offsets] = idx_phase_offsets*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._PHASE_OFFSET_WORD_OFFSET
+        i[lo][n_phase_steps+n_phase_offsets:n_phase_steps+n_phase_offsets+n_ri_steps] = idx_ri_steps*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._RI_STEP_WORD_OFFSET
+        i[lo][n_phase_steps+n_phase_offsets+n_ri_steps:n_phase_steps+n_phase_offsets+n_ri_steps+n_scaling] = idx_scaling*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._SCALE_WORD_OFFSET
     return v, i
 
 def write_control_buffer_data(r,buf,v):
@@ -1334,16 +1349,34 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
     offset_freqs_hz_tx_ri    = phase_steps_tx * fft_rbw_hz / 2 / np.pi 
     offset_freqs_hz_rx_ri    = phase_steps_rx * fft_rbw_hz / 2 / np.pi
     
+    # moved from outmap to inmap in the v7.9 psb_chanselect
+    # #get the filterbank channels
+    # chanmap_psb  = psb_chanselect_get_channel_outmap(r)
+    # chanmap_pfb  = chanselect_get_channel_outmap(r)
+    # psb_chans_active = np.nonzero(chanmap_psb+1)[0]
+    # pfb_chans_active = np.nonzero(chanmap_pfb+1)[0]
+    # psb_channels = psb_chans_active[np.argsort(chanmap_psb[psb_chans_active])]
+    # pfb_channels = chanmap_pfb[pfb_chans_active]
+    # if np.all(chanmap_psb == 2047):
+    #     warnings.warn('Possibly attempting to get frequencies when none are set.')
+    #     psb_channels = np.copy(pfb_channels)
+    
     #get the filterbank channels
-    chanmap_psb  = psb_chanselect_get_channel_outmap(r)
-    chanmap_pfb  = chanselect_get_channel_outmap(r)
-    psb_chans_active = np.nonzero(chanmap_psb+1)[0]
-    pfb_chans_active = np.nonzero(chanmap_pfb+1)[0]
-    psb_channels = psb_chans_active[np.argsort(chanmap_psb[psb_chans_active])]
+    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
+    chanmap_pfb = chanselect_get_channel_outmap(r)
+    
+    # For inmap: find active input channels (tones) - those not mapping to discard bin
+    # For outmap: find active output channels (tones) - those not mapping to discard chan
+    psb_discard_bin = r.psb_chanselect.n_chans_out - 1
+    pfb_discard_chan = -1
+    psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
+    pfb_chans_active = np.nonzero(chanmap_pfb != pfb_discard_chan)[0]
+    
+    # psb_channels are the FFT bins that active tones map to (in tone order)
+    psb_channels = chanmap_psb_inmap[psb_tones_active]
     pfb_channels = chanmap_pfb[pfb_chans_active]
-    if np.all(chanmap_psb == 2047):
-        warnings.warn('Possibly attempting to get frequencies when none are set.')
-        psb_channels = np.copy(pfb_channels)
+    
+
 
     #get the number of active channels (assumes anything not -1 is a channel)
     num_tones_tx = len(psb_channels)
@@ -1356,8 +1389,9 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
     rx_bin_centers_hz = all_rx_bin_centers_hz[pfb_channels]
 
     #get the digital baseband frequencies
-    dbb_freqs_tx = tx_bin_centers_hz + offset_freqs_hz_tx[:num_tones_tx]
-    dbb_freqs_rx = rx_bin_centers_hz + offset_freqs_hz_rx[:num_tones_rx]
+    # index by psb_tones_active (not :num_tones_tx) since tone indices may be non-contiguous with VACC
+    dbb_freqs_tx = tx_bin_centers_hz + offset_freqs_hz_tx[psb_tones_active]
+    dbb_freqs_rx = rx_bin_centers_hz + offset_freqs_hz_rx[pfb_chans_active]
 
     #get the analog output/input frequencies
     if dac_nyquist_zone == 1:
@@ -1383,18 +1417,18 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
     output_freqs = udc_freqs_tx if udc_connected else dac_out_freqs
     if detailed_output:
         details = {'tx':{},'rx':{}}
-        details['tx']['mixer_lo_phase_increment'] = phase_inc_tx.tolist()[:num_tones_tx]
-        details['tx']['mixer_lo_ri_step'] = [(i,q) for i,q in zip(ri_steps_tx.real.tolist(),ri_steps_tx.imag.tolist())][:num_tones_tx]
-        details['tx']['mixer_lo_phase_step'] = phase_steps_tx.tolist()[:num_tones_tx]
-        details['tx']['mixer_lo_offset_freq'] = offset_freqs_hz_tx.tolist()[:num_tones_tx]
+        details['tx']['mixer_lo_phase_increment'] = phase_inc_tx[psb_tones_active].tolist()
+        details['tx']['mixer_lo_ri_step'] = [(i,q) for i,q in zip(ri_steps_tx[psb_tones_active].real.tolist(),ri_steps_tx[psb_tones_active].imag.tolist())]
+        details['tx']['mixer_lo_phase_step'] = phase_steps_tx[psb_tones_active].tolist()
+        details['tx']['mixer_lo_offset_freq'] = offset_freqs_hz_tx[psb_tones_active].tolist()
         details['tx']['filterbank_center_freq'] = tx_bin_centers_hz.tolist()
         details['tx']['digital_baseband_freq'] = dbb_freqs_tx.tolist()
         details['tx']['analog_output_freq'] = dac_out_freqs.tolist()
         details['tx']['rf_output_freq'] = udc_freqs_tx.tolist()
-        details['rx']['mixer_lo_phase_increment'] = phase_inc_rx.tolist()[:num_tones_rx]
-        details['rx']['mixer_lo_ri_step'] = [(i,q) for i,q in zip(ri_steps_rx.real.tolist(),ri_steps_rx.imag.tolist())][:num_tones_rx]
-        details['rx']['mixer_lo_phase_step'] = phase_steps_rx.tolist()[:num_tones_rx]
-        details['rx']['mixer_lo_offset_freq'] = offset_freqs_hz_rx.tolist()[:num_tones_rx]
+        details['rx']['mixer_lo_phase_increment'] = phase_inc_rx[pfb_chans_active].tolist()
+        details['rx']['mixer_lo_ri_step'] = [(i,q) for i,q in zip(ri_steps_rx[pfb_chans_active].real.tolist(),ri_steps_rx[pfb_chans_active].imag.tolist())]
+        details['rx']['mixer_lo_phase_step'] = phase_steps_rx[pfb_chans_active].tolist()
+        details['rx']['mixer_lo_offset_freq'] = offset_freqs_hz_rx[pfb_chans_active].tolist()
         details['rx']['filterbank_center_freq'] = rx_bin_centers_hz.tolist()
         details['rx']['digital_baseband_freq'] = dbb_freqs_rx.tolist()
         details['rx']['analog_input_freq'] = adc_in_freqs.tolist()
@@ -1403,7 +1437,84 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
     else:
         return output_freqs
 
-def prepare_tone_frequency_settings(r, config_dict, tone_frequencies):
+
+def compute_vacc_tone_indices(tx_nearest_bins, n_lo, min_tone_separation=6):
+    """
+    Compute optimal LO indices for tones, respecting VACC constraints on the TX side.
+    
+    When multiple tones map to the same TX PSB bin, the LO indices feeding that bin
+    must be separated by at least min_tone_separation due to VACC dual-port RAM timing.
+    
+    Parameters:
+    tx_nearest_bins: array of TX PSB bin indices for each tone (already computed)
+    n_lo: number of available LO channels (typically 2048)
+    min_tone_separation: minimum separation between LO indices that feed the same PSB bin.
+                         Default is 6; anything lower may lead to missing tones.
+    
+    Returns:
+    tone_indices: array of LO indices for each tone (same length as tx_nearest_bins)
+    tone_to_lo: dict mapping original tone index to assigned LO index
+    """
+    tx_nearest_bins = np.atleast_1d(tx_nearest_bins)
+    num_tones = len(tx_nearest_bins)
+    
+    if num_tones == 0:
+        return np.array([], dtype=int), {}
+    
+    # Group tones by their target TX PSB bin (this is where VACC constraint applies)
+    bin_to_tones = {}  # tx_psb_bin_index -> list of original tone indices
+    for tone_idx, tx_bin in enumerate(tx_nearest_bins):
+        if tx_bin not in bin_to_tones:
+            bin_to_tones[tx_bin] = []
+        bin_to_tones[tx_bin].append(tone_idx)
+    
+    # Assign LO indices, respecting VACC constraints
+    lo_idx = 0
+    tone_to_lo = {}
+    used_los = set()
+    
+    for tx_bin in sorted(bin_to_tones.keys()):
+        tones_in_bin = bin_to_tones[tx_bin]
+        
+        for i, tone_idx in enumerate(tones_in_bin):
+            if i == 0:
+                # First tone in this bin: use next available LO
+                while lo_idx in used_los:
+                    lo_idx += 1
+                if lo_idx >= n_lo:
+                    raise ValueError(f'Not enough LO channels. Need more than {n_lo}.')
+                tone_to_lo[tone_idx] = lo_idx
+                used_los.add(lo_idx)
+                lo_idx += 1
+            else:
+                # Additional tone in same bin: need separation from others in this bin
+                los_for_this_bin = [tone_to_lo[t] for t in tones_in_bin[:i]]
+                
+                candidate = lo_idx
+                while True:
+                    if candidate >= n_lo:
+                        raise ValueError(
+                            f'Not enough LO channels with min_tone_separation={min_tone_separation}. '
+                            f'Need more than {n_lo}.'
+                        )
+                    
+                    valid = all(abs(candidate - existing) >= min_tone_separation 
+                                for existing in los_for_this_bin)
+                    
+                    if valid and candidate not in used_los:
+                        tone_to_lo[tone_idx] = candidate
+                        used_los.add(candidate)
+                        if candidate >= lo_idx:
+                            lo_idx = candidate + 1
+                        break
+                    candidate += 1
+    
+    tone_indices = np.array([tone_to_lo[i] for i in range(num_tones)], dtype=int)
+    return tone_indices, tone_to_lo
+
+
+
+def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indices=None, min_tone_separation=6):
     """
     Prepare the tone frequency settings for applying to the RFSOC.
 
@@ -1414,6 +1525,15 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies):
     the RFDC DUC/DDC setting. Finally the filterbank center frequencies and the mixer LO 
     offsets are translated to the formatted channel maps and phase accumulator increments
     and returned for setting in the RFSOC firmware.
+    
+    Parameters:
+    r: readout object
+    config_dict: configuration dictionary
+    tone_frequencies: array of tone frequencies in Hz
+    tone_indices: array of LO indices for the tones. If None, automatically computes optimal
+                  indices using compute_vacc_tone_indices() to handle VACC constraints.
+    min_tone_separation: minimum separation between LO indices feeding the same FFT bin
+                         (only used when tone_indices is None). Default is 6.
     """
     #config
     udc_connected = config_dict['rf_frontend']['connected']
@@ -1448,10 +1568,9 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies):
         print(bcolors.FAIL+'CRITICAL WARNING, misconfigured ADC tile/block, nyquist zone not found, assuming zone 1'+bcolors.ENDC)
         adc_nyquist_zone = 1
 
-    chanmap_psb = np.full(r.psb_chanselect.n_chans_out, -1, dtype=int)
     chanmap_pfb  = np.full(r.chanselect.n_chans_out, -1, dtype=int)
     num_tones = len(tone_frequencies)
-    channels = np.arange(num_tones)
+    
 
     #get the DAC/ADC analog frequencies given any analog up/down conversion
     if udc_connected:
@@ -1498,6 +1617,16 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies):
     tx_nearest_bins = get_closest_bin_indices(dbb_freqs_tx, all_tx_bin_centers_hz)
     rx_nearest_bins = get_closest_bin_indices(dbb_freqs_rx, all_rx_bin_centers_hz)
 
+    # Compute optimal tone indices if not provided
+    # This handles VACC constraints where tones in the same FFT bin need separated LO indices
+    if tone_indices is None:
+        tone_indices, _ = compute_vacc_tone_indices(tx_nearest_bins, r.mixer.n_chans, min_tone_separation)
+    else:
+        tone_indices = np.asarray(tone_indices)
+        if len(tone_indices) != num_tones:
+            raise ValueError(f'Number of tone_indices ({len(tone_indices)}) must match number of tone_frequencies ({num_tones})')
+
+
     #get the frequency offsets for each tone
     tx_freq_offsets_hz = dbb_freqs_tx - all_tx_bin_centers_hz[tx_nearest_bins]
     rx_freq_offsets_hz = dbb_freqs_rx - all_rx_bin_centers_hz[rx_nearest_bins]
@@ -1508,12 +1637,25 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies):
     ri_steps_tx = np.cos(phase_incs_tx) + 1j*np.sin(phase_incs_tx)
     ri_steps_rx = np.cos(phase_incs_rx) + 1j*np.sin(phase_incs_rx)
     
+    # Build full-sized arrays with values at the correct tone_indices positions
+    # This is required because prepare_control_buffer_data expects full arrays
+    n_chans = r.mixer.n_chans
+    phase_incs_tx_full = np.zeros(n_chans)
+    phase_incs_rx_full = np.zeros(n_chans)
+    ri_steps_tx_full = np.zeros(n_chans, dtype=complex)
+    ri_steps_rx_full = np.zeros(n_chans, dtype=complex)
+    
+    phase_incs_tx_full[tone_indices] = phase_incs_tx
+    phase_incs_rx_full[tone_indices] = phase_incs_rx
+    ri_steps_tx_full[tone_indices] = ri_steps_tx
+    ri_steps_rx_full[tone_indices] = ri_steps_rx
+    
     #prepare the formatted lo control buffer values
     buf = get_next_buffer_idx(r)
-    v = prepare_control_buffer_data(r,buf,{'tx':{'phase_steps':phase_incs_tx,
-                                            'ri_steps':ri_steps_tx},
-                                      'rx':{'phase_steps':phase_incs_rx,
-                                            'ri_steps':ri_steps_rx}})
+    v = prepare_control_buffer_data(r,buf,{'tx':{'phase_steps':phase_incs_tx_full,
+                                            'ri_steps':ri_steps_tx_full},
+                                      'rx':{'phase_steps':phase_incs_rx_full,
+                                            'ri_steps':ri_steps_rx_full}})
     
     # phase_incs_tx_formatted = _format_phase_steps(phase_incs_tx,r.mixer._phase_bp)
     # phase_incs_rx_formatted = _format_phase_steps(phase_incs_rx,r.mixer._phase_bp)
@@ -1521,8 +1663,11 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies):
     # ri_steps_rx_formatted = cplx2uint(ri_steps_rx, r.mixer._n_ri_step_bits)
 
     #set the filterbank channel maps
-    chanmap_psb[tx_nearest_bins] = channels
-    chanmap_pfb[channels] = rx_nearest_bins
+    # v7.9: use inmap for psb_chanselect (chanmap_psb_inmap[lo_index] = fft_bin)
+    chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in, r.psb_chanselect.n_chans_out - 1, dtype=int)  # default to discard bin
+    chanmap_psb_inmap[tone_indices] = tx_nearest_bins
+    # chanmap_pfb uses outmap: output positions 0,1,2... get the corresponding rx bins
+    chanmap_pfb[np.arange(num_tones)] = rx_nearest_bins
 
     # tone_settings_dict = {'phase_incs_tx_formatted':phase_incs_tx_formatted,
     #                       'phase_incs_rx_formatted':phase_incs_rx_formatted,
@@ -1534,15 +1679,16 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies):
     
     tone_settings_dict = {'control_buffer_data_values':v,
                           'control_buffer_index':buf,
-                          'chanmap_psb':chanmap_psb,
+                          'chanmap_psb_inmap':chanmap_psb_inmap,
                           'chanmap_pfb':chanmap_pfb,
+                          'tone_indices':tone_indices,
                           'num_tones':num_tones}
 
     
-    details = {'tx':{},'rx':{},'num_tones':num_tones}
+    details = {'tx':{},'rx':{},'num_tones':num_tones, 'tone_indices':tone_indices.tolist()}
     details['tx']['digital_baseband_freq'] = dbb_freqs_tx.tolist()
     details['tx']['filterbank_center_freq'] = all_tx_bin_centers_hz[tx_nearest_bins].tolist()
-    details['tx']['filterbank_channel_outmap'] = chanmap_psb.tolist()
+    details['tx']['filterbank_channel_inmap'] = chanmap_psb_inmap.tolist()
     details['tx']['freq_offset'] = tx_freq_offsets_hz.tolist()
     details['tx']['mixer_lo_phase_increment'] = phase_incs_tx.tolist()
     details['tx']['mixer_lo_ri_step'] = [(i,q) for i,q in zip(ri_steps_tx.real.tolist(),ri_steps_tx.imag.tolist())]
@@ -1572,7 +1718,7 @@ def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True):
 
     v = tone_settings_dict.get('control_buffer_data_values')
     buf = tone_settings_dict.get('control_buffer_index')
-    chanmap_psb   = tone_settings_dict.get('chanmap_psb')
+    chanmap_psb_inmap = tone_settings_dict.get('chanmap_psb_inmap')
     chanmap_pfb   = tone_settings_dict.get('chanmap_pfb')
     num_tones     = tone_settings_dict.get('num_tones')
 
@@ -1580,8 +1726,9 @@ def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True):
         # num_tones = max((len(phase_incs_tx),len(phase_incs_tx),len(ri_steps_tx),len(ri_steps_tx),))
         num_tones = r.mixer.n_chans
 
-    if not chanmap_psb is None:
-        psb_chanselect_set_channel_outmap(r,np.copy(chanmap_psb))
+    # v7.9: use inmap setter for psb_chanselect
+    if not chanmap_psb_inmap is None:
+        psb_chanselect_set_channel_inmap(r,np.copy(chanmap_psb_inmap))
     if not chanmap_pfb is None:
         chanselect_set_channel_outmap(r,np.copy(chanmap_pfb))
 
@@ -1607,7 +1754,7 @@ def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True):
     r.sync.sw_sync()
     return
 
-def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, detailed_output=False):
+def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, tone_indices=None, min_tone_separation=6, detailed_output=False):
     """
     Prepare the tone frequency settings for applying to the RFSOC.
 
@@ -1618,6 +1765,16 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, detai
     the RFDC DUC/DDC setting. Finally the filterbank center frequencies and the mixer LO 
     offsets are translated to the formatted channel maps and phase accumulator increments
     and returned for setting in the RFSOC firmware.
+    
+    Parameters:
+    r: readout object
+    config_dict: configuration dictionary
+    tone_frequencies: array of tone frequencies in Hz
+    tone_indices: array of LO indices for the tones. If None, automatically computes optimal
+                  indices using compute_vacc_tone_indices() to handle VACC constraints.
+    min_tone_separation: minimum separation between LO indices feeding the same FFT bin
+                         (only used when tone_indices is None). Default is 6.
+    detailed_output: if True, return detailed output dictionary
     """
     #config
     udc_connected = config_dict['rf_frontend']['connected']
@@ -1646,10 +1803,9 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, detai
     #ddc_settings = r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)
     #dac_nyquist_zone = r.rfdc.core.get_nyquist_zone(dac_tile,dac_block,r.rfdc.core.DAC_TILE)
     #adc_nyquist_zone = r.rfdc.core.get_nyquist_zone(adc_tile,adc_block,r.rfdc.core.ADC_TILE)
-    chanmap_psb = np.full(r.psb_chanselect.n_chans_out, -1, dtype=int)
     chanmap_pfb  = np.full(r.chanselect.n_chans_out, -1, dtype=int)
     num_tones = len(tone_frequencies)
-    channels = np.arange(num_tones)
+    
 
     #get the DAC/ADC analog frequencies given any analog up/down conversion
     if udc_connected:
@@ -1697,6 +1853,16 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, detai
     tx_nearest_bins = get_closest_bin_indices(dbb_freqs_tx, all_tx_bin_centers_hz)
     rx_nearest_bins = get_closest_bin_indices(dbb_freqs_rx, all_rx_bin_centers_hz)
 
+    # Compute optimal tone indices if not provided
+    # This handles VACC constraints where tones in the same FFT bin need separated LO indices
+    if tone_indices is None:
+        tone_indices, _ = compute_vacc_tone_indices(tx_nearest_bins, r.mixer.n_chans, min_tone_separation)
+    else:
+        tone_indices = np.asarray(tone_indices)
+        if len(tone_indices) != num_tones:
+            raise ValueError(f'Number of tone_indices ({len(tone_indices)}) must match number of tone_frequencies ({num_tones})')
+
+
     #get the frequency offsets for each tone
     tx_freq_offsets_hz = dbb_freqs_tx - all_tx_bin_centers_hz[tx_nearest_bins]
     rx_freq_offsets_hz = dbb_freqs_rx - all_rx_bin_centers_hz[rx_nearest_bins]
@@ -1713,10 +1879,12 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, detai
     # ri_steps_tx = np.pad(ri_steps_tx, (0,nc-len(ri_steps_tx)), 'constant', constant_values=(0,0))
     # ri_steps_rx = np.pad(ri_steps_rx, (0,nc-len(ri_steps_rx)), 'constant', constant_values=(0,0))
 
+    # Pass tone_indices to prepare_control_buffer_data_fast for correct sparse indexing
     v,i = prepare_control_buffer_data_fast(r,0,{'tx':{'phase_steps':phase_incs_tx,
                                             'ri_steps':ri_steps_tx},
                                       'rx':{'phase_steps':phase_incs_rx,
-                                            'ri_steps':ri_steps_rx}})
+                                            'ri_steps':ri_steps_rx}},
+                                      tone_indices=tone_indices)
     # #format the phase increments and ri steps for the mixer LOs
     # phase_incs_tx_formatted = _format_phase_steps(phase_incs_tx,r.mixer._phase_bp,fmt='<i4')
     # phase_incs_rx_formatted = _format_phase_steps(phase_incs_rx,r.mixer._phase_bp,fmt='<i4')
@@ -1724,8 +1892,11 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, detai
     # ri_steps_rx_formatted = cplx2uint(ri_steps_rx, r.mixer._n_ri_step_bits,fmt='<u4')
 
     #set the filterbank channel maps
-    chanmap_psb[tx_nearest_bins] = channels
-    chanmap_pfb[channels] = rx_nearest_bins
+    # v7.9: use inmap for psb_chanselect (chanmap_psb_inmap[lo_index] = fft_bin)
+    chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in, r.psb_chanselect.n_chans_out - 1, dtype=int)  # default to discard bin
+    chanmap_psb_inmap[tone_indices] = tx_nearest_bins
+    # chanmap_pfb uses outmap: output positions 0,1,2... get the corresponding rx bins
+    chanmap_pfb[np.arange(num_tones)] = rx_nearest_bins
 
     # tone_settings_dict = {'phase_incs_tx_formatted':phase_incs_tx_formatted,
     #                      'phase_incs_rx_formatted':phase_incs_rx_formatted,
@@ -1737,15 +1908,16 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, detai
     tone_settings_dict = {'control_buffer_data_values':v,
                             'control_buffer_data_indices':i,
                             'control_buffer_index':0,
-                            'chanmap_psb':chanmap_psb,
+                            'chanmap_psb_inmap':chanmap_psb_inmap,
                             'chanmap_pfb':chanmap_pfb,
+                            'tone_indices':tone_indices,
                             'num_tones':num_tones}
     
     if detailed_output:
-        details = {'tx':{},'rx':{},'num_tones':num_tones}
+        details = {'tx':{},'rx':{},'num_tones':num_tones,'tone_indices':tone_indices.tolist()}
         details['tx']['digital_baseband_freq'] = dbb_freqs_tx.tolist()
         details['tx']['filterbank_center_freq'] = all_tx_bin_centers_hz[tx_nearest_bins].tolist()
-        details['tx']['filterbank_channel_outmap'] = chanmap_psb.tolist()
+        details['tx']['filterbank_channel_inmap'] = chanmap_psb_inmap.tolist()
         details['tx']['freq_offset'] = tx_freq_offsets_hz.tolist()
         details['tx']['mixer_lo_phase_increment'] = phase_incs_tx.tolist()
         details['tx']['mixer_lo_ri_step'] = [(i,q) for i,q in zip(ri_steps_tx.real.tolist(),ri_steps_tx.imag.tolist())]
@@ -1760,10 +1932,17 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, detai
         return tone_settings_dict
 
 
-def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, detailed_output=False):
+def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone_separation=6, detailed_output=False):
+    """
+    Prepare sweep step settings with VACC-aware tone index assignment.
+    
+    sweep_freqs: 2D array (num_points, num_tones)
+    """
+    sweep_frequencies = np.atleast_2d(sweep_frequencies)
     num_points,num_tones = sweep_frequencies.shape
     channels = np.arange(num_tones)
     points = np.arange(num_points)
+    n_lo = r_fast.mixer.n_chans  # 2048
 
     #config
     udc_connected = config_dict['rf_frontend']['connected']
@@ -1790,11 +1969,14 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, detailed
     all_tx_bin_centers_hz = np.fft.fftfreq(fft_tx_nbins, 1. / r_fast.adc_clk_hz)
     all_rx_bin_centers_hz = np.fft.fftfreq(fft_rx_nbins, 1. / r_fast.adc_clk_hz)
 
-    chanmap_psb = np.full((num_points,r_fast.psb_chanselect.n_chans_out), -1, dtype=int)
+    # v7.9: use inmap for psb_chanselect - size is n_chans_in (LO indices), default to discard bin
+    psb_discard_bin = r_fast.psb_chanselect.n_chans_out - 1
+    chanmap_psb_inmap = np.full((num_points, r_fast.psb_chanselect.n_chans_in), psb_discard_bin, dtype=int)
     chanmap_pfb  = np.full((num_points,r_fast.chanselect.n_chans_out), -1, dtype=int)
 
-    skip_chanmap_psb=np.zeros(num_points,dtype=bool)
+    skip_chanmap_psb_inmap=np.zeros(num_points,dtype=bool)
     skip_chanmap_pfb=np.zeros(num_points,dtype=bool)
+
 
     # phase_incs_tx_formatted_padded = np.zeros((num_points,nc),dtype='<i4')+32767
     # phase_incs_rx_formatted_padded = np.zeros((num_points,nc),dtype='<i4')+32767
@@ -1848,7 +2030,7 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, detailed
     #get the nearest filterbank center frequencies for each tone
     tx_nearest_bins = get_closest_bin_indices(dbb_freqs_tx, all_tx_bin_centers_hz)
     rx_nearest_bins = get_closest_bin_indices(dbb_freqs_rx, all_rx_bin_centers_hz)
-
+    
     #get the frequency offsets for each tone
     tx_freq_offsets_hz = dbb_freqs_tx - all_tx_bin_centers_hz[tx_nearest_bins]
     rx_freq_offsets_hz = dbb_freqs_rx - all_rx_bin_centers_hz[rx_nearest_bins]
@@ -1865,6 +2047,28 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, detailed
     print('phase_incs_rx',phase_incs_rx.shape,'\n',phase_incs_rx)
     print('ri_steps_tx',ri_steps_tx.shape,'\n',ri_steps_tx)
     print('ri_steps_rx',ri_steps_rx.shape,'\n',ri_steps_rx)
+
+
+    # Check if TX bin assignments are stable across all sweep points
+    # This is common for narrow sweeps where frequency shift < bin bandwidth
+    tx_bins_stable = np.all(tx_nearest_bins == tx_nearest_bins[0:1, :])
+
+    if tx_bins_stable:
+        # Optimization: compute tone_indices once, tile for all points
+        tone_indices, _ = compute_vacc_tone_indices(
+            tx_nearest_bins[0], n_lo, min_tone_separation
+        )
+        tone_indices_arr = np.tile(tone_indices, (num_points, 1))  # (num_points, num_tones)
+    else:
+        # TX bins change during sweep - must compute per point
+        # This is slower but necessary for wide sweeps
+        tone_indices_arr = np.zeros((num_points, num_tones), dtype=int)
+        for p in range(num_points):
+            tone_indices_arr[p], _ = compute_vacc_tone_indices(
+                tx_nearest_bins[p], n_lo, min_tone_separation
+            )
+
+
 
     # #format the phase increments and ri steps for the mixer LOs
     # phase_incs_tx_formatted = _format_phase_steps(phase_incs_tx,r.mixer._phase_bp,fmt='<i4')
@@ -1895,16 +2099,19 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, detailed
                                                             {'tx':{'phase_steps':phase_incs_tx[p],
                                                                    'ri_steps':ri_steps_tx[p]},
                                                              'rx':{'phase_steps':phase_incs_rx[p],
-                                                                   'ri_steps':ri_steps_rx[p]}})
+                                                                   'ri_steps':ri_steps_rx[p]}},
+                                                            tone_indices=tone_indices_arr[p])
         #set the filterbank channel maps
-        chanmap_psb[p,tx_nearest_bins[p]] = channels
-        chanmap_pfb[p,channels] = rx_nearest_bins[p]
+        # v7.9: use inmap for psb_chanselect (chanmap_psb_inmap[lo_index] = fft_bin)
+        chanmap_psb_inmap[p, tone_indices_arr[p]] = tx_nearest_bins[p]
+        # chanmap_pfb uses outmap: output positions 0,1,2... get the corresponding rx bins
+        chanmap_pfb[p, channels] = rx_nearest_bins[p]
 
     for p in points:
         if p==0:
             pass
-        if (chanmap_psb[p] == chanmap_psb[p-1]).all():
-            skip_chanmap_psb[p]=True
+        if (chanmap_psb_inmap[p] == chanmap_psb_inmap[p-1]).all():
+            skip_chanmap_psb_inmap[p]=True
         if (chanmap_pfb[p] == chanmap_pfb[p-1]).all():
             skip_chanmap_pfb[p]=True
 
@@ -1921,10 +2128,11 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, detailed
     sweep_settings_dict = {'control_buffer_data_values':allv,
                             'control_buffer_data_indices':alli,
                             'control_buffer_index':allbuf,
-                            'chanmap_psb':chanmap_psb,
+                            'chanmap_psb_inmap':chanmap_psb_inmap,
                             'chanmap_pfb':chanmap_pfb,
-                            'skip_chanmap_psb':skip_chanmap_psb,
+                            'skip_chanmap_psb_inmap':skip_chanmap_psb_inmap,
                             'skip_chanmap_pfb':skip_chanmap_pfb,
+                            'tone_indices':tone_indices_arr,
                             'num_tones':num_tones}
 
     return sweep_settings_dict
@@ -1938,25 +2146,25 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
     allv= sweep_settings.get('control_buffer_data_values')
     alli= sweep_settings.get('control_buffer_data_indices')
     allbuf = sweep_settings.get('control_buffer_index')
-    chanmap_psb   = sweep_settings.get('chanmap_psb')
+    chanmap_psb_inmap   = sweep_settings.get('chanmap_psb_inmap')
     chanmap_pfb   = sweep_settings.get('chanmap_pfb')
-    skip_chanmap_psb = sweep_settings.get('skip_chanmap_psb')
+    skip_chanmap_psb_inmap = sweep_settings.get('skip_chanmap_psb_inmap')
     skip_chanmap_pfb = sweep_settings.get('skip_chanmap_pfb')
     num_tones     = sweep_settings.get('num_tones')
     
-    c1=not skip_chanmap_psb[step_index]
+    c1=not skip_chanmap_psb_inmap[step_index]
     c2=not skip_chanmap_pfb[step_index]
     if c1:
-        print('set chanmap 1 (out)')
-        # r_fast.psb_chanselect.set_channel_outmap(np.copy(chanmap_psb[step_index]))
-        psb_chanselect_set_channel_outmap(r_fast,chanmap_psb[step_index])
+        print('set chanmap 1 (psb inmap)')
+        # v7.9: use inmap setter for psb_chanselect
+        psb_chanselect_set_channel_inmap(r_fast, chanmap_psb_inmap[step_index])
         
         # while not (r.psb_chanselect.get_channel_outmap()==chanmap_psb[step_index]).all():
         #     print('waiting for psb chanmap to update')
         #     time.sleep(0.001)
         # print('psb chanmap updated')
     if c2:
-        print('set chanmap 2 (in)')
+        print('set chanmap 2 (pfb outmap)')
         # r_fast.chanselect.set_channel_outmap(np.copy(chanmap_pfb[step_index]))
         chanselect_set_channel_outmap(r_fast,chanmap_pfb[step_index])
         # while not (r.chanselect.get_channel_outmap()==chanmap_pfb[step_index]).all():
@@ -2195,16 +2403,17 @@ def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, 
     # phase_incs_rx_formatted = fast_tone_frequency_settings.get('phase_incs_rx_formatted')
     # ri_steps_tx_formatted   = fast_tone_frequency_settings.get('ri_steps_tx_formatted')
     # ri_steps_rx_formatted   = fast_tone_frequency_settings.get('ri_steps_rx_formatted')
-    chanmap_psb   = fast_tone_frequency_settings.get('chanmap_psb')
+    chanmap_psb_inmap = fast_tone_frequency_settings.get('chanmap_psb_inmap')
     chanmap_pfb   = fast_tone_frequency_settings.get('chanmap_pfb')
     # num_tones     = fast_tone_frequency_settings.get('num_tones')
-    c1 = chanmap_psb is not None
+    c1 = chanmap_psb_inmap is not None
     c2 = chanmap_pfb is not None
 
-    if c1 is not None:
-        # print('chanmap_psb set')
-        psb_chanselect_set_channel_outmap(r_fast,chanmap_psb)
-    if c2 is not None:
+    # v7.9: use inmap setter for psb_chanselect
+    if c1:
+        # print('chanmap_psb_inmap set')
+        psb_chanselect_set_channel_inmap(r_fast,chanmap_psb_inmap)
+    if c2:
         # print('chanmap_pfb set')
         chanselect_set_channel_outmap(r_fast,chanmap_pfb)
     
@@ -2227,7 +2436,7 @@ def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, 
     #     r_fast.sync.sw_sync()
 
 
-def set_tone_frequencies(r, config_dict, tone_frequencies, autosync=True, detailed_output=False):
+def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None, min_tone_separation=6, autosync=True, detailed_output=False):
     """
     Set the tone frequencies in the RFSOC.
     
@@ -2239,11 +2448,24 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, autosync=True, detail
     offsets are translated to the formatted channel maps and phase accumulator increments
     and written to the RFSOC firmware.
 
+    Parameters:
+    r: readout object
+    config_dict: configuration dictionary
+    tone_frequencies: array of tone frequencies in Hz
+    tone_indices: array of LO indices for the tones. If None, automatically computes optimal
+                  indices using compute_vacc_tone_indices() to handle VACC constraints.
+    min_tone_separation: minimum separation between LO indices feeding the same FFT bin
+                         (only used when tone_indices is None). Default is 6.
+    autosync: if True, sync after setting tones
+    detailed_output: if True, return detailed output dictionary
+    
     TODO: account for dual dac mode, for now assume all on dac 0
     
     """
     
-    tone_frequency_settings, details = prepare_tone_frequency_settings(r, config_dict, tone_frequencies)
+    tone_frequency_settings, details = prepare_tone_frequency_settings(r, config_dict, tone_frequencies, 
+                                                                        tone_indices=tone_indices,
+                                                                        min_tone_separation=min_tone_separation)
     apply_tone_frequency_settings(r, tone_frequency_settings, autosync=autosync)
    
     r.sync.arm_sync(wait=False)
@@ -2255,7 +2477,7 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, autosync=True, detail
     else:
         return
 
-def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies, autosync=True):
+def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies, tone_indices=None, min_tone_separation=6, autosync=True):
     """
     Set the tone frequencies in the RFSOC using the fast firmware interface.
     
@@ -2266,9 +2488,22 @@ def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies, autosync
     the RFDC DUC/DDC setting. Finally the filterbank center frequencies and the mixer LO
     offsets are translated to the formatted channel maps and phase accumulator increments
     and written to the fast firmware interface.
+    
+    Parameters:
+    r: readout object
+    r_fast: fast firmware interface object
+    config_dict: configuration dictionary
+    tone_frequencies: array of tone frequencies in Hz
+    tone_indices: array of LO indices for the tones. If None, automatically computes optimal
+                  indices using compute_vacc_tone_indices() to handle VACC constraints.
+    min_tone_separation: minimum separation between LO indices feeding the same FFT bin
+                         (only used when tone_indices is None). Default is 6.
+    autosync: if True, sync after setting tones
     """
 
-    tone_frequency_settings = prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies)
+    tone_frequency_settings = prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, 
+                                                                    tone_indices=tone_indices,
+                                                                    min_tone_separation=min_tone_separation)
     apply_tone_frequency_settings_fast(r, r_fast, tone_frequency_settings, autosync=autosync)
 
     return
@@ -2405,38 +2640,34 @@ def get_fast_sweep_params(r_fast, config_dict,tone_frequencies):
 
 
 
-def get_tone_amplitudes(r,config_dict,num_tones=None):
+def get_tone_amplitudes(r,config_dict):
     """
     Query the RFSOC for the current tone amplitude scale factors.
     """
-    if num_tones is None:
-        #get the number of active filterbanck channels (assumes anything not -1 is a channel)
-        chanmap_psb  = psb_chanselect_get_channel_outmap(r)
-        chanmap_pfb  = chanselect_get_channel_outmap(r)
-        psb_chans_active = np.nonzero(chanmap_psb+1)[0]
-        pfb_chans_active = np.nonzero(chanmap_pfb+1)[0]
-        if np.all(chanmap_psb == 2047):
-            warnings.warn('Possibly attempting to get amplitudes when no tones are set.')
-            psb_chans_active = np.copy(pfb_chans_active)  
-        num_tones_tx = len(psb_chans_active)
-        num_tones_rx = len(pfb_chans_active)
-        if num_tones_tx != num_tones_rx:
-            warnings.warn(f'Number of tones in tx ({num_tones_tx}) and rx ({num_tones_rx}) do not match.')
-        num_tones = num_tones_tx
-    if num_tones == 0:
+    # moved from outmap to inmap in the v7.9 psb_chanselect
+    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
+    chanmap_pfb = chanselect_get_channel_outmap(r)
+    
+    psb_discard_bin = r.psb_chanselect.n_chans_out - 1
+    pfb_discard_chan = -1
+    psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
+    pfb_chans_active = np.nonzero(chanmap_pfb != pfb_discard_chan)[0]
+    
+    if len(psb_tones_active) == 0:
+        warnings.warn('Possibly attempting to get amplitudes when no tones are set.')
         return np.array([],dtype=float)
+    
+    num_tones_tx = len(psb_tones_active)
+    num_tones_rx = len(pfb_chans_active)
+
+    if num_tones_tx != num_tones_rx:
+        warnings.warn(f'Number of tones in tx ({num_tones_tx}) and rx ({num_tones_rx}) do not match.')
     
     control_buffer = read_from_current_control_buffer(r)
     scaling_tx = control_buffer['tx']['scaling']
     scaling_rx = control_buffer['rx']['scaling']
-    # scaling_tx = np.zeros(num_tones_tx,dtype='>u4')
-    # scaling_rx = np.zeros(num_tones_rx,dtype='>u4')
-    # for i in range(min(r.mixer._n_parallel_chans, num_tones)):   
-    #     scaling_tx[i::r.mixer._n_parallel_chans] = np.frombuffer(r.mixer.read(f'tx_lo{i}_scale',4*num_tones_tx),dtype='>u4')
-    #     scaling_rx[i::r.mixer._n_parallel_chans] = np.frombuffer(r.mixer.read(f'rx_lo{i}_scale',4*num_tones_rx),dtype='>u4')
-    # scaling_tx = _invert_format_amp_scale(scaling_tx, r.mixer._n_scale_bits)
-    # scaling_rx = _invert_format_amp_scale(scaling_rx, r.mixer._n_scale_bits)
-    return scaling_tx[:num_tones]
+    # index by psb_tones_active (not :num_tones) since tone indices may be non-contiguous with VACC
+    return scaling_tx[psb_tones_active]
 
 def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
     """
@@ -2446,12 +2677,23 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
     This is not ideal, but for now it will 
     """
     tone_amplitudes = np.atleast_1d(tone_amplitudes)
-    num_tones = len(tone_amplitudes)
+    
+    # Get active tone indices - with VACC these may be non-contiguous
+    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
+    psb_discard_bin = r.psb_chanselect.n_chans_out - 1
+    psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
+    
+    if len(tone_amplitudes) != len(psb_tones_active):
+        raise ValueError(f'Number of amplitudes ({len(tone_amplitudes)}) does not match number of active tones ({len(psb_tones_active)})')
+    
+    # Create full-sized array and place values at correct LO indices
+    scaling_full = np.zeros(r.mixer.n_chans, dtype=float)
+    scaling_full[psb_tones_active] = tone_amplitudes
 
     # buf = get_control_buffer_idx(r)
     for buf in [0,1]:
-        v = prepare_control_buffer_data(r,buf,{'tx':{'scaling':tone_amplitudes},
-                                    'rx':{'scaling':tone_amplitudes}})
+        v = prepare_control_buffer_data(r,buf,{'tx':{'scaling':scaling_full},
+                                    'rx':{'scaling':scaling_full}})
     
         write_control_buffer_data(r,buf,v)
 
@@ -2469,50 +2711,57 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
 
     return
 
-def get_tone_phases(r, config_dict, num_tones=None):
+def get_tone_phases(r, config_dict):
     """
     Query the RFSOC for the current tone phase offsets.
     Note that the returned values are in the range [-pi,pi] regardless of how they were set.
     """
-    if num_tones is None:
-        #get the number of active filterbanck channels (assumes anything not -1 is a channel)
-        chanmap_psb  = psb_chanselect_get_channel_outmap(r)
-        chanmap_pfb  = chanselect_get_channel_outmap(r)
-        psb_chans_active = np.nonzero(chanmap_psb+1)[0]
-        pfb_chans_active = np.nonzero(chanmap_pfb+1)[0] 
-        if np.all(chanmap_psb == 2047):
-            warnings.warn('Possibly attempting to get phases when no tones are set.')
-            psb_chans_active = np.copy(pfb_chans_active)  
-        num_tones_tx = len(psb_chans_active)
-        num_tones_rx = len(pfb_chans_active)
-        if num_tones_tx != num_tones_rx:
-            warnings.warn(f'Number of tones in tx ({num_tones_tx}) and rx ({num_tones_rx}) do not match.')
-        num_tones = num_tones_tx
-    if num_tones == 0:
+    # moved from outmap to inmap in the v7.9 psb_chanselect
+    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
+    chanmap_pfb = chanselect_get_channel_outmap(r)
+    
+    psb_discard_bin = r.psb_chanselect.n_chans_out - 1
+    pfb_discard_chan = -1
+    psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
+    pfb_chans_active = np.nonzero(chanmap_pfb != pfb_discard_chan)[0]
+    
+    if len(psb_tones_active) == 0:
+        warnings.warn('Possibly attempting to get phases when no tones are set.')
         return np.array([],dtype=float)
+    
+    num_tones_tx = len(psb_tones_active)
+    num_tones_rx = len(pfb_chans_active)
+    
+    if num_tones_tx != num_tones_rx:
+        warnings.warn(f'Number of tones in tx ({num_tones_tx}) and rx ({num_tones_rx}) do not match.')
     
     control_buffer = read_from_current_control_buffer(r)
     phase_offsets_tx = control_buffer['tx']['phase_offsets']
     phase_offsets_rx = control_buffer['rx']['phase_offsets']
-
-    # phase_offsets_tx = np.zeros(num_tones_tx,dtype='>i4')
-    # phase_offsets_rx = np.zeros(num_tones_rx,dtype='>i4')
-    # for i in range(min(r.mixer._n_parallel_chans, num_tones)):   
-    #     phase_offsets_tx[i::r.mixer._n_parallel_chans] = np.frombuffer(r.mixer.read(f'tx_lo{i}_phase_offset',4*num_tones_tx),dtype='>i4')
-    #     phase_offsets_rx[i::r.mixer._n_parallel_chans] = np.frombuffer(r.mixer.read(f'rx_lo{i}_phase_offset',4*num_tones_rx),dtype='>i4')
-    # phase_offsets_tx = _invert_format_phase_offsets(phase_offsets_tx, r.mixer._phase_offset_bp)
-    # phase_offsets_rx = _invert_format_phase_offsets(phase_offsets_rx, r.mixer._phase_offset_bp)
-    return phase_offsets_tx[:num_tones]
+    # index by psb_tones_active (not :num_tones) since tone indices may be non-contiguous with VACC
+    return phase_offsets_tx[psb_tones_active]
 
 def set_tone_phases(r, config_dict, tone_phases, autosync=True):
     """
     Set the tone phase offsets in the RFSOC.
     """
     tone_phases = np.atleast_1d(tone_phases)
-    num_tones = len(tone_phases)
+    
+    # Get active tone indices - with VACC these may be non-contiguous
+    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
+    psb_discard_bin = r.psb_chanselect.n_chans_out - 1
+    psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
+    
+    if len(tone_phases) != len(psb_tones_active):
+        raise ValueError(f'Number of phases ({len(tone_phases)}) does not match number of active tones ({len(psb_tones_active)})')
+    
+    # Create full-sized array and place values at correct LO indices
+    phase_offsets_full = np.zeros(r.mixer.n_chans, dtype=float)
+    phase_offsets_full[psb_tones_active] = tone_phases
+    
     buf = get_control_buffer_idx(r)
-    v = prepare_control_buffer_data(r,buf,{'tx':{'phase_offsets':tone_phases},
-                                    'rx':{'phase_offsets':tone_phases}})
+    v = prepare_control_buffer_data(r,buf,{'tx':{'phase_offsets':phase_offsets_full},
+                                    'rx':{'phase_offsets':phase_offsets_full}})
     
     write_control_buffer_data(r,buf,v)
     
@@ -2653,6 +2902,345 @@ def psb_chanselect_get_channel_outmap(r):
 
 
         return outmap
+
+
+# New function to set channel in-map for the VACC-based PSB reorder
+def psb_chanselect_set_channel_inmap(r, inmap):
+    """
+    Remap the channels such that input channel `i`
+    contributes to output channel `inmap[i]`
+
+    :param inmap: The mapping of input to output data. I.e.,
+        if `inmap[16] = 0` then input channel 16 will contribute to
+        output channel 0.
+    :type inmap: list
+    """
+    if not hasattr(r.psb_chanselect, '_cached_block_id'):
+        n_exp = r.psb_chanselect._expansion_factor
+        n_par_samp = r.psb_chanselect.n_parallel_samples
+        n_par_chans = r.psb_chanselect.n_parallel_chans_out
+        
+        r.psb_chanselect._c_n_exp = n_exp
+        r.psb_chanselect._c_n_chans_in = r.psb_chanselect.n_chans_in
+        r.psb_chanselect._c_n_chans_out = r.psb_chanselect.n_chans_out
+        r.psb_chanselect._c_default_val = r.psb_chanselect.n_chans_in - 1
+        r.psb_chanselect._c_discard_bin = r.psb_chanselect.n_chans_out - 1
+        
+        outchans = np.arange(r.psb_chanselect._c_n_chans_out)
+        r.psb_chanselect._cached_block_id = (outchans // n_par_samp) % n_exp
+        r.psb_chanselect._cached_block_offset = (outchans // n_par_chans) * n_par_samp + (outchans % n_par_samp)
+        
+        r.psb_chanselect._cached_lookup = np.full((n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=int)
+        r.psb_chanselect._cached_lookup[r.psb_chanselect._cached_block_id, r.psb_chanselect._cached_block_offset] = outchans
+    
+    # Initialize with default value
+    serial_maps = np.full((r.psb_chanselect._c_n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_default_val, dtype=r.psb_chanselect._map_format)
+    
+    inmap = np.asarray(inmap, dtype=int)
+    nin = len(inmap)
+    
+    # Vectorized assignment
+    input_indices = np.arange(nin)
+    serial_maps[r.psb_chanselect._cached_block_id[inmap], input_indices] = r.psb_chanselect._cached_block_offset[inmap]
+    
+    # Write to hardware
+    for i in range(r.psb_chanselect._c_n_exp):
+        r.psb_chanselect.write(f'map{i}_{r.psb_chanselect._map_reg}', serial_maps[i].tobytes())
+
+
+def psb_chanselect_get_channel_inmap(r):
+    """
+    Get the currently loaded reorder map.
+    :return: The reorder map currently loaded. Entry `i` in this map
+        corresponds to the output channel to which input `i` contributes.
+    :rtype: list
+    """
+    if not hasattr(r.psb_chanselect, '_cached_block_id'):
+        n_exp = r.psb_chanselect._expansion_factor
+        n_par_samp = r.psb_chanselect.n_parallel_samples
+        n_par_chans = r.psb_chanselect.n_parallel_chans_out
+        
+        r.psb_chanselect._c_n_exp = n_exp
+        r.psb_chanselect._c_n_chans_in = r.psb_chanselect.n_chans_in
+        r.psb_chanselect._c_n_chans_out = r.psb_chanselect.n_chans_out
+        r.psb_chanselect._c_default_val = r.psb_chanselect.n_chans_in - 1
+        r.psb_chanselect._c_discard_bin = r.psb_chanselect.n_chans_out - 1
+        
+        outchans = np.arange(r.psb_chanselect._c_n_chans_out)
+        r.psb_chanselect._cached_block_id = (outchans // n_par_samp) % n_exp
+        r.psb_chanselect._cached_block_offset = (outchans // n_par_chans) * n_par_samp + (outchans % n_par_samp)
+        
+        r.psb_chanselect._cached_lookup = np.full((n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=int)
+        r.psb_chanselect._cached_lookup[r.psb_chanselect._cached_block_id, r.psb_chanselect._cached_block_offset] = outchans
+    
+    # Read the reorder memory contents
+    nbytes = r.psb_chanselect._reorder_depth * np.dtype(r.psb_chanselect._map_format).itemsize
+    serial_maps = np.empty((r.psb_chanselect._c_n_exp, r.psb_chanselect._reorder_depth), dtype=int)
+    for i in range(r.psb_chanselect._c_n_exp):
+        serial_maps[i] = np.frombuffer(r.psb_chanselect.read(f'map{i}_{r.psb_chanselect._map_reg}', nbytes), dtype=r.psb_chanselect._map_format)
+    
+    # Find non-default entries
+    non_default = serial_maps[:, :r.psb_chanselect._c_n_chans_in] != r.psb_chanselect._c_default_val
+    
+    # First expansion index with non-default value per input
+    first_exp = np.argmax(non_default, axis=0)
+    has_mapping = np.any(non_default, axis=0)
+    
+    # Gather stored values and lookup
+    input_idx = np.arange(r.psb_chanselect._c_n_chans_in)
+    stored = serial_maps[first_exp, input_idx]
+    
+    # Build result
+    inmap = np.full(r.psb_chanselect._c_n_chans_in, r.psb_chanselect._c_discard_bin, dtype=int)
+    inmap[has_mapping] = r.psb_chanselect._cached_lookup[first_exp[has_mapping], stored[has_mapping]]
+    
+    return inmap
+
+
+
+
+# # not tested
+
+
+
+# def prepare_tone_frequency_settings_vacc(r, config_dict, tone_frequencies):
+#     """
+#     Prepare tone frequency settings for VACC-enabled firmware.
+    
+#     Unlike prepare_tone_frequency_settings(), this uses inmap semantics and
+#     supports multiple tones per FFT bin with VACC constraint (min 2 LO separation).
+    
+#     Supports both standard and fast firmware interfaces.
+
+#     :param r: Firmware interface (standard or fast)
+#     :param config_dict: Configuration dictionary
+#     :param tone_frequencies: Array of tone frequencies in Hz
+#     :return: Dictionary with prepared settings
+#     """
+#     # Get config parameters
+#     udc_connected = config_dict.get('rf_frontend', {}).get('connected', False)
+#     udc_lo_frequency = float(config_dict.get('rf_frontend', {}).get('tx_mixer_lo_frequency_hz', 0))
+#     udc_sideband = int(config_dict.get('rf_frontend', {}).get('tx_mixer_sideband', 1))
+#     dac_tile = int(config_dict['firmware']['dac0_tile'])
+#     dac_block = int(config_dict['firmware']['dac0_block'])
+#     adc_tile = int(config_dict['firmware']['adc_tile'])
+#     adc_block = int(config_dict['firmware']['adc_block'])
+    
+#     tone_frequencies = np.atleast_1d(tone_frequencies)
+#     num_tones = len(tone_frequencies)
+#     n_chans_in = r.psb_chanselect.n_chans_in  # 2048 LOs
+#     n_chans_out = r.psb_chanselect.n_chans_out  # 8192 FFT bins
+    
+#     # Get FFT bin centers
+#     N_TX_FFT = n_chans_out // 2  # 4096
+#     N_RX_FFT = r.chanselect.n_chans_in
+#     fft_period_s = r.mixer._n_upstream_chans / r.mixer._upstream_oversample_factor / r.adc_clk_hz
+#     fft_rbw_hz = 1. / fft_period_s
+#     all_tx_bin_centers_hz = np.fft.fftfreq(2 * N_TX_FFT, 1. / r.adc_clk_hz)
+#     all_rx_bin_centers_hz = np.fft.fftfreq(N_RX_FFT, 1. / r.adc_clk_hz)
+    
+#     # Get Nyquist zones and mixer settings
+#     duc_settings = r.rfdc.core.get_mixer_settings(dac_tile, dac_block, r.rfdc.core.DAC_TILE)
+#     ddc_settings = r.rfdc.core.get_mixer_settings(adc_tile, adc_block, r.rfdc.core.ADC_TILE)
+#     dac_nyquist_zone = r.rfdc.core.get_nyquist_zone(dac_tile, dac_block, r.rfdc.core.DAC_TILE)
+#     adc_nyquist_zone = r.rfdc.core.get_nyquist_zone(adc_tile, adc_block, r.rfdc.core.ADC_TILE)
+    
+#     # Convert to DAC/ADC frequencies
+#     if udc_connected:
+#         dac_out_freqs = (tone_frequencies - udc_lo_frequency) / udc_sideband
+#         adc_in_freqs = (tone_frequencies - udc_lo_frequency) / udc_sideband
+#     else:
+#         dac_out_freqs = tone_frequencies.copy()
+#         adc_in_freqs = tone_frequencies.copy()
+    
+#     # Apply Nyquist zone correction
+#     if dac_nyquist_zone == 1:
+#         duc_freqs = dac_out_freqs
+#     elif dac_nyquist_zone == 2:
+#         duc_freqs = 2 * r.adc_clk_hz - dac_out_freqs
+#     else:
+#         raise ValueError(f'Invalid DAC nyquist zone ({dac_nyquist_zone})')
+    
+#     if adc_nyquist_zone == 1:
+#         ddc_freqs = adc_in_freqs
+#     elif adc_nyquist_zone == 2:
+#         ddc_freqs = 2 * r.adc_clk_hz - adc_in_freqs
+#     else:
+#         raise ValueError(f'Invalid ADC nyquist zone ({adc_nyquist_zone})')
+    
+#     # Get digital baseband frequencies
+#     dbb_freqs_tx = duc_freqs - 1e6 * duc_settings['Freq']
+#     dbb_freqs_rx = ddc_freqs + 1e6 * ddc_settings['Freq']
+    
+#     # Find nearest FFT bins
+#     diff_tx = dbb_freqs_tx[:, np.newaxis] - all_tx_bin_centers_hz
+#     diff_rx = dbb_freqs_rx[:, np.newaxis] - all_rx_bin_centers_hz
+#     tx_nearest_bins = np.argmin(diff_tx ** 2, axis=-1)
+#     rx_nearest_bins = np.argmin(diff_rx ** 2, axis=-1)
+    
+#     # Get frequency offsets
+#     tx_freq_offsets_hz = diff_tx[np.arange(num_tones), tx_nearest_bins]
+#     rx_freq_offsets_hz = diff_rx[np.arange(num_tones), rx_nearest_bins]
+    
+#     # VACC-aware LO assignment with gap-filling
+#     # Group tones by their target FFT bin
+#     bin_to_tones = {}
+#     for tone_idx, bin_idx in enumerate(tx_nearest_bins):
+#         bin_to_tones.setdefault(bin_idx, []).append(tone_idx)
+    
+#     # Assign LOs with VACC constraint
+#     inmap_psb = np.full(n_chans_in, -1, dtype=int)  # inmap[lo] = fft_bin
+#     lo_assignments = np.full(num_tones, -1, dtype=int)  # lo_assignments[tone_idx] = lo_idx
+#     used_los = set()
+    
+#     def find_available_lo(preferred, used, n_los, min_sep=2):
+#         """Find an available LO index, respecting VACC constraint."""
+#         if preferred not in used:
+#             # Check VACC constraint
+#             conflict = any(abs(preferred - u) < min_sep and u != preferred for u in used)
+#             if not conflict:
+#                 return preferred
+#         # Search outward from preferred
+#         for offset in range(1, n_los):
+#             for candidate in [preferred + offset, preferred - offset]:
+#                 if 0 <= candidate < n_los and candidate not in used:
+#                     conflict = any(abs(candidate - u) < min_sep for u in used)
+#                     if not conflict:
+#                         return candidate
+#         return None
+    
+#     for bin_idx in sorted(bin_to_tones.keys()):
+#         tone_indices = bin_to_tones[bin_idx]
+#         for i, tone_idx in enumerate(tone_indices):
+#             if i == 0:
+#                 # First tone for this bin: try to use LO = bin_idx % n_chans_in
+#                 preferred_lo = bin_idx % n_chans_in
+#             else:
+#                 # Subsequent tones: find next available LO with VACC separation
+#                 prev_lo = lo_assignments[tone_indices[i-1]]
+#                 preferred_lo = prev_lo + 2  # Start searching from prev + min_separation
+            
+#             lo = find_available_lo(preferred_lo, used_los, n_chans_in, min_sep=2)
+#             if lo is None:
+#                 raise ValueError(f"Could not find available LO for tone {tone_idx} (bin {bin_idx})")
+            
+#             lo_assignments[tone_idx] = lo
+#             used_los.add(lo)
+#             inmap_psb[lo] = bin_idx
+    
+#     # Build PFB chanmap (outmap semantics: chanmap[lo] = rx_bin)
+#     chanmap_pfb = np.full(r.chanselect.n_chans_out, -1, dtype=int)
+#     for tone_idx, lo in enumerate(lo_assignments):
+#         if lo >= 0 and lo < r.chanselect.n_chans_out:
+#             chanmap_pfb[lo] = rx_nearest_bins[tone_idx]
+    
+#     # Prepare phase increments and RI steps
+#     phase_incs_tx = tx_freq_offsets_hz / fft_rbw_hz * 2 * np.pi
+#     phase_incs_rx = rx_freq_offsets_hz / fft_rbw_hz * 2 * np.pi
+#     ri_steps_tx = np.cos(phase_incs_tx) + 1j * np.sin(phase_incs_tx)
+#     ri_steps_rx = np.cos(phase_incs_rx) + 1j * np.sin(phase_incs_rx)
+    
+#     # Build full mixer arrays (indexed by LO)
+#     full_phase_incs_tx = np.zeros(n_chans_in)
+#     full_phase_incs_rx = np.zeros(n_chans_in)
+#     full_ri_steps_tx = np.ones(n_chans_in, dtype=complex)
+#     full_ri_steps_rx = np.ones(n_chans_in, dtype=complex)
+    
+#     for tone_idx, lo in enumerate(lo_assignments):
+#         full_phase_incs_tx[lo] = phase_incs_tx[tone_idx]
+#         full_phase_incs_rx[lo] = phase_incs_rx[tone_idx]
+#         full_ri_steps_tx[lo] = ri_steps_tx[tone_idx]
+#         full_ri_steps_rx[lo] = ri_steps_rx[tone_idx]
+    
+#     # Format for firmware
+#     phase_incs_tx_formatted = _format_phase_steps(full_phase_incs_tx, r.mixer._phase_bp)
+#     phase_incs_rx_formatted = _format_phase_steps(full_phase_incs_rx, r.mixer._phase_bp)
+#     ri_steps_tx_formatted = cplx2uint(full_ri_steps_tx, r.mixer._n_ri_step_bits)
+#     ri_steps_rx_formatted = cplx2uint(full_ri_steps_rx, r.mixer._n_ri_step_bits)
+    
+#     return {
+#         'inmap_psb': inmap_psb,
+#         'chanmap_pfb': chanmap_pfb,
+#         'lo_assignments': lo_assignments,
+#         'phase_incs_tx': phase_incs_tx_formatted,
+#         'phase_incs_rx': phase_incs_rx_formatted,
+#         'ri_steps_tx': ri_steps_tx_formatted,
+#         'ri_steps_rx': ri_steps_rx_formatted,
+#         'tx_nearest_bins': tx_nearest_bins,
+#         'rx_nearest_bins': rx_nearest_bins,
+#         'tx_freq_offsets_hz': tx_freq_offsets_hz,
+#         'rx_freq_offsets_hz': rx_freq_offsets_hz,
+#     }
+
+
+# def apply_tone_frequency_settings_vacc(r, tone_settings_dict, autosync=True):
+#     """
+#     Apply VACC-aware tone frequency settings using inmap semantics.
+    
+#     Supports both standard and fast firmware interfaces.
+
+#     :param r: Firmware interface (standard or fast)
+#     :param tone_settings_dict: Dictionary from prepare_tone_frequency_settings_vacc()
+#     :param autosync: If True, trigger a sync after applying settings
+#     """
+#     # Get next buffer index
+#     buf = get_next_buffer_idx(r)
+    
+#     # Prepare and write control buffer data
+#     lo_control_values = {
+#         'tx': {
+#             'phase_incs': tone_settings_dict['phase_incs_tx'],
+#             'ri_steps': tone_settings_dict['ri_steps_tx'],
+#         },
+#         'rx': {
+#             'phase_incs': tone_settings_dict['phase_incs_rx'],
+#             'ri_steps': tone_settings_dict['ri_steps_rx'],
+#         }
+#     }
+    
+#     try:
+#         # Fast interface
+#         formatted = prepare_control_buffer_data_fast(r, buf, lo_control_values)
+#         indices = np.arange(r.mixer.n_chans)
+#         write_control_buffer_data_fast(r, buf, formatted, indices)
+#     except AttributeError:
+#         # Standard interface
+#         formatted = prepare_control_buffer_data(r, buf, lo_control_values)
+#         write_control_buffer_data(r, buf, formatted)
+    
+#     # Set PSB chanselect using inmap
+#     psb_chanselect_set_channel_inmap(r, tone_settings_dict['inmap_psb'])
+    
+#     # Set PFB chanselect using outmap
+#     chanselect_set_channel_outmap(r, tone_settings_dict['chanmap_pfb'])
+    
+#     # Switch to new buffer and sync
+#     try:
+#         set_control_buffer_idx_fast(r, buf)
+#     except AttributeError:
+#         set_control_buffer_idx(r, buf)
+    
+#     if autosync:
+#         try:
+#             force_sync_fast(r)
+#         except:
+#             r.sync.arm_sync()
+#             r.sync.sw_sync()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
