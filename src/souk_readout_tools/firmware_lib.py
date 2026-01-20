@@ -1670,9 +1670,8 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
     # v7.9: use inmap for psb_chanselect (chanmap_psb_inmap[lo_index] = fft_bin)
     chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in, r.psb_chanselect.n_chans_out - 1, dtype=int)  # default to discard bin
     chanmap_psb_inmap[tone_indices] = tx_nearest_bins
-    # chanmap_pfb uses outmap: outmap[output_slot] = fft_bin
-    # Use tone_indices so RX output slots match TX LO indices
-    chanmap_pfb[tone_indices] = rx_nearest_bins
+    # chanmap_pfb uses outmap: output positions 0,1,2... get the corresponding rx bins
+    chanmap_pfb[np.arange(num_tones)] = rx_nearest_bins
 
     # tone_settings_dict = {'phase_incs_tx_formatted':phase_incs_tx_formatted,
     #                       'phase_incs_rx_formatted':phase_incs_rx_formatted,
@@ -1900,9 +1899,8 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, tone_
     # v7.9: use inmap for psb_chanselect (chanmap_psb_inmap[lo_index] = fft_bin)
     chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in, r.psb_chanselect.n_chans_out - 1, dtype=int)  # default to discard bin
     chanmap_psb_inmap[tone_indices] = tx_nearest_bins
-    # chanmap_pfb uses outmap: outmap[output_slot] = fft_bin
-    # Use tone_indices so RX output slots match TX LO indices
-    chanmap_pfb[tone_indices] = rx_nearest_bins
+    # chanmap_pfb uses outmap: output positions 0,1,2... get the corresponding rx bins
+    chanmap_pfb[np.arange(num_tones)] = rx_nearest_bins
 
     # tone_settings_dict = {'phase_incs_tx_formatted':phase_incs_tx_formatted,
     #                      'phase_incs_rx_formatted':phase_incs_rx_formatted,
@@ -2110,8 +2108,9 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone
         #set the filterbank channel maps
         # v7.9: use inmap for psb_chanselect (chanmap_psb_inmap[lo_index] = fft_bin)
         chanmap_psb_inmap[p, tone_indices_arr[p]] = tx_nearest_bins[p]
-        # chanmap_pfb uses outmap: output positions 0,1,2... get the corresponding rx bins
-        chanmap_pfb[p, channels] = rx_nearest_bins[p]
+        # chanmap_pfb uses outmap: outmap[output_slot] = fft_bin
+        # Use tone_indices so RX output slots match TX LO indices
+        chanmap_pfb[p, tone_indices_arr[p]] = rx_nearest_bins[p]
 
     for p in points:
         if p==0:
