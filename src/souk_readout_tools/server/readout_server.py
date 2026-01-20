@@ -38,6 +38,11 @@ import sys
 import numpy as np
 import base64
 
+try:
+    from importlib.resources import files as importlib_files
+except ImportError:
+    from importlib_resources import files as importlib_files
+
 from souk_readout_tools import calibration
 from souk_readout_tools import firmware_lib
 import argparse
@@ -116,6 +121,7 @@ def get_pipeline_dirs(pipeline_id):
 def ensure_pipeline_dirs(pipeline_id):
     """
     Ensure pipeline-specific directories exist with correct ownership.
+    If the default config doesn't exist, copy template files from package data.
     """
     dirs = get_pipeline_dirs(pipeline_id)
     for key in ('config', 'calibrations', 'tmp'):
@@ -129,7 +135,59 @@ def ensure_pipeline_dirs(pipeline_id):
                     os.chown(parent, TARGET_UID, TARGET_GID)
                 parent = os.path.dirname(parent)
             os.chown(d, TARGET_UID, TARGET_GID)
+    
+    # Copy template config files if default config doesn't exist
+    if not os.path.exists(dirs['default_config']):
+        _copy_template_configs(dirs, pipeline_id)
+    
     return dirs
+
+
+def _copy_template_configs(dirs, pipeline_id):
+    """
+    Copy template configuration files from package data to the user's pipeline config directory.
+    Updates pipeline_id in template_config.yaml to match the target pipeline.
+    """
+    print(f"First run for pipeline {pipeline_id}: copying template config files to {dirs['config']}")
+    
+    try:
+        # Access package data directory
+        pkg_config_dir = importlib_files('souk_readout_tools').joinpath('data', 'config')
+        
+        # Copy template_config.yaml and update pipeline_id
+        template_src = pkg_config_dir.joinpath('template_config.yaml')
+        template_dst = os.path.join(dirs['config'], 'template_config.yaml')
+        
+        with open(str(template_src), 'r') as f:
+            template_content = yaml.safe_load(f)
+        
+        # Update pipeline_id in the template to match target pipeline
+        if 'firmware' in template_content:
+            template_content['firmware']['pipeline_id'] = pipeline_id
+        
+        with open(template_dst, 'w') as f:
+            yaml.dump(template_content, f, default_flow_style=False, sort_keys=False)
+        
+        os.chmod(template_dst, 0o664)
+        if SUDO:
+            os.chown(template_dst, TARGET_UID, TARGET_GID)
+        
+        # Create default_config.lnk pointing to template_config.yaml
+        default_lnk_dst = dirs['default_config']
+        with open(default_lnk_dst, 'w') as f:
+            f.write(template_dst)
+        
+        os.chmod(default_lnk_dst, 0o664)
+        if SUDO:
+            os.chown(default_lnk_dst, TARGET_UID, TARGET_GID)
+        
+        print(f"  Created {template_dst}")
+        print(f"  Created {default_lnk_dst} -> {template_dst}")
+        print(f"{bcolors.WARNING}Note: Please edit {template_dst} with your system-specific settings.{bcolors.ENDC}")
+        
+    except Exception as e:
+        print(f"{bcolors.FAIL}Warning: Could not copy template config files: {e}{bcolors.ENDC}")
+        print(f"{bcolors.WARNING}You may need to manually create a config file in {dirs['config']}{bcolors.ENDC}")
 
 
 def extract_pipeline_id_from_config(config_file):

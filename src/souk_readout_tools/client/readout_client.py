@@ -70,6 +70,11 @@ import csv
 import base64
 from scipy import signal
 
+try:
+    from importlib.resources import files as importlib_files
+except ImportError:
+    from importlib_resources import files as importlib_files
+
 
 def get_pipeline_dirs(pipeline_id):
     """
@@ -97,11 +102,60 @@ def get_pipeline_dirs(pipeline_id):
 def ensure_pipeline_dirs(pipeline_id):
     """
     Ensure pipeline-specific directories exist.
+    If the default config doesn't exist, copy template files from package data.
     """
     dirs = get_pipeline_dirs(pipeline_id)
     for key in ('config', 'calibrations', 'tmp'):
         os.makedirs(dirs[key], exist_ok=True)
+    
+    # Copy template config files if default config doesn't exist
+    if not os.path.exists(dirs['default_config']):
+        _copy_template_configs(dirs, pipeline_id)
+    
     return dirs
+
+
+def _copy_template_configs(dirs, pipeline_id):
+    """
+    Copy template configuration files from package data to the user's pipeline config directory.
+    Updates pipeline_id in template_config.yaml to match the target pipeline.
+    """
+    print(f"First run for pipeline {pipeline_id}: copying template config files to {dirs['config']}")
+    
+    try:
+        # Access package data directory
+        pkg_config_dir = importlib_files('souk_readout_tools').joinpath('data', 'config')
+        
+        # Copy template_config.yaml and update pipeline_id
+        template_src = pkg_config_dir.joinpath('template_config.yaml')
+        template_dst = os.path.join(dirs['config'], 'template_config.yaml')
+        
+        with open(str(template_src), 'r') as f:
+            template_content = yaml.safe_load(f)
+        
+        # Update pipeline_id in the template to match target pipeline
+        if 'firmware' in template_content:
+            template_content['firmware']['pipeline_id'] = pipeline_id
+        
+        with open(template_dst, 'w') as f:
+            yaml.dump(template_content, f, default_flow_style=False, sort_keys=False)
+        
+        os.chmod(template_dst, 0o664)
+        
+        # Create default_config.lnk pointing to template_config.yaml
+        default_lnk_dst = dirs['default_config']
+        with open(default_lnk_dst, 'w') as f:
+            f.write(template_dst)
+        
+        os.chmod(default_lnk_dst, 0o664)
+        
+        print(f"  Created {template_dst}")
+        print(f"  Created {default_lnk_dst} -> {template_dst}")
+        print(f"\033[93mNote: Please edit {template_dst} with your system-specific settings.\033[0m")
+        
+    except Exception as e:
+        print(f"\033[91mWarning: Could not copy template config files: {e}\033[0m")
+        print(f"\033[93mYou may need to manually create a config file in {dirs['config']}\033[0m")
 
 
 def extract_pipeline_id_from_config(config_file):
