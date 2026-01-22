@@ -1692,6 +1692,10 @@ class ReadoutClient:
         # Add small random offsets to avoid systematic effects
         small_offsets = np.random.uniform(-sweep_span / sweep_points / 2, 
                                           +sweep_span / sweep_points / 2, num_tones)
+        
+        # Dont't add the offset to the endpoints to avoid going out of band
+        small_offsets[0] = 0.0
+        small_offsets[-1] = 0.0
         freqs += small_offsets
         center_freqs = freqs + np.floor(sweep_points / 2) * spacings / sweep_points
         
