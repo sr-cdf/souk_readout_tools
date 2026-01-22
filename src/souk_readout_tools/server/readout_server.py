@@ -530,6 +530,13 @@ class ReadoutServer:
         except Exception as e:
             print(bcolors.WARNING+'Warning: could not get system information from firmware:',e,bcolors.ENDC)
             print('Try hard reset')
+
+        if firmware_lib.needs_programming(self.r,self.config):
+            print(bcolors.WARNING+'Warning: firmware needs programming'+bcolors.ENDC)
+        if firmware_lib.needs_shared_resource_initialising(self.r,self.config):
+            print(bcolors.WARNING+'Warning: shared resources need initialising'+bcolors.ENDC)
+        if firmware_lib.needs_pipeline_initialising(self.r,self.config):
+            print(bcolors.WARNING+'Warning: pipeline resources need initialising'+bcolors.ENDC)
         return
    
              
