@@ -786,6 +786,20 @@ def read_raw_control_buffer_data(r,buf,los=['tx','rx']):
     return formatted_lo_control_values
 
 
+def _get_control_buffer_addresses(r_fast):
+    """
+    Get (and cache) the base addresses of the TX and RX control buffers.
+    
+    Returns a dict with 'tx' and 'rx' keys containing the base byte addresses.
+    """
+    if not hasattr(r_fast.mixer, '_control_buffer_addrs'):
+        tx_addr = r_fast.mixer.host.transport._get_device_address(
+            f'{r_fast.mixer.prefix}tx_lo0_control')
+        rx_addr = r_fast.mixer.host.transport._get_device_address(
+            f'{r_fast.mixer.prefix}rx_lo0_control')
+        r_fast.mixer._control_buffer_addrs = {'tx': tx_addr, 'rx': rx_addr}
+    return r_fast.mixer._control_buffer_addrs
+
 def read_raw_control_buffer_data_fast(r_fast,buf,los=['tx','rx']):
     """
     From FW V7.5, all tone parameter settings are applied in one contiguous buffer and updates 
@@ -812,13 +826,17 @@ def read_raw_control_buffer_data_fast(r_fast,buf,los=['tx','rx']):
     if buf not in [0,1]:
         raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
     
+    # Get the dynamically-looked-up base addresses for the control buffers
+    addrs = _get_control_buffer_addresses(r_fast)
+    # Buffer size: n_serial_chans * _CONTROL_N_WORDS * 4 bytes
+    buf_size = r_fast.mixer._n_serial_chans * r_fast.mixer._CONTROL_N_WORDS * 4
+    
     for lo in los:
         if lo not in ['tx','rx']:
             raise ValueError(f"Only LOs 'rx' and 'tx' are understood. Not {lo}.")
         
-        offset = 0x80000 if lo=='rx' else 0x90000
-        offset += 0x8000*buf
-        length = 0x8000
+        offset = addrs[lo] + buf_size * buf
+        length = buf_size
         data = r_fast.mixer.host.transport.axil_mm[int(offset):int(offset+length)]
         arr = np.frombuffer(data, dtype='<u4')
         all_phase_steps_int = arr[r_fast.mixer._PHASE_INC_WORD_OFFSET::4]
@@ -1100,19 +1118,20 @@ def write_control_buffer_data_fast(r_fast,buf,v,indices):
     if buf not in [0,1]:
         raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
     
+    # Get the dynamically-looked-up base addresses for the control buffers
+    addrs = _get_control_buffer_addresses(r_fast)
+    # Buffer size in bytes: n_serial_chans * _CONTROL_N_WORDS * 4 bytes
+    buf_size = r_fast.mixer._n_serial_chans * r_fast.mixer._CONTROL_N_WORDS * 4
+    
     if indices is None:
         for lo in ['tx','rx']:    
-            start=0x80000 if lo=='rx' else 0x90000
-            start+= 0x8000*buf
-            length=0x8000
+            start = addrs[lo] + buf_size * buf
+            length = buf_size
             r_fast.mixer.host.transport.axil_mm[int(start):int(start+length)] = v[lo].astype('<u4').tobytes()
     else:
-        # for lo in ['tx','rx']:     
-            # start=0x80000 if lo=='rx' else 0x90000
-            # start+= 0x8000*buf
-            # r_fast.mixer.host.transport.axil_mm[start+indices[lo]] = v[lo].astype('<u4').tobytes()
-        start_tx = 0x90000//4 + 0x8000*buf//4
-        start_rx = 0x80000//4 + 0x8000*buf//4
+        # Convert byte addresses to word offsets (divide by 4)
+        start_tx = addrs['tx'] // 4 + (buf_size * buf) // 4
+        start_rx = addrs['rx'] // 4 + (buf_size * buf) // 4
         r_fast.mixer.tx_lo_control_buffer[start_tx+indices['tx']] = v['tx'].astype('<u4')
         r_fast.mixer.rx_lo_control_buffer[start_rx+indices['rx']] = v['rx'].astype('<u4')
             
@@ -1367,7 +1386,7 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
     
     # For inmap: find active input channels (tones) - those not mapping to discard bin
     # For outmap: find active output channels (tones) - those not mapping to discard chan
-    psb_discard_bin = r.psb_chanselect.n_chans_out - 1
+    psb_discard_bin = -1
     pfb_discard_chan = -1
     psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
     pfb_chans_active = np.nonzero(chanmap_pfb != pfb_discard_chan)[0]
@@ -1444,77 +1463,45 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
 
 def compute_vacc_tone_indices(tx_nearest_bins, n_lo, min_tone_separation=6):
     """
-    Compute optimal LO indices for tones, respecting VACC constraints on the TX side.
+    Compute LO indices for tones in user order, respecting VACC constraints.
     
-    When multiple tones map to the same TX PSB bin, the LO indices feeding that bin
-    must be separated by at least min_tone_separation due to VACC dual-port RAM timing.
-    
-    Parameters:
-    tx_nearest_bins: array of TX PSB bin indices for each tone (already computed)
-    n_lo: number of available LO channels (typically 2048)
-    min_tone_separation: minimum separation between LO indices that feed the same PSB bin.
-                         Default is 6; anything lower may lead to missing tones.
-    
-    Returns:
-    tone_indices: array of LO indices for each tone (same length as tx_nearest_bins)
-    tone_to_lo: dict mapping original tone index to assigned LO index
+    When multiple tones map to the same TX PSB bin, their LO indices must be 
+    separated by at least min_tone_separation due to VACC dual-port RAM timing.
     """
     tx_nearest_bins = np.atleast_1d(tx_nearest_bins)
     num_tones = len(tx_nearest_bins)
     
     if num_tones == 0:
-        return np.array([], dtype=int), {}
+        return np.array([], dtype=int)
     
-    # Group tones by their target TX PSB bin (this is where VACC constraint applies)
-    bin_to_tones = {}  # tx_psb_bin_index -> list of original tone indices
-    for tone_idx, tx_bin in enumerate(tx_nearest_bins):
-        if tx_bin not in bin_to_tones:
-            bin_to_tones[tx_bin] = []
-        bin_to_tones[tx_bin].append(tone_idx)
+    # Fast path: all bins unique -> no VACC constraints apply
+    if np.unique(tx_nearest_bins).size == num_tones:
+        return np.arange(num_tones, dtype=int)
     
-    # Assign LO indices, respecting VACC constraints
-    lo_idx = 0
-    tone_to_lo = {}
-    used_los = set()
+    # Precompute: for each tone, index of previous tone with same bin (-1 if none)
+    prev_same_bin = np.full(num_tones, -1, dtype=int)
+    bin_last_seen = {}
+    for i, b in enumerate(tx_nearest_bins.tolist()):
+        if b in bin_last_seen:
+            prev_same_bin[i] = bin_last_seen[b]
+        bin_last_seen[b] = i
     
-    for tx_bin in sorted(bin_to_tones.keys()):
-        tones_in_bin = bin_to_tones[tx_bin]
+    # Assign LO indices
+    tone_indices = np.empty(num_tones, dtype=int)
+    next_lo = 0
+    
+    for i in range(num_tones):
+        if prev_same_bin[i] >= 0:
+            # Must maintain separation from previous same-bin tone
+            next_lo = max(next_lo, tone_indices[prev_same_bin[i]] + min_tone_separation)
         
-        for i, tone_idx in enumerate(tones_in_bin):
-            if i == 0:
-                # First tone in this bin: use next available LO
-                while lo_idx in used_los:
-                    lo_idx += 1
-                if lo_idx >= n_lo:
-                    raise ValueError(f'Not enough LO channels. Need more than {n_lo}.')
-                tone_to_lo[tone_idx] = lo_idx
-                used_los.add(lo_idx)
-                lo_idx += 1
-            else:
-                # Additional tone in same bin: need separation from others in this bin
-                los_for_this_bin = [tone_to_lo[t] for t in tones_in_bin[:i]]
-                
-                candidate = lo_idx
-                while True:
-                    if candidate >= n_lo:
-                        raise ValueError(
-                            f'Not enough LO channels with min_tone_separation={min_tone_separation}. '
-                            f'Need more than {n_lo}.'
-                        )
-                    
-                    valid = all(abs(candidate - existing) >= min_tone_separation 
-                                for existing in los_for_this_bin)
-                    
-                    if valid and candidate not in used_los:
-                        tone_to_lo[tone_idx] = candidate
-                        used_los.add(candidate)
-                        if candidate >= lo_idx:
-                            lo_idx = candidate + 1
-                        break
-                    candidate += 1
+        if next_lo >= n_lo:
+            raise ValueError(f'Exceeded {n_lo} LO channels with min_tone_separation={min_tone_separation}')
+        
+        tone_indices[i] = next_lo
+        next_lo += 1
     
-    tone_indices = np.array([tone_to_lo[i] for i in range(num_tones)], dtype=int)
-    return tone_indices, tone_to_lo
+    return tone_indices
 
 
 
@@ -1624,7 +1611,7 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
     # Compute optimal tone indices if not provided
     # This handles VACC constraints where tones in the same FFT bin need separated LO indices
     if tone_indices is None:
-        tone_indices, _ = compute_vacc_tone_indices(tx_nearest_bins, r.mixer.n_chans, min_tone_separation)
+        tone_indices = compute_vacc_tone_indices(tx_nearest_bins, r.mixer.n_chans, min_tone_separation)
     else:
         tone_indices = np.asarray(tone_indices)
         if len(tone_indices) != num_tones:
@@ -1668,7 +1655,7 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
 
     #set the filterbank channel maps
     # v7.9: use inmap for psb_chanselect (chanmap_psb_inmap[lo_index] = fft_bin)
-    chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in, r.psb_chanselect.n_chans_out - 1, dtype=int)  # default to discard bin
+    chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in, -1, dtype=int)  # default to discard bin
     chanmap_psb_inmap[tone_indices] = tx_nearest_bins
     # chanmap_pfb uses outmap: outmap[output_slot] = fft_bin
     # Use tone_indices so RX output slots match TX LO indices
@@ -1710,7 +1697,7 @@ def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True):
     Apply the tone frequency settings to the RFSOC.
 
     Keys in the dictionary may be:
-    'phase_incs_tx', 'phase_incs_rx', 'ri_steps_tx', 'ri_steps_rx', 'chanmap_psb', 'chanmap_pfb', 'num_tones
+    'control_buffer_data_values', 'control_buffer_index', 'chanmap_psb_inmap', 'chanmap_pfb', 'num_tones
     """
     # phase_incs_tx = tone_settings_dict.get('phase_incs_tx_formatted')
     # phase_incs_rx = tone_settings_dict.get('phase_incs_rx_formatted')
@@ -1861,7 +1848,7 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, tone_
     # Compute optimal tone indices if not provided
     # This handles VACC constraints where tones in the same FFT bin need separated LO indices
     if tone_indices is None:
-        tone_indices, _ = compute_vacc_tone_indices(tx_nearest_bins, r.mixer.n_chans, min_tone_separation)
+        tone_indices = compute_vacc_tone_indices(tx_nearest_bins, r.mixer.n_chans, min_tone_separation)
     else:
         tone_indices = np.asarray(tone_indices)
         if len(tone_indices) != num_tones:
@@ -1898,7 +1885,7 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, tone_
 
     #set the filterbank channel maps
     # v7.9: use inmap for psb_chanselect (chanmap_psb_inmap[lo_index] = fft_bin)
-    chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in, r.psb_chanselect.n_chans_out - 1, dtype=int)  # default to discard bin
+    chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in,-1, dtype=int)  # default to discard bin
     chanmap_psb_inmap[tone_indices] = tx_nearest_bins
     # chanmap_pfb uses outmap: outmap[output_slot] = fft_bin
     # Use tone_indices so RX output slots match TX LO indices
@@ -1976,7 +1963,7 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone
     all_rx_bin_centers_hz = np.fft.fftfreq(fft_rx_nbins, 1. / r_fast.adc_clk_hz)
 
     # v7.9: use inmap for psb_chanselect - size is n_chans_in (LO indices), default to discard bin
-    psb_discard_bin = r_fast.psb_chanselect.n_chans_out - 1
+    psb_discard_bin = -1
     chanmap_psb_inmap = np.full((num_points, r_fast.psb_chanselect.n_chans_in), psb_discard_bin, dtype=int)
     chanmap_pfb  = np.full((num_points,r_fast.chanselect.n_chans_out), -1, dtype=int)
 
@@ -2061,7 +2048,7 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone
 
     if tx_bins_stable:
         # Optimization: compute tone_indices once, tile for all points
-        tone_indices, _ = compute_vacc_tone_indices(
+        tone_indices = compute_vacc_tone_indices(
             tx_nearest_bins[0], n_lo, min_tone_separation
         )
         tone_indices_arr = np.tile(tone_indices, (num_points, 1))  # (num_points, num_tones)
@@ -2070,7 +2057,7 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone
         # This is slower but necessary for wide sweeps
         tone_indices_arr = np.zeros((num_points, num_tones), dtype=int)
         for p in range(num_points):
-            tone_indices_arr[p], _ = compute_vacc_tone_indices(
+            tone_indices_arr[p] = compute_vacc_tone_indices(
                 tx_nearest_bins[p], n_lo, min_tone_separation
             )
 
@@ -2116,7 +2103,8 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone
 
     for p in points:
         if p==0:
-            pass
+            # continue, not pass!
+            continue
         if (chanmap_psb_inmap[p] == chanmap_psb_inmap[p-1]).all():
             skip_chanmap_psb_inmap[p]=True
         if (chanmap_pfb[p] == chanmap_pfb[p-1]).all():
@@ -2655,7 +2643,7 @@ def get_tone_amplitudes(r,config_dict):
     chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
     chanmap_pfb = chanselect_get_channel_outmap(r)
     
-    psb_discard_bin = r.psb_chanselect.n_chans_out - 1
+    psb_discard_bin =  -1
     pfb_discard_chan = -1
     psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
     pfb_chans_active = np.nonzero(chanmap_pfb != pfb_discard_chan)[0]
@@ -2687,7 +2675,7 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
     
     # Get active tone indices - with VACC these may be non-contiguous
     chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
-    psb_discard_bin = r.psb_chanselect.n_chans_out - 1
+    psb_discard_bin =  -1
     psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
     
     if len(tone_amplitudes) != len(psb_tones_active):
@@ -2727,7 +2715,7 @@ def get_tone_phases(r, config_dict):
     chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
     chanmap_pfb = chanselect_get_channel_outmap(r)
     
-    psb_discard_bin = r.psb_chanselect.n_chans_out - 1
+    psb_discard_bin = -1
     pfb_discard_chan = -1
     psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
     pfb_chans_active = np.nonzero(chanmap_pfb != pfb_discard_chan)[0]
@@ -2756,7 +2744,7 @@ def set_tone_phases(r, config_dict, tone_phases, autosync=True):
     
     # Get active tone indices - with VACC these may be non-contiguous
     chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
-    psb_discard_bin = r.psb_chanselect.n_chans_out - 1
+    psb_discard_bin = -1
     psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
     
     if len(tone_phases) != len(psb_tones_active):
@@ -2930,8 +2918,8 @@ def psb_chanselect_set_channel_inmap(r, inmap):
         r.psb_chanselect._c_n_exp = n_exp
         r.psb_chanselect._c_n_chans_in = r.psb_chanselect.n_chans_in
         r.psb_chanselect._c_n_chans_out = r.psb_chanselect.n_chans_out
-        r.psb_chanselect._c_default_val = r.psb_chanselect.n_chans_in - 1
-        r.psb_chanselect._c_discard_bin = r.psb_chanselect.n_chans_out - 1
+        r.psb_chanselect._c_default_val = -1
+        r.psb_chanselect._c_discard_bin = -1
         
         outchans = np.arange(r.psb_chanselect._c_n_chans_out)
         r.psb_chanselect._cached_block_id = (outchans // n_par_samp) % n_exp
@@ -2944,6 +2932,7 @@ def psb_chanselect_set_channel_inmap(r, inmap):
     serial_maps = np.full((r.psb_chanselect._c_n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_default_val, dtype=r.psb_chanselect._map_format)
     
     inmap = np.asarray(inmap, dtype=int)
+    inmap = inmap[inmap != r.psb_chanselect._c_discard_bin]  # Ignore discard bins
     nin = len(inmap)
     
     # Vectorized assignment
@@ -2970,8 +2959,8 @@ def psb_chanselect_get_channel_inmap(r):
         r.psb_chanselect._c_n_exp = n_exp
         r.psb_chanselect._c_n_chans_in = r.psb_chanselect.n_chans_in
         r.psb_chanselect._c_n_chans_out = r.psb_chanselect.n_chans_out
-        r.psb_chanselect._c_default_val = r.psb_chanselect.n_chans_in - 1
-        r.psb_chanselect._c_discard_bin = r.psb_chanselect.n_chans_out - 1
+        r.psb_chanselect._c_default_val = -1
+        r.psb_chanselect._c_discard_bin = -1
         
         outchans = np.arange(r.psb_chanselect._c_n_chans_out)
         r.psb_chanselect._cached_block_id = (outchans // n_par_samp) % n_exp
