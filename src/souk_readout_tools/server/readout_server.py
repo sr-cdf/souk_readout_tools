@@ -401,6 +401,14 @@ class ReadoutServer:
 
         self.load_config(config_file)
 
+        #re-establish firmware interfaces in case they were initially created before programming
+        fw_config_file = self.config['firmware']['fw_config_file']
+        pipeline_id = self.config['firmware']['pipeline_id']
+        self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
+        self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
+
+
+
         if level == "server":
             return
 
@@ -411,6 +419,14 @@ class ReadoutServer:
             # 2) Shared resources init if needed
             if firmware_lib.needs_shared_resource_initialising(self.r, self.config):
                 firmware_lib.initialise_shared_resources(self.r, self.config)
+            
+            #re-establish firmware interfaces in case they were initially created before programming
+            fw_config_file = self.config['firmware']['fw_config_file']
+            pipeline_id = self.config['firmware']['pipeline_id']
+            self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
+            self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
+
+
             return
 
         if level == "pipeline":
@@ -423,6 +439,13 @@ class ReadoutServer:
             # 3) Pipeline resources init if needed
             if firmware_lib.needs_pipeline_initialising(self.r, self.config):
                 firmware_lib.initialise_pipeline_resources(self.r, self.config)
+
+            #re-establish firmware interfaces in case they were initially created before programming
+            fw_config_file = self.config['firmware']['fw_config_file']
+            pipeline_id = self.config['firmware']['pipeline_id']
+            self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
+            self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
+                
             return
 
 
@@ -440,6 +463,15 @@ class ReadoutServer:
         if level not in ("server", "firmware", "pipeline"):
             raise ValueError(f"Invalid ready level: {level}")
 
+        #re-establish firmware interfaces in case they were initially created before programming
+        fw_config_file = self.config['firmware']['fw_config_file']
+        pipeline_id = self.config['firmware']['pipeline_id']
+        self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
+        self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
+
+
+
+
         if level == "server":
             self.init_server(self.config_file,ensure_ready=False, force_ready=False)
             return
@@ -449,6 +481,13 @@ class ReadoutServer:
             self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
             # 2) Shared resources
             firmware_lib.initialise_shared_resources(self.r, self.config)
+
+            #re-establish firmware interfaces in case they were initially created before programming
+            fw_config_file = self.config['firmware']['fw_config_file']
+            pipeline_id = self.config['firmware']['pipeline_id']
+            self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
+            self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
+
             return
 
         if level == "pipeline":
@@ -458,6 +497,13 @@ class ReadoutServer:
             firmware_lib.initialise_shared_resources(self.r, self.config)
             # 3) Pipeline resources
             firmware_lib.initialise_pipeline_resources(self.r, self.config)
+
+            #re-establish firmware interfaces in case they were initially created before programming
+            fw_config_file = self.config['firmware']['fw_config_file']
+            pipeline_id = self.config['firmware']['pipeline_id']
+            self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
+            self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
+
             return
         return
   
@@ -554,6 +600,7 @@ class ReadoutServer:
             self.load_config(config_file)
        
         self.force_ready(level="firmware")
+
         return
 
 
