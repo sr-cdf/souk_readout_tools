@@ -771,7 +771,7 @@ def read_raw_control_buffer_data(r,buf,los=['tx','rx']):
 
 
         # # From set_freqs, phase_steps (which become phase_inc here) were computed as:
-        # #   phase_steps = (freq / fft_rbw_hz) * 2π
+        # #   phase_steps = (freq / fft_rbw_hz) * 2pi
         # # So we invert that to recover the frequency:
         # fft_period_s = r.mixer._n_upstream_chans / r.mixer._upstream_oversample_factor / sample_rate_hz
         # fft_rbw_hz = 1. / fft_period_s
@@ -1386,9 +1386,9 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
 
     # For inmap: find active input channels (tones) - those not mapping to discard bin
     # For outmap: find active output channels (tones) - those not mapping to discard chan
-    psb_discard_bin = -1
+    psb_discard_bit = r.psb_chanselect.DISCARD_BIT
     pfb_discard_chan = -1
-    psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
+    psb_tones_active = np.nonzero((chanmap_psb_inmap & psb_discard_bit) == 0)[0]
     pfb_chans_active = np.nonzero(chanmap_pfb != pfb_discard_chan)[0]
 
     # psb_channels are the FFT bins that active tones map to (in tone order)
@@ -1655,7 +1655,7 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
 
     #set the filterbank channel maps
     # v7.9: use inmap for psb_chanselect (chanmap_psb_inmap[lo_index] = fft_bin)
-    chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in, -1, dtype=int)  # default to discard bin
+    chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in, r.psb_chanselect.DISCARD_BIN, dtype=np.uint32)  # default to discard bin
     chanmap_psb_inmap[tone_indices] = tx_nearest_bins
     # chanmap_pfb uses outmap: outmap[output_slot] = fft_bin
     # Use tone_indices so RX output slots match TX LO indices
@@ -1885,7 +1885,7 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, tone_
 
     #set the filterbank channel maps
     # v7.9: use inmap for psb_chanselect (chanmap_psb_inmap[lo_index] = fft_bin)
-    chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in,-1, dtype=int)  # default to discard bin
+    chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in, r.psb_chanselect.DISCARD_BIN, dtype=np.uint32)  # default to discard bin
     chanmap_psb_inmap[tone_indices] = tx_nearest_bins
     # chanmap_pfb uses outmap: outmap[output_slot] = fft_bin
     # Use tone_indices so RX output slots match TX LO indices
@@ -1963,8 +1963,8 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone
     all_rx_bin_centers_hz = np.fft.fftfreq(fft_rx_nbins, 1. / r_fast.adc_clk_hz)
 
     # v7.9: use inmap for psb_chanselect - size is n_chans_in (LO indices), default to discard bin
-    psb_discard_bin = -1
-    chanmap_psb_inmap = np.full((num_points, r_fast.psb_chanselect.n_chans_in), psb_discard_bin, dtype=int)
+    psb_discard_bin = r_fast.psb_chanselect.DISCARD_BIN
+    chanmap_psb_inmap = np.full((num_points, r_fast.psb_chanselect.n_chans_in), psb_discard_bin, dtype=np.uint32)
     chanmap_pfb  = np.full((num_points,r_fast.chanselect.n_chans_out), -1, dtype=int)
 
     skip_chanmap_psb_inmap=np.zeros(num_points,dtype=bool)
@@ -2643,9 +2643,9 @@ def get_tone_amplitudes(r,config_dict):
     chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
     chanmap_pfb = chanselect_get_channel_outmap(r)
 
-    psb_discard_bin =  -1
+    psb_discard_bit = r.psb_chanselect.DISCARD_BIT
     pfb_discard_chan = -1
-    psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
+    psb_tones_active = np.nonzero((chanmap_psb_inmap & psb_discard_bit) == 0)[0]
     pfb_chans_active = np.nonzero(chanmap_pfb != pfb_discard_chan)[0]
 
     if len(psb_tones_active) == 0:
@@ -2675,8 +2675,8 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
 
     # Get active tone indices - with VACC these may be non-contiguous
     chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
-    psb_discard_bin =  -1
-    psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
+    psb_discard_bit = r.psb_chanselect.DISCARD_BIT
+    psb_tones_active = np.nonzero((chanmap_psb_inmap & psb_discard_bit) == 0)[0]
 
     if len(tone_amplitudes) != len(psb_tones_active):
         raise ValueError(f'Number of amplitudes ({len(tone_amplitudes)}) does not match number of active tones ({len(psb_tones_active)})')
@@ -2715,9 +2715,9 @@ def get_tone_phases(r, config_dict):
     chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
     chanmap_pfb = chanselect_get_channel_outmap(r)
 
-    psb_discard_bin = -1
+    psb_discard_bit = r.psb_chanselect.DISCARD_BIT
     pfb_discard_chan = -1
-    psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
+    psb_tones_active = np.nonzero((chanmap_psb_inmap & psb_discard_bit) == 0)[0]
     pfb_chans_active = np.nonzero(chanmap_pfb != pfb_discard_chan)[0]
 
     if len(psb_tones_active) == 0:
@@ -2744,8 +2744,8 @@ def set_tone_phases(r, config_dict, tone_phases, autosync=True):
 
     # Get active tone indices - with VACC these may be non-contiguous
     chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
-    psb_discard_bin = -1
-    psb_tones_active = np.nonzero(chanmap_psb_inmap != psb_discard_bin)[0]
+    psb_discard_bit = r.psb_chanselect.DISCARD_BIT
+    psb_tones_active = np.nonzero((chanmap_psb_inmap & psb_discard_bit) == 0)[0]
 
     if len(tone_phases) != len(psb_tones_active):
         raise ValueError(f'Number of phases ({len(tone_phases)}) does not match number of active tones ({len(psb_tones_active)})')
@@ -2918,8 +2918,9 @@ def psb_chanselect_set_channel_inmap(r, inmap):
         r.psb_chanselect._c_n_exp = n_exp
         r.psb_chanselect._c_n_chans_in = r.psb_chanselect.n_chans_in
         r.psb_chanselect._c_n_chans_out = r.psb_chanselect.n_chans_out
-        r.psb_chanselect._c_default_val = -1
-        r.psb_chanselect._c_discard_bin = -1
+        r.psb_chanselect._c_discard_bin = r.psb_chanselect.DISCARD_BIN
+        r.psb_chanselect._c_discard_bit = r.psb_chanselect.DISCARD_BIT
+        r.psb_chanselect._c_addr_mask = r.psb_chanselect.ADDR_MASK
 
         outchans = np.arange(r.psb_chanselect._c_n_chans_out)
         r.psb_chanselect._cached_block_id = (outchans // n_par_samp) % n_exp
@@ -2928,16 +2929,18 @@ def psb_chanselect_set_channel_inmap(r, inmap):
         r.psb_chanselect._cached_lookup = np.full((n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=int)
         r.psb_chanselect._cached_lookup[r.psb_chanselect._cached_block_id, r.psb_chanselect._cached_block_offset] = outchans
 
-    # Initialize with default value
-    serial_maps = np.full((r.psb_chanselect._c_n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_default_val, dtype=r.psb_chanselect._map_format)
+    # Initialize with DISCARD_BIN (has DISCARD_BIT set)
+    serial_maps = np.full((r.psb_chanselect._c_n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=np.uint32)
 
-    inmap = np.asarray(inmap, dtype=int)
-    inmap = inmap[inmap != r.psb_chanselect._c_discard_bin]  # Ignore discard bins
-    nin = len(inmap)
+    inmap = np.asarray(inmap, dtype=np.uint32)
+    # Filter out discarded entries (those with DISCARD_BIT set)
+    valid_mask = (inmap & r.psb_chanselect._c_discard_bit) == 0
+    valid_inmap = inmap[valid_mask]
+    nin = len(valid_inmap)
 
     # Vectorized assignment
-    input_indices = np.arange(nin)
-    serial_maps[r.psb_chanselect._cached_block_id[inmap], input_indices] = r.psb_chanselect._cached_block_offset[inmap]
+    input_indices = np.where(valid_mask)[0][:nin]
+    serial_maps[r.psb_chanselect._cached_block_id[valid_inmap], input_indices] = r.psb_chanselect._cached_block_offset[valid_inmap]
 
     # Write to hardware
     for i in range(r.psb_chanselect._c_n_exp):
@@ -2959,8 +2962,9 @@ def psb_chanselect_get_channel_inmap(r):
         r.psb_chanselect._c_n_exp = n_exp
         r.psb_chanselect._c_n_chans_in = r.psb_chanselect.n_chans_in
         r.psb_chanselect._c_n_chans_out = r.psb_chanselect.n_chans_out
-        r.psb_chanselect._c_default_val = -1
-        r.psb_chanselect._c_discard_bin = -1
+        r.psb_chanselect._c_discard_bin = r.psb_chanselect.DISCARD_BIN
+        r.psb_chanselect._c_discard_bit = r.psb_chanselect.DISCARD_BIT
+        r.psb_chanselect._c_addr_mask = r.psb_chanselect.ADDR_MASK
 
         outchans = np.arange(r.psb_chanselect._c_n_chans_out)
         r.psb_chanselect._cached_block_id = (outchans // n_par_samp) % n_exp
@@ -2970,21 +2974,20 @@ def psb_chanselect_get_channel_inmap(r):
         r.psb_chanselect._cached_lookup[r.psb_chanselect._cached_block_id, r.psb_chanselect._cached_block_offset] = outchans
 
     # Read the reorder memory contents
-    nbytes = r.psb_chanselect._reorder_depth * np.dtype(r.psb_chanselect._map_format).itemsize
-    serial_maps = np.empty((r.psb_chanselect._c_n_exp, r.psb_chanselect._reorder_depth), dtype=int)
+    nbytes = r.psb_chanselect._reorder_depth * np.dtype(np.uint32).itemsize
+    serial_maps = np.full((r.psb_chanselect._c_n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=np.uint32)
     for i in range(r.psb_chanselect._c_n_exp):
-        serial_maps[i] = np.frombuffer(r.psb_chanselect.read(f'map{i}_{r.psb_chanselect._map_reg}', nbytes), dtype=r.psb_chanselect._map_format)
+        serial_maps[i] = np.frombuffer(r.psb_chanselect.read(f'map{i}_{r.psb_chanselect._map_reg}', nbytes), dtype=np.uint32).view(np.uint32)
 
-    # Find non-default entries
-    non_default = serial_maps[:, :r.psb_chanselect._c_n_chans_in] != r.psb_chanselect._c_default_val
-
-    # First expansion index with non-default value per input
-    first_exp = np.argmax(non_default, axis=0)
-    has_mapping = np.any(non_default, axis=0)
+    # Check for valid mappings: entries without DISCARD_BIT set
+    is_valid = (serial_maps[:, :r.psb_chanselect._c_n_chans_in] & r.psb_chanselect._c_discard_bit) == 0
+    first_exp = np.argmax(is_valid, axis=0)
+    has_mapping = np.any(is_valid, axis=0)
 
     # Gather stored values and lookup
     input_idx = np.arange(r.psb_chanselect._c_n_chans_in)
-    stored = serial_maps[first_exp, input_idx]
+    # Mask out the discard bit to get actual offset values
+    stored = (serial_maps[first_exp, input_idx] & r.psb_chanselect._c_addr_mask).astype(int)
 
     # Build result
     inmap = np.full(r.psb_chanselect._c_n_chans_in, r.psb_chanselect._c_discard_bin, dtype=int)
