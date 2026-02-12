@@ -1,0 +1,1651 @@
+#!/usr/bin/env python3
+
+"""
+Mocked Client for the SOUK MKID readout server, to enable UKKID_controller.py OCS
+agent to run without attached hardware.
+
+This client can be used to interact with the SOUK MKID readout server on
+the RFSoC ARM to initialize the firmware, get and set parameters,
+enable and disable streaming, perform retuning, and receive streamed
+samples.
+
+The client can be used as a standalone script or imported as a module.
+
+Example usage to begin triggered streaming:
+    python readout_client.py config/config.yaml
+
+Example general usage:
+    $ ipython
+
+    In [1]: import readout_client, numpy as np, matplotlib.pyplot as plt
+
+    In [2]: client = readout_client.ReadoutClient()
+
+    In [3]: client.get_server_status()
+    Out[3]:
+    {'process_name': 'readout_daemon',
+     'ip_addresses': '10.11.11.11 192.168.2.224',
+     'pwd': '/home/casper/src/readout_server',
+    ....}
+
+    In [4]: client.get_sample_rate()
+    Out[4]: 500.0
+
+    In [5]: num_tones = len(client.get_tone_frequencies())
+
+    In [6]: raw_samples = client.get_samples(500)
+    Received 500 samples in ~0.9946386814117432 seconds (~502.6951086301245 samples per second)
+
+    In [7]: data = readout_client.ReadoutClient.parse_samples(raw_samples,num_tones)
+
+    In [8]: print( np.all(np.diff(data['packet_counter']) == 1) )
+    True
+
+    In [9]: t = np.arange(len(data['packet_counter'])) / client.get_sample_rate()
+
+    In [10]: z0 = data['i_data']['0000'] + 1j*data['q_data']['0000']
+
+    In [11]: plt.plot(t, np.abs(z0))
+    Out[11]: [<matplotlib.lines.Line2D at 0x7f5fda517580>]
+
+    In [12]: plt.show()
+
+
+Author: Sam Rowe
+Date: July 2024
+Version: 0.1
+
+"""
+
+import socket
+import json
+import struct
+import numpy as np
+import yaml
+import sys
+import time
+import os
+import traceback
+import csv
+import base64
+import random
+from scipy import signal
+import pdb
+import so3g
+from spt3g import core
+USER_CALIBRATIONS_DIR = os.path.expanduser('~/.souk_readout_tools/calibrations')
+USER_CONFIG_DIR = os.path.expanduser('~/.souk_readout_tools/config')
+USER_TMP_DIR = os.path.expanduser('~/.souk_readout_tools/tmp')
+
+DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR,'default_config.lnk')
+
+class ReadoutClient:
+    def __init__(self,config_file=None):
+        if config_file is None:
+            config_file = DEFAULT_CONFIG
+            print(f'Loading default config file from {DEFAULT_CONFIG}')
+        if not os.path.exists(config_file):
+            #print(f'Config file not found {config_file}, searching in {USER_CONFIG_DIR}')
+            config_file = os.path.join(USER_CONFIG_DIR,config_file)
+        with open(config_file, 'r') as file:
+            config = yaml.safe_load(file)
+        if type(config) is str:
+            config_file = config
+            if not os.path.exists(config_file):
+                #print(f'Linked config file not found {config_file}, searching in {USER_CONFIG_DIR}')
+                config_file = os.path.join(USER_CONFIG_DIR,config_file)
+            #file is a link, try again using the link contents as the config file path
+            with open(config_file,'r') as file:
+                config = yaml.safe_load(file)
+        print(f'Config file loaded: {config_file}')
+        with open(DEFAULT_CONFIG,'w') as file:
+            file.write(os.path.abspath(config_file))
+        self.config = config
+        self.config_file = config_file
+        self.request_server_address = self.config['rfsoc_host']['address']
+        self.request_server_port = self.config['rfsoc_host']['request_port']
+        self.stream_server_address = self.config['rfsoc_host']['address']
+        self.stream_server_port = self.config['rfsoc_host']['stream_port']
+        self.system_information = None
+        self.parameters={}
+        ## Persistent states for mocked behaviour.
+        self.mock_config_on_rfsoc = None
+        self.mock_tone_frequencies = []
+        self.mock_is_streaming = False
+        self.mock_data_count = 0
+        self.mock_data_buffer = bytearray(2048*2*4 + 10*4)
+        self.mock_sample_rate = 500.0
+        self.mock_tone_amplitudes = []
+        self.mock_tone_powers_dbm = []
+        self.mock_tone_phases = []
+        
+    def send_request(self, message):
+        # THis should never get called in mocked mode.
+        # Throw an error message and exit.
+        sys.exit('send_request called in mocked mode. Have you written mocked code for the method you called?')
+        '''
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.connect((self.request_server_address, self.request_server_port))
+            except socket.gaierror as e:
+                print(f"Error connecting to request server {(self.request_server_address,self.request_server_port)}: {e}")
+                return {'status': 'error', 'message': f"Error connecting to request server {(self.request_server_address,self.request_server_port)}: {e}"}
+            except ConnectionRefusedError as e:
+                print(f"Connection refused, is the server running? {(self.request_server_address,self.request_server_port)}: {e}")
+                return {'status': 'error', 'message': f"Connection refused connecting to request server {(self.request_server_address,self.request_server_port)}: {e}"}
+            except:
+                print(f"Unhandled exception connecting to request server {(self.request_server_address,self.request_server_port)}: {sys.exc_info()[0]}")
+                return {'status': 'error', 'message': f"Error connecting to request server {(self.request_server_address,self.request_server_port)}: {sys.exc_info()[0]}"}
+            
+            # Send message length + data
+            message_data = json.dumps(message).encode()
+            message_len = struct.pack('>I', len(message_data))
+            s.sendall(message_len + message_data)
+            # print(f'sent: {message_data}')
+
+            # Receive message length
+            raw_msglen = s.recv(4)
+            if not raw_msglen:
+                return None
+            datalen = struct.unpack('>I', raw_msglen)[0]
+
+            # Pre-allocate bytearray to expected data length and receive the data
+            response_data = bytearray(datalen)
+            view = memoryview(response_data)
+            received_len = 0
+            while received_len < datalen:
+                packet_len = s.recv_into(view[received_len:], datalen - received_len)
+                if packet_len == 0:
+                    break
+                received_len += packet_len
+            if received_len < datalen:
+                print(f"Expected {datalen} bytes, but only received {received_len} bytes.")
+                return None
+
+            # print(f'received: {response_data}')
+            return json.loads(response_data.decode())
+        '''
+
+    def initialise_server(self,config_file=None):
+        message = {'request': 'initialise_server','config_filename': config_file}
+        response = self.send_request(message)
+        # Mock behaviour - just returns ststsus success.
+        response = {}
+        response['status'] = 'success'
+        # End mock
+        if response['status'] == 'success':
+            self.pull_config()
+        return response
+
+    def initialise_firmware(self,config_file=None):
+        message = {'request': 'initialise_firmware', 'config_filename': config_file}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            self.pull_config()
+        return response
+
+    def pull_config(self,destination_dir=None):
+        '''
+        if destination_dir is None:
+            destination_dir = USER_CONFIG_DIR
+        message = {'request': 'pull_config'}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            config_filename = response['config_filename']
+            config_contents = response['config_contents']
+            destination_file = os.path.join(destination_dir,os.path.basename(config_filename))
+            with open(destination_file,'w') as file:
+                file.write(config_contents)
+            print(f'Config file pulled from RFSoC into {destination_file}')
+            self.config_file = destination_file
+            self.config = yaml.safe_load(config_contents)
+            print(f'Config loaded {self.config_file}')
+            with open(DEFAULT_CONFIG,'w') as file:
+                file.write(os.path.abspath(self.config_file))
+
+            
+        else:
+            return response
+        '''
+        # JL Mock
+        # This prints to std out the same as a successful call to the pull_config.
+        print(f'Config file pulled from RFSoC into {self.config_file}')
+        print(f'Config loaded {self.config_file}')
+        
+    
+    def push_config(self):
+        name = os.path.basename(self.config_file)
+        config = yaml.dump(self.config,sort_keys=False)
+        message = {'request': 'push_config', 'config_filename': name, 'config_contents': config}
+        # JL Mock
+        # Store the config to te persistent store.
+        self.mock_config_on_rfsoc = config
+        response={'status':'success'}
+        # response['status'] = 'success'
+        # End mock
+        if response['status'] == 'success':
+            print(f'Config file pushed from {self.config_file} to RFSoC')
+            return 
+        else:
+            return response
+       # if response['status'] == 'success':
+       #     response=self.initialise_firmware(config_file=name)
+       # else:
+       #     print(f"Error saving config: {response['message']}")
+       #     return response
+        #if default:
+        #    self.set_config_default(name)
+
+
+    #def set_config_default(self,config_filename):
+    #    message = {'request': 'set_default_config', 'config_filename': config_filename}
+    #    response = self.send_request(message)
+    #    return response
+
+
+    def push_calibration(self, calibration_file):
+        with open(calibration_file,'r') as file:
+            cal = file.read()
+        cal_filename=os.path.basename(calibration_file)
+        message = {'request':'push_calibration',
+                   'cal_filename':cal_filename,
+                   'cal_contents':cal}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            print(f'Pushed {cal_filename} to RFSoC')
+        else:
+            return response
+
+    def pull_calibration(self,remote_file,destination_file=None):
+        if destination_file is None: 
+            destination_file = os.path.join(USER_CALIBRATIONS_DIR,os.path.basename(remote_file))
+        message = {'request':'pull_calibration',
+                   'cal_filename':remote_file}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            cal = response['cal_contents']
+            with open(destination_file,'w') as file:
+                file.write(cal)
+            print(f'Written calibration {os.path.basename(remote_file)} from RFSoC to {destination_file}')
+        else:
+            return response
+
+    def hard_reset(self):
+        return self.initialise_firmware()
+
+    def cancel_all_tasks(self):
+        message = {'request': 'cancel'}
+        return self.send_request(message)
+
+    def get_server_status(self):
+        # JL Mock
+        json_string = '{"process_name": "readout_server", "ip_addresses": "10.179.81.15", "pwd": "/home/casper", "sys.executable": "/home/casper/py3.8venv/bin/python3.8", "sys.argv": ["/home/casper/py3.8venv/bin/souk-readout-server"], "uname": "localhost.localdomain Linux 5.10.0-xilinx-v2021.2 #1 SMP Tue Oct 12 09:30:57 UTC 2021 aarch64", "python_version": "3.8.0 (default, Dec  9 2021, 17:53:27) \\n[GCC 8.4.0]", "config_file": "/home/casper/.souk_readout_tools/config/config.yaml", "request_clients": 1, "request_client_addrs": [["10.179.48.15", 37830]], "stream_clients": 0, "stream_client_addrs": [], "stream_task_started": true, "stream_enabled": false, "triggered_stream_task_started": true, "triggered_stream_enabled": false, "sweep_task_running": false, "tasks": 0, "firmware_interface_alive": true, "firmware_fast_interface_alive": true, "system_information": {"fpga_status": {"programmed": true, "timestamp": "2025-05-15T15:12:24.718438", "host": "localhost.localdomain:localhost", "antname": null, "sw_version": "0.1", "fw_version": "7.4.1.0", "fw_type": 2, "fw_build_time": "2025-02-03T14:48:59", "fw_supported": true}, "fpg_file": "/home/casper/src/souk-firmware/firmware/src/souk_single_pipeline_krm/outputs/souk_single_pipeline_krm_2025-02-03_1450.fpg", "pipeline_id": 0, "adc_clk_hz": 2048000000, "output_mode": "PSB", "sync_delay": 6225, "acc_len": 1000, "acc_freq": 500.0, "internal_loopback": false, "psb_scale": 2.19921875, "psb_fftshift": 63, "pfb_fftshift": 0, "dsa": "0", "vop_dac0": "19993", "vop_dac1": "19993", "dac_duc_mixer_frequency_hz": 1024000000.0, "adc_ddc_mix_frequency_hz": -1024000000.0, "nyquist_zone_adc": 1, "nyquist_zone_dac0": 1, "nyquist_zone_dac1": 1, "mixer_scale_1p0_dac0": false, "mixer_scale_1p0_dac1": false, "mixer_scale_1p0_adc": false, "mixer_qmc_settings_dac0": {"EnablePhase": 0.0, "EnableGain": 0.0, "GainCorrectionFactor": 0.0, "PhaseCorrectionFactor": 0.0, "OffsetCorrectionFactor": 0.0, "EventSource": 0.0}, "mixer_qmc_settings_dac1": {"EnablePhase": 0.0, "EnableGain": 0.0, "GainCorrectionFactor": 0.0, "PhaseCorrectionFactor": 0.0, "OffsetCorrectionFactor": 0.0, "EventSource": 0.0}, "mixer_qmc_settings_adc": {"EnablePhase": 0.0, "EnableGain": 0.0, "GainCorrectionFactor": 0.0, "PhaseCorrectionFactor": 0.0, "OffsetCorrectionFactor": 0.0, "EventSource": 0.0}, "tone_frequencies": [2212477829.111158, 2237482369.9397964, 2262515364.071587, 2287512276.221998, 2312487068.901537, 2337511780.364788, 2362502794.8740172, 2387500548.0613327, 2412490788.7354493, 2437501451.14155, 2462510329.182376, 2487492197.382497, 2512497422.5607004, 2537479424.6570673, 2562483849.7563033, 2587512257.4360576, 2612520630.930434, 2637521050.450159, 2662498048.324254, 2687509350.396227, 2712517589.36781, 2737479055.3014026, 2762493012.2345686, 2787486620.870768, 2812520895.2268586, 2837516652.397113, 2862502495.1334343, 2887501649.556798, 2912498561.96146, 2937475649.8549833, 2962475294.0252657, 2987514123.6417694, 3012513289.4995623, 3037514403.920155, 3062508417.770383, 3087483023.58645, 3112506652.2378473, 3137504510.4741583, 3162500837.23641, 3187499911.798397, 3212514202.608727, 3237477997.851791, 3262514216.019772, 3287475886.1215086, 3312505958.7297726, 3337494967.9616838, 3362511505.5735226, 3387514298.1506653, 3412507852.4413986, 3437484199.2427826, 3462524079.286377, 3487503389.788559, 3512490854.2211633, 3537512427.909416, 3562489448.0744843, 3587511312.1633186, 3612483317.0184865, 3637521976.1609335, 3662519622.8248534, 3687485606.5487256, 3712519260.7636566, 3737513872.4239078, 3762479011.521791, 3787494422.8281965], "tone_amplitudes": [0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375, 0.999755859375], "tone_phases": [0.0, 0.04910418390064474, 0.19664030605804297, 0.4421830625394359, 0.785526755359534, 1.2278254791281529, 1.7676969093859305, 2.4058557401313116, -3.141251705902239, -2.3063559872472217, -1.3732738869867278, -0.3431161812633285, 0.7861725503051998, 2.012489444903323, -2.945114841157405, -1.5199136177943997, 0.002424617017888122, 1.6224702842969265, -2.9441490182527184, -1.1270313290129366, 0.7881072550762764, 2.797625937606851, -1.3736356797939933, 0.8347324584602894, -3.1381294773803172, -0.7331457241993335, 1.7689651042913386, -1.912636400228926, 0.7868669346119506, -2.7009242262095627, 0.19511999916544423, -3.0890808653487496, 0.003396941130518802, -3.08889188559127, 0.19923797750719993, -2.700359291134892, 0.7881324333593387, -1.911947270723916, 1.7690856765365137, -0.7345019940877041, -3.1375340507041205, 0.8327740193062948, -1.3702699295398426, 2.795740405901173, 0.7882561230829408, -1.1280757193959883, -2.9413484093446876, 1.6243298930942403, 0.0032761348184509992, -1.522966615181138, -2.938747741839304, 2.015011666352542, 0.7852610835846667, -0.33931610087186986, -1.3749990243541952, -2.3030041756765303, 3.1395558473772103, 2.411803112160372, 1.773185505916578, 1.2253860924893365, 0.7914366327982224, 0.446571717298808, 0.19266148194690527, 0.04908738521234052]}, "latest_sweep_data_valid": false}'
+
+        response = json.loads(json_string)
+        return response
+
+    def get_system_information(self):
+        message = {'request': 'get_system_information'}
+        # JL Mocked code
+        response ={}
+        response['message'] = message
+        response['status'] = 'success'
+        response['data'] = {'fpga_status': {'programmed': True, 'timestamp': '2026-01-30T16:06:32.195481', 'host': 'localhost.localdomain:localhost', 'antname': None, 'sw_version': '0.1', 'fw_version': '7.6.1.0', 'fw_type': 2, 'fw_build_time': '2025-06-12T14:45:36', 'fw_supported': True}, 'fpg_file': '/home/casper/src/souk-firmware/firmware/src/souk_single_pipeline_krm/outputs/souk_single_pipeline_krm_2025-06-12_1346.fpg', 'pipeline_id': 0, 'adc_clk_hz': 2048000000, 'output_mode': 'PSB', 'sync_delay': 6225, 'acc_len': 1000, 'acc_freq': 500.0, 'internal_loopback': False, 'psb_scale': 2.1953125, 'psb_fftshift': 63, 'pfb_fftshift': 0, 'dsa': '0', 'vop_dac0': '19993', 'vop_dac1': '19993', 'dac_duc_mixer_frequency_hz': -3072000000.0, 'adc_ddc_mix_frequency_hz': 3072000000.0, 'nyquist_zone_adc': 2, 'nyquist_zone_dac0': 2, 'nyquist_zone_dac1': 2, 'mixer_scale_1p0_dac0': False, 'mixer_scale_1p0_dac1': False, 'mixer_scale_1p0_adc': False, 'mixer_qmc_settings_dac0': {'EnablePhase': 0.0, 'EnableGain': 0.0, 'GainCorrectionFactor': 0.0, 'PhaseCorrectionFactor': 0.0, 'OffsetCorrectionFactor': 0.0, 'EventSource': 0.0}, 'mixer_qmc_settings_dac1': {'EnablePhase': 0.0, 'EnableGain': 0.0, 'GainCorrectionFactor': 0.0, 'PhaseCorrectionFactor': 0.0, 'OffsetCorrectionFactor': 0.0, 'EventSource': 0.0}, 'mixer_qmc_settings_adc': {'EnablePhase': 0.0, 'EnableGain': 0.0, 'GainCorrectionFactor': 0.0, 'PhaseCorrectionFactor': 0.0, 'OffsetCorrectionFactor': 0.0, 'EventSource': 0.0}, 'tone_frequencies': [2100000000.0], 'tone_amplitudes': [0.0], 'tone_phases': [0.0]}
+        
+        if response['status'] == 'success':
+            self.system_information = response['data']
+            return response['data']
+        else:
+            print(f"Error getting system information: {response['message']}")
+            return response
+
+    def set_parameter(self, param_name, param_value):
+        message = {'request': 'set', 'param': param_name, 'value': param_value}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            return response
+        else:
+            print(f"Error setting parameter {param_name}: {response['message']}")
+            return response
+
+    def get_parameter(self, param_name):
+        message = {'request': 'get', 'param': param_name}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            return response['value']
+        else:
+            print(f"Error getting parameter {param_name}: {response['message']}")
+            return response
+
+    def set_sample_rate(self, sample_rate_hz):
+        # JL Mocked 
+        self.mock_sample_rate = sample_rate_hz
+        return {'status':'success'}
+        
+
+    def get_sample_rate(self):
+        # JL Mocked 
+        return self.mock_sample_rate
+
+    def set_tone_frequencies(self, tone_frequencies):
+        self.mock_tone_frequencies = tone_frequencies
+        # JL: Return frequency list just sent to the function
+        # Not sure if real funrction does this, but OCS client never looks
+        # at return values at the moment
+        response= {'status':'success'}
+        return response
+        #tone_frequencies = np.atleast_1d(tone_frequencies).tolist()
+        #return self.set_parameter('tone_frequencies',tone_frequencies)
+
+    def get_tone_frequencies(self,detailed_output=False):
+        # JL: Not sure what detailed output is so will ignore for the
+        # time being.
+        return np.array(self.mock_tone_frequencies)
+        '''
+        if detailed_output:
+            return self.get_parameter('tone_frequencies_detailed')
+        else:
+            return np.atleast_1d(self.get_parameter('tone_frequencies'))
+        '''
+
+    def set_tone_amplitudes(self, tone_amplitudes):
+        # JL mock
+        tone_amplitudes = np.atleast_1d(tone_amplitudes).tolist()
+        self.mock_tone_amplitudes = tone_amplitudes
+        return {'status':'success'}
+        # End Mock
+        #return self.set_parameter('tone_amplitudes',tone_amplitudes)
+
+    def get_tone_amplitudes(self):
+        # JL Mock 
+        return np.atleast_1d(self.mock_tone_amplitudes)
+               
+        #return np.atleast_1d(self.get_parameter('tone_amplitudes'))
+
+    def set_tone_phases(self, tone_phases):
+        # JL Mock
+        tone_phases = np.atleast_1d(tone_phases).tolist()
+        self.mock_tone_phases = tone_phases
+        return {'status':'success'} 
+        #return self.set_parameter('tone_phases',tone_phases)
+
+    def get_tone_phases(self):
+        #JL Mock
+        return np.atleast_1d( self.mock_tone_phases)
+        #return np.atleast_1d(self.get_parameter('tone_phases'))
+
+    def set_tone_powers(self, tone_powers_dbm):
+        # JL Mock 
+        tone_powers_dbm = np.atleast_1d(tone_powers_dbm).tolist()
+        self.mock_tone_powers_dbm = tone_powers_dbm
+        return {'status':'success'}
+        #return self.set_parameter('tone_powers',tone_powers_dbm)
+
+    def get_tone_powers(self,detailed_output=False):
+        # Example of get_tone_powers
+        # None detailed.
+        # >>> r_client.get_tone_powers()
+        # array([-61.20883481])
+        #
+        # detailed output.
+        # >>> r_client.get_tone_powers(detailed_output=True)
+        # {'amps': [0.10009765625], 'psb_shift_units': [0.000782012939453125], 'psb_scale_units': [0.0017167627811431885], 'dac_units': [112.509765625], 'dac_fs': [0.0017167627811431885], 'duc_fs': [0.0017167627811431885], 'duc_fs_power': [2.9472744467184953e-06], 'vop_fs': [2.9452117156469125e-06], 'vop_dbfs': [-55.30883480628215], 'dac_dbm': [-61.20883480628215], 'combiner_dbm': [-61.20883480628215], 'tx_if_dbm': [-61.20883480628215], 'tx_mixer_dbm': [-61.20883480628215], 'tx_rf_dbm': [-61.20883480628215], 'cryostat_dbm': [-61.20883480628215]}
+        #
+        # Detailed output not implemented yet.
+        #
+        
+        return np.atleast_1d(self.mock_tone_powers_dbm)
+    
+        '''
+        if detailed_output:
+            return self.get_parameter('tone_powers_detailed')
+        else:
+            return np.atleast_1d(self.get_parameter('tone_powers'))
+        '''
+
+    def check_input_saturation(self,iterations=10):
+        # JL Mock
+        # Examples output
+        # {'status': 'success', 'result': False, 'details': {'imax_fs': 0.00140380859375, 'imin_fs': -0.00152587890625, 'qmax_fs': 0.001373291015625, 'qmin_fs': -0.00152587890625, 'integration_time': 2e-05, 'threshold': 0.95}}
+        # Just return this for the time being
+        return {'status': 'success', 'result': False, 'details': {'imax_fs': 0.00140380859375, 'imin_fs': -0.00152587890625, 'qmax_fs': 0.001373291015625, 'qmin_fs': -0.00152587890625, 'integration_time': 2e-05, 'threshold': 0.95}}
+        #message = {'request': 'check_input_saturation','iterations':iterations}
+        #return self.send_request(message)
+
+    def check_output_saturation(self,iterations=10):
+        # JL Mock
+        # Example output
+        # {'status': 'success', 'result': False, 'details': {'i0max_fs': 0.001739501953125, 'i0min_fs': -0.001739501953125, 'q0max_fs': 0.001739501953125, 'q0min_fs': -0.001739501953125, 'i1max_fs': 0.0, 'i1min_fs': 0.0, 'q1max_fs': 0.0, 'q1min_fs': 0.0, 'integration_time': 2e-05, 'threshold': 0.95}}
+        return {'status': 'success', 'result': False, 'details': {'i0max_fs': 0.001739501953125, 'i0min_fs': -0.001739501953125, 'q0max_fs': 0.001739501953125, 'q0min_fs': -0.001739501953125, 'i1max_fs': 0.0, 'i1min_fs': 0.0, 'q1max_fs': 0.0, 'q1min_fs': 0.0, 'integration_time': 2e-05, 'threshold': 0.95}}
+        # message = {'request': 'check_output_saturation','iterations':iterations}
+        # return self.send_request(message)
+
+    def check_dsp_overflow(self,duration_s=0.2):
+        # JL Mock
+        # Example Output
+        # {'status': 'success', 'result': False, 'details': {'psbscale_ovf_count_start': 0, 'psbscale_ovf_count_end': 0, 'psbscale_ovf_delta': 0, 'psb_ovf_count_start': 0, 'psb_ovf_count_end': 0, 'psb_ovf_delta': 0, 'pfb_ovf_count_start': 0, 'pfb_ovf_count_end': 0, 'pfb_ovf_delta': 0}}
+        return {'status': 'success', 'result': False, 'details': {'psbscale_ovf_count_start': 0, 'psbscale_ovf_count_end': 0, 'psbscale_ovf_delta': 0, 'psb_ovf_count_start': 0, 'psb_ovf_count_end': 0, 'psb_ovf_delta': 0, 'pfb_ovf_count_start': 0, 'pfb_ovf_count_end': 0, 'pfb_ovf_delta': 0}}
+        #message = {'request': 'check_dsp_overflow','duration_s':duration_s}
+        #return self.send_request(message)
+    
+    def maximise_tx_power(self):
+        return self.send_request({'request': 'maximise_tx_power'})
+    
+    def maximise_rx_power(self):
+        return self.send_request({'request': 'maximise_rx_power'})
+    
+    def optimise_tx_snr(self):
+        return self.send_request({'request': 'optimise_tx_snr'})
+    
+    def optimise_rx_snr(self):
+        return self.send_request({'request': 'optimise_rx_snr'})
+
+    def fix_dac_saturation(self):
+        return self.send_request({'request': 'fix_dac_saturation'})
+    
+    def fix_adc_saturation(self):
+        return self.send_request({'request': 'fix_adc_saturation'})
+
+    def enable_stream(self):
+        self.mock_is_streaming = True
+        response= {'status':'success'}
+        return response 
+        #message = {'request': 'enable_stream'}
+        #return self.send_request(message)
+
+    def disable_stream(self):
+        self.mock_is_streaming = False
+        response= {'status':'success'}
+        return response 
+        #message = {'request': 'disable_stream'}
+        #return self.send_request(message)
+
+    def enable_triggered_stream(self):
+        message = {'request': 'enable_triggered_stream'}
+        return self.send_request(message)
+
+    def disable_triggered_stream(self):
+        message = {'request': 'disable_triggered_stream'}
+        return self.send_request(message)
+
+    def send_fake_trigger(self):
+        message = {'request': 'send_fake_trigger'}
+        return self.send_request(message)
+
+    def get_cal_freeze(self):
+        return self.get_parameter('cal_freeze')
+
+    def set_cal_freeze(self,freeze):
+        return self.set_parameter('cal_freeze',freeze)
+
+    def get_samples(self, num_samples,incl_system_info=True):
+        """
+        Acquire num_samples samples from the readout server and return concatenated raw data.
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((self.request_server_address, self.request_server_port))
+            message = {'request': 'get_samples', 'num_samples': num_samples}
+            # Send message length
+            message_data = json.dumps(message).encode()
+            message_len = struct.pack('>I', len(message_data))
+            s.sendall(message_len + message_data)
+            # # Pre-allocate bytearray to expected data length
+            alldatalen = 2048*2*4 + 10*4
+            data_raw = bytearray(alldatalen*num_samples)
+            view = memoryview(data_raw)
+
+            # i_data = np.zeros((num_samples,num_tones),dtype=int)
+            # q_data = np.zeros((num_samples,num_tones),dtype=int)
+            # cnt = np.zeros(num_samples,dtype=int)
+            # err = np.zeros(num_samples,dtype=int)
+            # flags = np.zeros((num_samples,8),dtype=int)
+            t0=time.time()
+            next_datalen=0
+            for j in range(num_samples):
+                packet_offset = j*next_datalen
+
+                # Read data length
+                raw_datalen = s.recv(4)
+                if not raw_datalen:
+                    break
+                next_datalen = struct.unpack('>I', raw_datalen)[0]
+                received_len = 0
+                while received_len < next_datalen:
+                    packet_len = s.recv_into(view[packet_offset+received_len:], next_datalen - received_len)
+                    if packet_len == 0:
+                        break
+                    received_len += packet_len
+                if received_len < next_datalen:
+                    print(f"Expected {next_datalen} bytes, but only received {received_len} bytes.")
+                    break
+            t1=time.time()
+            print(f"Received {num_samples} samples in ~{t1-t0} seconds (~{num_samples/(t1-t0)} samples per second)")
+            if incl_system_info:
+                info = self.get_system_information()
+            else:
+                info = {'system_information':'No system information requested'}
+            sample_rate = self.get_sample_rate()
+            sample_data = {'data_raw':data_raw,'sample_rate':sample_rate,'system_information':info}
+            return sample_data
+
+
+    @staticmethod
+    def parse_samples(sample_data,num_tones=2048):
+        data_raw = sample_data['data_raw']
+        sample_rate = sample_data['sample_rate']
+        info = sample_data['system_information']
+        datalen = 2048*2*4 + 10*4
+        num_samples = len(data_raw)//datalen
+        i_data = np.zeros((num_samples,num_tones),dtype='<i4')
+        q_data = np.zeros((num_samples,num_tones),dtype='<i4')
+        cnt = np.zeros(num_samples,dtype=int)
+        err = np.zeros(num_samples,dtype=int)
+        flags = np.zeros((num_samples,8),dtype=int)
+        for j in range(num_samples):
+            packet_offset = j*datalen
+            all_data = np.frombuffer(data_raw[packet_offset:packet_offset+datalen],dtype='<i4')
+            i_data[j] = all_data[::2][:num_tones]
+            q_data[j] = all_data[1::2][:num_tones]
+            err[j] = all_data[-1]
+            cnt[j] = all_data[-2]
+            flags[j] = all_data[-10:-2]
+        data_dict = {'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
+                    'num_tones':num_tones,
+                    'num_samples':num_samples,
+                    'sample_rate':sample_rate,
+                    'system_information':info,
+                    'i_data':{f'{i:04d}':i_data[:,i] for i in range(num_tones)},
+                    'q_data':{f'{i:04d}':q_data[:,i] for i in range(num_tones)},
+                    'packet_counter':cnt,
+                    'packet_error':err,
+                    'stream_flags':{f'flag{i}':flags[:,i] for i in range(8)}
+                    }
+
+        return data_dict
+
+    @staticmethod
+    def export_samples(filename, sample_data, num_tones_to_save=None,file_format=None):
+        if num_tones_to_save is None:
+            num_tones_to_save = 2048
+
+        if file_format is None:
+            try:
+                file_format = filename.split('.')[-1]
+            except IndexError:
+                raise ValueError("No file format provided and unable to determine from filename.")
+
+        if 'data_raw' in sample_data.keys():
+            data_dict = ReadoutClient.parse_samples(sample_data,num_tones=num_tones_to_save)
+        else:
+            data_dict = sample_data
+
+        if file_format == 'npy':
+            np.save(filename.rstrip('npy') + 'npy', data_dict)
+
+        elif file_format == 'json':
+            # Convert numpy arrays to lists for JSON serialization, including nested arrays
+            json_data_dict = {}
+            for key, value in data_dict.items():
+                if isinstance(value, dict):
+                    json_data_dict[key] = {
+                        sub_key: sub_value.tolist() if isinstance(sub_value, np.ndarray) else sub_value
+                        for sub_key, sub_value in value.items()
+                    }
+                elif isinstance(value, np.ndarray):
+                    json_data_dict[key] = value.tolist()
+                else:
+                    json_data_dict[key] = value
+
+            with open(filename.rstrip('json') + 'json', 'w') as file:
+                json.dump(json_data_dict, file, indent=4)
+
+        elif file_format == 'csv':
+            with open(filename.rstrip('csv') + 'csv', mode='w', newline='') as file:
+                writer = csv.writer(file)
+                # Write the metadata
+                writer.writerow(['# date', data_dict['date']])
+                writer.writerow(['# num_tones', data_dict['num_tones']])
+                writer.writerow(['# num_samples', data_dict['num_samples']])
+                writer.writerow(['# sample_rate', data_dict['sample_rate']])
+                for key,value in data_dict['system_information'].items():
+                    writer.writerow([f'# {key}', value])
+                # Write the header for i_data, q_data, packet_counter, packet_error, and stream_flags
+                header = []
+                for i in range(data_dict['num_tones']):
+                    header.extend([f'i_data_{i:04d}', f'q_data_{i:04d}'])
+                header.extend(['packet_counter', 'packet_error'])
+                header.extend([f'flag{i}' for i in range(8)])
+                writer.writerow(header)
+                # Write the data rows
+                for j in range(data_dict['num_samples']):
+                    row = []
+                    for i in range(data_dict['num_tones']):
+                        row.extend([data_dict['i_data'][f'{i:04d}'][j], data_dict['q_data'][f'{i:04d}'][j]])
+                    row.append(data_dict['packet_counter'][j])
+                    row.append(data_dict['packet_error'][j])
+                    row.extend([data_dict['stream_flags'][f'flag{k}'][j] for k in range(8)])
+                    writer.writerow(row)
+
+        elif file_format == 'dirfile':
+            raise NotImplementedError("dirfile format not yet implemented.")
+
+        elif file_format == 'hdf5':
+            raise NotImplementedError("hdf5 format not yet implemented.")
+
+        else:
+            raise ValueError(f"Invalid file_format {file_format}. Must be one of 'npy', 'json', 'csv', 'dirfile', or 'hdf5'.")
+
+    @staticmethod
+    def import_samples(filename):
+        data_dict={}
+        if filename.endswith('.npy'):
+            data_dict = np.load(filename,allow_pickle=True).item()
+
+        elif filename.endswith('.json'):
+            with open(filename,'r') as file:
+                data_dict = json.load(file)
+                for item in data_dict:
+                    if isinstance(data_dict[item],list):
+                        data_dict[item] = np.array(data_dict[item])
+                    if isinstance(data_dict[item],dict):
+                        for sub_item in data_dict[item]:
+                            if isinstance(data_dict[item][sub_item],list):
+                                data_dict[item][sub_item] = np.array(data_dict[item][sub_item])
+                            if isinstance(data_dict[item][sub_item],dict):
+                                for sub_sub_item in data_dict[item][sub_item]:
+                                    if isinstance(data_dict[item][sub_item][sub_sub_item],list):
+                                        data_dict[item][sub_item][sub_sub_item] = np.array(data_dict[item][sub_item][sub_sub_item])
+
+        elif filename.endswith('.csv'):
+            with open(filename, mode='r') as file:
+                lines=file.readlines()
+                header_lines=0
+                for line in lines:
+                    if line.startswith('#'):
+                        header_lines+=1
+                        key = line.split(',')[0].lstrip('# ')
+                        value = line[line.find(',')+1:].strip()
+                        if key=='date':
+                            value = value
+                        elif value.startswith('"') and value.endswith('"'):
+                            value = eval(value[1:-1])
+                        else:
+                            try:
+                                value = eval(value)
+                            except NameError:
+                                value = value
+                        data_dict[key] = value
+
+            data = np.genfromtxt(filename, delimiter=',',names=True,skip_header=header_lines)
+            data_dict['i_data'] = {f'{i:04d}':data[f'i_data_{i:04d}'].astype(int) for i in range(data_dict['num_tones'])}
+            data_dict['q_data'] = {f'{i:04d}':data[f'q_data_{i:04d}'].astype(int) for i in range(data_dict['num_tones'])}
+            data_dict['packet_counter'] = data['packet_counter'].astype(int)
+            data_dict['packet_error'] = data['packet_error'].astype(int)
+            data_dict['stream_flags'] = {f'flag{i}':data[f'flag{i}'].astype(int) for i in range(8)}
+
+        elif filename.endswith('.hdf5'):
+            raise NotImplementedError("hdf5 format not yet implemented.")
+        elif os.path.endswith('.dirfile'):
+            raise NotImplementedError("dirfile format not yet implemented.")
+        else:
+            raise ValueError(f"Invalid file format {filename.split('.')[-1]}")
+        return data_dict
+
+
+    def perform_sweep(self, centers, spans, points, samples_per_point,direction='up'):
+        #need to check the tones can be set otherwise the sweep task in the server will fail silently
+        response = self.set_tone_frequencies(centers)
+        if response['status'] != 'success':
+            print(f"Error setting tone frequencies: {response['message']}")
+            return response
+        centers=np.atleast_1d(centers)
+        spans=np.atleast_1d(spans)
+        
+        message = {
+            'request': 'sweep',
+            'centers': centers.tolist(),
+            'spans': spans.tolist(),
+            'points': points,
+            'samples_per_point': samples_per_point,
+            'direction': direction
+        }
+        return self.send_request(message)
+
+    def perform_retune(self, centers, spans, points, samples_per_point, direction='up',method='max_gradient'):
+        #need to check the tones can be set otherwise the sweep task in the server will fail silently
+        response = self.set_tone_frequencies(centers)
+        if response['status'] != 'success':
+            print(f"Error setting tone frequencies: {response['message']}")
+            return response
+        centers=np.atleast_1d(centers)
+        spans=np.atleast_1d(spans)
+
+        message = {
+            'request': 'retune',
+            'centers': centers,
+            'spans': spans,
+            'points': points,
+            'samples_per_point': samples_per_point,
+            'direction': direction,
+            'method': method
+        }
+        return self.send_request(message)
+
+    def get_sweep_progress(self):
+        message = {'request': 'get_sweep_progress'}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            return response['progress']
+        else:
+            print(f"Error getting sweep progress: {response['message']}")
+            return response
+
+    def get_sweep_data(self):
+        message = {'request': 'get_sweep_data'}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            sweep_data = response['data']
+            return sweep_data
+        else:
+            print(f"Error getting sweep_data: {response['message']}")
+            return response
+
+    def get_sweep_raw_samples(self):
+        message = {'request': 'get_sweep_raw_samples'}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            sweep_data = response['data']
+            # return np.array(sweep_data['data_i'])+1j*np.array(sweep_data['data_q'])
+            samples,points,tones = sweep_data['samples'],sweep_data['points'],sweep_data['tones']
+            data_i_bytes = base64.b64decode(sweep_data['data_i'])
+            data_q_bytes = base64.b64decode(sweep_data['data_q'])
+            data_i = np.frombuffer(data_i_bytes, dtype='float64').reshape((samples,points,tones)).copy()
+            data_q = np.frombuffer(data_q_bytes, dtype='float64').reshape((samples,points,tones)).copy()
+            return data_i+1j*data_q
+        else:
+            print(f"Error getting sweep_data: {response['message']}")
+            return response
+
+    def get_sweep_txt(self):
+        message = {'request': 'get_sweep_txt'}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            sweep_txt = response['data']
+            return sweep_txt
+        else:
+            print(f"Error getting sweep_data: {response['message']}")
+            return response
+
+    def parse_sweep_data(self,sweep_data, apply_phase_correction=True):
+        info = sweep_data['system_information']
+        date = sweep_data['date']
+        num_tones = int(sweep_data['num_tones'])
+        num_points = int(sweep_data['num_points'])
+        samples_per_point = int(sweep_data['samples_per_point'])
+        
+        sweep_f_bytes = base64.b64decode(sweep_data['sweep']['f'])
+        sweep_z_bytes = base64.b64decode(sweep_data['sweep']['z'])
+        sweep_e_bytes = base64.b64decode(sweep_data['sweep']['e'])
+        sweep_f = np.frombuffer(sweep_f_bytes, dtype='f8').reshape((num_points, num_tones)).copy()
+        sweep_z = np.frombuffer(sweep_z_bytes, dtype='complex128').reshape((num_points, num_tones)).copy()
+        sweep_e = np.frombuffer(sweep_e_bytes, dtype='complex128').reshape((num_points, num_tones)).copy()
+        #sweep_f = np.frombuffer(sweep_f_bytes, dtype='f8').reshape((num_tones, num_points)).copy()
+        #sweep_z = np.frombuffer(sweep_z_bytes, dtype='complex128').reshape((num_tones, num_points)).copy()
+        #sweep_e = np.frombuffer(sweep_e_bytes, dtype='complex128').reshape((num_tones, num_points)).copy()
+
+        
+        if apply_phase_correction:
+                
+                #get bin indexes
+                udc = self.config['rf_frontend']['connected']
+                lo = self.config['rf_frontend']['tx_mixer_lo_frequency_hz'] if udc else 0.0
+                sb = self.config['rf_frontend']['tx_mixer_sideband'] if udc else 1
+                
+                adcclk = info['adc_clk_hz']
+                dacclk = adcclk
+                dacduc = info['dac_duc_mixer_frequency_hz']
+                dacnyq = info['nyquist_zone_dac0']
+                txnfft = 8192
+                rxnfft = 8192
+                bin_freqs = np.fft.fftfreq(txnfft, 1.0/(dacclk))
+                sorted_indices = np.argsort(bin_freqs)
+                bin_freqs_sorted = bin_freqs[sorted_indices]
+
+                rffreqs = sweep_f
+                iffreqs = sb*(rffreqs-lo)
+                bbfreqs = iffreqs - dacduc
+                bbflat = np.ravel(bbfreqs.swapaxes(0,1))
+                idx = np.searchsorted(bin_freqs_sorted, bbflat)
+                idx = np.clip(idx, 1, 8192 - 1)
+                left = bin_freqs_sorted[idx - 1]
+                right = bin_freqs_sorted[idx]
+                closer_on_right = (bbflat - left) > (right - bbflat)
+                final_indices = sorted_indices[idx - 1 + closer_on_right.astype(int)]
+                bbbins = final_indices.reshape(bbfreqs.swapaxes(0,1).shape).swapaxes(0,1)
+    
+                filterbank_bin_numbers = np.around(bbbins)
+                sweep_z[filterbank_bin_numbers%2==1]*=np.exp(1j*np.pi)
+
+        sweep_i = sweep_z.real
+        sweep_q = sweep_z.imag
+        err_i = sweep_e.real
+        err_q = sweep_e.imag
+
+        # sweep_f = np.array([sweep_data['sweep'][f'{i:04d}']['f'] for i in range(num_tones)])
+        # sweep_i = np.array([sweep_data['sweep'][f'{i:04d}']['i'] for i in range(num_tones)])
+        # sweep_q = np.array([sweep_data['sweep'][f'{i:04d}']['q'] for i in range(num_tones)])
+        # err_i = np.array([sweep_data['sweep'][f'{i:04d}']['ei'] for i in range(num_tones)])
+        # err_q = np.array([sweep_data['sweep'][f'{i:04d}']['eq'] for i in range(num_tones)])
+        # sweep_z = sweep_i + 1j*sweep_q
+        # sweep_e = err_i + 1j*err_q
+        data_dict = {'date': date,
+                        'num_tones': num_tones,
+                        'num_points': num_points,
+                        'samples_per_point': samples_per_point,
+                        'system_information': info,
+                        'sweep_f': sweep_f,
+                        'sweep_i': sweep_i,
+                        'sweep_q': sweep_q,
+                        'sweep_ei': err_i,
+                        'sweep_eq': err_q
+                        }
+        return data_dict
+
+    @staticmethod
+    def export_sweep(filename, sweep_data, file_format='npy'):
+        if not os.path.exists(os.path.dirname(filename)):
+            os.makedirs(os.path.dirname(filename))
+
+        if 'sweep_eq' not in sweep_data.keys():
+            sweep_dict = ReadoutClient.parse_sweep_data(sweep_data)
+        else:
+            sweep_dict = sweep_data
+
+        if file_format == 'npy':
+            np.save(filename.replace('.npy', '')+'.npy', sweep_dict)
+
+        elif file_format == 'json':
+            # Convert numpy arrays to lists for JSON serialization, including nested arrays
+            json_data_dict = {}
+            for key, value in sweep_dict.items():
+                if isinstance(value, dict):
+                    json_data_dict[key] = {
+                        sub_key: sub_value.tolist() if isinstance(sub_value, np.ndarray) else sub_value
+                        for sub_key, sub_value in value.items()
+                    }
+                elif isinstance(value, np.ndarray):
+                    json_data_dict[key] = value.tolist()
+                else:
+                    json_data_dict[key] = value
+
+            with open(filename.replace('.json', '')+'.json', 'w') as file:
+                json.dump(json_data_dict, file, indent=4)
+
+
+        elif file_format == 'csv':
+            with open(filename.replace('.csv', '') + '.csv', mode='w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow(['# date', sweep_dict['date']])
+                writer.writerow(['# num_tones', sweep_dict['num_tones']])
+                writer.writerow(['# num_points', sweep_dict['num_points']])
+                writer.writerow(['# samples_per_point', sweep_dict['samples_per_point']])
+                for key,value in sweep_dict['system_information'].items():
+                    writer.writerow([f'# {key}', value])
+                header = []
+                for k in range(len(sweep_dict['sweep_f'])):
+                    header.extend([f'sweep_f_{k:04d}', f'sweep_i_{k:04d}', f'sweep_q_{k:04d}', f'err_i_{k:04d}', f'err_q_{k:04d}'])
+                writer.writerow(header)
+                for j in range(len(sweep_dict['sweep_f'][0])):
+                    row = []
+                    for i in range(len(sweep_dict['sweep_f'])):
+                        row.extend([
+                            f'{sweep_dict["sweep_f"][i][j]}',
+                            f'{sweep_dict["sweep_i"][i][j]}',
+                            f'{sweep_dict["sweep_q"][i][j]}',
+                            f'{sweep_dict["sweep_ei"][i][j]}',
+                            f'{sweep_dict["sweep_eq"][i][j]}'
+                        ])
+                    writer.writerow(row)
+
+        elif file_format == 'dirfile':
+            raise NotImplementedError("dirfile format not yet implemented.")
+        elif file_format == 'hdf5':
+            raise NotImplementedError("hdf5 format not yet implemented.")
+        else:
+            raise ValueError(f"Invalid file_format {file_format}. Must be one of 'json', 'npy', 'csv', 'dirfile' or 'hdf5'.")
+
+    @staticmethod
+    def import_sweep(filename):
+        sweep_dict={}
+        if filename.endswith('.npy'):
+            sweep_dict = np.load(filename,allow_pickle=True).item()
+
+        elif filename.endswith('.json'):
+            with open(filename,'r') as file:
+                sweep_dict = json.load(file)
+                for item in sweep_dict:
+                    if isinstance(sweep_dict[item],list):
+                        sweep_dict[item] = np.array(sweep_dict[item])
+                    if isinstance(sweep_dict[item],dict):
+                        for sub_item in sweep_dict[item]:
+                            if isinstance(sweep_dict[item][sub_item],list):
+                                sweep_dict[item][sub_item] = np.array(sweep_dict[item][sub_item])
+                            if isinstance(sweep_dict[item][sub_item],dict):
+                                for sub_sub_item in sweep_dict[item][sub_item]:
+                                    if isinstance(sweep_dict[item][sub_item][sub_sub_item],list):
+                                        sweep_dict[item][sub_item][sub_sub_item] = np.array(sweep_dict[item][sub_item][sub_sub_item])
+
+        elif filename.endswith('.csv'):
+            with open(filename, mode='r') as file:
+                lines=file.readlines()
+                header_lines=0
+                for line in lines:
+                    if line.startswith('#'):
+                        header_lines+=1
+                        key = line.split(',')[0].lstrip('# ')
+                        value = line[line.find(',')+1:].strip()
+                        if key=='date':
+                            value = value
+                        elif key=='fpg_file':
+                            value = value # Trying to eval a string like /home/casper/src/souk-firmware/firmware/src/souk_single_pipeline_krm/outputs/souk_single_pipeline_krm_2025-06-12_1346.fpg causes an error. 
+                        elif value.startswith('"') and value.endswith('"'):
+                            value = eval(value[1:-1])
+                        else:
+                            try:
+                                value = eval(value)
+                            except NameError:
+                                value = value
+                        sweep_dict[key] = value
+
+            data = np.genfromtxt(filename, delimiter=',',names=True,skip_header=header_lines)
+            print('Shape: '+str(np.shape(data)))
+            num_tones = sweep_dict['num_tones']
+            num_points = sweep_dict['num_points']
+            #samples_per_point = sweep_dict['samples_per_point']
+            sweep_f = np.array([data[f'sweep_f_{i:04d}'] for i in range(num_points)])
+            sweep_i = np.array([data[f'sweep_i_{i:04d}'] for i in range(num_points)])
+            sweep_q = np.array([data[f'sweep_q_{i:04d}'] for i in range(num_points)])
+            err_i = np.array([data[f'err_i_{i:04d}'] for i in range(num_points)])
+            err_q = np.array([data[f'err_q_{i:04d}'] for i in range(num_points)])
+            sweep_dict['sweep_f'] = sweep_f
+            sweep_dict['sweep_i'] = sweep_i
+            sweep_dict['sweep_q'] = sweep_q
+            sweep_dict['sweep_ei'] = err_i
+            sweep_dict['sweep_eq'] = err_q
+
+        elif filename.endswith('.hdf5'):
+            raise NotImplementedError("hdf5 format not yet implemented.")
+        elif os.path.endswith('.dirfile'):
+            raise NotImplementedError("dirfile format not yet implemented.")
+        else:
+            raise ValueError(f"Invalid file format {filename.split('.')[-1]}")
+
+        return sweep_dict
+
+
+    def mock_fill_data_buffer(self, num_tones):
+        max_tones = 2048
+        
+        # Fill I and Q fields with random data.
+        for i in range(num_tones*2):
+            self.mock_data_buffer[4*i:4*i+4] = random.randbytes(4)
+            
+        # Fill the rest of the 2048*2 space with zeros
+        for i in range(num_tones*2,max_tones*2):
+            self.mock_data_buffer[4*i:4*i+4] = bytes.fromhex('00000000')
+        
+        # 8 flags
+        for i in range(max_tones*2,max_tones*2 +8):
+            self.mock_data_buffer[4*i:4*i+4] = bytes.fromhex('00000000') 
+        # cnt    
+        self.mock_data_buffer[-8:-4] = self.mock_data_count.to_bytes(4,byteorder='little')  
+        # err
+        self.mock_data_buffer[-4:] = bytes.fromhex('00000000')
+        
+    def receive_stream(self, num_tones=2048, filename=None,print_data=False):
+        self.mock_data_count = 0
+        #data = bytearray(2048*2*4 + 10*4)
+        #view = memoryview(data)
+        iq_data=None
+        if filename is None:
+            filename =os.path.join(USER_TMP_DIR,'tmp_stream')
+        if not os.path.exists(os.path.dirname(filename)):
+            os.makedirs(os.path.dirname(filename))
+        info = self.get_system_information()
+
+        metadata = {}
+        metadata['date'] = time.strftime('%Y-%m-%d %H:%M:%S UTC%z')
+        metadata['num_tones'] = num_tones
+        metadata['sample_rate'] = self.get_sample_rate()
+        metadata['format'] = '<i4'
+        metadata['index_err'] = 2*num_tones-1+10
+        metadata['index_cnt'] = 2*num_tones-1+9
+        metadata['index_flag_7'] = 2*num_tones-1+8
+        metadata['index_flag_6'] = 2*num_tones-1+7
+        metadata['index_flag_5'] = 2*num_tones-1+6
+        metadata['index_flag_4'] = 2*num_tones-1+5
+        metadata['index_flag_3'] = 2*num_tones-1+4
+        metadata['index_flag_2'] = 2*num_tones-1+3
+        metadata['index_flag_1'] = 2*num_tones-1+2
+        metadata['index_flag_0'] = 2*num_tones-1+1
+        metadata['ordering'] = 'I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, Q_tone1_sample0,..flags, cnt, err .'
+        metadata['system_information'] = info
+
+        with open(filename+'.json','w') as file:
+            json.dump(metadata,file,indent=4)
+            
+        with open(filename, 'wb') as file:
+            print(f"Writing data to {filename}")
+            t0=time.time()
+            count=0
+            
+            while True:
+                try:
+                    # Get Mocked Random data
+                    datalen = 2048*2*4 + 10*4
+                    self.mock_fill_data_buffer(num_tones)
+                    self.mock_data_count +=1
+                    file.write(self.mock_data_buffer[:num_tones*2*4]) # data
+                    file.write(self.mock_data_buffer[-40:]) # extras
+                    count+=1
+
+                    if print_data:
+                        i = np.frombuffer(self.mock_data_buffer[:datalen][::2], dtype='<i4')[:num_tones]
+                        q = np.frombuffer(self.mock_data_buffer[:datalen][1::2], dtype='<i4')[:num_tones]
+                        err = np.frombuffer(self.mock_data_buffer[-4:], dtype='<i4')
+                        cnt = np.frombuffer(self.mock_data_buffer[-8:-4], dtype='<i4')
+                        flags = np.frombuffer(self.mock_data_buffer[-40:-8], dtype='<i4')
+                        iq_data=i+1j*q
+                        print(f"Received IQ data: {err} {cnt} {iq_data.tolist()}\r",end='',flush=True)
+                except KeyboardInterrupt:
+                    break
+
+                except Exception as e:
+                    print(f"Error receiving stream data: {e}")
+                    print(traceback.format_exc())
+                    break
+
+        t1=time.time()
+        print()
+        print(f"Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
+        return iq_data
+
+    def receive_stream_g3(self, num_tones=2048, filename=None,print_data=False):
+        ''' JL: Receives a data stream and write it to a g3 file'''
+        self.mock_data_count = 0
+        # JL: Level 1 data shows this is typically around 400
+        num_sample_rows_per_frame = 400
+        iq_data=None
+        if filename is None:
+            filename ='./tmp/tmp_stream'
+        if not os.path.exists('./tmp'):
+            os.makedirs('./tmp')
+
+        info = self.get_system_information()
+
+        metadata = {}
+        metadata['date'] = time.strftime('%Y-%m-%d %H:%M:%S UTC%z')
+        metadata['num_tones'] = num_tones
+        metadata['sample_rate'] = self.get_sample_rate()
+        metadata['format'] = '<i4'
+        metadata['system_information'] = info
+
+        # JL setting similar to Smurf at the the moment - some of our primary names won't exist. 
+        primary_names = [
+        'UnixTime', 'FluxRampIncrement', 'FluxRampOffset', 'Counter0',
+        'Counter1', 'Counter2', 'AveragingResetBits', 'FrameCounter',
+        'TESRelaySetting']
+        primary_idxs = {name: idx for idx, name in enumerate(primary_names)}
+
+        # JL Indexing below strips the assumed .g3 extension from the supplied filename and replaces it with .json
+        # pdb.set_trace()
+        with open(filename[:-3]+'.json','w') as file:
+            json.dump(metadata,file,indent=4)
+        
+        with core.G3Writer(filename=filename) as writer:
+            print(f"Writing data to {filename}")
+            t0=time.time()
+            frame_count=0 # Counter for total number of frames (each of  length num_sample_rows_per_frame) written/
+            count = 0    # counter for total number of packets (data rows) received.
+            row_frame_count =0 # Counter for number of packets received within the frame so far.
+            ppid = os.getppid()
+
+            key_interupt = False
+            while True:
+              start = time.time() # JL will be ultimately derived from the PTP data in the packets
+              while True:
+                  try: 
+                    # Get Mocked Random data
+                    datalen = 2048*2*4 + 10*4
+                    self.mock_fill_data_buffer(num_tones)
+                    self.mock_data_count +=1
+                    count+=1
+                    #############################################
+                    # JL Pickout out data from the bufferm contruct a 1-D "row" transfomar into a column vector
+                    # then hstack to build up the 2-D data_frame_buffer
+                    # Example row structure:
+                    # i_data_0000,q_data_0000,i_data_0001,q_data_0001,i_data_0002,q_data_0002,i_data_0003,q_data_0003,i_data_0004,q_data_0004,i_data_0005,q_data_0005,i_data_0006
+                    # ,q_data_0006,packet_counter,packet_error,flag0,flag1,flag2,flag3,flag4,flag5,flag6,flag7
+                    # Number of columns in a row =
+                    # iq_data = num_tones * 2
+                    # cnt = 1
+                    # err = 1
+                    # flags = 8
+                    # = num_tones*2 + 10
+                    iq_data = np.frombuffer(self.mock_data_buffer[:datalen][::1], dtype='<i4')[:2*num_tones]
+                    cnt = np.frombuffer(self.mock_data_buffer[-8:-4], dtype='<i4')
+                    err = np.frombuffer(self.mock_data_buffer[-4:], dtype='<i4')
+                    flags = np.frombuffer(self.mock_data_buffer[-40:-8], dtype='<i4')
+                    full_row = np.concatenate((iq_data, cnt, err, flags), axis=0)
+                    full_row = full_row.reshape(-1,1) # make into column vector
+                    if row_frame_count==0:
+                        data_frame_buffer = full_row
+                    else:
+                        data_frame_buffer = np.hstack((data_frame_buffer,full_row))
+                    #print('##############################')
+                    #print(f"Frame is {data_frame_buffer}")
+                    #print("Shape is ", np.shape(data_frame_buffer)) 
+                    #print(f"Frame is {data_frame_buffer}\r", end='', flush=True)                       
+                    count+=1
+                    row_frame_count+=1
+
+                    if (row_frame_count==num_sample_rows_per_frame):
+                        size_of_this_frame = row_frame_count
+                        row_frame_count = 0
+                        # Frame is full, reset counter and exit the loop
+                        break
+
+                    if print_data:
+                        i = np.frombuffer(self.mock_data_buffer[:datalen][::2], dtype='<i4')[:num_tones]
+                        q = np.frombuffer(self.mock_data_buffer[:datalen][1::2], dtype='<i4')[:num_tones]
+                        err = np.frombuffer(self.mock_data_buffer[-4:], dtype='<i4')
+                        cnt = np.frombuffer(self.mock_data_buffer[-8:-4], dtype='<i4')
+                        flags = np.frombuffer(self.mock_data_buffer[-40:-8], dtype='<i4')
+                        iq_data=i+1j*q
+                        print(f"datalen {datalen} row frame count {row_frame_count} Received IQ data: {err} {cnt} {iq_data.tolist()} \r",end='',flush=True)
+
+                  except KeyboardInterrupt:
+                    size_of_this_frame = row_frame_count
+                    key_interupt = True
+                    break
+
+                  except Exception as e:
+                    size_of_this_frame = row_frame_count 
+                    print(f"Error receiving stream data: {e}")
+                    print(traceback.format_exc())
+                    break
+
+
+              # End of data frame buffer contruction loop
+
+              if key_interupt:
+                  break
+
+              fr = core.G3Frame(core.G3FrameType.Scan)
+              sample_rate = metadata['sample_rate']
+              #Setup the 1-D time array for the data part of the frame
+              times =np.linspace(start,start+(size_of_this_frame)/sample_rate, size_of_this_frame) # JL Utimately will be from PTP within packets
+              g3times = core.G3VectorTime(times * core.G3Units.s)
+
+              chans = np.arange(num_tones)
+              # Set up the row descriptive names for the data part of the frame
+              names=['_']*(2*num_tones+1+1+8) # 1 cnt column, 1 err column, 8 flags
+              names[0:2*len(chans):2] = [f'i{ch:0>4}' for ch in chans] # i followed by zero padded 4 digit channel (tone) number 
+              names[1:2*len(chans):2] = [f'q{ch:0>4}' for ch in chans] # q followed by zero padded 4 digit channel (tone) number
+              names[num_tones*2:num_tones*2+8] =  [f'flag{flag}' for flag in list(range(1,9))]  # "flag0" to "flag7" 
+              names[num_tones*2+8] = 'cnt'
+              names[num_tones*2+9] = 'err'
+
+              #pdb.set_trace()
+              # Write the data frame - row names (len = 2*num_tones + 10), times (len = size_of_this_frame), 2-D data_frame_buffer  = len(row_names) * len(times).          
+              fr['data'] = so3g.G3SuperTimestream(names, g3times, data_frame_buffer)
+              #pdb.set_trace()
+              # This is purely a counter of how much data is in the frame - look at cnt to see if packets have been dropped.
+              frame_counter = np.arange(0,size_of_this_frame, dtype=int)  
+              primary_data = np.zeros((len(primary_names), size_of_this_frame), dtype=np.int64)
+              primary_data[primary_idxs['UnixTime'], :] = (times * 1e9).astype(int)
+              primary_data[primary_idxs['FrameCounter'], :] = frame_counter
+              fr['primary'] = so3g.G3SuperTimestream(primary_names, g3times, primary_data)
+
+              fr['timing_paradigm'] = 'High Precision'
+              fr['num_samples'] = size_of_this_frame # per frame
+              fr['frame_num'] = frame_count # JL Numbering from 0
+              fr['session_id'] = int(start) # Unix start time in whole seconds 
+              fr['sostream_id'] = 'ukkid_1' # JL This ultimately comes from the OCS agent that starts up the taks
+              fr['sostream_version'] = 2    # JL Again, should probably mean something different in our case.
+              fr['time'] = core.G3Time(time.time() * core.G3Units.s) # JL Presumably meant to be the time when frame is written out, not the timestamp of the first element of the frame??
+              writer(fr)
+              frame_count+=1
+
+
+        t1=time.time()
+        print()
+        print(f"Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
+        return iq_data
+
+
+    
+
+    def receive_triggered_stream(self, num_tones=2048, filename=None,print_data=False):
+        data = bytearray(4096*4 + 10*4)
+        view = memoryview(data)
+        if filename is None:
+            filename =os.path.join(USER_TMP_DIR,'tmp_triggered_stream')
+        if not os.path.exists(os.path.dirname(filename)):
+            os.makedirs(os.path.dirname(filename))
+
+        info = self.get_system_information()
+
+        metadata = {}
+        metadata['date'] = time.strftime('%Y-%m-%d %H:%M:%S UTC%z')
+        metadata['num_tones'] = num_tones
+        metadata['sample_rate'] = self.get_sample_rate()
+        metadata['format'] = '<i4'
+        metadata['index_err'] = 2*num_tones-1+10
+        metadata['index_cnt'] = 2*num_tones-1+9
+        metadata['index_flag_7'] = 2*num_tones-1+8
+        metadata['index_flag_6'] = 2*num_tones-1+7
+        metadata['index_flag_5'] = 2*num_tones-1+6
+        metadata['index_flag_4'] = 2*num_tones-1+5
+        metadata['index_flag_3'] = 2*num_tones-1+4
+        metadata['index_flag_2'] = 2*num_tones-1+3
+        metadata['index_flag_1'] = 2*num_tones-1+2
+        metadata['index_flag_0'] = 2*num_tones-1+1
+        metadata['ordering'] = 'I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, Q_tone1_sample0,..flags, cnt, err .'
+        metadata['system_information'] = info
+
+        with open(filename+'.json','w') as file:
+            json.dump(metadata,file,indent=4)
+
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((self.stream_server_address, self.stream_server_port))
+            with open(filename, 'wb') as file:
+                print(f"Writing data to {filename}")
+                t0=time.time()
+                count=0
+                ppid = os.getppid()
+                while True:
+                    try:
+                        #quit if parent no longer exists
+                        if os.getppid() != ppid:
+                            break
+
+                        # Read data length
+                        raw_datalen = s.recv(4)
+                        if not raw_datalen:
+                            break
+                        datalen = struct.unpack('>I', raw_datalen)[0]
+                        received_len = 0
+                        while received_len < datalen:
+                            packet_len = s.recv_into(view[received_len:], datalen - received_len)
+                            if packet_len == 0:
+                                break
+                            received_len += packet_len
+                        if received_len < datalen:
+                            print(f"Expected {datalen} bytes, but only received {received_len} bytes.")
+                            break
+                        # file.write(data) # whole frame
+                        # file.write(data[-1]) #err
+                        # file.write(data[-2]) #cnt
+                        # file.write(data[:num_tones*2*4]) #data
+
+                        file.write(data[:num_tones*2*4]) # data
+                        file.write(data[-40:]) # extras
+                        count+=1
+
+                        if print_data:
+                            i = np.frombuffer(data[:datalen][::2], dtype='<i4')[:num_tones]
+                            q = np.frombuffer(data[:datalen][1::2], dtype='<i4')[:num_tones]
+                            err = np.frombuffer(data[-4:], dtype='<i4')
+                            cnt = np.frombuffer(data[-8:-4], dtype='<i4')
+                            flags = np.frombuffer(data[-40:-8], dtype='<i4')
+                            iq_data=i+1j*q
+                            print(f"Received IQ data: {err} {cnt} {iq_data.tolist()}\r",end='',flush=True)
+                    except KeyboardInterrupt:
+                        break
+                    except Exception as e:
+                        print(f"Error receiving triggered stream data: {e}")
+                        print(traceback.format_exc())
+                        break
+
+                t1=time.time()
+                print()
+                print(f"Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
+                s.close()
+
+    @staticmethod
+    def parse_stream(filename):
+        with open(filename+'.json','r') as file:
+            metadata = json.load(file)
+        date = metadata['date']
+        num_tones = metadata['num_tones']
+        sample_rate = metadata['sample_rate']
+        format = metadata['format']
+        index_err = metadata['index_err']
+        index_cnt = metadata['index_cnt']
+        index_flag_0 = metadata['index_flag_0']
+        index_flag_7 = metadata['index_flag_7']
+        info = metadata['system_information']
+
+        data = np.fromfile(filename,dtype=format)
+        data = data.reshape(-1,2*num_tones+10).swapaxes(0,1)
+        num_samples = data.shape[1]
+
+        err = data[index_err]
+        cnt = data[index_cnt]
+        flags = data[index_flag_0:index_flag_7+1]
+
+        i_data = data[:2*num_tones:2]
+        q_data = data[1:2*num_tones:2]
+        # iq_data = iq_data[::2]+1j*iq_data[1::2]
+        data_dict = {'date':date,
+                     'num_tones':num_tones,
+                     'num_samples':num_samples,
+                     'sample_rate':sample_rate,
+                     'system_information':info,
+                     'i_data':{f'{i:04d}':i_data[i] for i in range(num_tones)},
+                     'q_data':{f'{i:04d}':q_data[i] for i in range(num_tones)},
+                     'packet_counter':cnt,
+                     'packet_error':err,
+                     'stream_flags':{f'flag{i}':flags[i] for i in range(8)}
+                     }
+        return data_dict
+
+    @staticmethod
+    def export_stream_data(filename,data_dict,file_format='npy'):
+
+        date = data_dict['date']
+        num_tones = data_dict['num_tones']
+        num_samples = data_dict['num_samples']
+        sample_rate = data_dict['sample_rate']
+        info = data_dict['system_information']
+        i_data = data_dict['i_data']
+        q_data = data_dict['q_data']
+        cnt = data_dict['packet_counter']
+        err = data_dict['packet_error']
+        flags = data_dict['stream_flags']
+
+        # metadata = data_dict['metadata']
+
+        if file_format == 'npy':
+            np.save(filename.rstrip('.npy') + '.npy', data_dict)
+
+        elif file_format == 'json':
+            # Convert numpy arrays to lists for JSON serialization, including nested arrays
+            json_data_dict = {}
+            for key, value in data_dict.items():
+                if isinstance(value, dict):
+                    json_data_dict[key] = {
+                        sub_key: sub_value.tolist() if isinstance(sub_value, np.ndarray) else sub_value
+                        for sub_key, sub_value in value.items()
+                    }
+                elif isinstance(value, np.ndarray):
+                    json_data_dict[key] = value.tolist()
+                else:
+                    json_data_dict[key] = value
+
+            with open(filename.rstrip('.json') + '.json', 'w') as file:
+                json.dump(json_data_dict, file)
+
+        elif file_format == 'csv':
+            with open(filename.rstrip('.csv') + '.csv', mode='w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow(['# date', date])
+                writer.writerow(['# num_tones', num_tones])
+                writer.writerow(['# num_samples', num_samples])
+                writer.writerow(['# sample_rate',sample_rate])
+                for key,value in info.items():
+                    writer.writerow([f'# {key}', value])
+
+                header = []
+                header.extend(['packet_counter', 'packet_error'])
+                header.extend([f'flag{i}' for i in range(8)])
+                for i in range(data_dict['num_tones']):
+                    header.extend([f'i_{i:04d}'])
+                    header.extend([f'q_{i:04d}'])
+
+                writer.writerow(header)
+                # Write the data rows
+                for j in range(data_dict['num_samples']):
+                    row = []
+                    row.append(data_dict['packet_counter'][j])
+                    row.append(data_dict['packet_error'][j])
+                    row.extend([data_dict['stream_flags'][f'flag{k}'][j] for k in range(8)])
+                    for i in range(data_dict['num_tones']):
+                        row.extend([data_dict['i_data'][f'{i:04d}'][j]])
+                        row.extend([data_dict['q_data'][f'{i:04d}'][j]])
+                    writer.writerow(row)
+
+        elif file_format == 'dirfile':
+            raise NotImplementedError("dirfile format not yet implemented.")
+        elif file_format == 'hdf5':
+            raise NotImplementedError("hdf5 format not yet implemented.")
+        else:
+            raise ValueError(f"Invalid file_format {file_format}. Must be one of 'npy', 'json', 'csv', 'dirfile', or 'hdf5'.")
+
+    @staticmethod
+    def import_stream_data(filename):
+        data_dict={}
+        if filename.endswith('.npy'):
+            data_dict = np.load(filename,allow_pickle=True).item()
+        elif filename.endswith('.json'):
+            with open(filename,'r') as file:
+                data_dict = json.load(file)
+                for item in data_dict:
+                    if isinstance(data_dict[item],list):
+                        data_dict[item] = np.array(data_dict[item])
+                    if isinstance(data_dict[item],dict):
+                        for sub_item in data_dict[item]:
+                            if isinstance(data_dict[item][sub_item],list):
+                                data_dict[item][sub_item] = np.array(data_dict[item][sub_item])
+                            if isinstance(data_dict[item][sub_item],dict):
+                                for sub_sub_item in data_dict[item][sub_item]:
+                                    if isinstance(data_dict[item][sub_item][sub_sub_item],list):
+                                        data_dict[item][sub_item][sub_sub_item] = np.array(data_dict[item][sub_item][sub_sub_item])
+        elif filename.endswith('.csv'):
+            with open(filename, mode='r') as file:
+                lines=file.readlines()
+                header_lines=0
+                for line in lines:
+                    if line.startswith('#'):
+                        header_lines+=1
+                        key = line.split(',')[0].lstrip('# ')
+                        value = line[line.find(',')+1:].strip()
+                        if key=='date':
+                            value = value
+                        elif value.startswith('"') and value.endswith('"'):
+                            value = eval(value[1:-1])
+                        else:
+                            try:
+                                value = eval(value)
+                            except NameError:
+                                value = value
+                        data_dict[key] = value
+
+            data = np.genfromtxt(filename, delimiter=',',names=True,skip_header=header_lines)
+            i_data = {f'{i:04d}':data[f'i_{i:04d}'] for i in range(data_dict['num_tones'])}
+            q_data = {f'{i:04d}':data[f'q_{i:04d}'] for i in range(data_dict['num_tones'])}
+            data_dict['i_data'] = i_data
+            data_dict['q_data'] = q_data
+            data_dict['packet_counter'] = data['packet_counter']
+            data_dict['packet_error'] = data['packet_error']
+            data_dict['stream_flags'] = {f'flag{i}':data[f'flag{i}'] for i in range(8)}
+
+        elif filename.endswith('.hdf5'):
+            raise NotImplementedError("hdf5 format not yet implemented.")
+        elif os.path.endswith('.dirfile'):
+            raise NotImplementedError("dirfile format not yet implemented.")
+        else:
+            raise ValueError(f"Invalid file format {filename.split('.')[-1]}")
+        return data_dict
+
+    @staticmethod
+    def generate_random_phases(freqs):
+        """
+        Generate random phases for a set of frequencies.
+        """
+        return np.random.uniform(0,2*np.pi,len(freqs))
+    
+    @staticmethod
+    def generate_newman_phases(freqs):
+        """
+        Generate the Newman phases for a set of frequencies.
+
+        If frequencies are exactly evenly spaced, the crest factor is minimised.
+
+        If the frequency spacing is not exactly equal, the phases are offset to account for the spacing. For largely varying spacings, this method is pretty much the same as picking random frequencies.
+
+        """
+        n=len(freqs)
+        freqs=np.atleast_1d(freqs)
+        freqssorted = np.sort(freqs)
+        k = (freqs-freqssorted[0]) / (freqssorted[-1] - freqssorted[0])*(len(freqs)-1)
+        #k should range from 0 to n-1, and elements are proportional to the frequencies
+        return np.pi*k**2/n
+
+    @staticmethod
+    def calculate_frequency_and_dissipation_noise(sweep_frequencies,sweep_complex_data,timestream_tone_frequency,timestream_complex_data,smooth_window_hz=1000):
+        """
+        Calculate the fractional frequency and dissipation noise timestreams from a sweep and complex timestream data.
+        Valid only for small frequency and dissipation shifts close to the tone frequency.
+
+        Parameters
+        ----------
+        sweep_frequencies : array
+            The frequencies of the tone in the sweep.
+        sweep_complex_data : array
+            The complex data of the tone in the sweep.
+        timestream_tone_frequency : float
+            The frequency of the tone in the timestream
+        timestream_complex_data : array
+            The complex timestream data.
+        smooth_window_hz : float, optional
+            The window size for a Savitzky-Golay filter with poly-order=1. The default is 1000 Hz.
+            The filter is applied to the sweep data to improve the estimate of the gradient.
+            Timestram data is not smoothed.        
+
+        Returns
+        -------
+        fractional_frequency_noise : array
+            The fractional frequency noise timestream.
+        fractional_dissipation_noise : array
+            The fractional dissipation noise timestream.
+        si0 : float
+            The in-phase component of the smoothed sweep at the tone frequency.
+        sq0 : float
+            The quadrature component of the smoothed sweep at the tone frequency.
+        didf : float
+            The gradient of the in-phase component of the smoothed sweep at the tone frequency.
+        dqdf : float
+            The gradient of the quadrature component of the smoothed sweep at the tone frequency.
+        """
+        
+        # # Find the index of the tone frequency in the sweep frequencies
+        # tone_index = np.argmin(np.abs(sweep_frequencies-tone_frequency))
+        # Note: now using interpolation instead of finding the closest frequency
+
+        # Shorthands for the real and imaginary parts of the sweep and timestream data
+        si = sweep_complex_data.real
+        sq = sweep_complex_data.imag
+        ti = timestream_complex_data.real
+        tq = timestream_complex_data.imag
+
+        #smooth the sweep data
+        if smooth_window_hz:
+            window_samples = max(3,int(smooth_window_hz/(sweep_frequencies[1]-sweep_frequencies[0])))
+            si = signal.savgol_filter(si, window_samples,1)
+            sq = signal.savgol_filter(sq, window_samples,1)
+            sz = si+1j*sq
+        else:
+            sz = sweep_complex_data
+        
+        # Calculate the gradient of the complex sweep data wrt the sweep frequencies 
+        grad = np.gradient(sz,sweep_frequencies)
+
+        # Calculate values at the tone frequency (with interpolation)
+        # i0 = si[tone_index]
+        # q0 = sq[tone_index]
+        # didf = grad[tone_index].real
+        # dqdf = grad[tone_index].imag
+        si0 = np.interp(timestream_tone_frequency,sweep_frequencies,sz.real)
+        sq0 = np.interp(timestream_tone_frequency,sweep_frequencies,sz.imag)
+        didf = np.interp(timestream_tone_frequency,sweep_frequencies,grad.real)
+        dqdf = np.interp(timestream_tone_frequency,sweep_frequencies,grad.imag)
+
+
+        #Compute the frequency and dissipation timestreams
+        divisor = didf**2 + dqdf**2
+        frequency_noise = ((si0 - ti) * didf + (sq0 - tq) * dqdf) / divisor
+        dissipation_noise = ((sq0 - tq) * didf - (si0 - ti) * dqdf) / divisor
+
+        #Scale by the tone frequency to get fractional frequency and fractional dissipation
+        fractional_frequency_noise = frequency_noise/timestream_tone_frequency
+        fractional_dissipation_noise = dissipation_noise/timestream_tone_frequency
+
+        return fractional_frequency_noise, fractional_dissipation_noise, si0, sq0, didf, dqdf
+    
+
+
+if __name__=='__main__':
+    config_file = sys.argv[1]
+    if not config_file:
+        print(f'No config file specified. Using default from {DEFAULT_CONFIG}.')
+        config_file = DEFAULT_CONFIG
+    client = ReadoutClient(config_file=config_file)
+    print('Starting triggered stream...')
+    client.enable_triggered_stream()
+    try:
+        client.receive_triggered_stream()
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"Error receiving triggered stream data: {e}")
+    finally:
+        pass
+    sys.exit(0)
+
+"""
+# Example usage
+client = ReadoutClient(config_file='config/config.yaml')
+
+# Get a parameter
+sample_rate_hz = client.get_parameter('sample_rate_hz')
+print(f"Sample rate, Hz: {sample_rate_hz}")
+
+# Set a parameter
+set_result = client.set_parameter('nyquist_zone', 2)
+print(f"Set result: {set_result}")
+
+# Initialize the firmware
+initialize_result = client.initialize_firmware()
+print(f"Initialize firmware result: {initialize_result}")
+
+# Enable continuous streaming
+enable_stream_result = client.enable_stream()
+print(f"Enable stream result: {enable_stream_result}")
+
+# Disable continuous streaming
+disable_stream_result = client.disable_stream()
+print(f"Disable stream result: {disable_stream_result}")
+
+# Enable triggered streaming
+enable_triggered_stream_result = client.enable_triggered_stream()
+print(f"Enable triggered stream result: {enable_triggered_stream_result}")
+
+# Disable triggered streaming
+disable_triggered_stream_result = client.disable_triggered_stream()
+print(f"Disable triggered stream result: {disable_triggered_stream_result}")
+
+# Perform a retune
+retune_result = client.perform_retune(1.5e9, 1e6, 101, 10)
+print(f"Retune result: {retune_result}")
+
+# Stream a finite number of samples
+client.get_samples(10)
+
+# Cancel tasks
+cancel_result = client.cancel_tasks()
+print(f"Cancel result: {cancel_result}")
+
+"""
