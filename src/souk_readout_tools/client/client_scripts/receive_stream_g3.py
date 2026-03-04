@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-This script is used to receive a continuous stream of data from the readout server and save it to a file.
+This script is used to receive a continuous stream of data from the readout server and save it to a _g3 file.
 """
 
 import sys
@@ -22,20 +22,24 @@ def main():
     signal.signal(signal.SIGINT, handle_signal)  # Handle Ctrl+C
     signal.signal(signal.SIGTERM, handle_signal)  # Handle termination
 
-    parser = argparse.ArgumentParser(description='Start saving a continuos stream of data from the readout server to a file')
+    parser = argparse.ArgumentParser(description='Start saving a continuous stream of data from the readout server to a file')
     parser.add_argument('-n', '--num_tones', type=int, default=2048, help='Number of tones to receive, default is all 2048. Save disk space by specifying the actual number of tones')
     parser.add_argument('-d', '--directory', type=str, default='./tmp', help='Directory where the file will be saved, default is ./tmp')
     parser.add_argument('-f', '--filename', type=str, default='tmp_stream', help='Filename to save the data to, default is tmp_stream')
     parser.add_argument('-p', '--print_data', action='store_true', help='Prints out the data to the console')
+    parser.add_argument('-m', '--mock', type=str, default='F', help='Set to T or F for mocked (simulated) operation.')
 
     args  = parser.parse_args()
 
     print("receiving stream with args: ", args)
 
-    import readout_client
 
+    if args.mock == "F":
+     import readout_client
+    else:
+     import mock_readout_client as readout_client
+     
     client = readout_client.ReadoutClient()
-
     client.receive_stream_g3(print_data=args.print_data,
                           num_tones=args.num_tones,
                           filename=os.path.join(args.directory,args.filename))
