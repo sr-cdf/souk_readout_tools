@@ -72,12 +72,15 @@ import random
 from scipy import signal
 import pdb
 import so3g
+import logging
 from spt3g import core
 USER_CALIBRATIONS_DIR = os.path.expanduser('~/.souk_readout_tools/calibrations')
 USER_CONFIG_DIR = os.path.expanduser('~/.souk_readout_tools/config')
 USER_TMP_DIR = os.path.expanduser('~/.souk_readout_tools/tmp')
 
 DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR,'default_config.lnk')
+
+logger = logging.getLogger(__name__)
 
 class ReadoutClient:
     def __init__(self,config_file=None):
@@ -1081,6 +1084,13 @@ class ReadoutClient:
         if not os.path.exists('./tmp'):
             os.makedirs('./tmp')
 
+
+        # Set up logging                                         
+        pid = os.getpid()
+        # Assumes input filename ends in '.g3'
+        log_filename = filename[:-3]+'_log_'+str(pid)+'.log'
+        logging.basicConfig(filename=log_filename, level=logging.INFO,format='%(asctime)s : %(levelname)s : %(message)s')
+    
         info = self.get_system_information()
 
         metadata = {}
@@ -1101,9 +1111,13 @@ class ReadoutClient:
         # pdb.set_trace()
         with open(filename[:-3]+'.json','w') as file:
             json.dump(metadata,file,indent=4)
-        
+
+        logger.info('MOCK: Wrote JSON header to '+filename[:-3]+'.json')
+        logger.info('MOCK: (Not really) Preparing to receive TCP/IP data from : '+ self.stream_server_address +':'+ str(self.stream_server_port))
+    
         with core.G3Writer(filename=filename) as writer:
-            print(f"Writing data to {filename}")
+            logger.info(f"MOCK: Writing data to {filename}")
+            print(f"MOCK: Writing data to {filename}")
             t0=time.time()
             frame_count=0 # Counter for total number of frames (each of  length num_sample_rows_per_frame) written/
             count = 0    # counter for total number of packets (data rows) received.
@@ -1111,6 +1125,8 @@ class ReadoutClient:
             ppid = os.getppid()
 
             key_interupt = False
+            general_exception = False
+
             while True:
               start = time.time() # JL will be ultimately derived from the PTP data in the packets
               while True:
@@ -1170,16 +1186,19 @@ class ReadoutClient:
                     break
 
                   except Exception as e:
-                    size_of_this_frame = row_frame_count 
-                    print(f"Error receiving stream data: {e}")
+                    size_of_this_frame = row_frame_count
+                    general_exception = True
+                    logger.error(f"MOCK: Error receiving stream data: {e}")
+                    logger.error(traceback.format_exc())
+                    print(f"MOCK: Error receiving stream data: {e}")
                     print(traceback.format_exc())
                     break
 
 
               # End of data frame buffer contruction loop
 
-              if key_interupt:
-                  break
+              if key_interupt or general_exception:
+                    break
 
               fr = core.G3Frame(core.G3FrameType.Scan)
               sample_rate = metadata['sample_rate']
@@ -1220,7 +1239,8 @@ class ReadoutClient:
 
         t1=time.time()
         print()
-        print(f"Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
+        print(f"MOCK: Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
+        logger.info(f"MOCK: Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
         return iq_data
 
 
