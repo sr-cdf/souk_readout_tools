@@ -70,12 +70,15 @@ import base64
 from scipy import signal
 import pdb
 import so3g
+import logging
 from spt3g import core
 USER_CALIBRATIONS_DIR = os.path.expanduser('~/.souk_readout_tools/calibrations')
 USER_CONFIG_DIR = os.path.expanduser('~/.souk_readout_tools/config')
 USER_TMP_DIR = os.path.expanduser('~/.souk_readout_tools/tmp')
 
 DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR,'default_config.lnk')
+
+logger = logging.getLogger(__name__)
 
 class ReadoutClient:
     def __init__(self,config_file=None):
@@ -793,7 +796,7 @@ class ReadoutClient:
                     writer.writerow([f'# {key}', value])
                 header = []
                 for k in range(len(sweep_dict['sweep_f'])):
-                    header.extend([f'#sweep_f_{k:04d}', f'sweep_i_{k:04d}', f'sweep_q_{k:04d}', f'err_i_{k:04d}', f'err_q_{k:04d}'])
+                    header.extend([f'sweep_f_{k:04d}', f'sweep_i_{k:04d}', f'sweep_q_{k:04d}', f'err_i_{k:04d}', f'err_q_{k:04d}'])
                 writer.writerow(header)
                 for j in range(len(sweep_dict['sweep_f'][0])):
                     row = []
@@ -846,6 +849,8 @@ class ReadoutClient:
                         value = line[line.find(',')+1:].strip()
                         if key=='date':
                             value = value
+                        elif key=='fpg_file':
+                            value = value # Trying to eval a string like /home/casper/src/souk-firmware/firmware/src/souk_single_pipeline_krm/outputs/souk_single_pipeline_krm_2025-06-12_1346.fpg causes an error. 
                         elif value.startswith('"') and value.endswith('"'):
                             value = eval(value[1:-1])
                         else:
@@ -856,15 +861,15 @@ class ReadoutClient:
                         sweep_dict[key] = value
 
             data = np.genfromtxt(filename, delimiter=',',names=True,skip_header=header_lines)
+            print('Shape: '+str(np.shape(data)))
             num_tones = sweep_dict['num_tones']
             num_points = sweep_dict['num_points']
             #samples_per_point = sweep_dict['samples_per_point']
-            
-            sweep_f = np.array([data[f'sweep_f_{i:04d}'] for i in range(num_tones)])
-            sweep_i = np.array([data[f'sweep_i_{i:04d}'] for i in range(num_tones)])
-            sweep_q = np.array([data[f'sweep_q_{i:04d}'] for i in range(num_tones)])
-            err_i = np.array([data[f'err_i_{i:04d}'] for i in range(num_tones)])
-            err_q = np.array([data[f'err_q_{i:04d}'] for i in range(num_tones)])
+            sweep_f = np.array([data[f'sweep_f_{i:04d}'] for i in range(num_points)])
+            sweep_i = np.array([data[f'sweep_i_{i:04d}'] for i in range(num_points)])
+            sweep_q = np.array([data[f'sweep_q_{i:04d}'] for i in range(num_points)])
+            err_i = np.array([data[f'err_i_{i:04d}'] for i in range(num_points)])
+            err_q = np.array([data[f'err_q_{i:04d}'] for i in range(num_points)])
             sweep_dict['sweep_f'] = sweep_f
             sweep_dict['sweep_i'] = sweep_i
             sweep_dict['sweep_q'] = sweep_q
@@ -950,7 +955,7 @@ class ReadoutClient:
                         file.write(data[:num_tones*2*4]) # data
                         file.write(data[-40:]) # extras
                         count+=1
-
+                        
                         if print_data:
                             i = np.frombuffer(data[:datalen][::2], dtype='<i4')[:num_tones]
                             q = np.frombuffer(data[:datalen][1::2], dtype='<i4')[:num_tones]
@@ -973,11 +978,11 @@ class ReadoutClient:
         return iq_data
 
     def receive_stream_g3(self, num_tones=2048, filename=None,print_data=False):
-        ''' JL: Recevies a data stream and write it to a g3 file'''
+        ''' JL: Receives a data stream and write it to a g3 file'''
         
         # JL: Level 1 data shows this is typically around 400
         num_sample_rows_per_frame =400
-        
+
         data = bytearray(2048*2*4 + 10*4)
         view = memoryview(data)
         iq_data=None
@@ -985,6 +990,12 @@ class ReadoutClient:
             filename ='./tmp/tmp_stream'
         if not os.path.exists('./tmp'):
             os.makedirs('./tmp')
+
+        # Set up logging    
+        pid = os.getpid()
+        # Assumes input filename ends in '.g3'
+        log_filename = filename[:-3]+'_log_'+str(pid)+'.log'
+        logging.basicConfig(filename=log_filename, level=logging.INFO,format='%(asctime)s : %(levelname)s : %(message)s')    
 
         info = self.get_system_information()
 
@@ -1007,10 +1018,14 @@ class ReadoutClient:
         with open(filename[:-3]+'.json','w') as file:
             json.dump(metadata,file,indent=4)
 
+        logger.info('Wrote JSON header to '+filename[:-3]+'.json')    
+        logger.info('Preparing to receive TCP/IP data from : '+ self.stream_server_address +':'+ str(self.stream_server_port)) 
+ 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((self.stream_server_address, self.stream_server_port))
             
             with core.G3Writer(filename=filename) as writer:
+                logger.info(f"Writing data to {filename}")
                 print(f"Writing data to {filename}")
                 t0=time.time()
                 frame_count=0 # Counter for total number of frames (each of  length num_sample_rows_per_frame) written/
@@ -1018,6 +1033,8 @@ class ReadoutClient:
                 row_frame_count =0 # Counter for number of packets received within the frame so far.
                 ppid = os.getppid()
                 
+                key_interupt = False
+                general_exception = False
                 while True:
                   start = time.time() # JL will be ultimately derived from the PTP data in the packets
                   while True:
@@ -1040,6 +1057,7 @@ class ReadoutClient:
                                 break
                             received_len += packet_len
                         if received_len < datalen:
+                            logger.error(f"Expected {datalen} bytes, but only received {received_len} bytes.")
                             print(f"Expected {datalen} bytes, but only received {received_len} bytes.")
                             break
 
@@ -1073,6 +1091,7 @@ class ReadoutClient:
                         row_frame_count+=1
 
                         if (row_frame_count==num_sample_rows_per_frame):
+                            size_of_this_frame = row_frame_count
                             # Frame is full, reset counter and exit the loop
                             row_frame_count = 0
                             break
@@ -1084,44 +1103,53 @@ class ReadoutClient:
                             cnt = np.frombuffer(data[-8:-4], dtype='<i4')
                             flags = np.frombuffer(data[-40:-8], dtype='<i4')
                             iq_data=i+1j*q
-                            print(f"datalen {datalen} Received IQ data: {err} {cnt} {iq_data.tolist()}\r",end='',flush=True)
+                            print(f"datalen {datalen} row frame count {row_frame_count} Received IQ data: {err} {cnt} {iq_data.tolist()} \r",end='',flush=True)
                         
                       except KeyboardInterrupt:
+                        size_of_this_frame = row_frame_count
+                        key_interupt = True 
                         break
 
                       except Exception as e:
+                        size_of_this_frame = row_frame_count
+                        general_exception = True
+                        logger.error(f"Error receiving stream data: {e}")
+                        logger.error(traceback.format_exc())
                         print(f"Error receiving stream data: {e}")
                         print(traceback.format_exc())
                         break
-                
+                    
+                  if key_interupt or general_exception:
+                    break
+              
                   # End of data frame buffer contruction loop
                   fr = core.G3Frame(core.G3FrameType.Scan)
                   sample_rate = metadata['sample_rate']
                   #Setup the 1-D time array for the data part of the frame
-                  times =np.linspace(start,start+(num_sample_rows_per_frame)/sample_rate, num_sample_rows_per_frame) # JL Utimately will be from PTP within packets
+                  times =np.linspace(start,start+(size_of_this_frame)/sample_rate, size_of_this_frame) # JL Utimately will be from PTP within packets
                   g3times = core.G3VectorTime(times * core.G3Units.s)
 
                   chans = np.arange(num_tones)
                   # Set up the row descriptive names for the data part of the frame
                   names=['_']*(2*num_tones+1+1+8) # 1 cnt column, 1 err column, 8 flags
                   names[0:2*len(chans):2] = [f'i{ch:0>4}' for ch in chans] # i followed by zero padded 4 digit channel (tone) number 
-                  names[1:2*len(chans):2] = [f'q{ch:0>4}' for ch in chans] # q followed by zero padded 4 digit channel (tone) number 
-                  names[num_tones*2] = 'cnt'
-                  names[num_tones*2+1] = 'err'
-                  names[num_tones*2+2:] = [f'flag{flag}' for flag in list(range(1,9))]  # "flag0" to "flag7"
+                  names[1:2*len(chans):2] = [f'q{ch:0>4}' for ch in chans] # q followed by zero padded 4 digit channel (tone) number
+                  names[num_tones*2:num_tones*2+8] =  [f'flag{flag}' for flag in list(range(1,9))]  # "flag0" to "flag7" 
+                  names[num_tones*2+8] = 'cnt'
+                  names[num_tones*2+9] = 'err'
 
-                  # Write the data frame - row names (len = 2*num_tones + 10), times (len = num_sample_rows_per_frame), 2-D data_frame_buffer  = len(row_names) * len(times).          
+                  # Write the data frame - row names (len = 2*num_tones + 10), times (len = size_of_this_frame), 2-D data_frame_buffer  = len(row_names) * len(times).          
                   fr['data'] = so3g.G3SuperTimestream(names, g3times, data_frame_buffer)
                   #pdb.set_trace()
                   # This is purely a counter of how much data is in the frame - look at cnt to see if packets have been dropped.
-                  frame_counter = np.arange(0,num_sample_rows_per_frame, dtype=int)  
-                  primary_data = np.zeros((len(primary_names), num_sample_rows_per_frame), dtype=np.int64)
+                  frame_counter = np.arange(0,size_of_this_frame, dtype=int)  
+                  primary_data = np.zeros((len(primary_names), size_of_this_frame), dtype=np.int64)
                   primary_data[primary_idxs['UnixTime'], :] = (times * 1e9).astype(int)
                   primary_data[primary_idxs['FrameCounter'], :] = frame_counter
                   fr['primary'] = so3g.G3SuperTimestream(primary_names, g3times, primary_data)
 
                   fr['timing_paradigm'] = 'High Precision'
-                  fr['num_samples'] = num_sample_rows_per_frame # per frame
+                  fr['num_samples'] = size_of_this_frame # per frame
                   fr['frame_num'] = frame_count # JL Numbering from 0
                   fr['session_id'] = int(start) # Unix start time in whole seconds 
                   fr['sostream_id'] = 'ukkid_1' # JL This ultimately comes from the OCS agent that starts up the taks
@@ -1129,11 +1157,12 @@ class ReadoutClient:
                   fr['time'] = core.G3Time(time.time() * core.G3Units.s) # JL Presumably meant to be the time when frame is written out, not the timestamp of the first element of the frame??
                   writer(fr)
                   frame_count+=1
-
                 
                 t1=time.time()
                 print()
                 print(f"Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
+                logger.info(f"Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
+
         return iq_data
  
 
