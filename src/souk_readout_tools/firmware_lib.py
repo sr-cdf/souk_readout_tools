@@ -4476,25 +4476,29 @@ def set_tone_powers(r,config_dict,powers_dbm):
 
 
 def force_sync_fast(r_fast,wait_s=0.0001):
-    regname = 'p0_sync_ctrl'
-    if not hasattr(r_fast,'_p0_sync_ctrl_addr'):
-        setattr(r_fast, '_p0_sync_ctrl_addr',r_fast.sync.host.transport._get_device_address(regname))
-        setattr(r_fast, '_p0_sync_ctrl_arm_bit', 1<<r_fast.sync.OFFSET_ARM_SYNC_OUT)
-        setattr(r_fast, '_p0_sync_ctrl_sync_bit', 1<<r_fast.sync.OFFSET_MAN_SYNC)
+    pid = r_fast.pipeline_id
+    regname = f'p{pid}_sync_ctrl'
+    cache_prefix = f'_p{pid}_sync_ctrl'
+    if not hasattr(r_fast, f'{cache_prefix}_addr'):
+        setattr(r_fast, f'{cache_prefix}_addr', r_fast.sync.host.transport._get_device_address(regname))
+        setattr(r_fast, f'{cache_prefix}_arm_bit', 1<<r_fast.sync.OFFSET_ARM_SYNC_OUT)
+        setattr(r_fast, f'{cache_prefix}_sync_bit', 1<<r_fast.sync.OFFSET_MAN_SYNC)
 
     #arm_sync
-    addr = r_fast._p0_sync_ctrl_addr
+    addr = getattr(r_fast, f'{cache_prefix}_addr')
+    arm_bit = getattr(r_fast, f'{cache_prefix}_arm_bit')
+    sync_bit = getattr(r_fast, f'{cache_prefix}_sync_bit')
     mm = r_fast.sync.host.transport.axil_mm
     (value,) = struct.unpack('<I',mm[addr:addr+4])
 
     #set 0
-    value &= ~r_fast._p0_sync_ctrl_arm_bit
+    value &= ~arm_bit
     mm[addr:addr+4] = struct.pack('<I',value)
     #set 1
-    value |= r_fast._p0_sync_ctrl_arm_bit
+    value |= arm_bit
     mm[addr:addr+4] = struct.pack('<I',value)
     #set 0
-    value &= ~r_fast._p0_sync_ctrl_arm_bit
+    value &= ~arm_bit
     mm[addr:addr+4] = struct.pack('<I',value)
 
     # change_reg_bits_fast(addr, 0, r_fast.sync.OFFSET_ARM_SYNC_OUT)
@@ -4506,13 +4510,13 @@ def force_sync_fast(r_fast,wait_s=0.0001):
 
     #manual sync
     #set0
-    value &= ~r_fast._p0_sync_ctrl_sync_bit
+    value &= ~sync_bit
     mm[addr:addr+4] = struct.pack('<I',value)
     #set 1
-    value |= r_fast._p0_sync_ctrl_sync_bit
+    value |= sync_bit
     mm[addr:addr+4] = struct.pack('<I',value)
     #set 0
-    value &= ~r_fast._p0_sync_ctrl_sync_bit
+    value &= ~sync_bit
     mm[addr:addr+4] = struct.pack('<I',value)
 
     # change_reg_bits('ctrl', 0, r_fast.sync.OFFSET_MAN_SYNC)
