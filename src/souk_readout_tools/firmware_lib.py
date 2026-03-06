@@ -600,6 +600,190 @@ def get_system_information(r,config_dict):
     return info
 
 
+def apply_config(new_config_dict, r, prev_config_dict=None):
+    """
+    Apply configuration changes to hardware.
+
+    If prev_config_dict is None, applies all values from new_config_dict.
+    If prev_config_dict is provided, only applies values that have changed.
+
+    Parameters
+    ----------
+    new_config_dict : dict
+        The new configuration dictionary to apply
+    r : object
+        The readout object with hardware access
+    prev_config_dict : dict, optional
+        The previous configuration dictionary for comparison
+    """
+    fwconf = new_config_dict['firmware']
+    defaults = fwconf.get('defaults', {})
+
+    # Treat empty dict same as None
+    if not prev_config_dict:
+        prev_config_dict = None
+
+    # Get previous config for comparison
+    if prev_config_dict is not None:
+        prev_fwconf = prev_config_dict.get('firmware', {})
+        prev_defaults = prev_fwconf.get('defaults', {})
+    else:
+        prev_fwconf = {}
+        prev_defaults = {}
+
+    # Check for tile/block changes that require re-initialisation
+    reinit_keys = ['dac0_tile', 'dac0_block', 'dac1_tile', 'dac1_block', 'adc_tile', 'adc_block', 'fw_config_file', 'pipeline_id']
+    if prev_config_dict is not None:
+        for key in reinit_keys:
+            if fwconf.get(key) != prev_fwconf.get(key):
+                print(bcolors.WARNING + f'WARNING: firmware config "{key}" changed ({prev_fwconf.get(key)} -> {fwconf.get(key)}). '
+                      f'This requires re-initialisation of firmware resources.' + bcolors.ENDC)
+
+    # Check for rfsoc_host parameter changes
+    if prev_config_dict is not None:
+        new_rfsoc_host = new_config_dict.get('rfsoc_host', {})
+        prev_rfsoc_host = prev_config_dict.get('rfsoc_host', {})
+        if new_rfsoc_host != prev_rfsoc_host:
+            print(bcolors.WARNING + 'WARNING: rfsoc_host configuration changed. These parameters cannot be applied remotely. '
+                  'Log into the RFSoC directly to make these changes.' + bcolors.ENDC)
+
+    # Helper to check if a value changed
+    def changed(key):
+        if prev_config_dict is None:
+            return key in defaults
+        return defaults.get(key) != prev_defaults.get(key)
+
+    # Get tile/block config for RFDC operations
+    dac0_tile = fwconf['dac0_tile']
+    dac0_block = fwconf['dac0_block']
+    dac1_tile = fwconf['dac1_tile']
+    dac1_block = fwconf['dac1_block']
+    adc_tile = fwconf['adc_tile']
+    adc_block = fwconf['adc_block']
+
+    # Apply changed parameters
+    if changed('sync_delay'):
+        sync_delay = defaults.get('sync_delay')
+        if sync_delay is not None:
+            print(f'apply_config: setting sync_delay = {sync_delay}')
+            r.sync.set_delay(sync_delay)
+            r.sync.arm_sync(wait=False)
+            r.sync.sw_sync()
+
+    if changed('acc_len'):
+        acc_len = defaults.get('acc_len')
+        if acc_len is not None:
+            print(f'apply_config: setting acc_len = {acc_len}')
+            r.accumulators[0].set_acc_len(acc_len)
+
+    if changed('dac_duc_mixer_frequency_hz'):
+        dac_duc_mixer_frequency_hz = defaults.get('dac_duc_mixer_frequency_hz')
+        if dac_duc_mixer_frequency_hz is not None:
+            print(f'apply_config: setting dac_duc_mixer_frequency_hz = {dac_duc_mixer_frequency_hz}')
+            r.rfdc.core.set_fine_mixer_freq(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE, dac_duc_mixer_frequency_hz/1e6)
+            r.rfdc.core.set_fine_mixer_freq(dac1_tile, dac1_block, r.rfdc.core.DAC_TILE, dac_duc_mixer_frequency_hz/1e6)
+
+    if changed('adc_ddc_mix_frequency_hz'):
+        adc_ddc_mix_frequency_hz = defaults.get('adc_ddc_mix_frequency_hz')
+        if adc_ddc_mix_frequency_hz is not None:
+            print(f'apply_config: setting adc_ddc_mix_frequency_hz = {adc_ddc_mix_frequency_hz}')
+            r.rfdc.core.set_fine_mixer_freq(adc_tile, adc_block, r.rfdc.core.ADC_TILE, adc_ddc_mix_frequency_hz/1e6)
+
+    if changed('nyquist_zone'):
+        nyquist_zone = defaults.get('nyquist_zone')
+        if nyquist_zone is not None:
+            print(f'apply_config: setting nyquist_zone = {nyquist_zone}')
+            set_nyquist_zone(r, new_config_dict, nyquist_zone, inv_sinc=False)
+
+    if changed('dac_mixer_scale_1p0'):
+        dac_mixer_scale_1p0 = defaults.get('dac_mixer_scale_1p0')
+        if dac_mixer_scale_1p0 is not None:
+            print(f'apply_config: setting dac_mixer_scale_1p0 = {dac_mixer_scale_1p0}')
+            if dac_mixer_scale_1p0:
+                r.rfdc.core.set_mixer_scale(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE, r.rfdc.core.MIX_SCALE_1P0)
+                r.rfdc.core.set_mixer_scale(dac1_tile, dac1_block, r.rfdc.core.DAC_TILE, r.rfdc.core.MIX_SCALE_1P0)
+            else:
+                r.rfdc.core.set_mixer_scale(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE, r.rfdc.core.MIX_SCALE_AUTO)
+                r.rfdc.core.set_mixer_scale(dac1_tile, dac1_block, r.rfdc.core.DAC_TILE, r.rfdc.core.MIX_SCALE_AUTO)
+
+    if changed('adc_mixer_scale_1p0'):
+        adc_mixer_scale_1p0 = defaults.get('adc_mixer_scale_1p0')
+        if adc_mixer_scale_1p0 is not None:
+            print(f'apply_config: setting adc_mixer_scale_1p0 = {adc_mixer_scale_1p0}')
+            if adc_mixer_scale_1p0:
+                r.rfdc.core.set_mixer_scale(adc_tile, adc_block, r.rfdc.core.ADC_TILE, r.rfdc.core.MIX_SCALE_1P0)
+            else:
+                r.rfdc.core.set_mixer_scale(adc_tile, adc_block, r.rfdc.core.ADC_TILE, r.rfdc.core.MIX_SCALE_AUTO)
+
+    if changed('dsa'):
+        dsa = defaults.get('dsa')
+        if dsa is not None:
+            print(f'apply_config: setting dsa = {dsa}')
+            r.rfdc.core.set_dsa(adc_tile, adc_block, dsa)
+
+    if changed('vop'):
+        vop = defaults.get('vop')
+        if vop is not None:
+            print(f'apply_config: setting vop = {vop}')
+            r.rfdc.core.set_vop(dac0_tile, dac0_block, vop)
+            r.rfdc.core.set_vop(dac1_tile, dac1_block, vop)
+
+    if changed('internal_loopback'):
+        internal_loopback = defaults.get('internal_loopback')
+        if internal_loopback is not None:
+            print(f'apply_config: setting internal_loopback = {internal_loopback}')
+            if internal_loopback:
+                r.input.enable_loopback()
+            else:
+                r.input.disable_loopback()
+
+    if changed('psb_scale'):
+        psb_scale = defaults.get('psb_scale')
+        if psb_scale is not None:
+            print(f'apply_config: setting psb_scale = {psb_scale}')
+            r.psbscale.set_scale(psb_scale)
+
+    if changed('psb_fftshift'):
+        psb_fftshift = defaults.get('psb_fftshift')
+        if psb_fftshift is not None:
+            print(f'apply_config: setting psb_fftshift = {psb_fftshift}')
+            r.psb.set_fftshift(psb_fftshift)
+
+    if changed('pfb_fftshift'):
+        pfb_fftshift = defaults.get('pfb_fftshift')
+        if pfb_fftshift is not None:
+            print(f'apply_config: setting pfb_fftshift = {pfb_fftshift}')
+            r.pfb.set_fftshift(pfb_fftshift)
+
+    if changed('frequencies'):
+        frequencies = defaults.get('frequencies', [])
+        if frequencies:
+            print(f'apply_config: setting frequencies ({len(frequencies)} tones)')
+            set_tone_frequencies(r, new_config_dict, frequencies)
+
+    if changed('amplitudes'):
+        amplitudes = defaults.get('amplitudes', [])
+        if amplitudes:
+            print(f'apply_config: setting amplitudes ({len(amplitudes)} values)')
+            set_tone_amplitudes(r, new_config_dict, amplitudes)
+
+    if changed('phases'):
+        phases = defaults.get('phases', [])
+        if phases:
+            print(f'apply_config: setting phases ({len(phases)} values)')
+            set_tone_phases(r, new_config_dict, phases)
+
+    #check signal levels
+    dac_saturation = check_output_saturation(r,iterations=1,saturation_bits=dac_saturation_bits)
+    adc_saturation = check_input_saturation(r,iterations=1,saturation_bits=adc_saturation_bits)
+    dsp_overflow = check_dsp_overflow(r)
+    print(f'DAC levels: {dac_saturation}')
+    print(f'ADC levels: {adc_saturation}')
+    print(f'DSP overflow: {dsp_overflow}')
+
+
+
+
 def read_parameter(r, param_name):
     if hasattr(r, param_name):
         return getattr(r, param_name)
@@ -2754,11 +2938,12 @@ def set_tone_phases(r, config_dict, tone_phases, autosync=True):
     phase_offsets_full = np.zeros(r.mixer.n_chans, dtype=float)
     phase_offsets_full[psb_tones_active] = tone_phases
 
-    buf = get_control_buffer_idx(r)
-    v = prepare_control_buffer_data(r,buf,{'tx':{'phase_offsets':phase_offsets_full},
+    # buf = get_control_buffer_idx(r)
+    for buf in [0,1]:
+        v = prepare_control_buffer_data(r,buf,{'tx':{'phase_offsets':phase_offsets_full},
                                     'rx':{'phase_offsets':phase_offsets_full}})
 
-    write_control_buffer_data(r,buf,v)
+        write_control_buffer_data(r,buf,v)
 
     # phase_offsets = _format_phase_offsets(tone_phases,r.mixer._phase_offset_bp)
     # for i in range(min(r.mixer._n_parallel_chans, num_tones)):
@@ -2910,41 +3095,47 @@ def psb_chanselect_set_channel_inmap(r, inmap):
         output channel 0.
     :type inmap: list
     """
-    if not hasattr(r.psb_chanselect, '_cached_block_id'):
-        n_exp = r.psb_chanselect._expansion_factor
-        n_par_samp = r.psb_chanselect.n_parallel_samples
-        n_par_chans = r.psb_chanselect.n_parallel_chans_out
 
-        r.psb_chanselect._c_n_exp = n_exp
-        r.psb_chanselect._c_n_chans_in = r.psb_chanselect.n_chans_in
-        r.psb_chanselect._c_n_chans_out = r.psb_chanselect.n_chans_out
-        r.psb_chanselect._c_discard_bin = r.psb_chanselect.DISCARD_BIN
-        r.psb_chanselect._c_discard_bit = r.psb_chanselect.DISCARD_BIT
-        r.psb_chanselect._c_addr_mask = r.psb_chanselect.ADDR_MASK
+    r.psb_chanselect.set_channel_inmap(inmap)
+    if False:
+            
+        if not hasattr(r.psb_chanselect, '_cached_block_id'):
+            n_exp = r.psb_chanselect._expansion_factor
+            n_par_samp = r.psb_chanselect.n_parallel_samples
+            n_par_chans = r.psb_chanselect.n_parallel_chans_out
 
-        outchans = np.arange(r.psb_chanselect._c_n_chans_out)
-        r.psb_chanselect._cached_block_id = (outchans // n_par_samp) % n_exp
-        r.psb_chanselect._cached_block_offset = (outchans // n_par_chans) * n_par_samp + (outchans % n_par_samp)
+            r.psb_chanselect._c_n_exp = n_exp
+            r.psb_chanselect._c_n_chans_in = r.psb_chanselect.n_chans_in
+            r.psb_chanselect._c_n_chans_out = r.psb_chanselect.n_chans_out
+            r.psb_chanselect._c_discard_bin = r.psb_chanselect.DISCARD_BIN
+            r.psb_chanselect._c_discard_bit = r.psb_chanselect.DISCARD_BIT
+            r.psb_chanselect._c_addr_mask = r.psb_chanselect.ADDR_MASK
 
-        r.psb_chanselect._cached_lookup = np.full((n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=int)
-        r.psb_chanselect._cached_lookup[r.psb_chanselect._cached_block_id, r.psb_chanselect._cached_block_offset] = outchans
+            outchans = np.arange(r.psb_chanselect._c_n_chans_out)
+            r.psb_chanselect._cached_block_id = (outchans // n_par_samp) % n_exp
+            r.psb_chanselect._cached_block_offset = (outchans // n_par_chans) * n_par_samp + (outchans % n_par_samp)
 
-    # Initialize with DISCARD_BIN (has DISCARD_BIT set)
-    serial_maps = np.full((r.psb_chanselect._c_n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=np.uint32)
+            r.psb_chanselect._cached_lookup = np.full((n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=int)
+            r.psb_chanselect._cached_lookup[r.psb_chanselect._cached_block_id, r.psb_chanselect._cached_block_offset] = outchans
 
-    inmap = np.asarray(inmap, dtype=np.uint32)
-    # Filter out discarded entries (those with DISCARD_BIT set)
-    valid_mask = (inmap & r.psb_chanselect._c_discard_bit) == 0
-    valid_inmap = inmap[valid_mask]
-    nin = len(valid_inmap)
+        # Initialize with DISCARD_BIN (has DISCARD_BIT set)
+        serial_maps = np.full((r.psb_chanselect._c_n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=np.uint32)
 
-    # Vectorized assignment
-    input_indices = np.where(valid_mask)[0][:nin]
-    serial_maps[r.psb_chanselect._cached_block_id[valid_inmap], input_indices] = r.psb_chanselect._cached_block_offset[valid_inmap]
+        inmap = np.asarray(inmap, dtype=np.uint32)
+        # Filter out discarded entries (those with DISCARD_BIT set)
+        valid_mask = (inmap & r.psb_chanselect._c_discard_bit) == 0
+        valid_inmap = inmap[valid_mask]
+        nin = len(valid_inmap)
 
-    # Write to hardware
-    for i in range(r.psb_chanselect._c_n_exp):
-        r.psb_chanselect.write(f'map{i}_{r.psb_chanselect._map_reg}', serial_maps[i].tobytes())
+        # Vectorized assignment
+        input_indices = np.where(valid_mask)[0][:nin]
+        serial_maps[r.psb_chanselect._cached_block_id[valid_inmap], input_indices] = r.psb_chanselect._cached_block_offset[valid_inmap]
+
+        # Write to hardware
+        for i in range(r.psb_chanselect._c_n_exp):
+            r.psb_chanselect.write(f'map{i}_{r.psb_chanselect._map_reg}', serial_maps[i].tobytes())
+
+    
 
 
 def psb_chanselect_get_channel_inmap(r):
@@ -2954,46 +3145,50 @@ def psb_chanselect_get_channel_inmap(r):
         corresponds to the output channel to which input `i` contributes.
     :rtype: list
     """
-    if not hasattr(r.psb_chanselect, '_cached_block_id'):
-        n_exp = r.psb_chanselect._expansion_factor
-        n_par_samp = r.psb_chanselect.n_parallel_samples
-        n_par_chans = r.psb_chanselect.n_parallel_chans_out
+    im = r.psb_chanselect.get_channel_inmap()
+    return im
+    if False:
+            
+        if not hasattr(r.psb_chanselect, '_cached_block_id'):
+            n_exp = r.psb_chanselect._expansion_factor
+            n_par_samp = r.psb_chanselect.n_parallel_samples
+            n_par_chans = r.psb_chanselect.n_parallel_chans_out
 
-        r.psb_chanselect._c_n_exp = n_exp
-        r.psb_chanselect._c_n_chans_in = r.psb_chanselect.n_chans_in
-        r.psb_chanselect._c_n_chans_out = r.psb_chanselect.n_chans_out
-        r.psb_chanselect._c_discard_bin = r.psb_chanselect.DISCARD_BIN
-        r.psb_chanselect._c_discard_bit = r.psb_chanselect.DISCARD_BIT
-        r.psb_chanselect._c_addr_mask = r.psb_chanselect.ADDR_MASK
+            r.psb_chanselect._c_n_exp = n_exp
+            r.psb_chanselect._c_n_chans_in = r.psb_chanselect.n_chans_in
+            r.psb_chanselect._c_n_chans_out = r.psb_chanselect.n_chans_out
+            r.psb_chanselect._c_discard_bin = r.psb_chanselect.DISCARD_BIN
+            r.psb_chanselect._c_discard_bit = r.psb_chanselect.DISCARD_BIT
+            r.psb_chanselect._c_addr_mask = r.psb_chanselect.ADDR_MASK
 
-        outchans = np.arange(r.psb_chanselect._c_n_chans_out)
-        r.psb_chanselect._cached_block_id = (outchans // n_par_samp) % n_exp
-        r.psb_chanselect._cached_block_offset = (outchans // n_par_chans) * n_par_samp + (outchans % n_par_samp)
+            outchans = np.arange(r.psb_chanselect._c_n_chans_out)
+            r.psb_chanselect._cached_block_id = (outchans // n_par_samp) % n_exp
+            r.psb_chanselect._cached_block_offset = (outchans // n_par_chans) * n_par_samp + (outchans % n_par_samp)
 
-        r.psb_chanselect._cached_lookup = np.full((n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=int)
-        r.psb_chanselect._cached_lookup[r.psb_chanselect._cached_block_id, r.psb_chanselect._cached_block_offset] = outchans
+            r.psb_chanselect._cached_lookup = np.full((n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=int)
+            r.psb_chanselect._cached_lookup[r.psb_chanselect._cached_block_id, r.psb_chanselect._cached_block_offset] = outchans
 
-    # Read the reorder memory contents
-    nbytes = r.psb_chanselect._reorder_depth * np.dtype(np.uint32).itemsize
-    serial_maps = np.full((r.psb_chanselect._c_n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=np.uint32)
-    for i in range(r.psb_chanselect._c_n_exp):
-        serial_maps[i] = np.frombuffer(r.psb_chanselect.read(f'map{i}_{r.psb_chanselect._map_reg}', nbytes), dtype=np.uint32).view(np.uint32)
+        # Read the reorder memory contents
+        nbytes = r.psb_chanselect._reorder_depth * np.dtype(np.uint32).itemsize
+        serial_maps = np.full((r.psb_chanselect._c_n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=np.uint32)
+        for i in range(r.psb_chanselect._c_n_exp):
+            serial_maps[i] = np.frombuffer(r.psb_chanselect.read(f'map{i}_{r.psb_chanselect._map_reg}', nbytes), dtype=np.uint32).view(np.uint32)
 
-    # Check for valid mappings: entries without DISCARD_BIT set
-    is_valid = (serial_maps[:, :r.psb_chanselect._c_n_chans_in] & r.psb_chanselect._c_discard_bit) == 0
-    first_exp = np.argmax(is_valid, axis=0)
-    has_mapping = np.any(is_valid, axis=0)
+        # Check for valid mappings: entries without DISCARD_BIT set
+        is_valid = (serial_maps[:, :r.psb_chanselect._c_n_chans_in] & r.psb_chanselect._c_discard_bit) == 0
+        first_exp = np.argmax(is_valid, axis=0)
+        has_mapping = np.any(is_valid, axis=0)
 
-    # Gather stored values and lookup
-    input_idx = np.arange(r.psb_chanselect._c_n_chans_in)
-    # Mask out the discard bit to get actual offset values
-    stored = (serial_maps[first_exp, input_idx] & r.psb_chanselect._c_addr_mask).astype(int)
+        # Gather stored values and lookup
+        input_idx = np.arange(r.psb_chanselect._c_n_chans_in)
+        # Mask out the discard bit to get actual offset values
+        stored = (serial_maps[first_exp, input_idx] & r.psb_chanselect._c_addr_mask).astype(int)
 
-    # Build result
-    inmap = np.full(r.psb_chanselect._c_n_chans_in, r.psb_chanselect._c_discard_bin, dtype=int)
-    inmap[has_mapping] = r.psb_chanselect._cached_lookup[first_exp[has_mapping], stored[has_mapping]]
+        # Build result
+        inmap = np.full(r.psb_chanselect._c_n_chans_in, r.psb_chanselect._c_discard_bin, dtype=int)
+        inmap[has_mapping] = r.psb_chanselect._cached_lookup[first_exp[has_mapping], stored[has_mapping]]
 
-    return inmap
+        return inmap
 
 
 

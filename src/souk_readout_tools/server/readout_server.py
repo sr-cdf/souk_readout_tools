@@ -391,6 +391,8 @@ class ReadoutServer:
 
         Does NOT force reprogramming or reinitialisation if not needed.
 
+        Does not notice if config parameters have changed - but it definitely should!
+        
         level:
           - "server": no firmware operations
           - "firmware": (re)program if needed, then initialise shared resources
@@ -671,6 +673,8 @@ class ReadoutServer:
         Apply a new configuration and re-initialise the firmware
         If default is true, overwrites the default_config.lnk so that this config is persistent
         Uses pipeline-specific directories.
+
+        Now also applies any modified config parameters in hardware.
         """
         print('************************************************')
         print('set_config')
@@ -691,6 +695,9 @@ class ReadoutServer:
         print('set_config')
         print('filename:',filename)
         print('************************************************')
+
+
+        firmware_lib.apply_config(config_contents, self.r, self.config)
 
         self.ensure_ready(config_file=filename, level="pipeline")
 
