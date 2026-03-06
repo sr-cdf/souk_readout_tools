@@ -24,9 +24,10 @@ import numpy as np
 from souk_readout_tools.client.readout_client import ReadoutClient
 
 
-def wideband_sweep(config_file=None, bandwidth_hz=None, center_freq_hz=None, 
-                   step_size_hz=10000, num_tones=1024, samples_per_point=10, 
-                   ignore_phase_correction=True, filename=None, filetype='npy', 
+def wideband_sweep(config_file=None, bandwidth_hz=None, center_freq_hz=None,
+                   step_size_hz=10000, num_tones=1024, samples_per_point=10,
+                   ignore_phase_correction=True, remove_phase_slope=True,
+                   filename=None, filetype='npy',
                    plot_data=True, pipeline_id=None):
     """
     Perform a wideband sweep of the system.
@@ -69,6 +70,7 @@ def wideband_sweep(config_file=None, bandwidth_hz=None, center_freq_hz=None,
         num_tones=num_tones,
         samples_per_point=samples_per_point,
         apply_phase_correction=not ignore_phase_correction,
+        remove_phase_slope=remove_phase_slope,
         verbose=True
     )
     
@@ -168,6 +170,8 @@ def main():
                         help='Output filename (without extension). Default: tmp_wideband_sweep in pipeline tmp dir.')
     parser.add_argument('-t', '--filetype', type=str, default='npy',
                         help='Output file format (npy, csv, etc.).')
+    parser.add_argument('--no_remove_phase_slope', action='store_true',
+                        help='Do not remove linear phase slope from the sweep data.')
     parser.add_argument('-P', '--plot_data', action='store_true',
                         help='Plot the data after saving.')
 
@@ -207,6 +211,7 @@ def main():
             num_tones=args.num_tones,
             samples_per_point=args.samples_per_point,
             ignore_phase_correction=ignore_correction,
+            remove_phase_slope=not args.no_remove_phase_slope,
             filename=args.filename,
             filetype=args.filetype,
             plot_data=args.plot_data,

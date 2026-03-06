@@ -1592,9 +1592,9 @@ class ReadoutClient:
         return resonances
 
 
-    def wideband_sweep(self, bandwidth_hz=None, center_freq_hz=None, step_size_hz=10000, 
+    def wideband_sweep(self, bandwidth_hz=None, center_freq_hz=None, step_size_hz=10000,
                        num_tones=1024, samples_per_point=10, apply_phase_correction=False,
-                       verbose=True):
+                       remove_phase_slope=True, verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
         
@@ -1609,9 +1609,11 @@ class ReadoutClient:
             num_tones (int): Number of tones to use in the sweep. More tones = fewer sweep 
                              steps but wider spacing. Default is 1024.
             samples_per_point (int): Number of samples to integrate per sweep point. Default is 10.
-            apply_phase_correction (bool): DEPRECATED. Correct for phase jumps at filterbank 
+            apply_phase_correction (bool): DEPRECATED. Correct for phase jumps at filterbank
                                            channel edges. Default is False. This correction is
                                            no longer needed following firmware fixes.
+            remove_phase_slope (bool): Remove linear phase slope from the sweep data.
+                                       Default is True.
             verbose (bool): Print progress information. Default is True.
         
         Returns:
@@ -1752,12 +1754,15 @@ class ReadoutClient:
         f = s['sweep_f']
         z = s['sweep_i'] + 1j * s['sweep_q']
 
-        # Remove slope from phase (concatenate all tones)
+        # Concatenate all tones
         fcat = np.ravel(f.T)
         zcat = np.ravel(z.T)
-        phicat = np.angle(zcat)
-        slope = np.nanmedian(np.gradient(phicat, fcat))
-        zcat *= np.exp(-1j * (slope * fcat))
+
+        # Optionally remove linear phase slope
+        if remove_phase_slope:
+            phicat = np.unwrap(np.angle(zcat))
+            slope = np.nanmedian(np.gradient(phicat, fcat))
+            zcat *= np.exp(-1j * (slope * fcat))
 
         # Reformat as single-row arrays (like a single-tone sweep covering all frequencies)
         s['sweep_f'] = np.array([fcat])
