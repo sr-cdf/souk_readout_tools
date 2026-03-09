@@ -18,6 +18,13 @@ python3 -m venv client_venv && source ./client_venv/bin/activate
 pip install .
 ```
 
+Installation is conditional and comes from `setup.py`:
+
+- On Xilinx platforms, the package installs server components.
+- On non-Xilinx platforms, the package installs client components.
+- `INSTALL_SERVER=true` or `INSTALL_CLIENT=true` can be used to override auto-detection.
+- `requirements.txt` is not the full dependency list.
+
 ```python
 from souk_readout_tools.client.readout_client import ReadoutClient
 
@@ -34,21 +41,25 @@ See the [Getting Started Guide](doc/getting_started.md) for full details.
 
 ## Key Features
 
-- **Tone management** - Set readout tone frequencies, amplitudes and phases with full calibration chain support (DAC through to cryostat)
-- **Data acquisition** - Discrete samples, continuous streaming, and triggered streaming modes
-- **Frequency sweeping** - Targeted sweeps around tone centers, and wideband sweeps covering the full RF bandwidth
-- **Resonance finding** - Built-in MKID resonance detection with configurable peak-finding algorithms, plus an interactive PyQt5 GUI (`souk-mkid-finder-app`)
-- **Retuning** - Automated sweep-and-retune to track resonance frequency drift
-- **Dual-pipeline** - Two independent readout pipelines on one RFSoC, with 3-level initialisation to avoid cross-pipeline disruption
-- **VACC multitone** (v7.9+ firmware) - Multiple tones per FFT bin via the vector accumulator
-- **Power optimisation** - Automatic saturation detection and TX/RX power optimisation
-- **Configuration management** - YAML-based config with `push_config()`/`pull_config()` for seamless client-server sync
+- **Tone control** – Set frequencies, amplitudes, and phases with full TX/RX power calibration (DAC through cryostat)
+- **Data acquisition** – Discrete samples, continuous streaming, and triggered streaming to multiple clients
+- **Single-tone burst mode** – Fast acquisition of 1024-sample bursts at the pre-accumulator rate for a single tone
+- **Frequency sweeping** – Wideband and targeted sweeps with configurable direction, span, and resolution
+- **Resonance finding** – Peak detection across multiple data formats (magnitude, phase, group delay), plus interactive PyQt5 GUI
+- **Automated retuning** – Sweep-and-retune workflows with max-gradient and min-magnitude methods
+- **Signal level optimization** – Automatic TX/RX level maximization with saturation detection and dynamic range management
+- **ADC calibration freeze** – Freeze internal ADC calibration during observations to eliminate drift noise
+- **Dual-pipeline support** – Two independent pipelines per board with three-level initialization to prevent cross-pipeline disruption
+- **VACC multitone** (v7.9+) – Multiple tones per FFT bin with automatic LO index management
+- **Configuration sync** – YAML-based config with `push_config()`/`pull_config()` for client-server synchronization
+- **Server infrastructure** – Async TCP server with systemd daemon support, multi-client streaming, and remote status monitoring
 
 ## Documentation
 
 | Document | Description |
 |----------|-------------|
-| [Getting Started](doc/getting_started.md) | Installation, configuration, usage guide, and feature list |
+| [Installation](doc/installation.md) | Detailed client and server installation instructions |
+| [Getting Started](doc/getting_started.md) | Configuration, usage guide, and feature list |
 | [Dual Pipeline](doc/dual_pipeline.md) | Dual-pipeline setup, initialisation, and configuration |
 | [v7.9 Multitone Notes](doc/v79-multitone-notes.md) | VACC multitone feature development notes |
 
@@ -58,9 +69,11 @@ See the [Getting Started Guide](doc/getting_started.md) for full details.
 
 | Command | Description |
 |---------|-------------|
-| `souk-connection-test` | Test connectivity to the readout server |
+| `souk-connection-test` | Test connectivity to the readout server; accepts `-C/--config_file` and `--pipeline` |
 | `souk-wideband_sweep` | Perform a wideband frequency sweep |
 | `souk-mkid-finder-app` | Launch the MKID resonance finder GUI |
+
+*More client tools are planned.*
 
 **Server** (installed on the RFSoC):
 
@@ -70,9 +83,31 @@ See the [Getting Started Guide](doc/getting_started.md) for full details.
 | `souk-enable-daemon` | Enable the server as a systemd service |
 | `souk-disable-daemon` | Disable the server systemd service |
 
+*More server tools are planned.*
+
 ## Configuration
 
-YAML-based configuration with sections for `rfsoc_host`, `firmware`, `rf_frontend`, `cryostat`, and `detector`. A template config is bundled with the package and copied to `~/.souk_readout_tools/` on first run. Per-pipeline config and data are stored in separate subdirectories (`pipeline_0/`, `pipeline_1/`).
+YAML-based configuration uses sections `rfsoc_host`, `firmware`, `rf_frontend`, `cryostat`, and `detector`. A template config is bundled with the package and copied to `~/.souk_readout_tools/` on first run.
+
+Runtime data is pipeline-specific:
+
+```text
+~/.souk_readout_tools/
+├── pipeline_0/
+│   ├── config/
+│   ├── calibrations/
+│   └── tmp/
+└── pipeline_1/
+	├── config/
+	├── calibrations/
+	└── tmp/
+```
+
+Important behavior:
+
+- `default_config.lnk` is a plain text file containing the most recent active config path, it may also be a filesystem symlink.
+- If you do not pass a config path, the client and server use the pipeline-specific `default_config.lnk`.
+- `firmware.pipeline_id` inside the config is authoritative; explicit pipeline arguments are mainly hints for locating the default config.
 
 ## Server Daemon
 
@@ -98,6 +133,14 @@ Override with environment variables: `INSTALL_SERVER=true` or `INSTALL_CLIENT=tr
 
 Dependencies: numpy, scipy, matplotlib, pyyaml, ipython. Client additionally requires PyQt5. Server requires `souk_mkid_readout` from the [souk-firmware](https://github.com/realtimeradio/souk-firmware) repository.
 
+The server package currently expects `souk_mkid_readout` to be available on the RFSoC from:
+
+```text
+/home/casper/src/souk-firmware/software/control_sw
+```
+
+This is hardcoded in `setup.py`.
+
 Client requires Python >= 3.8. Tested on Linux (Python 3.10, 3.12) and Windows (Python 3.12).
 
-Server requires Python == 3.8 and the `souk_mkid_readout` library. Tested on Xilinx/RFSoC Linux (Python 3.8)
+Server requires Python == 3.8 and the `souk_mkid_readout` library. Tested on Xilinx/RFSoC with the CASPER Linux image (Python 3.8).
