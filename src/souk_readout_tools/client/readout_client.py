@@ -394,6 +394,8 @@ class ReadoutClient:
         else:
             return response
 
+    # TODO: Add a save_config(filename=None) method to write the in-memory
+    #       config dict back to a local YAML file (defaults to self.config_file).
     def push_config(self):
         name = os.path.basename(self.config_file)
         config = yaml.dump(self.config,sort_keys=False)
@@ -544,15 +546,17 @@ class ReadoutClient:
         message = {'request': 'check_dsp_overflow','duration_s':duration_s}
         return self.send_request(message)
     
+    # TODO: Add option to save the resulting parameters to the config file after
+    #       maximise/optimise/fix operations (requires save_config, see push_config TODO).
     def maximise_tx_power(self):
         return self.send_request({'request': 'maximise_tx_power'})
-    
+
     def maximise_rx_power(self):
         return self.send_request({'request': 'maximise_rx_power'})
-    
+
     def optimise_tx_snr(self):
         return self.send_request({'request': 'optimise_tx_snr'})
-    
+
     def optimise_rx_snr(self):
         return self.send_request({'request': 'optimise_rx_snr'})
 
@@ -939,6 +943,8 @@ class ReadoutClient:
             return response
 
     def wait_for_sweep(self, poll_interval=0.5):
+        # TODO: Implement wait_for_sweep - poll get_sweep_progress and display
+        #       progress to the user. Also add a blocking option to perform_sweep.
         raise NotImplementedError("wait_for_sweep is not implemented yet. Use get_sweep_progress in a loop instead.")
 
     def get_sweep_data(self):
@@ -1665,12 +1671,14 @@ class ReadoutClient:
         return resonances
 
 
+    # TODO: Add a tone_powers parameter to wideband_sweep to allow specifying
+    #       power levels across the band (e.g. per-tone or per-band).
     def wideband_sweep(self, bandwidth_hz=None, center_freq_hz=None, step_size_hz=10000,
                        num_tones=1024, samples_per_point=10, apply_phase_correction=False,
                        remove_phase_slope=True, verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
-        
+
         This method configures tones across the bandwidth, performs a sweep, and returns
         the concatenated sweep data covering the full requested bandwidth.
         
