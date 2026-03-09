@@ -1046,7 +1046,13 @@ class ReadoutServer:
                     num_samples = message.get('num_samples')
                     task = asyncio.create_task(self.get_samples(writer, num_samples))
                     self.tasks.append(task)
-                
+
+                elif request == 'get_accumulator_snapshots':
+                    tone_index = message.get('tone_index')
+                    num_snapshots = message.get('num_snapshots')
+                    task = asyncio.create_task(self.get_accumulator_snapshots(writer, tone_index, num_snapshots))
+                    self.tasks.append(task)
+
                 elif request == 'sweep':
                     if self.sweep_task is None or self.sweep_task.done():
                         centers = message.get('centers')
@@ -1312,9 +1318,40 @@ class ReadoutServer:
             self.tasks.remove(asyncio.current_task())
             writer.close()
             await writer.wait_closed()
-        
 
+    async def get_accumulator_snapshots(self, writer, tone_index, num_snapshots):
+        """
+        Acquire num_snapshots pre-accumulation snapshots for a single tone
+        and send to client.
 
+        Each snapshot is 1024 complex samples at full rate (before accumulation).
+        """
+        try:
+            # Resolve tone index to firmware channel once
+            details = firmware_lib.get_tone_frequencies(self.r, self.config, detailed_output=True)[1]
+            firmware_indices = details['rx']['tone_indices']
+            if tone_index >= len(firmware_indices):
+                raise ValueError(f'Tone index {tone_index} out of range '
+                                 f'(only {len(firmware_indices)} tones active)')
+            fw_chan = firmware_indices[tone_index]
+            acc = self.r.accumulators[0]
+            acc.set_snapshot_chan(fw_chan)
+
+            for _ in range(num_snapshots):
+                data = np.asarray(acc.get_new_snapshot(), dtype=np.complex128)
+                data_bytes = data.tobytes()
+                data_len = struct.pack('>I', len(data_bytes))
+                writer.write(data_len + data_bytes)
+                await writer.drain()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Error getting accumulator snapshots: {e}")
+            print(traceback.format_exc())
+        finally:
+            self.tasks.remove(asyncio.current_task())
+            writer.close()
+            await writer.wait_closed()
 
     async def stream_data(self):
         """

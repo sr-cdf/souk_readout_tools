@@ -4019,6 +4019,29 @@ def get_fast_read_params(r_fast):
 
     return params
 
+def get_accumulator_snapshot(r, config_dict, tone_index):
+    """
+    Grab a single pre-accumulation snapshot for a given tone.
+
+    Translates the user-facing tone index (0, 1, 2, ...) to the firmware
+    accumulator channel index, then acquires and returns 1024 complex samples
+    at full rate (before accumulation).
+
+    :param r: Readout object
+    :param config_dict: Configuration dictionary (needed for tone index mapping)
+    :param tone_index: User-facing tone index (0-based)
+    :return: Complex numpy array of 1024 samples
+    """
+    details = get_tone_frequencies(r, config_dict, detailed_output=True)[1]
+    firmware_indices = details['rx']['tone_indices']
+    if tone_index >= len(firmware_indices):
+        raise ValueError(f'Tone index {tone_index} out of range '
+                         f'(only {len(firmware_indices)} tones active)')
+    fw_chan = firmware_indices[tone_index]
+    acc = r.accumulators[0]
+    acc.set_snapshot_chan(fw_chan)
+    return acc.get_new_snapshot()
+
 def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=None):
     """
     Read one sample of accumulated data from the RFSOC

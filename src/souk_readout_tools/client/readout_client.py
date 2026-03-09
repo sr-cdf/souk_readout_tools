@@ -801,6 +801,76 @@ class ReadoutClient:
             raise ValueError(f"Invalid file format {filename.split('.')[-1]}")
         return data_dict
 
+    def get_accumulator_snapshots(self, tone_index, num_snapshots):
+        """
+        Acquire num_snapshots pre-accumulation snapshots for a single tone.
+
+        Each snapshot contains 1024 complex samples at the FFT output rate
+        (before accumulation).
+
+        Args:
+            tone_index (int): Tone index to snapshot.
+            num_snapshots (int): Number of snapshots to acquire.
+
+        Returns:
+            dict with keys:
+                'snapshots': Complex array of shape (num_snapshots, 1024).
+                'tone_index': The tone index that was snapshotted.
+                'sample_rate': The pre-accumulation sample rate in Hz
+                               (FFT output rate = accumulated rate * acc_len).
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((self.request_server_address, self.request_server_port))
+            message = {'request': 'get_accumulator_snapshots',
+                       'tone_index': tone_index,
+                       'num_snapshots': num_snapshots}
+            message_data = json.dumps(message).encode()
+            message_len = struct.pack('>I', len(message_data))
+            s.sendall(message_len + message_data)
+
+            result = None
+            t0 = time.time()
+            for j in range(num_snapshots):
+                # Read data length
+                raw_datalen = s.recv(4)
+                if not raw_datalen:
+                    break
+                datalen = struct.unpack('>I', raw_datalen)[0]
+
+                # Receive the snapshot data
+                data_buf = bytearray(datalen)
+                view = memoryview(data_buf)
+                received_len = 0
+                while received_len < datalen:
+                    packet_len = s.recv_into(view[received_len:], datalen - received_len)
+                    if packet_len == 0:
+                        break
+                    received_len += packet_len
+                if received_len < datalen:
+                    print(f"Expected {datalen} bytes, but only received {received_len} bytes.")
+                    break
+
+                snapshot = np.frombuffer(data_buf, dtype=np.complex128)
+                if result is None:
+                    result = np.zeros((num_snapshots, len(snapshot)), dtype=np.complex128)
+                result[j] = snapshot
+
+            t1 = time.time()
+            print(f"Received {num_snapshots} snapshots in {t1-t0:.3f}s "
+                  f"({num_snapshots/(t1-t0):.1f} snapshots/s)")
+
+        info = self.get_system_information()
+        acc_len = info['acc_len']
+        accumulated_rate = self.get_sample_rate()
+        snapshot_rate = accumulated_rate * acc_len
+
+        return {'snapshots': result,
+                'tone_index': tone_index,
+                'sample_rate': snapshot_rate,
+                'num_snapshots': num_snapshots,
+                'len_snapshot': len(snapshot)}
+
+
 
     def perform_sweep(self, centers, spans, points, samples_per_point,direction='up'):
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
@@ -867,6 +937,9 @@ class ReadoutClient:
         else:
             print(f"Error getting sweep progress: {response['message']}")
             return response
+
+    def wait_for_sweep(self, poll_interval=0.5):
+        raise NotImplementedError("wait_for_sweep is not implemented yet. Use get_sweep_progress in a loop instead.")
 
     def get_sweep_data(self):
         message = {'request': 'get_sweep_data'}
