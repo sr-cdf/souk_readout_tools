@@ -136,10 +136,14 @@ def ensure_pipeline_dirs(pipeline_id):
                 parent = os.path.dirname(parent)
             os.chown(d, TARGET_UID, TARGET_GID)
     
-    # Copy template config files if default config doesn't exist
+    # Copy template config and calibration files if default config doesn't exist
     if not os.path.exists(dirs['default_config']):
         _copy_template_configs(dirs, pipeline_id)
-    
+        _copy_calibration_files(dirs)
+
+    # Copy daemon files (service file into pipeline dir, control scripts to top-level daemon/)
+    _ensure_daemon_files(dirs, pipeline_id)
+
     return dirs
 
 
@@ -161,9 +165,19 @@ def _copy_template_configs(dirs, pipeline_id):
         with open(str(template_src), 'r') as f:
             template_content = yaml.safe_load(f)
         
-        # Update pipeline_id in the template to match target pipeline
+        # Update pipeline-specific fields in the template
+        if 'rfsoc_host' in template_content:
+            template_content['rfsoc_host']['request_port'] = 10000 + pipeline_id
+            template_content['rfsoc_host']['stream_port'] = 20000 + pipeline_id
         if 'firmware' in template_content:
             template_content['firmware']['pipeline_id'] = pipeline_id
+            # RFDC tile/block mapping for dual-pipeline firmware (v7.9+)
+            if pipeline_id == 1:
+                template_content['firmware']['dac0_tile'] = 1
+                template_content['firmware']['dac1_tile'] = 1
+                template_content['firmware']['adc_tile'] = 3
+            if 'defaults' in template_content['firmware']:
+                template_content['firmware']['defaults']['sync_delay'] = 5714
         
         with open(template_dst, 'w') as f:
             yaml.dump(template_content, f, default_flow_style=False, sort_keys=False)
@@ -188,6 +202,67 @@ def _copy_template_configs(dirs, pipeline_id):
     except Exception as e:
         print(f"{bcolors.FAIL}Warning: Could not copy template config files: {e}{bcolors.ENDC}")
         print(f"{bcolors.WARNING}You may need to manually create a config file in {dirs['config']}{bcolors.ENDC}")
+
+
+def _copy_calibration_files(dirs):
+    """
+    Copy example calibration files from package data to the user's pipeline calibrations directory.
+    Skips files that already exist.
+    """
+    try:
+        pkg_cal_dir = importlib_files('souk_readout_tools').joinpath('data', 'calibrations')
+        for item in pkg_cal_dir.iterdir():
+            dst = os.path.join(dirs['calibrations'], item.name)
+            if not os.path.exists(dst):
+                shutil.copy2(str(item), dst)
+                if SUDO:
+                    os.chown(dst, TARGET_UID, TARGET_GID)
+    except Exception as e:
+        print(f"{bcolors.WARNING}Warning: Could not copy calibration files: {e}{bcolors.ENDC}")
+
+
+def _ensure_daemon_files(dirs, pipeline_id):
+    """
+    Copy daemon files from package data into the user directory structure.
+
+    - The pipeline-specific service file goes into the pipeline directory.
+    - The control scripts (install/remove) go into a top-level daemon/ directory.
+    """
+    import shutil
+
+    try:
+        pkg_daemon_dir = importlib_files('souk_readout_tools').joinpath('data', 'daemon')
+
+        # Copy the service file into the pipeline directory
+        # Both pipelines use the same base filename within their own directory
+        if pipeline_id == 0:
+            src_service = pkg_daemon_dir.joinpath('readout_server.service')
+        else:
+            src_service = pkg_daemon_dir.joinpath('readout_server_1.service')
+
+        dst_service = os.path.join(dirs['base'], 'readout_server.service')
+        if not os.path.exists(dst_service):
+            shutil.copy2(str(src_service), dst_service)
+            os.chmod(dst_service, 0o664)
+            if SUDO:
+                os.chown(dst_service, TARGET_UID, TARGET_GID)
+
+        # Copy control scripts to top-level daemon/ directory
+        daemon_dir = os.path.join(HOME, '.souk_readout_tools', 'daemon')
+        os.makedirs(daemon_dir, exist_ok=True)
+        if SUDO and os.path.exists(daemon_dir):
+            os.chown(daemon_dir, TARGET_UID, TARGET_GID)
+
+        for script in ('install_systemd_service.sh', 'remove_systemd_service.sh'):
+            dst_script = os.path.join(daemon_dir, script)
+            if not os.path.exists(dst_script):
+                shutil.copy2(str(pkg_daemon_dir.joinpath(script)), dst_script)
+                os.chmod(dst_script, 0o775)
+                if SUDO:
+                    os.chown(dst_script, TARGET_UID, TARGET_GID)
+
+    except Exception as e:
+        print(f"{bcolors.WARNING}Warning: Could not copy daemon files: {e}{bcolors.ENDC}")
 
 
 def extract_pipeline_id_from_config(config_file):
@@ -226,9 +301,6 @@ USER_CONFIG_DIR = os.path.join(HOME, '.souk_readout_tools', 'pipeline_0', 'confi
 USER_CALIBRATIONS_DIR = os.path.join(HOME, '.souk_readout_tools', 'pipeline_0', 'calibrations')
 USER_TMP_DIR = os.path.join(HOME, '.souk_readout_tools', 'pipeline_0', 'tmp')
 DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR, 'default_config.lnk')
-
-# Ensure default pipeline_0 dirs exist for backward compatibility
-ensure_pipeline_dirs(0)
 
 def check_if_running_on_rfsoc_arm():
     """

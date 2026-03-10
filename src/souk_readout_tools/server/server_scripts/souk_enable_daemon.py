@@ -1,19 +1,27 @@
+import argparse
 import os
-import sys 
+import sys
 
 
-#need to import to make sure user data (including the service file) is setup, but also need to avoid circular import..
+# Need to import to make sure user data (including the service file) is set up.
 if 'souk_readout_server' in sys.modules:
-    print('souk_readout_tools already imported')
+    pass
 else:
     import souk_readout_tools
 
 
 def main():
-    cmd='sudo /home/casper/.souk_readout_tools/daemon/install_systemd_service.sh'
+    parser = argparse.ArgumentParser(description='Enable the SOUK readout server systemd daemon.')
+    parser.add_argument('-p', '--pipeline', type=int, nargs='+', default=[0],
+                        choices=[0, 1],
+                        help='Pipeline ID(s) to enable (default: 0). '
+                             'Use -p 0 1 for both pipelines.')
+    args = parser.parse_args()
+
+    pipeline_args = ' '.join(str(p) for p in args.pipeline)
+    cmd = f'sudo /home/casper/.souk_readout_tools/daemon/install_systemd_service.sh {pipeline_args}'
     os.system(cmd)
-    return
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
-

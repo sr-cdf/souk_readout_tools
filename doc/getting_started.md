@@ -623,6 +623,10 @@ new_freqs = client.get_tone_frequencies()
 - `'max_gradient'` - Finds the frequency with the maximum gradient of the IQ trace (recommended).
 - `'min_mag'` - Finds the frequency with the minimum magnitude.
 
+### Tracking Loop
+
+*Not yet implemented.* A continuous tracking loop that periodically retunes tones to follow drifting resonances is planned for a future release.
+
 ---
 
 ## Power Calibration & Optimisation

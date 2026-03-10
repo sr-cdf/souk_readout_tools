@@ -7,8 +7,8 @@ config:
 rfsoc_host:
   hardware_id: "unnamed_rfsoc"
   address: "10.11.11.11"
-  request_port: 8888
-  stream_port: 9999
+  request_port: 10000
+  stream_port: 20000
   clock_source: "internal"
   trigger_source_pin: 0
   comments:
@@ -31,7 +31,7 @@ firmware:
   adc_dbm_to_dbfs: +12
   vop_current_fullscale: 20000
   defaults:
-    sync_delay: 6225
+    sync_delay: 5714
     acc_len: 1000
     internal_loopback: false
     psb_scale: 1 
@@ -50,9 +50,9 @@ firmware:
     adc_qmc_gain: 1 # WARNING UNTESTED. Gain correction factor. Range: 0 to 2.0 (Exclusive)
     adc_qmc_offset: 0 # WARNING UNTESTED. Offset correction factor is adding a fixed LSB value to the sampled signal.
     adc_qmc_phase: 0 # WARNING UNTESTED. Phase correction factor. Range: +/- 26.5 degrees (Exclusive)
-    tone_frequencies: []
-    tone_powers: []
-    tone_phases: []
+    frequencies: []
+    amplitudes: []
+    phases: []
   gpio_0: 'trigger_input'
   gpio_1: 'misc_input'
   gpio_2: 'misc_input'

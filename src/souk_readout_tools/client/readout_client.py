@@ -102,16 +102,17 @@ def get_pipeline_dirs(pipeline_id):
 def ensure_pipeline_dirs(pipeline_id):
     """
     Ensure pipeline-specific directories exist.
-    If the default config doesn't exist, copy template files from package data.
+    On first run, copies template config and calibration files from package data.
     """
     dirs = get_pipeline_dirs(pipeline_id)
     for key in ('config', 'calibrations', 'tmp'):
         os.makedirs(dirs[key], exist_ok=True)
-    
+
     # Copy template config files if default config doesn't exist
     if not os.path.exists(dirs['default_config']):
         _copy_template_configs(dirs, pipeline_id)
-    
+        _copy_calibration_files(dirs)
+
     return dirs
 
 
@@ -133,9 +134,18 @@ def _copy_template_configs(dirs, pipeline_id):
         with open(str(template_src), 'r') as f:
             template_content = yaml.safe_load(f)
         
-        # Update pipeline_id in the template to match target pipeline
+        # Update pipeline-specific fields in the template
+        if 'rfsoc_host' in template_content:
+            template_content['rfsoc_host']['request_port'] = 10000 + pipeline_id
+            template_content['rfsoc_host']['stream_port'] = 20000 + pipeline_id
         if 'firmware' in template_content:
             template_content['firmware']['pipeline_id'] = pipeline_id
+            if pipeline_id == 1:
+                template_content['firmware']['dac0_tile'] = 1
+                template_content['firmware']['dac1_tile'] = 1
+                template_content['firmware']['adc_tile'] = 3
+            if 'defaults' in template_content['firmware']:
+                template_content['firmware']['defaults']['sync_delay'] = 5714
         
         with open(template_dst, 'w') as f:
             yaml.dump(template_content, f, default_flow_style=False, sort_keys=False)
@@ -156,6 +166,23 @@ def _copy_template_configs(dirs, pipeline_id):
     except Exception as e:
         print(f"\033[91mWarning: Could not copy template config files: {e}\033[0m")
         print(f"\033[93mYou may need to manually create a config file in {dirs['config']}\033[0m")
+
+
+def _copy_calibration_files(dirs):
+    """
+    Copy example calibration files from package data to the user's pipeline calibrations directory.
+    Skips files that already exist.
+    """
+    import shutil
+
+    try:
+        pkg_cal_dir = importlib_files('souk_readout_tools').joinpath('data', 'calibrations')
+        for item in pkg_cal_dir.iterdir():
+            dst = os.path.join(dirs['calibrations'], item.name)
+            if not os.path.exists(dst):
+                shutil.copy2(str(item), dst)
+    except Exception as e:
+        print(f"\033[93mWarning: Could not copy calibration files: {e}\033[0m")
 
 
 def extract_pipeline_id_from_config(config_file):
@@ -195,8 +222,6 @@ USER_CONFIG_DIR = os.path.expanduser('~/.souk_readout_tools/pipeline_0/config')
 USER_TMP_DIR = os.path.expanduser('~/.souk_readout_tools/pipeline_0/tmp')
 DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR, 'default_config.lnk')
 
-# Ensure default pipeline_0 dirs exist for backward compatibility
-ensure_pipeline_dirs(0)
 
 class bcolors:
     HEADER = '\033[95m'

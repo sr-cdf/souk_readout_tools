@@ -1,69 +1,68 @@
 #!/bin/bash
 
 # install_systemd_service.sh
-# This script copies a predefined systemd service file to /etc/systemd/system/,
-# reloads the systemd daemon, enables the service, and starts it.
+# Installs readout server systemd service(s) for the specified pipeline(s).
+#
+# Usage:
+#   sudo ./install_systemd_service.sh           # pipeline 0 only (default)
+#   sudo ./install_systemd_service.sh 0         # pipeline 0 only
+#   sudo ./install_systemd_service.sh 1         # pipeline 1 only
+#   sudo ./install_systemd_service.sh 0 1       # both pipelines
 
-# Exit immediately if a command exits with a non-zero status
 set -e
 
 # === Configuration ===
-
-# Hardcoded service file name and source path
-SERVICE_NAME="readout_server.service"
-SERVICE_FILE_SRC="/home/casper/.souk_readout_tools/daemon/${SERVICE_NAME}"  # <-- Update this path
-
-# Destination directory for systemd service files
+BASE_DIR="/home/casper/.souk_readout_tools"
 SERVICE_DIR="/etc/systemd/system"
-SERVICE_FILE_DEST="${SERVICE_DIR}/${SERVICE_NAME}"
-
 # === End of Configuration ===
-
-# Function to display usage information (optional, since no arguments are used)
-usage() {
-    echo "Usage: sudo $0"
-    echo "This script does not accept any arguments."
-    exit 1
-}
 
 # Check if the script is run as root
 if [[ "$EUID" -ne 0 ]]; then
     echo "Error: This script must be run as root."
-    usage
-fi
-
-# Check if the service file exists and is a regular file
-if [[ ! -f "$SERVICE_FILE_SRC" ]]; then
-    echo "Error: Service file '$SERVICE_FILE_SRC' does not exist or is not a regular file."
+    echo "Usage: sudo $0 [pipeline_id ...]"
     exit 1
 fi
 
-echo "Copying service file to $SERVICE_DIR..."
-cp "$SERVICE_FILE_SRC" "$SERVICE_FILE_DEST"
-echo "Service file copied to $SERVICE_FILE_DEST."
+# Default to pipeline 0 if no arguments given
+if [[ "$#" -eq 0 ]]; then
+    PIPELINES=(0)
+else
+    PIPELINES=("$@")
+fi
 
-# Set appropriate permissions (optional but recommended)
-chmod 644 "$SERVICE_FILE_DEST"
-echo "Set permissions to 644 for $SERVICE_FILE_DEST."
+for PID in "${PIPELINES[@]}"; do
+    if [[ "$PID" != "0" && "$PID" != "1" ]]; then
+        echo "Error: Invalid pipeline ID '$PID'. Must be 0 or 1."
+        exit 1
+    fi
 
-# Reload systemd to recognize the new service
-echo "Reloading systemd daemon..."
-systemctl daemon-reload
-echo "Systemd daemon reloaded."
+    # Service file lives in the pipeline directory
+    SERVICE_FILE_SRC="${BASE_DIR}/pipeline_${PID}/readout_server.service"
+    SERVICE_NAME="readout_server_${PID}.service"
+    SERVICE_FILE_DEST="${SERVICE_DIR}/${SERVICE_NAME}"
 
-# Enable the service to start on boot
-echo "Enabling service '$SERVICE_NAME'..."
-systemctl enable "$SERVICE_NAME"
-echo "Service '$SERVICE_NAME' enabled to start on boot."
+    if [[ ! -f "$SERVICE_FILE_SRC" ]]; then
+        echo "Error: Service file '$SERVICE_FILE_SRC' does not exist."
+        echo "Run the readout server once for pipeline ${PID} to generate it."
+        exit 1
+    fi
 
-# Optionally, start the service immediately
-echo "Starting service '$SERVICE_NAME'..."
-systemctl start "$SERVICE_NAME"
-echo "Service '$SERVICE_NAME' started."
+    echo "=== Installing service for pipeline ${PID} ==="
 
-# Check the status of the service
-echo "Checking the status of '$SERVICE_NAME'..."
-systemctl status "$SERVICE_NAME" --no-pager
+    echo "Copying to ${SERVICE_FILE_DEST}..."
+    cp "$SERVICE_FILE_SRC" "$SERVICE_FILE_DEST"
+    chmod 644 "$SERVICE_FILE_DEST"
 
-echo "Service installation and setup completed successfully."
+    systemctl daemon-reload
 
+    echo "Enabling service '${SERVICE_NAME}'..."
+    systemctl enable "$SERVICE_NAME"
+
+    echo "Starting service '${SERVICE_NAME}'..."
+    systemctl start "$SERVICE_NAME"
+
+    systemctl status "$SERVICE_NAME" --no-pager
+    echo ""
+done
+
+echo "Done."
