@@ -160,4 +160,4 @@ The general procedure would be:
 - [Getting Started - Power Calibration & Optimisation](getting_started.md#power-calibration--optimisation)
 - [Getting Started - Setting Readout Tones](getting_started.md#setting-readout-tones)
 - [Installation - Calibration Files](installation.md#calibration-files)
-- Calibration measurement conditions: `~/.souk_readout_tools/pipeline_0/calibrations/readme`
+- Calibration measurement conditions: see the calibration readme on the RFSoC at `~/.souk_readout_tools/pipeline_0/calibrations/readme`

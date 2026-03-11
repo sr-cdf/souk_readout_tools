@@ -6,15 +6,25 @@ import argparse
 def main():
     try:
         parser = argparse.ArgumentParser(description='Check if the souk_readout_tools server is running on RFSoC')
-        parser.add_argument('-C', '--config_file', type=str,
-                            default=None,
-                            help='Path to config YAML or .lnk file. If omitted, uses the default_config.lnk for the selected pipeline.')
-        parser.add_argument('--pipeline', type=int, default=None, choices=[0, 1],
-                            help='Pipeline ID hint used only when --config_file is omitted. If omitted, defaults to pipeline 0.')
+        parser.add_argument('-C', '--config_file', type=str, default=None,
+                            help='Path to config YAML file.')
+        parser.add_argument('-a', '--address', type=str, default=None,
+                            help='RFSoC IP address (alternative to config file).')
+        parser.add_argument('--port', type=int, default=None,
+                            help='Request port (required with --address). Pipeline 0: 10000, pipeline 1: 10001.')
 
         args = parser.parse_args()
 
-        client = readout_client.ReadoutClient(config_file=args.config_file, pipeline_id=args.pipeline)
+        if args.config_file is not None:
+            client = readout_client.ReadoutClient(config_file=args.config_file)
+        elif args.address is not None:
+            if args.port is None:
+                print(bcolors.FAIL + '--port is required with --address (e.g. --port 10000).' + bcolors.ENDC)
+                return
+            client = readout_client.ReadoutClient(address=args.address, request_port=args.port)
+        else:
+            print(bcolors.FAIL + 'Provide --config_file or --address (with --port).' + bcolors.ENDC)
+            return
         result = client.get_server_status()
         
         if result['status']=='success':

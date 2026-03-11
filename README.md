@@ -69,7 +69,7 @@ See the [Getting Started Guide](doc/getting_started.md) for full details.
 
 | Command | Description |
 |---------|-------------|
-| `souk-connection-test` | Test connectivity to the readout server; accepts `-C/--config_file` and `--pipeline` |
+| `souk-connection-test` | Test connectivity to the readout server; accepts `-C/--config_file` or `-a/--address` |
 | `souk-wideband_sweep` | Perform a wideband frequency sweep |
 | `souk-mkid-finder-app` | Launch the MKID resonance finder GUI |
 
@@ -87,40 +87,43 @@ See the [Getting Started Guide](doc/getting_started.md) for full details.
 
 ## Configuration
 
-YAML-based configuration uses sections `rfsoc_host`, `firmware`, `rf_frontend`, `cryostat`, and `detector`. A template config is bundled with the package and copied to `~/.souk_readout_tools/` on first run.
+YAML-based configuration uses sections `rfsoc_host`, `firmware`, `rf_frontend`, `cryostat`, and `detector`. A template config is bundled with the package.
 
-Runtime data is pipeline-specific:
+**Client side:** Config files live wherever you choose. Create a config from the bundled template or pull one from a running server:
+
+```python
+from souk_readout_tools.client.readout_client import copy_template_config
+copy_template_config('my_config.yaml', pipeline_id=0)
+```
+
+**Server side:** The server manages its own pipeline-specific directories under `~/.souk_readout_tools/` on the RFSoC:
 
 ```text
 ~/.souk_readout_tools/
+├── daemon/
 ├── pipeline_0/
 │   ├── config/
-│   ├── calibrations/
-│   └── tmp/
+│   └── calibrations/
 └── pipeline_1/
-	├── config/
-	├── calibrations/
-	└── tmp/
+    ├── config/
+    └── calibrations/
 ```
 
-Important behavior:
-
-- `default_config.lnk` is a plain text file containing the most recent active config path, it may also be a filesystem symlink.
-- If you do not pass a config path, the client and server use the pipeline-specific `default_config.lnk`.
-- `firmware.pipeline_id` inside the config is authoritative; explicit pipeline arguments are mainly hints for locating the default config.
+`firmware.pipeline_id` inside the config is the authoritative pipeline identifier.
 
 ## Server Daemon
 
 The readout server can run as a systemd service for automatic start on boot and restart on crash:
 
 ```bash
-souk-enable-daemon    # Enable and start the service
-souk-disable-daemon   # Stop and disable the service
+souk-enable-daemon          # Enable pipeline 0 (default)
+souk-enable-daemon -p 0 1   # Enable both pipelines
+souk-disable-daemon         # Disable both pipelines (default)
 ```
 
 Monitor logs with:
 ```bash
-sudo journalctl -f -xu readout_server
+sudo journalctl -f -xu readout_server_0
 ```
 
 ## Installation Details

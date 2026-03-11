@@ -7,12 +7,13 @@ This script uses ReadoutClient.wideband_sweep() to perform the sweep,
 then saves and optionally plots the results.
 
 Example usage:
-    souk-wideband-sweep -C config.yaml -b 500e6 -n 1024 -P
-    souk-wideband-sweep --pipeline 0 --plot_data
-    
+    souk-wideband_sweep -C config.yaml -b 500e6 -n 1024 -P
+    souk-wideband_sweep -a 10.11.11.11 --port 10000 -P
+
 Programmatic usage:
     from souk_readout_tools.client.client_scripts.wideband_sweep import wideband_sweep
     sweep_data = wideband_sweep(config_file='config.yaml', plot_data=True)
+    sweep_data = wideband_sweep(address='10.11.11.11', request_port=10000, plot_data=True)
 """
 
 import sys
@@ -24,43 +25,54 @@ import numpy as np
 from souk_readout_tools.client.readout_client import ReadoutClient
 
 
-def wideband_sweep(config_file=None, bandwidth_hz=None, center_freq_hz=None,
+def wideband_sweep(config_file=None, address=None, request_port=None,
+                   bandwidth_hz=None, center_freq_hz=None,
                    step_size_hz=10000, num_tones=1024, samples_per_point=10,
                    ignore_phase_correction=True, remove_phase_slope=True,
                    filename=None, filetype='npy',
-                   plot_data=True, pipeline_id=None):
+                   plot_data=True):
     """
     Perform a wideband sweep of the system.
-    
+
     This is a convenience wrapper that creates a client, performs the sweep,
     and saves/plots the results.
-    
+
+    Connect using either a config file or an address and request port.
+    When connecting by address, the config is pulled from the server.
+
     Args:
-        config_file (str): Path to the configuration file. Default is None (uses default config).
+        config_file (str): Path to the configuration file.
+        address (str): RFSoC IP address (alternative to config_file).
+        request_port (int): Request port (required with address).
+                            Pipeline 0: 10000, pipeline 1: 10001.
         bandwidth_hz (float): Total bandwidth to measure. Default is full available bandwidth.
         center_freq_hz (float): Center frequency of the sweep. Default is band center.
-        step_size_hz (float): Step size of the sweep. Number of sweep steps = 
+        step_size_hz (float): Step size of the sweep. Number of sweep steps =
                               bandwidth / step_size / num_tones. Default is 10000.
         num_tones (int): Number of tones to use in the sweep. Default is 1024.
         samples_per_point (int): Number of samples to integrate per sweep point. Default is 10.
-        ignore_phase_correction (bool): DEPRECATED. Phase correction is no longer needed 
+        ignore_phase_correction (bool): DEPRECATED. Phase correction is no longer needed
                                         following firmware fixes. Default is True (no correction).
-        filename (str): Filename to save the data to. Default is tmp_wideband_sweep in tmp dir.
+        filename (str): Filename to save the data to. Default is tmp_wideband_sweep in cwd.
         filetype (str): Type of file to save. Default is 'npy'.
         plot_data (bool): Plot the data after saving. Default is True.
-        pipeline_id (int): Pipeline ID (0 or 1). If None, extracted from config. Default is None.
-    
+
     Returns:
         dict: Sweep data dictionary with frequencies, I/Q data, errors, and metadata.
     """
     # Create client
-    client = ReadoutClient(config_file=config_file, pipeline_id=pipeline_id)
-    
-    # Handle config: if none given, pull from server; else push ours
-    if config_file is None:
+    if config_file is not None:
+        client = ReadoutClient(config_file=config_file)
+        client.push_config()
+    elif address is not None:
+        client = ReadoutClient(address=address, request_port=request_port)
         client.pull_config()
     else:
-        client.push_config()
+        raise ValueError(
+            'Provide either config_file or address with request_port.\n'
+            'Example: wideband_sweep(config_file="config.yaml")\n'
+            'Example: wideband_sweep(address="10.11.11.11", request_port=10000)'
+        )
     
     # Perform the sweep using the client method
     sweep_data = client.wideband_sweep(
@@ -93,13 +105,13 @@ def save_and_plot_sweep(client, sweep_data, filename=None, filetype='npy', plot_
     Args:
         client: ReadoutClient instance (for export_sweep method)
         sweep_data: Sweep data dictionary from wideband_sweep()
-        filename: Output filename (without extension). Default is pipeline-specific tmp dir.
+        filename: Output filename (without extension). Default is tmp_wideband_sweep in cwd.
         filetype: File format ('npy', 'csv', etc.). Default is 'npy'.
         plot_data: Whether to display a plot. Default is False.
     """
     # Determine output filename
     if filename is None:
-        filename = os.path.join(client.user_tmp_dir, 'tmp_wideband_sweep')
+        filename = os.path.join(os.getcwd(), 'tmp_wideband_sweep')
     filename = os.path.abspath(filename)
     
     # Ensure directory exists
@@ -147,9 +159,12 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument('-C', '--config_file', type=str, default=None,
-                        help='Path to config YAML. Default: uses default_config.lnk for the pipeline.')
-    parser.add_argument('--pipeline', type=int, default=None, choices=[0, 1],
-                        help='Pipeline ID (0 or 1). If omitted, extracted from config or defaults to 0.')
+                        help='Path to config YAML file.')
+    parser.add_argument('-a', '--address', type=str, default=None,
+                        help='RFSoC IP address (alternative to config file).')
+    parser.add_argument('--port', type=int, default=None,
+                        help='Request port (required with --address). '
+                             'Pipeline 0: 10000, pipeline 1: 10001.')
     parser.add_argument('-b', '--bandwidth_hz', type=float, default=None,
                         help='Total bandwidth to measure in Hz. Default: full available bandwidth.')
     parser.add_argument('-c', '--center_freq_hz', type=float, default=None,
@@ -167,7 +182,7 @@ def main():
                         help='DEPRECATED. Apply legacy phase correction at filterbank channel edges. '\
                              'Not needed with current firmware.')
     parser.add_argument('-f', '--filename', type=str, default=None,
-                        help='Output filename (without extension). Default: tmp_wideband_sweep in pipeline tmp dir.')
+                        help='Output filename (without extension). Default: tmp_wideband_sweep in current directory.')
     parser.add_argument('-t', '--filetype', type=str, default='npy',
                         help='Output file format (npy, csv, etc.).')
     parser.add_argument('--no_remove_phase_slope', action='store_true',
@@ -177,12 +192,18 @@ def main():
 
     args = parser.parse_args()
 
+    # Validate connection arguments
+    if args.config_file is None and args.address is None:
+        parser.error('Provide either -C/--config_file or -a/--address (with --port).')
+    if args.address is not None and args.port is None:
+        parser.error('--port is required with --address (e.g. --port 10000).')
+
     print("Starting wideband sweep...")
 
     # Set up signal handler for graceful exit (need a client for cancel)
     # We create a temporary reference that will be set once client exists
     client_ref = [None]
-    
+
     def handle_signal(signum, frame):
         print(f"\nReceived signal {signum}. Cancelling tasks and exiting...")
         if client_ref[0] is not None:
@@ -205,6 +226,8 @@ def main():
     try:
         wideband_sweep(
             config_file=args.config_file,
+            address=args.address,
+            request_port=args.port,
             bandwidth_hz=args.bandwidth_hz,
             center_freq_hz=args.center_freq_hz,
             step_size_hz=args.step_size_hz,
@@ -215,7 +238,6 @@ def main():
             filename=args.filename,
             filetype=args.filetype,
             plot_data=args.plot_data,
-            pipeline_id=args.pipeline
         )
     except Exception as e:
         print(f"Error during sweep: {e}")

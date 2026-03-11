@@ -99,20 +99,18 @@ else:
 def get_pipeline_dirs(pipeline_id):
     """
     Get pipeline-specific directory paths.
-    
+
     For dual-pipeline support, each pipeline uses its own subdirectory:
       ~/.souk_readout_tools/pipeline_<id>/config/
       ~/.souk_readout_tools/pipeline_<id>/calibrations/
-      ~/.souk_readout_tools/pipeline_<id>/tmp/
-    
-    Returns a dict with keys: 'config', 'calibrations', 'tmp', 'default_config'
+
+    Returns a dict with keys: 'config', 'calibrations', 'default_config'
     """
     base_dir = os.path.join(HOME, '.souk_readout_tools', f'pipeline_{pipeline_id}')
     dirs = {
         'base': base_dir,
         'config': os.path.join(base_dir, 'config'),
         'calibrations': os.path.join(base_dir, 'calibrations'),
-        'tmp': os.path.join(base_dir, 'tmp'),
         'default_config': os.path.join(base_dir, 'config', 'default_config.lnk')
     }
     return dirs
@@ -124,7 +122,7 @@ def ensure_pipeline_dirs(pipeline_id):
     If the default config doesn't exist, copy template files from package data.
     """
     dirs = get_pipeline_dirs(pipeline_id)
-    for key in ('config', 'calibrations', 'tmp'):
+    for key in ('config', 'calibrations'):
         d = dirs[key]
         os.makedirs(d, exist_ok=True)
         if SUDO:
@@ -299,7 +297,6 @@ def extract_pipeline_id_from_config(config_file):
 # These will be overwritten per-instance in ReadoutServer
 USER_CONFIG_DIR = os.path.join(HOME, '.souk_readout_tools', 'pipeline_0', 'config')
 USER_CALIBRATIONS_DIR = os.path.join(HOME, '.souk_readout_tools', 'pipeline_0', 'calibrations')
-USER_TMP_DIR = os.path.join(HOME, '.souk_readout_tools', 'pipeline_0', 'tmp')
 DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR, 'default_config.lnk')
 
 def check_if_running_on_rfsoc_arm():
@@ -424,13 +421,11 @@ class ReadoutServer:
         self.pipeline_dirs = ensure_pipeline_dirs(self.pipeline_id)
         self.user_config_dir = self.pipeline_dirs['config']
         self.user_calibrations_dir = self.pipeline_dirs['calibrations']
-        self.user_tmp_dir = self.pipeline_dirs['tmp']
         self.default_config = self.pipeline_dirs['default_config']
-        
+
         print(f'Using pipeline {self.pipeline_id} directories:')
         print(f'  config: {self.user_config_dir}')
         print(f'  calibrations: {self.user_calibrations_dir}')
-        print(f'  tmp: {self.user_tmp_dir}')
         
         #server attributes
         self.config = None

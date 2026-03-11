@@ -123,7 +123,6 @@ On first use, the server automatically creates `~/.souk_readout_tools/` and popu
 │   │   ├── template_config.yaml
 │   │   └── default_config.lnk
 │   ├── calibrations/
-│   ├── tmp/
 │   └── readout_server.service
 └── pipeline_1/
     └── ...  (created when pipeline 1 is first used)
@@ -278,23 +277,38 @@ The installer auto-detects the platform and decides which components to install.
 INSTALL_CLIENT=true INSTALL_SERVER=true pip install .
 ```
 
-### 5. First Run & Config Setup
+### 5. Config Setup
 
-On first use (when a `ReadoutClient` is created), the package creates `~/.souk_readout_tools/pipeline_<id>/` and copies template config and example calibration files. A template config is available at `~/.souk_readout_tools/pipeline_0/config/template_config.yaml` as a starting point.
+There is no hidden directory on the client side. Config files live wherever you choose — keep them with your project or measurement data.
 
-Config files can live anywhere - keep them wherever makes sense for your project. Pass the path when creating a client:
+**Option A: Create a config from the template**
+
+```python
+from souk_readout_tools.client.readout_client import copy_template_config
+
+# Creates a config file with default settings for pipeline 0
+copy_template_config('my_config.yaml', pipeline_id=0)
+
+# Edit the file with your system-specific settings, then connect:
+from souk_readout_tools.client.readout_client import ReadoutClient
+client = ReadoutClient(config_file='my_config.yaml')
+```
+
+**Option B: Pull a config from a running server**
+
+If the server is already configured and running, connect by address and pull its config:
 
 ```python
 from souk_readout_tools.client.readout_client import ReadoutClient
 
-client = ReadoutClient(config_file='/path/to/my_project/my_config.yaml')
+client = ReadoutClient(address='10.11.11.11', request_port=10000)
+client.pull_config(save_as='my_config.yaml')
 ```
 
-If you are connecting to an already-running server and don't have a local config file, you can pull the active config from the server:
+Specify the request port matching the pipeline you want to connect to (10000 for pipeline 0, 10001 for pipeline 1). The pulled config is saved locally for future use. Next time, connect with:
 
 ```python
-client = ReadoutClient(config_file='path/to/my_config.yaml')
-client.pull_config()
+client = ReadoutClient(config_file='my_config.yaml')
 ```
 
 ### 6. Verify Installation
@@ -327,7 +341,7 @@ The config file is YAML with five main sections:
 
 The `rf_frontend`, `cryostat`, and `detector` sections each have a `connected: true/false` flag. When `false`, the section is ignored by the calibration chain.
 
-See the template config at `~/.souk_readout_tools/pipeline_0/config/template_config.yaml` for all available parameters and their defaults.
+Use `copy_template_config()` to generate a config file with all available parameters and their defaults. On the server, the template is also available at `~/.souk_readout_tools/pipeline_0/config/template_config.yaml`.
 
 ### Calibration Files
 
@@ -362,7 +376,7 @@ Calibration file format is two-column text (frequency in Hz, power in dBm at ful
 1500e6 -6.5
 ```
 
-Example calibration files are bundled with the package and copied to `~/.souk_readout_tools/pipeline_0/calibrations/` on first run. See the calibration readme there for details on measurement conditions (DAC settings, mixer scaling, VOP current, etc.).
+Example calibration files are bundled with the package. On the server, they are copied to `~/.souk_readout_tools/pipeline_0/calibrations/` on first run. On the client, use `client.pull_calibration('dac0.txt')` to fetch calibration files from the server. See the calibration readme on the server for details on measurement conditions (DAC settings, mixer scaling, VOP current, etc.).
 
 The same format and specification options apply to `dac1_dbfs_to_dbm` and `adc_dbm_to_dbfs`.
 
@@ -430,12 +444,18 @@ sudo dnf install python3-qt5
 
 ```
 
-#### Config file not found on first run
+#### Config file not found
 
-If you see errors about missing config paths, ensure the package data was initialised:
+The client does not create any hidden directories. You need to provide a config file or server address:
 
 ```python
-import souk_readout_tools  # creates ~/.souk_readout_tools/ on first run
+# Create a config from the template:
+from souk_readout_tools.client.readout_client import copy_template_config
+copy_template_config('my_config.yaml')
+
+# Or connect by address and pull the config from the server:
+client = ReadoutClient(address='10.11.11.11', request_port=10000)
+client.pull_config(save_as='my_config.yaml')
 ```
 
 ### Server Issues
@@ -510,7 +530,6 @@ sudo systemctl restart readout_server  # if running as daemon
 
 ```bash
 pip uninstall souk_readout_tools
-rm -rf ~/.souk_readout_tools  # optional: remove config/data
 ```
 
 ### Server

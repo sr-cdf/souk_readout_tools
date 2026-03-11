@@ -1,8 +1,7 @@
 # Getting Started with SOUK Readout Tools
 
-SOUK Readout Tools is a Python package for controlling SOUK MKID (Microwave Kinetic Inductance Detector) readout on RFSoC (Radio Frequency System-on-Chip) boards. It uses a client-server architecture: the server runs on the RFSoC ARM processor and clients connect remotely over TCP.
+SOUK Readout Tools is a Python package with tools for operating the MKID (Microwave Kinetic Inductance Detector) readout system on the RFSoC (Radio Frequency System-on-Chip) boards for Simons Observatory UK. It uses a client-server architecture: the server runs on the RFSoC ARM processor and clients connect remotely over TCP.
 
-Tested on Linux (bash, Python 3.10+) and Windows (PowerShell, Python 3.12+).
 
 ---
 
@@ -88,7 +87,20 @@ Detector → Cryostat → RF Frontend (optional downconversion) → ADC → PFB 
 
 ## Installation
 
-### 1. Network Setup
+### Server
+
+The readout server runs on the RFSoC and should already be installed and configured. If you need to set up or reinstall the server, see the [Installation Guide](installation.md#server-installation--setup).
+
+Verify the server is running:
+
+```bash
+ssh casper@10.11.11.11
+sudo systemctl status readout_server_0
+```
+
+### Client
+
+#### 1. Network Setup
 
 Ensure the RFSoC (e.g. `10.11.11.11/24`) is connected and on the same subnet. Manually set the client machine's IP address to `10.11.11.1/24` (or equivalent).
 
@@ -105,7 +117,7 @@ Optionally, add a hostname entry to `/etc/hosts` (Linux) or `C:\Windows\System32
 10.11.11.11 rfsoc
 ```
 
-### 2. Client Installation
+#### 2. Install the Package
 
 Clone the repository and set up a virtual environment:
 
@@ -132,28 +144,13 @@ Install the package:
 pip install .
 ```
 
-The installer auto-detects the platform (Xilinx/RFSoC for server, everything else for client). To override:
-```bash
-INSTALL_CLIENT=true pip install .
-```
-
-### 3. Server Installation
-
-On the RFSoC, the server is typically pre-installed. To reinstall or update:
-
-```bash
-ssh casper@rfsoc
-cd /home/casper/src/souk_readout_tools
-sudo /home/casper/py38venv/bin/pip install .
-```
-
-The server depends on `souk_mkid_readout` (from the `souk-firmware` repository), which must be installed on the RFSoC.
+The installer auto-detects the platform and installs client components on non-Xilinx machines.
 
 ---
 
 ## Configuration
 
-Configuration is YAML-based. A template is bundled with the package and is automatically copied to the user config directory on first run.
+Configuration is YAML-based. A template config is bundled with the package.
 
 ### Config File Structure
 
@@ -167,27 +164,24 @@ The main sections are:
 | `cryostat` | Channel info, S21 measurements, LNA settings, thermometry, optical setup |
 | `detector` | Chip/channel IDs, resonance and drive power file references |
 
-### Config Directories
+### Config Files
 
-User config and runtime data are stored per-pipeline:
+On the client side, config files live wherever you choose — there is no hidden directory. Keep them with your project or measurement data.
 
+To create a config from the template:
+
+```python
+from souk_readout_tools.client.readout_client import copy_template_config
+copy_template_config('my_config.yaml', pipeline_id=0)
 ```
-~/.souk_readout_tools/
-├── pipeline_0/
-│   ├── config/
-│   │   ├── default_config.lnk    # points to the active config file
-│   │   └── my_config.yaml
-│   ├── calibrations/
-│   └── tmp/
-└── pipeline_1/
-    └── ...
-```
+
+Or pull a config from a running server (see [Connecting to the RFSoC](#connecting-to-the-rfsoc)).
 
 ### Preparing a Config File
 
-Copy and edit the template config. The most important parameters to set are:
+Edit the template config. The most important parameters to set are:
 
-- `rfsoc_host.ip_address` - The RFSoC IP address
+- `rfsoc_host.address` - The RFSoC IP address
 - `rfsoc_host.request_port` / `stream_port` - TCP ports (must be unique per pipeline)
 - `firmware.fw_config_file` - Path to the firmware config YAML on the RFSoC
 - `firmware.pipeline_id` - Pipeline index (0 or 1)
@@ -210,10 +204,14 @@ Then, on the client machine, start an IPython session and create the client:
 ```python
 from souk_readout_tools.client.readout_client import ReadoutClient
 
-client = ReadoutClient(config_file='path/to/my_config.yaml')
+client = ReadoutClient(config_file='my_config.yaml')
 ```
 
-If no `config_file` is given, the client follows the `default_config.lnk` symlink in the pipeline config directory.
+You can also connect by address without a local config file. Specify the request port to select the pipeline (default 10000 for pipeline 0, 10001 for pipeline 1):
+
+```python
+client = ReadoutClient(address='10.11.11.11', request_port=10000)
+```
 
 ### Pushing Configuration to the RFSoC
 
@@ -227,32 +225,37 @@ client.config['firmware']['acc_len'] = 2**15
 
 # Push the modified config to the server
 client.push_config()
-```
 
-Note: there is currently no method to save the modified in-memory config back to a local YAML file. This is a planned addition.
+# Save the modified config back to a local file
+client.save_config()                       # overwrites the original file
+client.save_config('my_config_v2.yaml')    # save as a new file
+```
 
 If the config YAML file on disk is edited instead, a new client instance must be created to pick up those changes before pushing:
 
 ```python
 # After editing my_config.yaml on disk:
-client = ReadoutClient(config_file='path/to/my_config.yaml')
+client = ReadoutClient(config_file='my_config.yaml')
 client.push_config()
 ```
 
 ### Pulling Configuration from the RFSoC
 
-```python
-client.pull_config()
-```
-
-This is useful for reconnecting to a system that is already configured and running. You can create a client, pull the config, and start interacting immediately without needing to perform any initialisation or setup:
+This is useful for reconnecting to a system that is already configured and running. Connect by address, pull the config, and optionally save it locally:
 
 ```python
-client = ReadoutClient()
-client.pull_config()
+client = ReadoutClient(address='10.11.11.11', request_port=10000)
+client.pull_config(save_as='my_config.yaml')
 
 # Pick up where you left off - the system is already configured
 client.get_tone_frequencies()
+```
+
+If you already have a config file and just want to refresh the in-memory config from the server:
+
+```python
+client = ReadoutClient(config_file='my_config.yaml')
+client.pull_config()  # updates in memory only
 ```
 
 ### Requesting Information
@@ -443,7 +446,7 @@ The receiver script can be stopped with `Ctrl-C` or left running for the next st
 ### Parse Stream Data
 
 ```python
-data = client.parse_stream('tmp/tmp_stream')
+data = client.parse_stream('tmp_stream')
 t = np.arange(len(data['packet_counter'])) / data['sample_rate']
 z0 = data['i_data']['0000'] + 1j * data['q_data']['0000']
 plt.plot(t, np.abs(z0))
@@ -699,20 +702,20 @@ The system supports two independent readout pipelines on a single RFSoC board, a
 
 ### Quick Summary
 
-1. Create two config files with different `pipeline_id` (0 and 1), different ports, and correct RFDC tile/block mappings.
+1. Create two config files with different `pipeline_id` (0 and 1), different ports, and correct RFDC tile/block mappings. Use `copy_template_config()` with `pipeline_id=0` and `pipeline_id=1`.
 
 2. Start two server instances on the RFSoC:
    ```bash
    # Terminal 1
-   sudo souk-readout-server -p 0 ~/.souk_readout_tools/pipeline_0/config/config_p0.yaml
+   sudo souk-readout-server -p 0 /path/to/config_p0.yaml
    # Terminal 2
-   sudo souk-readout-server -p 1 ~/.souk_readout_tools/pipeline_1/config/config_p1.yaml
+   sudo souk-readout-server -p 1 /path/to/config_p1.yaml
    ```
 
 3. Connect two clients:
    ```python
-   client0 = ReadoutClient(config_file='config_p0.yaml', pipeline_id=0)
-   client1 = ReadoutClient(config_file='config_p1.yaml', pipeline_id=1)
+   client0 = ReadoutClient(config_file='config_p0.yaml')
+   client1 = ReadoutClient(config_file='config_p1.yaml')
    ```
 
 ### RFDC Mapping (v7.9+)
@@ -787,8 +790,9 @@ Server-side commands (installed on the RFSoC):
 
 **Configuration Management**
 - `push_config()` / `pull_config()` for transferring configs between client and server.
+- `save_config()` for saving the in-memory config to a local YAML file.
 - `apply_config()` detects changed parameters and applies hardware changes without full reinitialisation.
-- Pipeline-specific config and data directories (`~/.souk_readout_tools/pipeline_<id>/`).
+- Client config files live wherever the user chooses; server uses pipeline-specific directories on the RFSoC.
 
 **Power Calibration & Optimisation**
 - `set_tone_powers()` / `get_tone_powers()` with full calibration chain (PSB, DAC, VOP, mixer, RF frontend, cryostat).
