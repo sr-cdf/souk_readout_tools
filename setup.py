@@ -53,6 +53,7 @@ client_dependencies = [
 # Define server-specific dependencies
 server_dependencies = [
     "souk_mkid_readout  @ file://localhost//home/casper/src/souk-firmware/software/control_sw",
+    'smbus2',
 ]
 
 # Conditionally add client or server dependencies
@@ -81,6 +82,8 @@ if install_client:
     entry_points['console_scripts'].extend([
         'souk-connection-test=souk_readout_tools.client.client_scripts.souk_connection_test:main',
         'souk-wideband_sweep=souk_readout_tools.client.client_scripts.wideband_sweep:main',
+        'souk-batch-snapshots=souk_readout_tools.client.client_scripts.batch_snapshots:main',
+        'souk-find-resonances=souk_readout_tools.client.client_scripts.find_resonances:main',
         'souk-mkid-finder-app=souk_readout_tools.mkid_finder_app:main'
     ])
     entry_points['gui_scripts'].extend([
@@ -96,7 +99,7 @@ if install_server:
 
 setup(
     name='souk_readout_tools',
-    version='1.0.1',
+    version='1.1.0',
     description='Tools for the SOUK readout',
     author='Sam Rowe',
     author_email='sam.rowe@astro.cf.ac.uk',

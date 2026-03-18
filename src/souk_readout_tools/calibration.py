@@ -2,8 +2,8 @@
 
 import numpy as np
 
-def calc_tone_powers(amps, 
-                     psb_fftshift, 
+def calc_tone_powers(amps,
+                     psb_fftshift,
                      psb_scale,
                      mixer_scale_is_1p0,
                      mixer_qmc_gain,
@@ -15,6 +15,7 @@ def calc_tone_powers(amps,
                      tx_if_s21_db=0,
                      tx_mixer_conversion_loss_db=0,
                      tx_rf_s21_db=0,
+                     tx_bypass_amp_s21_db=0,
                      cryostat_input_s21_db=0,
                      dac_fs_bits=16,
                      detailed_output=False):
@@ -51,7 +52,8 @@ def calc_tone_powers(amps,
     tx_if_dbm = combiner_dbm + tx_if_s21_db - abs(tx_attenuator_value_db)
     tx_mixer_dbm = tx_if_dbm - abs(tx_mixer_conversion_loss_db)
     tx_rf_dbm = tx_mixer_dbm + tx_rf_s21_db
-    cryostat_dbm = tx_rf_dbm + cryostat_input_s21_db
+    tx_amp_dbm = tx_rf_dbm + tx_bypass_amp_s21_db
+    cryostat_dbm = tx_amp_dbm + cryostat_input_s21_db
     output_power_dbm = cryostat_dbm
     if detailed_output:
         details = {'amps':amps.tolist(),
@@ -68,13 +70,14 @@ def calc_tone_powers(amps,
                    'tx_if_dbm':tx_if_dbm.tolist(),
                    'tx_mixer_dbm':tx_mixer_dbm.tolist(),
                    'tx_rf_dbm':tx_rf_dbm.tolist(),
+                   'tx_amp_dbm':tx_amp_dbm.tolist(),
                    'cryostat_dbm':cryostat_dbm.tolist(),}
         return output_power_dbm, details
     else:
         return output_power_dbm
 
 def calc_tone_amplitudes(powers_dbm,
-                   psb_fftshift, 
+                   psb_fftshift,
                    psb_scale,
                    mixer_scale_is_1p0,
                    mixer_qmc_gain,
@@ -86,6 +89,7 @@ def calc_tone_amplitudes(powers_dbm,
                    tx_if_s21_db=0,
                    tx_mixer_conversion_loss_db=0,
                    tx_rf_s21_db=0,
+                   tx_bypass_amp_s21_db=0,
                    cryostat_input_s21_db=0,
                    dac_fs_bits=16,
                    detailed_output=False):
@@ -99,7 +103,9 @@ def calc_tone_amplitudes(powers_dbm,
     #assume reference power is final stage in the chain
     cryostat_dbm = output_powers_dbm
     #account for cryostat s21
-    tx_rf_dbm = cryostat_dbm - cryostat_input_s21_db
+    tx_amp_dbm = cryostat_dbm - cryostat_input_s21_db
+    #account for amp s21 (gain when enabled, insertion loss when bypassed)
+    tx_rf_dbm = tx_amp_dbm - tx_bypass_amp_s21_db
     #account for rf frontend s21
     tx_mixer_dbm = tx_rf_dbm - tx_rf_s21_db
     tx_if_dbm = tx_mixer_dbm + abs(tx_mixer_conversion_loss_db)
@@ -131,6 +137,7 @@ def calc_tone_amplitudes(powers_dbm,
     if detailed_output:
         details = {'powers_dbm':powers_dbm.tolist(),
                    'cryostat_dbm':cryostat_dbm.tolist(),
+                   'tx_amp_dbm':tx_amp_dbm.tolist(),
                    'tx_rf_dbm':tx_rf_dbm.tolist(),
                    'tx_mixer_dbm':tx_mixer_dbm.tolist(),
                    'tx_if_dbm':tx_if_dbm.tolist(),
@@ -149,12 +156,27 @@ def calc_tone_amplitudes(powers_dbm,
     else:
         return amps
     
-def calc_accumulated_iq_level(adc_input_power_dbm,adc_dbm_to_dbfs,mixer_qmc_gain,mixer_scale_is_1p0,adc_bits,pfb_fftshift,rx_mix_scale,acclen,windowfactor=1,accumulated_iq_phase=0):
+def calc_accumulated_iq_level(adc_input_power_dbm,adc_dbm_to_dbfs,mixer_qmc_gain,mixer_scale_is_1p0,adc_bits,pfb_fftshift,rx_mix_scale,acclen,
+                              rx_combiner_loss_db=0,
+                              rx_attenuator_value_db=0,
+                              rx_if_s21_db=0,
+                              rx_mixer_conversion_loss_db=0,
+                              rx_rf_s21_db=0,
+                              rx_bypass_amp_s21_db=0,
+                              cryostat_output_s21_db=0,
+                              windowfactor=1,accumulated_iq_phase=0):
     """
     Estimate the final accumulated IQ value levels for a given power level at the ADC input.
+    Optionally accounts for the RX analog frontend between cryostat output and ADC.
+    When RX frontend parameters are zero (default), adc_input_power_dbm is used directly.
     """
     #convert to numpy array
     sig_dbm = np.atleast_1d(adc_input_power_dbm)
+
+    # Account for RX analog frontend: cryostat output -> ADC input
+    # These default to 0 so the function is backwards-compatible when called
+    # with just adc_input_power_dbm representing power already at the ADC.
+    sig_dbm = sig_dbm + cryostat_output_s21_db + rx_bypass_amp_s21_db + rx_rf_s21_db - abs(rx_mixer_conversion_loss_db) + rx_if_s21_db - abs(rx_attenuator_value_db) - abs(rx_combiner_loss_db)
     
     sig_dbfs = sig_dbm - adc_dbm_to_dbfs
 
@@ -183,9 +205,19 @@ def calc_accumulated_iq_level(adc_input_power_dbm,adc_dbm_to_dbfs,mixer_qmc_gain
 
     return acc_i_out+1j*acc_q_out
 
-def calc_adc_input_power(accumulated_iq_level,adc_dbm_to_dbfs,mixer_qmc_gain,mixer_scale_is_1p0,adc_bits,pfb_fftshift,rx_mix_scale,acclen,windowfactor=1):
+def calc_adc_input_power(accumulated_iq_level,adc_dbm_to_dbfs,mixer_qmc_gain,mixer_scale_is_1p0,adc_bits,pfb_fftshift,rx_mix_scale,acclen,
+                         rx_combiner_loss_db=0,
+                         rx_attenuator_value_db=0,
+                         rx_if_s21_db=0,
+                         rx_mixer_conversion_loss_db=0,
+                         rx_rf_s21_db=0,
+                         rx_bypass_amp_s21_db=0,
+                         cryostat_output_s21_db=0,
+                         windowfactor=1):
     """
     Estimate the tone powers incident at the ADC from accumulated IQ values.
+    When RX frontend parameters are provided, returns the power at the cryostat output
+    (before the RX frontend). When all are zero (default), returns power at the ADC input.
     """
     #convert to numpy array
     accumulated_iq_levels = np.atleast_1d(accumulated_iq_level)
@@ -199,10 +231,8 @@ def calc_adc_input_power(accumulated_iq_level,adc_dbm_to_dbfs,mixer_qmc_gain,mix
     pfb_i_out = rx_mix_i_out / rx_mix_scale
     pfb_q_out = rx_mix_q_out / rx_mix_scale
 
-    adc_i_amp = pfb_i_out / 2**(13-bin(pfb_fftshift).count('1')) / np.cos(-np.angle(accumulated_iq_levels))
-    adc_q_amp = pfb_q_out / 2**(13-bin(pfb_fftshift).count('1')) / np.sin(-np.angle(accumulated_iq_levels))
-
-    adc_amp = abs(adc_i_amp +1j*adc_q_amp) / np.sqrt(2) # amp_i = amp_q = amp
+    pfb_amp = np.abs(pfb_i_out + 1j * pfb_q_out)
+    adc_amp = pfb_amp / 2**(13-bin(pfb_fftshift).count('1'))
 
     ddc_amp = adc_amp / 2**(adc_bits-1) 
 
@@ -217,6 +247,9 @@ def calc_adc_input_power(accumulated_iq_level,adc_dbm_to_dbfs,mixer_qmc_gain,mix
     
     sig_dbm = sig_dbfs + adc_dbm_to_dbfs
 
+    # Remove RX frontend gains to refer power back to cryostat output
+    sig_dbm = sig_dbm + abs(rx_combiner_loss_db) + abs(rx_attenuator_value_db) - rx_if_s21_db + abs(rx_mixer_conversion_loss_db) - rx_rf_s21_db - rx_bypass_amp_s21_db - cryostat_output_s21_db
+
     # print('\n'.join([str(i) for i in (accumulated_iq_levels,acc_i_out,acc_q_out,rx_mix_i_out,rx_mix_q_out,pfb_i_out,pfb_q_out,adc_i_amp,adc_q_amp,adc_amp,ddc_amp,sig_rms,sig_dbfs,sig_dbm)]))
 
     return sig_dbm
@@ -226,17 +259,17 @@ def calc_adc_input_power(accumulated_iq_level,adc_dbm_to_dbfs,mixer_qmc_gain,mix
 def check_sticky_adc_overvoltage_protection_status():
     """
     Check the status of the sticky ADC overvoltage register.
-    
-    There is no access to the register so we have to see of the measure signal compares with the expected signal
 
+    Deprecated — use firmware_lib.check_rfdc_rts_events() instead, which
+    checks all RFDC RTS sticky flags (DAC and ADC overvoltage/overrange)
+    via the souk_mkid_readout interface.
     """
     pass
 
 def clear_sticky_adc_overvoltage_protection_status():
     """
     Clear the sticky ADC overvoltage register.
-    
-    There is no access to the register so we have to see of the measure signal compares with the expected signal
 
+    Deprecated — use firmware_lib.check_rfdc_rts_events(clear=True) instead.
     """
     pass

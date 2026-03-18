@@ -113,6 +113,28 @@ def copy_template_config(destination, pipeline_id=0):
     print(f'Edit this file with your system-specific settings before use.')
 
 
+# Config keys whose string values are calibration file paths.
+# Each entry is (section, key).  These fields can also hold scalars,
+# inline [freq, dB] arrays, or None — only strings trigger file handling.
+CAL_FILE_KEYS = [
+    ('firmware', 'dac0_dbfs_to_dbm'),
+    ('firmware', 'dac1_dbfs_to_dbm'),
+    ('firmware', 'adc_dbm_to_dbfs'),
+    ('rf_frontend', 'tx_combiner_loss_db'),
+    ('rf_frontend', 'rx_combiner_loss_db'),
+    ('rf_frontend', 'tx_if_s21_db'),
+    ('rf_frontend', 'rx_if_s21_db'),
+    ('rf_frontend', 'tx_rf_s21_db'),
+    ('rf_frontend', 'rx_rf_s21_db'),
+    ('rf_frontend', 'tx_mixer_conversion_loss_db'),
+    ('rf_frontend', 'rx_mixer_conversion_loss_db'),
+    ('rf_frontend', 'tx_bypass_amp_s21_db'),
+    ('rf_frontend', 'rx_bypass_amp_s21_db'),
+    ('cryostat', 'input_s21_db'),
+    ('cryostat', 'output_s21_db'),
+]
+
+
 class bcolors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
@@ -205,6 +227,7 @@ class ReadoutClient:
 
         self.system_information = None
         self.parameters = {}
+        self.calibration_files = {}  # basename -> contents, populated by pull_config
 
     def send_request(self, message):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -278,13 +301,20 @@ class ReadoutClient:
             self.pull_config()
         return response
 
-    def pull_config(self, save_as=None):
+    def pull_config(self, save_as=None, pull_calibration_files=True):
         """
         Pull the running config from the server and load it into this client.
 
+        Calibration file paths in the config are detected and the file contents
+        are fetched into memory (``self.calibration_files``).  Nothing is written
+        to disk until ``save_config()`` is called (or ``save_as`` is provided
+        as a convenience shortcut).
+
         Args:
-            save_as: Path to save the config file locally. If None, the config
-                     is loaded in memory only. Use save_config() to write it later.
+            save_as: Path to save the config and calibration files to disk.
+                     If None, everything stays in memory only.
+            pull_calibration_files: If True (default), fetch referenced
+                     calibration files from the server into memory.
         """
         message = {'request': 'pull_config'}
         response = self.send_request(message)
@@ -294,18 +324,45 @@ class ReadoutClient:
             self.pipeline_id = self.config.get('firmware', {}).get('pipeline_id', 0)
             print(f'Config pulled from server (pipeline {self.pipeline_id})')
 
+            if pull_calibration_files:
+                self._pull_config_cal_files()
+
             if save_as is not None:
-                with open(save_as, 'w') as file:
-                    file.write(config_contents)
-                self.config_file = os.path.abspath(save_as)
-                self.config_dir = os.path.dirname(self.config_file)
-                print(f'Config saved to {self.config_file}')
+                self.save_config(save_as)
         else:
             return response
+
+    def _pull_config_cal_files(self):
+        """
+        For each calibration key in the config that holds a string (file path),
+        pull the file contents from the server into self.calibration_files.
+
+        Does not write to disk or modify config paths — that happens in
+        save_config().
+        """
+        for section, key in CAL_FILE_KEYS:
+            value = self.config.get(section, {}).get(key)
+            if not isinstance(value, str):
+                continue
+            basename = os.path.basename(value)
+            if basename in self.calibration_files:
+                continue  # already fetched (e.g. shared between keys)
+            msg = {'request': 'pull_calibration', 'cal_filename': basename}
+            response = self.send_request(msg)
+            if response.get('status') == 'success':
+                self.calibration_files[basename] = response['cal_contents']
+                print(f'  Pulled calibration file: {basename}')
+            else:
+                print(f'  WARNING: could not pull calibration file {basename} '
+                      f'for {section}.{key}')
 
     def save_config(self, filename=None):
         """
         Save the in-memory config dict to a local YAML file.
+
+        If calibration file contents are held in memory (from pull_config),
+        they are written to a ``calibrations/`` directory next to the config
+        file, and the config paths are rewritten to local relative paths.
 
         Args:
             filename: Path to write the config file. Defaults to self.config_file.
@@ -317,35 +374,99 @@ class ReadoutClient:
         if filename is None:
             raise ValueError('No filename specified and no config_file set. Pass a filename.')
         filename = os.path.abspath(filename)
-        with open(filename, 'w') as f:
-            yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
         self.config_file = filename
         self.config_dir = os.path.dirname(filename)
+
+        # Write any in-memory calibration files and rewrite config paths
+        if self.calibration_files:
+            local_cal_dir = os.path.join(self.config_dir, 'calibrations')
+            os.makedirs(local_cal_dir, exist_ok=True)
+            for basename, contents in self.calibration_files.items():
+                dest = os.path.join(local_cal_dir, basename)
+                with open(dest, 'w') as f:
+                    f.write(contents)
+            # Rewrite config paths to local relative form
+            for section, key in CAL_FILE_KEYS:
+                value = self.config.get(section, {}).get(key)
+                if not isinstance(value, str):
+                    continue
+                basename = os.path.basename(value)
+                if basename in self.calibration_files:
+                    self.config[section][key] = os.path.join('calibrations', basename)
+
+        with open(filename, 'w') as f:
+            yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
         print(f'Config saved to {filename}')
 
-    def push_config(self):
+    def push_config(self, push_calibration_files=True):
+        """
+        Push the current config to the server.
+
+        If push_calibration_files is True (default), any calibration parameters
+        in the config that point to local files are automatically pushed to the
+        server's calibrations directory and the paths are rewritten to the
+        server-relative form ``pipeline_N/calibrations/filename``.
+
+        The local config is not modified — only the copy sent to the server has
+        rewritten paths.
+        """
         name = os.path.basename(self.config_file)
-        config = yaml.dump(self.config,sort_keys=False)
-        message = {'request': 'push_config', 'config_filename': name, 'config_contents': config}
+
+        # Deep-copy config so local version is not modified
+        import copy
+        push_config = copy.deepcopy(self.config)
+        pipeline_id = push_config.get('firmware', {}).get('pipeline_id', 0)
+
+        if push_calibration_files:
+            for section, key in CAL_FILE_KEYS:
+                value = push_config.get(section, {}).get(key)
+                if not isinstance(value, str):
+                    continue
+                # Resolve the local file path
+                local_path = self._resolve_local_cal_path(value)
+                if local_path is None:
+                    print(f'  WARNING: calibration file not found for {section}.{key}: {value}')
+                    continue
+                # Push the file to the server
+                self.push_calibration(local_path)
+                # Rewrite the config path to server-relative form
+                basename = os.path.basename(local_path)
+                server_path = f'pipeline_{pipeline_id}/calibrations/{basename}'
+                push_config[section][key] = server_path
+                print(f'  {section}.{key}: pushed {basename}, path -> {server_path}')
+
+        config_contents = yaml.dump(push_config, sort_keys=False)
+        message = {'request': 'push_config', 'config_filename': name, 'config_contents': config_contents}
         response = self.send_request(message)
         if response['status'] == 'success':
             print(f'Config file pushed from {self.config_file} to RFSoC')
-            return 
+            return
         else:
             return response
-       # if response['status'] == 'success':
-       #     response=self.initialise_firmware(config_file=name)
-       # else:
-       #     print(f"Error saving config: {response['message']}")
-       #     return response
-        #if default:
-        #    self.set_config_default(name)
 
+    def _resolve_local_cal_path(self, path_str):
+        """
+        Resolve a calibration file path string from the config to a local file.
 
-    #def set_config_default(self,config_filename):
-    #    message = {'request': 'set_default_config', 'config_filename': config_filename}
-    #    response = self.send_request(message)
-    #    return response
+        Tries in order:
+          1. As-is (absolute path or cwd-relative)
+          2. Relative to the config file directory
+          3. Basename only, in a 'calibrations/' subdir next to the config
+
+        Returns the resolved absolute path, or None if not found.
+        """
+        # 1. As-is
+        if os.path.isfile(path_str):
+            return os.path.abspath(path_str)
+        # 2. Relative to config dir
+        rel_to_config = os.path.join(self.config_dir, path_str)
+        if os.path.isfile(rel_to_config):
+            return os.path.abspath(rel_to_config)
+        # 3. Basename in calibrations/ next to config
+        cal_dir = os.path.join(self.config_dir, 'calibrations', os.path.basename(path_str))
+        if os.path.isfile(cal_dir):
+            return os.path.abspath(cal_dir)
+        return None
 
 
     def push_calibration(self, calibration_file):
@@ -402,6 +523,110 @@ class ReadoutClient:
         else:
             print(f"Error getting system information: {response['message']}")
             return response
+
+    def sync_config_from_system(self):
+        """
+        Update the in-memory config with live hardware state from the server.
+
+        Fetches system information and writes the current firmware settings
+        back into config['firmware']['defaults'], and current tone
+        frequencies/amplitudes/phases into the defaults section.  This
+        captures the running state so that save_config() or push_config()
+        will persist it.
+
+        Does not write to disk — call save_config() afterwards to save.
+
+        Returns the system_information dict.
+        """
+        if self.config is None:
+            raise RuntimeError('No config loaded. Use pull_config() or load a config file first.')
+
+        info = self.get_system_information()
+        if not isinstance(info, dict) or 'pipeline_id' not in info:
+            raise RuntimeError(f'Failed to get system information: {info}')
+
+        defaults = self.config.setdefault('firmware', {}).setdefault('defaults', {})
+
+        # Direct mappings: system_info key -> defaults key
+        DIRECT_MAPS = {
+            'sync_delay':                'sync_delay',
+            'acc_len':                   'acc_len',
+            'internal_loopback':         'internal_loopback',
+            'psb_scale':                 'psb_scale',
+            'psb_fftshift':              'psb_fftshift',
+            'pfb_fftshift':              'pfb_fftshift',
+            'dsa':                       'dsa',
+            'dac_duc_mixer_frequency_hz': 'dac_duc_mixer_frequency_hz',
+            'adc_ddc_mix_frequency_hz':  'adc_ddc_mixer_frequency_hz',
+        }
+        for info_key, defaults_key in DIRECT_MAPS.items():
+            if info_key in info and info[info_key] is not None:
+                defaults[defaults_key] = info[info_key]
+
+        # VOP — use dac0 value
+        if info.get('vop_dac0') is not None and info['vop_dac0'] != 0:
+            defaults['vop'] = int(info['vop_dac0'])
+
+        # Mixer scale modes
+        if info.get('mixer_scale_1p0_dac0') is not None:
+            defaults['dac_mixer_scale_1p0'] = bool(info['mixer_scale_1p0_dac0'])
+        if info.get('mixer_scale_1p0_adc') is not None:
+            defaults['adc_mixer_scale_1p0'] = bool(info['mixer_scale_1p0_adc'])
+
+        # Nyquist zone — use DAC0 value
+        if info.get('nyquist_zone_dac0') is not None and info['nyquist_zone_dac0'] != 1:
+            defaults['nyquist_zone'] = int(info['nyquist_zone_dac0'])
+
+        # QMC settings from DAC0
+        dac_qmc = info.get('mixer_qmc_settings_dac0')
+        if dac_qmc is not None:
+            if 'GainCorrectionFactor' in dac_qmc:
+                defaults['dac_qmc_gain'] = dac_qmc['GainCorrectionFactor']
+            if 'OffsetCorrectionFactor' in dac_qmc:
+                defaults['dac_qmc_offset'] = dac_qmc['OffsetCorrectionFactor']
+            if 'PhaseCorrectionFactor' in dac_qmc:
+                defaults['dac_qmc_phase'] = dac_qmc['PhaseCorrectionFactor']
+
+        # QMC settings from ADC
+        adc_qmc = info.get('mixer_qmc_settings_adc')
+        if adc_qmc is not None:
+            if 'GainCorrectionFactor' in adc_qmc:
+                defaults['adc_qmc_gain'] = adc_qmc['GainCorrectionFactor']
+            if 'OffsetCorrectionFactor' in adc_qmc:
+                defaults['adc_qmc_offset'] = adc_qmc['OffsetCorrectionFactor']
+            if 'PhaseCorrectionFactor' in adc_qmc:
+                defaults['adc_qmc_phase'] = adc_qmc['PhaseCorrectionFactor']
+
+        # Tone state
+        if 'tone_frequencies' in info:
+            defaults['frequencies'] = info['tone_frequencies']
+        if 'tone_amplitudes' in info:
+            defaults['amplitudes'] = info['tone_amplitudes']
+        if 'tone_phases' in info:
+            defaults['phases'] = info['tone_phases']
+
+        # RF frontend peripheral state (attenuator, amp bypass)
+        rf_response = self.get_rf_peripheral_status()
+        rf_status = rf_response.get('result', {}) if isinstance(rf_response, dict) else {}
+        rf = self.config.setdefault('rf_frontend', {})
+        mm = rf.setdefault('mixerless_module', {})
+        if isinstance(rf_status, dict) and rf_status.get('enabled'):
+            rf['tx_attenuator_value_db'] = rf_status['tx_attenuation_db']
+            rf['rx_attenuator_value_db'] = rf_status['rx_attenuation_db']
+            mm['tx_amp_bypass'] = rf_status['tx_amp_bypass']
+            mm['rx_amp_bypass'] = rf_status['rx_amp_bypass']
+        else:
+            rf['tx_attenuator_value_db'] = None
+            rf['rx_attenuator_value_db'] = None
+            mm['tx_amp_bypass'] = None
+            mm['rx_amp_bypass'] = None
+
+        n_changed = sum(1 for k in DIRECT_MAPS.values() if k in defaults)
+        print(f'Config defaults updated from live system state '
+              f'({n_changed} parameters, {len(defaults.get("frequencies", []))} tones)')
+        print('Use save_config() to write to disk, or push_config() to persist on the server.')
+
+        return info
 
     def set_parameter(self, param_name, param_value):
         message = {'request': 'set', 'param': param_name, 'value': param_value}
@@ -492,6 +717,35 @@ class ReadoutClient:
     
     def fix_adc_saturation(self):
         return self.send_request({'request': 'fix_adc_saturation'})
+
+    # -- RF peripheral (attenuator / amp bypass) control --
+
+    def get_rf_peripheral_status(self):
+        return self.send_request({'request': 'get_rf_peripheral_status'})
+
+    def set_tx_attenuation(self, value_db):
+        return self.send_request({'request': 'set_tx_attenuation', 'value': float(value_db)})
+
+    def get_tx_attenuation(self):
+        return self.send_request({'request': 'get_tx_attenuation'})
+
+    def set_rx_attenuation(self, value_db):
+        return self.send_request({'request': 'set_rx_attenuation', 'value': float(value_db)})
+
+    def get_rx_attenuation(self):
+        return self.send_request({'request': 'get_rx_attenuation'})
+
+    def set_tx_amp_bypass(self, bypass=True):
+        return self.send_request({'request': 'set_tx_amp_bypass', 'bypass': bool(bypass)})
+
+    def get_tx_amp_bypass(self):
+        return self.send_request({'request': 'get_tx_amp_bypass'})
+
+    def set_rx_amp_bypass(self, bypass=True):
+        return self.send_request({'request': 'set_rx_amp_bypass', 'bypass': bool(bypass)})
+
+    def get_rx_amp_bypass(self):
+        return self.send_request({'request': 'get_rx_amp_bypass'})
 
     def enable_stream(self):
         message = {'request': 'enable_stream'}
@@ -801,7 +1055,112 @@ class ReadoutClient:
                 'num_snapshots': num_snapshots,
                 'len_snapshot': len(snapshot)}
 
+    def batch_snapshots(self, tone_indices=None, num_snapshots=10,
+                        export_file=None, plot=False, verbose=True):
+        """
+        Acquire pre-accumulator snapshots for multiple tones.
 
+        Iterates over the requested tone indices, acquiring num_snapshots
+        snapshots per tone via get_accumulator_snapshots().
+
+        Note on indexing: tone_indices are user-facing ordinal indices
+        (0, 1, 2, ...) corresponding to the order tones were set, not
+        firmware LO channel indices (which may be non-contiguous due to
+        VACC constraints). The translation to firmware channels happens
+        inside get_accumulator_snapshots().
+
+        Args:
+            tone_indices: List of user-facing tone indices to snapshot,
+                          or None for all active tones.
+            num_snapshots (int): Number of 1024-sample snapshots per tone.
+            export_file (str): Path to save results as .npz. None to skip.
+            plot (bool): If True, plot time-domain and power spectrum for
+                         each tone.
+            verbose (bool): Print progress.
+
+        Returns:
+            dict with keys:
+                'results': dict mapping tone_index -> snapshot dict (as
+                           returned by get_accumulator_snapshots).
+                'sample_rate': Pre-accumulator sample rate in Hz.
+                'num_snapshots': Snapshots per tone.
+                'tone_frequencies': Array of tone frequencies in Hz.
+                'firmware_indices': Firmware LO channel indices for each
+                                    tone (from detailed tone frequency query).
+        """
+        freqs = self.get_tone_frequencies()
+        n_tones = len(freqs)
+
+        # Get firmware-level tone index mapping for reference
+        freq_details = self.get_tone_frequencies(detailed_output=True)
+        fw_indices = freq_details.get('rx', {}).get('tone_indices', list(range(n_tones)))
+
+        if tone_indices is None:
+            tone_indices = list(range(n_tones))
+        else:
+            tone_indices = list(tone_indices)
+            for idx in tone_indices:
+                if idx < 0 or idx >= n_tones:
+                    raise ValueError(
+                        f"Tone index {idx} out of range (0 to {n_tones - 1})")
+
+        results = {}
+        sample_rate = None
+        for i, tidx in enumerate(tone_indices):
+            if verbose:
+                fw_idx = fw_indices[tidx] if tidx < len(fw_indices) else '?'
+                print(f"Snapshotting tone {tidx} (fw chan {fw_idx}, "
+                      f"{i+1}/{len(tone_indices)}, "
+                      f"{freqs[tidx]/1e6:.3f} MHz)...")
+            snap = self.get_accumulator_snapshots(tidx, num_snapshots)
+            results[tidx] = snap
+            if sample_rate is None:
+                sample_rate = snap['sample_rate']
+
+        output = {
+            'results': results,
+            'sample_rate': sample_rate,
+            'num_snapshots': num_snapshots,
+            'tone_frequencies': freqs,
+            'firmware_indices': fw_indices,
+        }
+
+        if export_file is not None:
+            self._export_batch_snapshots(output, export_file, verbose)
+
+        if plot:
+            self._plot_batch_snapshots(output)
+
+        return output
+
+    @staticmethod
+    def _export_batch_snapshots(batch_data, filepath, verbose=True):
+        """Save batch snapshot data to a .npz file."""
+        if not filepath.endswith('.npz'):
+            filepath += '.npz'
+
+        save_dict = {
+            'sample_rate': batch_data['sample_rate'],
+            'num_snapshots': batch_data['num_snapshots'],
+            'tone_frequencies': batch_data['tone_frequencies'],
+            'tone_indices': np.array(list(batch_data['results'].keys())),
+            'firmware_indices': np.array(batch_data['firmware_indices']),
+        }
+        for tidx, snap in batch_data['results'].items():
+            save_dict[f'snapshots_tone_{tidx}'] = snap['snapshots']
+
+        np.savez(filepath, **save_dict)
+        if verbose:
+            print(f"Batch snapshots saved to {filepath}")
+
+    @staticmethod
+    def _plot_batch_snapshots(batch_data):
+        """Plot time-domain and power spectrum for each tone in a batch."""
+        from souk_readout_tools.plotting import plot_batch_snapshots
+        import matplotlib.pyplot as plt
+        plot_batch_snapshots(batch_data, format='iq_vs_t',
+                             repetitions='mean', psd=True)
+        plt.show()
 
     def perform_sweep(self, centers, spans, points, samples_per_point,direction='up'):
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
@@ -869,10 +1228,36 @@ class ReadoutClient:
             print(f"Error getting sweep progress: {response['message']}")
             return response
 
-    def wait_for_sweep(self, poll_interval=0.5):
-        # TODO: Implement wait_for_sweep - poll get_sweep_progress and display
-        #       progress to the user. Also add a blocking option to perform_sweep.
-        raise NotImplementedError("wait_for_sweep is not implemented yet. Use get_sweep_progress in a loop instead.")
+    def wait_for_sweep(self, poll_interval=1.0, progress_bar=True):
+        """
+        Block until the current sweep completes, optionally displaying progress.
+
+        Args:
+            poll_interval (float): Seconds between progress polls. Default 1.0.
+            progress_bar (bool): If True, display an ASCII progress bar. If False,
+                                 print a plain numeric progress line. Default True.
+        """
+        import sys
+        bar_width = 40
+        while True:
+            progress = self.get_sweep_progress()
+            if isinstance(progress, dict):
+                # Error response from get_sweep_progress
+                break
+            pct = float(progress)
+            if progress_bar:
+                filled = int(bar_width * pct)
+                bar = '#' * filled + '-' * (bar_width - filled)
+                sys.stdout.write(f'\rSweep progress: [{bar}] {pct*100:5.1f}%')
+                sys.stdout.flush()
+            else:
+                sys.stdout.write(f'\rSweep progress: {pct*100:5.1f}%')
+                sys.stdout.flush()
+            if pct >= 1.0:
+                sys.stdout.write('\n')
+                sys.stdout.flush()
+                break
+            time.sleep(poll_interval)
 
     def get_sweep_data(self):
         message = {'request': 'get_sweep_data'}
@@ -1786,99 +2171,144 @@ class ReadoutClient:
         return s
 
 
-    def set_tones_helper(self, freqs, amps=None, phases=None):
+    def set_tones_helper(self, freqs, amps=None, phases=None, powers_dbm=None):
+        """
+        Convenience method: set frequencies, powers/amplitudes, and phases in one call.
+
+        Args:
+            freqs: Tone frequencies in Hz.
+            amps: LO amplitude scales (0 to 1.0). Ignored if powers_dbm is provided.
+            phases: Phase offsets in radians. Defaults to Newman phases if None.
+            powers_dbm: Per-tone output power in dBm. If provided, overrides amps and
+                        uses set_tone_powers() to apply calibrated power levels.
+        """
         if freqs is None or len(freqs) == 0:
             raise ValueError("Frequencies must be provided and cannot be empty.")
-        if amps is None:
-            amps = np.ones_like(freqs)
         if phases is None:
             phases = self.generate_newman_phases(freqs)
 
         self.set_tone_frequencies(freqs)
-        self.set_tone_amplitudes(amps)
+        if powers_dbm is not None:
+            self.set_tone_powers(powers_dbm)
+        else:
+            if amps is None:
+                amps = np.ones_like(freqs)
+            self.set_tone_amplitudes(amps)
         self.set_tone_phases(phases)
         return
 
-    def find_resonances(self, sweep_data=None, data_format='log_magnitude', 
+    def find_resonances(self, sweep_data=None, mode='wideband',
+                        data_format='log_magnitude',
                         filter_params=None, finder_params=None, **kwargs):
         """
         Find MKID resonances in sweep data using the peak_finder module.
-        
-        This is a convenience wrapper around the standalone peak_finder module
-        that can work with sweep data directly from wideband_sweep() or from file.
-        
+
+        Supports two modes:
+        - 'wideband': searches the full concatenated sweep trace for all
+          resonances (default, for wideband_sweep data).
+        - 'targeted': searches within each tone's individual sweep for
+          resonances. Returns per-tone results and flags tones with
+          multiple resonances (doubles/triples).
+
         Args:
-            sweep_data (dict, optional): Sweep data dictionary with keys 'sweep_f', 
-                'sweep_i', 'sweep_q'. If None, performs a new wideband_sweep.
+            sweep_data (dict, optional): Sweep data dictionary with keys
+                'sweep_f', 'sweep_i', 'sweep_q'. If None, performs a new
+                wideband_sweep (for mode='wideband') or raises an error
+                (for mode='targeted').
+            mode (str): 'wideband' or 'targeted'.
             data_format (str): Analysis format for peak finding. One of:
                 'lin_magnitude', 'log_magnitude', 'phase', 'unwrapped_phase',
                 'group_delay', 'complex_gradient'. Default is 'log_magnitude'.
-            filter_params: FilterParams instance or dict with keys:
-                - highpass_edge (float): 0-1 normalized (0 = disabled)
-                - lowpass_edge (float): 0-1 normalized (1 = disabled)
-                - median_kernel_size (int): 1 = disabled
-            finder_params: PeakFinderParams instance or dict with keys:
-                - prominence_enabled (bool), prominence_min/max (float)
-                - width_enabled (bool), width_min/max (float) in Hz
-                - distance_enabled (bool), distance_value (float) in Hz
-                - peak_direction (int): -1 for dips, +1 for peaks
+            filter_params: FilterParams instance or dict.
+            finder_params: PeakFinderParams instance or dict.
             **kwargs: Passed to wideband_sweep if sweep_data is None.
-        
+
         Returns:
-            list: List of ResonanceResult objects with attributes:
-                - frequency (float): Resonance frequency in Hz
-                - fwhm (float): Full width at half maximum in Hz
-                - q_factor (float): Quality factor
-                - qc (float): Coupling Q
-                - qi (float): Internal Q
-                - dip_depth (float): Depth of resonance dip in dB
-        
-        Example:
-            >>> client = ReadoutClient()
-            >>> # Find resonances from a new sweep
-            >>> resonances = client.find_resonances()
-            >>> print([r.frequency / 1e6 for r in resonances])  # MHz
-            
-            >>> # Find resonances from existing sweep data  
-            >>> sweep = client.wideband_sweep()
-            >>> resonances = client.find_resonances(sweep)
-            
-            >>> # Customize parameters
-            >>> from souk_readout_tools.peak_finder import FilterParams, PeakFinderParams
-            >>> fp = FilterParams(highpass_edge=0.001, lowpass_edge=0.5)
-            >>> pp = PeakFinderParams(prominence_min=2.0, distance_value=50000)
-            >>> resonances = client.find_resonances(filter_params=fp, finder_params=pp)
+            For mode='wideband':
+                list of ResonanceResult objects sorted by frequency.
+
+            For mode='targeted':
+                dict with keys:
+                    'per_tone': list of lists, per_tone[i] is the list of
+                        ResonanceResult objects found in tone i's sweep.
+                    'all_resonances': flat list of all ResonanceResult objects.
+                    'flagged_tones': list of tone indices with >1 resonance
+                        (doubles, triples, etc.).
+                    'num_tones': total number of tones.
         """
         from ..peak_finder import (
             find_mkid_resonances, FilterParams, PeakFinderParams
         )
-        
-        # Perform sweep if no data provided
-        if sweep_data is None:
-            sweep_data = self.wideband_sweep(**kwargs)
-        
-        # Extract arrays from sweep data
-        frequencies = np.ravel(sweep_data['sweep_f'])
-        i_data = np.ravel(sweep_data['sweep_i'])
-        q_data = np.ravel(sweep_data['sweep_q'])
-        s21_complex = i_data + 1j * q_data
-        
-        # Convert dicts to dataclass instances if needed
+
         if isinstance(filter_params, dict):
             filter_params = FilterParams(**filter_params)
         if isinstance(finder_params, dict):
             finder_params = PeakFinderParams(**finder_params)
-        
-        # Find resonances
-        resonances = find_mkid_resonances(
-            frequencies=frequencies,
-            s21_complex=s21_complex,
-            data_format=data_format,
-            filter_params=filter_params,
-            finder_params=finder_params,
-        )
-        
-        return resonances
+
+        if mode == 'wideband':
+            if sweep_data is None:
+                sweep_data = self.wideband_sweep(**kwargs)
+
+            frequencies = np.ravel(sweep_data['sweep_f'])
+            s21_complex = (np.ravel(sweep_data['sweep_i'])
+                           + 1j * np.ravel(sweep_data['sweep_q']))
+
+            return find_mkid_resonances(
+                frequencies=frequencies,
+                s21_complex=s21_complex,
+                data_format=data_format,
+                filter_params=filter_params,
+                finder_params=finder_params,
+            )
+
+        elif mode == 'targeted':
+            if sweep_data is None:
+                raise ValueError(
+                    "sweep_data must be provided for mode='targeted'. "
+                    "Use parse_sweep_data() output (shape: N_points x N_tones).")
+
+            sf = np.atleast_2d(sweep_data['sweep_f'])
+            si = np.atleast_2d(sweep_data['sweep_i'])
+            sq = np.atleast_2d(sweep_data['sweep_q'])
+
+            if sf.shape[0] == 1:
+                raise ValueError(
+                    "Targeted mode requires per-tone sweep data "
+                    "(shape N_points x N_tones), not wideband.")
+
+            n_points, n_tones = sf.shape
+            per_tone = []
+            all_resonances = []
+            flagged_tones = []
+
+            for t in range(n_tones):
+                f_tone = sf[:, t]
+                z_tone = si[:, t] + 1j * sq[:, t]
+
+                results = find_mkid_resonances(
+                    frequencies=f_tone,
+                    s21_complex=z_tone,
+                    data_format=data_format,
+                    filter_params=filter_params,
+                    finder_params=finder_params,
+                )
+                per_tone.append(results)
+                all_resonances.extend(results)
+
+                if len(results) > 1:
+                    flagged_tones.append(t)
+
+            all_resonances.sort(key=lambda r: r.frequency)
+
+            return {
+                'per_tone': per_tone,
+                'all_resonances': all_resonances,
+                'flagged_tones': flagged_tones,
+                'num_tones': n_tones,
+            }
+
+        else:
+            raise ValueError(f"Unknown mode '{mode}'. Use 'wideband' or 'targeted'.")
 
     def find_resonance_frequencies(self, sweep_data=None, **kwargs):
         """

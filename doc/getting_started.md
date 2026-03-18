@@ -21,6 +21,9 @@ SOUK Readout Tools is a Python package with tools for operating the MKID (Microw
 - [Retuning](#retuning)
 - [Power Calibration & Optimisation](#power-calibration--optimisation)
 - [Pre-Accumulator Snapshots](#pre-accumulator-snapshots)
+- [Plotting](#plotting)
+- [Resonator Analysis](#resonator-analysis)
+- [Parameter Space Measurements](#parameter-space-measurements)
 - [Dual-Pipeline Operation](#dual-pipeline-operation)
 - [CLI Tools](#cli-tools)
 - [Changelog & Feature List](#changelog--feature-list)
@@ -71,6 +74,10 @@ Default ports: pipeline 0 uses 10000/20000, pipeline 1 uses 10001/20001.
 | `firmware_lib.py` | FPGA firmware interface: register access, tone management, sweeps |
 | `calibration.py` | RF power/amplitude calibration chain (DAC to detector) |
 | `peak_finder.py` | MKID resonance detection algorithms |
+| `fitting.py` | Nonlinear resonator model fitting (Khalil notch model) |
+| `resonator.py` | Resonance circle deembedding (cable delay, centering, rotation) |
+| `plotting/` | Plotting library for sweep, timestream, and snapshot data |
+| `measurement.py` | Parameter space measurement framework |
 | `mkid_finder_app.py` | PyQt5 GUI for interactive resonance finding |
 | `tone_list_tools.py` | Tone list file I/O utilities |
 
@@ -166,9 +173,9 @@ The main sections are:
 
 ### Config Files
 
-On the client side, config files live wherever you choose — there is no hidden directory. Keep them with your project or measurement data.
+On the client side, config files live wherever you choose. Keep them with your project or measurement data.
 
-To create a config from the template:
+To create a new config from the template:
 
 ```python
 from souk_readout_tools.client.readout_client import copy_template_config
@@ -213,9 +220,19 @@ You can also connect by address without a local config file. Specify the request
 client = ReadoutClient(address='10.11.11.11', request_port=10000)
 ```
 
+### How config and calibration files are managed
+
+Config files and calibration files are always held **in memory** on the client. Pushing always writes to the server's persistent storage. Saving to the client's local disk is optional and only happens when explicitly requested.
+
+- **`push_config()`** sends the in-memory config to the server (always persisted on the RFSoC). Any calibration file paths in the config are resolved on the client, and the referenced files are automatically pushed to the server's pipeline calibrations directory. The local config is not modified.
+- **`pull_config()`** fetches the config and any referenced calibration files from the server **into memory**. Nothing is written to disk unless `save_as` is provided or `save_config()` is called.
+- **`save_config()`** writes the in-memory config to a local YAML file. If calibration files were pulled from the server, they are written to a `calibrations/` directory next to the config file, and the config paths are rewritten to local relative paths.
+
+This means calibration file paths in the config are portable: `push_config` resolves local paths and transfers the files to the server, `pull_config` + `save_config` fetches them back and creates local copies.
+
 ### Pushing Configuration to the RFSoC
 
-`push_config()` sends the client's current in-memory config dictionary to the server, which saves it, applies any hardware parameter changes, and calls `ensure_ready()` so that only the initialisation steps actually required by the changes are performed. The pushed config becomes the new default (persists across power cycles).
+`push_config()` sends the client's current in-memory config dictionary to the server, which saves it, applies any hardware parameter changes, and calls `ensure_ready()` so that any initialisation steps required by the changes are performed. The pushed config becomes the new default (persists across power cycles).
 
 Config parameters can be modified directly on the client instance before pushing:
 
@@ -226,7 +243,7 @@ client.config['firmware']['acc_len'] = 2**15
 # Push the modified config to the server
 client.push_config()
 
-# Save the modified config back to a local file
+# Optionally save the modified config back to a local file
 client.save_config()                       # overwrites the original file
 client.save_config('my_config_v2.yaml')    # save as a new file
 ```
@@ -241,10 +258,12 @@ client.push_config()
 
 ### Pulling Configuration from the RFSoC
 
-This is useful for reconnecting to a system that is already configured and running. Connect by address, pull the config, and optionally save it locally:
+This is useful for reconnecting to a system that is already configured and running. Connect by address, pull the config into memory, and optionally save it locally:
 
 ```python
 client = ReadoutClient(address='10.11.11.11', request_port=10000)
+
+# Pull into memory and save to disk (config + any referenced calibration files)
 client.pull_config(save_as='my_config.yaml')
 
 # Pick up where you left off - the system is already configured
@@ -255,7 +274,7 @@ If you already have a config file and just want to refresh the in-memory config 
 
 ```python
 client = ReadoutClient(config_file='my_config.yaml')
-client.pull_config()  # updates in memory only
+client.pull_config()  # updates in memory only, nothing written to disk
 ```
 
 ### Requesting Information
@@ -287,7 +306,7 @@ Use `ensure_ready()` to bring the system to a usable state with minimal disrupti
 client.ensure_ready(level="pipeline")
 ```
 
-This only performs the initialisation steps that are actually needed. If the system is already fully initialised, nothing happens. If only the pipeline needs initialising, the shared resources and firmware are left untouched.
+This only performs the initialisation steps that are actually needed. If the system is already fully initialised, nothing happens. If only the pipeline needs initialising, the shared resources and firmware bitfile are left untouched.
 
 ### Hard Reset
 
@@ -694,6 +713,205 @@ snapshots = client.get_accumulator_snapshots(tone_index=0, num_snapshots=10)
 
 This is useful for diagnostics, characterising noise at higher frequencies, or fast acquisition of single-tone data.
 
+### Batch Snapshots
+
+To acquire snapshots across multiple tones in one call:
+
+```python
+# All tones, 20 snapshots each, save to file and plot
+batch = client.batch_snapshots(num_snapshots=20, export_file='my_snapshots', plot=True)
+
+# Specific tones only
+batch = client.batch_snapshots(tone_indices=[0, 3, 7], num_snapshots=50)
+
+# Access per-tone data
+for tidx, snap in batch['results'].items():
+    print(f"Tone {tidx}: {snap['snapshots'].shape}")
+```
+
+CLI: `souk-batch-snapshots -C config.yaml -n 20 --tones 0 3 7 -P`
+
+---
+
+## Plotting
+
+The `souk_readout_tools.plotting` module provides consistent visualization for all data types. All functions return matplotlib Figure objects.
+
+### Sweep Plots
+
+```python
+from souk_readout_tools.plotting import plot_sweep, plot_sweep_iq
+
+# Magnitude and phase vs frequency (default)
+fig = plot_sweep(sweep_data, format='magphase', show_errors=True)
+
+# I vs Q complex plane
+fig = plot_sweep(sweep_data, format='iq')
+
+# With deembedding (cable delay removal, circle centering, rotation)
+fig = plot_sweep(sweep_data, format='iq', deembed=True)
+
+# I and Q vs frequency
+fig = plot_sweep(sweep_data, format='iq_vs_f')
+
+# Per-tone grid (one subplot per tone) instead of overlay
+fig = plot_sweep(per_tone_sweep, tones=[0, 1, 2], multi_tone='grid')
+```
+
+### Timestream Plots
+
+```python
+from souk_readout_tools.plotting import plot_timestream, plot_timestream_psd
+
+# I and Q vs time
+fig = plot_timestream(parsed_samples, format='iq_vs_t', tones=[0, 1])
+
+# Frequency and dissipation noise (requires sweep data for gradient)
+fig = plot_timestream(parsed_samples, format='freq_diss', sweep_data=sweep)
+
+# Power spectral density
+fig = plot_timestream_psd(parsed_samples, format='freq_diss', sweep_data=sweep)
+
+# Overlay timestream on resonance circle (debugging)
+from souk_readout_tools.plotting import plot_timestream_on_resonance
+fig = plot_timestream_on_resonance(parsed_samples, sweep, tone_index=0, deembed=True)
+```
+
+### Snapshot and Batch Snapshot Plots
+
+```python
+from souk_readout_tools.plotting import plot_snapshots, plot_snapshots_psd, plot_batch_snapshots
+
+# Single tone: time domain (mean, concatenated, or overlay)
+fig = plot_snapshots(snap_data, format='iq_vs_t', repetitions='mean')
+
+# Single tone: averaged PSD with error bars from repetition variance
+fig = plot_snapshots_psd(snap_data, method='averaged', show_errors=True)
+
+# Batch: one row per tone with optional PSD column
+fig = plot_batch_snapshots(batch_data, format='iq_vs_t', psd=True, psd_method='averaged')
+```
+
+---
+
+## Resonator Analysis
+
+### Deembedding
+
+The `souk_readout_tools.resonator` module provides S21 deembedding transforms:
+
+```python
+from souk_readout_tools.resonator import deembed, remove_cable_delay
+
+# Full deembedding pipeline
+z_deembedded, params = deembed(frequencies, s21_complex)
+# params contains: tau, center, radius, rotation_angle
+
+# Cable delay removal only
+z_nodelay, tau = remove_cable_delay(frequencies, s21_complex)
+```
+
+### Resonance Fitting
+
+The `souk_readout_tools.fitting` module fits resonances to a notch-type (Khalil) model:
+
+```python
+from souk_readout_tools.fitting import fit_resonance, batch_fit, extract_parameters
+
+# Fit a single resonance
+result = fit_resonance(f_tone, z_tone)
+print(f"fr={result.fr/1e6:.4f} MHz, Ql={result.Ql:.0f}, Qi={result.Qi:.0f}")
+
+# Batch fit all resonances in a sweep (auto-detects resonances)
+fits = batch_fit(sweep_data, verbose=True)
+
+# Extract to arrays
+params = extract_parameters(fits)
+print(f"Mean Qi: {np.mean(params['Qi']):.0f}")
+```
+
+CLI: `souk-find-resonances -C config.yaml --fit -f resonances.txt -P`
+
+### Targeted Resonance Finding
+
+For per-tone sweeps, use targeted mode to find resonances within each tone's bandwidth and flag doubles/triples:
+
+```python
+result = client.find_resonances(per_tone_sweep, mode='targeted')
+
+print(f"Total resonances: {len(result['all_resonances'])}")
+print(f"Tones with multiple resonances: {result['flagged_tones']}")
+
+# Per-tone results
+for t, ress in enumerate(result['per_tone']):
+    print(f"Tone {t}: {len(ress)} resonance(s)")
+```
+
+---
+
+## Parameter Space Measurements
+
+The `souk_readout_tools.measurement` module provides tools for repeating measurements across an external parameter. The parameter is abstract — supply set/get callbacks for any controllable or monitored quantity.
+
+### Sweeping a Controllable Parameter
+
+```python
+from souk_readout_tools.measurement import ParameterSweep
+
+# Example: sweep TX attenuation
+sweep = ParameterSweep(
+    client,
+    parameter_name='tx_attenuation_db',
+    set_parameter=lambda v: client.set_tx_attenuation(v),
+    get_parameter=lambda: client.get_rf_peripheral_status().get('result', {}).get('tx_attenuation_db'),
+    settle_time=1.0,
+)
+
+results = sweep.sweep(
+    values=[0, 5, 10, 15, 20],
+    measure_func=lambda c: c.wideband_sweep(verbose=False),
+)
+```
+
+### Timed Measurements
+
+```python
+from souk_readout_tools.measurement import TimedMeasurement
+
+timed = TimedMeasurement(
+    client,
+    parameter_name='temperature_mk',
+    get_parameter=lambda: read_thermometer(),  # your function
+    interval_s=60.0,
+)
+
+# Take 10 measurements, one per minute
+results = timed.run(
+    measure_func=lambda c: c.wideband_sweep(verbose=False),
+    n_points=10,
+)
+```
+
+### Conditional Measurements
+
+```python
+from souk_readout_tools.measurement import ConditionalMeasurement
+
+cond = ConditionalMeasurement(
+    client,
+    parameter_name='temperature_mk',
+    get_parameter=lambda: read_thermometer(),
+    condition=lambda t: abs(t - target_temp) < 5,  # within 5 mK
+    poll_interval_s=5.0,
+)
+
+results = cond.run(
+    measure_func=lambda c: c.wideband_sweep(verbose=False),
+    target_values=[100, 200, 300, 400],  # target temperatures in mK
+    timeout_s=3600,
+)
+```
+
 ---
 
 ## Dual-Pipeline Operation
@@ -742,6 +960,8 @@ The following command-line tools are installed with the client:
 |---------|-------------|
 | `souk-connection-test` | Test connectivity to the readout server |
 | `souk-wideband_sweep` | Perform a wideband frequency sweep from the command line |
+| `souk-batch-snapshots` | Acquire pre-accumulator snapshots across multiple tones |
+| `souk-find-resonances` | Find and optionally fit resonances in sweep data |
 | `souk-mkid-finder-app` | Launch the MKID resonance finder GUI |
 | `souk-mkid-finder` | Same as above (GUI shortcut) |
 
@@ -757,7 +977,61 @@ Server-side commands (installed on the RFSoC):
 
 ## Changelog & Feature List
 
-### v1.0.1 (Current)
+### v1.1.0 (Current)
+
+**RF Peripheral Controller**
+- `RFPeripheralController` with two backends: mixerless (I2C) and rudat (USB attenuators).
+- `sync_config_from_system()` and `get_rf_peripheral_status()` for reading hardware state.
+- Global rename: `tx_amp_s21_db` → `tx_bypass_amp_s21_db` (and rx) across the calibration chain.
+
+**Batch Snapshots**
+- `batch_snapshots()` method to acquire pre-accumulator snapshots across multiple tones.
+- Exports to `.npz` with metadata including firmware channel indices.
+- CLI tool: `souk-batch-snapshots`.
+
+**Plotting Library (`souk_readout_tools.plotting`)**
+- `plot_sweep()` — S21 magnitude/phase, I/Q vs frequency, or complex plane, with deembedding and error bars.
+- `plot_timestream()` — I/Q, magnitude/phase, or frequency/dissipation vs time.
+- `plot_timestream_psd()` — power spectral density of timestream data.
+- `plot_timestream_on_resonance()` — overlay timestream points on sweep resonance circle.
+- `plot_snapshots()`, `plot_snapshots_psd()`, `plot_batch_snapshots()` — snapshot visualization with per-repetition, averaged, and concatenated modes.
+- All formats support optional deembedding via the `resonator` module.
+- PSD utilities: `compute_psd()`, `compute_psd_averaged()`, `compute_psd_concatenated()`.
+
+**Resonator Analysis (`souk_readout_tools.resonator`)**
+- `remove_cable_delay()` — auto-estimate and remove electrical delay.
+- `center_circle()` — Kasa algebraic circle fit.
+- `rotate_to_real_axis()` — rotate resonance to negative real axis.
+- `deembed()` — full pipeline: delay → center → rotate.
+- `apply_deembed_params()` — apply sweep-derived transforms to timestream data.
+
+**Resonance Finding Enhancements**
+- `find_resonances(mode='targeted')` — per-tone resonance search with double/triple flagging.
+- `flagged_tones` output for tones containing multiple resonances.
+
+**Resonator Fitting (`souk_readout_tools.fitting`)**
+- Khalil notch-type resonator model: `S21 = a*exp(jα)*exp(-2πjfτ)*(1 - Ql/|Qc|*exp(jφ)/(1+2jQlΔf/fr))`.
+- `fit_resonance()` — single resonance nonlinear least-squares fit.
+- `batch_fit()` — automatic detection and fitting of all resonances.
+- `extract_parameters()` — extract fitted parameters into arrays.
+- CLI tool: `souk-find-resonances` (with `--fit` option).
+
+**Parameter Space Measurements (`souk_readout_tools.measurement`)**
+- `ParameterSweep` — step through external parameter values with set/get callbacks.
+- `TimedMeasurement` — periodic measurements at fixed time intervals.
+- `ConditionalMeasurement` — measure when a monitored parameter meets a condition.
+- Abstract `measure_func(client) → dict` pattern works with any readout measurement.
+- `save_measurement()` for exporting results.
+
+**System Information**
+- `get_system_information()` reports software versions, git info, and RFDC RTS events.
+- `check_rfdc_rts_events()` for DAC/ADC overvoltage sticky flag checking.
+
+**Sweep Progress**
+- `wait_for_sweep(progress_bar=True)` with ASCII progress bar.
+- `wideband_sweep()` prints progress when `verbose=True`.
+
+### v1.0.1
 
 **Dual-Pipeline Support**
 - Two independent readout pipelines on a single RFSoC board.
@@ -789,8 +1063,8 @@ Server-side commands (installed on the RFSoC):
 - `get_accumulator_snapshots()` for acquiring high time-resolution pre-accumulation data on a single tone (1024 samples per snapshot at FFT output rate).
 
 **Configuration Management**
-- `push_config()` / `pull_config()` for transferring configs between client and server.
-- `save_config()` for saving the in-memory config to a local YAML file.
+- `push_config()` / `pull_config()` for transferring configs and calibration files between client and server. Configs and calibration data are held in memory; pushed configs are always saved on the server, local saving is via `save_config()`.
+- `save_config()` writes the in-memory config and any pulled calibration files to a local YAML file and `calibrations/` directory.
 - `apply_config()` detects changed parameters and applies hardware changes without full reinitialisation.
 - Client config files live wherever the user chooses; server uses pipeline-specific directories on the RFSoC.
 
@@ -821,20 +1095,12 @@ Server-side commands (installed on the RFSoC):
 
 ## Future Developments
 
-*This section is a placeholder for planned features and improvements.*
+Planned for upcoming releases:
 
-<!--
-Possible items:
-- Blocking sweep option and wait_for_sweep helper in perform_sweep
-- Wideband sweep tone power parameter for specifying power levels across the band
-- Better tone-power control settings (per-tone, per-band, automatic levelling)
-- systemd service templates for dual-pipeline server management
-- Helper scripts for managing both pipelines simultaneously
-- Improved VACC tone backfilling for more efficient LO slot usage
-- Dual-DAC mode support
-- HDF5 export format support
-- Resonator tracking (continuous retune loop)
-- Extended calibration workflows
-- Automated version numbering
-- ...
--->
+- Per-tone power control in `wideband_sweep()` (power levels across the band).
+- Improved VACC tone backfilling for more efficient LO slot usage.
+- Dual-DAC mode support.
+- HDF5 export format support.
+- Resonator tracking (continuous retune loop with drift correction).
+- ADC calibration via loopback measurement.
+- Automated version numbering and release workflow.

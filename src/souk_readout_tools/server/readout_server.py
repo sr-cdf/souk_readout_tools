@@ -45,6 +45,7 @@ except ImportError:
 
 from souk_readout_tools import calibration
 from souk_readout_tools import firmware_lib
+from souk_readout_tools.server.rf_peripherals import RFPeripheralController
 import argparse
 
 import time
@@ -448,6 +449,9 @@ class ReadoutServer:
         self.latest_sweep_data_valid = False
         self.sweep_progress = 0.0
 
+        #rf peripheral controller
+        self.rf_peripherals = None
+
         #initialize server (this will load config again, but that's fine)
         self.init_server(resolved_config_file, ensure_ready=False, force_ready=False)
     
@@ -652,6 +656,23 @@ class ReadoutServer:
             print(bcolors.WARNING+'Warning: shared resources need initialising'+bcolors.ENDC)
         if firmware_lib.needs_pipeline_initialising(self.r,self.config):
             print(bcolors.WARNING+'Warning: pipeline resources need initialising'+bcolors.ENDC)
+
+        #initialize rf peripheral controller (attenuators, amp bypass)
+        try:
+            self.rf_peripherals = RFPeripheralController(self.config, self.pipeline_id)
+            if self.rf_peripherals.enabled:
+                print(f'{bcolors.OKGREEN}RF mixerless module initialised{bcolors.ENDC}')
+                status = self.rf_peripherals.get_status()
+                print(f'  TX atten: {status["tx_attenuation_db"]:.1f} dB, '
+                      f'amp bypass: {status["tx_amp_bypass"]}, '
+                      f'total gain: {status["tx_total_gain_db"]:.1f} dB')
+                print(f'  RX atten: {status["rx_attenuation_db"]:.1f} dB, '
+                      f'amp bypass: {status["rx_amp_bypass"]}, '
+                      f'total gain: {status["rx_total_gain_db"]:.1f} dB')
+        except Exception as e:
+            print(bcolors.WARNING+f'Warning: RF peripheral init failed: {e}'+bcolors.ENDC)
+            self.rf_peripherals = None
+
         return
    
              
@@ -765,6 +786,10 @@ class ReadoutServer:
 
 
         firmware_lib.apply_config(config_contents, self.r, self.config)
+
+        # Apply RF peripheral hardware settings (attenuators, amp bypass) from new config
+        if self.rf_peripherals is not None and self.rf_peripherals.enabled:
+            self.rf_peripherals.apply_config(config_contents)
 
         self.ensure_ready(config_file=filename, level="pipeline")
 
@@ -937,7 +962,7 @@ class ReadoutServer:
                 elif request == 'push_calibration':
                     cal_filename = message.get('cal_filename')
                     cal_contents = message.get('cal_contents')
-                    destination_filename = os.path.join(USER_CALIBRATIONS_DIR, os.path.basename(cal_filename))
+                    destination_filename = os.path.join(self.user_calibrations_dir, os.path.basename(cal_filename))
                     with open(destination_filename,'w') as file:
                         file.write(cal_contents)
                     if SUDO:
@@ -946,7 +971,7 @@ class ReadoutServer:
 
                 elif request == 'pull_calibration':
                     cal_filename = message.get('cal_filename')
-                    with open(os.path.join(USER_CALIBRATIONS_DIR,os.path.basename(cal_filename))) as file:
+                    with open(os.path.join(self.user_calibrations_dir,os.path.basename(cal_filename))) as file:
                         cal_contents = file.read()
                     await self.send_response(writer, {'status': 'success', 'cal_contents': cal_contents})
 
@@ -1107,6 +1132,55 @@ class ReadoutServer:
                 elif request == 'fix_adc_saturation':
                     dsa,fftshift, dsp_ovf, levels = firmware_lib.fix_adc_saturation(self.r,self.config)
                     result = {'dsa': dsa, 'fftshift': fftshift, 'dsp_ovf': dsp_ovf, 'adc_levels': levels}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                # -- RF peripheral (attenuator / amp bypass) commands --
+
+                elif request == 'get_rf_peripheral_status':
+                    if self.rf_peripherals is not None and self.rf_peripherals.enabled:
+                        result = self.rf_peripherals.get_status()
+                    else:
+                        result = {'enabled': False}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'set_tx_attenuation':
+                    value = float(message.get('value'))
+                    self.rf_peripherals.set_tx_attenuation(value)
+                    result = {'tx_attenuation_db': self.rf_peripherals.get_tx_attenuation()}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'get_tx_attenuation':
+                    result = {'tx_attenuation_db': self.rf_peripherals.get_tx_attenuation()}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'set_rx_attenuation':
+                    value = float(message.get('value'))
+                    self.rf_peripherals.set_rx_attenuation(value)
+                    result = {'rx_attenuation_db': self.rf_peripherals.get_rx_attenuation()}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'get_rx_attenuation':
+                    result = {'rx_attenuation_db': self.rf_peripherals.get_rx_attenuation()}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'set_tx_amp_bypass':
+                    bypass = bool(message.get('bypass'))
+                    self.rf_peripherals.set_tx_amp_bypass(bypass)
+                    result = {'tx_amp_bypass': self.rf_peripherals.get_tx_amp_bypass()}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'get_tx_amp_bypass':
+                    result = {'tx_amp_bypass': self.rf_peripherals.get_tx_amp_bypass()}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'set_rx_amp_bypass':
+                    bypass = bool(message.get('bypass'))
+                    self.rf_peripherals.set_rx_amp_bypass(bypass)
+                    result = {'rx_amp_bypass': self.rf_peripherals.get_rx_amp_bypass()}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'get_rx_amp_bypass':
+                    result = {'rx_amp_bypass': self.rf_peripherals.get_rx_amp_bypass()}
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'get_samples':

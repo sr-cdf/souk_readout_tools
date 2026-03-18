@@ -88,7 +88,17 @@ firmware:
 
 ## 3. Deploy configs to the RFSoC
 
-Copy both config files to the RFSoC server. The server manages its own directory structure under `~/.souk_readout_tools/`:
+Push configs from the client to the server. Any calibration files referenced in the config are transferred automatically:
+
+```python
+client0 = ReadoutClient(config_file='config_pipeline_0.yaml')
+client0.push_config()  # pushes config + calibration files to server
+
+client1 = ReadoutClient(config_file='config_pipeline_1.yaml')
+client1.push_config()
+```
+
+Alternatively, copy files manually with `scp`:
 
 ```bash
 scp config_pipeline_0.yaml casper@rfsoc:~/.souk_readout_tools/pipeline_0/config/
@@ -180,11 +190,11 @@ print(info0["pipeline_id"])  # expected: 0
 print(info1["pipeline_id"])  # expected: 1
 ```
 
-The pipeline ID is read from the config file automatically. You can also connect by address and pull configs from each server:
+The pipeline ID is read from the config file automatically. You can also connect by address and pull configs (and their calibration files) from each server into memory, optionally saving to disk:
 
 ```python
 client0 = ReadoutClient(address='10.11.11.11', request_port=10000)
-client0.pull_config(save_as='config_pipeline_0.yaml')
+client0.pull_config(save_as='config_pipeline_0.yaml')  # saves config + cal files
 
 client1 = ReadoutClient(address='10.11.11.11', request_port=10001)
 client1.pull_config(save_as='config_pipeline_1.yaml')

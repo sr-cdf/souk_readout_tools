@@ -81,7 +81,15 @@ rf_frontend:
   tx_mixer_sideband: 
   rx_mixer_sideband: 
   loopback: false
-  comments: 
+  tx_bypass_amp_s21_db: 0
+  rx_bypass_amp_s21_db: 0
+  mixerless_module:
+    enabled: false
+    i2c_bus: 0
+    channel: 0
+    tx_amp_bypass: false
+    rx_amp_bypass: false
+  comments:
 
 cryostat:
   connected: false

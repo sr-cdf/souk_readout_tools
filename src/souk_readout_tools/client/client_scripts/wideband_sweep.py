@@ -124,30 +124,9 @@ def save_and_plot_sweep(client, sweep_data, filename=None, filetype='npy', plot_
     print(f'Wideband sweep exported to: {final_filename}')
 
     if plot_data:
-        sf = sweep_data['sweep_f'][0]
-        si = sweep_data['sweep_i'][0]
-        sq = sweep_data['sweep_q'][0]
-        sz = si + 1j * sq
-        logmag = 20 * np.log10(np.abs(sz))
-        uphase = np.unwrap(np.angle(sz))
-
-        ei = sweep_data['sweep_ei'][0]
-        eq = sweep_data['sweep_eq'][0]
-        emag = 1 / np.abs(sz) * np.sqrt((si * ei)**2 + (sq * eq)**2)
-        elogmag = 20 / np.abs(sz) / np.log(10) * emag
-        ephi = 1 / (si**2 + sq**2) * np.sqrt((sq * ei)**2 + (si * eq)**2)
-        
+        from souk_readout_tools.plotting import plot_sweep_magphase
         import matplotlib.pyplot as plt
-        fig, (s1, s2) = plt.subplots(2, 1, sharex=True)
-        s1.errorbar(sf / 1e6, logmag, yerr=elogmag, fmt='.', ecolor='red', markersize=2)
-        s2.errorbar(sf / 1e6, uphase, yerr=ephi, fmt='.', ecolor='red', markersize=2)
-        fig.supxlabel('Frequency (MHz)')
-        s1.set_ylabel('Power (dB)')
-        s2.set_ylabel('Phase (rad)')
-        s1.set_ylim(np.nanmin(logmag), np.nanmax(logmag))
-        s2.set_ylim(np.nanmin(uphase), np.nanmax(uphase))
-        fig.suptitle(f'Wideband Sweep ({sweep_data.get("bandwidth_hz", 0)/1e6:.1f} MHz)')
-        plt.tight_layout()
+        plot_sweep_magphase(sweep_data, show_errors=True)
         plt.show()
 
     return final_filename

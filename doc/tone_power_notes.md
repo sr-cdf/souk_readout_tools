@@ -58,7 +58,7 @@ The `psb_scale` parameter provides a global scaling factor on the output wavefor
 - Avoid DAC clipping when the total power of all tones is high
 - Fine-tune the operating point between dynamic range and headroom
 
-The auto-optimisation methods (`client.maximise_tx_power()`, `client.optimise_tx_snr()`) adjust this parameter automatically.
+The auto-optimisation methods (`client.maximise_tx_power()`, `client.set_tone_powers(optimise_dynamic_range=True)`) adjust this parameter automatically. The `maximise_tx_power()` function sweeps the FFT shift from safest (most attenuated) to highest power, stopping at the first overflow, then binary-searches the PSB scale.
 
 ---
 
@@ -72,24 +72,58 @@ Tone amplitudes are linear scaling factors from 0 to 1.0, relative to the LO ful
 client.set_tone_amplitudes([0.5, 0.3])
 ```
 
-This sets relative power levels between tones.
+This sets relative power levels between tones but does not control absolute power.
 
 ### By power in dBm (absolute)
 
 The calibrated power interface accounts for the full signal chain:
 
 ```python
-client.set_tone_powers([-20, -25])  # dBm at the output reference plane
+# Simple mode — adjusts tone amplitudes only, keeps current PSB/analog settings
+client.set_tone_powers([-20, -25], reference_plane='detector')
 ```
 
-This requires calibration values in the config file (`dac0_dbfs_to_dbm`, RF frontend S21 parameters, cryostat S21, etc.). See the [calibration section](installation.md#calibration-files) for how to specify these.
+The `reference_plane` parameter controls where the target power is specified:
+- `'dac'` — at the DAC output, before any analog frontend
+- `'rf_output'` — at the RF frontend output, before the cryostat
+- `'detector'` — at the cryogenic detector (default, full TX chain)
+
+This requires calibration values in the config file. See the [calibration guide](calibration.md) for details.
+
+### Dynamic range optimisation
+
+For best SNR, use the dynamic range optimisation mode. This maximises DAC bit utilisation and adjusts the analog chain to hit the target power:
+
+```python
+# Optimised mode — maximises DAC dynamic range, adjusts attenuator/amp
+result = client.set_tone_powers(
+    [-20, -25],
+    reference_plane='detector',
+    optimise_dynamic_range=True
+)
+
+print(result['warnings'])       # any limitations encountered
+print(result['power_error_db']) # per-tone error vs target
+```
+
+The optimisation proceeds in steps:
+1. **Amplitude ratios** are computed from the target powers so per-tone variation is preserved.
+2. **PSB FFT shift** is swept from most attenuated (safe) to least, stopping at the first overflow. This avoids driving the downstream system at full power during the search.
+3. **PSB scale** is binary-searched up to just before overflow or DAC saturation.
+4. **Analog adjustment** (if RF peripherals are available): the TX variable attenuator and amplifier bypass are adjusted so the highest-power tone hits its target.
+5. **Compression check**: the total power into the RF frontend is compared against the 1 dB compression point.
+6. **Final amplitudes** are calculated with the now-fixed analog settings.
+7. **Verification** confirms achieved powers against targets.
+
+The function also checks RFDC RTS (Real-Time Status) sticky overvoltage flags during overflow detection, if available in the installed `souk_mkid_readout` version.
 
 ### Power breakdown
 
 To see where power is gained or lost through the chain:
 
 ```python
-client.get_tone_powers(detailed_output=True)
+powers, details = client.get_tone_powers(detailed_output=True)
+print(details)  # per-stage power contributions
 ```
 
 ---
@@ -157,7 +191,7 @@ The general procedure would be:
 
 ## Related
 
+- [Calibration Guide](calibration.md) for measurement procedures and RF peripheral details
 - [Getting Started - Power Calibration & Optimisation](getting_started.md#power-calibration--optimisation)
 - [Getting Started - Setting Readout Tones](getting_started.md#setting-readout-tones)
 - [Installation - Calibration Files](installation.md#calibration-files)
-- Calibration measurement conditions: see the calibration readme on the RFSoC at `~/.souk_readout_tools/pipeline_0/calibrations/readme`
