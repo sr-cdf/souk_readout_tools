@@ -17,14 +17,15 @@ Example usage:
     sudo ~/py3.12-venv/bin/souk-readout-server
     
 Author: Sam Rowe
-Date: July 2024 
-Version: 0.1
+Date: July 2024
+Version: 1.1.0
 
 """
 
 
 
 import asyncio, contextvars, functools
+import importlib.metadata
 import json
 import struct
 import yaml
@@ -841,7 +842,7 @@ class ReadoutServer:
             'sys.argv': sys.argv,
             'uname': os.uname().nodename+' '+os.uname().sysname+' '+os.uname().release + ' ' + os.uname().version + ' ' + os.uname().machine,
             'python_version': sys.version,
-            'server_version': 'not_implemented',
+            'server_version': importlib.metadata.version('souk_readout_tools'),
             'config_file': self.config_file,
             'request_clients': len(self.request_clients),
             'request_client_addrs': [client.get_extra_info('peername') for client in self.request_clients],

@@ -52,7 +52,7 @@ Example general usage:
 
 Author: Sam Rowe
 Date: July 2024
-Version: 0.1
+Version: 1.1.0
 
 """
 
