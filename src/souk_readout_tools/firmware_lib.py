@@ -272,7 +272,7 @@ def needs_programming(r,config_dict):
         pass
     with open(config_dict['firmware']['fw_config_file'],'r') as file:
         newfpg = yaml.safe_load(file)['fpgfile']
-    newfpg = newfpg.replace('../','').replace('./','/home/casper/src/souk-firmware/')
+    newfpg = newfpg.replace('../','').replace('./','/home/casper/souk-firmware/')
     try:
         newfpg = os.readlink(newfpg)
     except OSError:

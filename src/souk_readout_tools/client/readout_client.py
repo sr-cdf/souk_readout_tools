@@ -24,7 +24,7 @@ Example general usage:
     Out[3]:
     {'process_name': 'readout_daemon',
      'ip_addresses': '10.11.11.11 192.168.2.224',
-     'pwd': '/home/casper/src/readout_server',
+     'pwd': '/home/casper/readout_server',
     ....}
 
     In [4]: client.get_sample_rate()

@@ -54,7 +54,7 @@ rfsoc_host:
   ...
 
 firmware:
-  fw_config_file: "/home/casper/src/souk-firmware/software/control_sw/config/souk-dual-pipeline-krm.yaml"
+  fw_config_file: "/home/casper/souk-firmware/software/control_sw/config/souk-dual-pipeline-krm.yaml"
   pipeline_id: 0
   dac0_tile: 0
   dac0_block: 0
@@ -73,7 +73,7 @@ rfsoc_host:
   ...
 
 firmware:
-  fw_config_file: "/home/casper/src/souk-firmware/software/control_sw/config/souk-dual-pipeline-krm.yaml"
+  fw_config_file: "/home/casper/souk-firmware/software/control_sw/config/souk-dual-pipeline-krm.yaml"
   pipeline_id: 1
   dac0_tile: 1
   dac0_block: 0
@@ -137,18 +137,18 @@ Start each server instance with its config file. The server reads `pipeline_id` 
 #### Terminal 1 (pipeline 0)
 ```bash
 ssh casper@rfsoc
-sudo /home/casper/py38venv/bin/souk-readout-server ~/.souk_readout_tools/pipeline_0/config/config_pipeline_0.yaml
+sudo /home/casper/py3.12-venv/bin/souk-readout-server ~/.souk_readout_tools/pipeline_0/config/config_pipeline_0.yaml
 ```
 
 #### Terminal 2 (pipeline 1)
 ```bash
 ssh casper@rfsoc
-sudo /home/casper/py38venv/bin/souk-readout-server ~/.souk_readout_tools/pipeline_1/config/config_pipeline_1.yaml
+sudo /home/casper/py3.12-venv/bin/souk-readout-server ~/.souk_readout_tools/pipeline_1/config/config_pipeline_1.yaml
 ```
 
 If you omit the config file path, the `-p` / `--pipeline` flag selects which pipeline's default config to load:
 ```bash
-sudo /home/casper/py38venv/bin/souk-readout-server -p 1   # loads default config from ~/.souk_readout_tools/pipeline_1/
+sudo /home/casper/py3.12-venv/bin/souk-readout-server -p 1   # loads default config from ~/.souk_readout_tools/pipeline_1/
 ```
 When a config file is provided, `-p` is ignored — the config file's `firmware.pipeline_id` is always authoritative.
 
@@ -157,7 +157,7 @@ If you prefer launching manually from a Python session:
 
 ```bash
 ssh casper@rfsoc
-sudo /home/casper/py38venv/bin/python
+sudo /home/casper/py3.12-venv/bin/python
 ```
 
 ```python

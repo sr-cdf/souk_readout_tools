@@ -25,7 +25,7 @@ Requires=networking.service krc-utils.service
 SyslogIdentifier=readout_server_1
 WorkingDirectory=/home/casper/.souk_readout_tools/pipeline_1
 Environment=READOUT_SERVER_NAME=readout_daemon_1
-ExecStart=/home/casper/py38venv/bin/souk-readout-server -p 1
+ExecStart=/home/casper/py3.12-venv/bin/souk-readout-server -p 1
 Restart=always
 RestartSec=5
 User=root

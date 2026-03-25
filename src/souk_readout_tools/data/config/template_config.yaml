@@ -14,7 +14,7 @@ rfsoc_host:
   comments:
 
 firmware:
-  fw_config_file: "/home/casper/src/souk-firmware/software/control_sw/config/souk-single-pipeline-krm.yaml"    
+  fw_config_file: "/home/casper/souk-firmware/software/control_sw/config/souk-single-pipeline-krm.yaml"    
   pipeline_id: 0
   dac0_tile: 0
   dac0_block: 0

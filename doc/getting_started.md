@@ -203,7 +203,7 @@ Start the readout server on the RFSoC (if not already running as a daemon):
 
 ```bash
 ssh casper@rfsoc
-sudo /home/casper/py38venv/bin/souk-readout-server /path/to/config.yaml
+sudo /home/casper/py3.12-venv/bin/souk-readout-server /path/to/config.yaml
 ```
 
 Then, on the client machine, start an IPython session and create the client:

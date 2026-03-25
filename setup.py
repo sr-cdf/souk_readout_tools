@@ -52,7 +52,7 @@ client_dependencies = [
 
 # Define server-specific dependencies
 server_dependencies = [
-    "souk_mkid_readout  @ file://localhost//home/casper/src/souk-firmware/software/control_sw",
+    "souk_mkid_readout  @ file://localhost//home/casper/souk-firmware/software/control_sw",
     'smbus2',
 ]
 

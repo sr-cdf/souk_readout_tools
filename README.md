@@ -139,7 +139,7 @@ Dependencies: numpy, scipy, matplotlib, pyyaml, ipython. Client additionally req
 The server package currently expects `souk_mkid_readout` to be available on the RFSoC from:
 
 ```text
-/home/casper/src/souk-firmware/software/control_sw
+/home/casper/souk-firmware/software/control_sw
 ```
 
 This is hardcoded in `setup.py`.

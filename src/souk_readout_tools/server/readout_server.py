@@ -14,7 +14,7 @@ Requires python3.8
 Example usage:
     ssh rfsoc_host
     cd working_directory 
-    sudo ~/py38venv/bin/souk-readout-server
+    sudo ~/py3.12-venv/bin/souk-readout-server
     
 Author: Sam Rowe
 Date: July 2024 
