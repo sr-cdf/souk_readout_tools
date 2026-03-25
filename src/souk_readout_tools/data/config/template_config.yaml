@@ -85,10 +85,13 @@ rf_frontend:
   rx_bypass_amp_s21_db: 0
   mixerless_module:
     enabled: false
+    attenuator_backend: mixerless  # 'mixerless' (I2C module) or 'rudat' (Mini-Circuits USB)
     i2c_bus: 0
     channel: 0
     tx_amp_bypass: false
     rx_amp_bypass: false
+    # rudat_tx_serial:  # required if attenuator_backend: rudat
+    # rudat_rx_serial:  # required if attenuator_backend: rudat
   comments:
 
 cryostat:
