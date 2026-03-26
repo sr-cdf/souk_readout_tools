@@ -8,10 +8,7 @@ import faulthandler
 # Enable faulthandler to get tracebacks on segfaults
 faulthandler.enable()
 
-try:
-    from importlib.resources import files  # Python 3.9+
-except ImportError:
-    from importlib_resources import files  # Python < 3.9
+from importlib.resources import files
 
 import numpy as np
 

@@ -34,25 +34,21 @@ else:
 
 # Define common dependencies
 install_requires = [
-    'importlib_resources',
     'numpy',
     'matplotlib',
     'pyyaml',
     'ipython',
-    'scipy'
-    # Add other common dependencies here
+    'scipy',
 ]
 
 # Define client-specific dependencies
 client_dependencies = [
     'pyqt5',
-    'scipy',
-    # Add client dependencies here
 ]
 
 # Define server-specific dependencies
 server_dependencies = [
-    "souk_mkid_readout  @ file://localhost//home/casper/souk-firmware/software/control_sw",
+    "souk_mkid_readout",
     'smbus2',
 ]
 
@@ -113,5 +109,5 @@ setup(
     classifiers=[
         'Programming Language :: Python :: 3',
         ],
-    python_requires='>=3.8',
+    python_requires='>=3.10',
 )

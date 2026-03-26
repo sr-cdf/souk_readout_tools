@@ -70,10 +70,7 @@ import csv
 import base64
 from scipy import signal
 
-try:
-    from importlib.resources import files as importlib_files
-except ImportError:
-    from importlib_resources import files as importlib_files
+from importlib.resources import files as importlib_files
 
 
 def get_template_config_path():

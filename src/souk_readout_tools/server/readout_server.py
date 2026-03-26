@@ -39,10 +39,7 @@ import sys
 import numpy as np
 import base64
 
-try:
-    from importlib.resources import files as importlib_files
-except ImportError:
-    from importlib_resources import files as importlib_files
+from importlib.resources import files as importlib_files
 
 from souk_readout_tools import calibration
 from souk_readout_tools import firmware_lib
