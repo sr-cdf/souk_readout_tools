@@ -35,7 +35,7 @@ def main():
                       help='Path to config YAML file.')
     conn.add_argument('-a', '--address', type=str, default=None,
                       help='RFSoC IP address (alternative to config file).')
-    conn.add_argument('--port', type=int, default=None,
+    conn.add_argument('-p', '--port', type=int, default=None,
                       help='Request port (required with --address).')
     conn.add_argument('--load', type=str, default=None,
                       help='Load sweep data from .npy file instead of acquiring.')

@@ -33,7 +33,7 @@ def main():
                         help='Path to config YAML file.')
     parser.add_argument('-a', '--address', type=str, default=None,
                         help='RFSoC IP address (alternative to config file).')
-    parser.add_argument('--port', type=int, default=None,
+    parser.add_argument('-p', '--port', type=int, default=None,
                         help='Request port (required with --address). '
                              'Pipeline 0: 10000, pipeline 1: 10001.')
     parser.add_argument('--tones', type=int, nargs='+', default=None,
