@@ -867,6 +867,75 @@ class ResonanceFinderApp(QMainWindow):
         active_params = self.peak_finder_params[self.active_format]
         self.peakFinderManager.set_finder_parameters(active_params)
 
+    def apply_cli_overrides(self, args):
+        """Apply command-line argument overrides to settings and refresh UI."""
+        changed = False
+
+        if args.format:
+            format_map = {
+                'lin_mag': 'Lin Magnitude V',
+                'log_mag': 'Log Magnitude dB',
+                'phase': 'Phase rad',
+                'unwrapped_phase': 'Unwrapped Phase rad',
+                'group_delay': 'Group Delay us (-dphi/df)',
+                'complex_gradient': 'Complex Gradient V/Hz (speed)',
+                'sin_iq': 'Sin(IQ,dIdQ) (?)',
+            }
+            self.active_format = format_map[args.format]
+            changed = True
+
+        # Filter overrides
+        filter_params = self.filterManager.get_filter_params()
+        if args.highpass is not None:
+            filter_params['highpass_edge'] = args.highpass
+            changed = True
+        if args.lowpass is not None:
+            filter_params['lowpass_edge'] = args.lowpass
+            changed = True
+        if args.median_kernel is not None:
+            filter_params['median_kernel_size'] = args.median_kernel
+            changed = True
+        self.filterManager.set_filter_params(filter_params)
+
+        # Peak finder overrides (applied to active format)
+        finder_params = self.peak_finder_params[self.active_format]
+        if args.prominence_min is not None:
+            finder_params['prominence_enabled'] = True
+            finder_params['prominence_min'] = args.prominence_min
+            changed = True
+        if args.prominence_max is not None:
+            finder_params['prominence_enabled'] = True
+            finder_params['prominence_max'] = args.prominence_max
+            changed = True
+        if args.width_min is not None:
+            finder_params['width_enabled'] = True
+            finder_params['width_min'] = args.width_min
+            changed = True
+        if args.width_max is not None:
+            finder_params['width_enabled'] = True
+            finder_params['width_max'] = args.width_max
+            changed = True
+        if args.distance is not None:
+            finder_params['distance_enabled'] = True
+            finder_params['distance_value'] = args.distance
+            changed = True
+        if args.direction is not None:
+            finder_params['peak_direction'] = 1 if args.direction == 'peaks' else -1
+            changed = True
+        self.peakFinderManager.set_finder_parameters(finder_params)
+
+        # Sync UI to reflect overrides and reprocess
+        if changed:
+            self.setUIAnalysisFormat()
+            if len(self.frequencies) > 0:
+                self.applyFiltering()
+                self.updateResonances()
+                self.scheduleRefresh(0)
+
+        # Load file (overrides saved filename, triggers its own reprocessing)
+        if args.sweep_file:
+            self.loadFile(args.sweep_file)
+
     def saveSettingsFinderParameters(self):
         _log.debug('saveSettingsFinderParameters')
         for format, params in self.peak_finder_params.items():
@@ -1665,9 +1734,8 @@ class ResonanceFinderApp(QMainWindow):
         digit_codes = {}
         digit_widths = {}
 
-        # Cache printable ASCII characters (32–126).
-        for d in [chr(i) for i in range(32, 127)]:
-            # Create a path for this single character (NOT LaTeX).
+        # Cache characters used in labels: digits, "ignored", minus, period.
+        for d in set("0123456789-.ignored"):
             dp = TextPath((0, 0), d, prop=FONT_PROP)
             # Cache its vertices, codes, and bounding-box width
             digit_verts[d] = np.asarray(dp.vertices)  # shape (N,2)
@@ -3635,6 +3703,39 @@ class SplashScreen(QSplashScreen):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="SOUK MKID Resonance Finder GUI. "
+        "Note: MKID finding can also be done via Python script or "
+        "interactive session using the souk_readout_tools library directly; "
+        "this GUI provides a convenient interactive interface.")
+    parser.add_argument('sweep_file', nargs='?', default=None,
+                        help='Sweep data file to load (.fits, .npy, or .txt)')
+    parser.add_argument('-f', '--format', default=None,
+                        choices=['lin_mag', 'log_mag', 'phase', 'unwrapped_phase',
+                                 'group_delay', 'complex_gradient', 'sin_iq'],
+                        help='Analysis format')
+    parser.add_argument('--highpass', type=float, default=None,
+                        help='Highpass filter cutoff (normalised, 0-1)')
+    parser.add_argument('--lowpass', type=float, default=None,
+                        help='Lowpass filter cutoff (normalised, 0-1)')
+    parser.add_argument('--median-kernel', type=int, default=None,
+                        help='Median filter kernel size')
+    parser.add_argument('--prominence-min', type=float, default=None,
+                        help='Minimum peak prominence (dip depth)')
+    parser.add_argument('--prominence-max', type=float, default=None,
+                        help='Maximum peak prominence')
+    parser.add_argument('--width-min', type=float, default=None,
+                        help='Minimum peak width in Hz')
+    parser.add_argument('--width-max', type=float, default=None,
+                        help='Maximum peak width in Hz')
+    parser.add_argument('--distance', type=float, default=None,
+                        help='Minimum spacing between peaks in Hz')
+    parser.add_argument('--direction', choices=['peaks', 'dips'], default=None,
+                        help='Search for peaks (upward) or dips (downward)')
+    args = parser.parse_args()
+    parser.parse_args()
+
     # Install global exception handler to prevent silent crashes
     def exception_hook(exctype, value, tb):
         """Global exception handler that logs exceptions instead of crashing silently."""
@@ -3645,16 +3746,16 @@ def main():
         sys.stderr.flush()
         # Show message box if possible
         try:
-            QMessageBox.critical(None, "Fatal Error", 
+            QMessageBox.critical(None, "Fatal Error",
                 f"An unexpected error occurred:\n\n{exctype.__name__}: {value}\n\n"
                 f"See console/log for full traceback.")
         except:
             pass
         # Call default handler
         sys.__excepthook__(exctype, value, tb)
-    
+
     sys.excepthook = exception_hook
-    
+
     app = QApplication(sys.argv)
 
     iconpng = str(files("souk_readout_tools").joinpath("mkid_finder_app.png"))
@@ -3671,6 +3772,7 @@ def main():
     QApplication.processEvents()
 
     window = ResonanceFinderApp(splash)
+    window.apply_cli_overrides(args)
     window.show()
 
     splash.fadeOut(duration=3000)
