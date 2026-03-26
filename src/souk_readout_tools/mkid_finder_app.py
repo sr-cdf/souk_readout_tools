@@ -1665,13 +1665,13 @@ class ResonanceFinderApp(QMainWindow):
         digit_codes = {}
         digit_widths = {}
 
-        # for d in "0123456789":
-        for d in [chr(i) for i in range(128)]:
+        # Cache printable ASCII characters (32–126).
+        for d in [chr(i) for i in range(32, 127)]:
             # Create a path for this single character (NOT LaTeX).
             dp = TextPath((0, 0), d, prop=FONT_PROP)
             # Cache its vertices, codes, and bounding-box width
-            digit_verts[d] = dp.vertices  # shape (N,2)
-            digit_codes[d] = dp.codes    # shape (N,)
+            digit_verts[d] = np.asarray(dp.vertices)  # shape (N,2)
+            digit_codes[d] = np.asarray(dp.codes)     # shape (N,)
             digit_widths[d] = dp.get_extents().width
 
         def _make_path_from_digits(label):
