@@ -35,7 +35,6 @@ import pwd
 import shutil
 import traceback
 import sys
-#print(sys.version)
 import numpy as np
 import base64
 
