@@ -152,7 +152,7 @@ def main():
                         help='Step size of the sweep in Hz.')
     parser.add_argument('-n', '--num_tones', type=int, default=1024,
                         help='Number of tones to use. More tones = fewer sweep steps.')
-    parser.add_argument('-p', '--samples_per_point', type=int, default=10,
+    parser.add_argument('-S', '--samples_per_point', type=int, default=10,
                         help='Number of samples to integrate per sweep point.')
     parser.add_argument('-i', '--ignore_phase_correction', action='store_true',
                         help='DEPRECATED (no-op). Phase correction is disabled by default '\
