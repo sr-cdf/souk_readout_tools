@@ -31,7 +31,11 @@ def main():
             print(bcolors.OKGREEN+'Success'+bcolors.ENDC)
             print(f"SOUK Readout Server running on {result['message']['ip_addresses']}")
         else:
-            print(bcolors.FAIL+'Failed to get server status:\n'+bcolors.ENDC, result)
+            msg = result.get('message', 'Unknown error')
+            print(bcolors.FAIL + f'Failed: {msg}' + bcolors.ENDC)
+            if 'Connection refused' in str(msg):
+                print(bcolors.WARNING + 'Hint: ensure souk-readout-server is running on the target host '
+                      '(e.g. sudo ~/py3.12-venv/bin/souk-readout-server).' + bcolors.ENDC)
     except Exception as e:
         print(bcolors.FAIL+'Failed to get server status with exception:'+bcolors.ENDC,e)
     return
