@@ -40,9 +40,6 @@ import base64
 
 from importlib.resources import files as importlib_files
 
-from souk_readout_tools import calibration
-from souk_readout_tools import firmware_lib
-from souk_readout_tools.server.rf_peripherals import RFPeripheralController
 import argparse
 
 import time
@@ -1854,11 +1851,12 @@ def main():
     )
     args = parser.parse_args()
 
+    # Defer heavy imports until after argument parsing for fast --help.
+    global calibration, firmware_lib, RFPeripheralController
+    from souk_readout_tools import calibration
+    from souk_readout_tools import firmware_lib
+    from souk_readout_tools.server.rf_peripherals import RFPeripheralController
 
-
-    #check_if_running_on_rfsoc_arm()
-    #process_name = set_process_name()
-    #host_ips = get_host_ips()
     readout_server = ReadoutServer(config_file=args.config, pipeline_id=args.pipeline)
     asyncio.run(readout_server.async_main())
 
