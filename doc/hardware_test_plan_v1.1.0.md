@@ -19,20 +19,20 @@ beyond SSH access to the board.
 ```bash
 ssh casper@rfsoc
 cd /home/casper/souk-firmware/software/control_sw
-sudo /home/casper/py3.12-venv/bin/pip install .
+/home/casper/py3.12-venv/bin/pip install .
 ```
-- [ ] Installs without errors on Python 3.12
-- [ ] `python -c "import souk_mkid_readout"` succeeds
+- [x] Installs without errors on Python 3.12
+- [x] `python -c "import souk_mkid_readout"` succeeds
 
 ### 0.2  Install souk_readout_tools (server)
 
 ```bash
 cd /home/casper/souk_readout_tools
 git submodule init && git submodule update
-sudo /home/casper/py3.12-venv/bin/pip install .
+/home/casper/py3.12-venv/bin/pip install .
 ```
-- [ ] Auto-detects Xilinx platform and installs server components
-- [ ] `smbus2` installs cleanly on Python 3.12
+- [x] Auto-detects Xilinx platform and installs server components
+- [x] `smbus2` installs cleanly on Python 3.12
 
 ### 0.3  Server entry points
 
