@@ -3678,10 +3678,12 @@ class SplashScreen(QSplashScreen):
         Animate the windowOpacity from 1.0 to 0.0 over 'duration' milliseconds.
         Then close the splash screen.
         """
+        from PyQt5.QtCore import QEasingCurve
         self.anim = QPropertyAnimation(self, b"windowOpacity", self)
         self.anim.setDuration(duration)
         self.anim.setStartValue(1.0)
         self.anim.setEndValue(0.0)
+        self.anim.setEasingCurve(QEasingCurve.InQuad)
         self.anim.finished.connect(self.close)
         self.anim.start()
 
@@ -3733,8 +3735,11 @@ def main():
                         help='Minimum spacing between peaks in Hz')
     parser.add_argument('--direction', choices=['peaks', 'dips'], default=None,
                         help='Search for peaks (upward) or dips (downward)')
+    parser.add_argument('--reset-settings', action='store_true',
+                        help='Clear all saved settings (window size, filter '
+                        'parameters, etc.) and start with defaults. Useful if '
+                        'corrupted settings are causing crashes.')
     args = parser.parse_args()
-    parser.parse_args()
 
     # Install global exception handler to prevent silent crashes
     def exception_hook(exctype, value, tb):
@@ -3758,6 +3763,10 @@ def main():
 
     app = QApplication(sys.argv)
 
+    if args.reset_settings:
+        QSettings("mkid_resonance_finder", "ResonanceFinder2").clear()
+        print("Settings cleared.")
+
     iconpng = str(files("souk_readout_tools").joinpath("mkid_finder_app.png"))
     iconico = str(files("souk_readout_tools").joinpath("mkid_finder_app.ico"))
     if sys.platform in ['nt','win32']:
@@ -3775,7 +3784,7 @@ def main():
     window.apply_cli_overrides(args)
     window.show()
 
-    splash.fadeOut(duration=3000)
+    splash.fadeOut(duration=1500)
 
     app.exec_()
 
