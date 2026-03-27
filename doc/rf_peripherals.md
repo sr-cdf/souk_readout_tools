@@ -201,7 +201,7 @@ The `ReadoutClient` provides matching methods that send requests to the server:
 ```python
 from souk_readout_tools.client.readout_client import ReadoutClient
 
-client = ReadoutClient(host='192.168.2.10', port=8764)
+client = ReadoutClient(address='192.168.2.10', request_port=8764)
 
 # Attenuation control
 client.set_tx_attenuation(10.0)   # dB
