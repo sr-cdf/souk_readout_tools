@@ -925,9 +925,9 @@ The system supports two independent readout pipelines on a single RFSoC board, a
 2. Start two server instances on the RFSoC:
    ```bash
    # Terminal 1
-   sudo souk-readout-server -p 0 /path/to/config_p0.yaml
+   sudo /home/casper/py3.12-venv/bin/souk-readout-server -p 0 /path/to/config_p0.yaml
    # Terminal 2
-   sudo souk-readout-server -p 1 /path/to/config_p1.yaml
+   sudo /home/casper/py3.12-venv/bin/souk-readout-server -p 1 /path/to/config_p1.yaml
    ```
 
 3. Connect two clients:

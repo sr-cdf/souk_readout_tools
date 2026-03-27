@@ -183,13 +183,13 @@ To run the server as a systemd service that starts on boot and auto-restarts on 
 
 ```bash
 # Pipeline 0 only (default)
-sudo souk-enable-daemon
+sudo /home/casper/py3.12-venv/bin/souk-enable-daemon
 
 # Pipeline 1 only
-sudo souk-enable-daemon -p 1
+sudo /home/casper/py3.12-venv/bin/souk-enable-daemon -p 1
 
 # Both pipelines
-sudo souk-enable-daemon -p 0 1
+sudo /home/casper/py3.12-venv/bin/souk-enable-daemon -p 0 1
 ```
 
 Check status:
@@ -202,9 +202,9 @@ sudo journalctl -f -xu readout_server_1             # follow pipeline 1 logs
 
 Disable:
 ```bash
-sudo souk-disable-daemon            # both pipelines (default)
-sudo souk-disable-daemon -p 0       # pipeline 0 only
-sudo souk-disable-daemon -p 1       # pipeline 1 only
+sudo /home/casper/py3.12-venv/bin/souk-disable-daemon            # both pipelines (default)
+sudo /home/casper/py3.12-venv/bin/souk-disable-daemon -p 0       # pipeline 0 only
+sudo /home/casper/py3.12-venv/bin/souk-disable-daemon -p 1       # pipeline 1 only
 ```
 
 ---
@@ -568,6 +568,6 @@ pip uninstall souk_readout_tools
 ### Server
 
 ```bash
-sudo souk-disable-daemon  # if running as daemon
-sudo pip uninstall souk_readout_tools
+sudo /home/casper/py3.12-venv/bin/souk-disable-daemon  # if running as daemon
+sudo /home/casper/py3.12-venv/bin/pip uninstall souk_readout_tools
 ```

@@ -42,7 +42,7 @@ souk_readout_tools/server/
 submodule directory to `sys.path`, imports the submodule classes, and provides a
 unified `RFPeripheralController` interface that supports three backends:
 
-- **mixerless** (default) — real I2C hardware via `smbus2`
+- **mixerless** (default) — real SOUK I2C hardware via `smbus2`
 - **rudat** — Mini-Circuits RUDAT-6000-30 USB attenuators via `pyusb`
 - **software mimic** — automatic fallback when no hardware libraries are
   available; useful for offline transfer-function modelling
@@ -121,7 +121,51 @@ print(f"TX total gain: {tx_transfer.total_gain_dB:.1f} dB")
 print(f"TX input 1dB comp: {tx_transfer.input_1dB_comp:.1f} dBm")
 ```
 
-### Command-line quick check
+### RUDAT USB attenuator
+
+The `rudat.py` module provides a stateless USB driver for Mini-Circuits
+RUDAT-6000-30 programmable attenuators.  Range is 0–30 dB in 0.25 dB steps.
+
+```python
+from souk_readout_tools.server.rudat import find_rudats, Attenuator
+
+# Discover all connected RUDATs (prints bus/address/serial for each)
+rudats = find_rudats()
+# e.g. {12345: {'bus': 1, 'address': 5}, 12346: {'bus': 1, 'address': 6}}
+
+# Open a specific device by bus and address
+atten = Attenuator(usb_bus=1, usb_address=5)
+
+# Read current attenuation
+print(f"Current: {atten.att} dB")
+
+# Set attenuation (quantised to 0.25 dB, clamped to [0, 30] dB)
+atten.att = 12.5
+
+# Device info
+print(atten.get_model())             # 'RUDAT-6000-30'
+print(atten.get_serial())            # '12345'
+print(atten.get_firmware_version())
+print(atten.describe())              # one-line summary
+```
+
+The driver is stateless — each read/write opens and closes the USB handle, so
+multiple processes can share the device safely.  An advisory file lock
+(`/tmp/rudat.lock.<serial>`) serialises concurrent access.
+
+A udev rule avoids needing `sudo`:
+
+```
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="20ce", ATTRS{idProduct}=="0023", MODE="0666", GROUP="plugdev"
+```
+
+You can also probe all connected RUDATs from the command line:
+
+```bash
+python -m souk_readout_tools.server.rudat
+```
+
+### Command-line quick check (mixerless module)
 
 From the submodule directory:
 
@@ -129,10 +173,10 @@ From the submodule directory:
 cd src/souk_readout_tools/server/souk-peripherals-control
 
 # Print current attenuator and amp bypass states
-sudo python3 souk_rf_mixerless_module.py --get
+sudo /home/casper/py3.12-venv/bin/python3 souk_rf_mixerless_module.py --get
 
 # LNA bias status
-sudo python3 souk_lna_bias_control_monitor.py --status --channels 1 12 13 14
+sudo /home/casper/py3.12-venv/bin/python3 souk_lna_bias_control_monitor.py --status --channels 1 12 13 14
 ```
 
 ## Readout tools functions that use RF peripherals
