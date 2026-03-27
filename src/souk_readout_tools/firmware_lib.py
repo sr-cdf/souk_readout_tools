@@ -3748,7 +3748,7 @@ def check_rfdc_rts_events(r, clear=True):
         return False, details
 
 
-def check_dsp_overflow(r, duration_s=0.1, check_rts=False):
+def check_dsp_overflow(r, duration_s=0.1, check_rts=True):
     """
     Check to see if any of the digital signal processing blocks have overflowed.
 
