@@ -154,10 +154,6 @@ def _copy_template_configs(dirs, pipeline_id):
 
         copy_template_config(template_dst, pipeline_id=pipeline_id)
 
-        os.chmod(template_dst, 0o664)
-        if SUDO:
-            os.chown(template_dst, TARGET_UID, TARGET_GID)
-
         # Create default_config.lnk pointing to template_config.yaml
         default_lnk_dst = dirs['default_config']
         with open(default_lnk_dst, 'w') as f:

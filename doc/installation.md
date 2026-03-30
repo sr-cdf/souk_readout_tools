@@ -108,11 +108,13 @@ souk-readout-server --help
 
 ### 4. Create a Configuration File
 
-Use the `copy_template_config` function to create the server directory structure and a config file in one step:
+Use `ensure_pipeline_dirs` to create the server directory structure, then `copy_template_config` to create a config file:
 
 ```bash
 sudo /home/casper/py3.12-venv/bin/python -c "
+from souk_readout_tools.server.readout_server import ensure_pipeline_dirs
 from souk_readout_tools.config_utils import copy_template_config
+ensure_pipeline_dirs(0)
 copy_template_config('/home/casper/.souk_readout_tools/pipeline_0/config/my_config.yaml', pipeline_id=0)
 "
 ```

@@ -6,9 +6,28 @@ the client and server packages.
 """
 
 import os
+import pwd
 import re
 from datetime import date
 from importlib.resources import files as importlib_files
+
+
+def _get_target_ownership():
+    """
+    If running as root (e.g. via sudo), return (uid, gid) of the target user
+    so that created files are owned by them rather than root.
+    Returns None if not running as root.
+    """
+    if os.geteuid() != 0:
+        return None
+    target_user = 'casper'
+    try:
+        pw = pwd.getpwnam(target_user)
+        return pw.pw_uid, pw.pw_gid
+    except KeyError:
+        uid = int(os.getenv('SUDO_UID') or 0)
+        gid = int(os.getenv('SUDO_GID') or 0)
+        return uid, gid
 
 
 def get_template_config_path():
@@ -88,6 +107,11 @@ def copy_template_config(destination, pipeline_id=0, config_id=None,
 
     with open(destination, 'w') as f:
         f.write(text)
+
+    os.chmod(destination, 0o664)
+    ownership = _get_target_ownership()
+    if ownership is not None:
+        os.chown(destination, *ownership)
 
     print(f'Template config written to {destination}')
     print(f'Edit this file with your system-specific settings before use.')
