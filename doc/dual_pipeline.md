@@ -122,7 +122,7 @@ The server-side directory structure:
 On the client side, keep your config files wherever you like — there is no hidden directory. You can also generate pipeline-specific configs from the template provided in this package:
 
 ```python
-from souk_readout_tools.client.readout_client import copy_template_config
+from souk_readout_tools.config_utils import copy_template_config
 copy_template_config('config_pipeline_0.yaml', pipeline_id=0)
 copy_template_config('config_pipeline_1.yaml', pipeline_id=1)
 ```

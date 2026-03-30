@@ -112,7 +112,7 @@ Use the `copy_template_config` function to create the server directory structure
 
 ```bash
 sudo /home/casper/py3.12-venv/bin/python -c "
-from souk_readout_tools.client.readout_client import copy_template_config
+from souk_readout_tools.config_utils import copy_template_config
 copy_template_config('/home/casper/.souk_readout_tools/pipeline_0/config/my_config.yaml', pipeline_id=0)
 "
 ```
@@ -287,7 +287,7 @@ There is no hidden directory on the client side. Config files live wherever you 
 Generate a config from the bundled template, then edit it with your hardware-specific settings:
 
 ```python
-from souk_readout_tools.client.readout_client import copy_template_config
+from souk_readout_tools.config_utils import copy_template_config
 
 # Creates a config file with default settings for pipeline 0
 copy_template_config('my_config.yaml', pipeline_id=0)
@@ -478,7 +478,7 @@ The client does not create any hidden directories. You need to provide a config 
 
 ```python
 # Create a config from the template:
-from souk_readout_tools.client.readout_client import copy_template_config
+from souk_readout_tools.config_utils import copy_template_config
 copy_template_config('my_config.yaml')
 
 # Or connect by address and pull the config from the server:

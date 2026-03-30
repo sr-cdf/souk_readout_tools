@@ -178,7 +178,7 @@ On the client side, config files live wherever you choose. Keep them with your p
 Create a new config from the bundled template:
 
 ```python
-from souk_readout_tools.client.readout_client import copy_template_config
+from souk_readout_tools.config_utils import copy_template_config
 copy_template_config('my_config.yaml', pipeline_id=0)
 ```
 

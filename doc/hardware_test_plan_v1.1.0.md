@@ -152,7 +152,7 @@ DONE - attenuator config moved to rf_frontend level. attenuator_backend: 'i2c' (
 ### 0.10  Template config validation
 
 ```python
-from souk_readout_tools.client.readout_client import copy_template_config
+from souk_readout_tools.config_utils import copy_template_config
 copy_template_config('test_config.yaml', pipeline_id=0, config_id='test', created_by='test')
 ```
 - [X] Config is created and parseable

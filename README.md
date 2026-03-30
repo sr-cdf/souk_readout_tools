@@ -92,7 +92,7 @@ YAML-based configuration uses sections `rfsoc_host`, `firmware`, `rf_frontend`, 
 **Client side:** Config files live wherever you choose. Create a config from the bundled template or pull one from a running server:
 
 ```python
-from souk_readout_tools.client.readout_client import copy_template_config
+from souk_readout_tools.config_utils import copy_template_config
 copy_template_config('my_config.yaml', pipeline_id=0)
 ```
 

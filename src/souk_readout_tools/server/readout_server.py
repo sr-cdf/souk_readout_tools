@@ -39,6 +39,7 @@ import numpy as np
 import base64
 
 from importlib.resources import files as importlib_files
+from souk_readout_tools.config_utils import copy_template_config
 
 import argparse
 
@@ -146,60 +147,30 @@ def _copy_template_configs(dirs, pipeline_id):
     Updates pipeline_id in template_config.yaml to match the target pipeline.
     Copies as raw text to preserve comments.
     """
-    import re
-    from datetime import date
-
     print(f"First run for pipeline {pipeline_id}: copying template config files to {dirs['config']}")
 
     try:
-        # Access package data directory
-        pkg_config_dir = importlib_files('souk_readout_tools').joinpath('data', 'config')
-
-        # Copy template_config.yaml as raw text (preserves comments)
-        template_src = pkg_config_dir.joinpath('template_config.yaml')
         template_dst = os.path.join(dirs['config'], 'template_config.yaml')
 
-        with open(str(template_src), 'r') as f:
-            text = f.read()
+        copy_template_config(template_dst, pipeline_id=pipeline_id)
 
-        # Update creation date to today
-        text = re.sub(
-            r'(creation_date:\s*)"[^"]*"',
-            rf'\1"{date.today().isoformat()}"',
-            text,
-        )
-
-        # Update pipeline-specific fields
-        text = re.sub(r'(pipeline_id:\s*)0', rf'\g<1>{pipeline_id}', text)
-        text = re.sub(r'(request_port:\s*)10000', rf'\g<1>{10000 + pipeline_id}', text)
-        text = re.sub(r'(stream_port:\s*)20000', rf'\g<1>{20000 + pipeline_id}', text)
-
-        # RFDC tile/block mapping for pipeline 1
-        if pipeline_id == 1:
-            text = re.sub(r'(dac0_tile:\s*)0', r'\g<1>1', text)
-            text = re.sub(r'(dac1_tile:\s*)0', r'\g<1>1', text)
-            text = re.sub(r'(adc_tile:\s*)2', r'\g<1>3', text)
-
-        with open(template_dst, 'w') as f:
-            f.write(text)
-        
         os.chmod(template_dst, 0o664)
         if SUDO:
             os.chown(template_dst, TARGET_UID, TARGET_GID)
-        
+
         # Create default_config.lnk pointing to template_config.yaml
         default_lnk_dst = dirs['default_config']
         with open(default_lnk_dst, 'w') as f:
             f.write(template_dst)
-        
+
         os.chmod(default_lnk_dst, 0o664)
         if SUDO:
             os.chown(default_lnk_dst, TARGET_UID, TARGET_GID)
-        
+
         print(f"  Created {template_dst}")
         print(f"  Created {default_lnk_dst} -> {template_dst}")
         print(f"{bcolors.WARNING}Note: Please edit {template_dst} with your system-specific settings.{bcolors.ENDC}")
-        
+
     except Exception as e:
         print(f"{bcolors.FAIL}Warning: Could not copy template config files: {e}{bcolors.ENDC}")
         print(f"{bcolors.WARNING}You may need to manually create a config file in {dirs['config']}{bcolors.ENDC}")
