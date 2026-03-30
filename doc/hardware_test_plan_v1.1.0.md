@@ -41,7 +41,7 @@ souk-readout-server --help
 souk-enable-daemon --help
 souk-disable-daemon --help
 ```
-- [ ] All three commands are registered and print help text
+- [x] All three commands are registered and print help text
 
 ### 0.4  Client entry points (on client machine)
 
@@ -50,7 +50,7 @@ souk-connection-test --help
 souk-wideband_sweep --help
 souk-mkid-finder-app --help
 ```
-- [ ] All three commands are registered and print help text
+- [x] All three commands are registered and print help text
 
 ### 0.5  Python imports — server side
 
@@ -64,8 +64,8 @@ from souk_readout_tools.firmware_lib import needs_programming
 print('All server imports OK')
 "
 ```
-- [ ] All imports succeed without errors
-- [ ] `souk-peripherals-control` submodule classes import on Python 3.12
+- [x] All imports succeed without errors
+- [x] `souk-peripherals-control` submodule classes import on Python 3.12
 
 ### 0.6  Python imports — client side
 
@@ -82,7 +82,26 @@ from souk_readout_tools.measurement import ParameterSweep, TimedMeasurement
 print('All client imports OK')
 "
 ```
-- [ ] All imports succeed without errors
+- [FAIL ] All imports succeed without errors
+
+CalibrationChain and PeakFinder classes not implmented, try import *:
+
+```bash
+python -c "
+import souk_readout_tools
+from souk_readout_tools.client.readout_client import ReadoutClient, copy_template_config
+from souk_readout_tools.calibration import *
+from souk_readout_tools.peak_finder import *
+from souk_readout_tools.plotting import plot_sweep_magphase
+from souk_readout_tools.resonator import remove_cable_delay
+from souk_readout_tools.fitting import batch_fit
+from souk_readout_tools.measurement import ParameterSweep, TimedMeasurement
+print('All client imports OK')
+"
+```
+- [x] All imports succeed without errors
+
+
 
 ### 0.7  First-run directory creation
 
@@ -91,7 +110,7 @@ sudo /home/casper/py3.12-venv/bin/souk-readout-server -p 0
 # Ctrl-C after it starts
 ls -la ~/.souk_readout_tools/
 ```
-- [ ] `~/.souk_readout_tools/` is created with correct structure:
+- [x] `~/.souk_readout_tools/` is created with correct structure:
   ```
   ~/.souk_readout_tools/
   ├── daemon/
@@ -102,19 +121,20 @@ ls -la ~/.souk_readout_tools/
   │   ├── calibrations/
   │   └── readout_server.service
   ```
-- [ ] `template_config.yaml` paths reference `/home/casper/souk-firmware/...` (not `/home/casper/src/...`)
-- [ ] `readout_server.service` references `py3.12-venv` (not `py38venv`)
+- [x] `template_config.yaml` paths reference `/home/casper/souk-firmware/...` (not `/home/casper/src/...`)
+- [x] `readout_server.service` references `py3.12-venv` (not `py38venv`)
+
 
 ### 0.8  Systemd daemon setup
 
 ```bash
-sudo souk-enable-daemon
+souk-enable-daemon
 systemctl cat readout_server_0
 ```
-- [ ] Service installs without errors
-- [ ] `ExecStart` path is `/home/casper/py3.12-venv/bin/souk-readout-server -p 0`
-- [ ] `sudo systemctl start readout_server_0` starts the server
-- [ ] `sudo journalctl -xu readout_server_0` shows server log output
+- [x] Service installs without errors
+- [x] `ExecStart` path is `/home/casper/py3.12-venv/bin/souk-readout-server -p 0`
+- [x] `sudo systemctl start readout_server_0` starts the server
+- [x] `sudo journalctl -xu readout_server_0` shows server log output
 
 ### 0.9  RUDAT USB attenuator discovery (if devices connected)
 
@@ -123,20 +143,29 @@ from souk_readout_tools.server.rudat import find_rudats
 rudats = find_rudats()
 print(rudats)
 ```
-- [ ] Enumerates connected devices without errors
-- [ ] Serials and bus/address info are correct
-- [ ] If no RUDAT connected: returns empty dict without crashing
+- [X] Enumerates connected devices without errors
+- [x] Serials and bus/address info are correct
+- [x] If no RUDAT connected: returns empty dict without crashing
+
+DONE - attenuator config moved to rf_frontend level. attenuator_backend: 'i2c' (mixerless module), 'rudat' (USB), or blank (manual).
 
 ### 0.10  Template config validation
 
 ```python
 from souk_readout_tools.client.readout_client import copy_template_config
-copy_template_config('test_config.yaml', pipeline_id=0)
+copy_template_config('test_config.yaml', pipeline_id=0, config_id='test', created_by='test')
 ```
-- [ ] Config is created and parseable
-- [ ] `firmware.fw_config_file` points to `/home/casper/souk-firmware/...`
-- [ ] `rf_frontend.mixerless_module` section contains `attenuator_backend` key
-- [ ] `rf_frontend.mixerless_module` section contains commented RUDAT serial fields
+- [X] Config is created and parseable
+- [ ] YAML comments are preserved in the output file (not stripped by yaml.dump)
+- [ ] `config.creation_date` is today's date
+- [ ] `config.config_id` and `config.created_by` match the arguments passed
+- [x] `firmware.fw_config_file` points to `/home/casper/souk-firmware/...`
+- [ ] `firmware.fw_config_file` references dual-pipeline config by default
+- [x] `rf_frontend` section contains `attenuator_backend` key
+- [ ] `rf_frontend` section contains commented RUDAT serial fields
+- [ ] `rf_frontend.bypass_amps` subsection present with `enabled: false`
+- [ ] `rf_frontend.mixerless_module` subsection present with I2C settings
+- [ ] `cryostat.lna_bias` subsection present with `enabled: false`
 
 ---
 
@@ -155,12 +184,18 @@ essential.
    info = c.get_system_information()
    ```
 3. Verify the returned dict contains:
-   - [ ] `souk_readout_tools_version` matches `1.1.0`
-   - [ ] `firmware_version` and `fpg_file` match what was loaded
-   - [ ] `pipeline_id` matches config
-   - [ ] `adc_clk_hz` is sensible (e.g. 2.4576 GHz)
-   - [ ] `tone_frequencies`, `tone_amplitudes`, `tone_phases` are lists
-   - [ ] `rts_events` dict is present with boolean flags
+   - [x] `souk_readout_tools_version` matches `1.1.0`
+   - [ ] `souk_mkid_readout_sw_version` is a version string (software/driver version)
+   - [ ] `souk_mkid_readout_fw_version` is a version string (supported firmware version)
+   - [ ] `fpg_file` matches what was loaded
+   - [x] `pipeline_id` matches config
+   - [x] `adc_clk_hz` is sensible (e.g. 2.4576 GHz)
+   - [x] `tone_frequencies`, `tone_amplitudes`, `tone_phases` are lists
+   - [x] `rts_events` dict is present with boolean flags
+   - [ ] `souk_readout_tools_git` is a short commit hash string (or None)
+   - [ ] `souk_firmware_git` is a short commit hash string (or None)
+
+DONE - git info simplified to commit hash only from fixed paths (/home/casper/souk_readout_tools, /home/casper/souk-firmware). souk_mkid_readout_version renamed to souk_mkid_readout_sw_version. New souk_mkid_readout_fw_version from __fwversion__. firmware_version key removed.
 
 ### 1.2  RFDC RTS event detection
 
@@ -169,10 +204,31 @@ essential.
    info = c.get_system_information()
    print(info['rts_events'])
    ```
-2. [ ] All `rts_over_*` flags should be `False` in quiescent state
+2. [ x] All `rts_over_*` flags should be `False` in quiescent state
 3. If internal loopback is available, set tones at full scale and re-check:
-   - [ ] Confirm `rts_over_range` does not spuriously trigger at normal power
-4. [ ] Verify `rts_available` is `True` on v7.9+ firmware
+   - [x] Confirm `rts_over_range` does not spuriously trigger at normal power
+4. [x] Verify `rts_available` is `True` on v7.9+ firmware
+
+DONE: RTS flag checking added to check_input_saturation — over_range treated as saturation warning, over_voltage as error
+
+todo: investigate why check_input_saturation reports +/- 0.5 for full scale input but check_output_saturation reports +/- 1.0 — both use the same 16-bit normalisation so this may be a hardware gain/alignment issue rather than a software bug
+
+DONE: get_adc_snapshot and get_dac_snapshot available in client, server, and firmware_lib
+
+DONE: maximise tx power - the psbscale binary search now uses exponential ramp-up from current value instead of starting at max
+
+DONE: maximise tx/rx power - headroom_db parameter exposed through client/server (default 2.0 dB)
+
+DONE: optimise_tx_snr now records initial powers and verifies preservation after optimisation; optimise_rx_snr documents expected IQ level changes
+
+DONE: set_tone_powers now returns result dict with achieved_powers_dbm, power_error_db, and warnings; client surfaces warnings
+
+DONE: set_tone_powers with optimise_dynamic_range now follows order: maximise amps → fftshift → psbscale → compute required analog attenuation from calibration chain → RFDC DSA as last resort
+
+DONE: get_tone_powers now accepts reference_plane parameter ('dac', 'rf_output', 'detector')
+
+DONE: new get_rx_tone_powers function estimates received power with reference planes 'accumulator', 'adc_input', 'cryostat_output'; uses calc_adc_input_power from calibration.py
+
 
 ### 1.3  Config sync from system
 
@@ -181,16 +237,16 @@ essential.
    c.set_tones([5e9, 5.1e9])
    info = c.sync_config_from_system()
    ```
-2. [ ] `c.config['firmware']['defaults']` now contains updated keys
-3. [ ] Tone frequencies in synced config match what was set
-4. [ ] Calling `sync_config_from_system()` a second time is idempotent
+2. [x] `c.config['firmware']['defaults']` now contains updated keys
+3. [x] Tone frequencies in synced config match what was set
+4. [x] Calling `sync_config_from_system()` a second time is idempotent
 
 ### 1.4  Connection test CLI
 
 ```bash
 souk-connection-test -C config.yaml
 ```
-- [ ] Connects, prints system information, exits cleanly
+- [x] Connects, prints system information, exits cleanly
 
 ### 1.5  Push/pull config round-trip
 
@@ -200,36 +256,49 @@ c.push_config()
 c2 = ReadoutClient(address='10.11.11.11', request_port=10000)
 c2.pull_config(save_as='pulled_config.yaml')
 ```
-- [ ] `push_config()` succeeds on a freshly started server
-- [ ] `pull_config()` returns a valid config
-- [ ] Pulled config matches the pushed config (compare key fields)
-- [ ] `save_config()` writes a parseable YAML file
-- [ ] Creating a new client from the pulled config connects successfully:
+- [x] `push_config()` succeeds on a freshly started server
+- [x] `pull_config()` returns a valid config
+- [x] Pulled config matches the pushed config (compare key fields)
+- [x] `save_config()` writes a parseable YAML file
+- [x] Creating a new client from the pulled config connects successfully:
   ```python
   c3 = ReadoutClient(config_file='pulled_config.yaml')
   c3.get_server_status()
   ```
 
+DONE: souk-enable-daemon / souk-disable-daemon docs updated to not use sudo (they call sudo internally)
+
+
 ### 1.6  Single pre-accumulator snapshot
 
 ```python
-c.set_tones([5e9])
+c.set_tones_helper([1.5e9])
 snap = c.get_accumulator_snapshots(tone_index=0, num_snapshots=5)
 ```
-- [ ] `snap['snapshots'].shape` is `(5, 1024)`
-- [ ] `snap['snapshots'].dtype` is `complex128`
-- [ ] `snap['sample_rate']` is consistent with `adc_clk_hz / n_fft`
-- [ ] Data is not all zeros (if loopback or signal present)
+- [x] `snap['snapshots'].shape` is `(5, 1024)`
+- [x] `snap['snapshots'].dtype` is `complex128`
+- [x] `snap['sample_rate']` is consistent with `adc_clk_hz / n_fft`
+- [x] Data is not all zeros (if loopback or signal present)
+
+DONE: generate_newman_phases now returns [0] for a single tone instead of NaN from division by zero
+
+DONE: overflow counter bug fixed — now uses unsigned 32-bit modular arithmetic to prevent negative deltas
+
+minor asymmetry in 1.5G tone at very low level
 
 ### 1.7  Batch snapshots — single tone
 
 ```python
 result = c.batch_snapshots(tone_indices=[0], num_snapshots=5, verbose=True)
 ```
-- [ ] `result['results'][0]['snapshots'].shape` is `(5, 1024)`
-- [ ] `result['firmware_indices']` is an array with one entry
-- [ ] Firmware index is not necessarily 0 (depends on VACC mapping)
-- [ ] Verbose output shows correct firmware channel index
+- [x] `result['results'][0]['snapshots'].shape` is `(5, 1024)`
+- [x] `result['firmware_indices']` is an array with one entry
+- [x] Firmware index is not necessarily 0 (depends on VACC mapping)
+- [x] Verbose output shows correct firmware channel index
+
+DONE: maximise_tx_power now calls fix_dac_saturation() on pre-existing saturation instead of raising ValueError
+
+DONE: new _apply_per_bin_scaling helper scales all amplitudes by worst-case bin overlap factor to prevent coherent addition saturation
 
 ### 1.8  Batch snapshots — multiple tones (VACC index mapping)
 
@@ -263,6 +332,37 @@ sweep = c.wideband_sweep(step_size_hz=50000, verbose=True)
 - [ ] Phase is smooth (phase slope removal working)
 - [ ] `sweep['system_information']` dict is populated
 
+### 1.10b  Wideband sweep with auto power (new in v1.1.0)
+
+```python
+sweep = c.wideband_sweep(tone_powers_dbm='auto', verbose=True)
+```
+- [ ] `maximise_tx_power()` is called before sweep
+- [ ] If saturation detected after maximise, auto-fix is attempted
+- [ ] Sweep completes successfully
+- [ ] Magnitude levels are higher than unit-amplitude sweep
+
+```python
+sweep = c.wideband_sweep(tone_powers_dbm=-30.0, verbose=True)
+```
+- [ ] Tones are set to -30 dBm via `set_tone_powers()`
+- [ ] Sweep completes with consistent power levels
+
+### 1.10c  RX tone powers (new in v1.1.0)
+
+```python
+# Estimate received power from accumulated IQ
+rx_powers = c.get_rx_tone_powers(reference_plane='adc_input')
+print(f"RX powers at ADC: {rx_powers} dBm")
+
+rx_powers_cryo = c.get_rx_tone_powers(reference_plane='cryostat_output')
+print(f"RX powers at cryostat output: {rx_powers_cryo} dBm")
+```
+- [ ] Returns power array matching number of active tones
+- [ ] `reference_plane='adc_input'` returns sensible ADC-level powers
+- [ ] `reference_plane='cryostat_output'` includes RX frontend corrections (when connected)
+- [ ] `reference_plane='accumulator'` returns raw dB levels (no calibration)
+
 ### 1.11  Wideband sweep CLI
 
 ```bash
@@ -286,9 +386,9 @@ bench testing).
 status = c.get_rf_peripheral_status()
 print(status)
 ```
-- [ ] `status['enabled']` is `True` (config has `mixerless_module.enabled: true`)
+- [ ] `status['enabled']` is `True` (requires both `rf_frontend.connected: true` and `attenuator_backend` set to `'i2c'` or `'rudat'`)
 - [ ] `status['hardware']` is `True` (real hardware detected)
-- [ ] `status['attenuator_backend']` matches config (`'mixerless'` or `'rudat'`)
+- [ ] `status['attenuator_backend']` matches config (`'i2c'` or `'rudat'`)
 - [ ] `status['tx_attenuation_db']` and `status['rx_attenuation_db']` are floats
 - [ ] `status['tx_amp_bypass']` and `status['rx_amp_bypass']` are bools
 - [ ] `status['tx_total_gain_db']` and `status['rx_total_gain_db']` reflect current settings
@@ -332,8 +432,9 @@ assert status['tx_amp_bypass'] == False
 - [ ] TX amp bypass toggles correctly
 - [ ] RX amp bypass toggles correctly (repeat for RX)
 - [ ] Total gain changes appropriately when amp is bypassed vs active
-- [ ] `tx_bypass_amp_s21_db` / `rx_bypass_amp_s21_db` config values are used
-      in the gain calculation
+- [ ] `tx_bypass_amp_s21_db` / `rx_bypass_amp_s21_db` in `rf_frontend` are auto-updated by `_sync_config`
+- [ ] `bypass_amps.tx_amp_bypass` / `rx_amp_bypass` in `rf_frontend` are synced to config
+- [ ] Bypass commands are only applied when `bypass_amps.enabled: true` in config
 
 ### 2.5  Sweep with RF frontend — power level check
 
@@ -356,19 +457,61 @@ from souk_readout_tools.calibration import CalibrationChain  # or equivalent
       corrections
 - [ ] DAC power → detector power conversion is consistent with measured values
 
+### 2.6b  Power optimisation with RF frontend (updated in v1.1.0)
+
+```python
+# maximise_tx_power now accepts headroom_db and uses exponential ramp-up
+result = c.maximise_tx_power(headroom_db=2.0)
+print(result)
+```
+- [ ] `maximise_tx_power(headroom_db=2.0)` completes without error
+- [ ] Headroom parameter is respected (2 dB margin below saturation)
+- [ ] If DAC saturation exists at start, auto-fixes instead of raising ValueError
+- [ ] Per-bin scaling applied when tones share FFT bins (check print output)
+- [ ] PSB scale uses exponential ramp-up then binary search (not just binary search)
+
+```python
+# maximise_rx_power now optimises programmable RX attenuator before DSA
+result = c.maximise_rx_power(headroom_db=2.0)
+print(result)
+```
+- [ ] `maximise_rx_power()` returns `rx_attenuation_db` in result dict
+- [ ] Programmable RX attenuator is optimised first (when RF frontend connected)
+- [ ] Then ADC DSA is optimised
+- [ ] Headroom parameter is respected
+
+```python
+# get_tone_powers supports reference_plane parameter
+powers_dac = c.get_tone_powers(reference_plane='dac')
+powers_rf = c.get_tone_powers(reference_plane='rf_output')
+powers_det = c.get_tone_powers(reference_plane='detector')
+print(f"DAC: {powers_dac[0]:.1f}, RF: {powers_rf[0]:.1f}, Det: {powers_det[0]:.1f} dBm")
+```
+- [ ] Powers decrease from DAC → RF output → detector (losses along chain)
+- [ ] `detailed_output=True` works with all reference planes
+
+```python
+# set_tone_powers with optimise_dynamic_range uses improved analog adjustment
+result = c.set_tone_powers([-40.0], optimise_dynamic_range=True)
+```
+- [ ] Analog adjustment computes exact attenuation from calibration chain (no trial-and-error)
+- [ ] RFDC DAC DSA used as last resort when attenuator+amp bypass insufficient
+- [ ] `set_tone_powers` returns result dict with `warnings` list
+- [ ] Client prints any warnings from the result
+
 ### 2.7  Attenuator backend switching
 
 Test that the server correctly initialises with each backend:
 
-1. Set `attenuator_backend: mixerless` in config, restart server:
-   - [ ] `get_rf_peripheral_status()` reports `attenuator_backend: 'mixerless'`
+1. Set `attenuator_backend: i2c` in config, restart server:
+   - [ ] `get_rf_peripheral_status()` reports `attenuator_backend: 'i2c'`
    - [ ] Set/get attenuation works via I2C
 
-2. Set `attenuator_backend: rudat` with valid serial numbers, restart server:
+2. Set `attenuator_backend: rudat` with valid serial numbers at `rf_frontend` level, restart server:
    ```yaml
-   mixerless_module:
-     enabled: true
-     attenuator_backend: rudat
+   rf_frontend:
+     connected: true
+     attenuator_backend: "rudat"
      rudat_tx_serial: "12345"
      rudat_rx_serial: "12346"
    ```
@@ -379,18 +522,51 @@ Test that the server correctly initialises with each backend:
 3. Set `attenuator_backend: rudat` with invalid serial:
    - [ ] Server raises a clear error at startup (not a silent fallback)
 
-4. Set `enabled: false`:
+4. Set `connected: false` or remove `attenuator_backend`:
    - [ ] `get_rf_peripheral_status()` reports `enabled: False`
    - [ ] Attenuation commands are no-ops (no crash)
 
-### 2.8  Config template validation
+### 2.8  LNA bias control
+
+```python
+status = c.get_lna_controller_status()
+print(status)
+```
+- [ ] `status['enabled']` reflects `cryostat.lna_bias.enabled` in config
+- [ ] `status['lna_channel']` matches configured channel
+
+If LNA bias board is connected and `enabled: true`:
+```python
+# Read bias status for this pipeline's channel
+bias = c.get_lna_bias_status()
+print(f"Remote V: {bias['remote_voltage_v']:.3f}, Current: {bias['bias_current_a']*1e6:.1f} uA")
+
+# Read all 14 channels
+all_bias = c.get_lna_bias_status_all()
+
+# Set bias voltage (remote method with feedback)
+result = c.set_lna_bias_voltage(0.5)
+print(f"Achieved: {result['achieved_voltage_v']:.3f} V")
+
+# Set all channels
+result = c.set_lna_bias_voltage_all(0.0)
+```
+- [ ] `get_lna_bias_status()` returns voltage and current readings
+- [ ] `get_lna_bias_status_all()` returns results for all 14 channels
+- [ ] `set_lna_bias_voltage()` achieves the requested voltage (within tolerance)
+- [ ] `set_lna_bias_voltage(method='local')` sets DAC directly without feedback
+- [ ] `set_lna_bias_voltage(blind=True)` skips validation
+- [ ] Specifying `channel=N` overrides the configured pipeline channel
+- [ ] With `enabled: false` or no LNA board: status reports disabled, commands return gracefully
+
+### 2.9  Config template validation
 
 1. Copy the template config and fill in RF frontend section:
    ```bash
    cp $(python -c "from importlib_resources import files; print(files('souk_readout_tools.data.config') / 'template_config.yaml')") test_config.yaml
    ```
-2. [ ] `mixerless_module` section is present with all expected keys
-3. [ ] `attenuator_backend` key is present with default `mixerless`
+2. [ ] `rf_frontend` section contains `attenuator_backend`, `bypass_amps`, and `mixerless_module` subsections
+3. [ ] `attenuator_backend` key is present with default `i2c`
 4. [ ] Server starts cleanly with the filled-in config
 5. [ ] `RFPeripheralController` initialises without errors
 
@@ -604,6 +780,55 @@ for r in fit_results[:5]:
 - [ ] `Qi > Ql` (internal Q should exceed loaded Q)
 - [ ] `residual_rms` is small relative to the dip depth
 - [ ] Fitted `fr` values agree with peak-finder frequencies to within a linewidth
+- [ ] `FitResult.iq_center` and `FitResult.iq_radius` are populated
+- [ ] `FitResult.anl` is 0.0 for linear fits
+
+### 4.5b  Nonlinear resonance fitting (new in v1.1.0)
+
+```python
+from souk_readout_tools.fitting import batch_fit
+
+# Nonlinear (Duffing) model — useful at high drive power
+nl_results = batch_fit(sweep, nonlinear=True, sweep_direction='up', verbose=True)
+for r in nl_results[:5]:
+    print(f"  fr={r.fr/1e6:.4f} MHz, Ql={r.Ql:.0f}, Qi={r.Qi:.0f}, "
+          f"anl={r.anl:.2e}, rms={r.residual_rms:.2e}")
+```
+- [ ] Nonlinear fits converge
+- [ ] `anl` values are small and positive (typically < 0.1 for low-power)
+- [ ] Fit quality is comparable to or better than linear fits
+- [ ] `sweep_direction='down'` produces different `anl` values at high power
+
+### 4.5c  ResonatorCalibration and ToneConverter (new in v1.1.0)
+
+```python
+from souk_readout_tools.resonator import ResonatorCalibration
+
+# Build from a fit result
+cal = ResonatorCalibration.from_fit(fit_results[0])
+print(f"fr={cal.fr/1e6:.4f} MHz, Ql={cal.Ql:.0f}, tau={cal.tau*1e9:.2f} ns")
+
+# Deembed sweep data
+z_de = cal.deembed_sweep(fit_results[0].f_data, fit_results[0].z_data)
+
+# Convert to frequency/dissipation
+df, dd = cal.to_frequency_dissipation(z_de)
+print(f"df range: {np.min(df):.0f} to {np.max(df):.0f} Hz")
+
+# Build a ToneConverter for real-time readout
+convert = cal.tone_converter(fit_results[0].fr)
+ts = c.get_samples(num_samples=100)
+parsed = c.parse_samples(ts)
+key = sorted(parsed['i_data'].keys())[0]
+z_raw = parsed['i_data'][key] + 1j * parsed['q_data'][key]
+df_ts, dd_ts = convert(z_raw)
+```
+- [ ] `ResonatorCalibration.from_fit()` builds without error
+- [ ] `ResonatorCalibration.from_sweep()` builds from raw data
+- [ ] `deembed_sweep()` produces a centered, rotated resonance circle
+- [ ] `to_frequency_dissipation()` returns sensible df, dd values
+- [ ] `ToneConverter` produces same results as full deembed + convert pipeline
+- [ ] `deembed_params` property is compatible with `apply_deembed_params()`
 
 ### 4.6  Fit quality inspection
 
@@ -850,7 +1075,7 @@ sweep1 = c1.wideband_sweep()
 | First-run directory creation | 0.7 |
 | Systemd daemon setup | 0.8 |
 | RUDAT driver | 0.9 |
-| Template config | 0.10, 2.8 |
+| Template config | 0.10, 2.9 |
 | `get_system_information()` | 1.1, 1.10 |
 | `check_rfdc_rts_events()` | 1.2 |
 | `sync_config_from_system()` | 1.3 |
@@ -858,8 +1083,12 @@ sweep1 = c1.wideband_sweep()
 | Pre-accumulator snapshots | 1.6, 1.7, 1.8, 1.9 |
 | VACC tone index mapping | 1.8, 4.11 |
 | Wideband sweep + progress | 1.10, 1.11, 4.1 |
+| Wideband sweep auto power | 1.10b |
+| RX tone powers | 1.10c |
 | RF peripheral control | 2.1–2.5 |
+| Power optimisation | 2.6b |
 | Attenuator backend switching | 2.7 |
+| LNA bias control | 2.8 |
 | Calibration renames | 2.6 |
 | Plotting: sweep formats | 3.1, 3.2 |
 | Plotting: timestream | 3.4, 4.9 |
@@ -867,9 +1096,11 @@ sweep1 = c1.wideband_sweep()
 | Plotting: batch snapshots | 3.6, 4.11 |
 | Plotting: on-resonance | 3.8, 4.10 |
 | Resonator deembedding | 3.2, 3.3, 4.8 |
+| ResonatorCalibration | 4.5c |
 | Resonance finding (wideband) | 4.2, 4.4 |
 | Resonance finding (targeted) | 4.3, 4.11 |
-| Resonance fitting | 4.5, 4.6, 4.7 |
+| Resonance fitting (linear) | 4.5, 4.6, 4.7 |
+| Resonance fitting (nonlinear) | 4.5b |
 | Freq/diss noise | 4.9 |
 | ParameterSweep | 4.12 |
 | TimedMeasurement | 4.13 |

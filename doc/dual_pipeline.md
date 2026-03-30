@@ -98,7 +98,7 @@ client1 = ReadoutClient(config_file='config_pipeline_1.yaml')
 client1.push_config()
 ```
 
-Alternatively, copy files manually with `scp`:
+`push_config()` is the standard way to deploy configs — it handles calibration file transfer and path resolution automatically. If you need to copy files manually (e.g. before the server is running), you can use `scp`:
 
 ```bash
 scp config_pipeline_0.yaml casper@rfsoc:~/.souk_readout_tools/pipeline_0/config/
@@ -190,7 +190,7 @@ print(info0["pipeline_id"])  # expected: 0
 print(info1["pipeline_id"])  # expected: 1
 ```
 
-The pipeline ID is read from the config file automatically. You can also connect by address and pull configs (and their calibration files) from each server into memory, optionally saving to disk:
+The pipeline ID is read from the config file automatically. Alternatively, if the servers are already configured and running, you can connect by address and pull configs to create local config files for subsequent use:
 
 ```python
 client0 = ReadoutClient(address='10.11.11.11', request_port=10000)

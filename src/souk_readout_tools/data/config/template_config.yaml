@@ -1,9 +1,24 @@
-config:
-  config_id: "A bare minimum configuration file for the readout system"
-  created_by: "Sam R"
-  creation_date: "2024-08-29"
-  comments: "This config file contains the bare minimum configuration required to run the readout system. It is intended to be used as a template for creating new configuration files."
+# ============================================================================
+# SOUK Readout Tools — Configuration Template
+# ============================================================================
+# Copy this file and edit it to match your system setup.
+#
+# Use copy_template_config() to create a new config file:
+#   from souk_readout_tools.client.readout_client import copy_template_config
+#   copy_template_config('my_config.yaml', pipeline_id=0)
+#
+# ============================================================================
 
+config:
+  config_id: "New config from template"
+  created_by: "Automatically generated from template_config.yaml"
+  creation_date: "2024-08-29"
+  comments: "This config file is a template and should be updated to reflect the actual configuration."
+
+# --- RFSoC host connection settings ---
+# address: IP address of the RFSoC board
+# request_port / stream_port: offset by pipeline_id (e.g. pipeline 0 = 10000, pipeline 1 = 10001)
+# clock_source: 'internal' or 'external' clock reference
 rfsoc_host:
   hardware_id: "unnamed_rfsoc"
   address: "10.11.11.11"
@@ -13,9 +28,15 @@ rfsoc_host:
   trigger_source_pin: 0
   comments:
 
+# --- Firmware and RFDC settings ---
+# These settings must match the loaded firmware and RFDC tile/block mapping.
+# The default values are for dual-pipeline firmware on pipeline 0.
 firmware:
-  fw_config_file: "/home/casper/souk-firmware/software/control_sw/config/souk-single-pipeline-krm.yaml"    
+  fw_config_file: "/home/casper/souk-firmware/software/control_sw/config/souk-dual-pipeline-krm.yaml"
   pipeline_id: 0
+  # RFDC tile/block mapping — must match the firmware configuration:
+  #   Pipeline 0: DACs {0/0} and {0/2}, ADC {2/0}
+  #   Pipeline 1: DACs {1/0} and {1/2}, ADC {3/0}
   dac0_tile: 0
   dac0_block: 0
   dac1_tile: 0
@@ -26,6 +47,8 @@ firmware:
   adc_fullscale_bits: 16
   dac_physical_bits: 14
   adc_physical_bits: 14
+  # Conversion factors between digital full-scale (dBFS) and analog power (dBm).
+  # These can be scalar values or paths to CSV calibration files.
   dac0_dbfs_to_dbm: -6.0
   dac1_dbfs_to_dbm: -6.0
   adc_dbm_to_dbfs: +12
@@ -34,25 +57,26 @@ firmware:
     sync_delay: 5714
     acc_len: 1000
     internal_loopback: false
-    psb_scale: 1 
-    psb_fftshift: 0b0
-    pfb_fftshift: 0b0
+    psb_scale: 1
+    psb_fftshift: 0b00000011111111
+    pfb_fftshift: 0b0000001111111
     nyquist_zone: 1
     dsa: 0
-    vop: 20000 # WARNING: not rated above 20000uA in gen3 devices with 2.5 V_dac_vtt, anything upto max 40500uA adds nonlinearity
-    dac_duc_mixer_frequency_hz: 1024000000
-    adc_ddc_mixer_frequency_hz: -1024000000
-    dac_mixer_scale_1p0: false # WARNING: using 1p0 may add nonlinearity
-    adc_mixer_scale_1p0: false # WARNING: using 1p0 may add nonlinearity
-    dac_qmc_gain: 1 # WARNING UNTESTED. Gain correction factor. Range: 0 to 2.0 (Exclusive)
-    dac_qmc_offset: 0 # WARNING UNTESTED. Offset correction factor is adding a fixed LSB value to the sampled signal.
-    dac_qmc_phase: 0 # WARNING UNTESTED. Phase correction factor. Range: +/- 26.5 degrees (Exclusive)
-    adc_qmc_gain: 1 # WARNING UNTESTED. Gain correction factor. Range: 0 to 2.0 (Exclusive)
-    adc_qmc_offset: 0 # WARNING UNTESTED. Offset correction factor is adding a fixed LSB value to the sampled signal.
-    adc_qmc_phase: 0 # WARNING UNTESTED. Phase correction factor. Range: +/- 26.5 degrees (Exclusive)
+    vop: 20000                       # WARNING: not rated above 20000uA in gen3 with 2.5V V_dac_vtt; up to 40500uA adds nonlinearity
+    dac_duc_mixer_frequency_hz: 1228800000
+    adc_ddc_mixer_frequency_hz: -1228800000
+    dac_mixer_scale_1p0: false       # WARNING: using 1p0 may add nonlinearity
+    adc_mixer_scale_1p0: false       # WARNING: using 1p0 may add nonlinearity
+    dac_qmc_gain: 1                  # WARNING UNTESTED. Gain correction factor. Range: 0 to 2.0 (Exclusive)
+    dac_qmc_offset: 0               # WARNING UNTESTED. Offset correction factor (fixed LSB value added to signal)
+    dac_qmc_phase: 0                # WARNING UNTESTED. Phase correction factor. Range: +/- 26.5 degrees (Exclusive)
+    adc_qmc_gain: 1                  # WARNING UNTESTED. Gain correction factor. Range: 0 to 2.0 (Exclusive)
+    adc_qmc_offset: 0               # WARNING UNTESTED. Offset correction factor (fixed LSB value added to signal)
+    adc_qmc_phase: 0                # WARNING UNTESTED. Phase correction factor. Range: +/- 26.5 degrees (Exclusive)
     frequencies: []
     amplitudes: []
     phases: []
+  # GPIO pin assignments
   gpio_0: 'trigger_input'
   gpio_1: 'misc_input'
   gpio_2: 'misc_input'
@@ -63,51 +87,89 @@ firmware:
   gpio_7: 'pps_input'
   comments:
 
+# --- RF Frontend ---
+# Describes the RF signal chain between the RFSoC and the cryostat.
+# Set 'connected: true' to enable programmable attenuator control and
+# RF frontend calibration corrections.
 rf_frontend:
   connected: false
-  hardware_id: 
-  tx_combiner_loss_db: 
-  rx_combiner_loss_db: 
-  tx_attenuator_value_db: 
-  rx_attenuator_value_db: 
-  tx_if_s21_db: 
-  rx_if_s21_db: 
-  tx_rf_s21_db: 
-  rx_rf_s21_db: 
-  tx_mixer_conversion_loss_db: 
-  rx_mixer_conversion_loss_db: 
-  tx_mixer_lo_frequency_hz:  
-  rx_mixer_lo_frequency_hz: 
-  tx_mixer_sideband: 
-  rx_mixer_sideband: 
+  hardware_id: "souk-mixerless-module"
+
+  # --- Attenuator control ---
+  # The attenuator backend selects how programmable attenuators are controlled:
+  #   'i2c'   — uses the SOUK RF Mixerless Module on-board I2C attenuators
+  #   'rudat' — uses Mini-Circuits RUDAT USB attenuators
+  # Leave blank for manual (non-programmable) attenuators.
+  attenuator_backend: "i2c"
+  tx_attenuator_value_db:
+  rx_attenuator_value_db:
+  # --- Example RUDAT configuration (uncomment if attenuator_backend: rudat) ---
+  # rudat_tx_serial: "12345"          # serial number of TX RUDAT attenuator
+  # rudat_rx_serial: "12346"          # serial number of RX RUDAT attenuator
+
+  # --- RF path characterisation ---
+  # These values describe the gain/loss of each component in the signal chain.
+  # Each can be a scalar (dB), a [freq_hz, dB] array, or a path to a CSV file.
+  tx_combiner_loss_db:
+  rx_combiner_loss_db:
+  tx_if_s21_db:
+  rx_if_s21_db:
+  tx_rf_s21_db:
+  rx_rf_s21_db:
+  tx_mixer_conversion_loss_db:
+  rx_mixer_conversion_loss_db:
+  tx_mixer_lo_frequency_hz:
+  rx_mixer_lo_frequency_hz:
+  tx_mixer_sideband:
+  rx_mixer_sideband:
   loopback: false
+  # Amplifier S21 values — auto-updated when bypass_amps are controlled by hardware
   tx_bypass_amp_s21_db: 0
   rx_bypass_amp_s21_db: 0
-  mixerless_module:
+
+  # --- Bypassable amplifier controls ---
+  # Available on the SOUK RF Mixerless Module. Set enabled: true to allow
+  # software control of the TX/RX amplifier bypass state.
+  bypass_amps:
     enabled: false
-    attenuator_backend: mixerless  # 'mixerless' (I2C module) or 'rudat' (Mini-Circuits USB)
-    i2c_bus: 0
-    channel: 0
     tx_amp_bypass: false
     rx_amp_bypass: false
-    # rudat_tx_serial:  # required if attenuator_backend: rudat
-    # rudat_rx_serial:  # required if attenuator_backend: rudat
+
+  # --- I2C settings for SOUK RF Mixerless Module ---
+  # Only used when attenuator_backend: i2c
+  mixerless_module:
+    i2c_bus: 0
+    channel: 0                       # hardware channel (usually matches pipeline_id)
+
   comments:
 
+# --- Cryostat ---
+# Describes the cryostat and its RF connections.
 cryostat:
   connected: false
-  cryostat_id: 
-  input_channel_id: 
+  cryostat_id:
+  input_channel_id:
   output_channel_id:
-  input_s21_db: 
+  input_s21_db:
   output_s21_db:
   lna_model:
+
+  # --- LNA bias control ---
+  # Controls the cryostat LNA bias via the SOUK LNA bias board (I2C).
+  # There are 14 LNA channels per cryostat (indices 1-14).
+  # Set lna_channel to the LNA index that this readout pipeline is connected to.
   lna_bias:
+    enabled: false
+    i2c_bus: 0
+    lna_channel: 1                   # LNA index (1-14) for this readout pipeline
+
   thermometry_log_file:
   optical_setup:
   filter_stack:
   comments:
 
+# --- Detector ---
+# Describes the MKID detector array.
 detector:
   connected: false
   chip_id:
@@ -117,5 +179,3 @@ detector:
   drive_powers_file:
   detector_layout_file:
   comments:
-
-

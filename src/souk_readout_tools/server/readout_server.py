@@ -144,36 +144,44 @@ def _copy_template_configs(dirs, pipeline_id):
     """
     Copy template configuration files from package data to the user's pipeline config directory.
     Updates pipeline_id in template_config.yaml to match the target pipeline.
+    Copies as raw text to preserve comments.
     """
+    import re
+    from datetime import date
+
     print(f"First run for pipeline {pipeline_id}: copying template config files to {dirs['config']}")
-    
+
     try:
         # Access package data directory
         pkg_config_dir = importlib_files('souk_readout_tools').joinpath('data', 'config')
-        
-        # Copy template_config.yaml and update pipeline_id
+
+        # Copy template_config.yaml as raw text (preserves comments)
         template_src = pkg_config_dir.joinpath('template_config.yaml')
         template_dst = os.path.join(dirs['config'], 'template_config.yaml')
-        
+
         with open(str(template_src), 'r') as f:
-            template_content = yaml.safe_load(f)
-        
-        # Update pipeline-specific fields in the template
-        if 'rfsoc_host' in template_content:
-            template_content['rfsoc_host']['request_port'] = 10000 + pipeline_id
-            template_content['rfsoc_host']['stream_port'] = 20000 + pipeline_id
-        if 'firmware' in template_content:
-            template_content['firmware']['pipeline_id'] = pipeline_id
-            # RFDC tile/block mapping for dual-pipeline firmware (v7.9+)
-            if pipeline_id == 1:
-                template_content['firmware']['dac0_tile'] = 1
-                template_content['firmware']['dac1_tile'] = 1
-                template_content['firmware']['adc_tile'] = 3
-            if 'defaults' in template_content['firmware']:
-                template_content['firmware']['defaults']['sync_delay'] = 5714
-        
+            text = f.read()
+
+        # Update creation date to today
+        text = re.sub(
+            r'(creation_date:\s*)"[^"]*"',
+            rf'\1"{date.today().isoformat()}"',
+            text,
+        )
+
+        # Update pipeline-specific fields
+        text = re.sub(r'(pipeline_id:\s*)0', rf'\g<1>{pipeline_id}', text)
+        text = re.sub(r'(request_port:\s*)10000', rf'\g<1>{10000 + pipeline_id}', text)
+        text = re.sub(r'(stream_port:\s*)20000', rf'\g<1>{20000 + pipeline_id}', text)
+
+        # RFDC tile/block mapping for pipeline 1
+        if pipeline_id == 1:
+            text = re.sub(r'(dac0_tile:\s*)0', r'\g<1>1', text)
+            text = re.sub(r'(dac1_tile:\s*)0', r'\g<1>1', text)
+            text = re.sub(r'(adc_tile:\s*)2', r'\g<1>3', text)
+
         with open(template_dst, 'w') as f:
-            yaml.dump(template_content, f, default_flow_style=False, sort_keys=False)
+            f.write(text)
         
         os.chmod(template_dst, 0o664)
         if SUDO:
@@ -655,7 +663,7 @@ class ReadoutServer:
         try:
             self.rf_peripherals = RFPeripheralController(self.config, self.pipeline_id)
             if self.rf_peripherals.enabled:
-                print(f'{bcolors.OKGREEN}RF mixerless module initialised{bcolors.ENDC}')
+                print(f'{bcolors.OKGREEN}RF frontend initialised ({self.rf_peripherals.attenuator_backend}){bcolors.ENDC}')
                 status = self.rf_peripherals.get_status()
                 print(f'  TX atten: {status["tx_attenuation_db"]:.1f} dB, '
                       f'amp bypass: {status["tx_amp_bypass"]}, '
@@ -666,6 +674,16 @@ class ReadoutServer:
         except Exception as e:
             print(bcolors.WARNING+f'Warning: RF peripheral init failed: {e}'+bcolors.ENDC)
             self.rf_peripherals = None
+
+        # Initialize LNA bias controller
+        try:
+            self.lna_controller = LNABiasController(self.config, self.pipeline_id)
+            if self.lna_controller.enabled:
+                print(f'{bcolors.OKGREEN}LNA bias controller initialised '
+                      f'(channel {self.lna_controller.lna_channel}){bcolors.ENDC}')
+        except Exception as e:
+            print(bcolors.WARNING+f'Warning: LNA bias init failed: {e}'+bcolors.ENDC)
+            self.lna_controller = None
 
         return
    
@@ -992,11 +1010,13 @@ class ReadoutServer:
                         value = firmware_lib.get_tone_phases(self.r,self.config)
                         response = {'status': 'success', 'value': value.tolist()}
                     elif param_name == 'tone_powers':
-                        value = firmware_lib.get_tone_powers(self.r,self.config)
+                        ref_plane = message.get('reference_plane', 'detector')
+                        value = firmware_lib.get_tone_powers(self.r,self.config,reference_plane=ref_plane)
                         response = {'status': 'success', 'value': value.tolist()}
                     elif param_name == 'tone_powers_detailed':
-                        value = firmware_lib.get_tone_powers(self.r,self.config,detailed_output=True)[1]
-                        response = {'status': 'success', 'value': value}    
+                        ref_plane = message.get('reference_plane', 'detector')
+                        value = firmware_lib.get_tone_powers(self.r,self.config,detailed_output=True,reference_plane=ref_plane)[1]
+                        response = {'status': 'success', 'value': value}
                     elif param_name == 'cal_freeze':
                         value = firmware_lib.get_cal_freeze(self.r,self.config)
                         if value:
@@ -1042,10 +1062,10 @@ class ReadoutServer:
                     elif param_name == 'tone_powers':
                         self.stream_flags[FLAG_SET_AMPS].set()
                         await asyncio.sleep(0)
-                        firmware_lib.set_tone_powers(self.r, self.config, param_value)
+                        result = firmware_lib.set_tone_powers(self.r, self.config, param_value)
                         self.stream_flags[FLAG_SET_AMPS].clear()
                         await asyncio.sleep(0)
-                        response = {'status': 'success'}
+                        response = {'status': 'success', 'result': result}
 
 
                     elif param_name == 'cal_freeze':
@@ -1098,14 +1118,21 @@ class ReadoutServer:
                     result,details = firmware_lib.check_dsp_overflow(self.r,duration_s=duration_s)
                     await self.send_response(writer, {'status': 'success', 'result': result, 'details': details})
 
+                elif request == 'get_rx_tone_powers':
+                    ref_plane = message.get('reference_plane', 'adc_input')
+                    powers = firmware_lib.get_rx_tone_powers(self.r, self.config, reference_plane=ref_plane)
+                    await self.send_response(writer, {'status': 'success', 'powers': powers.tolist()})
+
                 elif request == 'maximise_tx_power':
-                    amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.maximise_tx_power(self.r,self.config)
+                    headroom_db = message.get('headroom_db', 2.0)
+                    amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.maximise_tx_power(self.r,self.config, headroom_db=headroom_db)
                     result = {'amps': amps.tolist(), 'psb_fft_shift': psb_fft_shift, 'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
                     await self.send_response(writer, {'status': 'success', 'result': result})
-                
+
                 elif request == 'maximise_rx_power':
-                    dsa,pfb_fft_shift,dsp,adc = firmware_lib.maximise_rx_power(self.r,self.config)
-                    result = {'dsa': dsa, 'pfb_fft_shift': pfb_fft_shift, 'dsp_ovf': dsp, 'adc_levels': adc}
+                    headroom_db = message.get('headroom_db', 2.0)
+                    dsa,pfb_fft_shift,dsp,adc,rx_atten = firmware_lib.maximise_rx_power(self.r,self.config, headroom_db=headroom_db, rf_peripherals=self.rf_peripherals)
+                    result = {'dsa': dsa, 'pfb_fft_shift': pfb_fft_shift, 'dsp_ovf': dsp, 'adc_levels': adc, 'rx_attenuation_db': rx_atten}
                     await self.send_response(writer, {'status': 'success', 'result': result})
                 
                 elif request == 'optimise_tx_snr':
@@ -1124,8 +1151,8 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success', 'result': result})
                 
                 elif request == 'fix_adc_saturation':
-                    dsa,fftshift, dsp_ovf, levels = firmware_lib.fix_adc_saturation(self.r,self.config)
-                    result = {'dsa': dsa, 'fftshift': fftshift, 'dsp_ovf': dsp_ovf, 'adc_levels': levels}
+                    dsa,fftshift, dsp_ovf, levels, rx_atten = firmware_lib.fix_adc_saturation(self.r,self.config, rf_peripherals=self.rf_peripherals)
+                    result = {'dsa': dsa, 'fftshift': fftshift, 'dsp_ovf': dsp_ovf, 'adc_levels': levels, 'rx_attenuation_db': rx_atten}
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 # -- RF peripheral (attenuator / amp bypass) commands --
@@ -1177,6 +1204,47 @@ class ReadoutServer:
                     result = {'rx_amp_bypass': self.rf_peripherals.get_rx_amp_bypass()}
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
+                # --- LNA bias control ---
+
+                elif request == 'get_lna_controller_status':
+                    if self.lna_controller is not None:
+                        result = self.lna_controller.get_status()
+                    else:
+                        result = {'enabled': False}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'get_lna_bias_status':
+                    channel = message.get('channel')
+                    if channel is not None:
+                        channel = int(channel)
+                    result = self.lna_controller.get_lna_bias_status(channel)
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'get_lna_bias_status_all':
+                    result = self.lna_controller.get_lna_bias_status_all()
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'set_lna_bias_voltage':
+                    voltage_v = float(message.get('voltage_v'))
+                    channel = message.get('channel')
+                    if channel is not None:
+                        channel = int(channel)
+                    method = message.get('method', 'remote')
+                    blind = message.get('blind', False)
+                    result = self.lna_controller.set_lna_bias_voltage(
+                        voltage_v, channel, method, blind,
+                    )
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'set_lna_bias_voltage_all':
+                    voltage_v = float(message.get('voltage_v'))
+                    method = message.get('method', 'remote')
+                    blind = message.get('blind', False)
+                    result = self.lna_controller.set_lna_bias_voltage_all(
+                        voltage_v, method, blind,
+                    )
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
                 elif request == 'get_samples':
                     num_samples = message.get('num_samples')
                     task = asyncio.create_task(self.get_samples(writer, num_samples))
@@ -1187,6 +1255,25 @@ class ReadoutServer:
                     num_snapshots = message.get('num_snapshots')
                     task = asyncio.create_task(self.get_accumulator_snapshots(writer, tone_index, num_snapshots))
                     self.tasks.append(task)
+
+                elif request == 'get_adc_snapshot':
+                    try:
+                        snapshot = firmware_lib.get_adc_snapshot(self.r)
+                        data = base64.b64encode(snapshot.tobytes()).decode()
+                        result = {'snapshot': data, 'length': len(snapshot)}
+                        await self.send_response(writer, {'status': 'success', 'result': result})
+                    except Exception as e:
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'get_dac_snapshot':
+                    try:
+                        dac0, dac1 = firmware_lib.get_dac_snapshot(self.r)
+                        data0 = base64.b64encode(dac0.tobytes()).decode()
+                        data1 = base64.b64encode(dac1.tobytes()).decode()
+                        result = {'dac0': data0, 'dac1': data1, 'length': len(dac0)}
+                        await self.send_response(writer, {'status': 'success', 'result': result})
+                    except Exception as e:
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
 
                 elif request == 'sweep':
                     if self.sweep_task is None or self.sweep_task.done():
@@ -1852,10 +1939,11 @@ def main():
     args = parser.parse_args()
 
     # Defer heavy imports until after argument parsing for fast --help.
-    global calibration, firmware_lib, RFPeripheralController
+    global calibration, firmware_lib, RFPeripheralController, LNABiasController
     from souk_readout_tools import calibration
     from souk_readout_tools import firmware_lib
     from souk_readout_tools.server.rf_peripherals import RFPeripheralController
+    from souk_readout_tools.server.lna_controller import LNABiasController
 
     readout_server = ReadoutServer(config_file=args.config, pipeline_id=args.pipeline)
     asyncio.run(readout_server.async_main())

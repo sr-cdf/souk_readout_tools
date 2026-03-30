@@ -173,20 +173,18 @@ The main sections are:
 
 ### Config Files
 
-On the client side, config files live wherever you choose. Keep them with your project or measurement data.
+On the client side, config files live wherever you choose. Keep them with your project or measurement data. The standard workflow is to maintain a local config file, connect with it, and push changes to the RFSoC.
 
-To create a new config from the template:
+Create a new config from the bundled template:
 
 ```python
 from souk_readout_tools.client.readout_client import copy_template_config
 copy_template_config('my_config.yaml', pipeline_id=0)
 ```
 
-Or pull a config from a running server (see [Connecting to the RFSoC](#connecting-to-the-rfsoc)).
-
 ### Preparing a Config File
 
-Edit the template config. The most important parameters to set are:
+Edit the config file with your hardware-specific settings. The most important parameters to set are:
 
 - `rfsoc_host.address` - The RFSoC IP address
 - `rfsoc_host.request_port` / `stream_port` - TCP ports (must be unique per pipeline)
@@ -206,7 +204,7 @@ ssh casper@rfsoc
 sudo /home/casper/py3.12-venv/bin/souk-readout-server /path/to/config.yaml
 ```
 
-Then, on the client machine, start an IPython session and create the client:
+Then, on the client machine, start an IPython session and create the client with your local config file:
 
 ```python
 from souk_readout_tools.client.readout_client import ReadoutClient
@@ -214,7 +212,7 @@ from souk_readout_tools.client.readout_client import ReadoutClient
 client = ReadoutClient(config_file='my_config.yaml')
 ```
 
-You can also connect by address without a local config file. Specify the request port to select the pipeline (default 10000 for pipeline 0, 10001 for pipeline 1):
+> **Quick start:** If the server is already configured and running (e.g. someone else set it up), you can skip config file creation and connect by address instead. See [Pulling Configuration from the RFSoC](#pulling-configuration-from-the-rfsoc) to get a local config file from the running system.
 
 ```python
 client = ReadoutClient(address='10.11.11.11', request_port=10000)
@@ -258,7 +256,7 @@ client.push_config()
 
 ### Pulling Configuration from the RFSoC
 
-This is useful for reconnecting to a system that is already configured and running. Connect by address, pull the config into memory, and optionally save it locally:
+If you are connecting to an RFSoC that is already configured and running, you can pull its config to create a local config file. This is the easiest way to get started for first-time use — once saved, you have a local config and can follow the standard workflow from then on:
 
 ```python
 client = ReadoutClient(address='10.11.11.11', request_port=10000)
@@ -376,8 +374,10 @@ client.set_tone_phases(phases)
 ### Convenience: Set All at Once
 
 ```python
-client.set_tones_helper(freqs=[0.8e9, 1.5e9], amps=[0.5, 0.3], phases=[0.0, 1.57])
+client.set_tones_helper(freqs=[0.8e9, 1.5e9], powers_dbm=[-50, -55], phases=[0.0, 1.57])
 ```
+
+`powers_dbm` sets calibrated output power in dBm via `set_tone_powers()`. You can also pass `amps` (0 to 1.0) instead for uncalibrated amplitude control — `amps` is ignored if `powers_dbm` is provided.
 
 ---
 
@@ -539,6 +539,7 @@ sweep_data = client.wideband_sweep(
     step_size_hz=10000,              # frequency step size
     num_tones=1024,                  # number of parallel tones
     samples_per_point=10,            # accumulation per point
+    tone_powers_dbm=-50,             # per-tone power in dBm (scalar or array), or 'auto'
     remove_phase_slope=True,         # remove linear phase slope
     verbose=True
 )
@@ -674,6 +675,35 @@ client.optimise_tx_snr()       # Optimise TX signal-to-noise
 client.optimise_rx_snr()       # Optimise RX signal-to-noise
 client.fix_dac_saturation()    # Auto-fix DAC clipping
 client.fix_adc_saturation()    # Auto-fix ADC clipping
+```
+
+`maximise_tx_power()` and `maximise_rx_power()` accept a `headroom_db` parameter (default 2.0 dB) that sets the safety margin below saturation:
+
+```python
+client.maximise_tx_power(headroom_db=3.0)   # 3 dB below saturation
+client.maximise_rx_power(headroom_db=1.0)   # 1 dB below saturation
+```
+
+### Tone Power Queries
+
+Query tone powers at different points in the signal chain using `reference_plane`:
+
+```python
+# TX power at different reference planes
+client.get_tone_powers()                              # at detector (default)
+client.get_tone_powers(reference_plane='dac')          # at DAC output
+client.get_tone_powers(reference_plane='rf_output')    # at RF frontend output
+
+# RX power estimation from accumulated IQ data
+client.get_rx_tone_powers()                                     # at ADC input (default)
+client.get_rx_tone_powers(reference_plane='cryostat_output')    # at cryostat output
+```
+
+`set_tone_powers()` returns a result dict with `achieved_powers_dbm`, `power_error_db`, and `warnings`:
+
+```python
+result = client.set_tone_powers([-20, -25], optimise_dynamic_range=True)
+# Warnings (e.g. power clamping, compression) are printed automatically
 ```
 
 ### ADC Calibration Freeze
@@ -1069,14 +1099,15 @@ Server-side commands (installed on the RFSoC):
 - Client config files live wherever the user chooses; server uses pipeline-specific directories on the RFSoC.
 
 **Power Calibration & Optimisation**
-- `set_tone_powers()` / `get_tone_powers()` with full calibration chain (PSB, DAC, VOP, mixer, RF frontend, cryostat).
+- `set_tone_powers()` / `get_tone_powers()` with full calibration chain and selectable `reference_plane` (`'dac'`, `'rf_output'`, `'detector'`).
+- `get_rx_tone_powers()` for RX power estimation with reference planes (`'accumulator'`, `'adc_input'`, `'cryostat_output'`).
 - Saturation detection: `check_input_saturation()`, `check_output_saturation()`, `check_dsp_overflow()`.
-- Auto-optimisation: `maximise_tx_power()`, `maximise_rx_power()`, `optimise_tx_snr()`, `optimise_rx_snr()`.
+- Auto-optimisation: `maximise_tx_power(headroom_db)`, `maximise_rx_power(headroom_db)`, `optimise_tx_snr()`, `optimise_rx_snr()`.
 - Auto-fix: `fix_dac_saturation()`, `fix_adc_saturation()`.
 
 **Other**
 - `generate_newman_phases()` for optimal crest factor minimisation.
-- `set_tones_helper()` convenience method for setting frequencies, amplitudes, and phases in one call.
+- `set_tones_helper()` convenience method for setting frequencies, powers (dBm), and phases in one call.
 - Triggered streaming with `enable_triggered_stream()` and `send_fake_trigger()`.
 - Generic parameter access via `set_parameter()` / `get_parameter()`.
 - Server daemon management: `souk-enable-daemon` / `souk-disable-daemon`.
@@ -1097,7 +1128,6 @@ Server-side commands (installed on the RFSoC):
 
 Planned for upcoming releases:
 
-- Per-tone power control in `wideband_sweep()` (power levels across the band).
 - Improved VACC tone backfilling for more efficient LO slot usage.
 - Dual-DAC mode support.
 - HDF5 export format support.

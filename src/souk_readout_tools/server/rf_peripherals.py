@@ -160,19 +160,23 @@ class RFPeripheralController:
         rf_cfg = config_dict.get('rf_frontend', {})
         mod_cfg = rf_cfg.get('mixerless_module', {})
 
-        self.enabled = mod_cfg.get('enabled', False)
-        if not self.enabled:
-            logger.info('RF mixerless module disabled in config')
+        connected = rf_cfg.get('connected', False)
+        attenuator_backend = rf_cfg.get('attenuator_backend') or None
+        self.enabled = connected and attenuator_backend is not None
+        if not connected:
+            logger.info('RF frontend not connected in config')
             return
+        if attenuator_backend is None:
+            logger.info('No programmable attenuator backend configured')
+            return
+        if attenuator_backend not in ('i2c', 'rudat'):
+            raise ValueError(
+                f"Unknown attenuator_backend '{attenuator_backend}'. "
+                f"Supported: 'i2c', 'rudat'"
+            )
 
         self._i2c_bus_num = mod_cfg.get('i2c_bus', 0)
         self._channel = mod_cfg.get('channel', pipeline_id)
-        attenuator_backend = mod_cfg.get('attenuator_backend', 'mixerless')
-        if attenuator_backend not in ('mixerless', 'rudat'):
-            raise ValueError(
-                f"Unknown attenuator_backend '{attenuator_backend}'. "
-                f"Supported: 'mixerless', 'rudat'"
-            )
 
         # -- RUDAT attenuator backend --
         if attenuator_backend == 'rudat':
@@ -181,12 +185,12 @@ class RFPeripheralController:
                     'RUDAT backend selected but rudat module not found. '
                     'Install pyusb and ensure rudat.py is on sys.path.'
                 )
-            tx_serial = mod_cfg.get('rudat_tx_serial')
-            rx_serial = mod_cfg.get('rudat_rx_serial')
+            tx_serial = rf_cfg.get('rudat_tx_serial')
+            rx_serial = rf_cfg.get('rudat_rx_serial')
             if tx_serial is None or rx_serial is None:
                 raise ValueError(
                     'RUDAT backend requires rudat_tx_serial and '
-                    'rudat_rx_serial in mixerless_module config'
+                    'rudat_rx_serial in rf_frontend config'
                 )
             rudats = find_rudats()
             tx_key = int(tx_serial) if str(tx_serial).isdigit() else tx_serial
@@ -214,7 +218,7 @@ class RFPeripheralController:
             self._sync_config_from_hardware()
             return
 
-        # -- Mixerless module backend (default) --
+        # -- I2C attenuator backend (default) --
         hw_configs = mod_cfg.get('hw_config', None)
 
         if _HW_AVAILABLE:
@@ -335,7 +339,7 @@ class RFPeripheralController:
         if isinstance(self._hw_module, RudatAdapter):
             return 'rudat'
         elif self._hw_module is not None:
-            return 'mixerless'
+            return 'i2c'
         elif self._mimic_module is not None:
             return 'mimic'
         return 'none'
@@ -368,9 +372,9 @@ class RFPeripheralController:
         FPGA/firmware parameters, this one handles RF peripheral hardware
         (variable attenuators and amplifier bypass via I2C).
 
-        Reads ``tx_attenuator_value_db``, ``rx_attenuator_value_db`` and
-        ``mixerless_module.tx_amp_bypass`` / ``rx_amp_bypass`` from the
-        rf_frontend config section and programs the hardware to match.
+        Reads ``tx_attenuator_value_db``, ``rx_attenuator_value_db`` from
+        rf_frontend and ``bypass_amps.tx_amp_bypass`` / ``rx_amp_bypass``
+        and programs the hardware to match.
         Derived config values (``tx_bypass_amp_s21_db`` etc.) are updated after
         each set operation via the normal _sync_config path.
         """
@@ -379,7 +383,7 @@ class RFPeripheralController:
 
         cfg = config_dict if config_dict is not None else self.config
         rf_cfg = cfg.get('rf_frontend', {})
-        mod_cfg = rf_cfg.get('mixerless_module', {})
+        bypass_cfg = rf_cfg.get('bypass_amps', {})
 
         # Set hardware attenuators to match config
         tx_atten = rf_cfg.get('tx_attenuator_value_db')
@@ -396,20 +400,21 @@ class RFPeripheralController:
             except (ValueError, RuntimeError) as e:
                 logger.warning('Could not apply RX attenuation from config: %s', e)
 
-        # Set amplifier bypass state to match config
-        tx_bypass = mod_cfg.get('tx_amp_bypass')
-        if tx_bypass is not None:
-            try:
-                self.set_tx_amp_bypass(bool(tx_bypass))
-            except (ValueError, RuntimeError) as e:
-                logger.warning('Could not apply TX amp bypass from config: %s', e)
+        # Set amplifier bypass state to match config (if bypass_amps enabled)
+        if bypass_cfg.get('enabled', False):
+            tx_bypass = bypass_cfg.get('tx_amp_bypass')
+            if tx_bypass is not None:
+                try:
+                    self.set_tx_amp_bypass(bool(tx_bypass))
+                except (ValueError, RuntimeError) as e:
+                    logger.warning('Could not apply TX amp bypass from config: %s', e)
 
-        rx_bypass = mod_cfg.get('rx_amp_bypass')
-        if rx_bypass is not None:
-            try:
-                self.set_rx_amp_bypass(bool(rx_bypass))
-            except (ValueError, RuntimeError) as e:
-                logger.warning('Could not apply RX amp bypass from config: %s', e)
+            rx_bypass = bypass_cfg.get('rx_amp_bypass')
+            if rx_bypass is not None:
+                try:
+                    self.set_rx_amp_bypass(bool(rx_bypass))
+                except (ValueError, RuntimeError) as e:
+                    logger.warning('Could not apply RX amp bypass from config: %s', e)
 
     # -- internal helpers --
 
@@ -436,13 +441,16 @@ class RFPeripheralController:
     def _sync_config(self, dev_name):
         """Update the in-memory config to reflect the current peripheral state."""
         rf_cfg = self.config.setdefault('rf_frontend', {})
+        bypass_cfg = rf_cfg.setdefault('bypass_amps', {})
 
         if dev_name == 'transmit_atten':
             rf_cfg['tx_attenuator_value_db'] = self.get_tx_attenuation()
             rf_cfg['tx_bypass_amp_s21_db'] = self._get_amp_s21('transmit_atten')
+            bypass_cfg['tx_amp_bypass'] = self.get_tx_amp_bypass()
         elif dev_name == 'recv_atten':
             rf_cfg['rx_attenuator_value_db'] = self.get_rx_attenuation()
             rf_cfg['rx_bypass_amp_s21_db'] = self._get_amp_s21('recv_atten')
+            bypass_cfg['rx_amp_bypass'] = self.get_rx_amp_bypass()
 
     def _sync_config_from_hardware(self):
         """Read all hardware state and update config on first init."""

@@ -183,28 +183,30 @@ To run the server as a systemd service that starts on boot and auto-restarts on 
 
 ```bash
 # Pipeline 0 only (default)
-sudo /home/casper/py3.12-venv/bin/souk-enable-daemon
+souk-enable-daemon
 
 # Pipeline 1 only
-sudo /home/casper/py3.12-venv/bin/souk-enable-daemon -p 1
+souk-enable-daemon -p 1
 
 # Both pipelines
-sudo /home/casper/py3.12-venv/bin/souk-enable-daemon -p 0 1
+souk-enable-daemon -p 0 1
 ```
+
+These commands call `sudo` internally and will prompt for a password if needed.
 
 Check status:
 ```bash
-sudo systemctl status readout_server_0              # pipeline 0
-sudo systemctl status readout_server_1              # pipeline 1
-sudo journalctl -f -xu readout_server_0             # follow pipeline 0 logs
-sudo journalctl -f -xu readout_server_1             # follow pipeline 1 logs
+systemctl status readout_server_0              # pipeline 0
+systemctl status readout_server_1              # pipeline 1
+sudo journalctl -f -xu readout_server_0        # follow pipeline 0 logs
+sudo journalctl -f -xu readout_server_1        # follow pipeline 1 logs
 ```
 
 Disable:
 ```bash
-sudo /home/casper/py3.12-venv/bin/souk-disable-daemon            # both pipelines (default)
-sudo /home/casper/py3.12-venv/bin/souk-disable-daemon -p 0       # pipeline 0 only
-sudo /home/casper/py3.12-venv/bin/souk-disable-daemon -p 1       # pipeline 1 only
+souk-disable-daemon            # both pipelines (default)
+souk-disable-daemon -p 0       # pipeline 0 only
+souk-disable-daemon -p 1       # pipeline 1 only
 ```
 
 ---
@@ -278,38 +280,11 @@ INSTALL_CLIENT=true INSTALL_SERVER=true pip install .
 
 ### 5. Config Setup
 
-There is no hidden directory on the client side. Config files live wherever you choose — keep them with your project or measurement data.
+There is no hidden directory on the client side. Config files live wherever you choose — keep them with your project or measurement data. The standard workflow is to maintain a local config file, connect with it, and push changes to the RFSoC.
 
-**Option A: Pull a config from a running server (recommended)**
+**Option A: Create a config from the template (standard)**
 
-If the server is already configured and running, connect by address and pull its config. This is the easiest way to get started — the config and any referenced calibration files are fetched in one step:
-
-```python
-from souk_readout_tools.client.readout_client import ReadoutClient
-
-client = ReadoutClient(address='10.11.11.11', request_port=10000)
-client.pull_config(save_as='my_config.yaml')
-# Config written to my_config.yaml, calibration files to calibrations/ alongside it
-```
-
-Specify the request port matching the pipeline you want to connect to (10000 for pipeline 0, 10001 for pipeline 1). Next time, connect with:
-
-```python
-client = ReadoutClient(config_file='my_config.yaml')
-```
-
-You can also pull into memory only (no disk write) and save later:
-
-```python
-client = ReadoutClient(address='10.11.11.11', request_port=10000)
-client.pull_config()              # config + cal files in memory only
-# ... inspect client.config, do work ...
-client.save_config('my_config.yaml')  # writes config + cal files to disk
-```
-
-**Option B: Create a config from the template**
-
-If you don't have a running server, or want to start from a blank template:
+Generate a config from the bundled template, then edit it with your hardware-specific settings:
 
 ```python
 from souk_readout_tools.client.readout_client import copy_template_config
@@ -319,6 +294,26 @@ copy_template_config('my_config.yaml', pipeline_id=0)
 
 # Edit the file with your system-specific settings, then connect:
 from souk_readout_tools.client.readout_client import ReadoutClient
+client = ReadoutClient(config_file='my_config.yaml')
+```
+
+See [Getting Started — Preparing a Config File](getting_started.md#preparing-a-config-file) for which parameters to set.
+
+**Option B: Pull a config from a running server (quick start)**
+
+If the server is already configured and running (e.g. someone else set up the RFSoC), you can connect by address and pull its config. This is the easiest way to get started for first-time use — the config and any referenced calibration files are fetched in one step:
+
+```python
+from souk_readout_tools.client.readout_client import ReadoutClient
+
+client = ReadoutClient(address='10.11.11.11', request_port=10000)
+client.pull_config(save_as='my_config.yaml')
+# Config written to my_config.yaml, calibration files to calibrations/ alongside it
+```
+
+Specify the request port matching the pipeline you want to connect to (10000 for pipeline 0, 10001 for pipeline 1). Once saved, you have a local config file and can follow the standard workflow from then on:
+
+```python
 client = ReadoutClient(config_file='my_config.yaml')
 ```
 
@@ -568,6 +563,6 @@ pip uninstall souk_readout_tools
 ### Server
 
 ```bash
-sudo /home/casper/py3.12-venv/bin/souk-disable-daemon  # if running as daemon
+souk-disable-daemon  # if running as daemon
 sudo /home/casper/py3.12-venv/bin/pip uninstall souk_readout_tools
 ```

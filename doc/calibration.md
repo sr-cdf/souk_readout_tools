@@ -15,6 +15,7 @@ How to calibrate the SOUK readout signal chain for accurate power measurements.
 - [RF Peripheral Control](#rf-peripheral-control)
 - [Cryostat Chain](#cryostat-chain)
 - [Example Workflow](#example-workflow)
+- [Reference Planes](#reference-planes)
 
 ---
 
@@ -85,7 +86,7 @@ rf_frontend:
   rx_rf_s21_db: -2.0
   tx_bypass_amp_s21_db: 0       # no bypass amp in breadboard
   rx_bypass_amp_s21_db: 0
-  mixerless_module:
+  bypass_amps:
     enabled: false
 ```
 
@@ -126,7 +127,7 @@ rf_frontend:
   rx_rf_s21_db: -1.5
   tx_bypass_amp_s21_db: 0       # no bypass amp
   rx_bypass_amp_s21_db: 0
-  mixerless_module:
+  bypass_amps:
     enabled: false
 ```
 
@@ -165,16 +166,17 @@ rf_frontend:
   rx_rf_s21_db: -1.5
   tx_bypass_amp_s21_db: 15.0    # auto-updated by RFPeripheralController
   rx_bypass_amp_s21_db: 15.0
-  mixerless_module:
+  attenuator_backend: "i2c"
+  bypass_amps:
     enabled: true
-    # attenuator_backend: mixerless  # default; use 'rudat' for RUDAT USB attenuators
-    i2c_bus: 0
-    channel: 0
     tx_amp_bypass: false
     rx_amp_bypass: false
+  mixerless_module:
+    i2c_bus: 0
+    channel: 0
 ```
 
-When `mixerless_module.enabled: true`, `tx_attenuator_value_db`, `rx_attenuator_value_db`, `tx_bypass_amp_s21_db`, and `rx_bypass_amp_s21_db` are automatically managed by the `RFPeripheralController`. See [RF Peripheral Control](#rf-peripheral-control) for full details and alternative attenuator backends.
+When `rf_frontend.connected: true`, `tx_attenuator_value_db`, `rx_attenuator_value_db`, `tx_bypass_amp_s21_db`, and `rx_bypass_amp_s21_db` are automatically managed by the `RFPeripheralController`. See [RF Peripheral Control](#rf-peripheral-control) for full details and alternative attenuator backends.
 
 ---
 
@@ -287,25 +289,27 @@ Measure these values with a VNA or signal source + spectrum analyser. For mixers
 
 ## RF Peripheral Control
 
-The `RFPeripheralController` manages programmable attenuators (and optionally a bypassable amplifier) on the TX and RX paths. It is initialised by the server on startup when `rf_frontend.mixerless_module.enabled: true`. Two attenuator backends are supported.
+The `RFPeripheralController` manages programmable attenuators (and optionally a bypassable amplifier) on the TX and RX paths. It is initialised by the server on startup when `rf_frontend.connected: true`. Two attenuator backends are supported.
 
 ### Attenuator backends
 
-The `attenuator_backend` config key selects the hardware driver. If omitted, defaults to `mixerless`.
+The `attenuator_backend` config key (under `rf_frontend`) selects the hardware driver. If omitted, defaults to `i2c`.
 
-#### `mixerless` — SOUK RF Mixerless Module (default)
+#### `i2c` — SOUK RF Mixerless Module (default)
 
 The I2C-controlled mixerless module provides a variable attenuator (0-31.5 dB, 0.5 dB steps) and a bypassable amplifier on each path.
 
 ```yaml
 rf_frontend:
-  mixerless_module:
+  connected: true
+  attenuator_backend: "i2c"
+  bypass_amps:
     enabled: true
-    attenuator_backend: mixerless   # default, can be omitted
-    i2c_bus: 0
-    channel: 0            # pipeline index
     tx_amp_bypass: false   # true = amplifier bypassed
     rx_amp_bypass: false
+  mixerless_module:
+    i2c_bus: 0
+    channel: 0             # pipeline index
 ```
 
 Requires `smbus2` and the `souk-peripherals-control` submodule on the server.
@@ -316,11 +320,10 @@ Uses two standalone RUDAT USB attenuators (one TX, one RX) for bench testing wit
 
 ```yaml
 rf_frontend:
-  mixerless_module:
-    enabled: true
-    attenuator_backend: rudat
-    rudat_tx_serial: 12345   # serial number from find_rudats()
-    rudat_rx_serial: 67890
+  connected: true
+  attenuator_backend: "rudat"
+  rudat_tx_serial: "12345"   # serial number from find_rudats()
+  rudat_rx_serial: "67890"
 ```
 
 Requires `pyusb` and the `rudat` module on the server's `PYTHONPATH`. To discover connected RUDATs and their serial numbers:
@@ -359,16 +362,16 @@ All peripheral operations are available from the client via the server's TCP int
 | `get_tx_attenuation()` | Read TX attenuator |
 | `set_rx_attenuation(value_db)` | Set RX attenuator |
 | `get_rx_attenuation()` | Read RX attenuator |
-| `set_tx_amp_bypass(bypass)` | Set TX amp bypass (mixerless only; no-op on RUDAT) |
+| `set_tx_amp_bypass(bypass)` | Set TX amp bypass (I2C only; no-op on RUDAT) |
 | `get_tx_amp_bypass()` | Read TX amp bypass state |
-| `set_rx_amp_bypass(bypass)` | Set RX amp bypass (mixerless only; no-op on RUDAT) |
+| `set_rx_amp_bypass(bypass)` | Set RX amp bypass (I2C only; no-op on RUDAT) |
 | `get_rx_amp_bypass()` | Read RX amp bypass state |
 
 After changing attenuator or bypass settings from the client, call `sync_config_from_system()` to update the client's in-memory config, then `save_config()` if you want to persist the new state.
 
 ### Disabling peripheral control
 
-For systems without programmable attenuators, set `mixerless_module.enabled: false` and enter the attenuator and amplifier values directly in the config as fixed scalars.
+For systems without programmable attenuators, leave `attenuator_backend` empty and enter the attenuator values directly in the config as fixed scalars. Keep `rf_frontend.connected: true` so that the RF frontend calibration chain is still applied — setting `connected: false` excludes the entire RF frontend from calibration.
 
 ---
 
@@ -398,9 +401,48 @@ print(details)  # shows per-stage power breakdown
 
 ---
 
-## TODO
+## Reference Planes
 
-Add a further reference plane to refer to the ADC input power, this way we can calibrate the ADC via loopback. Since we know the power at the DAC output and the S21 of the RF frontend, we can predict the power at the ADC input and use that to calibrate the ADC in dBm.
+Power can be queried at different points in the signal chain using the `reference_plane` parameter on `get_tone_powers()` and `get_rx_tone_powers()`.
+
+### TX reference planes (`get_tone_powers`)
+
+| `reference_plane` | Description |
+|---|---|
+| `'dac'` | Power at DAC output (digital full-scale converted to dBm) |
+| `'rf_output'` | Power at the RF frontend output (after attenuator, amp, mixer) |
+| `'detector'` | Power at the detector (after cryostat chain) — **default** |
+
+```python
+# Power at DAC output
+dac_powers = client.get_tone_powers(reference_plane='dac')
+
+# Power at detector (default)
+det_powers = client.get_tone_powers(reference_plane='detector')
+
+# Full breakdown
+powers, details = client.get_tone_powers(detailed_output=True)
+```
+
+### RX reference planes (`get_rx_tone_powers`)
+
+Estimates received tone powers from accumulated IQ data using `calibration.calc_adc_input_power()`.
+
+| `reference_plane` | Description |
+|---|---|
+| `'accumulator'` | Raw accumulated IQ magnitude in dB (no calibration applied) |
+| `'adc_input'` | Power at ADC input in dBm — **default** |
+| `'cryostat_output'` | Power at cryostat output (before RF frontend RX chain) |
+
+```python
+# Estimated power at ADC input
+rx_powers = client.get_rx_tone_powers(reference_plane='adc_input')
+
+# Estimated power at cryostat output
+cryo_powers = client.get_rx_tone_powers(reference_plane='cryostat_output')
+```
+
+This enables ADC calibration via loopback: compare `get_tone_powers(reference_plane='rf_output')` (known TX power) with `get_rx_tone_powers(reference_plane='adc_input')` (estimated RX power) to derive the ADC calibration correction.
 
 ---
 

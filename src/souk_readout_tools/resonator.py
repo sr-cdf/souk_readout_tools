@@ -2,10 +2,13 @@
 Resonator data transforms for MKID S21 analysis.
 
 Provides deembedding operations (cable delay removal, circle centering,
-rotation) as pure numerical transforms on complex S21 data.
+rotation) as pure numerical transforms on complex S21 data, and a
+ResonatorCalibration class for vectorized IQ ↔ frequency/dissipation
+conversion.
 
 These transforms are used by the plotting library when deembed=True,
-but can also be used independently for resonator characterisation.
+but can also be used independently for resonator characterisation and
+real-time readout.
 """
 
 import numpy as np
@@ -177,3 +180,261 @@ def apply_deembed_params(s21, params):
     s21_centered = s21 - params['center']
     s21_rotated = s21_centered * np.exp(1j * params['rotation_angle'])
     return s21_rotated
+
+
+class ResonatorCalibration:
+    """
+    Cached calibration for vectorized IQ ↔ frequency/dissipation conversion.
+
+    Stores the deembedding parameters (cable delay, circle center, rotation)
+    along with the resonator model parameters (fr, Ql) needed to convert
+    between raw IQ and physical quantities.
+
+    On the deembedded circle (centered at origin, resonance on negative
+    real axis), the exact Möbius inversion gives:
+
+        x = (f - fr) / fr = Re[-j * (z + r) / (2 * Ql * (r - z))]
+
+    This is valid for arbitrary detuning, not just small perturbations.
+
+    Construct from a FitResult or from raw sweep data:
+
+        cal = ResonatorCalibration.from_fit(fit_result)
+        cal = ResonatorCalibration.from_sweep(f, z, fr=..., Ql=...)
+
+    For real-time readout at a fixed tone frequency, use a ToneConverter
+    to reduce per-sample work to one complex multiply + one add + the
+    Möbius inversion:
+
+        convert = cal.tone_converter(f_tone)
+        df, dd = convert(z)     # z is raw IQ, scalar or array
+    """
+
+    __slots__ = ('fr', 'Ql', 'tau', 'center', 'radius',
+                 'rotation_angle', '_rotation_phasor')
+
+    def __init__(self, fr, Ql, tau, center, radius, rotation_angle):
+        self.fr = float(fr)
+        self.Ql = float(Ql)
+        self.tau = float(tau)
+        self.center = complex(center)
+        self.radius = float(radius)
+        self.rotation_angle = float(rotation_angle)
+        self._rotation_phasor = np.exp(1j * rotation_angle)
+
+    @classmethod
+    def from_fit(cls, fit_result):
+        """
+        Build from a fitting.FitResult.
+
+        Derives the deembedding geometry (center, radius, rotation) from
+        the fitted model parameters rather than from a Kasa circle fit,
+        so the calibration is fully consistent with the resonator model.
+        """
+        fr = fit_result.fr
+        Ql = fit_result.Ql
+        tau = fit_result.tau
+        center = fit_result.iq_center
+        radius = fit_result.iq_radius
+        # Rotation angle: put the resonance point on the negative real axis.
+        # In the centered frame, the resonance point is at angle (pi + alpha + phi).
+        rotation_angle = -(fit_result.alpha + fit_result.phi)
+        return cls(fr, Ql, tau, center, radius, rotation_angle)
+
+    @classmethod
+    def from_sweep(cls, frequencies, s21, fr=None, Ql=None):
+        """
+        Build from raw sweep data using the deembed pipeline.
+
+        Args:
+            frequencies: 1D frequency array (Hz).
+            s21: 1D complex S21 array.
+            fr: Resonance frequency (Hz). If None, estimated from
+                the minimum |S21| point.
+            Ql: Loaded quality factor. If None, estimated from the
+                3 dB bandwidth.
+        """
+        s21_deembedded, params = deembed(frequencies, s21)
+
+        if fr is None:
+            fr = float(frequencies[np.argmin(np.abs(s21))])
+        if Ql is None:
+            mag = np.abs(s21)
+            min_mag = np.min(mag)
+            max_mag = np.max(mag)
+            half = (min_mag + max_mag) / 2
+            below = np.where(mag < half)[0]
+            if len(below) > 1:
+                bw = max(frequencies[below[-1]] - frequencies[below[0]],
+                         np.median(np.diff(frequencies)))
+            else:
+                bw = (frequencies[-1] - frequencies[0]) / 10
+            Ql = float(fr / bw)
+
+        return cls(fr, Ql, params['tau'], params['center'],
+                   params['radius'], params['rotation_angle'])
+
+    @property
+    def deembed_params(self):
+        """Return a dict compatible with apply_deembed_params()."""
+        return {
+            'tau': self.tau,
+            'center': self.center,
+            'radius': self.radius,
+            'rotation_angle': self.rotation_angle,
+        }
+
+    # -- Deembedding ---------------------------------------------------------
+
+    def deembed_sweep(self, frequencies, s21):
+        """
+        Deembed sweep data (frequency-dependent cable delay removal).
+
+        Args:
+            frequencies: 1D frequency array (Hz).
+            s21: Complex S21 array.
+
+        Returns:
+            Complex array, fully deembedded.
+        """
+        s21 = np.asarray(s21, dtype=complex)
+        z = s21 * np.exp(1j * 2 * np.pi * np.asarray(frequencies) * self.tau)
+        return (z - self.center) * self._rotation_phasor
+
+    def deembed_timestream(self, s21):
+        """
+        Deembed timestream data (no cable delay removal — fixed tone).
+
+        For timestream IQ at a fixed tone frequency, cable delay is a
+        constant phase that is absorbed into the center/rotation. Use
+        tone_converter() for the full pipeline including cable delay.
+
+        Args:
+            s21: Complex array of timestream IQ samples.
+
+        Returns:
+            Complex array, centered and rotated.
+        """
+        s21 = np.asarray(s21, dtype=complex)
+        return (s21 - self.center) * self._rotation_phasor
+
+    # -- Conversions ---------------------------------------------------------
+
+    def to_phase_amplitude(self, z_deembedded):
+        """
+        Convert deembedded IQ to (phase, normalised amplitude).
+
+        Args:
+            z_deembedded: Complex array on the deembedded circle
+                          (output of deembed_sweep or deembed_timestream).
+
+        Returns:
+            phase: Angle on the resonance circle (rad). Zero at the
+                   off-resonance point (+real axis), ±pi at resonance.
+            amplitude: |z| / radius. Unity on the model circle;
+                       deviations indicate dissipation changes.
+        """
+        phase = np.angle(z_deembedded)
+        amplitude = np.abs(z_deembedded) / self.radius
+        return phase, amplitude
+
+    def to_frequency_dissipation(self, z_deembedded):
+        """
+        Convert deembedded IQ to (frequency shift, dissipation shift).
+
+        Uses the exact Möbius inversion of the resonance circle, valid
+        for arbitrary detuning (not just small perturbations).
+
+        On the deembedded circle the model is:
+            z = r * (-1 + 2j*Ql*x) / (1 + 2j*Ql*x),  x = (f-fr)/fr
+
+        Inverting:
+            x = Re[-j * (z + r) / (2*Ql * (r - z))]
+
+        Args:
+            z_deembedded: Complex array on the deembedded circle.
+
+        Returns:
+            df: Frequency shift from resonance (Hz).
+            dd: Fractional dissipation shift, (|z|/r - 1).
+                Zero on the model circle; positive = increased loss.
+        """
+        r = self.radius
+        z = np.asarray(z_deembedded, dtype=complex)
+        x = np.real(-1j * (z + r) / (2.0 * self.Ql * (r - z)))
+        df = x * self.fr
+        dd = np.abs(z) / r - 1.0
+        return df, dd
+
+    # -- Fixed-tone converter ------------------------------------------------
+
+    def tone_converter(self, f_tone):
+        """
+        Return a ToneConverter for a fixed tone frequency.
+
+        Pre-combines cable delay + centering + rotation into a single
+        complex multiply and add, minimising per-sample work for
+        real-time readout or tracking loops.
+
+        Args:
+            f_tone: Tone frequency (Hz).
+
+        Returns:
+            ToneConverter callable: df, dd = converter(z_raw)
+        """
+        return ToneConverter(self, f_tone)
+
+
+class ToneConverter:
+    """
+    Optimised IQ → (df, dd) converter for a single fixed tone frequency.
+
+    All per-tone constants are pre-computed so that each call is:
+        z_d = z * _multiply - _offset      (1 complex mul + 1 complex sub)
+        x   = Re[-j*(z_d + r) / (2*Ql*(r - z_d))]  (Möbius inversion)
+        df  = x * fr
+
+    Construct via ResonatorCalibration.tone_converter(f_tone).
+    """
+
+    __slots__ = ('_multiply', '_offset', '_fr', '_Ql', '_radius')
+
+    def __init__(self, cal, f_tone):
+        # Combine cable delay and rotation into a single phasor
+        self._multiply = np.exp(1j * 2 * np.pi * f_tone * cal.tau) * cal._rotation_phasor
+        self._offset = cal.center * cal._rotation_phasor
+        self._fr = cal.fr
+        self._Ql = cal.Ql
+        self._radius = cal.radius
+
+    def __call__(self, z):
+        """
+        Convert raw IQ to (df, dd).
+
+        Args:
+            z: Raw complex IQ data (scalar or array).
+
+        Returns:
+            df: Frequency shift from resonance (Hz).
+            dd: Fractional dissipation shift.
+        """
+        z_d = z * self._multiply - self._offset
+        r = self._radius
+        x = np.real(-1j * (z_d + r) / (2.0 * self._Ql * (r - z_d)))
+        df = x * self._fr
+        dd = np.abs(z_d) / r - 1.0
+        return df, dd
+
+    def deembed(self, z):
+        """
+        Deembed raw IQ without converting to frequency/dissipation.
+
+        Useful when you want the deembedded circle for plotting.
+
+        Args:
+            z: Raw complex IQ data (scalar or array).
+
+        Returns:
+            Complex deembedded IQ.
+        """
+        return z * self._multiply - self._offset

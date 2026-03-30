@@ -78,33 +78,81 @@ def get_template_config_path():
     return str(importlib_files('souk_readout_tools').joinpath('data', 'config', 'template_config.yaml'))
 
 
-def copy_template_config(destination, pipeline_id=0):
+def copy_template_config(destination, pipeline_id=0, config_id=None,
+                         created_by=None, comments=None):
     """
     Copy the template config to a destination file, updating pipeline-specific fields.
+
+    Copies the template as raw text so that comments are preserved.
 
     Args:
         destination: Path to write the config file.
         pipeline_id: Pipeline ID (0 or 1) to set in the template.
+        config_id: Optional config identifier string.
+        created_by: Optional author/creator string.
+        comments: Optional comments string.
     """
+    import re
+    from datetime import date
+
     template_src = get_template_config_path()
 
     with open(template_src, 'r') as f:
-        config = yaml.safe_load(f)
+        text = f.read()
 
-    if 'rfsoc_host' in config:
-        config['rfsoc_host']['request_port'] = 10000 + pipeline_id
-        config['rfsoc_host']['stream_port'] = 20000 + pipeline_id
-    if 'firmware' in config:
-        config['firmware']['pipeline_id'] = pipeline_id
-        if pipeline_id == 1:
-            config['firmware']['dac0_tile'] = 1
-            config['firmware']['dac1_tile'] = 1
-            config['firmware']['adc_tile'] = 3
-        if 'defaults' in config['firmware']:
-            config['firmware']['defaults']['sync_delay'] = 5714
+    # Update creation date to today
+    text = re.sub(
+        r'(creation_date:\s*)"[^"]*"',
+        rf'\1"{date.today().isoformat()}"',
+        text,
+    )
+
+    # Optional metadata overrides
+    if config_id is not None:
+        text = re.sub(
+            r'(config_id:\s*)"[^"]*"',
+            rf'\1"{config_id}"',
+            text,
+        )
+    if created_by is not None:
+        text = re.sub(
+            r'(created_by:\s*)"[^"]*"',
+            rf'\1"{created_by}"',
+            text,
+        )
+    if comments is not None:
+        text = re.sub(
+            r'(  comments:\s*)"[^"]*"',
+            rf'\1"{comments}"',
+            text,
+            count=1,
+        )
+
+    # Pipeline-specific fields
+    text = re.sub(
+        r'(pipeline_id:\s*)0',
+        rf'\g<1>{pipeline_id}',
+        text,
+    )
+    text = re.sub(
+        r'(request_port:\s*)10000',
+        rf'\g<1>{10000 + pipeline_id}',
+        text,
+    )
+    text = re.sub(
+        r'(stream_port:\s*)20000',
+        rf'\g<1>{20000 + pipeline_id}',
+        text,
+    )
+
+    # RFDC tile/block mapping for pipeline 1
+    if pipeline_id == 1:
+        text = re.sub(r'(dac0_tile:\s*)0', r'\g<1>1', text)
+        text = re.sub(r'(dac1_tile:\s*)0', r'\g<1>1', text)
+        text = re.sub(r'(adc_tile:\s*)2', r'\g<1>3', text)
 
     with open(destination, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        f.write(text)
 
     print(f'Template config written to {destination}')
     print(f'Edit this file with your system-specific settings before use.')
@@ -606,17 +654,17 @@ class ReadoutClient:
         rf_response = self.get_rf_peripheral_status()
         rf_status = rf_response.get('result', {}) if isinstance(rf_response, dict) else {}
         rf = self.config.setdefault('rf_frontend', {})
-        mm = rf.setdefault('mixerless_module', {})
+        bypass = rf.setdefault('bypass_amps', {})
         if isinstance(rf_status, dict) and rf_status.get('enabled'):
             rf['tx_attenuator_value_db'] = rf_status['tx_attenuation_db']
             rf['rx_attenuator_value_db'] = rf_status['rx_attenuation_db']
-            mm['tx_amp_bypass'] = rf_status['tx_amp_bypass']
-            mm['rx_amp_bypass'] = rf_status['rx_amp_bypass']
+            bypass['tx_amp_bypass'] = rf_status['tx_amp_bypass']
+            bypass['rx_amp_bypass'] = rf_status['rx_amp_bypass']
         else:
             rf['tx_attenuator_value_db'] = None
             rf['rx_attenuator_value_db'] = None
-            mm['tx_amp_bypass'] = None
-            mm['rx_amp_bypass'] = None
+            bypass['tx_amp_bypass'] = None
+            bypass['rx_amp_bypass'] = None
 
         n_changed = sum(1 for k in DIRECT_MAPS.values() if k in defaults)
         print(f'Config defaults updated from live system state '
@@ -634,8 +682,9 @@ class ReadoutClient:
             print(f"Error setting parameter {param_name}: {response['message']}")
             return response
 
-    def get_parameter(self, param_name):
+    def get_parameter(self, param_name, **kwargs):
         message = {'request': 'get', 'param': param_name}
+        message.update(kwargs)
         response = self.send_request(message)
         if response['status'] == 'success':
             return response['value']
@@ -675,13 +724,29 @@ class ReadoutClient:
 
     def set_tone_powers(self, tone_powers_dbm):
         tone_powers_dbm = np.atleast_1d(tone_powers_dbm).tolist()
-        return self.set_parameter('tone_powers',tone_powers_dbm)
+        response = self.set_parameter('tone_powers', tone_powers_dbm)
+        if isinstance(response, dict) and response.get('result'):
+            r = response['result']
+            for w in r.get('warnings', []):
+                print(f'  WARNING: {w}')
+        return response
 
-    def get_tone_powers(self,detailed_output=False):
+    def get_tone_powers(self,detailed_output=False,reference_plane='detector'):
         if detailed_output:
-            return self.get_parameter('tone_powers_detailed')
+            return self.get_parameter('tone_powers_detailed', reference_plane=reference_plane)
         else:
-            return np.atleast_1d(self.get_parameter('tone_powers'))
+            return np.atleast_1d(self.get_parameter('tone_powers', reference_plane=reference_plane))
+
+    def get_rx_tone_powers(self, reference_plane='adc_input'):
+        """Estimate received tone powers from accumulated IQ data.
+
+        reference_plane: 'accumulator', 'adc_input' (default), or 'cryostat_output'
+        """
+        response = self.send_request({'request': 'get_rx_tone_powers',
+                                       'reference_plane': reference_plane})
+        if isinstance(response, dict) and 'powers' in response:
+            return np.atleast_1d(response['powers'])
+        return response
 
     def check_input_saturation(self,iterations=10):
         message = {'request': 'check_input_saturation','iterations':iterations}
@@ -697,11 +762,11 @@ class ReadoutClient:
     
     # TODO: Add option to save the resulting parameters to the config file after
     #       maximise/optimise/fix operations (requires save_config, see push_config TODO).
-    def maximise_tx_power(self):
-        return self.send_request({'request': 'maximise_tx_power'})
+    def maximise_tx_power(self, headroom_db=2.0):
+        return self.send_request({'request': 'maximise_tx_power', 'headroom_db': headroom_db})
 
-    def maximise_rx_power(self):
-        return self.send_request({'request': 'maximise_rx_power'})
+    def maximise_rx_power(self, headroom_db=2.0):
+        return self.send_request({'request': 'maximise_rx_power', 'headroom_db': headroom_db})
 
     def optimise_tx_snr(self):
         return self.send_request({'request': 'optimise_tx_snr'})
@@ -743,6 +808,71 @@ class ReadoutClient:
 
     def get_rx_amp_bypass(self):
         return self.send_request({'request': 'get_rx_amp_bypass'})
+
+    # --- LNA bias control ---
+
+    def get_lna_controller_status(self):
+        """Get LNA bias controller status (enabled, hardware, lna_channel)."""
+        return self.send_request({'request': 'get_lna_controller_status'})
+
+    def get_lna_bias_status(self, channel=None):
+        """Read LNA bias voltage and current for a single channel.
+
+        Args:
+            channel: LNA channel index (1-14). Defaults to this pipeline's configured channel.
+
+        Returns:
+            dict with remote_voltage_v, local_voltage_v, bias_current_a.
+        """
+        msg = {'request': 'get_lna_bias_status'}
+        if channel is not None:
+            msg['channel'] = int(channel)
+        return self.send_request(msg)
+
+    def get_lna_bias_status_all(self):
+        """Read LNA bias voltage and current for all 14 channels."""
+        return self.send_request({'request': 'get_lna_bias_status_all'})
+
+    def set_lna_bias_voltage(self, voltage_v, channel=None,
+                             method='remote', blind=False):
+        """Set LNA bias voltage.
+
+        Args:
+            voltage_v: Target voltage in volts.
+            channel: LNA channel index (1-14). Defaults to this pipeline's configured channel.
+            method: 'remote' (iterative feedback, default) or 'local' (direct DAC).
+            blind: If True and method='remote', skip LNA voltage validation.
+
+        Returns:
+            dict with achieved voltage and any error message.
+        """
+        msg = {
+            'request': 'set_lna_bias_voltage',
+            'voltage_v': float(voltage_v),
+            'method': method,
+            'blind': blind,
+        }
+        if channel is not None:
+            msg['channel'] = int(channel)
+        return self.send_request(msg)
+
+    def set_lna_bias_voltage_all(self, voltage_v, method='remote', blind=False):
+        """Set LNA bias voltage for all 14 channels.
+
+        Args:
+            voltage_v: Target voltage in volts.
+            method: 'remote' (default) or 'local'.
+            blind: If True and method='remote', skip LNA voltage validation.
+
+        Returns:
+            dict of per-channel results keyed by channel index.
+        """
+        return self.send_request({
+            'request': 'set_lna_bias_voltage_all',
+            'voltage_v': float(voltage_v),
+            'method': method,
+            'blind': blind,
+        })
 
     def enable_stream(self):
         message = {'request': 'enable_stream'}
@@ -1158,6 +1288,186 @@ class ReadoutClient:
         plot_batch_snapshots(batch_data, format='iq_vs_t',
                              repetitions='mean', psd=True)
         plt.show()
+
+    # -- ADC / DAC snapshots --
+
+    def get_adc_snapshot(self):
+        """
+        Capture a single ADC snapshot (4096 complex128 samples).
+
+        Returns:
+            dict with keys:
+                'snapshot': complex128 array of shape (4096,).
+                'system_information': System info at time of capture.
+        """
+        response = self.send_request({'request': 'get_adc_snapshot'})
+        if response['status'] != 'success':
+            raise RuntimeError(f"ADC snapshot failed: {response.get('message')}")
+        result = response['result']
+        snapshot = np.frombuffer(
+            base64.b64decode(result['snapshot']), dtype=np.complex128,
+        ).copy()
+        info = self.get_system_information()
+        return {
+            'snapshot': snapshot,
+            'system_information': info,
+            'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
+        }
+
+    def get_dac_snapshot(self):
+        """
+        Capture a single DAC snapshot (4096 complex128 samples per DAC).
+
+        Returns:
+            dict with keys:
+                'dac0': complex128 array of shape (4096,).
+                'dac1': complex128 array of shape (4096,).
+                'system_information': System info at time of capture.
+        """
+        response = self.send_request({'request': 'get_dac_snapshot'})
+        if response['status'] != 'success':
+            raise RuntimeError(f"DAC snapshot failed: {response.get('message')}")
+        result = response['result']
+        dac0 = np.frombuffer(
+            base64.b64decode(result['dac0']), dtype=np.complex128,
+        ).copy()
+        dac1 = np.frombuffer(
+            base64.b64decode(result['dac1']), dtype=np.complex128,
+        ).copy()
+        info = self.get_system_information()
+        return {
+            'dac0': dac0,
+            'dac1': dac1,
+            'system_information': info,
+            'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
+        }
+
+    @staticmethod
+    def parse_adc_snapshot(snapshot_data):
+        """
+        Parse raw ADC snapshot data into a results dictionary.
+
+        Args:
+            snapshot_data: dict from get_adc_snapshot().
+
+        Returns:
+            dict with 'adc_i', 'adc_q', 'adc_amplitude', 'adc_phase',
+                 'length', and metadata.
+        """
+        snapshot = snapshot_data['snapshot']
+        return {
+            'date': snapshot_data.get('date', ''),
+            'system_information': snapshot_data.get('system_information', {}),
+            'length': len(snapshot),
+            'adc_i': snapshot.real,
+            'adc_q': snapshot.imag,
+            'adc_amplitude': np.abs(snapshot),
+            'adc_phase': np.angle(snapshot),
+        }
+
+    @staticmethod
+    def parse_dac_snapshot(snapshot_data):
+        """
+        Parse raw DAC snapshot data into a results dictionary.
+
+        Args:
+            snapshot_data: dict from get_dac_snapshot().
+
+        Returns:
+            dict with 'dac0_i', 'dac0_q', 'dac1_i', 'dac1_q', amplitudes,
+                 phases, 'length', and metadata.
+        """
+        dac0 = snapshot_data['dac0']
+        dac1 = snapshot_data['dac1']
+        return {
+            'date': snapshot_data.get('date', ''),
+            'system_information': snapshot_data.get('system_information', {}),
+            'length': len(dac0),
+            'dac0_i': dac0.real,
+            'dac0_q': dac0.imag,
+            'dac0_amplitude': np.abs(dac0),
+            'dac0_phase': np.angle(dac0),
+            'dac1_i': dac1.real,
+            'dac1_q': dac1.imag,
+            'dac1_amplitude': np.abs(dac1),
+            'dac1_phase': np.angle(dac1),
+        }
+
+    @staticmethod
+    def export_adc_snapshot(filename, snapshot_data, file_format='npy'):
+        """
+        Export ADC snapshot data to file.
+
+        Args:
+            filename: Output file path.
+            snapshot_data: dict from get_adc_snapshot() or parse_adc_snapshot().
+            file_format: 'npy' (default) or 'json'.
+        """
+        if 'adc_i' not in snapshot_data:
+            data_dict = ReadoutClient.parse_adc_snapshot(snapshot_data)
+        else:
+            data_dict = snapshot_data
+
+        dirpath = os.path.dirname(filename)
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath)
+
+        if file_format == 'npy':
+            np.save(filename.replace('.npy', '') + '.npy', data_dict)
+        elif file_format == 'json':
+            json_dict = {}
+            for key, value in data_dict.items():
+                if isinstance(value, np.ndarray):
+                    json_dict[key] = value.tolist()
+                elif isinstance(value, dict):
+                    json_dict[key] = {
+                        k: v.tolist() if isinstance(v, np.ndarray) else v
+                        for k, v in value.items()
+                    }
+                else:
+                    json_dict[key] = value
+            with open(filename.replace('.json', '') + '.json', 'w') as f:
+                json.dump(json_dict, f, indent=4)
+        else:
+            raise ValueError(f"Unsupported file_format '{file_format}'. Use 'npy' or 'json'.")
+
+    @staticmethod
+    def export_dac_snapshot(filename, snapshot_data, file_format='npy'):
+        """
+        Export DAC snapshot data to file.
+
+        Args:
+            filename: Output file path.
+            snapshot_data: dict from get_dac_snapshot() or parse_dac_snapshot().
+            file_format: 'npy' (default) or 'json'.
+        """
+        if 'dac0_i' not in snapshot_data:
+            data_dict = ReadoutClient.parse_dac_snapshot(snapshot_data)
+        else:
+            data_dict = snapshot_data
+
+        dirpath = os.path.dirname(filename)
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath)
+
+        if file_format == 'npy':
+            np.save(filename.replace('.npy', '') + '.npy', data_dict)
+        elif file_format == 'json':
+            json_dict = {}
+            for key, value in data_dict.items():
+                if isinstance(value, np.ndarray):
+                    json_dict[key] = value.tolist()
+                elif isinstance(value, dict):
+                    json_dict[key] = {
+                        k: v.tolist() if isinstance(v, np.ndarray) else v
+                        for k, v in value.items()
+                    }
+                else:
+                    json_dict[key] = value
+            with open(filename.replace('.json', '') + '.json', 'w') as f:
+                json.dump(json_dict, f, indent=4)
+        else:
+            raise ValueError(f"Unsupported file_format '{file_format}'. Use 'npy' or 'json'.")
 
     def perform_sweep(self, centers, spans, points, samples_per_point,direction='up'):
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
@@ -1867,10 +2177,12 @@ class ReadoutClient:
         If the frequency spacing is not exactly equal, the phases are offset to account for the spacing. For largely varying spacings, this method is pretty much the same as picking random frequencies.
 
         """
-        n=len(freqs)
         freqs=np.atleast_1d(freqs)
+        n=len(freqs)
+        if n == 1:
+            return np.zeros(1)
         freqssorted = np.sort(freqs)
-        k = (freqs-freqssorted[0]) / (freqssorted[-1] - freqssorted[0])*(len(freqs)-1)
+        k = (freqs-freqssorted[0]) / (freqssorted[-1] - freqssorted[0])*(n-1)
         #k should range from 0 to n-1, and elements are proportional to the frequencies
         return np.pi*k**2/n
 
@@ -1979,33 +2291,39 @@ class ReadoutClient:
     # TODO: Add a tone_powers parameter to wideband_sweep to allow specifying
     #       power levels across the band (e.g. per-tone or per-band).
     def wideband_sweep(self, bandwidth_hz=None, center_freq_hz=None, step_size_hz=10000,
-                       num_tones=1024, samples_per_point=10, apply_phase_correction=False,
+                       num_tones=1024, samples_per_point=10, tone_powers_dbm=None,
+                       apply_phase_correction=False,
                        remove_phase_slope=True, verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
 
         This method configures tones across the bandwidth, performs a sweep, and returns
         the concatenated sweep data covering the full requested bandwidth.
-        
+
         Args:
             bandwidth_hz (float): Total bandwidth to measure. Default is full available bandwidth.
             center_freq_hz (float): Center frequency of the sweep. Default is band center.
-            step_size_hz (float): Step size of the sweep in Hz. Number of sweep steps = 
+            step_size_hz (float): Step size of the sweep in Hz. Number of sweep steps =
                                   bandwidth / step_size / num_tones. Default is 10000.
-            num_tones (int): Number of tones to use in the sweep. More tones = fewer sweep 
+            num_tones (int): Number of tones to use in the sweep. More tones = fewer sweep
                              steps but wider spacing. Default is 1024.
             samples_per_point (int): Number of samples to integrate per sweep point. Default is 10.
+            tone_powers_dbm (float or array-like, optional): Per-tone output power in dBm.
+                If 'auto', calls maximise_tx_power() to optimise the dynamic range before
+                setting tones, then uses the resulting power level. If a scalar, all tones
+                are set to that power. If an array, must match num_tones. Default is None
+                (uses unit amplitudes).
             apply_phase_correction (bool): DEPRECATED. Correct for phase jumps at filterbank
                                            channel edges. Default is False. This correction is
                                            no longer needed following firmware fixes.
             remove_phase_slope (bool): Remove linear phase slope from the sweep data.
                                        Default is True.
             verbose (bool): Print progress information. Default is True.
-        
+
         Returns:
             dict: Sweep data dictionary with keys:
                 - 'sweep_f': Array of frequencies [1, N_total_points]
-                - 'sweep_i': Array of I values [1, N_total_points]  
+                - 'sweep_i': Array of I values [1, N_total_points]
                 - 'sweep_q': Array of Q values [1, N_total_points]
                 - 'sweep_ei': Array of I errors [1, N_total_points]
                 - 'sweep_eq': Array of Q errors [1, N_total_points]
@@ -2013,7 +2331,7 @@ class ReadoutClient:
                 - 'samples_per_point': Samples per point
                 - 'system_information': System info at time of sweep
                 - Plus other metadata from parse_sweep_data
-        
+
         Raises:
             RuntimeError: If a sweep is already in progress, saturation detected, or sweep fails.
             ValueError: If requested bandwidth is out of range or tone spacing is too small.
@@ -2087,7 +2405,6 @@ class ReadoutClient:
         freqs += small_offsets
         center_freqs = freqs + np.floor(sweep_points / 2) * spacings / sweep_points
         
-        tone_amplitudes = np.ones(num_tones)
         tone_phases = self.generate_newman_phases(center_freqs)
 
         if verbose:
@@ -2099,18 +2416,46 @@ class ReadoutClient:
 
         # Configure tones
         self.set_tone_frequencies(center_freqs)
-        self.set_tone_amplitudes(tone_amplitudes)
         self.set_tone_phases(tone_phases)
+
+        if tone_powers_dbm == 'auto':
+            # Optimise dynamic range: set unit amplitudes first, then maximise
+            self.set_tone_amplitudes(np.ones(num_tones))
+            result = self.maximise_tx_power()
+            if verbose:
+                print(f'  Auto TX power: maximise_tx_power() -> {result}')
+        elif tone_powers_dbm is not None:
+            self.set_tone_powers(np.broadcast_to(
+                np.atleast_1d(tone_powers_dbm), num_tones,
+            ))
+        else:
+            self.set_tone_amplitudes(np.ones(num_tones))
 
         # Check for saturation/overflow before sweeping
         outps = self.check_output_saturation()
         inps = self.check_input_saturation()
         dspof = self.check_dsp_overflow()
-        
+
         if outps['result']:
-            raise RuntimeError(f"Output saturation detected: {outps['details']}")
+            if tone_powers_dbm == 'auto':
+                if verbose:
+                    print(f'  Output saturation detected after maximise — running fix_dac_saturation()')
+                self.fix_dac_saturation()
+                outps = self.check_output_saturation()
+                if outps['result']:
+                    raise RuntimeError(f"Output saturation persists after fix: {outps['details']}")
+            else:
+                raise RuntimeError(f"Output saturation detected: {outps['details']}")
         if inps['result']:
-            raise RuntimeError(f"Input saturation detected: {inps['details']}")
+            if tone_powers_dbm == 'auto':
+                if verbose:
+                    print(f'  Input saturation detected after maximise — running fix_adc_saturation()')
+                self.fix_adc_saturation()
+                inps = self.check_input_saturation()
+                if inps['result']:
+                    raise RuntimeError(f"Input saturation persists after fix: {inps['details']}")
+            else:
+                raise RuntimeError(f"Input saturation detected: {inps['details']}")
         if dspof['result']:
             raise RuntimeError(f"DSP overflow detected: {dspof['details']}")
 
