@@ -22,7 +22,7 @@ Installation is conditional and comes from `setup.py`:
 
 - On Xilinx platforms, the package installs server components.
 - On non-Xilinx platforms, the package installs client components.
-- `INSTALL_SERVER=true` or `INSTALL_CLIENT=true` can be used to override auto-detection.
+- `INSTALL_SERVER=true` and/or `INSTALL_CLIENT=true` can be used to override auto-detection (both can be enabled simultaneously).
 - `requirements.txt` is not the full dependency list.
 
 ```python
@@ -132,9 +132,9 @@ The installer auto-detects the platform:
 - **Xilinx/RFSoC kernel**: Installs server components
 - **Everything else**: Installs client components
 
-Override with environment variables: `INSTALL_SERVER=true` or `INSTALL_CLIENT=true`.
+Override with environment variables: `INSTALL_SERVER=true` and/or `INSTALL_CLIENT=true` (both can be enabled simultaneously, e.g. for client+server on the RFSoC).
 
-Dependencies: numpy, scipy, matplotlib, pyyaml, ipython. Client additionally requires PyQt5. Server requires `souk_mkid_readout` from the [souk-firmware](https://github.com/realtimeradio/souk-firmware) repository.
+Dependencies: numpy, scipy, matplotlib, pyyaml, ipython. Client additionally requires PyQt5 (skipped automatically on Xilinx/headless platforms). Server requires `souk_mkid_readout` from the [souk-firmware](https://github.com/realtimeradio/souk-firmware) repository.
 
 The server package currently expects `souk_mkid_readout` to be available on the RFSoC from:
 

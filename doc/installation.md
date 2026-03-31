@@ -323,10 +323,9 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 pip install .
 ```
 
-The installer auto-detects the platform and decides which components to install. On the RFSoC, to install the client alongside the server (e.g. for scripted measurements directly on the board), run these one at a time:
+The installer auto-detects the platform and decides which components to install. On the RFSoC, to install the client alongside the server (e.g. for scripted measurements directly on the board):
 ```bash
-INSTALL_SERVER=true  pip install .
-INSTALL_CLIENT=true  pip install .
+INSTALL_SERVER=true INSTALL_CLIENT=true pip install .
 ```
 
 The GUI dependencies (PyQt5) are skipped automatically on the Xilinx platform since it is headless. Matplotlib is a common dependency (used by both server and client) and will fall back to the non-interactive `Agg` backend when no display is available.

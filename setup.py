@@ -14,15 +14,10 @@ install_server_env = os.environ.get('INSTALL_SERVER', '').lower() == 'true'
 install_client_env = os.environ.get('INSTALL_CLIENT', '').lower() == 'true'
 
 # Determine what to install
-if install_server_env and install_client_env:
-    print("Error: Cannot force both server and client installation via environment variables.")
-    sys.exit(1)
-elif install_server_env:
-    install_server = True
-    install_client = False
-elif install_client_env:
-    install_client = True
-    install_server = False
+if install_server_env or install_client_env:
+    # Use explicit env vars — both can be enabled simultaneously
+    install_server = install_server_env
+    install_client = install_client_env
 else:
     # Automatic detection
     if is_xilinx_platform():
