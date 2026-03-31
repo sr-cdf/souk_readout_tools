@@ -665,9 +665,14 @@ def get_system_information(r,config_dict):
     rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
     info['rts_events'] = rts_details
 
-    info['tone_frequencies'] = get_tone_frequencies(r,config_dict).tolist()
-    info['tone_amplitudes'] = get_tone_amplitudes(r,config_dict).tolist()
-    info['tone_phases'] = get_tone_phases(r,config_dict).tolist()
+    if firmware_blocks_ready:
+        info['tone_frequencies'] = get_tone_frequencies(r,config_dict).tolist()
+        info['tone_amplitudes'] = get_tone_amplitudes(r,config_dict).tolist()
+        info['tone_phases'] = get_tone_phases(r,config_dict).tolist()
+    else:
+        info['tone_frequencies'] = None
+        info['tone_amplitudes'] = None
+        info['tone_phases'] = None
     print('system information:')
     for key, value in info.items():
         print(f'{key}: {value}\n')
