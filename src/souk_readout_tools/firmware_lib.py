@@ -649,6 +649,7 @@ def get_system_information(r,config_dict):
         info['mixer_qmc_settings_dac0'] = r.rfdc.core.get_qmc_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)
         info['mixer_qmc_settings_dac1'] = r.rfdc.core.get_qmc_settings(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE)
         info['mixer_qmc_settings_adc'] = r.rfdc.core.get_qmc_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)
+        info['adc_cal_frozen'] = get_cal_freeze(r,config_dict)
     else:
         info['dsa'] = 0
         info['vop_dac0'] = 0
@@ -664,6 +665,7 @@ def get_system_information(r,config_dict):
         info['mixer_qmc_settings_dac0'] = None
         info['mixer_qmc_settings_dac1'] = None
         info['mixer_qmc_settings_adc'] = None
+        info['adc_cal_frozen'] = None
         print(bcolors.FAIL+'CRITICAL WARNING - RFDC settings not found, check that the DAC and ADC tiles/blocks are set correctly in the config to match the firmware'+bcolors.ENDC)
         print('Continuing regardless but the system will not work.')
 

@@ -842,7 +842,9 @@ class ReadoutServer:
             'firmware_shared_resources_ready': shared_ready,
             'firmware_pipeline_resources_ready': pipeline_ready,
             'system_information': self.get_system_information(),
-            'latest_sweep_data_valid': self.latest_sweep_data_valid
+            'latest_sweep_data_valid': self.latest_sweep_data_valid,
+            'rf_frontend': self.rf_peripherals.get_status() if getattr(self, 'rf_peripherals', None) else {'enabled': False},
+            'lna_bias': self.lna_controller.get_status() if getattr(self, 'lna_controller', None) else {'enabled': False},
         }
         return status
     
