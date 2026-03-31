@@ -593,25 +593,30 @@ def get_system_information(r,config_dict):
 
     # Determine initialisation level from attribute availability
     # (the needs_*() checks are done by the caller / get_server_status)
-    firmware_blocks_ready = hasattr(r, 'output')
-    pipeline_blocks_ready = hasattr(r, 'accumulators') and len(r.accumulators) > 0
-    if pipeline_blocks_ready:
+    # Shared blocks: common, adc_snapshot, dac_snapshot, zoomfft, zoomacc, gen_cordic, gen_lut, autocorr
+    # Pipeline blocks: sync, input, pfb, pfbtvg, chanselect, mixer, psb_chanselect, psb, psbscale, accumulator0, accumulator1, output, out_delay
+    programmed = r.fpga.is_programmed()
+    shared_ready = programmed and hasattr(r, 'autocorr')
+    pipeline_ready = shared_ready and hasattr(r, 'output') and hasattr(r, 'accumulators') and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0
+    if pipeline_ready:
         info['initialisation_level'] = 'pipeline'
-    elif firmware_blocks_ready:
+    elif shared_ready:
         info['initialisation_level'] = 'shared'
-    elif r.fpga.is_programmed():
+    elif programmed:
         info['initialisation_level'] = 'programmed'
     else:
         info['initialisation_level'] = 'not_programmed'
 
-    # Firmware block parameters require programming + initialisation
-    if firmware_blocks_ready:
+    # Pipeline block parameters (output, sync, input, pfb, psb, psbscale, mixer, accumulators)
+    if pipeline_ready:
         info['output_mode'] = r.output.get_status()[0]['mode']
         info['sync_delay'] = r.sync.get_delay()
         info['internal_loopback'] = r.input.loopback_enabled()
         info['psb_scale'] = r.psbscale.get_scale()
         info['psb_fftshift'] = r.psb.get_fftshift()
         info['pfb_fftshift'] = r.pfb.get_fftshift()
+        info['acc_len'] = r.accumulators[0].get_acc_len()
+        info['acc_freq'] = get_sample_rate(r)
     else:
         info['output_mode'] = None
         info['sync_delay'] = None
@@ -619,13 +624,6 @@ def get_system_information(r,config_dict):
         info['psb_scale'] = None
         info['psb_fftshift'] = None
         info['pfb_fftshift'] = None
-
-    # Pipeline parameters require pipeline initialisation
-    if hasattr(r, 'accumulators') and len(r.accumulators) > 0:
-        acc_len = r.accumulators[0].get_acc_len()
-        info['acc_len'] = acc_len
-        info['acc_freq'] = get_sample_rate(r) if acc_len > 0 else None
-    else:
         info['acc_len'] = None
         info['acc_freq'] = None
 
@@ -673,7 +671,7 @@ def get_system_information(r,config_dict):
     rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
     info['rts_events'] = rts_details
 
-    if firmware_blocks_ready:
+    if pipeline_ready:
         info['tone_frequencies'] = get_tone_frequencies(r,config_dict).tolist()
         info['tone_amplitudes'] = get_tone_amplitudes(r,config_dict).tolist()
         info['tone_phases'] = get_tone_phases(r,config_dict).tolist()
