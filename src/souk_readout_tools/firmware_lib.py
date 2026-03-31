@@ -581,15 +581,10 @@ def get_system_information(r,config_dict):
     except (NameError, AttributeError):
         info['souk_mkid_readout_fw_version'] = None
 
-    # Git repository commit hashes (source repos on the RFSoC)
-    info['souk_readout_tools_git'] = _get_git_commit('/home/casper/souk_readout_tools')
-    info['souk_firmware_git'] = _get_git_commit('/home/casper/souk-firmware')
-
-    # RF peripherals submodule
-    peripherals_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   'server', 'souk-peripherals-control')
-    if os.path.isdir(peripherals_dir):
-        info['souk_peripherals_git'] = _get_git_commit(peripherals_dir)
+    # Git repository commit IDs (source repos on the RFSoC)
+    info['souk_readout_tools_commit'] = _get_git_commit('/home/casper/souk_readout_tools')
+    info['souk_firmware_commit'] = _get_git_commit('/home/casper/souk-firmware')
+    info['souk_peripherals_commit'] = _get_git_commit('/home/casper/souk_readout_tools/src/souk_readout_tools/server/souk-peripherals-control')
 
     info['fpga_status'] = r.fpga.get_status()[0]
     info['fpg_file'] = r.fpgfile
