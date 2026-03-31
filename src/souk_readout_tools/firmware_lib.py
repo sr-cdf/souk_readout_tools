@@ -622,8 +622,9 @@ def get_system_information(r,config_dict):
 
     # Pipeline parameters require pipeline initialisation
     if hasattr(r, 'accumulators') and len(r.accumulators) > 0:
-        info['acc_len'] = r.accumulators[0].get_acc_len()
-        info['acc_freq'] = get_sample_rate(r)
+        acc_len = r.accumulators[0].get_acc_len()
+        info['acc_len'] = acc_len
+        info['acc_freq'] = get_sample_rate(r) if acc_len > 0 else None
     else:
         info['acc_len'] = None
         info['acc_freq'] = None
