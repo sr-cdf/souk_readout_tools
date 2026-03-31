@@ -41,8 +41,8 @@ install_requires = [
     'scipy',
 ]
 
-# Define client-specific dependencies
-client_dependencies = [
+# Define GUI dependencies (optional, not available on headless systems)
+gui_dependencies = [
     'pyqt5',
 ]
 
@@ -54,7 +54,8 @@ server_dependencies = [
 
 # Conditionally add client or server dependencies
 if install_client:
-    install_requires.extend(client_dependencies)
+    if not is_xilinx_platform():
+        install_requires.extend(gui_dependencies)
 
 if install_server:
     install_requires.extend(server_dependencies)

@@ -165,7 +165,7 @@ def _copy_template_configs(dirs, pipeline_id):
 
         print(f"  Created {template_dst}")
         print(f"  Created {default_lnk_dst} -> {template_dst}")
-        print(f"{bcolors.WARNING}Note: Please edit {template_dst} with your system-specific settings.{bcolors.ENDC}")
+        print(f"Note: Use copy_template_config() to create a named config from this template, then edit it with your system-specific settings.")
 
     except Exception as e:
         print(f"{bcolors.FAIL}Warning: Could not copy template config files: {e}{bcolors.ENDC}")

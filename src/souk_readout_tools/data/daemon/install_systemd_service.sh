@@ -43,7 +43,8 @@ for PID in "${PIPELINES[@]}"; do
 
     if [[ ! -f "$SERVICE_FILE_SRC" ]]; then
         echo "Error: Service file '$SERVICE_FILE_SRC' does not exist."
-        echo "Run the readout server once for pipeline ${PID} to generate it."
+        echo "Run 'ensure_pipeline_dirs(${PID})' to generate it, e.g.:"
+        echo "  python -c \"from souk_readout_tools.server.readout_server import ensure_pipeline_dirs; ensure_pipeline_dirs(${PID})\""
         exit 1
     fi
 
