@@ -583,21 +583,51 @@ def get_system_information(r,config_dict):
     info['fpg_file'] = r.fpgfile
     info['pipeline_id'] = r.pipeline_id
     info['adc_clk_hz'] = r.adc_clk_hz
-    info['output_mode'] = r.output.get_status()[0]['mode']
-    info['sync_delay'] = r.sync.get_delay()
-    info['acc_len'] = r.accumulators[0].get_acc_len()
-    info['acc_freq'] = get_sample_rate(r)
-    info['internal_loopback'] = r.input.loopback_enabled()
-    info['psb_scale'] = r.psbscale.get_scale()
-    info['psb_fftshift'] = r.psb.get_fftshift()
-    info['pfb_fftshift'] = r.pfb.get_fftshift()
+
+    # Determine initialisation level from attribute availability
+    # (the needs_*() checks are done by the caller / get_server_status)
+    firmware_blocks_ready = hasattr(r, 'output')
+    pipeline_blocks_ready = hasattr(r, 'accumulators') and len(r.accumulators) > 0
+    if pipeline_blocks_ready:
+        info['initialisation_level'] = 'pipeline'
+    elif firmware_blocks_ready:
+        info['initialisation_level'] = 'shared'
+    elif r.fpga.is_programmed():
+        info['initialisation_level'] = 'programmed'
+    else:
+        info['initialisation_level'] = 'not_programmed'
+
+    # Firmware block parameters require programming + initialisation
+    if firmware_blocks_ready:
+        info['output_mode'] = r.output.get_status()[0]['mode']
+        info['sync_delay'] = r.sync.get_delay()
+        info['internal_loopback'] = r.input.loopback_enabled()
+        info['psb_scale'] = r.psbscale.get_scale()
+        info['psb_fftshift'] = r.psb.get_fftshift()
+        info['pfb_fftshift'] = r.pfb.get_fftshift()
+    else:
+        info['output_mode'] = None
+        info['sync_delay'] = None
+        info['internal_loopback'] = None
+        info['psb_scale'] = None
+        info['psb_fftshift'] = None
+        info['pfb_fftshift'] = None
+
+    # Pipeline parameters require pipeline initialisation
+    if hasattr(r, 'accumulators') and len(r.accumulators) > 0:
+        info['acc_len'] = r.accumulators[0].get_acc_len()
+        info['acc_freq'] = get_sample_rate(r)
+    else:
+        info['acc_len'] = None
+        info['acc_freq'] = None
 
     #rfdc info will be missing keys if the dac and adc tiles/blocks are not set to match those in the firmware
     #lets check we can read dsa on the adc and vop on each dac before trying to read them
 
-    correct_adc = r.rfdc.core.get_dsa(adc_tile,adc_block).get('dsa',None) is not None
-    correct_dac0 = r.rfdc.core.get_output_current(dac0_tile,dac0_block).get('current',None) is not None
-    correct_dac1 = r.rfdc.core.get_output_current(dac1_tile,dac1_block).get('current',None) is not None
+    has_rfdc = hasattr(r, 'rfdc')
+    correct_adc = has_rfdc and r.rfdc.core.get_dsa(adc_tile,adc_block).get('dsa',None) is not None
+    correct_dac0 = has_rfdc and r.rfdc.core.get_output_current(dac0_tile,dac0_block).get('current',None) is not None
+    correct_dac1 = has_rfdc and r.rfdc.core.get_output_current(dac1_tile,dac1_block).get('current',None) is not None
     if correct_adc and correct_dac0 and correct_dac1:
         info['dsa'] = r.rfdc.core.get_dsa(adc_tile,adc_block)['dsa']
         info['vop_dac0'] = r.rfdc.core.get_output_current(dac0_tile,dac0_block)['current']

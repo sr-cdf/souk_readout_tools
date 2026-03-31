@@ -810,6 +810,10 @@ class ReadoutServer:
         This function is called when a client sends a 'server_status' request.
         """
 
+        programmed = not firmware_lib.needs_programming(self.r,self.config)
+        shared_ready = not firmware_lib.needs_shared_resource_initialising(self.r,self.config)
+        pipeline_ready = not firmware_lib.needs_pipeline_initialising(self.r,self.config)
+
         status = {
             'process_name': self.process_name,
             'ip_addresses': self.ip_addresses,
@@ -834,9 +838,9 @@ class ReadoutServer:
             'tasks': len(self.tasks),
             'firmware_interface_exists': bool(self.r),
             'firmware_fast_interface_exists': bool(self.r_fast),
-            'firmware_programmed': not firmware_lib.needs_programming(self.r,self.config),
-            'firmware_shared_resources_ready': not firmware_lib.needs_shared_resource_initialising(self.r,self.config),
-            'firmware_pipeline_resources_ready': not firmware_lib.needs_pipeline_initialising(self.r,self.config),
+            'firmware_programmed': programmed,
+            'firmware_shared_resources_ready': shared_ready,
+            'firmware_pipeline_resources_ready': pipeline_ready,
             'system_information': self.get_system_information(),
             'latest_sweep_data_valid': self.latest_sweep_data_valid
         }

@@ -323,31 +323,35 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 pip install .
 ```
 
-The installer auto-detects the platform and decides which components to install. On the RFSoC, to install the client alongside the server (e.g. for scripted measurements directly on the board):
+This is all most users need — the installer auto-detects the platform and installs the client components.
+
+**Advanced: client on the RFSoC.** If you need the client library directly on the RFSoC (e.g. for scripted measurements on the board), you can install both components in a single command:
 ```bash
 INSTALL_SERVER=true INSTALL_CLIENT=true pip install .
 ```
-
-The GUI dependencies (PyQt5) are skipped automatically on the Xilinx platform since it is headless. Matplotlib is a common dependency (used by both server and client) and will fall back to the non-interactive `Agg` backend when no display is available.
+The GUI dependencies (PyQt5) are skipped automatically on the Xilinx platform since it is headless. Matplotlib will fall back to the non-interactive `Agg` backend when no display is available.
 
 ### 5. Config Setup
 
-There is no hidden directory on the client side. Config files live wherever you choose — keep them with your project or measurement data. The standard workflow is to maintain a local config file, connect with it, and push changes to the RFSoC.
+Config files live wherever you choose — keep them with your project or measurement data. The standard workflow is to maintain a local config file, connect with it, and push/pull changes to/from the firmware pipeline on the RFSoC.
 
 **Option A: Create a config from the template (standard)**
 
-Generate a config from the bundled template, then edit it with your hardware-specific settings:
+Generate a config from the bundled template, then edit it with your hardware-specific settings and push it to the server:
 
 ```python
 from souk_readout_tools.config_utils import copy_template_config
 
 # Creates a config file with default settings for pipeline 0
 copy_template_config('my_config.yaml', pipeline_id=0,
-                     config_id='krm4_pipeline0', created_by='sam')
+                     config_id='krm4_pipeline0',
+                     created_by='sam',
+                     comments='My custom config')
 
 # Edit my_config.yaml with your system-specific settings, then connect:
 from souk_readout_tools.client.readout_client import ReadoutClient
 client = ReadoutClient(config_file='my_config.yaml')
+client.push_config()
 ```
 
 See [Getting Started — Preparing a Config File](getting_started.md#preparing-a-config-file) for which parameters to set.
