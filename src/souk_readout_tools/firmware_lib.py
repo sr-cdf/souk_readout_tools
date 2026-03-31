@@ -529,12 +529,24 @@ def initialise_pipeline_resources(r,config_dict):
     return
 
 def _get_git_commit(repo_path):
-    """Get the short git commit hash for a repository path, or None."""
+    """Get the short git commit hash and tag (if any) for a repository path, or None."""
     try:
-        return subprocess.check_output(
-            ['git', 'rev-parse', '--short', 'HEAD'],
-            cwd=repo_path, stderr=subprocess.DEVNULL
+        env = os.environ.copy()
+        env['GIT_DIR'] = os.path.join(repo_path, '.git')
+        env['GIT_WORK_TREE'] = repo_path
+        git_safe = ['git', '-c', f'safe.directory={repo_path}']
+        commit = subprocess.check_output(
+            git_safe + ['rev-parse', '--short', 'HEAD'],
+            cwd=repo_path, stderr=subprocess.DEVNULL, env=env
         ).decode().strip()
+        try:
+            describe = subprocess.check_output(
+                git_safe + ['describe', '--tags', '--exact-match', 'HEAD'],
+                cwd=repo_path, stderr=subprocess.DEVNULL, env=env
+            ).decode().strip()
+            return f'{describe} ({commit})'
+        except subprocess.CalledProcessError:
+            return commit
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
