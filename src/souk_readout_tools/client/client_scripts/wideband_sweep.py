@@ -223,6 +223,11 @@ def main():
                 tone_powers_dbm = [float(v) for v in args.tone_powers_dbm.split(',')]
             except ValueError:
                 parser.error('--tone_powers_dbm must be "auto", a float, or a comma-separated list of floats.')
+            if len(tone_powers_dbm) != args.num_tones:
+                parser.error(
+                    f'--tone_powers_dbm expects {args.num_tones} values (one per tone) '
+                    f'but got {len(tone_powers_dbm)} when provided as a comma-separated list.'
+                )
         else:
             try:
                 tone_powers_dbm = float(args.tone_powers_dbm)
