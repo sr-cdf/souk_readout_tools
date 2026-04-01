@@ -28,6 +28,7 @@ from souk_readout_tools.client.readout_client import ReadoutClient
 def wideband_sweep(config_file=None, address=None, request_port=None,
                    bandwidth_hz=None, center_freq_hz=None,
                    step_size_hz=10000, num_tones=1024, samples_per_point=10,
+                   tone_powers_dbm=None,
                    ignore_phase_correction=True, remove_phase_slope=True,
                    filename=None, filetype='npy',
                    plot_data=True):
@@ -51,6 +52,11 @@ def wideband_sweep(config_file=None, address=None, request_port=None,
                               bandwidth / step_size / num_tones. Default is 10000.
         num_tones (int): Number of tones to use in the sweep. Default is 1024.
         samples_per_point (int): Number of samples to integrate per sweep point. Default is 10.
+        tone_powers_dbm (float or array-like, optional): Per-tone output power in dBm.
+            If 'auto', calls maximise_tx_power() to optimise the dynamic range before
+            setting tones, then uses the resulting power level. If a scalar, all tones
+            are set to that power. If an array, must match num_tones. Default is None
+            (uses unit amplitudes).
         ignore_phase_correction (bool): DEPRECATED. Phase correction is no longer needed
                                         following firmware fixes. Default is True (no correction).
         filename (str): Filename to save the data to. Default is tmp_wideband_sweep in cwd.
@@ -81,6 +87,7 @@ def wideband_sweep(config_file=None, address=None, request_port=None,
         step_size_hz=step_size_hz,
         num_tones=num_tones,
         samples_per_point=samples_per_point,
+        tone_powers_dbm=tone_powers_dbm,
         apply_phase_correction=not ignore_phase_correction,
         remove_phase_slope=remove_phase_slope,
         verbose=True
@@ -154,6 +161,11 @@ def main():
                         help='Number of tones to use. More tones = fewer sweep steps.')
     parser.add_argument('-S', '--samples_per_point', type=int, default=10,
                         help='Number of samples to integrate per sweep point.')
+    parser.add_argument('--tone_powers_dbm', type=str, default=None,
+                        help='Per-tone output power in dBm. Use "auto" to maximise TX power, '
+                             'a single float to set all tones to that power, or a '
+                             'comma-separated list of floats (one per tone). '
+                             'Default: None (unit amplitudes).')
     parser.add_argument('-i', '--ignore_phase_correction', action='store_true',
                         help='DEPRECATED (no-op). Phase correction is disabled by default '\
                              'following firmware fixes. Kept for backward compatibility.')
@@ -201,6 +213,22 @@ def main():
     # - -i/--ignore_phase_correction is now a no-op (kept for backward compat)
     ignore_correction = not args.apply_phase_correction  # True unless --apply_phase_correction given
 
+    # Parse tone_powers_dbm: 'auto', a single float, or a comma-separated list of floats
+    tone_powers_dbm = None
+    if args.tone_powers_dbm is not None:
+        if args.tone_powers_dbm.strip().lower() == 'auto':
+            tone_powers_dbm = 'auto'
+        elif ',' in args.tone_powers_dbm:
+            try:
+                tone_powers_dbm = [float(v) for v in args.tone_powers_dbm.split(',')]
+            except ValueError:
+                parser.error('--tone_powers_dbm must be "auto", a float, or a comma-separated list of floats.')
+        else:
+            try:
+                tone_powers_dbm = float(args.tone_powers_dbm)
+            except ValueError:
+                parser.error('--tone_powers_dbm must be "auto", a float, or a comma-separated list of floats.')
+
     # Perform the sweep using the wrapper function
     try:
         wideband_sweep(
@@ -212,6 +240,7 @@ def main():
             step_size_hz=args.step_size_hz,
             num_tones=args.num_tones,
             samples_per_point=args.samples_per_point,
+            tone_powers_dbm=tone_powers_dbm,
             ignore_phase_correction=ignore_correction,
             remove_phase_slope=not args.no_remove_phase_slope,
             filename=args.filename,
