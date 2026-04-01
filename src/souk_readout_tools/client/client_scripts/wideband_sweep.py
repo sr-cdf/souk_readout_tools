@@ -14,7 +14,7 @@ import time
 import souk_readout_tools
  
 
-def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = None, step_size_hz = 10000, num_tones = 1024, samples_per_point = 10, ignore_phase_correction = False, filename = None, filetype = 'npy', plot_data = True):
+def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = None, step_size_hz = 10000, num_tones = 1024, samples_per_point = 10, ignore_phase_correction = False, tone_powers_dbm = None, filename = None, filetype = 'npy', plot_data = True):
     """
     Perform a wideband sweep of the system.
     
@@ -26,6 +26,7 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
         num_tones (int): Number of tones to use in the sweep, default is 1024, using more tones require fewer sweep steps
         samples_per_point (int): Number of samples to integrate per sweep point, default is 10
         ignore_phase_correction (bool): Do not correct for phase jumps at filterbank channel edges. Default is False, meaning the phase correction is applied by default)
+        tone_powers_dbm (float): Output tone power in dBm, applied to all tones. Default is None (maximum amplitude)
         filename (str): Filename to save the data to, default is tmp_wideband_sweep
         filetype (str): Type of file to save, default is .npy
         plot_data (bool): Plot the data after saving
@@ -117,7 +118,6 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
 
     
     center_freqs = freqs + np.floor(sweep_points/2)*spacings/sweep_points
-    tone_amplitudes = np.ones(num_tones) # set_amplitudes to max
     tone_phases = client.generate_newman_phases(center_freqs)
 
     print('udc:',udc)
@@ -138,7 +138,10 @@ def wideband_sweep(config_file = None, bandwidth_hz = None, center_freq_hz = Non
     print(center_freqs.min(),center_freqs.max())
 
     client.set_tone_frequencies(center_freqs)
-    client.set_tone_amplitudes(tone_amplitudes)
+    if tone_powers_dbm is not None:
+        client.set_tone_powers(np.full(num_tones, tone_powers_dbm))
+    else:
+        client.set_tone_amplitudes(np.ones(num_tones))
     client.set_tone_phases(tone_phases)
 
     outps = client.check_output_saturation()
@@ -234,6 +237,7 @@ def main():
     parser.add_argument('-n', '--num_tones', type=int, default=1024, help='Number of tones to use in the sweep, default is 1024, using more tones require fewer sweep steps')
     parser.add_argument('-p', '--samples_per_point', type=int, default=10, help='Number of samples to integrate per sweep point, default is 10')    
     parser.add_argument('-i', '--ignore_phase_correction', action='store_true', help='Do not correct for phase jumps at filterbank channel edges, ')    
+    parser.add_argument('-T', '--tone_powers_dbm', type=float, default=None, help='Output tone power in dBm, applied to all tones. Default is None (maximum amplitude)')
     parser.add_argument('-f', '--filename', type=str, default=None, help='Filename to save the data to, default is ~/.souk_readout_tools/tmp/tmp_wideband_sweep.npy')
     parser.add_argument('-t', '--filetype', type=str, default='npy', help='Type of file to save, default is .npy')
     parser.add_argument('-P', '--plot_data', action='store_true', help='Plot the data after saving')
@@ -261,9 +265,10 @@ def main():
                          num_tones = args.num_tones,
                            samples_per_point = args.samples_per_point,
                              ignore_phase_correction = args.ignore_phase_correction,
-                                 filename = args.filename,
-                                   filetype = args.filetype,
-                                     plot_data = args.plot_data)
+                               tone_powers_dbm = args.tone_powers_dbm,
+                                   filename = args.filename,
+                                     filetype = args.filetype,
+                                       plot_data = args.plot_data)
 
 if __name__ == "__main__":
     main()    
