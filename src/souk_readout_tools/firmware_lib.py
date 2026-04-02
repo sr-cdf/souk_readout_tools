@@ -4556,206 +4556,186 @@ def get_tone_powers(r,config_dict,detailed_output=False,reference_plane='detecto
     """
     Get current tone powers at the specified reference plane.
 
+    Covers the full signal chain from DAC through to the accumulator.
+    When detailed_output is True, returns power at every intermediate stage
+    in both the TX and RX chains.
+
     Parameters
     ----------
     reference_plane : str
-        'dac'        - DAC output (after VOP, before analog frontend)
-        'rf_output'  - RF frontend output (after amp, before cryostat)
-        'detector'   - cryogenic focal plane (default, end of full TX chain)
+        TX chain (DAC -> detector):
+            'dac'              - DAC output (after VOP, before analog frontend)
+            'rf_output'        - RF frontend output (after amp, before cryostat)
+            'detector'         - cryogenic focal plane (default)
+        RX chain (detector -> accumulator):
+            'cryostat_output'  - cryostat output (before RX frontend)
+            'adc_input'        - ADC input (after RX frontend)
+            'accumulator'      - raw accumulated IQ magnitude in dB
+    detailed_output : bool
+        If True, return (powers, details) where details is a dict of
+        per-stage values across the full TX and RX chain.
     """
-    VALID_PLANES = ('dac', 'rf_output', 'detector')
+    TX_PLANES = ('dac', 'rf_output', 'detector')
+    RX_PLANES = ('cryostat_output', 'adc_input', 'accumulator')
+    VALID_PLANES = TX_PLANES + RX_PLANES
     if reference_plane not in VALID_PLANES:
         raise ValueError(f'reference_plane must be one of {VALID_PLANES}, got {reference_plane!r}')
 
-    dac_tile = int(config_dict['firmware']['dac0_tile'])
-    dac_block = int(config_dict['firmware']['dac0_block'])
+    need_tx = reference_plane in TX_PLANES or detailed_output
+    need_rx = reference_plane in RX_PLANES or detailed_output
 
-    #get live params from firmware
-    amps=get_tone_amplitudes(r,config_dict)
     freqs,freq_details=get_tone_frequencies(r,config_dict,detailed_output=True)
-    psb_fftshift=r.psb.get_fftshift()
-    psb_scale=r.psbscale.get_scale()
-    mixer_settings=r.rfdc.core.get_mixer_settings(dac_tile,dac_block,r.rfdc.core.DAC_TILE)
-    mixer_scale_is_1p0 = mixer_settings['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0
-    qmc_settings = r.rfdc.core.get_qmc_settings(dac_tile,dac_block,r.rfdc.core.DAC_TILE)
-    mixer_qmc_gain = qmc_settings['GainCorrectionFactor'] if qmc_settings['EnableGain'] else 1.0
-    vop_current = int(r.rfdc.core.get_output_current(dac_tile,dac_block)['current'])
-
-    #get fixed params from config
-    dac_fs_bits = config_dict['firmware']['dac_fullscale_bits']
-    vop_current_fs = config_dict['firmware']['vop_current_fullscale']
-    dac_dbfs_to_dbm = config_dict['firmware']['dac0_dbfs_to_dbm']
-    tx_combiner_loss_db = config_dict['rf_frontend']['tx_combiner_loss_db']
-    tx_attenuator_value_db = config_dict['rf_frontend']['tx_attenuator_value_db']
-    tx_if_s21_db = config_dict['rf_frontend']['tx_if_s21_db']
-    tx_mixer_conversion_loss_db = config_dict['rf_frontend']['tx_mixer_conversion_loss_db']
-    tx_rf_s21_db = config_dict['rf_frontend']['tx_rf_s21_db']
-    tx_bypass_amp_s21_db = config_dict['rf_frontend'].get('tx_bypass_amp_s21_db', 0)
-    cryostat_input_s21_db = config_dict['cryostat']['input_s21_db']
-    cryostat_connected = config_dict['cryostat']['connected']
     rf_frontend_connected = config_dict['rf_frontend']['connected']
+    cryostat_connected = config_dict['cryostat']['connected']
 
-    if dac_dbfs_to_dbm is None:
-        #set defaults if not provided in config
-        dac_dbfs_to_dbm = 0
-    elif isinstance(dac_dbfs_to_dbm,str):
-        #perform nearest neighbour interpolation on calibration data if filenames stored in config file directly
-        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,dac_dbfs_to_dbm),ndmin=2).T
-        dac_dbfs_to_dbm = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
-    elif not np.isscalar(dac_dbfs_to_dbm):
-        #perform nearest neighbour interpolation on calibration data if arrays stored in config file directly
-        cal_f,cal_db = np.array(dac_dbfs_to_dbm,ndmin=2).T
-        dac_dbfs_to_dbm = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
+    details = {}
 
-    if tx_combiner_loss_db is None:
-        tx_combiner_loss_db = 0
-    elif isinstance(tx_combiner_loss_db,str):
-        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_combiner_loss_db),ndmin=2).T
-        tx_combiner_loss_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
-    elif not np.isscalar(tx_combiner_loss_db):
-        cal_f,cal_db = np.array(tx_combiner_loss_db,ndmin=2).T
-        tx_combiner_loss_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
+    # ---- TX chain ----
+    if need_tx:
+        dac_tile = int(config_dict['firmware']['dac0_tile'])
+        dac_block = int(config_dict['firmware']['dac0_block'])
 
-    if tx_attenuator_value_db is None:
-        tx_attenuator_value_db = 0
+        #get live params from firmware
+        amps=get_tone_amplitudes(r,config_dict)
+        psb_fftshift=r.psb.get_fftshift()
+        psb_scale=r.psbscale.get_scale()
+        mixer_settings=r.rfdc.core.get_mixer_settings(dac_tile,dac_block,r.rfdc.core.DAC_TILE)
+        mixer_scale_is_1p0 = mixer_settings['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0
+        qmc_settings = r.rfdc.core.get_qmc_settings(dac_tile,dac_block,r.rfdc.core.DAC_TILE)
+        mixer_qmc_gain = qmc_settings['GainCorrectionFactor'] if qmc_settings['EnableGain'] else 1.0
+        vop_current = int(r.rfdc.core.get_output_current(dac_tile,dac_block)['current'])
 
-    if tx_if_s21_db is None:
-        tx_if_s21_db = 0
-    elif isinstance(tx_if_s21_db,str):
-        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_if_s21_db),ndmin=2).T
-        tx_if_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
-    elif not np.isscalar(tx_if_s21_db):
-        cal_f,cal_db = np.array(tx_if_s21_db,ndmin=2).T
-        tx_if_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
+        #get fixed params from config
+        dac_fs_bits = config_dict['firmware']['dac_fullscale_bits']
+        vop_current_fs = config_dict['firmware']['vop_current_fullscale']
+        dac_dbfs_to_dbm = config_dict['firmware']['dac0_dbfs_to_dbm']
+        tx_combiner_loss_db = config_dict['rf_frontend']['tx_combiner_loss_db']
+        tx_attenuator_value_db = config_dict['rf_frontend']['tx_attenuator_value_db']
+        tx_if_s21_db = config_dict['rf_frontend']['tx_if_s21_db']
+        tx_mixer_conversion_loss_db = config_dict['rf_frontend']['tx_mixer_conversion_loss_db']
+        tx_rf_s21_db = config_dict['rf_frontend']['tx_rf_s21_db']
+        tx_bypass_amp_s21_db = config_dict['rf_frontend'].get('tx_bypass_amp_s21_db', 0)
+        cryostat_input_s21_db = config_dict['cryostat']['input_s21_db']
 
-    if tx_mixer_conversion_loss_db is None:
-        tx_mixer_conversion_loss_db = 0
-    elif isinstance(tx_mixer_conversion_loss_db,str):
-        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_mixer_conversion_loss_db),ndmin=2).T
-        tx_mixer_conversion_loss_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
-    elif not np.isscalar(tx_mixer_conversion_loss_db):
-        cal_f,cal_db = np.array(tx_mixer_conversion_loss_db,ndmin=2).T
-        tx_mixer_conversion_loss_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
+        if dac_dbfs_to_dbm is None:
+            #set defaults if not provided in config
+            dac_dbfs_to_dbm = 0
+        elif isinstance(dac_dbfs_to_dbm,str):
+            #perform nearest neighbour interpolation on calibration data if filenames stored in config file directly
+            cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,dac_dbfs_to_dbm),ndmin=2).T
+            dac_dbfs_to_dbm = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
+        elif not np.isscalar(dac_dbfs_to_dbm):
+            #perform nearest neighbour interpolation on calibration data if arrays stored in config file directly
+            cal_f,cal_db = np.array(dac_dbfs_to_dbm,ndmin=2).T
+            dac_dbfs_to_dbm = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
 
-    if tx_rf_s21_db is None:
-        tx_rf_s21_db = 0
-    elif isinstance(tx_rf_s21_db,str):
-        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_rf_s21_db),ndmin=2).T
-        tx_rf_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
-    elif not np.isscalar(tx_rf_s21_db):
-        cal_f,cal_db = np.array(tx_rf_s21_db,ndmin=2).T
-        tx_rf_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
+        if tx_combiner_loss_db is None:
+            tx_combiner_loss_db = 0
+        elif isinstance(tx_combiner_loss_db,str):
+            cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_combiner_loss_db),ndmin=2).T
+            tx_combiner_loss_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
+        elif not np.isscalar(tx_combiner_loss_db):
+            cal_f,cal_db = np.array(tx_combiner_loss_db,ndmin=2).T
+            tx_combiner_loss_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
 
-    if tx_bypass_amp_s21_db is None:
-        tx_bypass_amp_s21_db = 0
-    elif isinstance(tx_bypass_amp_s21_db,str):
-        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_bypass_amp_s21_db),ndmin=2).T
-        tx_bypass_amp_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
-    elif not np.isscalar(tx_bypass_amp_s21_db):
-        cal_f,cal_db = np.array(tx_bypass_amp_s21_db,ndmin=2).T
-        tx_bypass_amp_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
+        if tx_attenuator_value_db is None:
+            tx_attenuator_value_db = 0
 
-    if cryostat_input_s21_db is None:
-        cryostat_input_s21_db = 0
-    elif isinstance(cryostat_input_s21_db,str):
-        cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,cryostat_input_s21_db),ndmin=2).T
-        cryostat_input_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
-    elif not np.isscalar(cryostat_input_s21_db):
-        cal_f,cal_db = np.array(cryostat_input_s21_db,ndmin=2).T
-        cryostat_input_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
+        if tx_if_s21_db is None:
+            tx_if_s21_db = 0
+        elif isinstance(tx_if_s21_db,str):
+            cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_if_s21_db),ndmin=2).T
+            tx_if_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
+        elif not np.isscalar(tx_if_s21_db):
+            cal_f,cal_db = np.array(tx_if_s21_db,ndmin=2).T
+            tx_if_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
 
-    if not rf_frontend_connected:
-        tx_combiner_loss_db = np.zeros_like(freqs)
-        tx_attenuator_value_db = np.zeros_like(freqs)
-        tx_if_s21_db = np.zeros_like(freqs)
-        tx_mixer_conversion_loss_db = np.zeros_like(freqs)
-        tx_rf_s21_db = np.zeros_like(freqs)
-        tx_bypass_amp_s21_db = np.zeros_like(freqs)
-    if not cryostat_connected:
-        cryostat_input_s21_db = np.zeros_like(freqs)
+        if tx_mixer_conversion_loss_db is None:
+            tx_mixer_conversion_loss_db = 0
+        elif isinstance(tx_mixer_conversion_loss_db,str):
+            cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_mixer_conversion_loss_db),ndmin=2).T
+            tx_mixer_conversion_loss_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
+        elif not np.isscalar(tx_mixer_conversion_loss_db):
+            cal_f,cal_db = np.array(tx_mixer_conversion_loss_db,ndmin=2).T
+            tx_mixer_conversion_loss_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['analog_output_freq']])
 
-    powers,details = calibration.calc_tone_powers(amps,
-                                        psb_fftshift,
-                                        psb_scale,
-                                        mixer_scale_is_1p0,
-                                        mixer_qmc_gain,
-                                        vop_current,
-                                        vop_current_fs,
-                                        dac_dbfs_to_dbm,
-                                        tx_combiner_loss_db,
-                                        tx_attenuator_value_db,
-                                        tx_if_s21_db,
-                                        tx_mixer_conversion_loss_db,
-                                        tx_rf_s21_db,
-                                        tx_bypass_amp_s21_db,
-                                        cryostat_input_s21_db,
-                                        dac_fs_bits,
-                                        detailed_output=True)
+        if tx_rf_s21_db is None:
+            tx_rf_s21_db = 0
+        elif isinstance(tx_rf_s21_db,str):
+            cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_rf_s21_db),ndmin=2).T
+            tx_rf_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
+        elif not np.isscalar(tx_rf_s21_db):
+            cal_f,cal_db = np.array(tx_rf_s21_db,ndmin=2).T
+            tx_rf_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
 
-    # Select power at requested reference plane
-    if reference_plane == 'dac':
-        powers = np.array(details['dac_dbm'])
-    elif reference_plane == 'rf_output':
-        powers = np.array(details['tx_amp_dbm'])
-    # else: 'detector' — default (end of full TX chain)
+        if tx_bypass_amp_s21_db is None:
+            tx_bypass_amp_s21_db = 0
+        elif isinstance(tx_bypass_amp_s21_db,str):
+            cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,tx_bypass_amp_s21_db),ndmin=2).T
+            tx_bypass_amp_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
+        elif not np.isscalar(tx_bypass_amp_s21_db):
+            cal_f,cal_db = np.array(tx_bypass_amp_s21_db,ndmin=2).T
+            tx_bypass_amp_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
 
-    if detailed_output:
-        return powers,details
-    else:
-        return powers
+        if cryostat_input_s21_db is None:
+            cryostat_input_s21_db = 0
+        elif isinstance(cryostat_input_s21_db,str):
+            cal_f,cal_db = np.loadtxt(os.path.join(USER_DIR,cryostat_input_s21_db),ndmin=2).T
+            cryostat_input_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
+        elif not np.isscalar(cryostat_input_s21_db):
+            cal_f,cal_db = np.array(cryostat_input_s21_db,ndmin=2).T
+            cryostat_input_s21_db = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in freq_details['tx']['rf_output_freq']])
 
-def get_rx_tone_powers(r, config_dict, reference_plane='adc_input'):
-    """
-    Estimate received tone powers from accumulated IQ data.
+        if not rf_frontend_connected:
+            tx_combiner_loss_db = np.zeros_like(freqs)
+            tx_attenuator_value_db = np.zeros_like(freqs)
+            tx_if_s21_db = np.zeros_like(freqs)
+            tx_mixer_conversion_loss_db = np.zeros_like(freqs)
+            tx_rf_s21_db = np.zeros_like(freqs)
+            tx_bypass_amp_s21_db = np.zeros_like(freqs)
+        if not cryostat_connected:
+            cryostat_input_s21_db = np.zeros_like(freqs)
 
-    Uses calibration.calc_adc_input_power() to convert accumulated IQ levels
-    back to power at the requested reference plane in the RX chain.
+        tx_powers,tx_details = calibration.calc_tone_powers(amps,
+                                            psb_fftshift,
+                                            psb_scale,
+                                            mixer_scale_is_1p0,
+                                            mixer_qmc_gain,
+                                            vop_current,
+                                            vop_current_fs,
+                                            dac_dbfs_to_dbm,
+                                            tx_combiner_loss_db,
+                                            tx_attenuator_value_db,
+                                            tx_if_s21_db,
+                                            tx_mixer_conversion_loss_db,
+                                            tx_rf_s21_db,
+                                            tx_bypass_amp_s21_db,
+                                            cryostat_input_s21_db,
+                                            dac_fs_bits,
+                                            detailed_output=True)
+        details.update(tx_details)
 
-    Parameters
-    ----------
-    reference_plane : str
-        'accumulator'      - raw accumulated IQ magnitude in dB (no calibration)
-        'adc_input'        - power at the ADC input (default)
-        'cryostat_output'  - power at the cryostat output (before RX frontend)
-    """
-    VALID_PLANES = ('accumulator', 'adc_input', 'cryostat_output')
-    if reference_plane not in VALID_PLANES:
-        raise ValueError(f'reference_plane must be one of {VALID_PLANES}, got {reference_plane!r}')
+    # ---- RX chain ----
+    if need_rx:
+        adc_tile = int(config_dict['firmware']['adc_tile'])
+        adc_block = int(config_dict['firmware']['adc_block'])
 
-    adc_tile = int(config_dict['firmware']['adc_tile'])
-    adc_block = int(config_dict['firmware']['adc_block'])
+        # Read accumulated IQ data for active tones only
+        tone_indices = freq_details['rx']['tone_indices']
+        acc_data = read_accumulated_data(r, tone_indices=tone_indices)
 
-    # Read accumulated IQ data for all active tones
-    acc_data = read_accumulated_data(r)
+        adc_mixer_settings = r.rfdc.core.get_mixer_settings(adc_tile, adc_block, r.rfdc.core.ADC_TILE)
+        adc_mixer_scale_is_1p0 = adc_mixer_settings['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0
+        adc_qmc_settings = r.rfdc.core.get_qmc_settings(adc_tile, adc_block, r.rfdc.core.ADC_TILE)
+        adc_mixer_qmc_gain = adc_qmc_settings['GainCorrectionFactor'] if adc_qmc_settings['EnableGain'] else 1.0
 
-    if reference_plane == 'accumulator':
-        return 20 * np.log10(np.abs(acc_data) + 1e-30)  # dB, avoid log(0)
+        adc_bits = config_dict['firmware']['adc_fullscale_bits']
+        adc_dbm_to_dbfs = config_dict['firmware'].get('adc_dbm_to_dbfs', 12.0)
+        pfb_fftshift = r.pfb.get_fftshift()
+        acc_len = r.accumulators[0].get_acc_len()
+        rx_mix_scale = config_dict['firmware'].get('rx_mix_scale', 1.0)
 
-    # Gather firmware parameters
-    mixer_settings = r.rfdc.core.get_mixer_settings(adc_tile, adc_block, r.rfdc.core.ADC_TILE)
-    mixer_scale_is_1p0 = mixer_settings['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0
-    qmc_settings = r.rfdc.core.get_qmc_settings(adc_tile, adc_block, r.rfdc.core.ADC_TILE)
-    mixer_qmc_gain = qmc_settings['GainCorrectionFactor'] if qmc_settings['EnableGain'] else 1.0
-
-    adc_bits = config_dict['firmware']['adc_fullscale_bits']
-    adc_dbm_to_dbfs = config_dict['firmware'].get('adc_dbm_to_dbfs', 12.0)
-    pfb_fftshift = r.pfb.get_fftshift()
-    acc_len = r.accumulators[0].get_acc_len()
-
-    # RX mixer scale — default 1.0 if not available in config
-    rx_mix_scale = config_dict['firmware'].get('rx_mix_scale', 1.0)
-
-    # RX frontend parameters (default to 0 = no correction)
-    rf_connected = config_dict['rf_frontend']['connected']
-    cryo_connected = config_dict['cryostat']['connected']
-
-    if reference_plane == 'adc_input':
-        # No RX frontend correction — return power at ADC
-        powers = calibration.calc_adc_input_power(
-            acc_data, adc_dbm_to_dbfs, mixer_qmc_gain, mixer_scale_is_1p0,
-            adc_bits, pfb_fftshift, rx_mix_scale, acc_len)
-    elif reference_plane == 'cryostat_output':
-        # Include RX frontend corrections to refer power back to cryostat output
+        # RX frontend parameters
         rx_combiner_loss_db = config_dict['rf_frontend'].get('rx_combiner_loss_db', 0) or 0
         rx_attenuator_value_db = config_dict['rf_frontend'].get('rx_attenuator_value_db', 0) or 0
         rx_if_s21_db = config_dict['rf_frontend'].get('rx_if_s21_db', 0) or 0
@@ -4764,18 +4744,18 @@ def get_rx_tone_powers(r, config_dict, reference_plane='adc_input'):
         rx_bypass_amp_s21_db = config_dict['rf_frontend'].get('rx_bypass_amp_s21_db', 0) or 0
         cryostat_output_s21_db = config_dict['cryostat'].get('output_s21_db', 0) or 0
 
-        if not rf_connected:
+        if not rf_frontend_connected:
             rx_combiner_loss_db = 0
             rx_attenuator_value_db = 0
             rx_if_s21_db = 0
             rx_mixer_conversion_loss_db = 0
             rx_rf_s21_db = 0
             rx_bypass_amp_s21_db = 0
-        if not cryo_connected:
+        if not cryostat_connected:
             cryostat_output_s21_db = 0
 
-        powers = calibration.calc_adc_input_power(
-            acc_data, adc_dbm_to_dbfs, mixer_qmc_gain, mixer_scale_is_1p0,
+        rx_powers, rx_details = calibration.calc_adc_input_power(
+            acc_data, adc_dbm_to_dbfs, adc_mixer_qmc_gain, adc_mixer_scale_is_1p0,
             adc_bits, pfb_fftshift, rx_mix_scale, acc_len,
             rx_combiner_loss_db=rx_combiner_loss_db,
             rx_attenuator_value_db=rx_attenuator_value_db,
@@ -4783,9 +4763,28 @@ def get_rx_tone_powers(r, config_dict, reference_plane='adc_input'):
             rx_mixer_conversion_loss_db=rx_mixer_conversion_loss_db,
             rx_rf_s21_db=rx_rf_s21_db,
             rx_bypass_amp_s21_db=rx_bypass_amp_s21_db,
-            cryostat_output_s21_db=cryostat_output_s21_db)
+            cryostat_output_s21_db=cryostat_output_s21_db,
+            detailed_output=True)
+        details.update(rx_details)
 
-    return powers
+    # Select power at requested reference plane
+    if reference_plane == 'dac':
+        powers = np.array(details['dac_dbm'])
+    elif reference_plane == 'rf_output':
+        powers = np.array(details['tx_amp_dbm'])
+    elif reference_plane == 'detector':
+        powers = tx_powers
+    elif reference_plane == 'accumulator':
+        powers = np.array(details['accumulator_db'])
+    elif reference_plane == 'adc_input':
+        powers = np.array(details['adc_dbm'])
+    elif reference_plane == 'cryostat_output':
+        powers = rx_powers
+
+    if detailed_output:
+        return powers,details
+    else:
+        return powers
 
 
 def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',

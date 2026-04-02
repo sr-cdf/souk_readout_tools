@@ -696,8 +696,8 @@ client.get_tone_powers(reference_plane='dac')          # at DAC output
 client.get_tone_powers(reference_plane='rf_output')    # at RF frontend output
 
 # RX power estimation from accumulated IQ data
-client.get_rx_tone_powers()                                     # at ADC input (default)
-client.get_rx_tone_powers(reference_plane='cryostat_output')    # at cryostat output
+client.get_tone_powers(reference_plane='adc_input')             # at ADC input
+client.get_tone_powers(reference_plane='cryostat_output')       # at cryostat output
 ```
 
 `set_tone_powers()` returns a result dict with `achieved_powers_dbm`, `power_error_db`, and `warnings`:
@@ -1100,8 +1100,7 @@ Server-side commands (installed on the RFSoC):
 - Client config files live wherever the user chooses; server uses pipeline-specific directories on the RFSoC.
 
 **Power Calibration & Optimisation**
-- `set_tone_powers()` / `get_tone_powers()` with full calibration chain and selectable `reference_plane` (`'dac'`, `'rf_output'`, `'detector'`).
-- `get_rx_tone_powers()` for RX power estimation with reference planes (`'accumulator'`, `'adc_input'`, `'cryostat_output'`).
+- `set_tone_powers()` / `get_tone_powers()` with full calibration chain and selectable `reference_plane` covering the entire signal chain: TX (`'dac'`, `'rf_output'`, `'detector'`) and RX (`'cryostat_output'`, `'adc_input'`, `'accumulator'`).
 - Saturation detection: `check_input_saturation()`, `check_output_saturation()`, `check_dsp_overflow()`.
 - Auto-optimisation: `maximise_tx_power(headroom_db)`, `maximise_rx_power(headroom_db)`, `optimise_tx_snr()`, `optimise_rx_snr()`.
 - Auto-fix: `fix_dac_saturation()`, `fix_adc_saturation()`.

@@ -403,15 +403,25 @@ print(details)  # shows per-stage power breakdown
 
 ## Reference Planes
 
-Power can be queried at different points in the signal chain using the `reference_plane` parameter on `get_tone_powers()` and `get_rx_tone_powers()`.
+Power can be queried at any point in the signal chain using the `reference_plane` parameter on `get_tone_powers()`.
 
-### TX reference planes (`get_tone_powers`)
+### TX reference planes
 
 | `reference_plane` | Description |
 |---|---|
 | `'dac'` | Power at DAC output (digital full-scale converted to dBm) |
 | `'rf_output'` | Power at the RF frontend output (after attenuator, amp, mixer) |
 | `'detector'` | Power at the detector (after cryostat chain) — **default** |
+
+### RX reference planes
+
+Estimates received tone powers from accumulated IQ data using `calibration.calc_adc_input_power()`.
+
+| `reference_plane` | Description |
+|---|---|
+| `'cryostat_output'` | Power at cryostat output (before RF frontend RX chain) |
+| `'adc_input'` | Power at ADC input in dBm |
+| `'accumulator'` | Raw accumulated IQ magnitude in dB (no calibration applied) |
 
 ```python
 # Power at DAC output
@@ -420,29 +430,17 @@ dac_powers = client.get_tone_powers(reference_plane='dac')
 # Power at detector (default)
 det_powers = client.get_tone_powers(reference_plane='detector')
 
-# Full breakdown
+# Estimated power at ADC input
+rx_powers = client.get_tone_powers(reference_plane='adc_input')
+
+# Estimated power at cryostat output
+cryo_powers = client.get_tone_powers(reference_plane='cryostat_output')
+
+# Full breakdown of every stage in both TX and RX chains
 powers, details = client.get_tone_powers(detailed_output=True)
 ```
 
-### RX reference planes (`get_rx_tone_powers`)
-
-Estimates received tone powers from accumulated IQ data using `calibration.calc_adc_input_power()`.
-
-| `reference_plane` | Description |
-|---|---|
-| `'accumulator'` | Raw accumulated IQ magnitude in dB (no calibration applied) |
-| `'adc_input'` | Power at ADC input in dBm — **default** |
-| `'cryostat_output'` | Power at cryostat output (before RF frontend RX chain) |
-
-```python
-# Estimated power at ADC input
-rx_powers = client.get_rx_tone_powers(reference_plane='adc_input')
-
-# Estimated power at cryostat output
-cryo_powers = client.get_rx_tone_powers(reference_plane='cryostat_output')
-```
-
-This enables ADC calibration via loopback: compare `get_tone_powers(reference_plane='rf_output')` (known TX power) with `get_rx_tone_powers(reference_plane='adc_input')` (estimated RX power) to derive the ADC calibration correction.
+This enables ADC calibration via loopback: compare `get_tone_powers(reference_plane='rf_output')` (known TX power) with `get_tone_powers(reference_plane='adc_input')` (estimated RX power) to derive the ADC calibration correction.
 
 ---
 

@@ -1097,11 +1097,6 @@ class ReadoutServer:
                     result,details = firmware_lib.check_dsp_overflow(self.r,duration_s=duration_s)
                     await self.send_response(writer, {'status': 'success', 'result': result, 'details': details})
 
-                elif request == 'get_rx_tone_powers':
-                    ref_plane = message.get('reference_plane', 'adc_input')
-                    powers = firmware_lib.get_rx_tone_powers(self.r, self.config, reference_plane=ref_plane)
-                    await self.send_response(writer, {'status': 'success', 'powers': powers.tolist()})
-
                 elif request == 'maximise_tx_power':
                     headroom_db = message.get('headroom_db', 2.0)
                     amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.maximise_tx_power(self.r,self.config, headroom_db=headroom_db)

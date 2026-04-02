@@ -135,17 +135,17 @@ print(details)  # per-stage power contributions
 
 ### RX tone powers
 
-Received tone powers can be estimated from accumulated IQ data using `get_rx_tone_powers()`:
+Received tone powers can be estimated from accumulated IQ data using `get_tone_powers()` with an RX reference plane:
 
 ```python
 # Estimated power at ADC input
-rx_powers = client.get_rx_tone_powers(reference_plane='adc_input')
+rx_powers = client.get_tone_powers(reference_plane='adc_input')
 
 # Estimated power at cryostat output (before RX frontend)
-cryo_powers = client.get_rx_tone_powers(reference_plane='cryostat_output')
+cryo_powers = client.get_tone_powers(reference_plane='cryostat_output')
 
 # Raw accumulated IQ magnitude (no calibration)
-raw_powers = client.get_rx_tone_powers(reference_plane='accumulator')
+raw_powers = client.get_tone_powers(reference_plane='accumulator')
 ```
 
 See the [Calibration Guide - Reference Planes](calibration.md#reference-planes) for the full list of TX and RX reference planes.

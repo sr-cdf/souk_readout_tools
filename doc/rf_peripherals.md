@@ -297,20 +297,21 @@ dac_powers = client.get_tone_powers(reference_plane='dac')
 powers, details = client.get_tone_powers(detailed_output=True)
 ```
 
-### RX tone power estimation (`firmware_lib.get_rx_tone_powers`)
+### RX tone power estimation
 
-`get_rx_tone_powers()` estimates received tone powers from accumulated IQ data,
-using the RX calibration chain to convert back to physical power.
+`get_tone_powers()` also covers the RX chain, estimating received tone powers
+from accumulated IQ data using the RX calibration chain to convert back to
+physical power.
 
 | `reference_plane` | Description |
 |---|---|
-| `'accumulator'` | Raw accumulated IQ magnitude in dB |
-| `'adc_input'` | Power at ADC input in dBm (default) |
 | `'cryostat_output'` | Power at cryostat output (before RX frontend) |
+| `'adc_input'` | Power at ADC input in dBm |
+| `'accumulator'` | Raw accumulated IQ magnitude in dB |
 
 ```python
 # Estimated power at ADC input
-rx_powers = client.get_rx_tone_powers(reference_plane='adc_input')
+rx_powers = client.get_tone_powers(reference_plane='adc_input')
 ```
 
 ### TX power optimisation (`firmware_lib.set_tone_powers`)

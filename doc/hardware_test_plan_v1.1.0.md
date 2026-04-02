@@ -227,7 +227,7 @@ DONE: set_tone_powers with optimise_dynamic_range now follows order: maximise am
 
 DONE: get_tone_powers now accepts reference_plane parameter ('dac', 'rf_output', 'detector')
 
-DONE: new get_rx_tone_powers function estimates received power with reference planes 'accumulator', 'adc_input', 'cryostat_output'; uses calc_adc_input_power from calibration.py
+DONE: get_tone_powers now covers the full signal chain with RX reference planes 'accumulator', 'adc_input', 'cryostat_output' in addition to TX planes; uses calc_adc_input_power from calibration.py
 
 
 ### 1.3  Config sync from system
@@ -352,10 +352,10 @@ sweep = c.wideband_sweep(tone_powers_dbm=-30.0, verbose=True)
 
 ```python
 # Estimate received power from accumulated IQ
-rx_powers = c.get_rx_tone_powers(reference_plane='adc_input')
+rx_powers = c.get_tone_powers(reference_plane='adc_input')
 print(f"RX powers at ADC: {rx_powers} dBm")
 
-rx_powers_cryo = c.get_rx_tone_powers(reference_plane='cryostat_output')
+rx_powers_cryo = c.get_tone_powers(reference_plane='cryostat_output')
 print(f"RX powers at cryostat output: {rx_powers_cryo} dBm")
 ```
 - [ ] Returns power array matching number of active tones
