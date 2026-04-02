@@ -156,16 +156,16 @@ from souk_readout_tools.config_utils import copy_template_config
 copy_template_config(config_file='test_config.yaml', pipeline_id=0, config_id='test', created_by='test')
 ```
 - [X] Config is created and parseable
-- [ ] YAML comments are preserved in the output file (not stripped by yaml.dump)
-- [ ] `config.creation_date` is today's date
-- [ ] `config.config_id` and `config.created_by` match the arguments passed
+- [x] YAML comments are preserved in the output file (not stripped by yaml.dump)
+- [x] `config.creation_date` is today's date
+- [x] `config.config_id` and `config.created_by` match the arguments passed
 - [x] `firmware.fw_config_file` points to `/home/casper/souk-firmware/...`
-- [ ] `firmware.fw_config_file` references dual-pipeline config by default
+- [x] `firmware.fw_config_file` references dual-pipeline config by default
 - [x] `rf_frontend` section contains `attenuator_backend` key
-- [ ] `rf_frontend` section contains commented RUDAT serial fields
-- [ ] `rf_frontend.bypass_amps` subsection present with `enabled: false`
-- [ ] `rf_frontend.mixerless_module` subsection present with I2C settings
-- [ ] `cryostat.lna_bias` subsection present with `enabled: false`
+- [x] `rf_frontend` section contains commented RUDAT serial fields
+- [x] `rf_frontend.bypass_amps` subsection present with `enabled: false`
+- [x] `rf_frontend.mixerless_module` subsection present with I2C settings
+- [x] `cryostat.lna_bias` subsection present with `enabled: false`
 
 ---
 
@@ -234,7 +234,7 @@ DONE: new get_rx_tone_powers function estimates received power with reference pl
 
 1. Set some tones and modify a firmware default:
    ```python
-   c.set_tones([5e9, 5.1e9])
+   c.set_tones_helper([5e9, 5.1e9])
    info = c.sync_config_from_system()
    ```
 2. [x] `c.config['firmware']['defaults']` now contains updated keys
@@ -303,7 +303,7 @@ DONE: new _apply_per_bin_scaling helper scales all amplitudes by worst-case bin 
 ### 1.8  Batch snapshots — multiple tones (VACC index mapping)
 
 ```python
-c.set_tones([5e9, 5.001e9, 5.1e9])  # two tones near same bin + one distant
+c.set_tones_helper([5e9, 5.001e9, 5.1e9])  # two tones near same bin + one distant
 result = c.batch_snapshots(tone_indices=[0, 1, 2], num_snapshots=3, verbose=True)
 ```
 - [ ] All three tones return data
@@ -398,7 +398,7 @@ print(status)
 
 ```python
 for atten in [0, 5, 10, 15.5, 31.5]:
-    c.send_request({'request': 'set_tx_attenuation', 'value': atten})
+    c.set_tx_attenuation(atten)
     readback = c.get_rf_peripheral_status()
     print(f"Set {atten} dB, readback {readback['tx_attenuation_db']} dB")
 ```
@@ -412,7 +412,7 @@ for atten in [0, 5, 10, 15.5, 31.5]:
 
 Same as 2.2 but for RX path:
 ```python
-c.send_request({'request': 'set_rx_attenuation', 'value': 10.0})
+c.set_rx_attenuation(10.0)
 ```
 - [ ] Set/readback match
 - [ ] Verify with a known input signal that received power changes correctly
@@ -421,11 +421,11 @@ c.send_request({'request': 'set_rx_attenuation', 'value': 10.0})
 
 ```python
 # TX amp
-c.send_request({'request': 'set_tx_amp_bypass', 'bypass': True})
+c.set_tx_amp_bypass(True)
 status = c.get_rf_peripheral_status()
 assert status['tx_amp_bypass'] == True
 
-c.send_request({'request': 'set_tx_amp_bypass', 'bypass': False})
+c.set_tx_amp_bypass(False)
 status = c.get_rf_peripheral_status()
 assert status['tx_amp_bypass'] == False
 ```
@@ -492,7 +492,7 @@ print(f"DAC: {powers_dac[0]:.1f}, RF: {powers_rf[0]:.1f}, Det: {powers_det[0]:.1
 
 ```python
 # set_tone_powers with optimise_dynamic_range uses improved analog adjustment
-result = c.set_tone_powers([-40.0], optimise_dynamic_range=True)
+result = c.set_tone_powers([-40.0], reference_plane='detector', optimise_dynamic_range=True)
 ```
 - [ ] Analog adjustment computes exact attenuation from calibration chain (no trial-and-error)
 - [ ] RFDC DAC DSA used as last resort when attenuator+amp bypass insufficient
@@ -628,7 +628,7 @@ print(f"Estimated cable delay: {tau*1e9:.2f} ns")
 ### 3.4  Timestream plotting
 
 ```python
-c.set_tones([5e9])
+c.set_tones_helper([5e9])
 ts = c.get_samples(num_samples=10000)
 parsed = c.parse_samples(ts)
 
@@ -664,7 +664,7 @@ fig = plot_snapshots_psd(snap, method='averaged', show_errors=True); plt.show()
 ### 3.6  Batch snapshot plotting
 
 ```python
-c.set_tones([5e9, 5.1e9])
+c.set_tones_helper([5e9, 5.1e9])
 batch = c.batch_snapshots(num_snapshots=5, plot=True)
 ```
 - [ ] Auto-generated plot shows one row per tone
@@ -692,7 +692,7 @@ print(list(data.keys()))
 
 ```python
 # Single-tone sweep + timestream
-c.set_tones([5e9])
+c.set_tones_helper([5e9])
 sweep_1t = c.wideband_sweep(bandwidth_hz=2e6, num_tones=1)
 ts = c.get_samples(num_samples=5000)
 parsed = c.parse_samples(ts)
@@ -741,7 +741,7 @@ for r in resonances[:5]:
 
 ```python
 # Set tones on known resonances first
-c.set_tones([r.frequency for r in resonances[:5]])
+c.set_tones_helper([r.frequency for r in resonances[:5]])
 targeted = c.find_resonances(sweep_data=sweep, mode='targeted')
 print(f"Flagged tones: {targeted['flagged_tones']}")
 for i, per_tone in enumerate(targeted['per_tone']):
@@ -892,7 +892,7 @@ plt.show()
 
 ```python
 # Set tone on a resonance
-c.set_tones([fit_results[0].fr])
+c.set_tones_helper([fit_results[0].fr])
 ts = c.get_samples(num_samples=50000)
 parsed = c.parse_samples(ts)
 
@@ -929,7 +929,7 @@ plt.show()
 ```python
 # Set tones on several resonances
 freqs = [r.fr for r in fit_results[:10]]
-c.set_tones(freqs)
+c.set_tones_helper(freqs)
 
 # Batch snapshots
 batch = c.batch_snapshots(num_snapshots=10, verbose=True)
@@ -953,7 +953,7 @@ from souk_readout_tools.measurement import ParameterSweep
 from souk_readout_tools.fitting import batch_fit
 
 def set_atten(val):
-    c.send_request({'request': 'set_tx_attenuation', 'value': val})
+    c.set_tx_attenuation(val)
 
 def measure(client):
     sweep = client.wideband_sweep(verbose=False)
@@ -1047,8 +1047,8 @@ instances.
 c0 = ReadoutClient(config_file='config_p0.yaml')
 c1 = ReadoutClient(config_file='config_p1.yaml')
 
-c0.set_tones([5e9])
-c1.set_tones([6e9])
+c0.set_tones_helper([5e9])
+c1.set_tones_helper([6e9])
 
 sweep0 = c0.wideband_sweep()
 sweep1 = c1.wideband_sweep()

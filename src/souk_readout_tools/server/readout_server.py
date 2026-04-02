@@ -1035,7 +1035,13 @@ class ReadoutServer:
                     elif param_name == 'tone_powers':
                         self.stream_flags[FLAG_SET_AMPS].set()
                         await asyncio.sleep(0)
-                        result = firmware_lib.set_tone_powers(self.r, self.config, param_value)
+                        ref_plane = message.get('reference_plane', 'detector')
+                        opt_dr = message.get('optimise_dynamic_range', False)
+                        result = firmware_lib.set_tone_powers(
+                            self.r, self.config, param_value,
+                            reference_plane=ref_plane,
+                            optimise_dynamic_range=opt_dr,
+                            rf_peripherals=self.rf_peripherals)
                         self.stream_flags[FLAG_SET_AMPS].clear()
                         await asyncio.sleep(0)
                         response = {'status': 'success', 'result': result}

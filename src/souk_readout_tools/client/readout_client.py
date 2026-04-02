@@ -637,10 +637,31 @@ class ReadoutClient:
     def get_tone_phases(self):
         return np.atleast_1d(self.get_parameter('tone_phases'))
 
-    def set_tone_powers(self, tone_powers_dbm):
+    def set_tone_powers(self, tone_powers_dbm, reference_plane='detector',
+                        optimise_dynamic_range=False):
+        """Set tone powers to specified levels in dBm.
+
+        Parameters
+        ----------
+        tone_powers_dbm : array-like
+            Target power per tone in dBm.
+        reference_plane : str
+            Where the target power is specified: 'dac', 'rf_output', or
+            'detector' (default).
+        optimise_dynamic_range : bool
+            If True, maximise DAC bit utilisation and adjust the analog
+            chain (attenuator, amp bypass, DSA) to hit the target power.
+        """
         tone_powers_dbm = np.atleast_1d(tone_powers_dbm).tolist()
-        response = self.set_parameter('tone_powers', tone_powers_dbm)
-        if isinstance(response, dict) and response.get('result'):
+        message = {'request': 'set', 'param': 'tone_powers',
+                   'value': tone_powers_dbm,
+                   'reference_plane': reference_plane,
+                   'optimise_dynamic_range': optimise_dynamic_range}
+        response = self.send_request(message)
+        if response.get('status') != 'success':
+            print(f"Error setting tone powers: {response.get('message')}")
+            return response
+        if response.get('result'):
             r = response['result']
             for w in r.get('warnings', []):
                 print(f'  WARNING: {w}')

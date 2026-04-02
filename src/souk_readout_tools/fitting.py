@@ -45,13 +45,13 @@ class FitResult:
     iq_center: complex             # IQ circle center (cable-delay removed)
     iq_radius: float               # IQ circle radius (cable-delay removed)
 
-    # Nonlinear parameter (only set by fit_resonance_nonlinear)
-    anl: float = 0.0              # Nonlinear kinetic inductance parameter
-    sweep_direction: str = 'up'   # Sweep direction used for nonlinear fit
-
     # Fit quality
     residual_rms: float            # RMS of fit residuals
     success: bool                  # Whether the fit converged
+
+    # Nonlinear parameter (only set by fit_resonance_nonlinear)
+    anl: float = 0.0              # Nonlinear kinetic inductance parameter
+    sweep_direction: str = 'up'   # Sweep direction used for nonlinear fit
     message: str = ''              # Fit status message
 
     # Data used for fitting
