@@ -49,7 +49,8 @@ def calc_tone_powers(amps,
     #convert to absolute dBm using the calibration 
     dac_dbm = vop_dbfs + dac_dbfs_to_dbm
     combiner_dbm = dac_dbm - abs(tx_combiner_loss_db)
-    tx_if_dbm = combiner_dbm + tx_if_s21_db - abs(tx_attenuator_value_db)
+    tx_attenuator_dbm = combiner_dbm - abs(tx_attenuator_value_db)
+    tx_if_dbm = tx_attenuator_dbm + tx_if_s21_db
     tx_mixer_dbm = tx_if_dbm - abs(tx_mixer_conversion_loss_db)
     tx_rf_dbm = tx_mixer_dbm + tx_rf_s21_db
     tx_amp_dbm = tx_rf_dbm + tx_bypass_amp_s21_db
@@ -67,6 +68,7 @@ def calc_tone_powers(amps,
                    'vop_dbfs':vop_dbfs.tolist(),
                    'dac_dbm':dac_dbm.tolist(),
                    'combiner_dbm':combiner_dbm.tolist(),
+                   'tx_attenuator_dbm':tx_attenuator_dbm.tolist(),
                    'tx_if_dbm':tx_if_dbm.tolist(),
                    'tx_mixer_dbm':tx_mixer_dbm.tolist(),
                    'tx_rf_dbm':tx_rf_dbm.tolist(),
@@ -109,7 +111,8 @@ def calc_tone_amplitudes(powers_dbm,
     #account for rf frontend s21
     tx_mixer_dbm = tx_rf_dbm - tx_rf_s21_db
     tx_if_dbm = tx_mixer_dbm + abs(tx_mixer_conversion_loss_db)
-    combiner_dbm = tx_if_dbm - tx_if_s21_db + abs(tx_attenuator_value_db)
+    tx_attenuator_dbm = tx_if_dbm - tx_if_s21_db
+    combiner_dbm = tx_attenuator_dbm + abs(tx_attenuator_value_db)
     dac_dbm = combiner_dbm + abs(tx_combiner_loss_db)
     #account for the calibration of the DAC, converting dBm to dBFS
     vop_dbfs = dac_dbm - dac_dbfs_to_dbm
@@ -141,6 +144,7 @@ def calc_tone_amplitudes(powers_dbm,
                    'tx_rf_dbm':tx_rf_dbm.tolist(),
                    'tx_mixer_dbm':tx_mixer_dbm.tolist(),
                    'tx_if_dbm':tx_if_dbm.tolist(),
+                   'tx_attenuator_dbm':tx_attenuator_dbm.tolist(),
                    'combiner_dbm':combiner_dbm.tolist(),
                    'dac_dbm':dac_dbm.tolist(),
                    'vop_dbfs':vop_dbfs.tolist(),
@@ -176,7 +180,13 @@ def calc_accumulated_iq_level(adc_input_power_dbm,adc_dbm_to_dbfs,mixer_qmc_gain
     # Account for RX analog frontend: cryostat output -> ADC input
     # These default to 0 so the function is backwards-compatible when called
     # with just adc_input_power_dbm representing power already at the ADC.
-    sig_dbm = sig_dbm + cryostat_output_s21_db + rx_bypass_amp_s21_db + rx_rf_s21_db - abs(rx_mixer_conversion_loss_db) + rx_if_s21_db - abs(rx_attenuator_value_db) - abs(rx_combiner_loss_db)
+    sig_dbm = sig_dbm + cryostat_output_s21_db
+    sig_dbm = sig_dbm + rx_bypass_amp_s21_db
+    sig_dbm = sig_dbm + rx_rf_s21_db
+    sig_dbm = sig_dbm - abs(rx_mixer_conversion_loss_db)
+    sig_dbm = sig_dbm + rx_if_s21_db
+    sig_dbm = sig_dbm - abs(rx_attenuator_value_db)
+    sig_dbm = sig_dbm - abs(rx_combiner_loss_db)
     
     sig_dbfs = sig_dbm - adc_dbm_to_dbfs
 
@@ -248,7 +258,13 @@ def calc_adc_input_power(accumulated_iq_level,adc_dbm_to_dbfs,mixer_qmc_gain,mix
     sig_dbm = sig_dbfs + adc_dbm_to_dbfs
 
     # Remove RX frontend gains to refer power back to cryostat output
-    sig_dbm = sig_dbm + abs(rx_combiner_loss_db) + abs(rx_attenuator_value_db) - rx_if_s21_db + abs(rx_mixer_conversion_loss_db) - rx_rf_s21_db - rx_bypass_amp_s21_db - cryostat_output_s21_db
+    sig_dbm = sig_dbm + abs(rx_combiner_loss_db)
+    sig_dbm = sig_dbm + abs(rx_attenuator_value_db)
+    sig_dbm = sig_dbm - rx_if_s21_db
+    sig_dbm = sig_dbm + abs(rx_mixer_conversion_loss_db)
+    sig_dbm = sig_dbm - rx_rf_s21_db
+    sig_dbm = sig_dbm - rx_bypass_amp_s21_db
+    sig_dbm = sig_dbm - cryostat_output_s21_db
 
     # print('\n'.join([str(i) for i in (accumulated_iq_levels,acc_i_out,acc_q_out,rx_mix_i_out,rx_mix_q_out,pfb_i_out,pfb_q_out,adc_i_amp,adc_q_amp,adc_amp,ddc_amp,sig_rms,sig_dbfs,sig_dbm)]))
 

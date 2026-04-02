@@ -303,7 +303,7 @@ DONE: new _apply_per_bin_scaling helper scales all amplitudes by worst-case bin 
 ### 1.8  Batch snapshots — multiple tones (VACC index mapping)
 
 ```python
-c.set_tones_helper([5e9, 5.001e9, 5.1e9])  # two tones near same bin + one distant
+c.set_tones_helper([1.5e9, 1.5001e9, 1.51e9])  # two tones near same bin + one distant
 result = c.batch_snapshots(tone_indices=[0, 1, 2], num_snapshots=3, verbose=True)
 ```
 - [ ] All three tones return data

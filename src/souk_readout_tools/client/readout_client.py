@@ -668,6 +668,23 @@ class ReadoutClient:
         return response
 
     def get_tone_powers(self,detailed_output=False,reference_plane='detector'):
+        """Get current tone powers at the specified TX reference plane.
+
+        Parameters
+        ----------
+        detailed_output : bool
+            If True, return a dict with power at every stage in the TX chain.
+        reference_plane : str
+            'dac'        - DAC output (after VOP, before analog frontend)
+            'rf_output'  - RF frontend output (after amp, before cryostat)
+            'detector'   - cryogenic focal plane (default, end of full TX chain)
+
+        Returns
+        -------
+        numpy.ndarray or tuple
+            Tone powers in dBm. If detailed_output is True, returns
+            (powers, details) where details is a dict of per-stage values.
+        """
         if detailed_output:
             return self.get_parameter('tone_powers_detailed', reference_plane=reference_plane)
         else:
@@ -683,6 +700,45 @@ class ReadoutClient:
         if isinstance(response, dict) and 'powers' in response:
             return np.atleast_1d(response['powers'])
         return response
+
+    # TX and RX reference plane sets for get_power()
+    _TX_PLANES = ('dac', 'rf_output', 'detector')
+    _RX_PLANES = ('accumulator', 'adc_input', 'cryostat_output')
+
+    def get_power(self, reference_plane='detector', detailed_output=False):
+        """Get tone power at any point in the signal chain.
+
+        Dispatches to the TX or RX path based on the reference plane.
+
+        Parameters
+        ----------
+        reference_plane : str
+            TX chain (DAC → detector):
+                'dac'              - DAC output (after VOP, before analog frontend)
+                'rf_output'        - RF frontend output (after amp, before cryostat)
+                'detector'         - cryogenic focal plane (default)
+            RX chain (detector → accumulator):
+                'cryostat_output'  - cryostat output (before RX frontend)
+                'adc_input'        - ADC input (after RX frontend)
+                'accumulator'      - raw accumulated IQ magnitude in dB
+        detailed_output : bool
+            If True and reference_plane is a TX plane, return (powers, details)
+            with power at every intermediate stage. Not supported for RX planes.
+
+        Returns
+        -------
+        numpy.ndarray or tuple
+            Tone powers in dBm (or dB for 'accumulator').
+        """
+        if reference_plane in self._TX_PLANES:
+            return self.get_tone_powers(detailed_output=detailed_output,
+                                        reference_plane=reference_plane)
+        elif reference_plane in self._RX_PLANES:
+            return self.get_rx_tone_powers(reference_plane=reference_plane)
+        else:
+            raise ValueError(
+                f'reference_plane must be one of {self._TX_PLANES + self._RX_PLANES}, '
+                f'got {reference_plane!r}')
 
     def check_input_saturation(self,iterations=10):
         message = {'request': 'check_input_saturation','iterations':iterations}
