@@ -168,29 +168,31 @@ def calc_accumulated_iq_level(adc_input_power_dbm,adc_dbm_to_dbfs,mixer_qmc_gain
                               rx_rf_s21_db=0,
                               rx_bypass_amp_s21_db=0,
                               cryostat_output_s21_db=0,
-                              windowfactor=1,accumulated_iq_phase=0):
+                              windowfactor=1,accumulated_iq_phase=0,
+                              detailed_output=False):
     """
-    Estimate the final accumulated IQ value levels for a given power level at the ADC input.
-    Optionally accounts for the RX analog frontend between cryostat output and ADC.
-    When RX frontend parameters are zero (default), adc_input_power_dbm is used directly.
+    Estimate the final accumulated IQ value levels for a given power level
+    at the cryostat output (or ADC input when RX frontend parameters are zero).
+
+    Computes forward through the RX analog frontend and digital chain.
+    When detailed_output is True, returns per-stage power values.
     """
     #convert to numpy array
     sig_dbm = np.atleast_1d(adc_input_power_dbm)
+    cryostat_output_dbm = sig_dbm
 
     # Account for RX analog frontend: cryostat output -> ADC input
-    # These default to 0 so the function is backwards-compatible when called
-    # with just adc_input_power_dbm representing power already at the ADC.
-    sig_dbm = sig_dbm + cryostat_output_s21_db
-    sig_dbm = sig_dbm + rx_bypass_amp_s21_db
-    sig_dbm = sig_dbm + rx_rf_s21_db
-    sig_dbm = sig_dbm - abs(rx_mixer_conversion_loss_db)
-    sig_dbm = sig_dbm + rx_if_s21_db
-    sig_dbm = sig_dbm - abs(rx_attenuator_value_db)
-    sig_dbm = sig_dbm - abs(rx_combiner_loss_db)
-    
-    sig_dbfs = sig_dbm - adc_dbm_to_dbfs
+    rx_amp_dbm = cryostat_output_dbm + cryostat_output_s21_db
+    rx_rf_dbm = rx_amp_dbm + rx_bypass_amp_s21_db
+    rx_mixer_dbm = rx_rf_dbm + rx_rf_s21_db
+    rx_if_dbm = rx_mixer_dbm - abs(rx_mixer_conversion_loss_db)
+    rx_attenuator_dbm = rx_if_dbm + rx_if_s21_db
+    rx_combiner_dbm = rx_attenuator_dbm - abs(rx_attenuator_value_db)
+    adc_dbm = rx_combiner_dbm - abs(rx_combiner_loss_db)
 
-    sig_rms = 10**(sig_dbfs/20)
+    adc_dbfs = adc_dbm - adc_dbm_to_dbfs
+
+    sig_rms = 10**(adc_dbfs/20)
 
     sig_amp = sig_rms * np.sqrt(2)
 
@@ -198,22 +200,37 @@ def calc_accumulated_iq_level(adc_input_power_dbm,adc_dbm_to_dbfs,mixer_qmc_gain
 
     if not mixer_scale_is_1p0:
         ddc_amp /= np.sqrt(2)
-    
+
     adc_amp = ddc_amp * 2**(adc_bits-1)
 
     adc_i_amp = adc_q_amp = adc_amp #eg phase=45 deg = pi/4 rad
 
-    pfb_i_out = adc_i_amp * 2**(13-bin(pfb_fftshift).count('1')) * np.cos(accumulated_iq_phase) 
-    pfb_q_out = adc_q_amp * 2**(13-bin(pfb_fftshift).count('1')) * np.sin(accumulated_iq_phase) 
+    pfb_i_out = adc_i_amp * 2**(13-bin(pfb_fftshift).count('1')) * np.cos(accumulated_iq_phase)
+    pfb_q_out = adc_q_amp * 2**(13-bin(pfb_fftshift).count('1')) * np.sin(accumulated_iq_phase)
 
     rx_mix_i_out = pfb_i_out * rx_mix_scale
     rx_mix_q_out = pfb_q_out * rx_mix_scale
 
     acc_i_out = rx_mix_i_out * acclen * windowfactor
     acc_q_out = rx_mix_q_out * acclen * windowfactor
-    # print('\n'.join([str(i) for i in (acc_i_out+1j*acc_q_out,acc_i_out,acc_q_out,rx_mix_i_out,rx_mix_q_out,pfb_i_out,pfb_q_out,adc_i_amp,adc_q_amp,adc_amp,ddc_amp,sig_rms,sig_dbfs,sig_dbm)]))
 
-    return acc_i_out+1j*acc_q_out
+    accumulated_iq = acc_i_out+1j*acc_q_out
+    accumulator_db = 20 * np.log10(np.abs(accumulated_iq) + 1e-30)
+
+    if detailed_output:
+        details = {'cryostat_output_dbm':cryostat_output_dbm.tolist(),
+                   'rx_amp_dbm':rx_amp_dbm.tolist(),
+                   'rx_rf_dbm':rx_rf_dbm.tolist(),
+                   'rx_mixer_dbm':rx_mixer_dbm.tolist(),
+                   'rx_if_dbm':rx_if_dbm.tolist(),
+                   'rx_attenuator_dbm':rx_attenuator_dbm.tolist(),
+                   'rx_combiner_dbm':rx_combiner_dbm.tolist(),
+                   'adc_dbm':adc_dbm.tolist(),
+                   'adc_dbfs':adc_dbfs.tolist(),
+                   'accumulator_db':accumulator_db.tolist(),}
+        return accumulated_iq, details
+    else:
+        return accumulated_iq
 
 def calc_adc_input_power(accumulated_iq_level,adc_dbm_to_dbfs,mixer_qmc_gain,mixer_scale_is_1p0,adc_bits,pfb_fftshift,rx_mix_scale,acclen,
                          rx_combiner_loss_db=0,
