@@ -666,8 +666,11 @@ def get_system_information(r,config_dict):
         info['mixer_qmc_settings_dac1'] = None
         info['mixer_qmc_settings_adc'] = None
         info['adc_cal_frozen'] = None
-        print(bcolors.FAIL+'CRITICAL WARNING - RFDC settings not found, check that the DAC and ADC tiles/blocks are set correctly in the config to match the firmware'+bcolors.ENDC)
-        print('Continuing regardless but the system will not work.')
+        if not has_rfdc:
+            print(bcolors.FAIL+'CRITICAL WARNING - RFDC block not found, the FPGA may not be programmed'+bcolors.ENDC)
+        else:
+            print(bcolors.FAIL+'CRITICAL WARNING - RFDC settings not found, check that the DAC and ADC tiles/blocks are set correctly in the config to match the firmware'+bcolors.ENDC)
+            print('Continuing regardless but the system will not work.')
 
     # RTS overvoltage flags
     rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
