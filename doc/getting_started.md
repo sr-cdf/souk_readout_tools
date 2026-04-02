@@ -96,7 +96,7 @@ Detector → Cryostat → RF Frontend (optional downconversion) → ADC → PFB 
 
 ### Server
 
-The readout server runs on the RFSoC and should already be installed and configured. If you need to set up or reinstall the server, see the [Installation Guide](installation.md#server-installation--setup).
+The readout server runs on the RFSoC and should already be installed and configured. If you need to set up or reinstall the server, see the [Installation Guide](installation.md#server-software-installation--setup).
 
 Verify the server is running:
 
@@ -131,6 +131,7 @@ Clone the repository and set up a virtual environment:
 ```bash
 git clone https://github.com/sr-cdf/souk_readout_tools
 cd souk_readout_tools
+git submodule init && git submodule update
 ```
 
 **Linux:**
@@ -179,7 +180,7 @@ Create a new config from the bundled template:
 
 ```python
 from souk_readout_tools.config_utils import copy_template_config
-copy_template_config('my_config.yaml', pipeline_id=0)
+copy_template_config(config_file='my_config.yaml', pipeline_id=0)
 ```
 
 ### Preparing a Config File

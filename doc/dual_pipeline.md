@@ -123,8 +123,8 @@ On the client side, keep your config files wherever you like — there is no hid
 
 ```python
 from souk_readout_tools.config_utils import copy_template_config
-copy_template_config('config_pipeline_0.yaml', pipeline_id=0)
-copy_template_config('config_pipeline_1.yaml', pipeline_id=1)
+copy_template_config(config_file='config_pipeline_0.yaml', pipeline_id=0)
+copy_template_config(config_file='config_pipeline_1.yaml', pipeline_id=1)
 ```
 
 ---

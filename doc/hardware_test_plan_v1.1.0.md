@@ -153,7 +153,7 @@ DONE - attenuator config moved to rf_frontend level. attenuator_backend: 'i2c' (
 
 ```python
 from souk_readout_tools.config_utils import copy_template_config
-copy_template_config('test_config.yaml', pipeline_id=0, config_id='test', created_by='test')
+copy_template_config(config_file='test_config.yaml', pipeline_id=0, config_id='test', created_by='test')
 ```
 - [X] Config is created and parseable
 - [ ] YAML comments are preserved in the output file (not stripped by yaml.dump)
