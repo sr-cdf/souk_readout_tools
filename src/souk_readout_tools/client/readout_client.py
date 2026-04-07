@@ -410,7 +410,7 @@ class ReadoutClient:
         The local config is not modified — only the copy sent to the server has
         rewritten paths.
         """
-        name = os.path.basename(self.config_file)
+        name = os.path.basename(self.config_file) if self.config_file else 'config.yaml'
 
         # Deep-copy config so local version is not modified
         import copy
@@ -439,7 +439,8 @@ class ReadoutClient:
         message = {'request': 'push_config', 'config_filename': name, 'config_contents': config_contents}
         response = self.send_request(message)
         if response['status'] == 'success':
-            print(f'Config file pushed from {self.config_file} to RFSoC')
+            source = self.config_file or 'memory'
+            print(f'Config pushed from {source} to RFSoC')
             return
         else:
             return response
