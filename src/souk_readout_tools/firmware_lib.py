@@ -4373,6 +4373,10 @@ def fix_adc_saturation(r, config_dict, rf_peripherals=None):
          value that clears saturation).
       3. Increase the ADC DSA (binary search, last resort).
 
+    Handles both continuous saturation (visible in ADC snapshots) and
+    intermittent saturation (multi-tone peak coherent addition detected
+    only by the RFDC RTS hardware flags).
+
     Does not raise on saturation — if all controls are exhausted a warning
     is printed and the function returns so that callers can continue with
     best-effort settings.
@@ -4385,54 +4389,80 @@ def fix_adc_saturation(r, config_dict, rf_peripherals=None):
 
     Returns
     -------
-    dsa : float
-        Final ADC DSA value in dB.
-    fftshift : int
-        Current PFB FFT shift register value.
-    dsp_ovf : dict
-        DSP overflow details from check_dsp_overflow.
-    levels : dict
-        ADC level details from the final saturation check.
-    rx_atten : float or None
-        RX attenuator value in dB (None if rf_peripherals not used).
+    result : dict
+        'dsa'                : float — final ADC DSA value in dB.
+        'adc_levels'         : dict  — ADC level details from the final saturation check.
+        'rx_attenuation_db'  : float or None — RX attenuator setting (None if not used).
+        'rx_amp_bypass'      : bool or None  — RX amp bypass state (None if not used).
+        'saturation'         : bool  — True if saturation still present after fix.
     """
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
 
-    # If the RTS over_voltage flag is asserted the firmware will have
-    # applied a hidden DSA increase that is not visible via get_dsa().
-    # Clearing the flag removes that hidden DSA, which would cause the
-    # signal to jump back up.  To absorb that safely we set the user
-    # DSA to maximum *before* clearing, then work from that known state.
+    def _make_result():
+        """Gather final state and return the result dict."""
+        check_rfdc_rts_events(r, clear=True)
+        time.sleep(0.05)
+        sat, lvls = check_input_saturation(r, iterations=50)
+        d = float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
+        ra = rf_peripherals.get_rx_attenuation() if (rf_peripherals is not None and rf_peripherals.enabled) else None
+        ab = rf_peripherals.get_rx_amp_bypass() if (rf_peripherals is not None and rf_peripherals.enabled) else None
+        return {'dsa': d, 'adc_levels': lvls, 'rx_attenuation_db': ra,
+                'rx_amp_bypass': ab, 'saturation': sat}
+
+    # --- Determine saturation source ---
+    # Check RTS flags (without clearing) for hardware-detected events,
+    # then check snapshot levels separately.
     rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
-    if rts_details.get('rts_over_voltage', False):
+    had_rts_over_voltage = rts_details.get('rts_over_voltage', False)
+    had_rts_over_range = rts_details.get('rts_over_range', False)
+
+    # Handle hidden firmware DSA from over_voltage
+    if had_rts_over_voltage:
         print('fix_adc_saturation: RTS over-voltage flag set — '
               'setting DSA to maximum before clearing hidden firmware DSA')
         r.rfdc.core.set_dsa(adc_tile, adc_block, 27)
         time.sleep(0.1)
-        # Now clear the flag (removes hidden DSA, but user DSA protects us)
         check_rfdc_rts_events(r, clear=True)
         time.sleep(0.1)
-    elif rts_details.get('rts_over_range', False):
-        # over_range doesn't apply hidden DSA, but clear the stale flag
-        # so subsequent check_input_saturation calls see fresh state.
+    elif had_rts_over_range:
         check_rfdc_rts_events(r, clear=True)
         time.sleep(0.05)
 
-    # The initial check uses RTS so we catch marginal saturation that
-    # only the hardware flags detect (snapshot levels may be below the
-    # 0.95 threshold).  The binary searches below use check_rts=False
-    # because RTS sticky flags re-assert on transients during
-    # DSA/attenuator changes and produce false positives.
-    check, levels = check_input_saturation(r, iterations=50, check_rts=True)
-    if not check:
-        dsa = float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
-        fftshift = r.pfb.get_fftshift()
-        rx_atten = rf_peripherals.get_rx_attenuation() if (rf_peripherals is not None and rf_peripherals.enabled) else None
-        return dsa, fftshift, check_dsp_overflow(r, 0.5)[1], levels, rx_atten
+    # Snapshot-based check (reliable, no transient issues)
+    snapshot_saturated, levels = check_input_saturation(r, iterations=50, check_rts=False)
 
-    print('fix_adc_saturation: ADC saturation detected — '
-          'attempting to reduce input power')
+    # If neither snapshot nor RTS shows saturation, nothing to do.
+    if not snapshot_saturated and not had_rts_over_voltage and not had_rts_over_range:
+        return _make_result()
+
+    # Multi-tone signals can have intermittent peaks from coherent phase
+    # addition that only the RTS hardware catches (snapshot levels may be
+    # well below the 0.95 threshold).  When saturation is RTS-only, the
+    # binary searches must use RTS with a longer settle time instead of
+    # snapshot levels.
+    rts_only = not snapshot_saturated and (had_rts_over_voltage or had_rts_over_range)
+
+    def _check_saturated():
+        """Check for saturation using the appropriate method."""
+        if rts_only:
+            # Intermittent peaks: clear RTS, wait for potential recurrence,
+            # then read.  0.5 s gives multi-tone beat patterns time to
+            # produce a peak if one exists at this power level.
+            check_rfdc_rts_events(r, clear=True)
+            time.sleep(0.5)
+            ev, det = check_rfdc_rts_events(r, clear=False)
+            return ev
+        else:
+            sat, _ = check_input_saturation(r, iterations=50, check_rts=False)
+            return sat
+
+    if rts_only:
+        print('fix_adc_saturation: RTS over-range detected (intermittent — '
+              'snapshot levels OK but hardware detected peaks exceeding full-scale)')
+    else:
+        print('fix_adc_saturation: ADC saturation detected — '
+              'attempting to reduce input power')
     saturation_resolved = False
 
     # --- Step 1: RF peripheral controls (preferred) ---
@@ -4442,8 +4472,7 @@ def fix_adc_saturation(r, config_dict, rf_peripherals=None):
             print('  Bypassing RX amplifier...')
             rf_peripherals.set_rx_amp_bypass(True)
             time.sleep(0.1)
-            check, levels = check_input_saturation(r, iterations=50, check_rts=False)
-            if not check:
+            if not _check_saturated():
                 print('  Saturation resolved by bypassing RX amplifier')
                 saturation_resolved = True
             else:
@@ -4466,9 +4495,9 @@ def fix_adc_saturation(r, config_dict, rf_peripherals=None):
                 mid_att = attenuations[mid_idx]
                 rf_peripherals.set_rx_attenuation(mid_att)
                 time.sleep(0.1)
-                check, levels = check_input_saturation(r, iterations=50, check_rts=False)
-                print(f'    RX atten: {mid_att:.1f} dB, Saturated: {check}')
-                if check:
+                sat = _check_saturated()
+                print(f'    RX atten: {mid_att:.1f} dB, Saturated: {sat}')
+                if sat:
                     low_idx = mid_idx + 1
                 else:
                     best_atten = mid_att
@@ -4502,9 +4531,9 @@ def fix_adc_saturation(r, config_dict, rf_peripherals=None):
             mid_dsa = dsa_values[mid_idx]
             r.rfdc.core.set_dsa(adc_tile, adc_block, mid_dsa)
             time.sleep(0.1)
-            check, levels = check_input_saturation(r, iterations=50, check_rts=False)
-            print(f'    DSA: {mid_dsa:.2f} dB, Saturated: {check}')
-            if check:
+            sat = _check_saturated()
+            print(f'    DSA: {mid_dsa:.2f} dB, Saturated: {sat}')
+            if sat:
                 low_idx = mid_idx + 1
             else:
                 best_dsa = mid_dsa
@@ -4521,15 +4550,7 @@ def fix_adc_saturation(r, config_dict, rf_peripherals=None):
                   f'({dsamax} dB) and maximum RF attenuation — '
                   f'external signal level may need to be reduced')
 
-    # Clear any RTS flags that accumulated during the search, then
-    # return the final state.
-    check_rfdc_rts_events(r, clear=True)
-    time.sleep(0.05)
-    _, levels = check_input_saturation(r, iterations=50)
-    dsa = float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
-    fftshift = r.pfb.get_fftshift()
-    rx_atten = rf_peripherals.get_rx_attenuation() if (rf_peripherals is not None and rf_peripherals.enabled) else None
-    return dsa, fftshift, check_dsp_overflow(r, 0.5)[1], levels, rx_atten
+    return _make_result()
 
 def optimise_rx_snr(r, config_dict=None, rf_peripherals=None):
     """

@@ -1130,8 +1130,7 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success', 'result': result})
                 
                 elif request == 'fix_adc_saturation':
-                    dsa,fftshift, dsp_ovf, levels, rx_atten = firmware_lib.fix_adc_saturation(self.r,self.config, rf_peripherals=self.rf_peripherals)
-                    result = {'dsa': dsa, 'fftshift': fftshift, 'dsp_ovf': dsp_ovf, 'adc_levels': levels, 'rx_attenuation_db': rx_atten}
+                    result = firmware_lib.fix_adc_saturation(self.r,self.config, rf_peripherals=self.rf_peripherals)
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 # -- RF peripheral (attenuator / amp bypass) commands --
