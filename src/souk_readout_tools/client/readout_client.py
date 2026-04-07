@@ -2328,7 +2328,7 @@ class ReadoutClient:
     # TODO: Add a tone_powers parameter to wideband_sweep to allow specifying
     #       power levels across the band (e.g. per-tone or per-band).
     def wideband_sweep(self, bandwidth_hz=None, center_freq_hz=None, step_size_hz=10000,
-                       num_tones=1024, samples_per_point=10, tone_powers_dbm=None,
+                       num_tones=1024, samples_per_point=10, tone_powers_dbm='auto',
                        apply_phase_correction=False,
                        remove_phase_slope=True, verbose=True):
         """
