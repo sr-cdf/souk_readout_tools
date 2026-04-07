@@ -483,6 +483,9 @@ def initialise_pipeline_resources(r,config_dict):
         r.rfdc.core.set_fine_mixer_freq(adc_tile,adc_block,r.rfdc.core.ADC_TILE,adc_ddc_mix_frequency_hz/1e6)
     if nyquist_zone is not None:
         set_nyquist_zone(r,config_dict,nyquist_zone,inv_sinc=False)
+    # Ensure config has current mixer frequencies (set_nyquist_zone may have updated them)
+    config_dict['firmware']['defaults']['dac_duc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)['Freq'])*1e6
+    config_dict['firmware']['defaults']['adc_ddc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['Freq'])*1e6
     if dac_mixer_scale_1p0 is not None:
         if dac_mixer_scale_1p0:
             r.rfdc.core.set_mixer_scale(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE,r.rfdc.core.MIX_SCALE_1P0)
@@ -789,6 +792,11 @@ def apply_config(new_config_dict, r, prev_config_dict=None):
             print(f'apply_config: setting nyquist_zone = {nyquist_zone}')
             set_nyquist_zone(r, new_config_dict, nyquist_zone, inv_sinc=False)
 
+    # Ensure config has current mixer frequencies after any changes
+    if changed('dac_duc_mixer_frequency_hz') or changed('adc_ddc_mix_frequency_hz') or changed('nyquist_zone'):
+        new_config_dict['firmware']['defaults']['dac_duc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)['Freq'])*1e6
+        new_config_dict['firmware']['defaults']['adc_ddc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['Freq'])*1e6
+
     if changed('dac_mixer_scale_1p0'):
         dac_mixer_scale_1p0 = defaults.get('dac_mixer_scale_1p0')
         if dac_mixer_scale_1p0 is not None:
@@ -977,6 +985,10 @@ def set_nyquist_zone(r,config_dict,nyquist_zone,inv_sinc=False):
         else:
             r.rfdc.core.set_invsinc_fir(dac0_tile,dac0_block,r.rfdc.core.INVSINC_FIR_DISABLED)
             r.rfdc.core.set_invsinc_fir(dac1_tile,dac1_block,r.rfdc.core.INVSINC_FIR_DISABLED)
+
+    # Store actual mixer frequencies in config so fast functions can access them without RFDC
+    config_dict['firmware']['defaults']['dac_duc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)['Freq'])*1e6
+    config_dict['firmware']['defaults']['adc_ddc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['Freq'])*1e6
 
     return
 
@@ -2058,10 +2070,8 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, tone_
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
     defaults = config_dict['firmware']['defaults']
-    duc_frequency = defaults.get('dac_duc_mixer_frequency_hz',
-        float(r.rfdc.core.get_mixer_settings(dac_tile,dac_block,r.rfdc.core.DAC_TILE)['Freq'])*1e6)
-    ddc_frequency = defaults.get('adc_ddc_mixer_frequency_hz',
-        float(r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['Freq'])*1e6)
+    duc_frequency = defaults['dac_duc_mixer_frequency_hz']
+    ddc_frequency = defaults['adc_ddc_mixer_frequency_hz']
     dac_nyquist_zone = defaults['nyquist_zone']
     adc_nyquist_zone = defaults['nyquist_zone']
 
@@ -2230,10 +2240,8 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
     defaults = config_dict['firmware']['defaults']
-    duc_frequency = defaults.get('dac_duc_mixer_frequency_hz',
-        float(r_fast.rfdc.core.get_mixer_settings(dac_tile,dac_block,r_fast.rfdc.core.DAC_TILE)['Freq'])*1e6)
-    ddc_frequency = defaults.get('adc_ddc_mixer_frequency_hz',
-        float(r_fast.rfdc.core.get_mixer_settings(adc_tile,adc_block,r_fast.rfdc.core.ADC_TILE)['Freq'])*1e6)
+    duc_frequency = defaults['dac_duc_mixer_frequency_hz']
+    ddc_frequency = defaults['adc_ddc_mixer_frequency_hz']
     dac_nyquist_zone = defaults['nyquist_zone']
     adc_nyquist_zone = defaults['nyquist_zone']
 
