@@ -4419,11 +4419,12 @@ def fix_adc_saturation(r, config_dict, rf_peripherals=None):
         check_rfdc_rts_events(r, clear=True)
         time.sleep(0.05)
 
-    # Use check_rts=False for the initial check and during the binary
-    # searches below.  The RTS sticky flags re-assert on transients
-    # during DSA/attenuator changes and produce false positives; the
-    # ADC snapshot level check is the reliable indicator during search.
-    check, levels = check_input_saturation(r, iterations=50, check_rts=False)
+    # The initial check uses RTS so we catch marginal saturation that
+    # only the hardware flags detect (snapshot levels may be below the
+    # 0.95 threshold).  The binary searches below use check_rts=False
+    # because RTS sticky flags re-assert on transients during
+    # DSA/attenuator changes and produce false positives.
+    check, levels = check_input_saturation(r, iterations=50, check_rts=True)
     if not check:
         dsa = float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
         fftshift = r.pfb.get_fftshift()
