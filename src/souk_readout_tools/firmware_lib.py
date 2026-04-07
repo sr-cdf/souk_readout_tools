@@ -2070,10 +2070,14 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, tone_
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
     defaults = config_dict['firmware']['defaults']
-    duc_frequency = defaults['dac_duc_mixer_frequency_hz']
-    ddc_frequency = defaults['adc_ddc_mixer_frequency_hz']
     dac_nyquist_zone = defaults['nyquist_zone']
     adc_nyquist_zone = defaults['nyquist_zone']
+    # DUC/DDC mixer frequencies: use stored values if available, otherwise derive from nyquist zone
+    _fs = 2 * r.adc_clk_hz  # RFDC sampling frequency
+    duc_frequency = defaults.get('dac_duc_mixer_frequency_hz',
+        _fs / 4 if dac_nyquist_zone == 1 else -_fs * 3 / 4)
+    ddc_frequency = defaults.get('adc_ddc_mixer_frequency_hz',
+        -_fs / 4 if adc_nyquist_zone == 1 else _fs * 3 / 4)
 
     #constants
     nc = r.mixer.n_chans
@@ -2240,10 +2244,14 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
     defaults = config_dict['firmware']['defaults']
-    duc_frequency = defaults['dac_duc_mixer_frequency_hz']
-    ddc_frequency = defaults['adc_ddc_mixer_frequency_hz']
     dac_nyquist_zone = defaults['nyquist_zone']
     adc_nyquist_zone = defaults['nyquist_zone']
+    # DUC/DDC mixer frequencies: use stored values if available, otherwise derive from nyquist zone
+    _fs = 2 * r_fast.adc_clk_hz  # RFDC sampling frequency
+    duc_frequency = defaults.get('dac_duc_mixer_frequency_hz',
+        _fs / 4 if dac_nyquist_zone == 1 else -_fs * 3 / 4)
+    ddc_frequency = defaults.get('adc_ddc_mixer_frequency_hz',
+        -_fs / 4 if adc_nyquist_zone == 1 else _fs * 3 / 4)
 
     #constants
     nc = r_fast.mixer.n_chans
