@@ -5423,29 +5423,10 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         print(f'  Step 4c: psb_scale adjusted {current_psb_scale:.6f} → {adjusted_scale:.6f} '
               f'to absorb remaining {remaining_delta:.1f} dB delta')
 
-    # --- Step 6: Final amplitude calculation. --------------------------
-    #     Re-read analog state from config (rf_peripherals may have synced
-    #     it).  _calc_amps reads the live PSB settings from hardware.
-    final_atten_for_cal = config_dict['rf_frontend']['tx_attenuator_value_db']
-    if final_atten_for_cal is None:
-        final_atten_for_cal = 0
-    final_amp_s21_for_cal = _resolve_cal(config_dict['rf_frontend'].get('tx_bypass_amp_s21_db', 0), rf_freq)
-    if not rf_connected:
-        final_atten_for_cal = 0
-        final_amp_s21_for_cal = 0
-
-    amps = _calc_amps(powers_dbm, final_atten_for_cal if reference_plane != 'dac' else 0,
-                      final_amp_s21_for_cal if reference_plane != 'dac' else 0)
-
-    if np.any(amps > 1.0):
-        n_clipped = int(np.sum(amps > 1.0))
-        amps = np.clip(amps, 0, 1 - 2**-12)
-        msg = f'{n_clipped} tone(s) clipped to max amplitude after optimisation'
-        print(f'  WARNING: {msg}')
-        warnings_list.append(msg)
-
-    set_tone_amplitudes(r, config_dict, amps)
-    print(f'  Step 6: final amplitudes set (max = {float(np.max(amps)):.6f})')
+    # Amplitudes were already set with correct ratios in Step 1.
+    # Steps 2-4 adjusted fftshift, psb_scale, and attenuator to hit the
+    # target power — there is no need to recalculate or clip amplitudes.
+    amps = get_tone_amplitudes(r, config_dict)
 
     # --- Step 7: Verify achieved powers at the reference plane. --------
     achieved = get_tone_powers(r, config_dict, reference_plane=reference_plane)
