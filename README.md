@@ -4,17 +4,16 @@
 
 Simons Observatory: UK (SOUK) uses Microwave Kinetic Inductance Detectors (MKIDs) to observe the cosmic microwave background across two telescopes. Each MKID is a superconducting resonator whose resonance frequency shifts in response to absorbed photons - the readout system's job is to continuously probe these resonances and record the detector responses.
 
-The readout hardware is based on AMD/Xilinx RFSoC (Radio Frequency System-on-Chip) boards. Each board runs dual-pipeline firmware providing **two independent RF readout channels**, each capable of driving and measuring up to 2048 tones simultaneously across a wide RF bandwidth. The full SOUK instrument uses **7 boards per telescope** (28 RF networks in total), with all boards managed from a single host machine.
+The readout hardware is based on AMD/Xilinx RFSoC (Radio Frequency System-on-Chip) boards. Each board runs the [`souk-firmware`](https://github.com/realtimeradio/souk-firmware) dual-pipeline firmware providing **two independent RF readout channels**, each capable of driving and measuring up to 2048 tones simultaneously across a wide RF bandwidth. The full SOUK instrument uses **7 boards per telescope** (28 RF networks in total), with all boards managed from a single host machine.
 
-While developed for SOUK, the readout system and this software are general-purpose enough that they can be used wherever MKIDs (or similar superconducting resonators) need a wideband, multi-tone readout.
 
 
 ## What This Package Does
 
-`souk_readout_tools` is the Python control and data acquisition package for this system. It uses a **client-server architecture**:
+`souk_readout_tools` is the Python control and data acquisition package for this system. It uses a **client-server architecture** with `ReadoutClient` and `ReadoutServer` classes:
 
-- A **server** runs on each RFSoC's ARM processor. It interfaces with the FPGA firmware through the [souk_mkid_readout](https://github.com/realtimeradio/souk-firmware) library and controls RF peripheral hardware (attenuators, amplifiers, etc.) via `souk-peripherals-control`. One server instance runs per pipeline (two per board), managing hardware state, configuration, and data tranmission.
-- A **client** runs on a remote machine and connects to an individual pipeline's server over TCP. It provides the high-level API for measurements, data acquisition, and basic analysis tools for inspecting data quality.
+- The **server** runs on each RFSoC's ARM processor. It interfaces with the FPGA firmware through the [souk_mkid_readout](https://github.com/realtimeradio/souk-firmware) library and controls RF peripheral hardware (attenuators, amplifiers, etc.) via `souk-peripherals-control`. One server instance runs per pipeline (two per board), managing hardware state, configuration, and data tranmission.
+- The **client** runs on a remote machine and connects to an individual pipeline's server over TCP. It provides the high-level API for measurements, data acquisition, and basic analysis tools for inspecting data quality.
 
 ```
  Client Machine (OCS)               RFSoC Board                                            
@@ -24,13 +23,12 @@ While developed for SOUK, the readout system and this software are general-purpo
 │                     │            │   ┌── Ubuntu 24.04 (CASPER image) ───────────────┐   │
 │                     │            │   │                                              │   │
 │    ReadoutClient A ─┼─── TCP ────┼───┼──  ReadoutServer 0 ────┐                     │   │
-│                     │            │   │                        ├── firmware_lib/     │   │
-│    ReadoutClient B ─┼─── TCP ────┼───┼──  ReadoutServer 1 ────┘   souk_mkid_readout │   │
-│                     │            │   │                                   │          │   │
-│    ReadoutClient C ─┼─           │   └───────────────────────────────────┼──────────┘   │
-│                     │            ├───────────────────────────────────────┼──────────────┤
-│    ...              │            │  FPGA Programmable Logic (PL)         │              │
-│                     │            │                                       │              │
+│                     │            │   │                        ├── souk_mkid_readout │   │
+│    ReadoutClient B ─┼─── TCP ────┼───┼──  ReadoutServer 1 ────┘          │          │   │
+│                     │            │   └───────────────────────────────────┼──────────┘   │
+│    ReadoutClient C ─┼─           ├───────────────────────────────────────┼──────────────┤
+│                     │            │  FPGA Programmable Logic (PL)         │              │
+│    ...              │            │                                       │              │
 │                     │            │   ┌── SOUK Firmware ──────────────────┴──────────┐   │
 │    ReadoutClient N ─┼─           │   │                                              │   │
 │                     │            │   │                   Pipeline 0     Pipeline 1  │   │
@@ -43,12 +41,12 @@ While developed for SOUK, the readout system and this software are general-purpo
                                                            TX0   RX0      TX1   RX1         
 ```
 
-Each server uses two TCP ports - a **request port** for JSON command/response control and a **stream port** for binary data transfer.
+Each `ReadoutServer` uses two TCP ports - a **request port** for JSON command/response control and a **stream port** for binary data transfer.
 
 ### Capabilities
 
 - **Tone control** - set frequencies, amplitudes, and phases for up to 2048 readout tones per pipeline with full TX/RX power calibration through the entire signal chain (DSP → DAC → RF frontend → cryostat → detector). Tone updates happen on millisecond timescales, enabling fast resonator tracking.
-- **Data acquisition** - discrete samples, continuous streaming, triggered streaming, and single tone pre-accumulator snapshots (1024 sample bursts at the raw channeliser rate)
+- **Data acquisition** - discrete samples, continuous streaming, triggered streaming, and single tone snapshots (1024 sample bursts at the pre-accumulator rate)
 - **Frequency sweeping** - wideband survey sweeps across the full RF band and targeted sweeps around individual resonances
 - **Resonance finding** - automated peak detection across multiple data formats (magnitude, phase, group delay, |dS21/df|, etc), plus an interactive PyQt5 GUI
 - **Retuning** - sweep-and-retune workflows to track drifting resonances using max-derivative or min-magnitude methods
@@ -65,13 +63,14 @@ Each server uses two TCP ports - a **request port** for JSON command/response co
 
 Most users only need the client. The server should already be running on the RFSoC.
 
+Clone the repository and initialise submodules:
 ```bash
 git clone https://github.com/sr-cdf/souk_readout_tools
 cd souk_readout_tools
 git submodule init && git submodule update
 ```
 
-Create a virtual environment and install:
+Create a python virtual environment and install:
 
 ```bash
 python3 -m venv client_venv
@@ -79,7 +78,7 @@ source ./client_venv/bin/activate
 pip install .
 ```
 
-The installer auto-detects your platform and installs client components on non-Xilinx machines. On Windows, use `python -m venv` and `.\client_venv\Scripts\Activate.ps1` instead.
+On Windows, use `python -m venv` and `.\client_venv\Scripts\Activate.ps1` instead.
 
 Connect to a running server and pull its config:
 
@@ -134,7 +133,7 @@ For full installation details (including server setup, SD card imaging, and daem
 |---------|-------------|
 | `souk-readout-server` | Start the readout server (optional config path, `-p` for pipeline) |
 | `souk-enable-daemon` | Enable the server as a systemd service (`-p 0 1` for both pipelines) |
-| `souk-disable-daemon` | Disable the server systemd service |
+| `souk-disable-daemon` | Disable the server systemd service(s) |
 
 ## Documentation
 
@@ -149,7 +148,7 @@ For full installation details (including server setup, SD card imaging, and daem
 
 YAML-based configuration with five sections: `rfsoc_host`, `firmware`, `rf_frontend`, `cryostat`, and `detector`. A template config with all parameters and defaults is bundled with the package. Config files live wherever you choose on the client side - keep them with your measurement data.
 
-The standard workflow is: create or pull a config, edit hardware-specific settings, connect with it, and use `push_config()` / `pull_config()` to synchronise with the server. Calibration files referenced in the config are transferred automatically.
+The standard workflow is: create or pull a config, edit hardware-/firmware-specific settings, connect with it, and use `push_config()` / `pull_config()` to synchronise with the server. Calibration files referenced in the config are transferred automatically.
 
 See [Getting Started - Configuration](doc/getting_started.md#configuration) for details.
 
