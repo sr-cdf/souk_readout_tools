@@ -3899,6 +3899,9 @@ def maximise_tx_power(r,config_dict=None, headroom_db=2.0):
             break  # overflow at this shift — use the previous safe value
         best_fftshift = int(shift)
 
+    # Find the index of best_fftshift in the shift schedule for stepping back
+    best_fftshift_idx = list(psb_fftshifts).index(best_fftshift)
+
     fftshift_gain = (best_fftshift+1) /(init_psb_fftshift+1) #assume shift stages are all ones.
     r.psb.set_fftshift(best_fftshift)
     print('Best FFT Shift set:',format(best_fftshift,'#016b'))
@@ -3917,30 +3920,52 @@ def maximise_tx_power(r,config_dict=None, headroom_db=2.0):
         scale_current = scalemin
 
     # Ramp up: double until overflow or DAC saturation
-    low = scale_current
-    high = scale_current
-    while high <= scalemax:
-        r.psbscale.set_scale(high)
-        time.sleep(0.01)
-        ovf = check_dsp_overflow(r,0.5)[1]['psbscale_ovf_delta']
-        sat = check_output_saturation(r,iterations=10)[0]
-        print('Maximise psb_scale (ramp):',high,'ovf:',ovf,'sat:',sat)
-        if ovf or sat:
-            break
-        low = high
-        high = min(high * 2, scalemax)
-        if low == scalemax:
-            break
+    # If PSB filterbank overflow is detected during the ramp, the FFT shift
+    # was marginal — step it back one level and restart the ramp.
+    psb_ovf_during_ramp = True
+    while psb_ovf_during_ramp:
+        psb_ovf_during_ramp = False
+        low = scale_current
+        high = scale_current
+        while high <= scalemax:
+            r.psbscale.set_scale(high)
+            time.sleep(0.01)
+            ovf_details = check_dsp_overflow(r,0.5)[1]
+            ovf = ovf_details['psbscale_ovf_delta']
+            psb_ovf = ovf_details['psb_ovf_delta']
+            sat = check_output_saturation(r,iterations=10)[0]
+            print('Maximise psb_scale (ramp):',high,'ovf:',ovf,'psb_ovf:',psb_ovf,'sat:',sat)
+            if psb_ovf:
+                # FFT shift was marginal — step back and restart
+                if best_fftshift_idx == 0:
+                    raise RuntimeError('PSB filterbank overflow at safest FFT shift — cannot maximise')
+                best_fftshift_idx -= 1
+                best_fftshift = int(psb_fftshifts[best_fftshift_idx])
+                r.psb.set_fftshift(best_fftshift)
+                r.psbscale.set_scale(scale_current)
+                print('PSB filterbank overflow during scale ramp — stepping back fftshift to',
+                      format(best_fftshift,'#016b'))
+                time.sleep(0.01)
+                psb_ovf_during_ramp = True
+                break
+            if ovf or sat:
+                break
+            low = high
+            high = min(high * 2, scalemax)
+            if low == scalemax:
+                break
 
     # Binary search between last safe (low) and first overflow (high)
     while (high - low) > tolerance * low:
         mid = (high + low) / 2
         r.psbscale.set_scale(mid)
         time.sleep(0.01)
-        ovf = check_dsp_overflow(r,0.5)[1]['psbscale_ovf_delta']
+        ovf_details = check_dsp_overflow(r,0.5)[1]
+        ovf = ovf_details['psbscale_ovf_delta']
+        psb_ovf = ovf_details['psb_ovf_delta']
         sat = check_output_saturation(r,iterations=10)[0]
-        print('Maximise psb_scale (search):',mid,'ovf:',ovf,'sat:',sat)
-        if ovf or sat:
+        print('Maximise psb_scale (search):',mid,'ovf:',ovf,'psb_ovf:',psb_ovf,'sat:',sat)
+        if ovf or sat or psb_ovf:
             high = mid
         else:
             low = mid
@@ -4055,27 +4080,50 @@ def optimise_tx_snr(r,config_dict=None):
         if psb_ovf:
             break  # overflow at this shift — use the previous safe value
         best_fftshift = int(shift)
-    fftshift_gain = (best_fftshift+1) /(init_psb_fftshift+1) #assume shift stages are all ones.
-    r.psb.set_fftshift(best_fftshift)
-    print('Best FFT Shift set:',format(best_fftshift,'#016b'))
+    best_fftshift_idx = list(psb_fftshifts).index(best_fftshift)
 
-    time.sleep(0.01)
+    # Set psb_scale to compensate for change in amps and fftshift.
+    # If PSB filterbank overflow is detected, the FFT shift was marginal —
+    # step it back and retry.
+    while True:
+        fftshift_gain = (best_fftshift+1) /(init_psb_fftshift+1) #assume shift stages are all ones.
+        r.psb.set_fftshift(best_fftshift)
+        print('Best FFT Shift set:',format(best_fftshift,'#016b'))
+        time.sleep(0.01)
 
-    #adjust psb scale to compensate for change in amps and fftshift
-    psb_gain = 1/fftshift_gain * 1/amps_gain
-    psb_scale = init_psb_scale * psb_gain
-    r.psbscale.set_scale(psb_scale)
-    time.sleep(0.01)
+        #adjust psb scale to compensate for change in amps and fftshift
+        psb_gain = 1/fftshift_gain * 1/amps_gain
+        psb_scale = init_psb_scale * psb_gain
+        r.psbscale.set_scale(psb_scale)
+        time.sleep(0.01)
 
-    #check not overflowing and revert if so.
-    dsp_overflow, dsp_overflow_details = check_dsp_overflow(r,0.5)
-    dac_saturation, dac_levels = check_output_saturation(r,iterations=50)
-    if dac_saturation or dsp_overflow_details['psb_ovf_delta'] or dsp_overflow_details['psbscale_ovf_delta']:
-        print('DAC or DSP Saturated... reverting to initial settings')
-        set_tone_amplitudes(r,config_dict,init_amps)
-        r.psb.set_fftshift(init_psb_fftshift)
-        r.psbscale.set_scale(init_psb_scale)
-        raise ValueError('TX DSP overflow detected')
+        #check not overflowing
+        dsp_overflow, dsp_overflow_details = check_dsp_overflow(r,0.5)
+        dac_saturation, dac_levels = check_output_saturation(r,iterations=50)
+        psb_ovf = dsp_overflow_details['psb_ovf_delta']
+        psbscale_ovf = dsp_overflow_details['psbscale_ovf_delta']
+
+        if psb_ovf:
+            # FFT shift was marginal — step back and retry
+            if best_fftshift_idx == 0:
+                print('DAC or DSP Saturated... reverting to initial settings')
+                set_tone_amplitudes(r,config_dict,init_amps)
+                r.psb.set_fftshift(init_psb_fftshift)
+                r.psbscale.set_scale(init_psb_scale)
+                raise ValueError('PSB filterbank overflow at safest FFT shift — cannot optimise')
+            best_fftshift_idx -= 1
+            best_fftshift = int(psb_fftshifts[best_fftshift_idx])
+            print('PSB filterbank overflow — stepping back fftshift to',
+                  format(best_fftshift,'#016b'))
+            continue
+
+        if dac_saturation or psbscale_ovf:
+            print('DAC or DSP Saturated... reverting to initial settings')
+            set_tone_amplitudes(r,config_dict,init_amps)
+            r.psb.set_fftshift(init_psb_fftshift)
+            r.psbscale.set_scale(init_psb_scale)
+            raise ValueError('TX DSP overflow detected')
+        break
 
     #verify output power is preserved
     achieved_powers = get_tone_powers(r, config_dict)
@@ -4214,7 +4262,23 @@ def maximise_rx_power(r,config_dict,headroom_db = 2.0, rf_peripherals=None):
         pfb_fft_overflow.append(pfb_ovf)
         print('Maximise fftshift:',format(shift,'#016b'),pfb_ovf)
 
-    best_fftshift = int(pfb_fftshifts[np.argmin(pfb_fft_overflow)]) # assume higher power from lower fftshift
+    best_fftshift_idx = int(np.argmin(pfb_fft_overflow)) # assume higher power from lower fftshift
+    best_fftshift = int(pfb_fftshifts[best_fftshift_idx])
+
+    # Verify the chosen shift doesn't overflow under sustained operation.
+    # If it does, step back to a safer (higher) shift value.
+    while best_fftshift_idx < len(pfb_fftshifts) - 1:
+        r.pfb.set_fftshift(best_fftshift)
+        time.sleep(0.01)
+        dsp_overflow_details = check_dsp_overflow(r,1.0)[1]
+        pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
+        if not pfb_ovf:
+            break
+        print('PFB overflow during verification — stepping back fftshift from',
+              format(best_fftshift,'#016b'))
+        best_fftshift_idx += 1
+        best_fftshift = int(pfb_fftshifts[best_fftshift_idx])
+
     fftshift_gain = (best_fftshift+1) /(init_pfb_fftshift+1) #assume shift stages are all ones.
     r.pfb.set_fftshift(best_fftshift)
     print('Best FFT Shift set:',format(best_fftshift,'#016b'))
@@ -4245,7 +4309,23 @@ def optimise_rx_snr(r,config_dict=None):
         pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
         pfb_fft_overflow.append(pfb_ovf)
         print(i,shift,pfb_ovf)
-    best_fftshift = int(pfb_fftshifts[np.argmin(pfb_fft_overflow)]) # assume higher power from lower fftshift
+    best_fftshift_idx = int(np.argmin(pfb_fft_overflow)) # assume higher power from lower fftshift
+    best_fftshift = int(pfb_fftshifts[best_fftshift_idx])
+
+    # Verify the chosen shift doesn't overflow under sustained operation.
+    # If it does, step back to a safer (higher) shift value.
+    while best_fftshift_idx < len(pfb_fftshifts) - 1:
+        r.pfb.set_fftshift(best_fftshift)
+        time.sleep(0.01)
+        dsp_overflow_details = check_dsp_overflow(r,1.0)[1]
+        pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
+        if not pfb_ovf:
+            break
+        print('PFB overflow during verification — stepping back fftshift from',
+              format(best_fftshift,'#016b'))
+        best_fftshift_idx += 1
+        best_fftshift = int(pfb_fftshifts[best_fftshift_idx])
+
     fftshift_gain = (best_fftshift+1) /(init_pfb_fftshift+1) #assume shift stages are all ones.
     r.pfb.set_fftshift(best_fftshift)
     print('Best FFT Shift set:',format(best_fftshift,'#016b'))
