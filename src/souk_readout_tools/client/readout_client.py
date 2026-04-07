@@ -2330,7 +2330,8 @@ class ReadoutClient:
     def wideband_sweep(self, bandwidth_hz=None, center_freq_hz=None, step_size_hz=10000,
                        num_tones=1024, samples_per_point=10, tone_powers_dbm='auto',
                        apply_phase_correction=False,
-                       remove_phase_slope=True, verbose=True):
+                       remove_phase_slope=True, optimise_dynamic_range=False,
+                       verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
 
@@ -2355,6 +2356,9 @@ class ReadoutClient:
                                            no longer needed following firmware fixes.
             remove_phase_slope (bool): Remove linear phase slope from the sweep data.
                                        Default is True.
+            optimise_dynamic_range (bool): If True, maximise DAC bit utilisation and
+                adjust the analog chain to hit the target power when setting tone
+                powers. Passed through to set_tone_powers(). Default is False.
             verbose (bool): Print progress information. Default is True.
 
         Returns:
@@ -2464,7 +2468,7 @@ class ReadoutClient:
         elif tone_powers_dbm is not None:
             self.set_tone_powers(np.broadcast_to(
                 np.atleast_1d(tone_powers_dbm), num_tones,
-            ))
+            ), optimise_dynamic_range=optimise_dynamic_range)
         else:
             self.set_tone_amplitudes(np.ones(num_tones))
 

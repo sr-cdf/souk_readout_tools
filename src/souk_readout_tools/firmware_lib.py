@@ -5647,9 +5647,15 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
 
     error = achieved - powers_dbm
     max_error = float(np.max(np.abs(error)))
+    worst_idx = int(np.argmax(np.abs(error)))
     print(f'  Step 7: verification — max power error = {max_error:.2f} dB')
     if max_error > 1.0:
-        msg = f'Power error exceeds 1 dB (max = {max_error:.1f} dB)'
+        msg = (f'Target power not achieved: requested {powers_dbm[worst_idx]:.1f} dBm '
+               f'but achieved {achieved[worst_idx]:.1f} dBm '
+               f'at {reference_plane} (error {error[worst_idx]:+.1f} dB, '
+               f'{len(powers_dbm)} tones). '
+               f'The total requested power ({10*np.log10(np.sum(10**(powers_dbm/10))):.1f} dBm) '
+               f'may exceed DAC capability.')
         print(f'  WARNING: {msg}')
         warnings_list.append(msg)
 
