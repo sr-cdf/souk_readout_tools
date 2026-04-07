@@ -3857,7 +3857,14 @@ def _apply_per_bin_scaling(r, config_dict, amps):
 
 def maximise_tx_power(r,config_dict=None, headroom_db=2.0):
     """
-    Maximise the tx amplitudes, psb fft shift and psb scale, avoiding saturation.
+    Maximise the tx output power with the best digital dynamic range,
+    avoiding DSP overflow and DAC saturation.
+
+    Scales tone amplitudes to near-max, finds the highest PSB FFT shift
+    (least attenuation) without PSB overflow, then ramps up PSB scale to
+    just below DAC saturation.  All gain changes are compensated via
+    psb_scale before they take effect so the RF chain never sees transient
+    spikes.
 
     Parameters
     ----------
@@ -3871,30 +3878,43 @@ def maximise_tx_power(r,config_dict=None, headroom_db=2.0):
     init_amps = get_tone_amplitudes(r,config_dict)
     init_psb_scale = r.psbscale.get_scale()
     init_psb_fftshift = r.psb.get_fftshift()
-    # init_tone_powers,init_tone_powers_details = get_tone_powers(r,config_dict,detailed_output=True)
 
-    #maximise amps
+    # --- Step 1: Maximise amplitudes, compensate psb_scale to keep DAC output constant ---
     max_amp = 1-2**-12
     amps_max = np.max(init_amps)
     if amps_max == 0:
         raise ValueError('Tone powers are all zero')
     amps_gain = max_amp/amps_max
-    amps = init_amps*amps_gain
+    compensated_scale = init_psb_scale / amps_gain
+    scalemin = 1/256
+    scalemax = 255
+    compensated_scale = float(np.clip(compensated_scale, scalemin, scalemax))
+    r.psbscale.set_scale(compensated_scale)
+    time.sleep(0.01)
+    amps = init_amps * amps_gain
     amps = _apply_per_bin_scaling(r, config_dict, amps)
     print('Maximise amplitudes:',amps)
     set_tone_amplitudes(r,config_dict,amps)
     time.sleep(0.01)
 
-    #adjust fft shift to avoid overflow
-    #iterate from most attenuated (safest) to least attenuated, stop on overflow
+    # --- Step 2: Find best PSB FFT shift without overflow ---
+    # Pre-compensate psb_scale before each fftshift change to keep DAC output constant.
     psb_fftshifts = (2**np.arange(14)-1).astype(int)[::-1]  # 8191, 4095, ..., 1, 0
     best_fftshift = int(psb_fftshifts[0])  # start with safest
+    current_fftshift = r.psb.get_fftshift()
+    current_popcount = bin(current_fftshift).count('1')
+    current_scale = r.psbscale.get_scale()
     for shift in psb_fftshifts:
+        popcount = bin(shift).count('1')
+        # PSB FFT gain ∝ 2^(popcount+1).  Pre-compensate psbscale.
+        comp_scale = current_scale * 2**(current_popcount - popcount)
+        comp_scale = float(np.clip(comp_scale, scalemin, scalemax))
+        r.psbscale.set_scale(comp_scale)
         r.psb.set_fftshift(shift)
         time.sleep(0.01)
         dsp_overflow, dsp_overflow_details = check_dsp_overflow(r,0.5)
         psb_ovf = dsp_overflow_details['psb_ovf_delta']
-        print('Maximise fftshift:',format(shift,'#016b'),psb_ovf)
+        print('Maximise fftshift:',format(shift,'#016b'),'psbscale:',f'{comp_scale:.6f}','ovf:',psb_ovf)
         if psb_ovf:
             break  # overflow at this shift — use the previous safe value
         best_fftshift = int(shift)
@@ -3902,16 +3922,16 @@ def maximise_tx_power(r,config_dict=None, headroom_db=2.0):
     # Find the index of best_fftshift in the shift schedule for stepping back
     best_fftshift_idx = list(psb_fftshifts).index(best_fftshift)
 
-    fftshift_gain = (best_fftshift+1) /(init_psb_fftshift+1) #assume shift stages are all ones.
     r.psb.set_fftshift(best_fftshift)
+    # Restore compensated psbscale for the chosen fftshift
+    best_popcount = bin(best_fftshift).count('1')
+    comp_scale = current_scale * 2**(current_popcount - best_popcount)
+    comp_scale = float(np.clip(comp_scale, scalemin, scalemax))
+    r.psbscale.set_scale(comp_scale)
     print('Best FFT Shift set:',format(best_fftshift,'#016b'))
-
     time.sleep(0.01)
 
-    #adjust psb scale up until just before overflow or DAC saturation
-    #use exponential ramp-up from current value, then binary search
-    scalemax=255
-    scalemin=1/256
+    # --- Step 3: Ramp up PSB scale to maximise DAC output ---
     tolerance = 0.1 #10% of lower bound
     headroom_linear = 10**(-headroom_db/20)
 
@@ -4042,10 +4062,15 @@ def fix_dac_saturation(r,config_dict=None):
 
 def optimise_tx_snr(r,config_dict=None):
     """
-    Optimise the tx amplitudes, psb fft shift and psb scale. Maintain the same power but maximise the SNR.
+    Optimise the tx digital dynamic range while preserving output power.
 
-    Rescale the tx amplitudes to the maximum possible and then the psb fft shift to get the highest gain.
-    Then adjust psb scale to return to the original powers.
+    Rescales tone amplitudes to near-max to use the most DAC bits (better
+    SNR), finds the highest PSB FFT shift without overflow, then adjusts
+    psb_scale so the overall product (amps × fftshift_gain × psb_scale)
+    is unchanged — keeping the DAC output power constant.
+
+    All intermediate gain changes are pre-compensated via psb_scale so the
+    RF chain never sees transient power spikes.
     """
     #get initial levels and settings
     init_dac_saturation, init_dac_levels = check_output_saturation(r,iterations=50)
@@ -4056,44 +4081,66 @@ def optimise_tx_snr(r,config_dict=None):
     init_psb_scale = r.psbscale.get_scale()
     init_psb_fftshift = r.psb.get_fftshift()
     init_powers = get_tone_powers(r,config_dict)
+    scalemin = 1/256
+    scalemax = 255
 
-    #rescale amps
+    # --- Step 1: Maximise amplitudes, pre-compensate psb_scale ---
     max_amp = 1-2**-12
     amps_max = np.max(init_amps)
     if amps_max == 0:
         raise ValueError('Tone powers are all zero')
     amps_gain = max_amp/amps_max
+    # Reduce psb_scale by the same factor BEFORE boosting amps
+    compensated_scale = init_psb_scale / amps_gain
+    compensated_scale = float(np.clip(compensated_scale, scalemin, scalemax))
+    r.psbscale.set_scale(compensated_scale)
+    time.sleep(0.01)
     amps = init_amps*amps_gain
     amps = _apply_per_bin_scaling(r, config_dict, amps)
     print('Maximise amplitudes:',amps)
     set_tone_amplitudes(r,config_dict,amps)
+    time.sleep(0.01)
 
-    #adjust fft shift — iterate from safest to least attenuated, stop on overflow
+    # --- Step 2: Find best PSB FFT shift without overflow ---
+    # Pre-compensate psb_scale before each fftshift change.
     psb_fftshifts = (2**np.arange(14)-1).astype(int)[::-1]  # 8191, 4095, ..., 1, 0
     best_fftshift = int(psb_fftshifts[0])  # start with safest
+    current_fftshift = r.psb.get_fftshift()
+    current_popcount = bin(current_fftshift).count('1')
+    current_scale = r.psbscale.get_scale()
     for shift in psb_fftshifts:
+        popcount = bin(shift).count('1')
+        # PSB FFT gain ∝ 2^(popcount+1).  Pre-compensate psbscale.
+        comp_scale = current_scale * 2**(current_popcount - popcount)
+        comp_scale = float(np.clip(comp_scale, scalemin, scalemax))
+        r.psbscale.set_scale(comp_scale)
         r.psb.set_fftshift(shift)
         time.sleep(0.01)
         dsp_overflow, dsp_overflow_details = check_dsp_overflow(r,0.5)
         psb_ovf = dsp_overflow_details['psb_ovf_delta']
-        print('Maximise fftshift:',format(shift,'#016b'),psb_ovf)
+        print('Maximise fftshift:',format(shift,'#016b'),'psbscale:',f'{comp_scale:.6f}','ovf:',psb_ovf)
         if psb_ovf:
             break  # overflow at this shift — use the previous safe value
         best_fftshift = int(shift)
     best_fftshift_idx = list(psb_fftshifts).index(best_fftshift)
 
-    # Set psb_scale to compensate for change in amps and fftshift.
-    # If PSB filterbank overflow is detected, the FFT shift was marginal —
-    # step it back and retry.
+    # --- Step 3: Set final psb_scale to preserve original output power ---
+    # The total gain change is: amps_gain × fftshift_gain_change.
+    # psb_scale must be divided by this to keep output constant.
+    init_popcount = bin(init_psb_fftshift).count('1')
+    best_popcount = bin(best_fftshift).count('1')
+    fftshift_gain = 2**(init_popcount - best_popcount)  # >1 if best has fewer set bits (more gain)
+    psb_gain = 1.0 / (fftshift_gain * amps_gain)
+    psb_scale = init_psb_scale * psb_gain
+
+    # Verify chosen settings don't overflow.  If PSB filterbank overflow is
+    # detected, the FFT shift was marginal — step it back and retry.
     while True:
-        fftshift_gain = (best_fftshift+1) /(init_psb_fftshift+1) #assume shift stages are all ones.
         r.psb.set_fftshift(best_fftshift)
         print('Best FFT Shift set:',format(best_fftshift,'#016b'))
         time.sleep(0.01)
 
-        #adjust psb scale to compensate for change in amps and fftshift
-        psb_gain = 1/fftshift_gain * 1/amps_gain
-        psb_scale = init_psb_scale * psb_gain
+        psb_scale = float(np.clip(psb_scale, scalemin, scalemax))
         r.psbscale.set_scale(psb_scale)
         time.sleep(0.01)
 
@@ -4113,6 +4160,11 @@ def optimise_tx_snr(r,config_dict=None):
                 raise ValueError('PSB filterbank overflow at safest FFT shift — cannot optimise')
             best_fftshift_idx -= 1
             best_fftshift = int(psb_fftshifts[best_fftshift_idx])
+            # Recompute psb_scale for the new fftshift
+            best_popcount = bin(best_fftshift).count('1')
+            fftshift_gain = 2**(init_popcount - best_popcount)
+            psb_gain = 1.0 / (fftshift_gain * amps_gain)
+            psb_scale = init_psb_scale * psb_gain
             print('PSB filterbank overflow — stepping back fftshift to',
                   format(best_fftshift,'#016b'))
             continue
@@ -4252,36 +4304,39 @@ def maximise_rx_power(r,config_dict,headroom_db = 2.0, rf_peripherals=None):
     print(f'Current ADC Headroom = {20*np.log10(maxlevel)} dB')
 
     # --- Step 3: Optimise PFB FFT shift ---
-    pfb_fft_overflow = []
-    pfb_fftshifts = (2**np.arange(14)-1).astype(int)
-    for i,shift in enumerate(pfb_fftshifts):
+    # The RX PFB is an analysis filterbank (inverse of TX PSB synthesis).
+    # More bits set in fftshift = more divide-by-2 stages = more attenuation.
+    # shift=0 is maximum gain, shift=8191 is maximum attenuation.
+    # Iterate from least attenuation to most; first non-overflow is optimal.
+    pfb_fftshifts = (2**np.arange(14) - 1).astype(int)  # 0, 1, 3, 7, ..., 8191
+    best_fftshift = int(pfb_fftshifts[-1])  # fallback to safest
+    for shift in pfb_fftshifts:
         r.pfb.set_fftshift(shift)
         time.sleep(0.01)
-        dsp_overflow, dsp_overflow_details = check_dsp_overflow(r,0.5)
+        dsp_overflow_details = check_dsp_overflow(r, 0.5)[1]
         pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
-        pfb_fft_overflow.append(pfb_ovf)
-        print('Maximise fftshift:',format(shift,'#016b'),pfb_ovf)
-
-    best_fftshift_idx = int(np.argmin(pfb_fft_overflow)) # assume higher power from lower fftshift
-    best_fftshift = int(pfb_fftshifts[best_fftshift_idx])
-
-    # Verify the chosen shift doesn't overflow under sustained operation.
-    # If it does, step back to a safer (higher) shift value.
-    while best_fftshift_idx < len(pfb_fftshifts) - 1:
-        r.pfb.set_fftshift(best_fftshift)
-        time.sleep(0.01)
-        dsp_overflow_details = check_dsp_overflow(r,1.0)[1]
-        pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
+        print(f'  PFB fftshift: {format(shift, "#016b")} overflow: {pfb_ovf}')
         if not pfb_ovf:
-            break
-        print('PFB overflow during verification — stepping back fftshift from',
-              format(best_fftshift,'#016b'))
-        best_fftshift_idx += 1
-        best_fftshift = int(pfb_fftshifts[best_fftshift_idx])
+            best_fftshift = int(shift)
+            break  # least attenuation without overflow — optimal
 
-    fftshift_gain = (best_fftshift+1) /(init_pfb_fftshift+1) #assume shift stages are all ones.
+    # Verify under sustained operation
     r.pfb.set_fftshift(best_fftshift)
-    print('Best FFT Shift set:',format(best_fftshift,'#016b'))
+    time.sleep(0.01)
+    dsp_overflow_details = check_dsp_overflow(r, 1.0)[1]
+    pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
+    if pfb_ovf:
+        # Step to next safer (more attenuating) shift
+        best_idx = list(pfb_fftshifts).index(best_fftshift)
+        if best_idx < len(pfb_fftshifts) - 1:
+            best_fftshift = int(pfb_fftshifts[best_idx + 1])
+            r.pfb.set_fftshift(best_fftshift)
+            print(f'  PFB overflow during verification — stepped to {format(best_fftshift, "#016b")}')
+        else:
+            print(f'  WARNING: PFB overflow even at safest shift')
+
+    r.pfb.set_fftshift(best_fftshift)
+    print(f'Best PFB fftshift: {format(best_fftshift, "#016b")}')
     time.sleep(0.01)
     return best_dsa,best_fftshift, check_dsp_overflow(r,0.5)[1], levels, best_rx_atten
 
@@ -4292,46 +4347,159 @@ def fix_adc_saturation(r,config_dict, rf_peripherals=None):
         raise ValueError('ADC saturation detected at maximum attenuation')
     return best_dsa,best_fftshift, dsp_ovf, levels, best_rx_atten
 
-def optimise_rx_snr(r,config_dict=None):
-    init_adc_saturation, init_adc_levels = check_input_saturation(r,iterations=50)
+def optimise_rx_snr(r, config_dict=None, rf_peripherals=None):
+    """
+    Optimise the RX digital dynamic range while preserving signal levels.
+
+    Maximises ADC bit utilisation by reducing analog attenuation (RX
+    variable attenuator and ADC DSA) as far as possible without ADC
+    saturation, then finds the best PFB FFT shift to avoid DSP overflow.
+
+    The PFB FFT shift search iterates from least attenuation (most gain)
+    to most attenuation, stopping at the first shift that doesn't overflow.
+
+    Parameters
+    ----------
+    r : readout interface
+    config_dict : dict
+    rf_peripherals : RFPeripheralController or None
+        If provided and enabled, the RX variable attenuator is reduced
+        to minimize analog attenuation before the ADC.
+    """
+    adc_tile = int(config_dict['firmware']['adc_tile'])
+    adc_block = int(config_dict['firmware']['adc_block'])
+
+    init_adc_saturation, init_adc_levels = check_input_saturation(r, iterations=50)
     if init_adc_saturation:
         raise ValueError('ADC saturation detected prior to optimisation')
-
-    #adjust fft shift
     init_pfb_fftshift = r.pfb.get_fftshift()
 
-    pfb_fft_overflow = []
-    pfb_fftshifts = (2**np.arange(14)-1).astype(int)
-    for i,shift in enumerate(pfb_fftshifts):
+    # --- Step 1: Reduce RX analog attenuation to maximize ADC bits ---
+    best_rx_atten = None
+    if rf_peripherals is not None and rf_peripherals.enabled:
+        print('optimise_rx_snr: reducing RX attenuation to maximise ADC bits...')
+        atten_min = rf_peripherals.ATTEN_MIN
+        atten_max = rf_peripherals.ATTEN_MAX
+        atten_step = rf_peripherals.ATTEN_STEP
+        current_rx_atten = rf_peripherals.get_rx_attenuation()
+
+        # Try minimum attenuation first
+        rf_peripherals.set_rx_attenuation(atten_min)
+        time.sleep(0.1)
+        check, levels = check_input_saturation(r, iterations=50)
+        print(f'  RX atten: {atten_min:.1f} dB, Saturated: {check}')
+
+        if not check:
+            best_rx_atten = atten_min
+            print(f'  No saturation at minimum RX attenuation: {atten_min} dB')
+        else:
+            # Binary search for lowest attenuation without saturation
+            attenuations = np.arange(atten_min, atten_max + atten_step, atten_step)
+            low_idx = 0
+            high_idx = len(attenuations) - 1
+            best_rx_atten = current_rx_atten  # fallback to current
+
+            while low_idx <= high_idx:
+                mid_idx = (low_idx + high_idx) // 2
+                mid_att = attenuations[mid_idx]
+                rf_peripherals.set_rx_attenuation(mid_att)
+                time.sleep(0.1)
+                check, levels = check_input_saturation(r, iterations=50)
+                print(f'  RX atten: {mid_att:.1f} dB, Saturated: {check}')
+                if check:
+                    low_idx = mid_idx + 1
+                else:
+                    best_rx_atten = mid_att
+                    high_idx = mid_idx - 1
+
+            # Add small headroom
+            best_rx_atten = min(best_rx_atten + 0.5, atten_max)
+            print(f'  Optimal RX attenuation: {best_rx_atten} dB')
+
+        rf_peripherals.set_rx_attenuation(best_rx_atten)
+        time.sleep(0.1)
+
+    # --- Step 2: Reduce ADC DSA to maximize ADC bits ---
+    current_dsa = float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
+    if current_dsa > 0:
+        print(f'optimise_rx_snr: reducing ADC DSA from {current_dsa:.1f} dB...')
+        # Try minimum DSA
+        r.rfdc.core.set_dsa(adc_tile, adc_block, 0)
+        time.sleep(0.1)
+        check, levels = check_input_saturation(r, iterations=50)
+        print(f'  DSA: 0 dB, Saturated: {check}')
+
+        if not check:
+            best_dsa = 0
+            print(f'  No saturation at minimum DSA')
+        else:
+            # Binary search for lowest DSA without saturation
+            dsamax = current_dsa
+            dsamin = 0
+            step_size = 0.25
+            attenuations = np.arange(dsamin, dsamax + step_size, step_size)
+            low_idx = 0
+            high_idx = len(attenuations) - 1
+            best_dsa = current_dsa  # fallback to current
+
+            while low_idx <= high_idx:
+                mid_idx = (low_idx + high_idx) // 2
+                mid_att = attenuations[mid_idx]
+                r.rfdc.core.set_dsa(adc_tile, adc_block, mid_att)
+                time.sleep(0.1)
+                check, levels = check_input_saturation(r, iterations=50)
+                print(f'  DSA: {mid_att:.2f} dB, Saturated: {check}')
+                if check:
+                    low_idx = mid_idx + 1
+                else:
+                    best_dsa = mid_att
+                    high_idx = mid_idx - 1
+
+            # Add headroom (1 dB) to avoid marginal saturation
+            best_dsa = min(best_dsa + 1.0, 27.0)
+            print(f'  Optimal DSA: {best_dsa:.2f} dB')
+
+        r.rfdc.core.set_dsa(adc_tile, adc_block, best_dsa)
+        time.sleep(0.1)
+    else:
+        print(f'optimise_rx_snr: ADC DSA already at minimum ({current_dsa:.1f} dB)')
+
+    # --- Step 3: Find best PFB FFT shift without overflow ---
+    # Iterate from least attenuation (most gain, shift=0) to most
+    # attenuation (shift=8191).  The first shift without overflow is optimal.
+    pfb_fftshifts = (2**np.arange(14) - 1).astype(int)  # 0, 1, 3, 7, ..., 8191
+    best_fftshift = int(pfb_fftshifts[-1])  # fallback to safest
+    for shift in pfb_fftshifts:
         r.pfb.set_fftshift(shift)
         time.sleep(0.01)
-        dsp_overflow, dsp_overflow_details = check_dsp_overflow(r,0.5)
+        dsp_overflow_details = check_dsp_overflow(r, 0.5)[1]
         pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
-        pfb_fft_overflow.append(pfb_ovf)
-        print(i,shift,pfb_ovf)
-    best_fftshift_idx = int(np.argmin(pfb_fft_overflow)) # assume higher power from lower fftshift
-    best_fftshift = int(pfb_fftshifts[best_fftshift_idx])
-
-    # Verify the chosen shift doesn't overflow under sustained operation.
-    # If it does, step back to a safer (higher) shift value.
-    while best_fftshift_idx < len(pfb_fftshifts) - 1:
-        r.pfb.set_fftshift(best_fftshift)
-        time.sleep(0.01)
-        dsp_overflow_details = check_dsp_overflow(r,1.0)[1]
-        pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
+        print(f'  PFB fftshift: {format(shift, "#016b")} overflow: {pfb_ovf}')
         if not pfb_ovf:
-            break
-        print('PFB overflow during verification — stepping back fftshift from',
-              format(best_fftshift,'#016b'))
-        best_fftshift_idx += 1
-        best_fftshift = int(pfb_fftshifts[best_fftshift_idx])
+            best_fftshift = int(shift)
+            break  # least attenuation without overflow — this is optimal
 
-    fftshift_gain = (best_fftshift+1) /(init_pfb_fftshift+1) #assume shift stages are all ones.
+    # Verify under sustained operation
     r.pfb.set_fftshift(best_fftshift)
-    print('Best FFT Shift set:',format(best_fftshift,'#016b'))
     time.sleep(0.01)
-    check,levels = check_input_saturation(r,iterations=50)
-    return best_fftshift, check_dsp_overflow(r,0.5)[1],levels
+    dsp_overflow_details = check_dsp_overflow(r, 1.0)[1]
+    pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
+    if pfb_ovf:
+        # Step to next safer shift
+        best_idx = list(pfb_fftshifts).index(best_fftshift)
+        if best_idx < len(pfb_fftshifts) - 1:
+            best_fftshift = int(pfb_fftshifts[best_idx + 1])
+            r.pfb.set_fftshift(best_fftshift)
+            print(f'  PFB overflow during verification — stepped to {format(best_fftshift, "#016b")}')
+        else:
+            print(f'  WARNING: PFB overflow even at safest shift')
+    time.sleep(0.01)
+
+    r.pfb.set_fftshift(best_fftshift)
+    print(f'optimise_rx_snr: best PFB fftshift = {format(best_fftshift, "#016b")}')
+    time.sleep(0.01)
+    check, levels = check_input_saturation(r, iterations=50)
+    return best_fftshift, check_dsp_overflow(r, 0.5)[1], levels
 
 
 
@@ -5087,154 +5255,133 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
 
     # ================================================================
     # Dynamic range optimisation mode
+    #
+    # Goal: achieve the target power at the reference plane while
+    # maximising tone amplitudes (DAC bit utilisation) for best SNR.
+    #
+    # Strategy:
+    #   1. Set tone amplitudes with correct inter-tone ratios, near-max.
+    #   2. Use optimise_tx_snr to find the best PSB fftshift/scale that
+    #      keeps the DAC output constant while maximising amplitudes.
+    #   3. If rf_peripherals available, prefer analog attenuation to absorb
+    #      any excess power — this keeps the digital chain at max bits.
+    #      If not, adjust psb_scale down to hit the target (last resort).
+    #   4. Recalculate final amplitudes for exact target powers.
+    #   5. Verify.
+    #
+    # At no point should the DAC output spike above its final level.
     # ================================================================
     print(f'set_tone_powers: optimising dynamic range for {len(powers_dbm)} tones '
           f'at reference_plane={reference_plane!r}')
 
-    # Step 1: Compute amplitude ratios from target powers.
-    #         The highest-power tone maps to max amplitude; others are scaled.
-    max_target = np.max(powers_dbm)
-    amp_ratios = 10**((powers_dbm - max_target) / 20.0)  # linear voltage ratios
     max_amp = 1 - 2**-12
-    initial_amps = amp_ratios * max_amp
-    print(f'  Step 1: amplitude ratios set (max target = {max_target:.1f} dBm)')
+    max_target = float(np.max(powers_dbm))
 
-    # Step 2: Set these amplitudes and optimise PSB shift/scale.
-    #         This maximises DAC bit utilisation while preserving tone ratios.
-    set_tone_amplitudes(r, config_dict, initial_amps)
-    time.sleep(0.01)
+    # --- Step 1: Set amplitudes with correct ratios at near-max. --------
+    #     The strongest tone gets max_amp; others are scaled by the power
+    #     difference.  PSB is compensated so DAC output doesn't change.
+    amp_ratios = 10**((powers_dbm - max_target) / 20.0)  # linear voltage ratios
+    target_amps = amp_ratios * max_amp
 
-    # 2a: Find best PSB FFT shift without overflow
-    #     Iterate from most attenuated (safest) to least, stop on overflow
-    psb_fftshifts = (2**np.arange(14) - 1).astype(int)[::-1]  # 8191, 4095, ..., 1, 0
-    best_fftshift = int(psb_fftshifts[0])  # start with safest
-    for shift in psb_fftshifts:
-        r.psb.set_fftshift(shift)
+    current_amps = get_tone_amplitudes(r, config_dict)
+    current_max_amp = float(np.max(np.abs(current_amps))) if len(current_amps) > 0 else 0
+    current_psb_scale = r.psbscale.get_scale()
+
+    if current_max_amp > 0:
+        # Compensate psb_scale for the amplitude change BEFORE writing amps
+        amp_gain_factor = max_amp / current_max_amp
+        compensated_scale = current_psb_scale / amp_gain_factor
+        compensated_scale = float(np.clip(compensated_scale, 1/256, 255))
+        r.psbscale.set_scale(compensated_scale)
         time.sleep(0.01)
-        _, dsp_details = check_dsp_overflow(r, 0.5, check_rts=True)
-        psb_ovf = dsp_details['psb_ovf_delta']
-        print(f'  Step 2a: fftshift={format(shift, "#016b")} overflow={psb_ovf}')
-        if psb_ovf:
-            break  # overflow at this shift — use the previous safe value
-        best_fftshift = int(shift)
-    r.psb.set_fftshift(best_fftshift)
-    print(f'  Step 2a: best fftshift = {format(best_fftshift, "#016b")}')
-    time.sleep(0.01)
 
-    # 2b: Ramp up PSB scale from current value, then binary search
-    scalemax = 255
-    scalemin = 1/256
-    tolerance = 0.1
-    scale_current = r.psbscale.get_scale()
-    if scale_current < scalemin:
-        scale_current = scalemin
-    scale_low = scale_current
-    scale_high = scale_current
-    while scale_high <= scalemax:
-        r.psbscale.set_scale(scale_high)
-        time.sleep(0.01)
-        ovf = check_dsp_overflow(r, 0.5, check_rts=True)[1]['psbscale_ovf_delta']
-        sat = check_output_saturation(r, iterations=10)[0]
-        print(f'  Step 2b: psb_scale={scale_high:.4f} (ramp) ovf={ovf} sat={sat}')
-        if ovf or sat:
-            break
-        scale_low = scale_high
-        scale_high = min(scale_high * 2, scalemax)
-        if scale_low == scalemax:
-            break
-    while (scale_high - scale_low) > tolerance * scale_low:
-        mid = (scale_high + scale_low) / 2
-        r.psbscale.set_scale(mid)
-        time.sleep(0.01)
-        ovf = check_dsp_overflow(r, 0.5, check_rts=True)[1]['psbscale_ovf_delta']
-        sat = check_output_saturation(r, iterations=10)[0]
-        print(f'  Step 2b: psb_scale={mid:.4f} (search) ovf={ovf} sat={sat}')
-        if ovf or sat:
-            scale_high = mid
-        else:
-            scale_low = mid
-    best_psb_scale = scale_low * 10**(-2.0/20)  # 2 dB headroom
-    r.psbscale.set_scale(best_psb_scale)
+    set_tone_amplitudes(r, config_dict, target_amps)
     time.sleep(0.01)
-    print(f'  Step 2b: best psb_scale = {best_psb_scale:.4f}')
+    print(f'  Step 1: amplitudes set with correct ratios at near-max, '
+          f'psb_scale compensated ({current_psb_scale:.4f} → {r.psbscale.get_scale():.6f})')
 
-    # Step 3: Compute power at DAC after digital optimisation.
-    #         From the calibration chain we know all gains/losses, so we can
-    #         calculate the exact attenuation needed — no trial-and-error.
+    # --- Step 2: Optimise digital dynamic range. -----------------------
+    #     optimise_tx_snr maximises amplitudes and finds the best PSB
+    #     fftshift, then adjusts psb_scale to preserve output power.
+    #     Since amps are already near-max, this mainly optimises fftshift.
+    try:
+        snr_amps, snr_fftshift, snr_scale, snr_dsp, snr_dac = \
+            optimise_tx_snr(r, config_dict)
+        print(f'  Step 2: optimise_tx_snr complete — '
+              f'fftshift={format(snr_fftshift, "#016b")}, psb_scale={snr_scale:.6f}')
+    except ValueError as e:
+        msg = f'Digital optimisation failed: {e}'
+        print(f'  WARNING: {msg}')
+        warnings_list.append(msg)
+
+    # --- Step 3: Determine required analog/digital attenuation. --------
+    #     Current DAC output reflects the initial power before optimisation.
+    #     Compute how much the chain needs to attenuate (or amplify) to
+    #     hit the target at the reference plane.
+    #
+    #     We compute: target_dac_power = power the DAC needs to output for
+    #     the strongest tone to hit max_target at the reference plane, given
+    #     all downstream gains/losses.  Then delta = current - target.
     dac_powers = get_tone_powers(r, config_dict, reference_plane='dac')
     max_dac_power = float(np.max(dac_powers))
-    print(f'  Step 3: max DAC output power = {max_dac_power:.1f} dBm')
 
-    # Step 4: Analog adjustment via rf_peripherals (if available)
-    #         Strategy: enable amp, set attenuation to 0, compute chain gain,
-    #         then add exactly enough attenuation to hit the target.
+    # Downstream chain gain from DAC to reference plane (using config values)
+    chain_gain = float(np.mean(
+        -np.abs(cal_tx_combiner) - np.abs(cal_tx_atten)
+        + cal_tx_if - np.abs(cal_tx_mixer_conv)
+        + cal_tx_rf + cal_tx_amp + cal_cryo
+    )) if reference_plane == 'detector' else (
+        float(np.mean(
+            -np.abs(cal_tx_combiner) - np.abs(cal_tx_atten)
+            + cal_tx_if - np.abs(cal_tx_mixer_conv)
+            + cal_tx_rf + cal_tx_amp
+        )) if reference_plane == 'rf_output' else 0.0
+    )
+
+    current_power_at_ref = max_dac_power + chain_gain
+    delta_db = current_power_at_ref - max_target  # positive = too much power
+    print(f'  Step 3: current max DAC power = {max_dac_power:.1f} dBm, '
+          f'chain gain = {chain_gain:.1f} dB, '
+          f'power at {reference_plane} = {current_power_at_ref:.1f} dBm, '
+          f'target = {max_target:.1f} dBm, delta = {delta_db:.1f} dB')
+
+    # --- Step 4: Apply attenuation, preferring analog over digital. ----
     final_tx_atten = float(tx_attenuator_value_db) if np.isscalar(tx_attenuator_value_db) else float(np.mean(tx_attenuator_value_db))
     final_tx_amp_bypass = None
     final_tx_amp_s21 = float(np.mean(tx_bypass_amp_s21_db)) if not np.isscalar(tx_bypass_amp_s21_db) else float(tx_bypass_amp_s21_db)
 
+    remaining_delta = delta_db  # positive = need to attenuate
+
     if rf_peripherals is not None and rf_peripherals.enabled and reference_plane != 'dac':
-        # Compute chain gain with amp enabled and 0 dB attenuation
-        # Chain: DAC → combiner → IF → (attenuator=0) → mixer → RF → amp(enabled) → [cryostat]
-        chain_gain_no_atten = float(np.mean(-np.abs(cal_tx_combiner) + cal_tx_if
-                                            - np.abs(tx_mixer_conv_loss_db) + cal_tx_rf))
-
-        # Get amp gain when enabled (not bypassed)
-        rf_peripherals.set_tx_amp_bypass(False)
-        amp_s21_enabled = rf_peripherals.get_tx_total_gain() - chain_gain_no_atten  # isolate amp contribution
-        # Actually use the peripheral's own method for amp S21
-        amp_s21_enabled = rf_peripherals._get_amp_s21('transmit_atten')
-        chain_gain_no_atten += amp_s21_enabled
-
-        if reference_plane == 'detector':
-            chain_gain_no_atten += float(np.mean(cal_cryo))
-
-        # Power at reference plane with max digital, amp enabled, 0 dB atten
-        max_power_at_ref = max_dac_power + chain_gain_no_atten
-        delta = max_power_at_ref - max_target  # positive = excess power
-        print(f'  Step 4: max power at {reference_plane} = {max_power_at_ref:.1f} dBm, '
-              f'target = {max_target:.1f} dBm, delta = {delta:.1f} dB')
-
-        remaining_excess = 0.0
-        if delta > 0:
-            # Excess power — add just enough attenuation
-            desired_atten = round(delta * 2) / 2  # 0.5 dB steps
-            if desired_atten <= 31.5:
-                rf_peripherals.set_tx_attenuation(desired_atten)
-                print(f'  Step 4: TX attenuation set to {desired_atten:.1f} dB')
-            else:
-                rf_peripherals.set_tx_attenuation(31.5)
-                remaining_excess = delta - 31.5
-                # Try bypassing amp to reduce power further
-                amp_s21_bypassed = rf_peripherals._get_amp_s21('transmit_atten')
-                rf_peripherals.set_tx_amp_bypass(True)
-                amp_s21_now = rf_peripherals._get_amp_s21('transmit_atten')
-                amp_reduction = amp_s21_enabled - amp_s21_now
-                remaining_excess -= amp_reduction
-                print(f'  Step 4: TX atten=31.5 dB, amp bypassed (-{amp_reduction:.1f} dB)')
-                if remaining_excess > 0:
-                    # Last resort: RFDC DAC DSA
-                    try:
-                        current_dsa = float(r.rfdc.core.get_dsa(dac_tile, dac_block)['dsa'])
-                        new_dsa = min(current_dsa + remaining_excess, 12.0)
-                        r.rfdc.core.set_dsa(dac_tile, dac_block, new_dsa)
-                        remaining_excess -= (new_dsa - current_dsa)
-                        print(f'  Step 4: RFDC DAC DSA set to {new_dsa:.1f} dB (last resort)')
-                    except Exception as e:
-                        print(f'  Step 4: RFDC DAC DSA not available: {e}')
-                    if remaining_excess > 0:
-                        msg = (f'TX attenuator at max, amp bypassed, DSA at max — '
-                               f'{remaining_excess:.1f} dB excess remains')
-                        print(f'  WARNING: {msg}')
-                        warnings_list.append(msg)
-        elif delta < 0:
-            # Need more power than max achievable — set min attenuation
-            rf_peripherals.set_tx_attenuation(0)
-            msg = (f'Target power {-delta:.1f} dB above maximum achievable — '
-                   f'tone amplitudes may be clipped')
-            print(f'  WARNING: {msg}')
-            warnings_list.append(msg)
+        # 4a: Use TX variable attenuator first (0-31.5 dB in 0.5 dB steps)
+        if remaining_delta > 0:
+            desired_atten = min(round(remaining_delta * 2) / 2, 31.5)
+            rf_peripherals.set_tx_attenuation(desired_atten)
+            remaining_delta -= desired_atten
+            print(f'  Step 4a: TX attenuation set to {desired_atten:.1f} dB '
+                  f'(remaining delta = {remaining_delta:.1f} dB)')
         else:
             rf_peripherals.set_tx_attenuation(0)
+            print(f'  Step 4a: TX attenuation set to 0 dB (need more power)')
+
+        # 4b: If still too much power, try bypassing TX amp
+        if remaining_delta > 0 and remaining_delta > 1.0:
+            amp_s21_current = rf_peripherals._get_amp_s21('transmit_atten')
+            rf_peripherals.set_tx_amp_bypass(True)
+            amp_s21_bypassed = rf_peripherals._get_amp_s21('transmit_atten')
+            amp_reduction = amp_s21_current - amp_s21_bypassed
+            remaining_delta -= amp_reduction
+            print(f'  Step 4b: TX amp bypassed (-{amp_reduction:.1f} dB, '
+                  f'remaining delta = {remaining_delta:.1f} dB)')
+        elif remaining_delta < 0:
+            # Need more gain — ensure amp is enabled
+            rf_peripherals.set_tx_amp_bypass(False)
+            amp_s21_enabled = rf_peripherals._get_amp_s21('transmit_atten')
+            # Recalculate: we changed the amp state from what was in the chain_gain calc
+            amp_gain_change = amp_s21_enabled - float(np.mean(cal_tx_amp))
+            remaining_delta += amp_gain_change
+            print(f'  Step 4b: TX amp enabled (+{amp_gain_change:.1f} dB, '
+                  f'remaining delta = {remaining_delta:.1f} dB)')
 
         # Step 5: Compression check
         tx_1db_comp = rf_peripherals.get_tx_input_1db_comp()
@@ -5251,6 +5398,7 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
             comp_atten = rf_peripherals.get_tx_attenuation() + excess + 1.0  # +1 dB margin
             comp_atten = min(round(comp_atten * 2) / 2, 31.5)
             rf_peripherals.set_tx_attenuation(comp_atten)
+            remaining_delta -= (comp_atten - rf_peripherals.get_tx_attenuation())
             print(f'  Step 5: TX attenuation increased to {comp_atten:.1f} dB to avoid compression')
         else:
             headroom = tx_1db_comp - total_power_into_frontend
@@ -5259,13 +5407,25 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         final_tx_atten = rf_peripherals.get_tx_attenuation()
         final_tx_amp_bypass = rf_peripherals.get_tx_amp_bypass()
         final_tx_amp_s21 = rf_peripherals._get_amp_s21('transmit_atten')
-    elif optimise_dynamic_range and rf_peripherals is None:
-        msg = 'No rf_peripherals provided — only digital optimisation performed, analog chain unchanged'
-        print(f'  Step 4: {msg}')
-        warnings_list.append(msg)
 
-    # Step 6: Final amplitude calculation with the now-fixed analog settings.
-    #         Re-read analog state from config (rf_peripherals._sync_config has updated it).
+    elif rf_peripherals is None:
+        print(f'  Step 4: no rf_peripherals — analog chain unchanged')
+
+    # 4c: Any remaining delta must be absorbed digitally via psb_scale.
+    #     This is the last resort — it uses fewer DAC bits but doesn't
+    #     touch VOP current (which is slow and affects calibration).
+    if abs(remaining_delta) > 0.1:
+        current_psb_scale = r.psbscale.get_scale()
+        adjusted_scale = current_psb_scale * 10**(-remaining_delta / 20.0)
+        adjusted_scale = float(np.clip(adjusted_scale, 1/256, 255))
+        r.psbscale.set_scale(adjusted_scale)
+        time.sleep(0.01)
+        print(f'  Step 4c: psb_scale adjusted {current_psb_scale:.6f} → {adjusted_scale:.6f} '
+              f'to absorb remaining {remaining_delta:.1f} dB delta')
+
+    # --- Step 6: Final amplitude calculation. --------------------------
+    #     Re-read analog state from config (rf_peripherals may have synced
+    #     it).  _calc_amps reads the live PSB settings from hardware.
     final_atten_for_cal = config_dict['rf_frontend']['tx_attenuator_value_db']
     if final_atten_for_cal is None:
         final_atten_for_cal = 0
@@ -5285,9 +5445,9 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         warnings_list.append(msg)
 
     set_tone_amplitudes(r, config_dict, amps)
-    print(f'  Step 6: final amplitudes set')
+    print(f'  Step 6: final amplitudes set (max = {float(np.max(amps)):.6f})')
 
-    # Step 7: Verify achieved powers at the same reference plane
+    # --- Step 7: Verify achieved powers at the reference plane. --------
     achieved = get_tone_powers(r, config_dict, reference_plane=reference_plane)
 
     error = achieved - powers_dbm

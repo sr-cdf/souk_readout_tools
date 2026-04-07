@@ -1120,7 +1120,7 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success', 'result': result})
                 
                 elif request == 'optimise_rx_snr':
-                    pfb_fft_shift,dsp,adc = firmware_lib.optimise_rx_snr(self.r,self.config)
+                    pfb_fft_shift,dsp,adc = firmware_lib.optimise_rx_snr(self.r,self.config, rf_peripherals=self.rf_peripherals)
                     result = {'pfb_fft_shift': pfb_fft_shift, 'dsp_ovf': dsp, 'adc_levels': adc}
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
