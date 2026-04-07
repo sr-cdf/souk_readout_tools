@@ -5049,7 +5049,10 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         if np.any(amps > 1.0):
             n_clipped = int(np.sum(amps > 1.0))
             amps = np.clip(amps, 0, 1 - 2**-12)
-            msg = f'{n_clipped} tone(s) clipped to max amplitude — target power exceeds DAC capacity at current settings'
+            msg = (f'{n_clipped} tone(s) clipped to max amplitude — '
+                   f'target power not achievable with current digital gain settings '
+                   f'(psb_fftshift={psb_fftshift:#06x}, psb_scale={psb_scale:.4f}). '
+                   f'Use optimise_dynamic_range=True to auto-adjust')
             print(f'  WARNING: {msg}')
             warnings_list.append(msg)
         if np.any(amps < 2**-12):
