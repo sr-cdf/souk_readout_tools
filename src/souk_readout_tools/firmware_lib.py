@@ -677,13 +677,16 @@ def get_system_information(r,config_dict):
     info['rts_events'] = rts_details
 
     if pipeline_ready:
-        info['tone_frequencies'] = get_tone_frequencies(r,config_dict).tolist()
+        freqs_detailed = get_tone_frequencies(r,config_dict,detailed_output=True)
+        info['tone_frequencies'] = freqs_detailed[0].tolist()
         info['tone_amplitudes'] = get_tone_amplitudes(r,config_dict).tolist()
         info['tone_phases'] = get_tone_phases(r,config_dict).tolist()
+        info['tone_indices'] = freqs_detailed[1]['rx']['tone_indices']
     else:
         info['tone_frequencies'] = None
         info['tone_amplitudes'] = None
         info['tone_phases'] = None
+        info['tone_indices'] = None
     print('system information:')
     for key, value in info.items():
         print(f'{key}: {value}\n')

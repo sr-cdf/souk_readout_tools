@@ -414,6 +414,7 @@ class ReadoutServer:
         #firmware interface attributes
         self.r = None
         self.r_fast = None
+        self.active_tone_indices = None
         self.latest_sweep_results = {}
         self.latest_sweep_data_valid = False
         self.sweep_progress = 0.0
@@ -583,10 +584,11 @@ class ReadoutServer:
         #firmware interface attributes
         self.r = None
         self.r_fast = None
+        self.active_tone_indices = None
         self.latest_sweep_results = {}
         self.latest_sweep_data_valid = False
         self.sweep_progress = 0.0
-        
+
         #load config
         self.load_config(config_file)
         self.server_address = '0.0.0.0'
@@ -615,6 +617,7 @@ class ReadoutServer:
         #see if we can succesfully load system information
         try:
             system_information = self.get_system_information()
+            self.update_active_tone_indices()
         except Exception as e:
             print(bcolors.WARNING+'Warning: could not get system information from firmware:',e,bcolors.ENDC)
             print('Try hard reset')
@@ -765,6 +768,7 @@ class ReadoutServer:
 
 
         firmware_lib.apply_config(config_contents, self.r, self.config)
+        self.update_active_tone_indices()
 
         # Apply RF peripheral hardware settings (attenuators, amp bypass) from new config
         if self.rf_peripherals is not None and self.rf_peripherals.enabled:
@@ -1012,6 +1016,7 @@ class ReadoutServer:
                         self.stream_flags[FLAG_SET_FREQS].set()
                         await asyncio.sleep(0)
                         firmware_lib.set_tone_frequencies(self.r, self.config, param_value)
+                        self.update_active_tone_indices()
                         self.stream_flags[FLAG_SET_FREQS].clear()
                         await asyncio.sleep(0)
                         response = {'status': 'success'}
@@ -1443,17 +1448,35 @@ class ReadoutServer:
             print(f"Error sending response: {response} \n {e}")
             print(traceback.format_exc())
     
+    def update_active_tone_indices(self):
+        """
+        Refresh active_tone_indices from the firmware.
+
+        Called after tone frequencies are set so that prepare_frame sends
+        only active tones in user order.
+        """
+        try:
+            details = firmware_lib.get_tone_frequencies(
+                self.r, self.config, detailed_output=True)[1]
+            self.active_tone_indices = np.asarray(
+                details['rx']['tone_indices'])
+        except Exception as e:
+            print(f"Warning: could not update active tone indices: {e}")
+            self.active_tone_indices = None
+
     def prepare_frame(self,fast_read_params):
         """
         Prepare a frame for sending to a client.
+
+        Reads accumulated data at the active tone indices (user order)
+        so that clients receive only active tones without needing to
+        reindex.
         """
         num_headers = 10
-        # # cnt = await firmware_lib._wait_for_acc(fast_read_params['acc'],0.0001)
-        # cnt = firmware_lib._wait_for_acc(fast_read_params['acc'],0.0001)
 
-        cnt,data,err = firmware_lib.read_accumulated_data_fast(fast_read_params)
-       
-        # frame=data
+        cnt,data,err = firmware_lib.read_accumulated_data_fast(
+            fast_read_params, tone_indices=self.active_tone_indices)
+
         frame = np.zeros(len(data)+num_headers,dtype='<i4')
         frame[:len(data)] = data
         frame[-1] = err
@@ -1466,14 +1489,13 @@ class ReadoutServer:
         frame[-8] = int(self.stream_flags[FLAG_SET_AMPS].is_set())
         frame[-9] = int(self.stream_flags[FLAG_SET_FREQS].is_set())
         frame[-10] = int(self.stream_flags[FLAG_SERVER_REQUEST].is_set())
-        
+
         data_bytes = frame.tobytes()
 
         data_len = struct.pack('>I', len(data_bytes))
 
         payload = data_len+data_bytes
 
-        # return payload
         return payload,cnt,err
     
 
@@ -1846,6 +1868,7 @@ class ReadoutServer:
             print('Retune freqs = found freqs + freq offsets = ',retune_freqs)
 
             firmware_lib.set_tone_frequencies(self.r,self.config,retune_freqs)
+            self.update_active_tone_indices()
             # print('New frequencies:',firmware_lib.get_tone_frequencies(self.r,self.config))
 
             # results = firmware_lib.perform_retune(self.r,self.r_fast, self.config, center, span, points, samples_per_point, direction, method)

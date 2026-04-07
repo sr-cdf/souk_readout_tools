@@ -189,6 +189,46 @@ class ReadoutClient:
         self.parameters = {}
         self.calibration_files = {}  # basename -> contents, populated by pull_config
 
+    @staticmethod
+    def _resolve_export_path(filename, file_format, supported, default=None):
+        """Resolve output filepath and format for export functions.
+
+        Args:
+            filename: User-provided filename.
+            file_format: Explicit format string, or None to infer.
+            supported: Tuple of recognised format strings (e.g. ('npy', 'json', 'csv')).
+            default: Default format when neither file_format nor a recognised
+                     extension is present.  None means raise an error instead.
+
+        Returns:
+            (filepath, file_format) tuple.
+        """
+        import warnings
+
+        if file_format is not None:
+            # Check for mismatch with filename extension
+            parts = filename.rsplit('.', 1)
+            if len(parts) == 2 and parts[1] in supported and parts[1] != file_format:
+                warnings.warn(
+                    f"Filename has extension '.{parts[1]}' but file_format='{file_format}' "
+                    f"was specified. Writing to '{filename}.{file_format}'."
+                )
+            filepath = filename + '.' + file_format
+        else:
+            parts = filename.rsplit('.', 1)
+            if len(parts) == 2 and parts[1] in supported:
+                file_format = parts[1]
+                filepath = filename
+            elif default is not None:
+                file_format = default
+                filepath = filename + '.' + default
+            else:
+                raise ValueError(
+                    f"No file_format provided and filename has no recognised "
+                    f"extension ({', '.join('.' + s for s in supported)})."
+                )
+        return filepath, file_format
+
     def send_request(self, message):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
@@ -852,6 +892,10 @@ class ReadoutClient:
     def get_samples(self, num_samples,incl_system_info=True):
         """
         Acquire num_samples samples from the readout server and return concatenated raw data.
+
+        The server sends only active tones in user order, so the frame
+        size depends on the number of active tones. The per-frame byte
+        count is stored in sample_data['frame_bytes'] for parse_samples.
         """
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((self.request_server_address, self.request_server_port))
@@ -860,35 +904,30 @@ class ReadoutClient:
             message_data = json.dumps(message).encode()
             message_len = struct.pack('>I', len(message_data))
             s.sendall(message_len + message_data)
-            # # Pre-allocate bytearray to expected data length
-            alldatalen = 2048*2*4 + 10*4
-            data_raw = bytearray(alldatalen*num_samples)
+            # Pre-allocate bytearray (conservative upper bound)
+            max_frame_bytes = 2048*2*4 + 10*4
+            data_raw = bytearray(max_frame_bytes*num_samples)
             view = memoryview(data_raw)
 
-            # i_data = np.zeros((num_samples,num_tones),dtype=int)
-            # q_data = np.zeros((num_samples,num_tones),dtype=int)
-            # cnt = np.zeros(num_samples,dtype=int)
-            # err = np.zeros(num_samples,dtype=int)
-            # flags = np.zeros((num_samples,8),dtype=int)
             t0=time.time()
-            next_datalen=0
+            frame_bytes = 0
+            write_offset = 0
             for j in range(num_samples):
-                packet_offset = j*next_datalen
-
                 # Read data length
                 raw_datalen = s.recv(4)
                 if not raw_datalen:
                     break
-                next_datalen = struct.unpack('>I', raw_datalen)[0]
+                frame_bytes = struct.unpack('>I', raw_datalen)[0]
                 received_len = 0
-                while received_len < next_datalen:
-                    packet_len = s.recv_into(view[packet_offset+received_len:], next_datalen - received_len)
+                while received_len < frame_bytes:
+                    packet_len = s.recv_into(view[write_offset+received_len:], frame_bytes - received_len)
                     if packet_len == 0:
                         break
                     received_len += packet_len
-                if received_len < next_datalen:
-                    print(f"Expected {next_datalen} bytes, but only received {received_len} bytes.")
+                if received_len < frame_bytes:
+                    print(f"Expected {frame_bytes} bytes, but only received {received_len} bytes.")
                     break
+                write_offset += frame_bytes
             t1=time.time()
             print(f"Received {num_samples} samples in ~{t1-t0} seconds (~{num_samples/(t1-t0)} samples per second)")
             if incl_system_info:
@@ -896,25 +935,52 @@ class ReadoutClient:
             else:
                 info = {'system_information':'No system information requested'}
             sample_rate = self.get_sample_rate()
-            sample_data = {'data_raw':data_raw,'sample_rate':sample_rate,'system_information':info}
+            # Trim buffer to actual data received
+            data_raw = data_raw[:write_offset]
+            sample_data = {'data_raw':data_raw,'sample_rate':sample_rate,
+                           'system_information':info,'frame_bytes':frame_bytes}
             return sample_data
 
 
     @staticmethod
-    def parse_samples(sample_data,num_tones=2048):
+    def parse_samples(sample_data, num_tones=None):
+        """
+        Parse raw sample data into per-tone I/Q arrays.
+
+        The server sends only active tones in user order, so the data
+        is already correctly ordered. Frame size is determined from
+        sample_data['frame_bytes'] (set by get_samples) or derived
+        from tone_indices in system_information.
+
+        Falls back to 2048 channels for data from older servers that
+        send all channels.
+        """
         data_raw = sample_data['data_raw']
         sample_rate = sample_data['sample_rate']
         info = sample_data['system_information']
-        datalen = 2048*2*4 + 10*4
-        num_samples = len(data_raw)//datalen
-        i_data = np.zeros((num_samples,num_tones),dtype='<i4')
-        q_data = np.zeros((num_samples,num_tones),dtype='<i4')
-        cnt = np.zeros(num_samples,dtype=int)
-        err = np.zeros(num_samples,dtype=int)
-        flags = np.zeros((num_samples,8),dtype=int)
+        num_headers = 10
+
+        # Determine frame size and num_tones
+        if 'frame_bytes' in sample_data:
+            frame_bytes = sample_data['frame_bytes']
+            num_tones = (frame_bytes // 4 - num_headers) // 2
+        elif num_tones is None:
+            tone_indices = info.get('tone_indices')
+            if tone_indices is not None:
+                num_tones = len(tone_indices)
+            else:
+                num_tones = 2048
+
+        datalen = num_tones * 2 * 4 + num_headers * 4
+        num_samples = len(data_raw) // datalen
+        i_data = np.zeros((num_samples, num_tones), dtype='<i4')
+        q_data = np.zeros((num_samples, num_tones), dtype='<i4')
+        cnt = np.zeros(num_samples, dtype=int)
+        err = np.zeros(num_samples, dtype=int)
+        flags = np.zeros((num_samples, 8), dtype=int)
         for j in range(num_samples):
-            packet_offset = j*datalen
-            all_data = np.frombuffer(data_raw[packet_offset:packet_offset+datalen],dtype='<i4')
+            packet_offset = j * datalen
+            all_data = np.frombuffer(data_raw[packet_offset:packet_offset+datalen], dtype='<i4')
             i_data[j] = all_data[::2][:num_tones]
             q_data[j] = all_data[1::2][:num_tones]
             err[j] = all_data[-1]
@@ -936,14 +1002,8 @@ class ReadoutClient:
 
     @staticmethod
     def export_samples(filename, sample_data, num_tones_to_save=None,file_format=None):
-        if num_tones_to_save is None:
-            num_tones_to_save = 2048
-
-        if file_format is None:
-            try:
-                file_format = filename.split('.')[-1]
-            except IndexError:
-                raise ValueError("No file format provided and unable to determine from filename.")
+        filepath, file_format = ReadoutClient._resolve_export_path(
+            filename, file_format, ('npy', 'json', 'csv'))
 
         if 'data_raw' in sample_data.keys():
             data_dict = ReadoutClient.parse_samples(sample_data,num_tones=num_tones_to_save)
@@ -951,7 +1011,7 @@ class ReadoutClient:
             data_dict = sample_data
 
         if file_format == 'npy':
-            np.save(filename.rstrip('npy') + 'npy', data_dict)
+            np.save(filepath, data_dict)
 
         elif file_format == 'json':
             # Convert numpy arrays to lists for JSON serialization, including nested arrays
@@ -967,11 +1027,11 @@ class ReadoutClient:
                 else:
                     json_data_dict[key] = value
 
-            with open(filename.rstrip('json') + 'json', 'w') as file:
+            with open(filepath, 'w') as file:
                 json.dump(json_data_dict, file, indent=4)
 
         elif file_format == 'csv':
-            with open(filename.rstrip('csv') + 'csv', mode='w', newline='') as file:
+            with open(filepath, mode='w', newline='') as file:
                 writer = csv.writer(file)
                 # Write the metadata
                 writer.writerow(['# date', data_dict['date']])
@@ -1343,26 +1403,31 @@ class ReadoutClient:
         }
 
     @staticmethod
-    def export_adc_snapshot(filename, snapshot_data, file_format='npy'):
+    def export_adc_snapshot(filename, snapshot_data, file_format=None):
         """
         Export ADC snapshot data to file.
 
         Args:
-            filename: Output file path.
+            filename: Output file path. If it has a recognised extension
+                      (.npy, .json), the format is inferred from it.
             snapshot_data: dict from get_adc_snapshot() or parse_adc_snapshot().
-            file_format: 'npy' (default) or 'json'.
+            file_format: If given, appended as extension to filename.
+                         Otherwise inferred from filename, defaulting to 'npy'.
         """
+        filepath, file_format = ReadoutClient._resolve_export_path(
+            filename, file_format, ('npy', 'json'), default='npy')
+
         if 'adc_i' not in snapshot_data:
             data_dict = ReadoutClient.parse_adc_snapshot(snapshot_data)
         else:
             data_dict = snapshot_data
 
-        dirpath = os.path.dirname(filename)
+        dirpath = os.path.dirname(filepath)
         if dirpath and not os.path.exists(dirpath):
             os.makedirs(dirpath)
 
         if file_format == 'npy':
-            np.save(filename.replace('.npy', '') + '.npy', data_dict)
+            np.save(filepath, data_dict)
         elif file_format == 'json':
             json_dict = {}
             for key, value in data_dict.items():
@@ -1375,32 +1440,37 @@ class ReadoutClient:
                     }
                 else:
                     json_dict[key] = value
-            with open(filename.replace('.json', '') + '.json', 'w') as f:
+            with open(filepath, 'w') as f:
                 json.dump(json_dict, f, indent=4)
         else:
             raise ValueError(f"Unsupported file_format '{file_format}'. Use 'npy' or 'json'.")
 
     @staticmethod
-    def export_dac_snapshot(filename, snapshot_data, file_format='npy'):
+    def export_dac_snapshot(filename, snapshot_data, file_format=None):
         """
         Export DAC snapshot data to file.
 
         Args:
-            filename: Output file path.
+            filename: Output file path. If it has a recognised extension
+                      (.npy, .json), the format is inferred from it.
             snapshot_data: dict from get_dac_snapshot() or parse_dac_snapshot().
-            file_format: 'npy' (default) or 'json'.
+            file_format: If given, appended as extension to filename.
+                         Otherwise inferred from filename, defaulting to 'npy'.
         """
+        filepath, file_format = ReadoutClient._resolve_export_path(
+            filename, file_format, ('npy', 'json'), default='npy')
+
         if 'dac0_i' not in snapshot_data:
             data_dict = ReadoutClient.parse_dac_snapshot(snapshot_data)
         else:
             data_dict = snapshot_data
 
-        dirpath = os.path.dirname(filename)
+        dirpath = os.path.dirname(filepath)
         if dirpath and not os.path.exists(dirpath):
             os.makedirs(dirpath)
 
         if file_format == 'npy':
-            np.save(filename.replace('.npy', '') + '.npy', data_dict)
+            np.save(filepath, data_dict)
         elif file_format == 'json':
             json_dict = {}
             for key, value in data_dict.items():
@@ -1413,7 +1483,7 @@ class ReadoutClient:
                     }
                 else:
                     json_dict[key] = value
-            with open(filename.replace('.json', '') + '.json', 'w') as f:
+            with open(filepath, 'w') as f:
                 json.dump(json_dict, f, indent=4)
         else:
             raise ValueError(f"Unsupported file_format '{file_format}'. Use 'npy' or 'json'.")
@@ -1638,9 +1708,13 @@ class ReadoutClient:
         return data_dict
 
     @staticmethod
-    def export_sweep(filename, sweep_data, file_format='npy'):
-        if not os.path.exists(os.path.dirname(filename)):
-            os.makedirs(os.path.dirname(filename))
+    def export_sweep(filename, sweep_data, file_format=None):
+        filepath, file_format = ReadoutClient._resolve_export_path(
+            filename, file_format, ('npy', 'json', 'csv', 'dirfile', 'hdf5'), default='npy')
+
+        dirpath = os.path.dirname(filepath)
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath)
 
         if 'sweep_eq' not in sweep_data.keys():
             sweep_dict = ReadoutClient.parse_sweep_data(sweep_data)
@@ -1648,7 +1722,7 @@ class ReadoutClient:
             sweep_dict = sweep_data
 
         if file_format == 'npy':
-            np.save(filename.replace('.npy', '')+'.npy', sweep_dict)
+            np.save(filepath, sweep_dict)
 
         elif file_format == 'json':
             # Convert numpy arrays to lists for JSON serialization, including nested arrays
@@ -1664,12 +1738,11 @@ class ReadoutClient:
                 else:
                     json_data_dict[key] = value
 
-            with open(filename.replace('.json', '')+'.json', 'w') as file:
+            with open(filepath, 'w') as file:
                 json.dump(json_data_dict, file, indent=4)
 
-
         elif file_format == 'csv':
-            with open(filename.replace('.csv', '') + '.csv', mode='w', newline='') as file:
+            with open(filepath, mode='w', newline='') as file:
                 writer = csv.writer(file)
                 writer.writerow(['# date', sweep_dict['date']])
                 writer.writerow(['# num_tones', sweep_dict['num_tones']])
@@ -1768,13 +1841,21 @@ class ReadoutClient:
         return sweep_dict
 
 
-    def receive_stream(self, num_tones=2048, filename=None, print_data=False):
-        data = bytearray(2048*2*4 + 10*4)
-        view = memoryview(data)
+    def receive_stream(self, num_tones=None, filename=None, print_data=False):
         iq_data=None
         if filename is None:
             filename = os.path.join(os.getcwd(), 'tmp_stream')
+            print(f"No filename specified, writing to {filename}")
         info = self.get_system_information()
+
+        # Determine num_tones from system info (server sends only active tones)
+        tone_indices = info.get('tone_indices')
+        if num_tones is None:
+            num_tones = len(tone_indices) if tone_indices is not None else 2048
+
+        max_frame_bytes = 2048*2*4 + 10*4
+        data = bytearray(max_frame_bytes)
+        view = memoryview(data)
 
         metadata = {}
         metadata['date'] = time.strftime('%Y-%m-%d %H:%M:%S UTC%z')
@@ -1826,21 +1907,17 @@ class ReadoutClient:
                         if received_len < datalen:
                             print(f"Expected {datalen} bytes, but only received {received_len} bytes.")
                             break
-                        # file.write(data) # whole frame
-                        # file.write(data[-1]) #err
-                        # file.write(data[-2]) #cnt
-                        # file.write(data[:num_tones*2*4]) #data
 
-                        file.write(data[:num_tones*2*4]) # data
-                        file.write(data[-40:]) # extras
+                        # Write entire frame (already only active tones in user order)
+                        file.write(data[:datalen])
                         count+=1
 
                         if print_data:
-                            i = np.frombuffer(data[:datalen][::2], dtype='<i4')[:num_tones]
-                            q = np.frombuffer(data[:datalen][1::2], dtype='<i4')[:num_tones]
-                            err = np.frombuffer(data[-4:], dtype='<i4')
-                            cnt = np.frombuffer(data[-8:-4], dtype='<i4')
-                            flags = np.frombuffer(data[-40:-8], dtype='<i4')
+                            tone_data_bytes = datalen - 10*4
+                            i = np.frombuffer(data[:tone_data_bytes:], dtype='<i4')[::2]
+                            q = np.frombuffer(data[:tone_data_bytes:], dtype='<i4')[1::2]
+                            err = np.frombuffer(data[datalen-4:datalen], dtype='<i4')
+                            cnt = np.frombuffer(data[datalen-8:datalen-4], dtype='<i4')
                             iq_data=i+1j*q
                             print(f"Received IQ data: {err} {cnt} {iq_data.tolist()}\r",end='',flush=True)
                     except KeyboardInterrupt:
@@ -1857,13 +1934,21 @@ class ReadoutClient:
         return iq_data
 
 
-    def receive_triggered_stream(self, num_tones=2048, filename=None, print_data=False):
-        data = bytearray(4096*4 + 10*4)
-        view = memoryview(data)
+    def receive_triggered_stream(self, num_tones=None, filename=None, print_data=False):
         if filename is None:
             filename = os.path.join(os.getcwd(), 'tmp_triggered_stream')
+            print(f"No filename specified, writing to {filename}")
 
         info = self.get_system_information()
+
+        # Determine num_tones from system info (server sends only active tones)
+        tone_indices = info.get('tone_indices')
+        if num_tones is None:
+            num_tones = len(tone_indices) if tone_indices is not None else 2048
+
+        max_frame_bytes = 2048*2*4 + 10*4
+        data = bytearray(max_frame_bytes)
+        view = memoryview(data)
 
         metadata = {}
         metadata['date'] = time.strftime('%Y-%m-%d %H:%M:%S UTC%z')
@@ -1885,7 +1970,6 @@ class ReadoutClient:
 
         with open(filename+'.json','w') as file:
             json.dump(metadata,file,indent=4)
-
 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((self.stream_server_address, self.stream_server_port))
@@ -1914,21 +1998,17 @@ class ReadoutClient:
                         if received_len < datalen:
                             print(f"Expected {datalen} bytes, but only received {received_len} bytes.")
                             break
-                        # file.write(data) # whole frame
-                        # file.write(data[-1]) #err
-                        # file.write(data[-2]) #cnt
-                        # file.write(data[:num_tones*2*4]) #data
 
-                        file.write(data[:num_tones*2*4]) # data
-                        file.write(data[-40:]) # extras
+                        # Write entire frame (already only active tones in user order)
+                        file.write(data[:datalen])
                         count+=1
 
                         if print_data:
-                            i = np.frombuffer(data[:datalen][::2], dtype='<i4')[:num_tones]
-                            q = np.frombuffer(data[:datalen][1::2], dtype='<i4')[:num_tones]
-                            err = np.frombuffer(data[-4:], dtype='<i4')
-                            cnt = np.frombuffer(data[-8:-4], dtype='<i4')
-                            flags = np.frombuffer(data[-40:-8], dtype='<i4')
+                            tone_data_bytes = datalen - 10*4
+                            i = np.frombuffer(data[:tone_data_bytes:], dtype='<i4')[::2]
+                            q = np.frombuffer(data[:tone_data_bytes:], dtype='<i4')[1::2]
+                            err = np.frombuffer(data[datalen-4:datalen], dtype='<i4')
+                            cnt = np.frombuffer(data[datalen-8:datalen-4], dtype='<i4')
                             iq_data=i+1j*q
                             print(f"Received IQ data: {err} {cnt} {iq_data.tolist()}\r",end='',flush=True)
                     except KeyboardInterrupt:
@@ -1945,6 +2025,13 @@ class ReadoutClient:
 
     @staticmethod
     def parse_stream(filename):
+        """
+        Parse a saved stream file into per-tone I/Q arrays.
+
+        Data is already in user-tone order (the server sends only active
+        tones in user order). num_tones in the metadata reflects the
+        actual number of active tones.
+        """
         with open(filename+'.json','r') as file:
             metadata = json.load(file)
         date = metadata['date']
@@ -1967,7 +2054,7 @@ class ReadoutClient:
 
         i_data = data[:2*num_tones:2]
         q_data = data[1:2*num_tones:2]
-        # iq_data = iq_data[::2]+1j*iq_data[1::2]
+
         data_dict = {'date':date,
                      'num_tones':num_tones,
                      'num_samples':num_samples,
@@ -1982,7 +2069,9 @@ class ReadoutClient:
         return data_dict
 
     @staticmethod
-    def export_stream_data(filename,data_dict,file_format='npy'):
+    def export_stream_data(filename,data_dict,file_format=None):
+        filepath, file_format = ReadoutClient._resolve_export_path(
+            filename, file_format, ('npy', 'json', 'csv'), default='npy')
 
         date = data_dict['date']
         num_tones = data_dict['num_tones']
@@ -1995,10 +2084,8 @@ class ReadoutClient:
         err = data_dict['packet_error']
         flags = data_dict['stream_flags']
 
-        # metadata = data_dict['metadata']
-
         if file_format == 'npy':
-            np.save(filename.rstrip('.npy') + '.npy', data_dict)
+            np.save(filepath, data_dict)
 
         elif file_format == 'json':
             # Convert numpy arrays to lists for JSON serialization, including nested arrays
@@ -2014,11 +2101,11 @@ class ReadoutClient:
                 else:
                     json_data_dict[key] = value
 
-            with open(filename.rstrip('.json') + '.json', 'w') as file:
+            with open(filepath, 'w') as file:
                 json.dump(json_data_dict, file)
 
         elif file_format == 'csv':
-            with open(filename.rstrip('.csv') + '.csv', mode='w', newline='') as file:
+            with open(filepath, mode='w', newline='') as file:
                 writer = csv.writer(file)
                 writer.writerow(['# date', date])
                 writer.writerow(['# num_tones', num_tones])
@@ -2466,6 +2553,10 @@ class ReadoutClient:
         """
         Convenience method: set frequencies, powers/amplitudes, and phases in one call.
 
+        Checks for multiple tones mapping to the same FFT bin and warns the user.
+        When using amplitudes (not powers_dbm), automatically scales per-bin
+        amplitudes so that the sum per bin does not exceed 1.0.
+
         Args:
             freqs: Tone frequencies in Hz.
             amps: LO amplitude scales (0 to 1.0). Ignored if powers_dbm is provided.
@@ -2473,17 +2564,61 @@ class ReadoutClient:
             powers_dbm: Per-tone output power in dBm. If provided, overrides amps and
                         uses set_tone_powers() to apply calibrated power levels.
         """
+        import warnings
+
         if freqs is None or len(freqs) == 0:
             raise ValueError("Frequencies must be provided and cannot be empty.")
+        freqs = np.atleast_1d(freqs)
         if phases is None:
             phases = self.generate_newman_phases(freqs)
 
         self.set_tone_frequencies(freqs)
+
+        # Check for multiple tones per FFT bin
+        detailed = self.get_tone_frequencies(detailed_output=True)
+        tx_bins = np.array(detailed['tx']['filterbank_bins'])
+        unique_bins, counts = np.unique(tx_bins, return_counts=True)
+        shared_mask = counts > 1
+
+        if np.any(shared_mask):
+            # Build a descriptive warning
+            lines = []
+            for fft_bin, count in zip(unique_bins[shared_mask], counts[shared_mask]):
+                idxs = np.nonzero(tx_bins == fft_bin)[0]
+                tone_freqs = freqs[idxs]
+                freq_strs = ', '.join(f'{f/1e6:.4f} MHz' for f in tone_freqs)
+                lines.append(f'  FFT bin {fft_bin}: {count} tones (tones {idxs.tolist()}, freqs [{freq_strs}])')
+            detail_str = '\n'.join(lines)
+            warnings.warn(
+                f'Multiple tones map to the same FFT bin. '
+                f'Their amplitudes will add coherently in the PSB output.\n{detail_str}'
+            )
+
         if powers_dbm is not None:
+            if np.any(shared_mask):
+                warnings.warn(
+                    'Tones sharing FFT bins detected with powers_dbm mode. '
+                    'Cannot automatically scale powers — the actual output '
+                    'power per bin will be higher than requested due to '
+                    'coherent addition. Consider separating these tones.'
+                )
             self.set_tone_powers(powers_dbm)
         else:
             if amps is None:
                 amps = np.ones_like(freqs)
+            amps = np.atleast_1d(amps).copy()
+            if np.any(shared_mask):
+                # Scale amplitudes so the sum per bin does not exceed 1.0
+                for fft_bin, count in zip(unique_bins[shared_mask], counts[shared_mask]):
+                    idxs = np.nonzero(tx_bins == fft_bin)[0]
+                    bin_amp_sum = np.sum(amps[idxs])
+                    if bin_amp_sum > 1.0:
+                        scale_factor = 1.0 / bin_amp_sum
+                        amps[idxs] *= scale_factor
+                        warnings.warn(
+                            f'FFT bin {fft_bin}: scaled {count} tone amplitudes '
+                            f'by {scale_factor:.4f} to keep per-bin sum <= 1.0'
+                        )
             self.set_tone_amplitudes(amps)
         self.set_tone_phases(phases)
         return
