@@ -3805,12 +3805,12 @@ def check_rfdc_rts_events(r, clear=True):
         return False, details
 
 
-def check_dsp_overflow(r, duration_s=0.1, check_rts=True):
+def check_dsp_overflow(r, duration_s=0.1):
     """
     Check to see if any of the digital signal processing blocks have overflowed.
 
-    If check_rts is True, also checks the RFDC RTS sticky overvoltage/overrange
-    flags via r.rfdc.get_rts_flags() (requires souk_mkid_readout >= v7.9).
+    Checks the PSB scale, PSB filterbank and PFB filterbank overflow counters.
+    ADC-level checks (RFDC RTS flags) are handled by check_input_saturation().
     """
     psbscale_overflow0 = r.psbscale.get_overflow_count()
     psb_overflow0 = r.psb.get_overflow_count()
@@ -3843,17 +3843,6 @@ def check_dsp_overflow(r, duration_s=0.1, check_rts=True):
                 'pfb_ovf_count_start':pfb_overflow0,
                 'pfb_ovf_count_end':pfb_overflow1,
                 'pfb_ovf_delta':pfb_delta}
-
-    # Check RFDC RTS sticky flags
-    if check_rts:
-        # Clear stale flags first, then re-read to detect *current* events.
-        rts_event_stale, rts_stale = check_rfdc_rts_events(r, clear=True)
-        if rts_stale.get('rts_available', False):
-            time.sleep(0.05)
-            rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
-            details.update(rts_details)
-            if rts_event:
-                any_overflow = True
 
     return any_overflow, details
 
