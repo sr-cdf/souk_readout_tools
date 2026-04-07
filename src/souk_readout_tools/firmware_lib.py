@@ -3959,6 +3959,7 @@ def maximise_tx_power(r,config_dict=None, headroom_db=2.0):
         psb_ovf_during_ramp = False
         low = scale_current
         high = scale_current
+        ramp_first = True
         while high <= scalemax:
             r.psbscale.set_scale(high)
             time.sleep(0.01)
@@ -3971,19 +3972,29 @@ def maximise_tx_power(r,config_dict=None, headroom_db=2.0):
                 # FFT shift was marginal — step back and restart
                 if best_fftshift_idx == 0:
                     raise RuntimeError('PSB filterbank overflow at safest FFT shift — cannot maximise')
+                prev_popcount = bin(psb_fftshifts[best_fftshift_idx]).count('1')
                 best_fftshift_idx -= 1
                 best_fftshift = int(psb_fftshifts[best_fftshift_idx])
+                new_popcount = bin(best_fftshift).count('1')
+                # Compensate scale_current for the changed FFT gain
+                # (FFT gain ∝ 2^popcount, so halve scale per extra popcount bit)
+                scale_current *= 2**(prev_popcount - new_popcount)
+                scale_current = float(np.clip(scale_current, scalemin, scalemax))
                 r.psb.set_fftshift(best_fftshift)
                 r.psbscale.set_scale(scale_current)
                 print('PSB filterbank overflow during scale ramp — stepping back fftshift to',
-                      format(best_fftshift,'#016b'))
+                      format(best_fftshift,'#016b'), 'psbscale:', f'{scale_current:.6f}')
                 time.sleep(0.01)
                 psb_ovf_during_ramp = True
                 break
             if ovf or sat:
+                if ramp_first:
+                    # Initial scale already overflows — search down from here
+                    low = scalemin
                 break
             low = high
             high = min(high * 2, scalemax)
+            ramp_first = False
             if low == scalemax:
                 break
 
