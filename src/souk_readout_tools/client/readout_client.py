@@ -2609,17 +2609,25 @@ class ReadoutClient:
                 amps = np.ones_like(freqs)
             amps = np.atleast_1d(amps).copy()
             if np.any(shared_mask):
-                # Scale amplitudes so the sum per bin does not exceed 1.0
+                # Find the worst-case bin (highest amplitude sum) and scale
+                # ALL tones uniformly so that bin stays <= 1.0.  This keeps
+                # relative power constant across all tones.
+                worst_scale = 1.0
+                worst_bin = None
                 for fft_bin, count in zip(unique_bins[shared_mask], counts[shared_mask]):
                     idxs = np.nonzero(tx_bins == fft_bin)[0]
                     bin_amp_sum = np.sum(amps[idxs])
                     if bin_amp_sum > 1.0:
                         scale_factor = 1.0 / bin_amp_sum
-                        amps[idxs] *= scale_factor
-                        warnings.warn(
-                            f'FFT bin {fft_bin}: scaled {count} tone amplitudes '
-                            f'by {scale_factor:.4f} to keep per-bin sum <= 1.0'
-                        )
+                        if scale_factor < worst_scale:
+                            worst_scale = scale_factor
+                            worst_bin = fft_bin
+                if worst_scale < 1.0:
+                    amps *= worst_scale
+                    warnings.warn(
+                        f'Scaled all tone amplitudes by {worst_scale:.4f} to '
+                        f'keep per-bin sum <= 1.0 (worst-case bin {worst_bin})'
+                    )
             self.set_tone_amplitudes(amps)
         self.set_tone_phases(phases)
         return
