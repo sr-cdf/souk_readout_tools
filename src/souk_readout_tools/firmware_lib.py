@@ -2057,10 +2057,13 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, tone_
     dac_block = int(config_dict['firmware']['dac0_block'])
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
-    duc_frequency = config_dict['firmware']['defaults']['dac_duc_mixer_frequency_hz']
-    ddc_frequency = config_dict['firmware']['defaults']['adc_ddc_mixer_frequency_hz']
-    dac_nyquist_zone = config_dict['firmware']['defaults']['nyquist_zone']
-    adc_nyquist_zone = config_dict['firmware']['defaults']['nyquist_zone']
+    defaults = config_dict['firmware']['defaults']
+    duc_frequency = defaults.get('dac_duc_mixer_frequency_hz',
+        float(r.rfdc.core.get_mixer_settings(dac_tile,dac_block,r.rfdc.core.DAC_TILE)['Freq'])*1e6)
+    ddc_frequency = defaults.get('adc_ddc_mixer_frequency_hz',
+        float(r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['Freq'])*1e6)
+    dac_nyquist_zone = defaults['nyquist_zone']
+    adc_nyquist_zone = defaults['nyquist_zone']
 
     #constants
     nc = r.mixer.n_chans
@@ -2226,10 +2229,13 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone
     dac_block = int(config_dict['firmware']['dac0_block'])
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
-    duc_frequency = config_dict['firmware']['defaults']['dac_duc_mixer_frequency_hz']
-    ddc_frequency = config_dict['firmware']['defaults']['adc_ddc_mixer_frequency_hz']
-    dac_nyquist_zone = config_dict['firmware']['defaults']['nyquist_zone']
-    adc_nyquist_zone = config_dict['firmware']['defaults']['nyquist_zone']
+    defaults = config_dict['firmware']['defaults']
+    duc_frequency = defaults.get('dac_duc_mixer_frequency_hz',
+        float(r_fast.rfdc.core.get_mixer_settings(dac_tile,dac_block,r_fast.rfdc.core.DAC_TILE)['Freq'])*1e6)
+    ddc_frequency = defaults.get('adc_ddc_mixer_frequency_hz',
+        float(r_fast.rfdc.core.get_mixer_settings(adc_tile,adc_block,r_fast.rfdc.core.ADC_TILE)['Freq'])*1e6)
+    dac_nyquist_zone = defaults['nyquist_zone']
+    adc_nyquist_zone = defaults['nyquist_zone']
 
     #constants
     nc = r_fast.mixer.n_chans
