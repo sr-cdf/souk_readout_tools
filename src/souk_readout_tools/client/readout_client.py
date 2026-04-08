@@ -706,6 +706,14 @@ class ReadoutClient:
             r = response['result']
             for w in r.get('warnings', []):
                 print(f'  WARNING: {w}')
+            if r.get('effective_bits_per_tone'):
+                bits = np.array(r['effective_bits_per_tone'])
+                valid = bits[np.isfinite(bits)]
+                if len(valid) > 0:
+                    print(f'  Effective DAC bits: {np.min(valid):.1f} — {np.max(valid):.1f} '
+                          f'(of 16)')
+            if r.get('dynamic_range_compromise'):
+                print(f'  Note: dynamic range compromised (psb_scale < max)')
         return response
 
     def get_tone_powers(self,detailed_output=False,reference_plane='detector'):
@@ -2329,8 +2337,9 @@ class ReadoutClient:
     #       power levels across the band (e.g. per-tone or per-band).
     def wideband_sweep(self, bandwidth_hz=None, center_freq_hz=None, step_size_hz=10000,
                        num_tones=1024, samples_per_point=10, tone_powers_dbm='auto',
+                       reference_plane='detector',
                        apply_phase_correction=False,
-                       remove_phase_slope=True, optimise_dynamic_range=False,
+                       remove_phase_slope=True, optimise_dynamic_range=True,
                        verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
@@ -2346,19 +2355,21 @@ class ReadoutClient:
             num_tones (int): Number of tones to use in the sweep. More tones = fewer sweep
                              steps but wider spacing. Default is 1024.
             samples_per_point (int): Number of samples to integrate per sweep point. Default is 10.
-            tone_powers_dbm (float or array-like, optional): Per-tone output power in dBm.
-                If 'auto', calls maximise_tx_power() to optimise the dynamic range before
-                setting tones, then uses the resulting power level. If a scalar, all tones
-                are set to that power. If an array, must match num_tones. Default is None
-                (uses unit amplitudes).
+            tone_powers_dbm (float or array-like or 'auto'): Tone power in dBm.
+                If 'auto', calls maximise_tx_power() to optimise the dynamic range.
+                If a scalar, all tones are set to uniform power at this level (the
+                strongest tone achieves the specified power at the reference plane).
+                If an array (must match num_tones), per-tone powers are applied.
+                Default is 'auto'.
+            reference_plane (str): Where tone_powers_dbm is specified: 'dac',
+                'rf_output', or 'detector' (default).
             apply_phase_correction (bool): DEPRECATED. Correct for phase jumps at filterbank
                                            channel edges. Default is False. This correction is
                                            no longer needed following firmware fixes.
             remove_phase_slope (bool): Remove linear phase slope from the sweep data.
                                        Default is True.
             optimise_dynamic_range (bool): If True, maximise DAC bit utilisation and
-                adjust the analog chain to hit the target power when setting tone
-                powers. Passed through to set_tone_powers(). Default is False.
+                adjust the analog chain when setting tone powers. Default is True.
             verbose (bool): Print progress information. Default is True.
 
         Returns:
@@ -2384,7 +2395,7 @@ class ReadoutClient:
         
         info = self.get_system_information()
         
-        # Get RF frontend configuration
+        # Get RF frontend mixer configuration
         udc = self.config['rf_frontend']['connected']
         lo = self.config['rf_frontend']['tx_mixer_lo_frequency_hz']
         sb = self.config['rf_frontend']['tx_mixer_sideband']
@@ -2426,17 +2437,19 @@ class ReadoutClient:
             raise ValueError(f'Requested sweep out of band (band = {rfmin/1e6:.1f} - {rfmax/1e6:.1f} MHz, '
                            f'requested {fmin/1e6:.1f} - {fmax/1e6:.1f} MHz)')
 
-        # Calculate tone frequencies
+        # Calculate tone start frequencies
         freqs, spacings = np.linspace(fmin, fmax, num_tones, endpoint=False, retstep=True)
         
-        if spacings <= dacclk / txnfft:
-            raise ValueError(f'Tone spacing must be greater than {dacclk/txnfft:.0f} Hz but is {spacings:.0f} Hz. '
-                           f'Try fewer tones or wider bandwidth.')
+        #DEPRECATED since v7.9-multitone
+        if False:
+            if spacings <= dacclk / txnfft:
+                raise ValueError(f'Tone spacing must be greater than {dacclk/txnfft:.0f} Hz but is {spacings:.0f} Hz. '
+                               f'Try fewer tones or wider bandwidth.')
 
         sweep_points = int(bandwidth_hz / step_size_hz / num_tones)
         sweep_span = spacings * (sweep_points - 1) / sweep_points
 
-        # Add small random offsets to avoid systematic effects
+        # Add small random offsets to avoid intermodulation distortion effects
         small_offsets = np.random.uniform(-sweep_span / sweep_points / 2, 
                                           +sweep_span / sweep_points / 2, num_tones)
         
@@ -2444,7 +2457,7 @@ class ReadoutClient:
         small_offsets[0] = 0.0
         small_offsets[-1] = 0.0
         freqs += small_offsets
-        center_freqs = freqs + np.floor(sweep_points / 2) * spacings / sweep_points
+        center_freqs = freqs + np.floor(sweep_points / 2) * spacings / sweep_points # converts start freqs to center freqs
         
         tone_phases = self.generate_newman_phases(center_freqs)
 
@@ -2460,15 +2473,16 @@ class ReadoutClient:
         self.set_tone_phases(tone_phases)
 
         if tone_powers_dbm == 'auto':
-            # Optimise dynamic range: set unit amplitudes first, then maximise
+            # Maximum power/dynamic-range: set unit amplitudes first, then maximise
             self.set_tone_amplitudes(np.ones(num_tones))
             result = self.maximise_tx_power()
             if verbose:
                 print(f'  Auto TX power: maximise_tx_power() -> {result}')
         elif tone_powers_dbm is not None:
-            self.set_tone_powers(np.broadcast_to(
-                np.atleast_1d(tone_powers_dbm), num_tones,
-            ), optimise_dynamic_range=optimise_dynamic_range)
+            powers = np.broadcast_to(np.atleast_1d(tone_powers_dbm), num_tones).copy()
+            self.set_tone_powers(powers,
+                                reference_plane=reference_plane,
+                                optimise_dynamic_range=optimise_dynamic_range)
         else:
             self.set_tone_amplitudes(np.ones(num_tones))
 
@@ -2480,25 +2494,55 @@ class ReadoutClient:
         if outps['result']:
             if tone_powers_dbm == 'auto':
                 if verbose:
-                    print(f'  Output saturation detected after maximise — running fix_dac_saturation()')
+                    print(f'  Output saturation detected — running fix_dac_saturation()')
                 self.fix_dac_saturation()
                 outps = self.check_output_saturation()
                 if outps['result']:
-                    raise RuntimeError(f"Output saturation persists after fix: {outps['details']}")
+                    raise RuntimeError(
+                        f"DAC output saturation persists after attempted fix. "
+                        f"The requested per-tone power ({np.atleast_1d(tone_powers_dbm).flat[0]} dBm x "
+                        f"{num_tones} tones) exceeds what the DAC can produce. "
+                        f"Try reducing tone_powers_dbm or num_tones.")
             else:
-                raise RuntimeError(f"Output saturation detected: {outps['details']}")
+                raise RuntimeError(
+                    f"DAC output saturation detected. "
+                    f"The requested per-tone power ({np.atleast_1d(tone_powers_dbm).flat[0]} dBm x "
+                    f"{num_tones} tones) exceeds what the DAC can produce. "
+                    f"Try reducing tone_powers_dbm, reducing num_tones, or use "
+                    f"optimise_dynamic_range=True.")
         if inps['result']:
-            if tone_powers_dbm == 'auto':
+            if tone_powers_dbm == 'auto' or optimise_dynamic_range:
                 if verbose:
-                    print(f'  Input saturation detected after maximise — running fix_adc_saturation()')
+                    print(f'  Input saturation detected — running fix_adc_saturation()')
                 self.fix_adc_saturation()
                 inps = self.check_input_saturation()
                 if inps['result']:
-                    raise RuntimeError(f"Input saturation persists after fix: {inps['details']}")
+                    raise RuntimeError(
+                        f"ADC input saturation persists after attempted fix. "
+                        f"The requested per-tone power ({np.atleast_1d(tone_powers_dbm).flat[0]} dBm x "
+                        f"{num_tones} tones) may be driving the ADC into clipping. "
+                        f"Try reducing tone_powers_dbm or num_tones.")
             else:
-                raise RuntimeError(f"Input saturation detected: {inps['details']}")
+                raise RuntimeError(
+                    f"ADC input saturation detected. "
+                    f"Try reducing tone_powers_dbm, or reducing num_tones")
         if dspof['result']:
-            raise RuntimeError(f"DSP overflow detected: {dspof['details']}")
+            if tone_powers_dbm == 'auto':
+                if verbose:
+                    print(f'  DSP overflow detected — running fix_dac_saturation() to reduce psb_scale')
+                self.fix_dac_saturation()
+                dspof = self.check_dsp_overflow()
+                if dspof['result']:
+                    raise RuntimeError(
+                        f"DSP overflow persists after attempted fix. "
+                        f"The requested per-tone power ({np.atleast_1d(tone_powers_dbm).flat[0]} dBm x "
+                        f"{num_tones} tones) requires a psb_scale that overflows the "
+                        f"DSP pipeline. Try reducing tone_powers_dbm or num_tones.")
+            else:
+                raise RuntimeError(
+                    f"DSP overflow detected. "
+                    f"Try reducing tone_powers_dbm, reducing num_tones, or use "
+                    f"optimise_dynamic_range=True.")
 
         # Perform the sweep
         response = self.perform_sweep(center_freqs, sweep_span,
