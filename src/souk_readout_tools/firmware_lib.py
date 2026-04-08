@@ -4100,7 +4100,7 @@ def maximise_tx_power(r,config_dict=None, headroom_db=2.0):
     headroom_db : float
         Safety margin in dB below the saturation point (default 2.0).
     """
-    init_dac_saturation, init_dac_levels = check_output_saturation(r,iterations=50)
+    init_dac_saturation, init_dac_levels = check_output_saturation(r,iterations=10)
     if init_dac_saturation:
         print('DAC saturation detected — fixing before optimisation...')
         fix_dac_saturation(r, config_dict)
@@ -4201,7 +4201,7 @@ def maximise_tx_power(r,config_dict=None, headroom_db=2.0):
     psb_scale = low * headroom_linear
     r.psbscale.set_scale(psb_scale)
 
-    return amps, best_fftshift, psb_scale, check_dsp_overflow(r,0.5)[1], check_output_saturation(r,iterations=50)[1]
+    return amps, best_fftshift, psb_scale, check_dsp_overflow(r,0.5)[1], check_output_saturation(r,iterations=10)[1]
 
 def fix_dac_saturation(r,config_dict=None):
     init_amps = get_tone_amplitudes(r,config_dict)
@@ -4215,7 +4215,7 @@ def fix_dac_saturation(r,config_dict=None):
     precision = 0.05
 
     # Check if the current value causes saturation
-    check,levels=check_output_saturation(r,iterations=50)
+    check,levels=check_output_saturation(r,iterations=10)
     if check:
         # Exponential Reduction Phase
         last_saturated_value = current_value
@@ -4227,7 +4227,7 @@ def fix_dac_saturation(r,config_dict=None):
                 current_value = min_value
                 r.psbscale.set_scale(current_value)
                 time.sleep(0.1)
-                check,levels=check_output_saturation(r,iterations=50)
+                check,levels=check_output_saturation(r,iterations=10)
                 if check:
                     # Saturation cannot be avoided
                     return min_value
@@ -4236,7 +4236,7 @@ def fix_dac_saturation(r,config_dict=None):
                     break
             r.psbscale.set_scale(current_value)
             time.sleep(0.1)
-            check,levels=check_output_saturation(r,iterations=50)
+            check,levels=check_output_saturation(r,iterations=10)
             if check:
                 last_saturated_value = current_value
             else:
@@ -4252,7 +4252,7 @@ def fix_dac_saturation(r,config_dict=None):
         mid_value = (lower_bound + upper_bound) / 2
         r.psbscale.set_scale(mid_value)
         time.sleep(0.1)
-        check,levels=check_output_saturation(r,iterations=50)
+        check,levels=check_output_saturation(r,iterations=10)
         print('Increase psb_scale with Binary Search: ', mid_value,levels)
         if check:
             upper_bound = mid_value
@@ -4263,7 +4263,7 @@ def fix_dac_saturation(r,config_dict=None):
     psb_scale = lower_bound *0.90
     r.psbscale.set_scale(psb_scale)
     time.sleep(0.1)
-    check,levels=check_output_saturation(r,iterations=50)
+    check,levels=check_output_saturation(r,iterations=10)
 
     return psb_scale, check_dsp_overflow(r,0.5)[1], levels
 
@@ -4282,7 +4282,7 @@ def optimise_tx_snr(r,config_dict=None):
     RF chain never sees transient power spikes.
     """
     #get initial levels and settings
-    init_dac_saturation, init_dac_levels = check_output_saturation(r,iterations=50)
+    init_dac_saturation, init_dac_levels = check_output_saturation(r,iterations=10)
     if init_dac_saturation:
         print('DAC saturation detected — fixing before optimisation...')
         fix_dac_saturation(r, config_dict)
@@ -4335,7 +4335,7 @@ def optimise_tx_snr(r,config_dict=None):
 
         #check not overflowing
         dsp_overflow, dsp_overflow_details = check_dsp_overflow(r,0.5)
-        dac_saturation, dac_levels = check_output_saturation(r,iterations=50)
+        dac_saturation, dac_levels = check_output_saturation(r,iterations=10)
         psb_ovf = dsp_overflow_details['psb_ovf_delta']
         psbscale_ovf = dsp_overflow_details['psbscale_ovf_delta']
 
@@ -4400,7 +4400,7 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
 
-    init_adc_saturation, init_adc_levels = check_input_saturation(r, iterations=50)
+    init_adc_saturation, init_adc_levels = check_input_saturation(r, iterations=10)
     if init_adc_saturation:
         fix_adc_saturation(r, config_dict, rf_peripherals=rf_peripherals)
 
@@ -4420,7 +4420,7 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
         def set_and_check_rx_atten(att_value):
             rf_peripherals.set_rx_attenuation(att_value)
             time.sleep(0.1)
-            check, levels = check_input_saturation(r, iterations=50)
+            check, levels = check_input_saturation(r, iterations=10)
             print(f'  RX atten: {att_value:.1f} dB, Saturated: {check}')
             return check, levels
 
@@ -4429,7 +4429,7 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
             print('  Trying to enable RX amplifier...')
             rf_peripherals.set_rx_amp_bypass(False)
             time.sleep(0.1)
-            check, _ = check_input_saturation(r, iterations=50)
+            check, _ = check_input_saturation(r, iterations=10)
             if check:
                 # Saturated with amp enabled — bypass it again
                 rf_peripherals.set_rx_amp_bypass(True)
@@ -4469,7 +4469,7 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
         time.sleep(0.1)
 
     # --- Step 3: DSA as last resort if still saturated ---
-    check, levels = check_input_saturation(r, iterations=50)
+    check, levels = check_input_saturation(r, iterations=10)
     best_dsa = 0.0
     if check:
         print(f'  Still saturated — searching ADC DSA...')
@@ -4485,7 +4485,7 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
             mid_dsa = dsa_values[mid_idx]
             r.rfdc.core.set_dsa(adc_tile, adc_block, mid_dsa)
             time.sleep(0.1)
-            check, levels = check_input_saturation(r, iterations=50)
+            check, levels = check_input_saturation(r, iterations=10)
             print(f'    DSA: {mid_dsa:.2f} dB, Saturated: {check}')
             if check:
                 low_idx = mid_idx + 1
@@ -4498,7 +4498,7 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
         time.sleep(0.1)
         print(f'  DSA set to {best_dsa:.2f} dB (includes {headroom_db} dB headroom)')
 
-    check, levels = check_input_saturation(r, iterations=50)
+    check, levels = check_input_saturation(r, iterations=10)
     maxlevel = np.max(np.abs([levels['imax_fs'], levels['imin_fs'],
                               levels['qmax_fs'], levels['qmin_fs']]))
     print(f'  ADC headroom = {20 * np.log10(maxlevel):.1f} dBFS')
@@ -4547,7 +4547,7 @@ def fix_adc_saturation(r, config_dict, rf_peripherals=None):
         """Gather final state and return the result dict."""
         check_rfdc_rts_events(r, clear=True)
         time.sleep(0.05)
-        sat, lvls = check_input_saturation(r, iterations=50)
+        sat, lvls = check_input_saturation(r, iterations=10)
         d = float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
         ra = rf_peripherals.get_rx_attenuation() if (rf_peripherals is not None and rf_peripherals.enabled) else None
         ab = rf_peripherals.get_rx_amp_bypass() if (rf_peripherals is not None and rf_peripherals.enabled) else None
@@ -4574,7 +4574,7 @@ def fix_adc_saturation(r, config_dict, rf_peripherals=None):
         time.sleep(0.05)
 
     # Snapshot-based check (reliable, no transient issues)
-    snapshot_saturated, levels = check_input_saturation(r, iterations=50, check_rts=False)
+    snapshot_saturated, levels = check_input_saturation(r, iterations=10, check_rts=False)
 
     # If neither snapshot nor RTS shows saturation, nothing to do.
     if not snapshot_saturated and not had_rts_over_voltage and not had_rts_over_range:
@@ -4598,7 +4598,7 @@ def fix_adc_saturation(r, config_dict, rf_peripherals=None):
             ev, det = check_rfdc_rts_events(r, clear=False)
             return ev
         else:
-            sat, _ = check_input_saturation(r, iterations=50, check_rts=False)
+            sat, _ = check_input_saturation(r, iterations=10, check_rts=False)
             return sat
 
     if rts_only:
@@ -4724,7 +4724,7 @@ def optimise_rx_snr(r, config_dict=None, headroom_db=1.0, rf_peripherals=None):
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
 
-    init_adc_saturation, init_adc_levels = check_input_saturation(r, iterations=50)
+    init_adc_saturation, init_adc_levels = check_input_saturation(r, iterations=10)
     if init_adc_saturation:
         fix_adc_saturation(r, config_dict, rf_peripherals=rf_peripherals)
 
@@ -4734,7 +4734,7 @@ def optimise_rx_snr(r, config_dict=None, headroom_db=1.0, rf_peripherals=None):
         print(f'optimise_rx_snr: reducing ADC DSA from {current_dsa:.1f} dB...')
         r.rfdc.core.set_dsa(adc_tile, adc_block, 0)
         time.sleep(0.1)
-        check, levels = check_input_saturation(r, iterations=50)
+        check, levels = check_input_saturation(r, iterations=10)
         print(f'  DSA: 0 dB, Saturated: {check}')
 
         if not check:
@@ -4754,7 +4754,7 @@ def optimise_rx_snr(r, config_dict=None, headroom_db=1.0, rf_peripherals=None):
                 mid_dsa = dsa_values[mid_idx]
                 r.rfdc.core.set_dsa(adc_tile, adc_block, mid_dsa)
                 time.sleep(0.1)
-                check, levels = check_input_saturation(r, iterations=50)
+                check, levels = check_input_saturation(r, iterations=10)
                 print(f'  DSA: {mid_dsa:.2f} dB, Saturated: {check}')
                 if check:
                     low_idx = mid_idx + 1
@@ -4781,7 +4781,7 @@ def optimise_rx_snr(r, config_dict=None, headroom_db=1.0, rf_peripherals=None):
 
         rf_peripherals.set_rx_attenuation(atten_min)
         time.sleep(0.1)
-        check, levels = check_input_saturation(r, iterations=50)
+        check, levels = check_input_saturation(r, iterations=10)
         print(f'  RX atten: {atten_min:.1f} dB, Saturated: {check}')
 
         if not check:
@@ -4798,7 +4798,7 @@ def optimise_rx_snr(r, config_dict=None, headroom_db=1.0, rf_peripherals=None):
                 mid_att = attenuations[mid_idx]
                 rf_peripherals.set_rx_attenuation(mid_att)
                 time.sleep(0.1)
-                check, levels = check_input_saturation(r, iterations=50)
+                check, levels = check_input_saturation(r, iterations=10)
                 print(f'  RX atten: {mid_att:.1f} dB, Saturated: {check}')
                 if check:
                     low_idx = mid_idx + 1
@@ -4818,7 +4818,7 @@ def optimise_rx_snr(r, config_dict=None, headroom_db=1.0, rf_peripherals=None):
     best_fftshift, _ = _find_best_pfb_fftshift(r)
     print(f'optimise_rx_snr: best PFB fftshift = {format(best_fftshift, "#016b")}')
 
-    check, levels = check_input_saturation(r, iterations=50)
+    check, levels = check_input_saturation(r, iterations=10)
     return best_fftshift, check_dsp_overflow(r, 0.5)[1], levels
 
 
@@ -5377,6 +5377,13 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
             if optimal_psb_scale < SCALEMIN or optimal_psb_scale > SCALEMAX:
                 continue  # out of range
 
+            # Check DAC overflow: per-tone DAC level = amp / 2^(popcount+1) * psb_scale.
+            # With max(amps) = max_amp ≈ 1, the peak level ≈ psb_scale / 2^(popcount+1).
+            # If this exceeds 1.0 the DAC is overdriven.
+            popcount_candidate = bin(fftshift).count('1')
+            if optimal_psb_scale > 2**(popcount_candidate + 1):
+                continue  # would overdrive DAC
+
             # Valid solution — prefer higher psb_scale (better DAC utilisation,
             # secondary to the amplitude maximisation which is always satisfied)
             if optimal_psb_scale > best_psb_scale:
@@ -5397,12 +5404,29 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
             break
 
     if best_solution is None:
+        # Compute the maximum per-tone power at the reference plane for context.
+        # Use the most aggressive digital settings (lowest popcount, max psb_scale)
+        # to find the hard ceiling.
+        _best_shift = int(fftshift_candidates[-1])  # lowest popcount
+        _best_pop = bin(_best_shift).count('1')
+        _max_psb = min(SCALEMAX, 2**(_best_pop + 1))  # limited by DAC full-scale
+        _ceil_amps = np.array([max_amp])
+        _ceil_pwr = calibration.calc_tone_powers(
+            _ceil_amps, _best_shift, _max_psb,
+            tx_attenuator_value_db=analog_options[0][0],
+            tx_bypass_amp_s21_db=analog_options[0][2],
+            cryostat_input_s21_db=cal.get('cryostat_input_s21_db', 0),
+            **cal_base)
+        _max_pwr = float(_ceil_pwr[0]) if np.isfinite(_ceil_pwr[0]) else float('nan')
+        n_tones = len(powers_dbm)
         return {
             'achievable': False,
             'failure_reason': (
                 f'Cannot achieve target powers ({float(np.min(powers_dbm)):.1f} to '
                 f'{float(np.max(powers_dbm)):.1f} dBm) at {reference_plane} '
-                f'with available hardware settings'),
+                f'with {n_tones} tones. Maximum per-tone power is '
+                f'approximately {_max_pwr:.1f} dBm. '
+                f'Reduce tone_powers_dbm or num_tones.'),
             'warnings': [],
         }
 
@@ -5604,15 +5628,14 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
 
         warnings_list = []
         if np.any(amps > max_amp):
-            # Scale ALL uniformly to preserve relative powers
             scale_factor = max_amp / float(np.max(amps))
-            amps = amps * scale_factor
             shortfall_db = -20 * np.log10(scale_factor)
-            msg = (f'Target power too high by {shortfall_db:.1f} dB for current '
-                   f'gain settings. All tones scaled down to preserve relative '
-                   f'powers. Use optimise_dynamic_range=True to auto-adjust.')
-            print(f'  WARNING: {msg}')
-            warnings_list.append(msg)
+            n_tones = len(powers_dbm)
+            raise ValueError(
+                f'Target power too high by {shortfall_db:.1f} dB for current '
+                f'gain settings with {n_tones} tones. '
+                f'Reduce tone_powers_dbm or num_tones, '
+                f'or use optimise_dynamic_range=True to auto-adjust.')
         if np.any((amps > 0) & (amps < 2**-12)):
             n_low = int(np.sum((amps > 0) & (amps < 2**-12)))
             msg = f'{n_low} tone(s) below minimum amplitude resolution'
