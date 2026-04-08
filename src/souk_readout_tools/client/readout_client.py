@@ -765,7 +765,7 @@ class ReadoutClient:
     def maximise_tx_power(self, headroom_db=2.0):
         return self.send_request({'request': 'maximise_tx_power', 'headroom_db': headroom_db})
 
-    def maximise_rx_power(self, headroom_db=2.0):
+    def maximise_rx_power(self, headroom_db=1.0):
         return self.send_request({'request': 'maximise_rx_power', 'headroom_db': headroom_db})
 
     def optimise_tx_snr(self):

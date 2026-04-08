@@ -4427,10 +4427,10 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
         atten_step = rf_peripherals.ATTEN_STEP
         attenuations = np.arange(atten_min, atten_max + atten_step, atten_step)
 
-        def set_and_check_rx_atten(att_value, check_rts=True):
+        def set_and_check_rx_atten(att_value):
             rf_peripherals.set_rx_attenuation(att_value)
             time.sleep(0.1)
-            check, levels = check_input_saturation(r, iterations=10, check_rts=check_rts)
+            check, levels = check_input_saturation(r, iterations=10)
             print(f'  RX atten: {att_value:.1f} dB, Saturated: {check}')
             return check, levels
 
@@ -4462,7 +4462,7 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
             while low_idx <= high_idx:
                 mid_idx = (low_idx + high_idx) // 2
                 mid_att = attenuations[mid_idx]
-                check, levels = set_and_check_rx_atten(mid_att, check_rts=False)
+                check, levels = set_and_check_rx_atten(mid_att)
                 if check:
                     low_idx = mid_idx + 1
                 else:
@@ -4495,7 +4495,7 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
             mid_dsa = dsa_values[mid_idx]
             r.rfdc.core.set_dsa(adc_tile, adc_block, mid_dsa)
             time.sleep(0.1)
-            check, levels = check_input_saturation(r, iterations=10, check_rts=False)
+            check, levels = check_input_saturation(r, iterations=10)
             print(f'    DSA: {mid_dsa:.2f} dB, Saturated: {check}')
             if check:
                 low_idx = mid_idx + 1
@@ -4592,24 +4592,16 @@ def fix_adc_saturation(r, config_dict, rf_peripherals=None):
 
     # Multi-tone signals can have intermittent peaks from coherent phase
     # addition that only the RTS hardware catches (snapshot levels may be
-    # well below the 0.95 threshold).  When saturation is RTS-only, the
-    # binary searches must use RTS with a longer settle time instead of
-    # snapshot levels.
+    # well below the 0.90 threshold).  check_input_saturation with
+    # check_rts=True handles this: it clears the sticky flags before the
+    # snapshot window and reads them afterwards, so any flag that
+    # re-asserts during the captures reflects a current condition.
     rts_only = not snapshot_saturated and (had_rts_over_voltage or had_rts_over_range)
 
     def _check_saturated():
-        """Check for saturation using the appropriate method."""
-        if rts_only:
-            # Intermittent peaks: clear RTS, wait for potential recurrence,
-            # then read.  0.5 s gives multi-tone beat patterns time to
-            # produce a peak if one exists at this power level.
-            check_rfdc_rts_events(r, clear=True)
-            time.sleep(0.5)
-            ev, det = check_rfdc_rts_events(r, clear=False)
-            return ev
-        else:
-            sat, _ = check_input_saturation(r, iterations=10, check_rts=False)
-            return sat
+        """Check for saturation (snapshot levels + RTS flags)."""
+        sat, _ = check_input_saturation(r, iterations=10)
+        return sat
 
     if rts_only:
         print('fix_adc_saturation: RTS over-range detected (intermittent — '
@@ -4764,7 +4756,7 @@ def optimise_rx_snr(r, config_dict=None, headroom_db=1.0, rf_peripherals=None):
                 mid_dsa = dsa_values[mid_idx]
                 r.rfdc.core.set_dsa(adc_tile, adc_block, mid_dsa)
                 time.sleep(0.1)
-                check, levels = check_input_saturation(r, iterations=10, check_rts=False)
+                check, levels = check_input_saturation(r, iterations=10)
                 print(f'  DSA: {mid_dsa:.2f} dB, Saturated: {check}')
                 if check:
                     low_idx = mid_idx + 1
@@ -4808,7 +4800,7 @@ def optimise_rx_snr(r, config_dict=None, headroom_db=1.0, rf_peripherals=None):
                 mid_att = attenuations[mid_idx]
                 rf_peripherals.set_rx_attenuation(mid_att)
                 time.sleep(0.1)
-                check, levels = check_input_saturation(r, iterations=10, check_rts=False)
+                check, levels = check_input_saturation(r, iterations=10)
                 print(f'  RX atten: {mid_att:.1f} dB, Saturated: {check}')
                 if check:
                     low_idx = mid_idx + 1
