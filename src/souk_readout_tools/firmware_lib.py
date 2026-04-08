@@ -5770,6 +5770,11 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
     _, counts = np.unique(bin_indices, return_counts=True)
     max_tones_per_bin = int(np.max(counts))
 
+    # Broadcast scalar power to all tones
+    n_tones = len(bin_indices)
+    if powers_dbm.size == 1 and n_tones > 1:
+        powers_dbm = np.full(n_tones, powers_dbm[0])
+
     # ---- Phase 2: PLAN ----
     # Gather RF peripheral info if available
     has_rf = (rf_peripherals is not None and rf_peripherals.enabled
