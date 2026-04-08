@@ -189,7 +189,8 @@ def calc_accumulated_iq_level(adc_input_power_dbm,adc_dbm_to_dbfs,mixer_qmc_gain
     rx_if_dbm = rx_mixer_dbm - abs(rx_mixer_conversion_loss_db)
     rx_attenuator_dbm = rx_if_dbm + rx_if_s21_db
     rx_combiner_dbm = rx_attenuator_dbm - abs(rx_attenuator_value_db)
-    adc_dbm = rx_combiner_dbm - abs(rx_combiner_loss_db) - abs(adc_dsa_db)
+    adc_dsa_dbm = rx_combiner_dbm - abs(rx_combiner_loss_db)
+    adc_dbm = adc_dsa_dbm - abs(adc_dsa_db)
 
     adc_dbfs = adc_dbm - adc_dbm_to_dbfs
 
@@ -226,6 +227,7 @@ def calc_accumulated_iq_level(adc_input_power_dbm,adc_dbm_to_dbfs,mixer_qmc_gain
                    'rx_if_dbm':rx_if_dbm.tolist(),
                    'rx_attenuator_dbm':rx_attenuator_dbm.tolist(),
                    'rx_combiner_dbm':rx_combiner_dbm.tolist(),
+                   'adc_dsa_dbm':adc_dsa_dbm.tolist(),
                    'adc_dbm':adc_dbm.tolist(),
                    'adc_dbfs':adc_dbfs.tolist(),
                    'accumulator_db':accumulator_db.tolist(),}
@@ -282,7 +284,8 @@ def calc_adc_input_power(accumulated_iq_level,adc_dbm_to_dbfs,mixer_qmc_gain,mix
     adc_dbm = sig_dbfs + adc_dbm_to_dbfs
 
     # Remove RX frontend gains to refer power back to cryostat output
-    rx_combiner_dbm = adc_dbm + abs(adc_dsa_db) + abs(rx_combiner_loss_db)
+    adc_dsa_dbm = adc_dbm + abs(adc_dsa_db)
+    rx_combiner_dbm = adc_dsa_dbm + abs(rx_combiner_loss_db)
     rx_attenuator_dbm = rx_combiner_dbm + abs(rx_attenuator_value_db)
     rx_if_dbm = rx_attenuator_dbm - rx_if_s21_db
     rx_mixer_dbm = rx_if_dbm + abs(rx_mixer_conversion_loss_db)
@@ -295,6 +298,7 @@ def calc_adc_input_power(accumulated_iq_level,adc_dbm_to_dbfs,mixer_qmc_gain,mix
         details = {'accumulator_db':accumulator_db.tolist(),
                    'adc_dbfs':sig_dbfs.tolist(),
                    'adc_dbm':adc_dbm.tolist(),
+                   'adc_dsa_dbm':adc_dsa_dbm.tolist(),
                    'rx_combiner_dbm':rx_combiner_dbm.tolist(),
                    'rx_attenuator_dbm':rx_attenuator_dbm.tolist(),
                    'rx_if_dbm':rx_if_dbm.tolist(),
