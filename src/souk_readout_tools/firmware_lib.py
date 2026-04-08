@@ -4449,9 +4449,10 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
         # Clear stale over-range so the first iteration gets a fresh read.
         check_rfdc_rts_events(r, clear=True)
 
-    # Track the lowest DSA value at which saturation was observed so we
-    # don't oscillate past it when reducing DSA.  None = no boundary known.
-    min_saturated_dsa = None
+    # Track the highest DSA value at which saturation was observed and the
+    # lowest DSA where it was safe — these bracket the true boundary.
+    max_saturated_dsa = None   # highest DSA that was saturated
+    min_safe_dsa = None        # lowest DSA that was safe
 
     for iteration in range(MAX_ITERATIONS):
         saturated, levels = check_input_saturation(r, iterations=10)
@@ -4463,9 +4464,9 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
               f'DSA = {current_dsa:.2f} dB, saturated = {saturated}')
 
         if saturated:
-            # Record this as a saturation boundary
-            if min_saturated_dsa is None or current_dsa < min_saturated_dsa:
-                min_saturated_dsa = current_dsa
+            # Update saturation boundary
+            if max_saturated_dsa is None or current_dsa > max_saturated_dsa:
+                max_saturated_dsa = current_dsa
 
             # --- Need to reduce power ---
             resolved = False
@@ -4476,8 +4477,6 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
                 atten_max = rf_peripherals.ATTEN_MAX
                 current_atten = rf_peripherals.get_rx_attenuation()
                 if current_atten < atten_max:
-                    # Estimate increase needed; use 6 dB if snapshot
-                    # levels don't indicate severity (RTS-only detection)
                     increase = max(6.0, -peak_db) if peak_db >= 0 else 6.0
                     new_atten = min(round((current_atten + increase) / atten_step) * atten_step,
                                     atten_max)
@@ -4500,10 +4499,13 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
                         resolved = True
                         continue
 
-            # 3. Increase DSA
+            # 3. Increase DSA — return to known-safe value or add headroom
             if not resolved:
-                increase = max(6.0, -peak_db) if peak_db >= 0 else 6.0
-                new_dsa = _set_dsa(current_dsa + increase)
+                if min_safe_dsa is not None:
+                    new_dsa = _set_dsa(min_safe_dsa)
+                else:
+                    increase = max(headroom_db + 1.0, -peak_db) if peak_db >= 0 else (headroom_db + 1.0)
+                    new_dsa = _set_dsa(current_dsa + increase)
                 print(f'  DSA: {current_dsa:.2f} → {new_dsa:.2f} dB')
                 if new_dsa >= DSA_MAX:
                     print('  WARNING: DSA at maximum — cannot reduce further')
@@ -4511,13 +4513,23 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
                 continue  # re-assess
 
         else:
+            # Update safe boundary
+            if min_safe_dsa is None or current_dsa < min_safe_dsa:
+                min_safe_dsa = current_dsa
+
             # --- Not saturated — try to increase power ---
+            # Compute DSA floor from saturation boundary
+            dsa_floor = (round((max_saturated_dsa + headroom_db) / DSA_STEP) * DSA_STEP
+                         if max_saturated_dsa is not None else 0.0)
+
             # Target: headroom_db below full-scale, i.e. peak at -headroom_db dBFS
             power_increase = headroom_available - headroom_db
-            if power_increase < 0.5:
-                # Already close enough to target
-                print(f'  Headroom {headroom_available:.1f} dB — '
-                      f'within target ({headroom_db:.1f} dB)')
+            if power_increase < 0.5 or current_dsa <= dsa_floor:
+                if current_dsa <= dsa_floor and dsa_floor > 0:
+                    print(f'  DSA at saturation boundary ({dsa_floor:.2f} dB)')
+                else:
+                    print(f'  Headroom {headroom_available:.1f} dB — '
+                          f'within target ({headroom_db:.1f} dB)')
                 break
 
             print(f'  Headroom {headroom_available:.1f} dB — '
@@ -4525,19 +4537,13 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
 
             # 1. Reduce DSA
             if current_dsa > 0:
-                # Don't reduce below the known saturation boundary
-                dsa_floor = (min_saturated_dsa + headroom_db
-                             if min_saturated_dsa is not None else 0.0)
-                dsa_floor = round(dsa_floor / DSA_STEP) * DSA_STEP
-                if current_dsa <= dsa_floor:
-                    # Already at or below the safe boundary — DSA can't help
-                    print(f'  DSA already at saturation boundary '
-                          f'({dsa_floor:.2f} dB) — cannot reduce further')
-                else:
-                    dsa_decrease = min(power_increase, current_dsa - dsa_floor)
-                    new_dsa = _set_dsa(current_dsa - dsa_decrease)
-                    print(f'  DSA: {current_dsa:.2f} → {new_dsa:.2f} dB')
-                    continue  # re-assess after change
+                dsa_decrease = min(power_increase, current_dsa - dsa_floor)
+                if dsa_decrease < DSA_STEP:
+                    print(f'  DSA at saturation boundary ({dsa_floor:.2f} dB)')
+                    break
+                new_dsa = _set_dsa(current_dsa - dsa_decrease)
+                print(f'  DSA: {current_dsa:.2f} → {new_dsa:.2f} dB')
+                continue  # re-assess after change
 
             # 2. Reduce RX attenuator (DSA already at minimum or at boundary)
             if has_rf:
