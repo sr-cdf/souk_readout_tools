@@ -4499,11 +4499,13 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
                         resolved = True
                         continue
 
-            # 3. Increase DSA — return to known-safe value or add headroom
+            # 3. Increase DSA — bisect between saturated and safe values
             if not resolved:
-                if min_safe_dsa is not None:
-                    new_dsa = _set_dsa(min_safe_dsa)
+                if min_safe_dsa is not None and min_safe_dsa > current_dsa:
+                    # Bisect between current (saturated) and known safe
+                    new_dsa = _set_dsa((current_dsa + min_safe_dsa) / 2)
                 else:
+                    # No safe reference — estimate from snapshot headroom
                     increase = max(headroom_db + 1.0, -peak_db) if peak_db >= 0 else (headroom_db + 1.0)
                     new_dsa = _set_dsa(current_dsa + increase)
                 print(f'  DSA: {current_dsa:.2f} → {new_dsa:.2f} dB')
