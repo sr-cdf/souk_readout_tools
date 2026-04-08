@@ -5247,6 +5247,116 @@ def get_tone_powers(r,config_dict,detailed_output=False,reference_plane='detecto
         return powers
 
 
+def _diagnose_plan_failure(powers_dbm, cal, cal_base, reference_plane,
+                           analog_options, fftshift_candidates, max_amp,
+                           scalemin, scalemax, tx_1db_comp):
+    """Build a detailed failure message explaining why no tone power plan is achievable.
+
+    Identifies the specific bottleneck (DAC overflow, power too low, P1dB)
+    and reports the full signal chain budget.
+    """
+    n_tones = len(powers_dbm)
+    total_requested_dbm = 10 * np.log10(np.sum(10**(powers_dbm / 10)))
+
+    # Compute DAC full-scale power through the chain using the best-case
+    # analog settings (first entry = highest gain option).
+    best_shift = int(fftshift_candidates[-1])
+    best_pop = bin(best_shift).count('1')
+    max_psb = min(scalemax, 2**(best_pop + 1))
+    atten_db = analog_options[0][0]
+    amp_s21 = analog_options[0][2]
+    cryo_s21 = cal.get('cryostat_input_s21_db', 0)
+
+    ceil_pwr, ceil_detail = calibration.calc_tone_powers(
+        np.array([max_amp]), best_shift, max_psb,
+        tx_attenuator_value_db=atten_db,
+        tx_bypass_amp_s21_db=amp_s21,
+        cryostat_input_s21_db=cryo_s21,
+        **cal_base, detailed_output=True)
+
+    dac_fs_at_ref = float(ceil_pwr[0])
+    dac_fs_dbm = float(ceil_detail['dac_dbm'][0])
+
+    # Also compute the minimum achievable power (lowest analog gain option,
+    # minimum psb_scale).
+    atten_db_min_gain = analog_options[-1][0]
+    amp_s21_min_gain = analog_options[-1][2]
+    min_psb = max(scalemin, 2**-12)  # smallest meaningful scale
+    min_pwr = calibration.calc_tone_powers(
+        np.array([max_amp]), best_shift, min_psb,
+        tx_attenuator_value_db=atten_db_min_gain,
+        tx_bypass_amp_s21_db=amp_s21_min_gain,
+        cryostat_input_s21_db=cryo_s21,
+        **cal_base)
+    dac_min_at_ref = float(min_pwr[0])
+
+    # Chain gain: difference between DAC dBm and reference plane dBm
+    chain_gain_db = dac_fs_at_ref - dac_fs_dbm
+    required_dac_dbm = total_requested_dbm - chain_gain_db
+
+    # Classify the failure
+    if total_requested_dbm > dac_fs_at_ref:
+        bottleneck = 'too_high'
+    elif total_requested_dbm < dac_min_at_ref:
+        bottleneck = 'too_low'
+    else:
+        bottleneck = 'too_high'  # DAC power sum check (multi-tone overhead)
+
+    # --- Build signal chain breakdown (only non-zero stages) ---
+    chain_parts = []
+    combiner = cal_base['tx_combiner_loss_db']
+    if np.any(np.atleast_1d(combiner) != 0):
+        v = float(np.mean(np.atleast_1d(combiner)))
+        chain_parts.append(f'combiner {-abs(v):+.1f} dB')
+    if float(atten_db) != 0:
+        chain_parts.append(f'attenuator {-abs(float(atten_db)):+.1f} dB')
+    if_s21 = cal_base['tx_if_s21_db']
+    if np.any(np.atleast_1d(if_s21) != 0):
+        v = float(np.mean(np.atleast_1d(if_s21)))
+        chain_parts.append(f'IF path {v:+.1f} dB')
+    mix_loss = cal_base['tx_mixer_conversion_loss_db']
+    if np.any(np.atleast_1d(mix_loss) != 0):
+        v = float(np.mean(np.atleast_1d(mix_loss)))
+        chain_parts.append(f'mixer {-abs(v):+.1f} dB')
+    rf_s21 = cal_base['tx_rf_s21_db']
+    if np.any(np.atleast_1d(rf_s21) != 0):
+        v = float(np.mean(np.atleast_1d(rf_s21)))
+        chain_parts.append(f'RF path {v:+.1f} dB')
+    if np.any(np.atleast_1d(amp_s21) != 0):
+        v = float(np.mean(np.atleast_1d(amp_s21)))
+        chain_parts.append(f'amp {v:+.1f} dB')
+    if np.any(np.atleast_1d(cryo_s21) != 0):
+        v = float(np.mean(np.atleast_1d(cryo_s21)))
+        chain_parts.append(f'cryostat {v:+.1f} dB')
+
+    # --- Format the message ---
+    lines = [f'Cannot achieve target powers at reference_plane={reference_plane!r}.']
+
+    if bottleneck == 'too_high':
+        lines.append(f'  Requested: {n_tones} tones, total power = {total_requested_dbm:.1f} dBm at {reference_plane}.')
+        lines.append(f'  DAC full-scale output: {dac_fs_dbm:.1f} dBm.')
+        if chain_parts:
+            lines.append(f'  Signal chain (DAC to {reference_plane}): {", ".join(chain_parts)} = {chain_gain_db:+.1f} dB net.')
+            lines.append(f'  Maximum total power at {reference_plane}: {dac_fs_at_ref:.1f} dBm.')
+        lines.append(f'  Required DAC output for {n_tones} tones: {required_dac_dbm:.1f} dBm '
+                     f'(exceeds full-scale by {required_dac_dbm - dac_fs_dbm:.1f} dB).')
+    elif bottleneck == 'too_low':
+        lines.append(f'  Requested: {n_tones} tones, total power = {total_requested_dbm:.1f} dBm at {reference_plane}.')
+        lines.append(f'  Minimum achievable total power at {reference_plane}: {dac_min_at_ref:.1f} dBm.')
+        lines.append(f'  The requested power is below the minimum the hardware can produce.')
+
+    # P1dB check (informational, when available and relevant)
+    if tx_1db_comp is not None and reference_plane != 'dac' and bottleneck == 'too_high':
+        combiner_total_dbm = required_dac_dbm - abs(float(np.mean(np.atleast_1d(combiner))))
+        if combiner_total_dbm > tx_1db_comp:
+            excess = combiner_total_dbm - tx_1db_comp
+            lines.append(f'  Additionally: RF frontend input would be {combiner_total_dbm:.1f} dBm, '
+                         f'exceeding the 1 dB compression point ({tx_1db_comp:.1f} dBm) by {excess:.1f} dB.')
+
+    lines.append(f'  Reduce tone_powers_dbm or num_tones.')
+    return '\n'.join(lines)
+
+
 def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
                                max_tones_per_bin=1,
                                has_rf_peripherals=False,
@@ -5406,31 +5516,13 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
             break
 
     if best_solution is None:
-        # Compute the maximum per-tone power at the reference plane for context.
-        # Use the most aggressive digital settings (lowest popcount, max psb_scale)
-        # to find the hard ceiling.
-        _best_shift = int(fftshift_candidates[-1])  # lowest popcount
-        _best_pop = bin(_best_shift).count('1')
-        _max_psb = min(SCALEMAX, 2**(_best_pop + 1))  # limited by DAC full-scale
-        _ceil_amps = np.array([max_amp])
-        _ceil_pwr = calibration.calc_tone_powers(
-            _ceil_amps, _best_shift, _max_psb,
-            tx_attenuator_value_db=analog_options[0][0],
-            tx_bypass_amp_s21_db=analog_options[0][2],
-            cryostat_input_s21_db=cal.get('cryostat_input_s21_db', 0),
-            **cal_base)
-        # Compute total requested power (sum in linear) and DAC full-scale.
-        n_tones = len(powers_dbm)
-        _dac_fs_dbm = float(_ceil_pwr[0]) if np.isfinite(_ceil_pwr[0]) else float('nan')
-        _total_requested_dbm = 10 * np.log10(np.sum(10**(powers_dbm / 10)))
+        _reason = _diagnose_plan_failure(
+            powers_dbm, cal, cal_base, reference_plane,
+            analog_options, fftshift_candidates, max_amp,
+            SCALEMIN, SCALEMAX, tx_1db_comp)
         return {
             'achievable': False,
-            'failure_reason': (
-                f'Cannot achieve target powers at {reference_plane}: '
-                f'total power from {n_tones} tones is '
-                f'{_total_requested_dbm:.1f} dBm, '
-                f'but DAC full-scale is {_dac_fs_dbm:.1f} dBm. '
-                f'Reduce tone_powers_dbm or num_tones.'),
+            'failure_reason': _reason,
             'warnings': [],
         }
 
@@ -5449,6 +5541,20 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
         total_at_frontend = 10 * np.log10(total_linear)
         if total_at_frontend > tx_1db_comp:
             excess = total_at_frontend - tx_1db_comp
+            if excess > 3.0:
+                # Severe compression — treat as infeasible
+                _lines = [
+                    f'Cannot achieve target powers at reference_plane={reference_plane!r}.',
+                    f'  A valid DAC solution exists, but the RF frontend would be driven into compression.',
+                    f'  Total power at frontend input: {total_at_frontend:.1f} dBm.',
+                    f'  1 dB compression point: {tx_1db_comp:.1f} dBm (exceeded by {excess:.1f} dB).',
+                    f'  Reduce tone_powers_dbm or num_tones.',
+                ]
+                return {
+                    'achievable': False,
+                    'failure_reason': '\n'.join(_lines),
+                    'warnings': [],
+                }
             warnings_list.append(
                 f'RF frontend input ({total_at_frontend:.1f} dBm) exceeds '
                 f'1 dB compression point ({tx_1db_comp:.1f} dBm) by {excess:.1f} dB')
