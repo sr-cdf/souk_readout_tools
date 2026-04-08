@@ -1109,8 +1109,10 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'maximise_rx_power':
-                    headroom_db = message.get('headroom_db', 2.0)
-                    dsa,pfb_fft_shift,dsp,adc,rx_atten = firmware_lib.maximise_rx_power(self.r,self.config, headroom_db=headroom_db, rf_peripherals=self.rf_peripherals)
+                    kwargs = {'rf_peripherals': self.rf_peripherals}
+                    if 'headroom_db' in message:
+                        kwargs['headroom_db'] = message['headroom_db']
+                    dsa,pfb_fft_shift,dsp,adc,rx_atten = firmware_lib.maximise_rx_power(self.r,self.config, **kwargs)
                     result = {'dsa': dsa, 'pfb_fft_shift': pfb_fft_shift, 'dsp_ovf': dsp, 'adc_levels': adc, 'rx_attenuation_db': rx_atten}
                     await self.send_response(writer, {'status': 'success', 'result': result})
                 

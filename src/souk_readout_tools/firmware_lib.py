@@ -4388,132 +4388,160 @@ def optimise_tx_snr(r,config_dict=None):
 def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
     """Maximise RX signal power into the ADC without clipping.
 
-    Adjusts RX-path controls to get the highest ADC input power while
-    maintaining headroom.  DSA noise performance is not trusted, so it
-    is minimised first; headroom is preferably absorbed by the RX
-    variable attenuator.
+    Iteratively adjusts RX-path controls to bring ADC levels as close
+    to full-scale as possible while maintaining *headroom_db* of margin.
 
-    Order of operations:
-      1. Minimise DSA (set to 0).
-      2. If RF peripherals available: try enabling RX amp (if bypassed),
-         then find lowest RX attenuator setting without saturation,
-         adding headroom to the attenuator.
-      3. If still saturated at maximum RX attenuation, increase DSA as
-         last resort (with headroom).
-      4. Optimise PFB FFT shift for maximum gain without overflow.
+    Each iteration:
+      - If saturated: increase RX attenuator → bypass RX amp → increase
+        DSA (in that order of preference).
+      - If not saturated: estimate available headroom from snapshot peak
+        level and reduce DSA by that amount → if DSA already at minimum,
+        reduce RX attenuator → try enabling RX amp.
+
+    Finishes with a PFB FFT shift optimisation.
 
     Parameters
     ----------
     headroom_db : float
         Safety margin in dB below the saturation point (default 1.0).
     """
+    DSA_MAX = 27.0
+    DSA_STEP = 0.25
+    MAX_ITERATIONS = 10
+
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
 
-    init_adc_saturation, init_adc_levels = check_input_saturation(r, iterations=10)
-    if init_adc_saturation:
-        fix_adc_saturation(r, config_dict, rf_peripherals=rf_peripherals)
+    has_rf = rf_peripherals is not None and rf_peripherals.enabled
 
-    # --- Step 1: Minimise DSA (not trusted for noise performance) ---
-    r.rfdc.core.set_dsa(adc_tile, adc_block, 0)
-    time.sleep(0.1)
-    print(f'maximise_rx_power: DSA set to 0 dB')
+    def _get_dsa():
+        return float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
 
-    # --- Step 2: Optimise RX frontend (if available) ---
-    best_rx_atten = None
-    if rf_peripherals is not None and rf_peripherals.enabled:
-        atten_min = rf_peripherals.ATTEN_MIN
-        atten_max = rf_peripherals.ATTEN_MAX
-        atten_step = rf_peripherals.ATTEN_STEP
-        attenuations = np.arange(atten_min, atten_max + atten_step, atten_step)
-
-        def set_and_check_rx_atten(att_value):
-            rf_peripherals.set_rx_attenuation(att_value)
-            time.sleep(0.1)
-            check, levels = check_input_saturation(r, iterations=10)
-            print(f'  RX atten: {att_value:.1f} dB, Saturated: {check}')
-            return check, levels
-
-        # 2a: Try enabling RX amp if currently bypassed
-        if rf_peripherals.get_rx_amp_bypass():
-            print('  Trying to enable RX amplifier...')
-            rf_peripherals.set_rx_amp_bypass(False)
-            time.sleep(0.1)
-            check, _ = check_input_saturation(r, iterations=10)
-            if check:
-                # Saturated with amp enabled — bypass it again
-                rf_peripherals.set_rx_amp_bypass(True)
-                time.sleep(0.1)
-                print('  RX amp causes saturation — keeping bypassed')
-            else:
-                print('  RX amp enabled successfully')
-
-        # 2b: Find lowest RX attenuation without saturation
-        print('  Optimising RX attenuator...')
-        check, levels = set_and_check_rx_atten(atten_min)
-        if not check:
-            best_rx_atten = atten_min
-            print(f'  No saturation at minimum RX attenuation: {atten_min} dB')
-        else:
-            low_idx = 0
-            high_idx = len(attenuations) - 1
-            best_rx_atten = atten_max  # fallback
-
-            while low_idx <= high_idx:
-                mid_idx = (low_idx + high_idx) // 2
-                mid_att = attenuations[mid_idx]
-                check, levels = set_and_check_rx_atten(mid_att)
-                if check:
-                    low_idx = mid_idx + 1
-                else:
-                    best_rx_atten = mid_att
-                    high_idx = mid_idx - 1
-
-            # Add headroom to attenuator (preferred over DSA)
-            best_rx_atten = min(round((best_rx_atten + headroom_db) / atten_step) * atten_step,
-                                atten_max)
-            print(f'  Optimal RX attenuation: {best_rx_atten:.1f} dB '
-                  f'(includes {headroom_db} dB headroom)')
-
-        rf_peripherals.set_rx_attenuation(best_rx_atten)
+    def _set_dsa(val):
+        val = round(val / DSA_STEP) * DSA_STEP
+        val = float(np.clip(val, 0, DSA_MAX))
+        r.rfdc.core.set_dsa(adc_tile, adc_block, val)
         time.sleep(0.1)
+        return val
 
-    # --- Step 3: DSA as last resort if still saturated ---
-    check, levels = check_input_saturation(r, iterations=10)
-    best_dsa = 0.0
-    if check:
-        print(f'  Still saturated — searching ADC DSA...')
-        dsamax = 27
-        step_size = 0.25
-        dsa_values = np.arange(0, dsamax + step_size, step_size)
-        low_idx = 0
-        high_idx = len(dsa_values) - 1
-        best_dsa = dsamax  # fallback
-
-        while low_idx <= high_idx:
-            mid_idx = (low_idx + high_idx) // 2
-            mid_dsa = dsa_values[mid_idx]
-            r.rfdc.core.set_dsa(adc_tile, adc_block, mid_dsa)
-            time.sleep(0.1)
-            check, levels = check_input_saturation(r, iterations=10)
-            print(f'    DSA: {mid_dsa:.2f} dB, Saturated: {check}')
-            if check:
-                low_idx = mid_idx + 1
-            else:
-                best_dsa = mid_dsa
-                high_idx = mid_idx - 1
-
-        best_dsa = min(best_dsa + headroom_db, dsamax)
-        r.rfdc.core.set_dsa(adc_tile, adc_block, best_dsa)
-        time.sleep(0.1)
-        print(f'  DSA set to {best_dsa:.2f} dB (includes {headroom_db} dB headroom)')
-
-    check, levels = check_input_saturation(r, iterations=10)
-    maxlevel = np.max(np.abs([levels['imax_fs'], levels['imin_fs'],
+    def _peak_dbfs(levels):
+        peak = np.max(np.abs([levels['imax_fs'], levels['imin_fs'],
                               levels['qmax_fs'], levels['qmin_fs']]))
-    print(f'  ADC headroom = {20 * np.log10(maxlevel):.1f} dBFS')
+        if peak <= 0:
+            return -100.0
+        return float(20 * np.log10(peak))
 
-    # --- Step 4: Optimise PFB FFT shift ---
+    for iteration in range(MAX_ITERATIONS):
+        saturated, levels = check_input_saturation(r, iterations=10)
+        current_dsa = _get_dsa()
+        peak_db = _peak_dbfs(levels)
+        headroom_available = -peak_db  # dB below full-scale
+
+        print(f'maximise_rx_power [{iteration}]: peak = {peak_db:.1f} dBFS, '
+              f'DSA = {current_dsa:.2f} dB, saturated = {saturated}')
+
+        if saturated:
+            # --- Need to reduce power ---
+            resolved = False
+
+            # 1. Increase RX attenuator
+            if has_rf and not resolved:
+                atten_step = rf_peripherals.ATTEN_STEP
+                atten_max = rf_peripherals.ATTEN_MAX
+                current_atten = rf_peripherals.get_rx_attenuation()
+                if current_atten < atten_max:
+                    # Estimate increase needed; use 6 dB if snapshot
+                    # levels don't indicate severity (RTS-only detection)
+                    increase = max(6.0, -peak_db) if peak_db >= 0 else 6.0
+                    new_atten = min(round((current_atten + increase) / atten_step) * atten_step,
+                                    atten_max)
+                    rf_peripherals.set_rx_attenuation(new_atten)
+                    time.sleep(0.1)
+                    print(f'  RX attenuation: {current_atten:.1f} → {new_atten:.1f} dB')
+                    sat2, _ = check_input_saturation(r, iterations=10)
+                    if not sat2:
+                        resolved = True
+                        continue  # re-assess — may have over-corrected
+
+            # 2. Bypass RX amp
+            if has_rf and not resolved:
+                if not rf_peripherals.get_rx_amp_bypass():
+                    print('  Bypassing RX amplifier')
+                    rf_peripherals.set_rx_amp_bypass(True)
+                    time.sleep(0.1)
+                    sat2, _ = check_input_saturation(r, iterations=10)
+                    if not sat2:
+                        resolved = True
+                        continue
+
+            # 3. Increase DSA
+            if not resolved:
+                increase = max(6.0, -peak_db) if peak_db >= 0 else 6.0
+                new_dsa = _set_dsa(current_dsa + increase)
+                print(f'  DSA: {current_dsa:.2f} → {new_dsa:.2f} dB')
+                if new_dsa >= DSA_MAX:
+                    print('  WARNING: DSA at maximum — cannot reduce further')
+                    break
+                continue  # re-assess
+
+        else:
+            # --- Not saturated — try to increase power ---
+            # Target: headroom_db below full-scale, i.e. peak at -headroom_db dBFS
+            power_increase = headroom_available - headroom_db
+            if power_increase < 0.5:
+                # Already close enough to target
+                print(f'  Headroom {headroom_available:.1f} dB — '
+                      f'within target ({headroom_db:.1f} dB)')
+                break
+
+            print(f'  Headroom {headroom_available:.1f} dB — '
+                  f'can increase power by {power_increase:.1f} dB')
+
+            # 1. Reduce DSA
+            if current_dsa > 0:
+                dsa_decrease = min(power_increase, current_dsa)
+                new_dsa = _set_dsa(current_dsa - dsa_decrease)
+                print(f'  DSA: {current_dsa:.2f} → {new_dsa:.2f} dB')
+                continue  # re-assess after change
+
+            # 2. Reduce RX attenuator (DSA already at 0)
+            if has_rf:
+                atten_step = rf_peripherals.ATTEN_STEP
+                atten_min = rf_peripherals.ATTEN_MIN
+                current_atten = rf_peripherals.get_rx_attenuation()
+                if current_atten > atten_min:
+                    new_atten = max(round((current_atten - power_increase) / atten_step) * atten_step,
+                                    atten_min)
+                    rf_peripherals.set_rx_attenuation(new_atten)
+                    time.sleep(0.1)
+                    print(f'  RX attenuation: {current_atten:.1f} → {new_atten:.1f} dB')
+                    continue
+
+                # 3. Try enabling RX amp
+                if rf_peripherals.get_rx_amp_bypass():
+                    print('  Enabling RX amplifier')
+                    rf_peripherals.set_rx_amp_bypass(False)
+                    time.sleep(0.1)
+                    sat2, _ = check_input_saturation(r, iterations=10)
+                    if sat2:
+                        rf_peripherals.set_rx_amp_bypass(True)
+                        time.sleep(0.1)
+                        print('  RX amp causes saturation — keeping bypassed')
+                    continue
+
+            # Nothing left to adjust
+            print(f'  All controls at minimum — cannot increase power further')
+            break
+
+    # --- Final assessment ---
+    saturated, levels = check_input_saturation(r, iterations=10)
+    best_dsa = _get_dsa()
+    best_rx_atten = rf_peripherals.get_rx_attenuation() if has_rf else None
+    peak_db = _peak_dbfs(levels)
+    print(f'maximise_rx_power: done — peak = {peak_db:.1f} dBFS, '
+          f'DSA = {best_dsa:.2f} dB, saturated = {saturated}')
+
+    # --- Optimise PFB FFT shift ---
     best_fftshift, _ = _find_best_pfb_fftshift(r)
 
     return best_dsa, best_fftshift, check_dsp_overflow(r, 0.5)[1], levels, best_rx_atten
