@@ -2392,6 +2392,9 @@ class ReadoutClient:
         """
         # Check if a sweep is already running
         p = self.get_sweep_progress()
+        if isinstance(p, dict):
+            # Request failed (e.g. connection error) — no sweep running
+            p = 0.0
         if p != 0.0 and p != 1.0:
             raise RuntimeError(f'Sweep already in progress ({p*100:.3f}%), wait for it to finish.')
         
