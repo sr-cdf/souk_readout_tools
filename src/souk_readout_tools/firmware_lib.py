@@ -4431,6 +4431,28 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
             return -100.0
         return float(20 * np.log10(peak))
 
+    # --- Check for RTS over-voltage (hidden firmware DSA) ---
+    # When the over-voltage flag is set the RFDC secretly applies ~15 dB
+    # of extra DSA that doesn't show up in get_dsa().  We must clear this
+    # before assessing headroom, otherwise the snapshot levels are
+    # artificially low and we'd under-estimate the true signal power.
+    rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
+    if rts_details.get('rts_over_voltage', False):
+        print('maximise_rx_power: RTS over-voltage flag set — '
+              'clearing hidden firmware DSA')
+        # Set DSA to max so that when the hidden DSA is removed the ADC
+        # isn't immediately slammed.
+        _set_dsa(DSA_MAX)
+        check_rfdc_rts_events(r, clear=True)
+        time.sleep(0.1)
+    elif rts_details.get('rts_over_range', False):
+        # Clear stale over-range so the first iteration gets a fresh read.
+        check_rfdc_rts_events(r, clear=True)
+
+    # Track the lowest DSA value at which saturation was observed so we
+    # don't oscillate past it when reducing DSA.  None = no boundary known.
+    min_saturated_dsa = None
+
     for iteration in range(MAX_ITERATIONS):
         saturated, levels = check_input_saturation(r, iterations=10)
         current_dsa = _get_dsa()
@@ -4441,6 +4463,10 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
               f'DSA = {current_dsa:.2f} dB, saturated = {saturated}')
 
         if saturated:
+            # Record this as a saturation boundary
+            if min_saturated_dsa is None or current_dsa < min_saturated_dsa:
+                min_saturated_dsa = current_dsa
+
             # --- Need to reduce power ---
             resolved = False
 
@@ -4499,12 +4525,21 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
 
             # 1. Reduce DSA
             if current_dsa > 0:
-                dsa_decrease = min(power_increase, current_dsa)
-                new_dsa = _set_dsa(current_dsa - dsa_decrease)
-                print(f'  DSA: {current_dsa:.2f} → {new_dsa:.2f} dB')
-                continue  # re-assess after change
+                # Don't reduce below the known saturation boundary
+                dsa_floor = (min_saturated_dsa + headroom_db
+                             if min_saturated_dsa is not None else 0.0)
+                dsa_floor = round(dsa_floor / DSA_STEP) * DSA_STEP
+                if current_dsa <= dsa_floor:
+                    # Already at or below the safe boundary — DSA can't help
+                    print(f'  DSA already at saturation boundary '
+                          f'({dsa_floor:.2f} dB) — cannot reduce further')
+                else:
+                    dsa_decrease = min(power_increase, current_dsa - dsa_floor)
+                    new_dsa = _set_dsa(current_dsa - dsa_decrease)
+                    print(f'  DSA: {current_dsa:.2f} → {new_dsa:.2f} dB')
+                    continue  # re-assess after change
 
-            # 2. Reduce RX attenuator (DSA already at 0)
+            # 2. Reduce RX attenuator (DSA already at minimum or at boundary)
             if has_rf:
                 atten_step = rf_peripherals.ATTEN_STEP
                 atten_min = rf_peripherals.ATTEN_MIN
