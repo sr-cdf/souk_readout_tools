@@ -5299,7 +5299,7 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
         achievable, amplitudes, psb_fftshift, psb_scale,
         tx_attenuation_db, tx_amp_bypass, tx_bypass_amp_s21_db,
         effective_bits_per_tone, amplitude_resolution_bits,
-        dynamic_range_compromise, warnings, failure_reason
+        warnings, failure_reason
     """
     SCALEMIN, SCALEMAX = 1/256, 255
     max_amp = (1 - 2**-12) / max_tones_per_bin
@@ -5435,9 +5435,6 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
             np.abs(best_solution['amplitudes']) / 2**-12,
             np.nan))
 
-    # Check if psb_scale had to be reduced below maximum
-    dynamic_range_compromise = best_psb_scale < SCALEMAX * 0.9
-
     if max_tones_per_bin > 1:
         warnings_list.append(
             f'Up to {max_tones_per_bin} tones share an FFT bin, '
@@ -5448,7 +5445,6 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
         'failure_reason': None,
         'effective_bits_per_tone': effective_bits.tolist(),
         'amplitude_resolution_bits': amp_resolution_bits.tolist(),
-        'dynamic_range_compromise': dynamic_range_compromise,
         'warnings': warnings_list,
     })
     return best_solution
@@ -5552,7 +5548,7 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         target_powers_dbm, reference_plane, achieved_powers_dbm, power_error_db,
         amplitudes, psb_fftshift, psb_scale, tx_attenuation_db, tx_amp_bypass,
         tx_bypass_amp_s21_db, optimised, effective_bits_per_tone,
-        amplitude_resolution_bits, dynamic_range_compromise, warnings
+        amplitude_resolution_bits, warnings
     """
     VALID_PLANES = ('dac', 'rf_output', 'detector')
     if reference_plane not in VALID_PLANES:
@@ -5611,11 +5607,10 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
             # Scale ALL uniformly to preserve relative powers
             scale_factor = max_amp / float(np.max(amps))
             amps = amps * scale_factor
-            msg = (f'All tones scaled by {scale_factor:.4f} to fit max amplitude — '
-                   f'target power not achievable with current digital gain settings '
-                   f'(psb_fftshift={p["psb_fftshift"]:#06x}, '
-                   f'psb_scale={p["psb_scale"]:.4f}). '
-                   f'Use optimise_dynamic_range=True to auto-adjust')
+            shortfall_db = -20 * np.log10(scale_factor)
+            msg = (f'Target power too high by {shortfall_db:.1f} dB for current '
+                   f'gain settings. All tones scaled down to preserve relative '
+                   f'powers. Use optimise_dynamic_range=True to auto-adjust.')
             print(f'  WARNING: {msg}')
             warnings_list.append(msg)
         if np.any((amps > 0) & (amps < 2**-12)):
@@ -5659,7 +5654,6 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
             'optimised': False,
             'effective_bits_per_tone': eff_bits.tolist(),
             'amplitude_resolution_bits': amp_res_bits.tolist(),
-            'dynamic_range_compromise': False,
             'warnings': warnings_list,
         }
 
@@ -5689,8 +5683,9 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
     print(f'  Verification: max power error = {max_error:.2f} dB')
 
     if max_error > 1.0:
-        msg = (f'Target power accuracy > 1 dB — max error {max_error:.1f} dB '
-               f'at tone {int(np.argmax(np.abs(error)))}')
+        msg = (f'Achieved power differs from target by up to {max_error:.1f} dB '
+               f'(tone {int(np.argmax(np.abs(error)))}). '
+               f'The requested power may not be achievable at this reference plane.')
         print(f'  WARNING: {msg}')
         plan['warnings'].append(msg)
 
@@ -5708,7 +5703,6 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         'optimised': True,
         'effective_bits_per_tone': plan['effective_bits_per_tone'],
         'amplitude_resolution_bits': plan['amplitude_resolution_bits'],
-        'dynamic_range_compromise': plan['dynamic_range_compromise'],
         'warnings': plan['warnings'],
     }
 

@@ -710,10 +710,12 @@ class ReadoutClient:
                 bits = np.array(r['effective_bits_per_tone'])
                 valid = bits[np.isfinite(bits)]
                 if len(valid) > 0:
-                    print(f'  Effective DAC bits: {np.min(valid):.1f} — {np.max(valid):.1f} '
-                          f'(of 16)')
-            if r.get('dynamic_range_compromise'):
-                print(f'  Note: dynamic range compromised (psb_scale < max)')
+                    if np.max(valid) > 16:
+                        print(f'  WARNING: DAC overdriven ({np.max(valid):.1f} effective bits, '
+                              f'max is 16)')
+                    else:
+                        print(f'  Effective DAC bits per tone: '
+                              f'{np.min(valid):.1f} — {np.max(valid):.1f} (of 16)')
         return response
 
     def get_tone_powers(self,detailed_output=False,reference_plane='detector'):
@@ -2486,63 +2488,35 @@ class ReadoutClient:
         else:
             self.set_tone_amplitudes(np.ones(num_tones))
 
-        # Check for saturation/overflow before sweeping
+        # Check for saturation/overflow before sweeping and attempt to fix
         outps = self.check_output_saturation()
         inps = self.check_input_saturation()
         dspof = self.check_dsp_overflow()
 
         if outps['result']:
-            if tone_powers_dbm == 'auto':
-                if verbose:
-                    print(f'  Output saturation detected — running fix_dac_saturation()')
-                self.fix_dac_saturation()
-                outps = self.check_output_saturation()
-                if outps['result']:
-                    raise RuntimeError(
-                        f"DAC output saturation persists after attempted fix. "
-                        f"The requested per-tone power ({np.atleast_1d(tone_powers_dbm).flat[0]} dBm x "
-                        f"{num_tones} tones) exceeds what the DAC can produce. "
-                        f"Try reducing tone_powers_dbm or num_tones.")
-            else:
+            if verbose:
+                print(f'  DAC saturation detected — attempting fix...')
+            self.fix_dac_saturation()
+            outps = self.check_output_saturation()
+            if outps['result']:
                 raise RuntimeError(
-                    f"DAC output saturation detected. "
-                    f"The requested per-tone power ({np.atleast_1d(tone_powers_dbm).flat[0]} dBm x "
-                    f"{num_tones} tones) exceeds what the DAC can produce. "
-                    f"Try reducing tone_powers_dbm, reducing num_tones, or use "
-                    f"optimise_dynamic_range=True.")
+                    f"DAC saturation persists. Reduce tone_powers_dbm or num_tones.")
         if inps['result']:
-            if tone_powers_dbm == 'auto' or optimise_dynamic_range:
-                if verbose:
-                    print(f'  Input saturation detected — running fix_adc_saturation()')
-                self.fix_adc_saturation()
-                inps = self.check_input_saturation()
-                if inps['result']:
-                    raise RuntimeError(
-                        f"ADC input saturation persists after attempted fix. "
-                        f"The requested per-tone power ({np.atleast_1d(tone_powers_dbm).flat[0]} dBm x "
-                        f"{num_tones} tones) may be driving the ADC into clipping. "
-                        f"Try reducing tone_powers_dbm or num_tones.")
-            else:
+            if verbose:
+                print(f'  ADC saturation detected — attempting fix...')
+            self.fix_adc_saturation()
+            inps = self.check_input_saturation()
+            if inps['result']:
                 raise RuntimeError(
-                    f"ADC input saturation detected. "
-                    f"Try reducing tone_powers_dbm, or reducing num_tones")
+                    f"ADC saturation persists. Reduce tone_powers_dbm or num_tones.")
         if dspof['result']:
-            if tone_powers_dbm == 'auto':
-                if verbose:
-                    print(f'  DSP overflow detected — running fix_dac_saturation() to reduce psb_scale')
-                self.fix_dac_saturation()
-                dspof = self.check_dsp_overflow()
-                if dspof['result']:
-                    raise RuntimeError(
-                        f"DSP overflow persists after attempted fix. "
-                        f"The requested per-tone power ({np.atleast_1d(tone_powers_dbm).flat[0]} dBm x "
-                        f"{num_tones} tones) requires a psb_scale that overflows the "
-                        f"DSP pipeline. Try reducing tone_powers_dbm or num_tones.")
-            else:
+            if verbose:
+                print(f'  DSP overflow detected — attempting fix...')
+            self.fix_dac_saturation()
+            dspof = self.check_dsp_overflow()
+            if dspof['result']:
                 raise RuntimeError(
-                    f"DSP overflow detected. "
-                    f"Try reducing tone_powers_dbm, reducing num_tones, or use "
-                    f"optimise_dynamic_range=True.")
+                    f"DSP overflow persists. Reduce tone_powers_dbm or num_tones.")
 
         # Perform the sweep
         response = self.perform_sweep(center_freqs, sweep_span,
