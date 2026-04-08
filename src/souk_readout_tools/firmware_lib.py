@@ -3665,7 +3665,7 @@ def chanselect_get_channel_outmap(r, descramble_input=None):
 
 
 
-def check_input_saturation(r,iterations=1,saturation_bits=adc_saturation_bits,threshold=0.95,check_rts=True):
+def check_input_saturation(r,iterations=1,saturation_bits=adc_saturation_bits,threshold=0.90,check_rts=True):
     """
     Check to see if the input ADC is saturating.
 
@@ -3686,6 +3686,18 @@ def check_input_saturation(r,iterations=1,saturation_bits=adc_saturation_bits,th
         If True, also check the RFDC RTS sticky flags.
     """
     r.common.set_input(r.pipeline_id)
+
+    # Clear stale RTS sticky flags *before* capturing snapshots so that
+    # any flag that re-asserts during the snapshot window reflects a
+    # current condition rather than a past transient.  The snapshot
+    # iterations themselves provide a natural observation window (much
+    # longer than a fixed sleep) for intermittent spikes to trigger the
+    # hardware flags.
+    rts_available = False
+    if check_rts:
+        _, rts_stale = check_rfdc_rts_events(r, clear=True)
+        rts_available = rts_stale.get('rts_available', False)
+
     ss_0 = r.adc_snapshot.get_snapshot() / 2**(saturation_bits-1)
     ss=np.zeros((iterations,ss_0.size),dtype=ss_0.dtype)
     ss[0]=ss_0
@@ -3705,25 +3717,21 @@ def check_input_saturation(r,iterations=1,saturation_bits=adc_saturation_bits,th
                'integration_time':integration_time,
                'threshold':threshold}
 
-    if check_rts:
-        # Clear stale sticky flags first, then re-read to detect *current*
-        # events.  Without this the flags could reflect a past transient
-        # that has since resolved.
-        rts_event_stale, rts_stale = check_rfdc_rts_events(r, clear=True)
-        if rts_stale.get('rts_available', False):
-            time.sleep(0.05)  # allow fresh flags to assert if condition persists
-            rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
-            details.update(rts_details)
-            if rts_details.get('rts_over_voltage', False):
-                print('ERROR: ADC RTS over-voltage flag set — signal far exceeded input range')
-                any_saturation = True
-            elif rts_details.get('rts_over_range', False):
-                print('WARNING: ADC RTS over-range flag set — signal exceeded full-scale input')
-                any_saturation = True
+    # Read RTS flags *after* the snapshot window — any flag that latched
+    # during the captures indicates the condition is still active.
+    if check_rts and rts_available:
+        rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
+        details.update(rts_details)
+        if rts_details.get('rts_over_voltage', False):
+            print('ERROR: ADC RTS over-voltage flag set — signal far exceeded input range')
+            any_saturation = True
+        elif rts_details.get('rts_over_range', False):
+            print('WARNING: ADC RTS over-range flag set — signal exceeded full-scale input')
+            any_saturation = True
 
     return any_saturation, details
 
-def check_output_saturation(r,iterations=1,saturation_bits=dac_saturation_bits,threshold = 0.95):
+def check_output_saturation(r,iterations=1,saturation_bits=dac_saturation_bits,threshold = 0.90):
     """
     Check to see if the output DACs are saturating.
 
@@ -3798,19 +3806,21 @@ def check_rfdc_rts_events(r, clear=True):
     details = {'rts_available': False}
     try:
         flags = r.rfdc.get_rts_flags()
-        details['rts_available'] = True
-        details.update(flags)
-
-        any_event = any(flags.values())
-
-        if clear:
-            r.rfdc.reset_rts_flags(over_range=True, over_voltage=True)
-
-        return any_event, details
-
     except AttributeError:
         # get_rts_flags not available in this version of souk_mkid_readout
         return False, details
+
+    details['rts_available'] = True
+    details.update(flags)
+    any_event = any(flags.values())
+
+    if clear:
+        try:
+            r.rfdc.reset_rts_flags(over_range=True, over_voltage=True)
+        except AttributeError:
+            pass
+
+    return any_event, details
 
 
 def check_dsp_overflow(r, duration_s=0.1):
@@ -4417,10 +4427,10 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
         atten_step = rf_peripherals.ATTEN_STEP
         attenuations = np.arange(atten_min, atten_max + atten_step, atten_step)
 
-        def set_and_check_rx_atten(att_value):
+        def set_and_check_rx_atten(att_value, check_rts=True):
             rf_peripherals.set_rx_attenuation(att_value)
             time.sleep(0.1)
-            check, levels = check_input_saturation(r, iterations=10)
+            check, levels = check_input_saturation(r, iterations=10, check_rts=check_rts)
             print(f'  RX atten: {att_value:.1f} dB, Saturated: {check}')
             return check, levels
 
@@ -4452,7 +4462,7 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
             while low_idx <= high_idx:
                 mid_idx = (low_idx + high_idx) // 2
                 mid_att = attenuations[mid_idx]
-                check, levels = set_and_check_rx_atten(mid_att)
+                check, levels = set_and_check_rx_atten(mid_att, check_rts=False)
                 if check:
                     low_idx = mid_idx + 1
                 else:
@@ -4485,7 +4495,7 @@ def maximise_rx_power(r, config_dict, headroom_db=1.0, rf_peripherals=None):
             mid_dsa = dsa_values[mid_idx]
             r.rfdc.core.set_dsa(adc_tile, adc_block, mid_dsa)
             time.sleep(0.1)
-            check, levels = check_input_saturation(r, iterations=10)
+            check, levels = check_input_saturation(r, iterations=10, check_rts=False)
             print(f'    DSA: {mid_dsa:.2f} dB, Saturated: {check}')
             if check:
                 low_idx = mid_idx + 1
@@ -4754,7 +4764,7 @@ def optimise_rx_snr(r, config_dict=None, headroom_db=1.0, rf_peripherals=None):
                 mid_dsa = dsa_values[mid_idx]
                 r.rfdc.core.set_dsa(adc_tile, adc_block, mid_dsa)
                 time.sleep(0.1)
-                check, levels = check_input_saturation(r, iterations=10)
+                check, levels = check_input_saturation(r, iterations=10, check_rts=False)
                 print(f'  DSA: {mid_dsa:.2f} dB, Saturated: {check}')
                 if check:
                     low_idx = mid_idx + 1
@@ -4798,7 +4808,7 @@ def optimise_rx_snr(r, config_dict=None, headroom_db=1.0, rf_peripherals=None):
                 mid_att = attenuations[mid_idx]
                 rf_peripherals.set_rx_attenuation(mid_att)
                 time.sleep(0.1)
-                check, levels = check_input_saturation(r, iterations=10)
+                check, levels = check_input_saturation(r, iterations=10, check_rts=False)
                 print(f'  RX atten: {mid_att:.1f} dB, Saturated: {check}')
                 if check:
                     low_idx = mid_idx + 1
