@@ -5377,11 +5377,13 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
             if optimal_psb_scale < SCALEMIN or optimal_psb_scale > SCALEMAX:
                 continue  # out of range
 
-            # Check DAC overflow: per-tone DAC level = amp / 2^(popcount+1) * psb_scale.
-            # With max(amps) = max_amp ≈ 1, the peak level ≈ psb_scale / 2^(popcount+1).
-            # If this exceeds 1.0 the DAC is overdriven.
+            # Check DAC overflow: compute actual per-tone DAC amplitudes
+            # and sum their powers.  Total must not exceed 0 dBFS.
             popcount_candidate = bin(fftshift).count('1')
-            if optimal_psb_scale > 2**(popcount_candidate + 1):
+            candidate_amps = ref_amps / optimal_psb_scale
+            dac_amps = np.abs(candidate_amps) / 2**(popcount_candidate + 1) * optimal_psb_scale
+            total_dac_power = float(np.sum(dac_amps**2))
+            if total_dac_power > 1.0:
                 continue  # would overdrive DAC
 
             # Valid solution — prefer higher psb_scale (better DAC utilisation,
@@ -5417,15 +5419,17 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
             tx_bypass_amp_s21_db=analog_options[0][2],
             cryostat_input_s21_db=cal.get('cryostat_input_s21_db', 0),
             **cal_base)
-        _max_pwr = float(_ceil_pwr[0]) if np.isfinite(_ceil_pwr[0]) else float('nan')
+        # Compute total requested power (sum in linear) and DAC full-scale.
         n_tones = len(powers_dbm)
+        _dac_fs_dbm = float(_ceil_pwr[0]) if np.isfinite(_ceil_pwr[0]) else float('nan')
+        _total_requested_dbm = 10 * np.log10(np.sum(10**(powers_dbm / 10)))
         return {
             'achievable': False,
             'failure_reason': (
-                f'Cannot achieve target powers ({float(np.min(powers_dbm)):.1f} to '
-                f'{float(np.max(powers_dbm)):.1f} dBm) at {reference_plane} '
-                f'with {n_tones} tones. Maximum per-tone power is '
-                f'approximately {_max_pwr:.1f} dBm. '
+                f'Cannot achieve target powers at {reference_plane}: '
+                f'total power from {n_tones} tones is '
+                f'{_total_requested_dbm:.1f} dBm, '
+                f'but DAC full-scale is {_dac_fs_dbm:.1f} dBm. '
                 f'Reduce tone_powers_dbm or num_tones.'),
             'warnings': [],
         }

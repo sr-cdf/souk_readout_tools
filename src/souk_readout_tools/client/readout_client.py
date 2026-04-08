@@ -2485,9 +2485,12 @@ class ReadoutClient:
                 print(f'  Auto TX power: maximise_tx_power() -> {result}')
         elif tone_powers_dbm is not None:
             powers = np.broadcast_to(np.atleast_1d(tone_powers_dbm), num_tones).copy()
-            self.set_tone_powers(powers,
+            stp_response = self.set_tone_powers(powers,
                                 reference_plane=reference_plane,
                                 optimise_dynamic_range=optimise_dynamic_range)
+            if stp_response.get('status') != 'success':
+                raise RuntimeError(
+                    f"Failed to set tone powers: {stp_response.get('message', 'unknown error')}")
         else:
             self.set_tone_amplitudes(np.ones(num_tones))
 
