@@ -5878,6 +5878,18 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
     if not plan['achievable']:
         raise ValueError(plan['failure_reason'])
 
+    popcount = bin(plan['psb_fftshift']).count('1')
+    eff_bits = plan['effective_bits_per_tone']
+    min_eff_bits = float(np.nanmin(eff_bits))
+    print(f'  psb_fftshift: {format(plan["psb_fftshift"], "#016b")} '
+          f'(popcount {popcount})')
+    print(f'  psb_scale: {plan["psb_scale"]:.6f}')
+    if plan['tx_attenuation_db'] is not None:
+        print(f'  TX attenuation: {plan["tx_attenuation_db"]:.1f} dB, '
+              f'TX amp bypass: {plan["tx_amp_bypass"]}')
+    print(f'  Effective DAC bits per tone: {min_eff_bits:.1f} '
+          f'(worst case)')
+
     for w in plan['warnings']:
         print(f'  WARNING: {w}')
 
