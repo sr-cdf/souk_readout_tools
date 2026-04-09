@@ -3729,6 +3729,10 @@ def check_input_saturation(r,iterations=1,saturation_bits=adc_saturation_bits,th
             print('WARNING: ADC RTS over-range flag set — signal exceeded full-scale input')
             any_saturation = True
 
+    status = 'SATURATING' if any_saturation else 'OK'
+    print(f'ADC input saturation check: {status}')
+    print(f'  I range: [{imin:.3f}, {imax:.3f}] FS  |  Q range: [{qmin:.3f}, {qmax:.3f}] FS  (threshold: {threshold:.0%})')
+
     return any_saturation, details
 
 def check_output_saturation(r,iterations=1,saturation_bits=dac_saturation_bits,threshold = 0.90):
@@ -3764,6 +3768,15 @@ def check_output_saturation(r,iterations=1,saturation_bits=dac_saturation_bits,t
                'i1max_fs':i1max,'i1min_fs':i1min,'q1max_fs':q1max,'q1min_fs':q1min,
                'integration_time':integration_time,
                'threshold':threshold}
+
+    status = 'SATURATING' if any_saturation else 'OK'
+    dac0_status = 'SATURATING' if any0_saturation else 'OK'
+    dac1_status = 'SATURATING' if any1_saturation else 'OK'
+    print(f'DAC output saturation check: {status}')
+    print(f'  DAC0 ({dac0_status}): I range: [{i0min:.3f}, {i0max:.3f}] FS  |  Q range: [{q0min:.3f}, {q0max:.3f}] FS')
+    print(f'  DAC1 ({dac1_status}): I range: [{i1min:.3f}, {i1max:.3f}] FS  |  Q range: [{q1min:.3f}, {q1max:.3f}] FS')
+    print(f'  Threshold: {threshold:.0%}')
+
     return any_saturation, details
 
 
@@ -3861,6 +3874,12 @@ def check_dsp_overflow(r, duration_s=0.1):
                 'pfb_ovf_count_start':pfb_overflow0,
                 'pfb_ovf_count_end':pfb_overflow1,
                 'pfb_ovf_delta':pfb_delta}
+
+    status = 'OVERFLOW DETECTED' if any_overflow else 'OK'
+    print(f'DSP overflow check ({duration_s:.1f}s window): {status}')
+    print(f'  PSB scale overflow delta: {psbscale_delta}')
+    print(f'  PSB filterbank overflow delta: {psb_delta}')
+    print(f'  PFB filterbank overflow delta: {pfb_delta}')
 
     return any_overflow, details
 
