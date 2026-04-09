@@ -5915,12 +5915,19 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         if np.any(amps > max_amp):
             scale_factor = max_amp / float(np.max(amps))
             shortfall_db = -20 * np.log10(scale_factor)
-            n_tones = len(powers_dbm)
-            raise ValueError(
-                f'Target power too high by {shortfall_db:.1f} dB for current '
-                f'gain settings with {n_tones} tones. '
-                f'Reduce tone_powers_dbm or num_tones, '
-                f'or use optimise_dynamic_range=True to auto-adjust.')
+            if shortfall_db < 0.1:
+                # Marginal overshoot (< 0.1 dB) — clip to max_amp
+                amps = np.clip(amps, 0, max_amp)
+                msg = (f'Tone amplitudes clipped to max ({shortfall_db:.2f} dB overshoot)')
+                print(f'  WARNING: {msg}')
+                warnings_list.append(msg)
+            else:
+                n_tones = len(powers_dbm)
+                raise ValueError(
+                    f'Target power too high by {shortfall_db:.1f} dB for current '
+                    f'gain settings with {n_tones} tones. '
+                    f'Reduce tone_powers_dbm or num_tones, '
+                    f'or use optimise_dynamic_range=True to auto-adjust.')
         if np.any((amps > 0) & (amps < 2**-12)):
             n_low = int(np.sum((amps > 0) & (amps < 2**-12)))
             msg = f'{n_low} tone(s) below minimum amplitude resolution'
