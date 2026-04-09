@@ -3988,8 +3988,10 @@ def _find_best_psb_fftshift(r, overflow_check_duration=0.5):
     be set to their target values before calling, since PSB overflow
     depends on amplitudes + fftshift (psb_scale is downstream).
 
-    Iterates from highest-gain (most popcount) to lowest-gain fftshift,
-    stopping at the first overflow.
+    Iterates from most-attenuating (highest popcount) to highest-gain
+    (lowest popcount) fftshift, stopping at the first overflow.
+    The returned best_fftshift is the lowest popcount that is safe
+    (i.e. the minimum safe popcount).
 
     Returns (best_fftshift, best_fftshift_idx, fftshifts_array).
     """
@@ -5426,7 +5428,7 @@ def _diagnose_plan_failure(powers_dbm, cal, cal_base, reference_plane,
 
 def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
                                max_tones_per_bin=1,
-                               max_fftshift_popcount=None,
+                               fixed_fftshift=None,
                                has_rf_peripherals=False,
                                tx_atten_range=(0.0, 31.5, 0.5),
                                tx_amp_s21_enabled=None,
@@ -5460,6 +5462,10 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
         'dac', 'rf_output', or 'detector'.
     max_tones_per_bin : int
         Worst-case number of tones sharing a single FFT bin.
+    fixed_fftshift : int or None
+        If given, use only this fftshift value (from empirical search).
+        The planner will compute the optimal psb_scale and analog
+        settings for this exact fftshift.
     has_rf_peripherals : bool
         Whether TX attenuator / amp bypass are available.
     tx_atten_range : tuple
@@ -5487,12 +5493,10 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
     # maximised regardless of fftshift (the gain cancels with psb_scale).
     # Trying highest popcount first maximises psb_scale, giving marginally
     # better DAC utilisation (secondary to the 12-bit amplitude quantisation).
-    fftshift_candidates = (2**np.arange(14) - 1).astype(int)[::-1]
-    if max_fftshift_popcount is not None:
-        fftshift_candidates = np.array([
-            f for f in fftshift_candidates
-            if bin(f).count('1') <= max_fftshift_popcount
-        ])
+    if fixed_fftshift is not None:
+        fftshift_candidates = np.array([int(fixed_fftshift)])
+    else:
+        fftshift_candidates = (2**np.arange(14) - 1).astype(int)[::-1]
 
     # Build the common kwargs for calc_tone_amplitudes (excluding psb_fftshift,
     # psb_scale, tx_attenuator_value_db, tx_bypass_amp_s21_db which we vary)
@@ -5844,42 +5848,40 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
     print(f'set_tone_powers: optimising dynamic range for {len(powers_dbm)} tones '
           f'at reference_plane={reference_plane!r}')
 
-    # Phase 2a: Mute output, then set maximised amplitudes for the
-    # fftshift overflow test.  Amplitudes are fftshift-independent
-    # (gain cancels with psb_scale algebraically).
-    plan_unconstrained = _plan_tone_power_settings(
+    # Phase 2a: Compute maximised amplitudes for the fftshift overflow
+    # test.  Amplitudes are fftshift-independent (gain cancels with
+    # psb_scale algebraically), so we use any fftshift here.
+    initial_plan = _plan_tone_power_settings(
         powers_dbm, cal, reference_plane,
         max_tones_per_bin=max_tones_per_bin,
         **rf_kwargs)
 
-    if not plan_unconstrained['achievable']:
-        raise ValueError(plan_unconstrained['failure_reason'])
+    if not initial_plan['achievable']:
+        raise ValueError(initial_plan['failure_reason'])
 
-    # Mute and set target amplitudes for realistic overflow testing.
+    # Phase 2b: Mute, set maximised amps, find best fftshift empirically.
+    # The fftshift search is authoritative — it tests with the actual
+    # target amplitudes and finds the highest-gain shift without overflow.
     r.psbscale.set_scale(0)
     time.sleep(0.01)
-    set_tone_amplitudes(r, config_dict, np.array(plan_unconstrained['amplitudes']))
+    set_tone_amplitudes(r, config_dict, np.array(initial_plan['amplitudes']))
 
-    # Phase 2b: Find best fftshift with output muted (no DAC spikes).
     best_fftshift, _, _ = _find_best_psb_fftshift(r)
-    max_safe_popcount = bin(best_fftshift).count('1')
-    planned_popcount = bin(plan_unconstrained['psb_fftshift']).count('1')
 
-    # Phase 2c: Re-plan with empirical fftshift limit if needed.
-    if max_safe_popcount < planned_popcount:
-        print(f'  PSB overflow at planned popcount {planned_popcount}, '
-              f'constraining to <={max_safe_popcount}')
-        plan = _plan_tone_power_settings(
-            powers_dbm, cal, reference_plane,
-            max_tones_per_bin=max_tones_per_bin,
-            max_fftshift_popcount=max_safe_popcount,
-            **rf_kwargs)
-        if not plan['achievable']:
-            raise ValueError(
-                f'PSB overflow limits fftshift popcount to {max_safe_popcount}. '
-                + plan['failure_reason'])
-    else:
-        plan = plan_unconstrained
+    # Phase 2c: Plan with the empirically-determined fftshift locked in.
+    # The planner computes the optimal psb_scale and analog settings for
+    # this exact fftshift.
+    plan = _plan_tone_power_settings(
+        powers_dbm, cal, reference_plane,
+        max_tones_per_bin=max_tones_per_bin,
+        fixed_fftshift=best_fftshift,
+        **rf_kwargs)
+    if not plan['achievable']:
+        raise ValueError(
+            f'No valid plan at empirical fftshift '
+            f'{format(best_fftshift, "#016b")} '
+            f'(popcount {bin(best_fftshift).count("1")}). '
+            + plan['failure_reason'])
 
     # ---- Phase 3: APPLY ----
     # Output is already muted from the search.  _apply_tone_power_plan
