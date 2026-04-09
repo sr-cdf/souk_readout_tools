@@ -9,7 +9,8 @@ circle from sweep data.
 
 import numpy as np
 from ._common import (_get_pyplot, _compute_mag_phase, _apply_deembedding,
-                       ERRORBAR_STYLE, _resolve_label)
+                       ERRORBAR_STYLE, _resolve_label,
+                       _normalise_iq, _compute_mag_phase_units, UNITS)
 from ._psd import compute_psd
 
 
@@ -79,7 +80,7 @@ def _compute_freq_diss(ts_data, tone_key, i_arr, q_arr, sweep_data):
 
 def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     deembed=False, sweep_data=None, fig=None, label=None,
-                    **kwargs):
+                    units='raw', config=None, **kwargs):
     """
     Plot timestream data in various formats.
 
@@ -94,6 +95,15 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             and for deembed=True.
         fig: Existing figure. If None, create new.
         label: Legend label. If None, uses an auto-incrementing index.
+        units: Unit for I/Q normalisation.  One of:
+            'raw' (default) – accumulator codes, no normalisation.
+            'peak' – normalise to the peak magnitude of the data.
+            'adc_fs' – fraction of ADC full-scale.
+            'dbfs' – dB relative to ADC full-scale.
+            'dbm' – estimated ADC input power in dBm.
+            All options except 'raw' and 'peak' require
+            'system_information' in ts_data.
+        config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
         **kwargs: Passed to matplotlib plot calls.
 
     Returns:
@@ -104,6 +114,21 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
     sample_rate = ts_data['sample_rate']
     n_samples = ts_data.get('num_samples', len(selected[0][1]))
     t_axis = np.arange(n_samples) / sample_rate
+    info = ts_data.get('system_information')
+
+    # Normalise
+    if units != 'raw':
+        if units != 'peak' and (info is None or not isinstance(info, dict)):
+            raise ValueError("ts_data must contain 'system_information' for non-raw units.")
+        normalised = []
+        for key, i_arr, q_arr in selected:
+            ni, nq, _, _, iq_label, mag_label = _normalise_iq(
+                i_arr, q_arr, units, info, config=config)
+            normalised.append((key, ni, nq))
+        selected = normalised
+    else:
+        iq_label = ''
+        mag_label = '|S21| (dB)'
 
     if format == 'freq_diss' and sweep_data is None:
         raise ValueError("sweep_data is required for format='freq_diss'")
@@ -121,8 +146,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                                          suffix=f'Tone {key}' if len(selected) > 1 else None)
             ax.plot(z.real, z.imag, '.', markersize=1,
                     label=trace_label, **kwargs)
-        ax.set_xlabel('I')
-        ax.set_ylabel('Q')
+        ax.set_xlabel(f'I {iq_label}'.strip())
+        ax.set_ylabel(f'Q {iq_label}'.strip())
         ax.set_aspect('equal')
         ax.legend(fontsize='small')
         title = 'Timestream I vs Q'
@@ -148,16 +173,16 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                 z, _ = _apply_deembedding(None, z, deembed)
             ax1.plot(t_axis, z.real, linewidth=0.5, label=trace_label, **kwargs)
             ax2.plot(t_axis, z.imag, linewidth=0.5, label=trace_label, **kwargs)
-            ax1.set_ylabel('I')
-            ax2.set_ylabel('Q')
+            ax1.set_ylabel(f'I {iq_label}'.strip())
+            ax2.set_ylabel(f'Q {iq_label}'.strip())
 
         elif format == 'magphase':
             if deembed:
                 z, _ = _apply_deembedding(None, z, deembed)
-            mag_db, phase = _compute_mag_phase(z)
+            mag_db, phase = _compute_mag_phase_units(z, units, info=info, config=config)
             ax1.plot(t_axis, mag_db, linewidth=0.5, label=trace_label, **kwargs)
             ax2.plot(t_axis, phase, linewidth=0.5, label=trace_label, **kwargs)
-            ax1.set_ylabel('|S21| (dB)')
+            ax1.set_ylabel(mag_label)
             ax2.set_ylabel('Phase (rad)')
 
         elif format == 'freq_diss':

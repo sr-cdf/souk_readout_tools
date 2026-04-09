@@ -8,7 +8,8 @@ frequency, all with optional deembedding and error bars.
 
 import numpy as np
 from ._common import (_get_pyplot, _compute_mag_phase, _propagate_errors_mag,
-                       _apply_deembedding, ERROR_FILL_STYLE, _resolve_label)
+                       _apply_deembedding, ERROR_FILL_STYLE, _resolve_label,
+                       _normalise_iq, _compute_mag_phase_units, UNITS)
 
 
 def _extract_traces(sweep_data, tones=None):
@@ -43,7 +44,7 @@ def _extract_traces(sweep_data, tones=None):
 
 def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                show_errors=True, multi_tone='overlay', fig=None, label=None,
-               **kwargs):
+               units='raw', config=None, **kwargs):
     """
     General-purpose sweep plot.
 
@@ -57,6 +58,15 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         multi_tone: 'overlay' (shared axes) or 'grid' (one subplot per tone).
         fig: Existing figure. If None, create new.
         label: Legend label. If None, uses an auto-incrementing index.
+        units: Unit for I/Q normalisation.  One of:
+            'raw' (default) – accumulator codes, no normalisation.
+            'peak' – normalise to the peak magnitude of the data.
+            'adc_fs' – fraction of ADC full-scale.
+            'dbfs' – dB relative to ADC full-scale.
+            'dbm' – estimated ADC input power in dBm.
+            All options except 'raw' and 'peak' require
+            'system_information' in sweep_data.
+        config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
         **kwargs: Passed to matplotlib plot/errorbar calls.
 
     Returns:
@@ -64,6 +74,22 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
     """
     plt = _get_pyplot()
     traces = _extract_traces(sweep_data, tones)
+    info = sweep_data.get('system_information')
+
+    # Normalise traces
+    if units != 'raw':
+        if units != 'peak' and info is None:
+            raise ValueError("sweep_data must contain 'system_information' for non-raw units.")
+        normalised = []
+        for f, si, sq, ei, eq, tidx in traces:
+            si, sq, ei, eq, iq_label, mag_label = _normalise_iq(
+                si, sq, units, info, config=config, ei=ei, eq=eq)
+            normalised.append((f, si, sq, ei, eq, tidx))
+        traces = normalised
+    else:
+        iq_label = ''
+        mag_label = '|S21| (dB)'
+
     has_errors = show_errors and any(np.any(ei != 0) for _, _, _, ei, _, _ in traces)
     n_traces = len(traces)
     is_multi = n_traces > 1 and traces[0][5] is not None
@@ -87,8 +113,8 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                 ax.plot(z.real, z.imag, linewidth=0.8, label=trace_label, **kwargs)
                 ax.set_aspect('equal')
                 ax.set_title(f'Tone {tidx}')
-                ax.set_xlabel('I')
-                ax.set_ylabel('Q')
+                ax.set_xlabel(f'I {iq_label}'.strip())
+                ax.set_ylabel(f'Q {iq_label}'.strip())
                 ax.legend(fontsize='small')
             # Hide unused axes
             for i in range(n_traces, len(axes_flat)):
@@ -106,7 +132,10 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                 trace_label = _resolve_label(axes[i, 0], label,
                                              suffix=f'Tone {tidx}' if tidx is not None else None)
                 _plot_single_trace(axes[i, 0], axes[i, 1], f, si, sq, ei, eq,
-                                   format, deembed, has_errors, trace_label, **kwargs)
+                                   format, deembed, has_errors, trace_label,
+                                   units=units, info=info, config=config,
+                                   iq_label=iq_label, mag_label=mag_label,
+                                   **kwargs)
                 axes[i, 0].legend(fontsize='small')
                 axes[i, 1].legend(fontsize='small')
             plt.tight_layout()
@@ -125,8 +154,8 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             trace_label = _resolve_label(ax, label,
                                          suffix=f'Tone {tidx}' if tidx is not None else None)
             ax.plot(z.real, z.imag, linewidth=0.8, label=trace_label, **kwargs)
-        ax.set_xlabel('I')
-        ax.set_ylabel('Q')
+        ax.set_xlabel(f'I {iq_label}'.strip())
+        ax.set_ylabel(f'Q {iq_label}'.strip())
         ax.set_aspect('equal')
         ax.legend(fontsize='small')
         title = 'S21 Complex Plane'
@@ -146,7 +175,10 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         trace_label = _resolve_label(ax1, label,
                                      suffix=f'Tone {tidx}' if tidx is not None else None)
         _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
-                           format, deembed, has_errors, trace_label, **kwargs)
+                           format, deembed, has_errors, trace_label,
+                           units=units, info=info, config=config,
+                           iq_label=iq_label, mag_label=mag_label,
+                           **kwargs)
 
     ax1.legend(fontsize='small')
     ax2.legend(fontsize='small')
@@ -161,7 +193,9 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
 
 
 def _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
-                        format, deembed, has_errors, label, **kwargs):
+                        format, deembed, has_errors, label,
+                        units='raw', info=None, config=None,
+                        iq_label='', mag_label='|S21| (dB)', **kwargs):
     """Plot a single trace on a pair of axes."""
     z = si + 1j * sq
     if deembed:
@@ -171,7 +205,7 @@ def _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
     f_mhz = f / 1e6
 
     if format == 'magphase':
-        mag_db, phase = _compute_mag_phase(z)
+        mag_db, phase = _compute_mag_phase_units(z, units, info=info, config=config)
         if has_errors and np.any(ei != 0):
             e_mag, e_phase = _propagate_errors_mag(si, sq, ei, eq)
             line, = ax1.plot(f_mhz, mag_db, linewidth=0.8, label=label, **kwargs)
@@ -183,7 +217,7 @@ def _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
         else:
             ax1.plot(f_mhz, mag_db, linewidth=0.8, label=label, **kwargs)
             ax2.plot(f_mhz, phase, linewidth=0.8, label=label, **kwargs)
-        ax1.set_ylabel('|S21| (dB)')
+        ax1.set_ylabel(mag_label)
         ax2.set_ylabel('Phase (rad)')
         ax2.set_xlabel('Frequency (MHz)')
 
@@ -198,8 +232,8 @@ def _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
         else:
             ax1.plot(f_mhz, si, linewidth=0.8, label=label, **kwargs)
             ax2.plot(f_mhz, sq, linewidth=0.8, label=label, **kwargs)
-        ax1.set_ylabel('I')
-        ax2.set_ylabel('Q')
+        ax1.set_ylabel(f'I {iq_label}'.strip())
+        ax2.set_ylabel(f'Q {iq_label}'.strip())
         ax2.set_xlabel('Frequency (MHz)')
 
     else:

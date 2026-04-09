@@ -10,12 +10,14 @@ overlay on shared axes.
 """
 
 import numpy as np
-from ._common import _get_pyplot, _compute_mag_phase, ERRORBAR_STYLE, _resolve_label
+from ._common import (_get_pyplot, _compute_mag_phase, ERRORBAR_STYLE, _resolve_label,
+                       _normalise_iq, _compute_mag_phase_units, UNITS)
 from ._psd import compute_psd, compute_psd_averaged, compute_psd_concatenated
 
 
 def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
-                   deembed=False, fig=None, label=None, **kwargs):
+                   deembed=False, fig=None, label=None,
+                   units='raw', config=None, system_info=None, **kwargs):
     """
     Plot snapshot data for a single tone.
 
@@ -30,6 +32,16 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
         deembed: bool or deembed params dict.
         fig: Existing figure.
         label: Legend label. If None, uses an auto-incrementing index.
+        units: Unit for I/Q normalisation.  One of:
+            'raw' (default) – accumulator codes, no normalisation.
+            'peak' – normalise to the peak magnitude of the data.
+            'adc_fs' – fraction of ADC full-scale.
+            'dbfs' – dB relative to ADC full-scale.
+            'dbm' – estimated ADC input power in dBm.
+            All options except 'raw' and 'peak' require system_info.
+        config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
+        system_info: system_information dict.  Looked up from
+            snapshot_data['system_information'] if not provided.
         **kwargs: Passed to plot calls.
 
     Returns:
@@ -40,6 +52,20 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
     sample_rate = snapshot_data['sample_rate']
     tone_index = snapshot_data['tone_index']
     n_snap, n_samples = snapshots.shape
+    info = system_info or snapshot_data.get('system_information')
+
+    # Normalise I/Q label setup
+    if units != 'raw':
+        if units != 'peak' and info is None:
+            raise ValueError("system_info (or snapshot_data['system_information']) "
+                             "is required for non-raw units.")
+        # Probe labels from a dummy call
+        _, _, _, _, iq_label, mag_label = _normalise_iq(
+            np.zeros(1), np.zeros(1), units, info, config=config,
+            pre_accumulation=True)
+    else:
+        iq_label = ''
+        mag_label = '|S21| (dB)'
 
     # Prepare data based on repetitions mode
     if repetitions == 'concatenate':
@@ -60,6 +86,16 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
         from ._common import _apply_deembedding
         z_list = [_apply_deembedding(None, z, deembed)[0] for z in z_list]
 
+    # Apply normalisation to complex arrays
+    if units != 'raw':
+        normalised = []
+        for z in z_list:
+            ni, nq, _, _, _, _ = _normalise_iq(
+                z.real.copy(), z.imag.copy(), units, info, config=config,
+                pre_accumulation=True)
+            normalised.append(ni + 1j * nq)
+        z_list = normalised
+
     if format == 'iq':
         if fig is None:
             fig, ax = plt.subplots(1, 1, figsize=(8, 8))
@@ -69,8 +105,8 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             trace_label = _resolve_label(ax, label,
                                          suffix=rep_label)
             ax.plot(z.real, z.imag, '.', markersize=1, label=trace_label, **kwargs)
-        ax.set_xlabel('I')
-        ax.set_ylabel('Q')
+        ax.set_xlabel(f'I {iq_label}'.strip())
+        ax.set_ylabel(f'Q {iq_label}'.strip())
         ax.set_aspect('equal')
         ax.legend(fontsize='small')
         ax.set_title(f'Tone {tone_index} — I vs Q')
@@ -91,15 +127,15 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
         if format == 'iq_vs_t':
             ax1.plot(t, z.real, linewidth=0.5, label=trace_label, **kwargs)
             ax2.plot(t, z.imag, linewidth=0.5, label=trace_label, **kwargs)
-            ax1.set_ylabel('I')
-            ax2.set_ylabel('Q')
+            ax1.set_ylabel(f'I {iq_label}'.strip())
+            ax2.set_ylabel(f'Q {iq_label}'.strip())
             ax2.set_xlabel('Time (µs)')
 
         elif format == 'magphase':
-            mag_db, phase = _compute_mag_phase(z)
+            mag_db, phase = _compute_mag_phase_units(z, units, info=info, config=config)
             ax1.plot(t, mag_db, linewidth=0.5, label=trace_label, **kwargs)
             ax2.plot(t, phase, linewidth=0.5, label=trace_label, **kwargs)
-            ax1.set_ylabel('|S21| (dB)')
+            ax1.set_ylabel(mag_label)
             ax2.set_ylabel('Phase (rad)')
             ax2.set_xlabel('Time (µs)')
 
