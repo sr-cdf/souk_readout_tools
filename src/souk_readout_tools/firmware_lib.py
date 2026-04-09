@@ -3983,47 +3983,42 @@ def _mask_cal_for_reference_plane(cal_params, reference_plane):
 def _find_best_psb_fftshift(r, overflow_check_duration=0.5):
     """Find the best PSB FFT shift without overflow, testing on live hardware.
 
-    Iterates from the highest-gain (most popcount) to lowest-gain fftshift,
-    pre-compensating psb_scale at each step so the DAC output stays constant.
-    Stops at the first overflow and returns the previous safe value.
+    Mutes PSB output (psb_scale → minimum) before searching to avoid
+    sending transient spikes to the DAC.  Tone amplitudes should already
+    be set to their target values before calling, since PSB overflow
+    depends on amplitudes + fftshift (psb_scale is downstream).
 
-    Returns (best_fftshift, best_fftshift_idx, compensated_psb_scale, fftshifts_array).
+    Iterates from highest-gain (most popcount) to lowest-gain fftshift,
+    stopping at the first overflow.
+
+    Returns (best_fftshift, best_fftshift_idx, fftshifts_array).
     """
-    SCALEMIN, SCALEMAX = 1/256, 255
     psb_fftshifts = (2**np.arange(14) - 1).astype(int)[::-1]  # 8191, 4095, ..., 1, 0
     best_fftshift = int(psb_fftshifts[0])  # start with safest (lowest gain)
 
-    current_fftshift = r.psb.get_fftshift()
-    current_popcount = bin(current_fftshift).count('1')
-    current_scale = r.psbscale.get_scale()
+    # Mute output during search — psb_scale is downstream of the PSB
+    # filterbank so it doesn't affect overflow detection.
+    r.psbscale.set_scale(0)
+    time.sleep(0.01)
 
     for shift in psb_fftshifts:
-        popcount = bin(shift).count('1')
-        # PSB FFT gain proportional to 2^(popcount+1).  Pre-compensate psbscale.
-        comp_scale = current_scale * 2**(current_popcount - popcount)
-        comp_scale = float(np.clip(comp_scale, SCALEMIN, SCALEMAX))
-        r.psbscale.set_scale(comp_scale)
         r.psb.set_fftshift(shift)
         time.sleep(0.01)
         dsp_overflow, dsp_overflow_details = check_dsp_overflow(r, overflow_check_duration)
         psb_ovf = dsp_overflow_details['psb_ovf_delta']
-        print(f'  fftshift search: {format(shift, "#016b")} psbscale: {comp_scale:.6f} ovf: {psb_ovf}')
+        print(f'  fftshift search: {format(shift, "#016b")} ovf: {psb_ovf}')
         if psb_ovf:
             break  # overflow at this shift — use the previous safe value
         best_fftshift = int(shift)
 
     best_fftshift_idx = list(psb_fftshifts).index(best_fftshift)
 
-    # Restore the best fftshift and its compensated scale
-    best_popcount = bin(best_fftshift).count('1')
-    comp_scale = current_scale * 2**(current_popcount - best_popcount)
-    comp_scale = float(np.clip(comp_scale, SCALEMIN, SCALEMAX))
+    # Set the best fftshift (output remains muted for caller to unmute)
     r.psb.set_fftshift(best_fftshift)
-    r.psbscale.set_scale(comp_scale)
     time.sleep(0.01)
     print(f'  best fftshift: {format(best_fftshift, "#016b")}')
 
-    return best_fftshift, best_fftshift_idx, comp_scale, psb_fftshifts
+    return best_fftshift, best_fftshift_idx, psb_fftshifts
 
 
 def _find_best_pfb_fftshift(r, overflow_check_duration=0.5, verify_duration=1.0):
@@ -4124,11 +4119,10 @@ def maximise_tx_power(r,config_dict=None, headroom_db=2.0):
     if amps_max == 0:
         raise ValueError('Tone powers are all zero')
     amps_gain = max_amp/amps_max
-    compensated_scale = init_psb_scale / amps_gain
     scalemin = 1/256
     scalemax = 255
-    compensated_scale = float(np.clip(compensated_scale, scalemin, scalemax))
-    r.psbscale.set_scale(compensated_scale)
+    # Mute output before changing amplitudes
+    r.psbscale.set_scale(0)
     time.sleep(0.01)
     amps = init_amps * amps_gain
     amps = _apply_per_bin_scaling(r, config_dict, amps)
@@ -4136,16 +4130,19 @@ def maximise_tx_power(r,config_dict=None, headroom_db=2.0):
     set_tone_amplitudes(r,config_dict,amps)
     time.sleep(0.01)
 
-    # --- Step 2: Find best PSB FFT shift without overflow ---
-    best_fftshift, best_fftshift_idx, comp_scale, psb_fftshifts = _find_best_psb_fftshift(r)
+    # --- Step 2: Find best PSB FFT shift without overflow (output muted) ---
+    best_fftshift, best_fftshift_idx, psb_fftshifts = _find_best_psb_fftshift(r)
 
     # --- Step 3: Ramp up PSB scale to maximise DAC output ---
     tolerance = 0.1 #10% of lower bound
     headroom_linear = 10**(-headroom_db/20)
 
-    scale_current = r.psbscale.get_scale()
-    if scale_current < scalemin:
-        scale_current = scalemin
+    # Compute the scale that would maintain original output power with
+    # the new amplitudes and fftshift, use as starting point for the ramp.
+    init_popcount = bin(init_psb_fftshift).count('1')
+    best_popcount = bin(best_fftshift).count('1')
+    scale_current = init_psb_scale / amps_gain * 2**(init_popcount - best_popcount)
+    scale_current = float(np.clip(scale_current, scalemin, scalemax))
 
     # Ramp up: double until overflow or DAC saturation
     # If PSB filterbank overflow is detected during the ramp, the FFT shift
@@ -4303,16 +4300,13 @@ def optimise_tx_snr(r,config_dict=None):
     scalemin = 1/256
     scalemax = 255
 
-    # --- Step 1: Maximise amplitudes, pre-compensate psb_scale ---
+    # --- Step 1: Mute output and maximise amplitudes ---
     max_amp = 1-2**-12
     amps_max = np.max(init_amps)
     if amps_max == 0:
         raise ValueError('Tone powers are all zero')
     amps_gain = max_amp/amps_max
-    # Reduce psb_scale by the same factor BEFORE boosting amps
-    compensated_scale = init_psb_scale / amps_gain
-    compensated_scale = float(np.clip(compensated_scale, scalemin, scalemax))
-    r.psbscale.set_scale(compensated_scale)
+    r.psbscale.set_scale(0)
     time.sleep(0.01)
     amps = init_amps*amps_gain
     amps = _apply_per_bin_scaling(r, config_dict, amps)
@@ -4320,8 +4314,8 @@ def optimise_tx_snr(r,config_dict=None):
     set_tone_amplitudes(r,config_dict,amps)
     time.sleep(0.01)
 
-    # --- Step 2: Find best PSB FFT shift without overflow ---
-    best_fftshift, best_fftshift_idx, _, psb_fftshifts = _find_best_psb_fftshift(r)
+    # --- Step 2: Find best PSB FFT shift without overflow (output muted) ---
+    best_fftshift, best_fftshift_idx, psb_fftshifts = _find_best_psb_fftshift(r)
 
     # --- Step 3: Set final psb_scale to preserve original output power ---
     # The total gain change is: amps_gain × fftshift_gain_change.
@@ -5663,45 +5657,39 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
 
 
 def _apply_tone_power_plan(r, config_dict, plan, rf_peripherals=None):
-    """Apply a computed tone power plan to hardware in safe order.
+    """Apply a computed tone power plan to hardware.
 
-    Safe ordering: reduce power before increasing to avoid transient spikes.
+    Mutes PSB output first (psb_scale → minimum), configures fftshift,
+    amplitudes, and analog chain while muted, then unmutes by setting
+    the target psb_scale last.
     """
-    SCALEMIN, SCALEMAX = 1/256, 255
     target_fftshift = plan['psb_fftshift']
     target_psb_scale = plan['psb_scale']
     target_amps = np.array(plan['amplitudes'])
 
-    current_fftshift = r.psb.get_fftshift()
-    current_psb_scale = r.psbscale.get_scale()
-    current_popcount = bin(current_fftshift).count('1')
-    target_popcount = bin(target_fftshift).count('1')
+    if target_psb_scale <= 0:
+        raise ValueError(f'psb_scale must be positive for tone output, got {target_psb_scale}')
 
-    # Step 1: Pre-compensate psb_scale downward to prevent transient spikes
-    #         when switching fftshift (which changes gain).
-    comp_scale = current_psb_scale * 2**(current_popcount - target_popcount)
-    safe_scale = min(float(np.clip(comp_scale, SCALEMIN, SCALEMAX)), target_psb_scale)
-    r.psbscale.set_scale(safe_scale)
+    # Mute output
+    r.psbscale.set_scale(0)
     time.sleep(0.01)
 
-    # Step 2: Set fftshift
+    # Set fftshift and amplitudes while muted
     r.psb.set_fftshift(target_fftshift)
     time.sleep(0.01)
-
-    # Step 3: Set amplitudes
     set_tone_amplitudes(r, config_dict, target_amps)
     time.sleep(0.01)
 
-    # Step 4: Set final psb_scale
-    r.psbscale.set_scale(target_psb_scale)
-    time.sleep(0.01)
-
-    # Step 5: Set analog chain (if available)
+    # Set analog chain while muted (if available)
     if rf_peripherals is not None and rf_peripherals.enabled:
         if plan['tx_attenuation_db'] is not None:
             rf_peripherals.set_tx_attenuation(plan['tx_attenuation_db'])
         if plan['tx_amp_bypass'] is not None:
             rf_peripherals.set_tx_amp_bypass(plan['tx_amp_bypass'])
+
+    # Unmute: set final psb_scale last
+    r.psbscale.set_scale(target_psb_scale)
+    time.sleep(0.01)
 
 
 def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
@@ -5856,32 +5844,28 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
     print(f'set_tone_powers: optimising dynamic range for {len(powers_dbm)} tones '
           f'at reference_plane={reference_plane!r}')
 
-    # Phase 2a: Initial plan (unconstrained) to get maximised amplitudes.
-    # Maximised amps are fftshift-independent (ratios cancel algebraically).
-    plan = _plan_tone_power_settings(
+    # Phase 2a: Mute output, then set maximised amplitudes for the
+    # fftshift overflow test.  Amplitudes are fftshift-independent
+    # (gain cancels with psb_scale algebraically).
+    plan_unconstrained = _plan_tone_power_settings(
         powers_dbm, cal, reference_plane,
         max_tones_per_bin=max_tones_per_bin,
         **rf_kwargs)
 
-    if not plan['achievable']:
-        raise ValueError(plan['failure_reason'])
+    if not plan_unconstrained['achievable']:
+        raise ValueError(plan_unconstrained['failure_reason'])
 
-    # Phase 2b: Set target amplitudes and find safe fftshift empirically.
-    # PSB filterbank overflow depends on amps + fftshift (psb_scale is
-    # downstream), so setting target amps first gives a valid overflow test.
-    set_tone_amplitudes(r, config_dict, np.array(plan['amplitudes']))
-    r.psb.set_fftshift(plan['psb_fftshift'])
-    r.psbscale.set_scale(plan['psb_scale'])
+    # Mute and set target amplitudes for realistic overflow testing.
+    r.psbscale.set_scale(0)
     time.sleep(0.01)
+    set_tone_amplitudes(r, config_dict, np.array(plan_unconstrained['amplitudes']))
 
-    best_fftshift, _, _, _ = _find_best_psb_fftshift(r)
+    # Phase 2b: Find best fftshift with output muted (no DAC spikes).
+    best_fftshift, _, _ = _find_best_psb_fftshift(r)
     max_safe_popcount = bin(best_fftshift).count('1')
-    planned_popcount = bin(plan['psb_fftshift']).count('1')
+    planned_popcount = bin(plan_unconstrained['psb_fftshift']).count('1')
 
-    # Phase 2c: If the planned fftshift overflows, re-plan with the
-    # empirically-determined popcount limit.  The plan will pick the
-    # best (fftshift, psb_scale, analog) combo within the safe range
-    # and recompute amplitudes + psb_scale correctly.
+    # Phase 2c: Re-plan with empirical fftshift limit if needed.
     if max_safe_popcount < planned_popcount:
         print(f'  PSB overflow at planned popcount {planned_popcount}, '
               f'constraining to <={max_safe_popcount}')
@@ -5894,11 +5878,16 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
             raise ValueError(
                 f'PSB overflow limits fftshift popcount to {max_safe_popcount}. '
                 + plan['failure_reason'])
+    else:
+        plan = plan_unconstrained
 
     # ---- Phase 3: APPLY ----
+    # Output is already muted from the search.  _apply_tone_power_plan
+    # sets fftshift, amps, and analog while muted, then unmutes with
+    # the final psb_scale.
     _apply_tone_power_plan(r, config_dict, plan, rf_peripherals)
 
-    # Log actual settings (plan is updated in-place by _apply_tone_power_plan)
+    # Log settings
     popcount = bin(plan['psb_fftshift']).count('1')
     eff_bits = plan['effective_bits_per_tone']
     min_eff_bits = float(np.nanmin(eff_bits))
