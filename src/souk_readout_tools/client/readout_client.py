@@ -2229,7 +2229,8 @@ class ReadoutClient:
         if n == 1:
             return np.zeros(1)
         freqssorted = np.sort(freqs)
-        k = (freqs-freqssorted[0]) / (freqssorted[-1] - freqssorted[0])*(n-1)
+        k = np.arange(len(freqs))
+        # k = (freqs-freqssorted[0]) / (freqssorted[-1] - freqssorted[0])*(n-1)
         #k should range from 0 to n-1, and elements are proportional to the frequencies
         return np.pi*k**2/n
 
@@ -2344,6 +2345,7 @@ class ReadoutClient:
                        remove_phase_slope=True, 
                        optimise_tx_dynamic_range=True,
                        optimise_rx_gain=True,
+                       round_freqs_to_sample_rate=True,
                        verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
@@ -2377,6 +2379,8 @@ class ReadoutClient:
             optimise_rx_gain (bool): If True, maximise ADC power utilisation and
                 optimise the PFB FFT shift for best RX dynamic range after tones
                 are configured. Calls maximise_rx_power(). Default is True.
+            round_freqs_to_sample_rate (bool): If True, attempt to minimise IMD effects by snapping
+                frequencies to integer multiples of the output sample rate. Default is True.
             verbose (bool): Print progress information. Default is True.
 
         Returns:
@@ -2405,6 +2409,13 @@ class ReadoutClient:
         
         info = self.get_system_information()
         
+        if round_freqs_to_sample_rate:
+            if info['acc_freq'] >= step_size_hz:
+                print(f'Warning: step_size_hz ({step_size_hz} Hz) is smaller than the output sample rate '
+                      f'({info["acc_freq"]} Hz), and round_freqs_to_sample_rate is True. This will cause '
+                      f'tone centre frequencies to be snapped to the same grid as the sweep steps, so the '
+                      f'effective frequency resolution will be limited to the sample rate, not the step size. '
+                      f'Consider setting step_size_hz >= {info["acc_freq"]} Hz or round_freqs_to_sample_rate=False.')
         # Get RF frontend mixer configuration
         udc = self.config['rf_frontend']['connected']
         lo = self.config['rf_frontend']['tx_mixer_lo_frequency_hz']
@@ -2460,8 +2471,9 @@ class ReadoutClient:
         sweep_span = spacings * (sweep_points - 1) / sweep_points
 
         # Add small random offsets to avoid intermodulation distortion effects
-        small_offsets = np.random.uniform(-sweep_span / sweep_points / 2, 
-                                          +sweep_span / sweep_points / 2, num_tones)
+        offsetscale = 0.5 # if larger than one then segments will overlap, if zero there will be worst possible IMD
+        small_offsets = np.random.uniform(-sweep_span / sweep_points / 2 * offsetscale, 
+                                          +sweep_span / sweep_points / 2 * offsetscale, num_tones)
         
         # Dont't add the offset to the endpoints to avoid going out of band
         small_offsets[0] = 0.0
@@ -2469,6 +2481,11 @@ class ReadoutClient:
         freqs += small_offsets
         center_freqs = freqs + np.floor(sweep_points / 2) * spacings / sweep_points # converts start freqs to center freqs
         
+        # Round to nearest integer multiple of output sample rate to minimise IMD effects
+        if round_freqs_to_sample_rate:
+            sample_rate = info['acc_freq']
+            center_freqs = np.round(center_freqs / sample_rate) * sample_rate
+
         tone_phases = self.generate_newman_phases(center_freqs)
 
         if verbose:
