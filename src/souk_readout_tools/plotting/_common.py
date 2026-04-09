@@ -87,3 +87,18 @@ ERRORBAR_STYLE = dict(fmt='.', capsize=0, ecolor='red', markersize=2)
 
 # Fill style for fast error-band rendering on large traces
 ERROR_FILL_STYLE = dict(alpha=0.25)
+
+
+def _resolve_label(ax, label=None, suffix=None):
+    """Resolve the label for a plot line.
+
+    If label and suffix both given, returns '{label} {suffix}'.
+    If only label, returns label.
+    If only suffix, returns str(suffix).
+    If neither, returns the next integer index based on existing lines on ax.
+    """
+    if label is not None:
+        return f'{label} {suffix}' if suffix else label
+    if suffix is not None:
+        return str(suffix)
+    return str(len(ax.get_lines()))

@@ -8,7 +8,7 @@ frequency, all with optional deembedding and error bars.
 
 import numpy as np
 from ._common import (_get_pyplot, _compute_mag_phase, _propagate_errors_mag,
-                       _apply_deembedding, ERROR_FILL_STYLE)
+                       _apply_deembedding, ERROR_FILL_STYLE, _resolve_label)
 
 
 def _extract_traces(sweep_data, tones=None):
@@ -42,7 +42,8 @@ def _extract_traces(sweep_data, tones=None):
 
 
 def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
-               show_errors=True, multi_tone='overlay', fig=None, **kwargs):
+               show_errors=True, multi_tone='overlay', fig=None, label=None,
+               **kwargs):
     """
     General-purpose sweep plot.
 
@@ -55,6 +56,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         show_errors: bool, show error bars (line only, no caps).
         multi_tone: 'overlay' (shared axes) or 'grid' (one subplot per tone).
         fig: Existing figure. If None, create new.
+        label: Legend label. If None, uses an auto-incrementing index.
         **kwargs: Passed to matplotlib plot/errorbar calls.
 
     Returns:
@@ -81,11 +83,13 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                 z = si + 1j * sq
                 if deembed:
                     z, _ = _apply_deembedding(f, z, deembed)
-                ax.plot(z.real, z.imag, linewidth=0.8, **kwargs)
+                trace_label = _resolve_label(ax, label, suffix=f'Tone {tidx}' if tidx is not None else None)
+                ax.plot(z.real, z.imag, linewidth=0.8, label=trace_label, **kwargs)
                 ax.set_aspect('equal')
                 ax.set_title(f'Tone {tidx}')
                 ax.set_xlabel('I')
                 ax.set_ylabel('Q')
+                ax.legend(fontsize='small')
             # Hide unused axes
             for i in range(n_traces, len(axes_flat)):
                 axes_flat[i].set_visible(False)
@@ -99,8 +103,12 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             else:
                 axes = np.array(fig.axes).reshape(n_traces, 2)
             for i, (f, si, sq, ei, eq, tidx) in enumerate(traces):
+                trace_label = _resolve_label(axes[i, 0], label,
+                                             suffix=f'Tone {tidx}' if tidx is not None else None)
                 _plot_single_trace(axes[i, 0], axes[i, 1], f, si, sq, ei, eq,
-                                   format, deembed, has_errors, tidx, **kwargs)
+                                   format, deembed, has_errors, trace_label, **kwargs)
+                axes[i, 0].legend(fontsize='small')
+                axes[i, 1].legend(fontsize='small')
             plt.tight_layout()
             return fig
 
@@ -114,13 +122,13 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             z = si + 1j * sq
             if deembed:
                 z, _ = _apply_deembedding(f, z, deembed)
-            label = f'Tone {tidx}' if tidx is not None else None
-            ax.plot(z.real, z.imag, linewidth=0.8, label=label, **kwargs)
+            trace_label = _resolve_label(ax, label,
+                                         suffix=f'Tone {tidx}' if tidx is not None else None)
+            ax.plot(z.real, z.imag, linewidth=0.8, label=trace_label, **kwargs)
         ax.set_xlabel('I')
         ax.set_ylabel('Q')
         ax.set_aspect('equal')
-        if is_multi:
-            ax.legend(fontsize='small')
+        ax.legend(fontsize='small')
         title = 'S21 Complex Plane'
         if deembed:
             title += ' (deembedded)'
@@ -135,11 +143,13 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         ax1, ax2 = fig.axes[:2]
 
     for f, si, sq, ei, eq, tidx in traces:
+        trace_label = _resolve_label(ax1, label,
+                                     suffix=f'Tone {tidx}' if tidx is not None else None)
         _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
-                           format, deembed, has_errors, tidx, **kwargs)
+                           format, deembed, has_errors, trace_label, **kwargs)
 
-    if is_multi:
-        ax1.legend(fontsize='small')
+    ax1.legend(fontsize='small')
+    ax2.legend(fontsize='small')
 
     bw = sweep_data.get('bandwidth_hz')
     title = f'Sweep ({bw/1e6:.1f} MHz)' if bw else 'Sweep'
@@ -151,7 +161,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
 
 
 def _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
-                        format, deembed, has_errors, tidx, **kwargs):
+                        format, deembed, has_errors, label, **kwargs):
     """Plot a single trace on a pair of axes."""
     z = si + 1j * sq
     if deembed:
@@ -159,7 +169,6 @@ def _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
         si, sq = z.real, z.imag
 
     f_mhz = f / 1e6
-    label = f'Tone {tidx}' if tidx is not None else None
 
     if format == 'magphase':
         mag_db, phase = _compute_mag_phase(z)

@@ -9,7 +9,7 @@ circle from sweep data.
 
 import numpy as np
 from ._common import (_get_pyplot, _compute_mag_phase, _apply_deembedding,
-                       ERRORBAR_STYLE)
+                       ERRORBAR_STYLE, _resolve_label)
 from ._psd import compute_psd
 
 
@@ -78,7 +78,8 @@ def _compute_freq_diss(ts_data, tone_key, i_arr, q_arr, sweep_data):
 
 
 def plot_timestream(ts_data, format='iq_vs_t', tones=None,
-                    deembed=False, sweep_data=None, fig=None, **kwargs):
+                    deembed=False, sweep_data=None, fig=None, label=None,
+                    **kwargs):
     """
     Plot timestream data in various formats.
 
@@ -92,6 +93,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         sweep_data: Sweep data dict. Required for 'freq_diss' format
             and for deembed=True.
         fig: Existing figure. If None, create new.
+        label: Legend label. If None, uses an auto-incrementing index.
         **kwargs: Passed to matplotlib plot calls.
 
     Returns:
@@ -115,13 +117,14 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             z = i_arr + 1j * q_arr
             if deembed:
                 z, _ = _apply_deembedding(None, z, deembed)
+            trace_label = _resolve_label(ax, label,
+                                         suffix=f'Tone {key}' if len(selected) > 1 else None)
             ax.plot(z.real, z.imag, '.', markersize=1,
-                    label=f'Tone {key}', **kwargs)
+                    label=trace_label, **kwargs)
         ax.set_xlabel('I')
         ax.set_ylabel('Q')
         ax.set_aspect('equal')
-        if len(selected) > 1:
-            ax.legend(fontsize='small')
+        ax.legend(fontsize='small')
         title = 'Timestream I vs Q'
         if deembed:
             title += ' (deembedded)'
@@ -136,14 +139,15 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         ax1, ax2 = fig.axes[:2]
 
     for key, i_arr, q_arr in selected:
-        label = f'Tone {key}' if len(selected) > 1 else None
+        trace_label = _resolve_label(ax1, label,
+                                     suffix=f'Tone {key}' if len(selected) > 1 else None)
         z = i_arr + 1j * q_arr
 
         if format == 'iq_vs_t':
             if deembed:
                 z, _ = _apply_deembedding(None, z, deembed)
-            ax1.plot(t_axis, z.real, linewidth=0.5, label=label, **kwargs)
-            ax2.plot(t_axis, z.imag, linewidth=0.5, label=label, **kwargs)
+            ax1.plot(t_axis, z.real, linewidth=0.5, label=trace_label, **kwargs)
+            ax2.plot(t_axis, z.imag, linewidth=0.5, label=trace_label, **kwargs)
             ax1.set_ylabel('I')
             ax2.set_ylabel('Q')
 
@@ -151,16 +155,16 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             if deembed:
                 z, _ = _apply_deembedding(None, z, deembed)
             mag_db, phase = _compute_mag_phase(z)
-            ax1.plot(t_axis, mag_db, linewidth=0.5, label=label, **kwargs)
-            ax2.plot(t_axis, phase, linewidth=0.5, label=label, **kwargs)
+            ax1.plot(t_axis, mag_db, linewidth=0.5, label=trace_label, **kwargs)
+            ax2.plot(t_axis, phase, linewidth=0.5, label=trace_label, **kwargs)
             ax1.set_ylabel('|S21| (dB)')
             ax2.set_ylabel('Phase (rad)')
 
         elif format == 'freq_diss':
             frac_f, frac_d = _compute_freq_diss(ts_data, key, i_arr, q_arr,
                                                  sweep_data)
-            ax1.plot(t_axis, frac_f, linewidth=0.5, label=label, **kwargs)
-            ax2.plot(t_axis, frac_d, linewidth=0.5, label=label, **kwargs)
+            ax1.plot(t_axis, frac_f, linewidth=0.5, label=trace_label, **kwargs)
+            ax2.plot(t_axis, frac_d, linewidth=0.5, label=trace_label, **kwargs)
             ax1.set_ylabel('Fractional frequency shift')
             ax2.set_ylabel('Fractional dissipation shift')
 
@@ -170,8 +174,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                 "Use 'iq', 'iq_vs_t', 'magphase', or 'freq_diss'.")
 
     ax2.set_xlabel('Time (s)')
-    if len(selected) > 1:
-        ax1.legend(fontsize='small')
+    ax1.legend(fontsize='small')
+    ax2.legend(fontsize='small')
     title_map = {
         'iq_vs_t': 'Timestream',
         'magphase': 'Timestream',
@@ -187,7 +191,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
 
 def plot_timestream_psd(ts_data, format='iq', tones=None,
                         sweep_data=None, psd_kwargs=None,
-                        precomputed_psd=None, fig=None, **kwargs):
+                        precomputed_psd=None, fig=None, label=None, **kwargs):
     """
     Plot power spectral density of timestream data.
 
@@ -201,6 +205,7 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
         precomputed_psd: dict mapping tone_key -> (f_psd, psd_values).
             If provided, skip computation.
         fig: Existing figure.
+        label: Legend label. If None, uses an auto-incrementing index.
         **kwargs: Passed to plot calls.
 
     Returns:
@@ -221,7 +226,8 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
             ax1, ax2 = fig.axes[:2]
 
         for key, i_arr, q_arr in selected:
-            label = f'Tone {key}' if len(selected) > 1 else None
+            trace_label = _resolve_label(ax1, label,
+                                         suffix=f'Tone {key}' if len(selected) > 1 else None)
             z = i_arr + 1j * q_arr
 
             if precomputed_psd and key in precomputed_psd:
@@ -236,8 +242,8 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                 f1, p1 = compute_psd(mag, sample_rate, **psd_kw)
                 f2, p2 = compute_psd(phase, sample_rate, **psd_kw)
 
-            ax1.loglog(f1, p1, linewidth=0.5, label=label, **kwargs)
-            ax2.loglog(f2, p2, linewidth=0.5, label=label, **kwargs)
+            ax1.loglog(f1, p1, linewidth=0.5, label=trace_label, **kwargs)
+            ax2.loglog(f2, p2, linewidth=0.5, label=trace_label, **kwargs)
 
         if format == 'iq':
             ax1.set_ylabel('I PSD')
@@ -253,14 +259,15 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
             ax1, ax2 = fig.axes[:2]
 
         for key, i_arr, q_arr in selected:
-            label = f'Tone {key}' if len(selected) > 1 else None
+            trace_label = _resolve_label(ax1, label,
+                                         suffix=f'Tone {key}' if len(selected) > 1 else None)
             frac_f, frac_d = _compute_freq_diss(ts_data, key, i_arr, q_arr,
                                                  sweep_data)
             f1, p1 = compute_psd(frac_f, sample_rate, **psd_kw)
             f2, p2 = compute_psd(frac_d, sample_rate, **psd_kw)
 
-            ax1.loglog(f1, p1, linewidth=0.5, label=label, **kwargs)
-            ax2.loglog(f2, p2, linewidth=0.5, label=label, **kwargs)
+            ax1.loglog(f1, p1, linewidth=0.5, label=trace_label, **kwargs)
+            ax2.loglog(f2, p2, linewidth=0.5, label=trace_label, **kwargs)
 
         ax1.set_ylabel('Frequency noise PSD')
         ax2.set_ylabel('Dissipation noise PSD')
@@ -270,15 +277,16 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
             f"Unknown format '{format}'. Use 'iq', 'magphase', or 'freq_diss'.")
 
     ax2.set_xlabel('Frequency (Hz)')
-    if len(selected) > 1:
-        ax1.legend(fontsize='small')
+    ax1.legend(fontsize='small')
+    ax2.legend(fontsize='small')
     fig.suptitle('Power Spectral Density')
     plt.tight_layout()
     return fig
 
 
 def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
-                                  deembed=False, fig=None, **kwargs):
+                                  deembed=False, fig=None, label=None,
+                                  **kwargs):
     """
     Overplot timestream I/Q points on the resonance circle from sweep data.
 
@@ -288,6 +296,8 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
         tone_index: int, which tone to plot.
         deembed: bool, deembed both sweep and timestream.
         fig: Existing figure.
+        label: Legend label for the timestream points. If None, uses
+            'Timestream'.
         **kwargs: Passed to plot calls.
 
     Returns:
@@ -325,8 +335,9 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     ax.plot(z_sweep.real, z_sweep.imag, '-', linewidth=1.5,
             color='C0', label='Sweep', zorder=2)
     # Timestream scatter
+    ts_label = label if label is not None else 'Timestream'
     ax.plot(z_ts.real, z_ts.imag, '.', markersize=1, alpha=0.3,
-            color='C1', label='Timestream', zorder=1, **kwargs)
+            color='C1', label=ts_label, zorder=1, **kwargs)
 
     ax.set_xlabel('I')
     ax.set_ylabel('Q')
