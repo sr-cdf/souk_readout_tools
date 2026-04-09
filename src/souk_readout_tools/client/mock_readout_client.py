@@ -1073,8 +1073,10 @@ class ReadoutClient:
         print(f"Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
         return iq_data
 
-    def receive_stream_g3(self, num_tones=2048, filename=None,print_data=False):
+    def receive_stream_g3(self, num_tones=2048, filename=None,print_data=False,kid_stream_id='UNSET',duration=30):
         ''' JL: Receives a data stream and write it to a g3 file'''
+        # JL: Presumably this gets updated if something radically changes in this code
+        SOSTREAM_VERSION = 1 
         self.mock_data_count = 0
         # JL: Level 1 data shows this is typically around 400
         num_sample_rows_per_frame = 400
@@ -1114,11 +1116,12 @@ class ReadoutClient:
 
         logger.info('MOCK: Wrote JSON header to '+filename[:-3]+'.json')
         logger.info('MOCK: (Not really) Preparing to receive TCP/IP data from : '+ self.stream_server_address +':'+ str(self.stream_server_port))
-    
+        logger.info(f'MOCK: Will stream for duration {duration}') 
+        
         with core.G3Writer(filename=filename) as writer:
             logger.info(f"MOCK: Writing data to {filename}")
             print(f"MOCK: Writing data to {filename}")
-            t0=time.time()
+       
             frame_count=0 # Counter for total number of frames (each of  length num_sample_rows_per_frame) written/
             count = 0    # counter for total number of packets (data rows) received.
             row_frame_count =0 # Counter for number of packets received within the frame so far.
@@ -1127,9 +1130,65 @@ class ReadoutClient:
             key_interupt = False
             general_exception = False
 
-            while True:
-              start = time.time() # JL will be ultimately derived from the PTP data in the packets
-              while True:
+            # First write out an observation frame
+            # JL: TO DO
+            # increment frame count
+            fr = core.G3Frame(core.G3FrameType.Observation)
+            t0=time.time()
+            fr['frame_num'] = frame_count
+            fr['session_id'] = int(t0) # Unix start time in whole seconds
+            fr['sostream_id'] = kid_stream_id
+            fr['sostream_version'] = SOSTREAM_VERSION
+            fr['stream_placement'] = 'start'
+            fr['time'] = core.G3Time(t0 * core.G3Units.s)
+            writer(fr)
+            frame_count+=1
+            #################################################
+            # Then write out a  write out a Wiring Frame
+            fr = core.G3Frame(core.G3FrameType.Wiring)
+            t0=time.time()   
+            fr['frame_num'] = frame_count
+            fr['session_id'] = int(t0) # Unix start time in whole seconds  
+            fr['sostream_id'] = kid_stream_id
+            fr['sostream_version'] = SOSTREAM_VERSION
+            fr['time'] = core.G3Time(t0 * core.G3Units.s)
+            fr['dump'] = True
+            # Persistent bug here with the yaml string being truncated.
+            '''
+            yaml_dump_string =  yaml.dump(metadata)
+            logger.info('###################################')
+            logger.info(str(type(metadata)))
+            logger.info('###################################')
+            logger.info(yaml_dump_string)
+            logger.info('###################################')
+            logger.info(str(metadata))
+            logger.info('###################################')
+            logger.info(json.dumps(metadata).encode())
+            logger.info('###################################')
+            logger.info('###################################')
+            logger.info(len(yaml_dump_string))
+            logger.info('###################################')
+            logger.info(len(str(metadata)))
+            logger.info('###################################')
+            logger.info(len(json.dumps(metadata).encode()))
+            logger.info('###################################')
+            logger.info('###################################')
+            logger.info(yaml_dump_string[-50:])
+            logger.info('###################################')
+            logger.info(str(metadata)[-50:])
+            logger.info('###################################')
+            logger.info(json.dumps(metadata).encode()[-50:])
+            fr['status'] = yaml_dump_string
+            '''
+            # Thus write the json string isntread, which does not ahve this problem.
+            fr['status'] = json.dumps(metadata).encode()
+            writer(fr)
+            frame_count+=1
+            #################################################
+            start = time.time() # JL will be ultimately derived from the PTP data in the packets
+            time_now = time.time()
+            while (time_now-t0) < duration:
+               while True:   
                   try: 
                     # Get Mocked Random data
                     datalen = 2048*2*4 + 10*4
@@ -1193,58 +1252,73 @@ class ReadoutClient:
                     print(f"MOCK: Error receiving stream data: {e}")
                     print(traceback.format_exc())
                     break
+                
+               # End "while true" data frame buffer contruction loop
+               # We arrive here if a frame has become completely filled or a keyboard interrupt or exception has happened.
+               # in either case size_of_this_frame contains the numer of rows in the frame
 
+               # If we arrive here after an exception leave the loop entirely.
+               if key_interupt or general_exception:
+                     logger.info(f"MOCK: Key Interrupt: {key_interupt} General exception: {general_exception} ")
+                     break
 
-              # End of data frame buffer contruction loop
+               #### Write the scan frame out  
+               fr = core.G3Frame(core.G3FrameType.Scan)
+               sample_rate = metadata['sample_rate']
+               # Setup the 1-D time array for the data part of the frame
+               times =np.linspace(start,start+(size_of_this_frame)/sample_rate, size_of_this_frame) # JL Utimately will be from PTP within packets
+               g3times = core.G3VectorTime(times * core.G3Units.s)
 
-              if key_interupt or general_exception:
-                    break
+               chans = np.arange(num_tones)
+               # Set up the row descriptive names for the data part of the frame
+               names=['_']*(2*num_tones+1+1+8) # 1 cnt column, 1 err column, 8 flags
+               names[0:2*len(chans):2] = [f'i{ch:0>4}' for ch in chans] # i followed by zero padded 4 digit channel (tone) number 
+               names[1:2*len(chans):2] = [f'q{ch:0>4}' for ch in chans] # q followed by zero padded 4 digit channel (tone) number
+               names[num_tones*2:num_tones*2+8] =  [f'flag{flag}' for flag in list(range(1,9))]  # "flag0" to "flag7" 
+               names[num_tones*2+8] = 'cnt'
+               names[num_tones*2+9] = 'err'
 
-              fr = core.G3Frame(core.G3FrameType.Scan)
-              sample_rate = metadata['sample_rate']
-              #Setup the 1-D time array for the data part of the frame
-              times =np.linspace(start,start+(size_of_this_frame)/sample_rate, size_of_this_frame) # JL Utimately will be from PTP within packets
-              g3times = core.G3VectorTime(times * core.G3Units.s)
+               # Write the data frame - row names (len = 2*num_tones + 10), times (len = size_of_this_frame), 2-D data_frame_buffer  = len(row_names) * len(times).          
+               fr['data'] = so3g.G3SuperTimestream(names, g3times, data_frame_buffer)
 
-              chans = np.arange(num_tones)
-              # Set up the row descriptive names for the data part of the frame
-              names=['_']*(2*num_tones+1+1+8) # 1 cnt column, 1 err column, 8 flags
-              names[0:2*len(chans):2] = [f'i{ch:0>4}' for ch in chans] # i followed by zero padded 4 digit channel (tone) number 
-              names[1:2*len(chans):2] = [f'q{ch:0>4}' for ch in chans] # q followed by zero padded 4 digit channel (tone) number
-              names[num_tones*2:num_tones*2+8] =  [f'flag{flag}' for flag in list(range(1,9))]  # "flag0" to "flag7" 
-              names[num_tones*2+8] = 'cnt'
-              names[num_tones*2+9] = 'err'
+               # This is purely a counter of how much data is in the frame - look at cnt to see if packets have been dropped.
+               frame_counter = np.arange(0,size_of_this_frame, dtype=int)  
+               primary_data = np.zeros((len(primary_names), size_of_this_frame), dtype=np.int64)
+               primary_data[primary_idxs['UnixTime'], :] = (times * 1e9).astype(int)
+               primary_data[primary_idxs['FrameCounter'], :] = frame_counter
+               fr['primary'] = so3g.G3SuperTimestream(primary_names, g3times, primary_data)
 
-              #pdb.set_trace()
-              # Write the data frame - row names (len = 2*num_tones + 10), times (len = size_of_this_frame), 2-D data_frame_buffer  = len(row_names) * len(times).          
-              fr['data'] = so3g.G3SuperTimestream(names, g3times, data_frame_buffer)
-              #pdb.set_trace()
-              # This is purely a counter of how much data is in the frame - look at cnt to see if packets have been dropped.
-              frame_counter = np.arange(0,size_of_this_frame, dtype=int)  
-              primary_data = np.zeros((len(primary_names), size_of_this_frame), dtype=np.int64)
-              primary_data[primary_idxs['UnixTime'], :] = (times * 1e9).astype(int)
-              primary_data[primary_idxs['FrameCounter'], :] = frame_counter
-              fr['primary'] = so3g.G3SuperTimestream(primary_names, g3times, primary_data)
-
-              fr['timing_paradigm'] = 'High Precision'
-              fr['num_samples'] = size_of_this_frame # per frame
-              fr['frame_num'] = frame_count # JL Numbering from 0
-              fr['session_id'] = int(start) # Unix start time in whole seconds 
-              fr['sostream_id'] = 'ukkid_1' # JL This ultimately comes from the OCS agent that starts up the taks
-              fr['sostream_version'] = 2    # JL Again, should probably mean something different in our case.
-              fr['time'] = core.G3Time(time.time() * core.G3Units.s) # JL Presumably meant to be the time when frame is written out, not the timestamp of the first element of the frame??
-              writer(fr)
-              frame_count+=1
-
-
-        t1=time.time()
+               fr['timing_paradigm'] = 'High Precision'
+               fr['num_samples'] = size_of_this_frame # per frame
+               fr['frame_num'] = frame_count # JL Numbering from 0
+               fr['session_id'] = int(start) # Unix start time in whole seconds 
+               fr['sostream_id'] = kid_stream_id # JL This ultimately comes from the OCS agent that starts up the taks
+               fr['sostream_version'] = SOSTREAM_VERSION # JL See comment above.
+               fr['time'] = core.G3Time(time.time() * core.G3Units.s) # JL Presumably meant to be the time when frame is written out, not the timestamp of the first element of the frame??
+               writer(fr)
+               frame_count+=1
+               time_now = time.time()  
+            #end while (time_now-t0) < duration:
+            
+            logger.info(f'MOCK Streaming duration {duration} expired.')
+            logger.info(f"MOCK: Writing final observation frame..")
+            t1=time.time()
+        
+            # At the end of the observation write out an observation frame.
+            fr = core.G3Frame(core.G3FrameType.Observation)
+            fr['frame_num'] = frame_count
+            fr['session_id'] = int(t1) # Unix start time in whole seconds
+            fr['sostream_id'] = kid_stream_id
+            fr['sostream_version'] = SOSTREAM_VERSION
+            fr['stream_placement'] = 'end'
+            fr['time'] = core.G3Time(t1 * core.G3Units.s)
+            writer(fr)
+        # End of "with"  
         print()
         print(f"MOCK: Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
         logger.info(f"MOCK: Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
         return iq_data
 
-
-    
 
     def receive_triggered_stream(self, num_tones=2048, filename=None,print_data=False):
         data = bytearray(4096*4 + 10*4)
