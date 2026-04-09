@@ -4243,7 +4243,7 @@ def fix_dac_saturation(r,config_dict=None):
     precision = 0.05
 
     # Check if the current value causes saturation
-    check,levels=check_output_saturation(r,iterations=10)
+    check,levels=check_output_saturation(r,iterations=100)
     if check:
         # Exponential Reduction Phase
         last_saturated_value = current_value
@@ -4255,7 +4255,7 @@ def fix_dac_saturation(r,config_dict=None):
                 current_value = min_value
                 r.psbscale.set_scale(current_value)
                 time.sleep(0.1)
-                check,levels=check_output_saturation(r,iterations=10)
+                check,levels=check_output_saturation(r,iterations=100)
                 if check:
                     # Saturation cannot be avoided
                     return min_value
@@ -4264,7 +4264,7 @@ def fix_dac_saturation(r,config_dict=None):
                     break
             r.psbscale.set_scale(current_value)
             time.sleep(0.1)
-            check,levels=check_output_saturation(r,iterations=10)
+            check,levels=check_output_saturation(r,iterations=100)
             if check:
                 last_saturated_value = current_value
             else:
@@ -4272,7 +4272,16 @@ def fix_dac_saturation(r,config_dict=None):
                 upper_bound = last_saturated_value
                 break
     else:
-        pass
+        # Saturation was not detected here, but the caller probably observed it.
+        # Trust the caller: treat init_psb_scale as the saturating point
+        # and apply a safety reduction rather than binary-searching upward
+        # (which would converge back to the saturating value).
+        psb_scale = init_psb_scale * 0.707
+        r.psbscale.set_scale(psb_scale)
+        time.sleep(0.1)
+        check,levels=check_output_saturation(r,iterations=100)
+        print(f'Intermittent saturation assumed — applied 3db safety reduction: psb_scale={psb_scale:.4f}')
+        return psb_scale, check_dsp_overflow(r,0.5)[1], levels
 
     # Binary Search Phase
     while upper_bound - lower_bound > precision*lower_bound:
@@ -4280,7 +4289,7 @@ def fix_dac_saturation(r,config_dict=None):
         mid_value = (lower_bound + upper_bound) / 2
         r.psbscale.set_scale(mid_value)
         time.sleep(0.1)
-        check,levels=check_output_saturation(r,iterations=10)
+        check,levels=check_output_saturation(r,iterations=100)
         print('Increase psb_scale with Binary Search: ', mid_value,levels)
         if check:
             upper_bound = mid_value
