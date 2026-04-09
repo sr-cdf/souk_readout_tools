@@ -2376,8 +2376,7 @@ class ReadoutClient:
                 adjust the TX analog chain when setting tone powers. Default is True.
             optimise_rx_gain (bool): If True, maximise ADC power utilisation and
                 optimise the PFB FFT shift for best RX dynamic range after tones
-                are configured. Calls maximise_rx_power() followed by
-                optimise_rx_snr(). Default is True.
+                are configured. Calls maximise_rx_power(). Default is True.
             verbose (bool): Print progress information. Default is True.
 
         Returns:
@@ -2537,9 +2536,6 @@ class ReadoutClient:
             rx_result = self.maximise_rx_power()
             if verbose:
                 print(f'  maximise_rx_power() -> {rx_result}')
-            rx_snr_result = self.optimise_rx_snr()
-            if verbose:
-                print(f'  optimise_rx_snr() -> {rx_snr_result}')
 
         # Perform the sweep
         response = self.perform_sweep(center_freqs, sweep_span,
