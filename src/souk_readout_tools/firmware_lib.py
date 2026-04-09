@@ -5599,6 +5599,32 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
             'warnings': [],
         }
 
+    # Collect all valid fftshift candidates for the chosen analog setting.
+    # These will be tested empirically for PSB overflow during apply.
+    chosen_atten = best_solution['tx_attenuation_db']
+    chosen_s21 = best_solution['tx_bypass_amp_s21_db']
+    fftshift_options = []
+    for fftshift in fftshift_candidates:
+        ref_amps = calibration.calc_tone_amplitudes(
+            powers_dbm, fftshift, psb_scale=1.0,
+            tx_attenuator_value_db=chosen_atten,
+            tx_bypass_amp_s21_db=chosen_s21,
+            **cal_base)
+        max_ref_amp = float(np.max(np.abs(ref_amps)))
+        if max_ref_amp <= 0:
+            continue
+        psb_scale_candidate = max_ref_amp / max_amp
+        if psb_scale_candidate < SCALEMIN or psb_scale_candidate > SCALEMAX:
+            continue
+        popcount_c = bin(fftshift).count('1')
+        candidate_amps = ref_amps / psb_scale_candidate
+        dac_amps = np.abs(candidate_amps) / 2**(popcount_c + 1) * psb_scale_candidate
+        total_dac_power = float(np.sum(dac_amps**2))
+        if total_dac_power > 1.0:
+            continue
+        fftshift_options.append((int(fftshift), float(psb_scale_candidate)))
+    best_solution['fftshift_candidates'] = fftshift_options
+
     # Compression check (if applicable)
     if tx_1db_comp is not None and reference_plane != 'dac':
         # Compute powers at every stage with the planned settings
@@ -5658,66 +5684,84 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
 
 
 def _apply_tone_power_plan(r, config_dict, plan, rf_peripherals=None):
-    """Apply a computed tone power plan to hardware in safe order.
+    """Apply a computed tone power plan to hardware, empirically selecting fftshift.
 
-    Safe ordering: reduce power before increasing to avoid transient spikes.
+    Steps through fftshift candidates from highest popcount to lowest,
+    checking for PSB overflow at each step on live hardware.  Updates the
+    plan dict in-place with the actually-chosen fftshift and psb_scale.
+
+    Safe ordering: psb_scale is reduced to minimum before switching fftshift
+    to avoid transient spikes.
     """
-    SCALEMIN, SCALEMAX = 1/256, 255
-    target_fftshift = plan['psb_fftshift']
-    target_psb_scale = plan['psb_scale']
+    SCALEMIN = 1/256
     target_amps = np.array(plan['amplitudes'])
+    fftshift_candidates = plan.get('fftshift_candidates',
+                                    [(plan['psb_fftshift'], plan['psb_scale'])])
 
-    current_fftshift = r.psb.get_fftshift()
-    current_psb_scale = r.psbscale.get_scale()
-    current_popcount = bin(current_fftshift).count('1')
-    target_popcount = bin(target_fftshift).count('1')
-
-    # Step 1: Pre-compensate psb_scale downward to prevent transient spikes
-    #         when switching fftshift (which changes gain).
-    comp_scale = current_psb_scale * 2**(current_popcount - target_popcount)
-    # Use the smaller of compensated and target to be safe
-    safe_scale = min(float(np.clip(comp_scale, SCALEMIN, SCALEMAX)), target_psb_scale)
-    r.psbscale.set_scale(safe_scale)
+    # Step 1: Reduce psb_scale to minimum for safe transitions
+    r.psbscale.set_scale(SCALEMIN)
     time.sleep(0.01)
 
-    # Step 2: Set fftshift
-    r.psb.set_fftshift(target_fftshift)
-    time.sleep(0.01)
-
-    # Step 3: Set amplitudes
+    # Step 2: Set amplitudes
     set_tone_amplitudes(r, config_dict, target_amps)
     time.sleep(0.01)
 
-    # Step 4: Set final psb_scale
-    r.psbscale.set_scale(target_psb_scale)
-    time.sleep(0.01)
-
-    # Step 5: Set analog chain (if available)
+    # Step 3: Set analog chain (if available)
     if rf_peripherals is not None and rf_peripherals.enabled:
         if plan['tx_attenuation_db'] is not None:
             rf_peripherals.set_tx_attenuation(plan['tx_attenuation_db'])
         if plan['tx_amp_bypass'] is not None:
             rf_peripherals.set_tx_amp_bypass(plan['tx_amp_bypass'])
 
-    # Step 6: Validate fftshift on live hardware — if overflow, fall back
-    dsp_overflow, dsp_details = check_dsp_overflow(r, 0.5)
-    if dsp_details['psb_ovf_delta']:
-        # Try stepping back fftshift
-        fftshifts = (2**np.arange(14) - 1).astype(int)[::-1]
-        idx = list(fftshifts).index(target_fftshift)
-        if idx > 0:
-            fallback_fftshift = int(fftshifts[idx - 1])
-            fallback_popcount = bin(fallback_fftshift).count('1')
-            # Compensate psb_scale for the gain change
-            scale_adjust = 2**(target_popcount - fallback_popcount)
-            fallback_scale = float(np.clip(target_psb_scale * scale_adjust, SCALEMIN, SCALEMAX))
-            r.psbscale.set_scale(fallback_scale)
-            r.psb.set_fftshift(fallback_fftshift)
-            time.sleep(0.01)
-            print(f'  WARNING: PSB overflow at planned fftshift, fell back to '
-                  f'{format(fallback_fftshift, "#016b")} (psb_scale={fallback_scale:.6f})')
-        else:
-            print(f'  WARNING: PSB overflow at safest fftshift — cannot resolve')
+    # Step 4: Empirically find the highest-popcount fftshift without overflow
+    chosen_fftshift = None
+    chosen_psb_scale = None
+
+    for fftshift, psb_scale in fftshift_candidates:
+        # Set fftshift (safe because psb_scale is at minimum)
+        r.psb.set_fftshift(fftshift)
+        time.sleep(0.01)
+        # Set psb_scale to candidate value
+        r.psbscale.set_scale(psb_scale)
+        time.sleep(0.01)
+
+        # Check for PSB overflow on live hardware
+        _, details = check_dsp_overflow(r, 0.2)
+        if not details['psb_ovf_delta'] and not details['psbscale_ovf_delta']:
+            chosen_fftshift = fftshift
+            chosen_psb_scale = psb_scale
+            break
+
+        popcount = bin(fftshift).count('1')
+        print(f'  PSB overflow at fftshift {format(fftshift, "#016b")} '
+              f'(popcount {popcount}), trying next')
+        # Reduce psb_scale before next fftshift change
+        r.psbscale.set_scale(SCALEMIN)
+        time.sleep(0.01)
+
+    if chosen_fftshift is None:
+        # All candidates overflowed — use safest (lowest popcount, last in list)
+        chosen_fftshift, chosen_psb_scale = fftshift_candidates[-1]
+        r.psb.set_fftshift(chosen_fftshift)
+        r.psbscale.set_scale(chosen_psb_scale)
+        time.sleep(0.01)
+        print(f'  WARNING: PSB overflow at all fftshift candidates — '
+              f'using safest (popcount {bin(chosen_fftshift).count("1")})')
+
+    # Update plan with actually-chosen values
+    plan['psb_fftshift'] = chosen_fftshift
+    plan['psb_scale'] = chosen_psb_scale
+
+    # Recompute dynamic range metrics for actual choice
+    popcount = bin(chosen_fftshift).count('1')
+    dac_amplitude_fs = np.abs(target_amps) / 2**(popcount + 1) * chosen_psb_scale
+    with np.errstate(divide='ignore'):
+        plan['effective_bits_per_tone'] = (
+            16 + np.log2(np.where(dac_amplitude_fs > 0, dac_amplitude_fs, np.nan))
+        ).tolist()
+        plan['amplitude_resolution_bits'] = np.log2(np.where(
+            np.abs(target_amps) > 0, np.abs(target_amps) / 2**-12, np.nan
+        )).tolist()
 
 
 def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
@@ -5880,6 +5924,10 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
     if not plan['achievable']:
         raise ValueError(plan['failure_reason'])
 
+    # ---- Phase 3: APPLY (includes empirical fftshift search) ----
+    _apply_tone_power_plan(r, config_dict, plan, rf_peripherals)
+
+    # Log actual settings (plan is updated in-place by _apply_tone_power_plan)
     popcount = bin(plan['psb_fftshift']).count('1')
     eff_bits = plan['effective_bits_per_tone']
     min_eff_bits = float(np.nanmin(eff_bits))
@@ -5894,9 +5942,6 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
 
     for w in plan['warnings']:
         print(f'  WARNING: {w}')
-
-    # ---- Phase 3: APPLY ----
-    _apply_tone_power_plan(r, config_dict, plan, rf_peripherals)
 
     # ---- Phase 4: VERIFY ----
     achieved = get_tone_powers(r, config_dict, reference_plane=reference_plane)
