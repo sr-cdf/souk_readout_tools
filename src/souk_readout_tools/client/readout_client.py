@@ -2500,7 +2500,7 @@ class ReadoutClient:
                 raise RuntimeError(
                     f"Failed to set tone powers: {stp_response.get('message', 'unknown error')}")
             if verbose:
-                print(f'  set_tone_powers() -> {stp_response}')
+                print(f'  set_tone_powers(): {stp_response.get("status")}')
         else:
             self.set_tone_amplitudes(np.ones(num_tones))
 
