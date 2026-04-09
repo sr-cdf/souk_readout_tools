@@ -8,7 +8,7 @@ frequency, all with optional deembedding and error bars.
 
 import numpy as np
 from ._common import (_get_pyplot, _compute_mag_phase, _propagate_errors_mag,
-                       _apply_deembedding, ERRORBAR_STYLE)
+                       _apply_deembedding, ERROR_FILL_STYLE)
 
 
 def _extract_traces(sweep_data, tones=None):
@@ -165,9 +165,12 @@ def _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
         mag_db, phase = _compute_mag_phase(z)
         if has_errors and np.any(ei != 0):
             e_mag, e_phase = _propagate_errors_mag(si, sq, ei, eq)
-            eb = {**ERRORBAR_STYLE, **kwargs}
-            ax1.errorbar(f_mhz, mag_db, yerr=e_mag, label=label, **eb)
-            ax2.errorbar(f_mhz, phase, yerr=e_phase, label=label, **eb)
+            line, = ax1.plot(f_mhz, mag_db, linewidth=0.8, label=label, **kwargs)
+            ax1.fill_between(f_mhz, mag_db - e_mag, mag_db + e_mag,
+                             color=line.get_color(), **ERROR_FILL_STYLE)
+            line, = ax2.plot(f_mhz, phase, linewidth=0.8, label=label, **kwargs)
+            ax2.fill_between(f_mhz, phase - e_phase, phase + e_phase,
+                             color=line.get_color(), **ERROR_FILL_STYLE)
         else:
             ax1.plot(f_mhz, mag_db, linewidth=0.8, label=label, **kwargs)
             ax2.plot(f_mhz, phase, linewidth=0.8, label=label, **kwargs)
@@ -177,9 +180,12 @@ def _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
 
     elif format == 'iq_vs_f':
         if has_errors and np.any(ei != 0):
-            eb = {**ERRORBAR_STYLE, **kwargs}
-            ax1.errorbar(f_mhz, si, yerr=ei, label=label, **eb)
-            ax2.errorbar(f_mhz, sq, yerr=eq, label=label, **eb)
+            line, = ax1.plot(f_mhz, si, linewidth=0.8, label=label, **kwargs)
+            ax1.fill_between(f_mhz, si - ei, si + ei,
+                             color=line.get_color(), **ERROR_FILL_STYLE)
+            line, = ax2.plot(f_mhz, sq, linewidth=0.8, label=label, **kwargs)
+            ax2.fill_between(f_mhz, sq - eq, sq + eq,
+                             color=line.get_color(), **ERROR_FILL_STYLE)
         else:
             ax1.plot(f_mhz, si, linewidth=0.8, label=label, **kwargs)
             ax2.plot(f_mhz, sq, linewidth=0.8, label=label, **kwargs)

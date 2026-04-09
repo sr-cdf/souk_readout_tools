@@ -82,5 +82,8 @@ def _apply_deembedding(frequencies, z, deembed, params=None):
     return z, None
 
 
-# Standard error bar style
+# Standard error bar style (legacy, kept for non-sweep plots)
 ERRORBAR_STYLE = dict(fmt='.', capsize=0, ecolor='red', markersize=2)
+
+# Fill style for fast error-band rendering on large traces
+ERROR_FILL_STYLE = dict(alpha=0.25)
