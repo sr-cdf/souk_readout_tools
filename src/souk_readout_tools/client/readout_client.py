@@ -2341,7 +2341,9 @@ class ReadoutClient:
                        num_tones=1024, samples_per_point=10, tone_powers_dbm='auto',
                        reference_plane='detector',
                        apply_phase_correction=False,
-                       remove_phase_slope=True, optimise_dynamic_range=True,
+                       remove_phase_slope=True, 
+                       optimise_tx_dynamic_range=True,
+                       optimise_rx_gain=True,
                        verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
@@ -2370,8 +2372,12 @@ class ReadoutClient:
                                            no longer needed following firmware fixes.
             remove_phase_slope (bool): Remove linear phase slope from the sweep data.
                                        Default is True.
-            optimise_dynamic_range (bool): If True, maximise DAC bit utilisation and
-                adjust the analog chain when setting tone powers. Default is True.
+            optimise_tx_dynamic_range (bool): If True, maximise DAC bit utilisation and
+                adjust the TX analog chain when setting tone powers. Default is True.
+            optimise_rx_gain (bool): If True, maximise ADC power utilisation and
+                optimise the PFB FFT shift for best RX dynamic range after tones
+                are configured. Calls maximise_rx_power() followed by
+                optimise_rx_snr(). Default is True.
             verbose (bool): Print progress information. Default is True.
 
         Returns:
@@ -2487,7 +2493,7 @@ class ReadoutClient:
             powers = np.broadcast_to(np.atleast_1d(tone_powers_dbm), num_tones).copy()
             stp_response = self.set_tone_powers(powers,
                                 reference_plane=reference_plane,
-                                optimise_dynamic_range=optimise_dynamic_range)
+                                optimise_dynamic_range=optimise_tx_dynamic_range)
             if stp_response.get('status') != 'success':
                 raise RuntimeError(
                     f"Failed to set tone powers: {stp_response.get('message', 'unknown error')}")
@@ -2523,6 +2529,17 @@ class ReadoutClient:
             if dspof['result']:
                 raise RuntimeError(
                     f"DSP overflow persists. Reduce tone_powers_dbm or num_tones.")
+
+        # Optimise RX gain: maximise ADC power and PFB FFT shift
+        if optimise_rx_gain:
+            if verbose:
+                print(f'  Optimising RX gain...')
+            rx_result = self.maximise_rx_power()
+            if verbose:
+                print(f'  maximise_rx_power() -> {rx_result}')
+            rx_snr_result = self.optimise_rx_snr()
+            if verbose:
+                print(f'  optimise_rx_snr() -> {rx_snr_result}')
 
         # Perform the sweep
         response = self.perform_sweep(center_freqs, sweep_span,
