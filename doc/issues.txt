@@ -1,0 +1,95 @@
+In [4]: wbs=client.wideband_sweep(num_tones=500,tone_powers_dbm=-55,step_size_hz=10e3,reference_plane='dac',optimise_rx_gain=True)
+Wideband sweep configuration:
+  RF band: 0.0 - 2457.6 MHz
+  Sweep range: 0.0 - 2457.6 MHz (2457.6 MHz)
+  Num tones: 500, sweep points: 491
+  Total points: 245500
+  Setting tone powers: -55 dBm at dac (optimise_dynamic_range=True)
+Error setting tone powers: Error handling request: Request read on host localhost failed.
+        Request: ?read p0_mix_rx_lo0_control 32768 32768
+        Reply: ?read[735] fail Not\_connected\_to\_device\_localhost:7147
+---------------------------------------------------------------------------
+RuntimeError                              Traceback (most recent call last)
+Cell In[4], line 1
+----> 1 wbs=client.wideband_sweep(num_tones=500,tone_powers_dbm=-55,step_size_hz=10e3,reference_plane='dac',optimise_rx_gain=True)
+
+File ~/souk/client_venv/lib/python3.12/site-packages/souk_readout_tools/client/readout_client.py:2505, in ReadoutClient.wideband_sweep(self, bandwidth_hz, center_freq_hz, step_size_hz, num_tones, samples_per_point, tone_powers_dbm, reference_plane, apply_phase_correction, remove_phase_slope, optimise_tx_dynamic_range, optimise_rx_gain, verbose)
+   2501 stp_response = self.set_tone_powers(powers,
+   2502                     reference_plane=reference_plane,
+   2503                     optimise_dynamic_range=optimise_tx_dynamic_range)
+   2504 if stp_response.get('status') != 'success':
+-> 2505     raise RuntimeError(
+   2506         f"Failed to set tone powers: {stp_response.get('message', 'unknown error')}")
+   2507 if verbose:
+   2508     print(f'  set_tone_powers(): {stp_response.get("status")}')
+
+RuntimeError: Failed to set tone powers: Error handling request: Request read on host localhost failed.
+        Request: ?read p0_mix_rx_lo0_control 32768 32768
+        Reply: ?read[735] fail Not\_connected\_to\_device\_localhost:7147
+
+
+
+sudo reboot:
+
+
+...
+[  OK  ] Started systemd-logind.service - User Login Management.
+[  OK  ] Finished networking.service - Raise network interfaces.
+[  OK  ] Reached target network.target - Network.
+[  OK  ] Reached target network-online.target - Network is Online.
+         Starting program-fpga.service - Pr…abric with /lib/firmware/top.bit...
+         Starting rpc-statd-notify.service - Notify NFS peers of a restart...
+         Starting systemd-user-sessions.service - Permit User Sessions...
+         Starting tcpborphserver.service - … and communication with the FPGA...
+[  OK  ] Finished systemd-user-sessions.service - Permit User Sessions.
+[  OK  ] Started getty@tty1.service - Getty on tty1.
+[  OK  ] Started serial-getty@ttyPS0.service - Serial Getty on ttyPS0.
+[  OK  ] Reached target getty.target - Login Prompts.
+[  OK  ] Started rpc-statd-notify.service - Notify NFS peers of a restart.
+
+[  OK  ] Started tcpborphserver.service - T…ng and communication with the FPGA.
+[   37.424981] fpga_manager fpga0: Error while writing image data to FPGA
+[   37.469842] sh[538]: /bin/sh: 1: echo: echo: I/O error
+
+Ubuntu 24.04.4 LTS krm4 ttyPS0
+
+krm4 login: [   47.771547] krc-utils[556]: [lmk04208.0] Loading: /etc/krc-utils.d/clock.d/lmk04208.txt
+[   47.771977] krc-utils[556]: Timeout: lmk04208.0 not locked
+[   47.772205] krc-utils[556]: [ lmx2594.0] Loading: /etc/krc-utils.d/clock.d/lmx2594.txt
+[   47.772377] krc-utils[556]: [ lmx2594.1] Loading: /etc/krc-utils.d/clock.d/lmx2594.txt
+[   47.772546] krc-utils[556]: [ lmx2594.2] Loading: /etc/krc-utils.d/clock.d/lmx2594.txt
+[   47.772709] krc-utils[556]: [lmk04208.0] status: unlocked
+[   47.772879] krc-utils[556]: [ lmx2594.0] status: unlocked low
+[   47.773038] krc-utils[556]: [ lmx2594.1] status: unlocked low
+[   47.773190] krc-utils[556]: [ lmx2594.2] status: unlocked low
+
+hangs
+
+reboot over usb serial:
+...
+[  OK  ] Started systemd-logind.service - User Login Management.
+[  OK  ] Finished networking.service - Raise network interfaces.
+[  OK  ] Reached target network.target - Network.
+[  OK  ] Reached target network-online.target - Network is Online.
+         Starting program-fpga.service - Pr…abric with /lib/firmware/top.bit...
+         Starting rpc-statd-notify.service - Notify NFS peers of a restart...
+         Starting systemd-user-sessions.service - Permit User Sessions...
+         Starting tcpborphserver.service - … and communication with the FPGA...
+[  OK  ] Finished systemd-user-sessions.service - Permit User Sessions.
+[  OK  ] Started getty@tty1.service - Getty on tty1.
+[  OK  ] Started serial-getty@ttyPS0.service - Serial Getty on ttyPS0.
+[  OK  ] Reached target getty.target - Login Prompts.
+[  OK  ] Started rpc-statd-notify.service - Notify NFS peers of a restart.
+[  OK  ] Started tcpborphserver.service - T…ng and communication with the FPGA.
+[   33.195543] krc-utils[553]: [lmk04208.0] Loading: /etc/krc-utils.d/clock.d/lmk04208.txt
+[   33.195880] krc-utils[553]: [ lmx2594.0] Loading: /etc/krc-utils.d/clock.d/lmx2594.txt
+[   33.196088] krc-utils[553]: [ lmx2594.1] Loading: /etc/krc-utils.d/clock.d/lmx2594.txt
+[   33.196249] krc-utils[553]: [ lmx2594.2] Loading: /etc/krc-utils.d/clock.d/lmx2594.txt
+[   33.196469] krc-utils[553]: [lmk04208.0] status: locked
+[   33.196675] krc-utils[553]: [ lmx2594.0] status: locked
+[   33.196837] krc-utils[553]: [ lmx2594.1] status: locked
+[   33.196989] krc-utils[553]: [ lmx2594.2] status: locked
+
+Ubuntu 24.04.4 LTS krm4 ttyPS0
+
+krm4 login: 
