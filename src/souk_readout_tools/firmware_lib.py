@@ -4009,8 +4009,8 @@ def _find_best_psb_fftshift(r, overflow_check_duration=0.5):
 
     Iterates from most-attenuating (highest popcount) to highest-gain
     (lowest popcount) fftshift, stopping at the first overflow.
-    The returned best_fftshift is the lowest popcount that is safe
-    (i.e. the minimum safe popcount).
+    Steps back two levels from the overflow point as a safety margin
+    against intermittent overflows.
 
     Returns (best_fftshift, best_fftshift_idx, fftshifts_array).
     """
@@ -4032,6 +4032,12 @@ def _find_best_psb_fftshift(r, overflow_check_duration=0.5):
             break  # overflow at this shift — use the previous safe value
         best_fftshift = int(shift)
 
+    # Step back one extra level as safety margin against intermittent overflows
+    best_idx = list(psb_fftshifts).index(best_fftshift)
+    if best_idx > 0:
+        best_fftshift = int(psb_fftshifts[best_idx - 1])
+        print(f'  PSB safety margin — stepped to {format(best_fftshift, "#016b")}')
+
     best_fftshift_idx = list(psb_fftshifts).index(best_fftshift)
 
     # Set the best fftshift (output remains muted for caller to unmute)
@@ -4042,20 +4048,22 @@ def _find_best_psb_fftshift(r, overflow_check_duration=0.5):
     return best_fftshift, best_fftshift_idx, psb_fftshifts
 
 
-def _find_best_pfb_fftshift(r, overflow_check_duration=0.5, verify_duration=1.0):
+def _find_best_pfb_fftshift(r, overflow_check_duration=0.5):
     """Find the best PFB FFT shift without overflow, testing on live hardware.
 
     The PFB is an analysis filterbank (inverse of PSB synthesis).  More bits
     set = more divide-by-2 stages = more attenuation.  shift=0 is maximum
     gain, shift=8191 is maximum attenuation.
 
-    Iterates from least attenuation (most gain) to most, stopping at the
-    first shift without overflow.  Verifies under sustained operation.
+    Iterates from most-attenuating (highest popcount) to highest-gain
+    (lowest popcount) fftshift, stopping at the first overflow.
+    Steps back two levels from the overflow point as a safety margin
+    against intermittent overflows.
 
     Returns (best_fftshift, pfb_fftshifts_array).
     """
-    pfb_fftshifts = (2**np.arange(14) - 1).astype(int)  # 0, 1, 3, 7, ..., 8191
-    best_fftshift = int(pfb_fftshifts[-1])  # fallback to safest (most attenuation)
+    pfb_fftshifts = (2**np.arange(14) - 1).astype(int)[::-1]  # 8191, 4095, ..., 1, 0
+    best_fftshift = int(pfb_fftshifts[0])  # start with safest (most attenuation)
 
     for shift in pfb_fftshifts:
         r.pfb.set_fftshift(shift)
@@ -4063,25 +4071,15 @@ def _find_best_pfb_fftshift(r, overflow_check_duration=0.5, verify_duration=1.0)
         dsp_overflow_details = check_dsp_overflow(r, overflow_check_duration)[1]
         pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
         print(f'  pfb fftshift search: {format(shift, "#016b")} overflow: {pfb_ovf}')
-        if not pfb_ovf:
-            best_fftshift = int(shift)
-            break  # least attenuation without overflow — optimal
+        if pfb_ovf:
+            break  # overflow at this shift — use the previous safe value
+        best_fftshift = int(shift)
 
-    # Verify under sustained operation
-    r.pfb.set_fftshift(best_fftshift)
-    time.sleep(0.01)
-    dsp_overflow_details = check_dsp_overflow(r, verify_duration)[1]
-    pfb_ovf = dsp_overflow_details['pfb_ovf_delta']
-    if pfb_ovf:
-        # Step to next safer (more attenuating) shift
-        best_idx = list(pfb_fftshifts).index(best_fftshift)
-        if best_idx < len(pfb_fftshifts) - 1:
-            best_fftshift = int(pfb_fftshifts[best_idx + 1])
-            r.pfb.set_fftshift(best_fftshift)
-            print(f'  PFB overflow during verification — stepped to '
-                  f'{format(best_fftshift, "#016b")}')
-        else:
-            print(f'  WARNING: PFB overflow even at safest shift')
+    # Step back one extra level as safety margin against intermittent overflows
+    best_idx = list(pfb_fftshifts).index(best_fftshift)
+    if best_idx > 0:
+        best_fftshift = int(pfb_fftshifts[best_idx - 1])
+        print(f'  PFB safety margin — stepped to {format(best_fftshift, "#016b")}')
 
     r.pfb.set_fftshift(best_fftshift)
     time.sleep(0.01)
@@ -4304,6 +4302,101 @@ def fix_dac_saturation(r,config_dict=None):
 
     return psb_scale, check_dsp_overflow(r,0.5)[1], levels
 
+
+def fix_dsp_overflow(r, duration_s=0.5, max_iterations=10):
+    """
+    Fix DSP overflow by targeting the specific block(s) that are overflowing.
+
+    - PSB scale overflow  → reduce psb_scale by half
+    - PSB filterbank overflow → increase PSB fftshift popcount by one
+      (adds a divide-by-2 stage), then double psb_scale to compensate
+      output power (if no psbscale overflow results)
+    - PFB filterbank overflow → increase PFB fftshift popcount by one
+
+    Repeats until no overflow is detected or max_iterations is reached.
+
+    Returns
+    -------
+    changed : bool
+        True if any settings were modified.
+    details : dict
+        Final overflow check details.
+    """
+    fftshift_values = (2**np.arange(14) - 1).astype(int)  # 0,1,3,7,...,8191
+    max_fftshift = int(fftshift_values[-1])
+    changed = False
+
+    for iteration in range(max_iterations):
+        any_overflow, details = check_dsp_overflow(r, duration_s)
+        if not any_overflow:
+            if iteration == 0:
+                print('fix_dsp_overflow: no overflow detected')
+            else:
+                print(f'fix_dsp_overflow: resolved after {iteration} iteration(s)')
+            return changed, details
+
+        psbscale_ovf = details['psbscale_ovf_delta']
+        psb_ovf = details['psb_ovf_delta']
+        pfb_ovf = details['pfb_ovf_delta']
+
+        if psb_ovf:
+            # PSB filterbank overflowing — increase fftshift popcount by one
+            current_shift = r.psb.get_fftshift()
+            current_popcount = bin(current_shift).count('1')
+            new_popcount = current_popcount + 1
+            if new_popcount > 13:
+                print(f'fix_dsp_overflow: PSB fftshift already at max attenuation '
+                      f'({format(current_shift, "#016b")}), cannot add more')
+            else:
+                new_shift = int(fftshift_values[new_popcount])
+                # Compensate psb_scale to preserve output power (halved by
+                # the extra divide-by-2), but only if it won't overflow.
+                psb_scale = r.psbscale.get_scale()
+                compensated_scale = psb_scale * 2
+                r.psb.set_fftshift(new_shift)
+                if compensated_scale <= 255:
+                    r.psbscale.set_scale(compensated_scale)
+                    print(f'fix_dsp_overflow: PSB overflow — fftshift '
+                          f'{format(current_shift, "#016b")} -> {format(new_shift, "#016b")}, '
+                          f'psb_scale {psb_scale:.4f} -> {compensated_scale:.4f} (compensated)')
+                else:
+                    print(f'fix_dsp_overflow: PSB overflow — fftshift '
+                          f'{format(current_shift, "#016b")} -> {format(new_shift, "#016b")} '
+                          f'(psb_scale not compensated, would exceed max)')
+                time.sleep(0.1)
+                changed = True
+
+        if psbscale_ovf:
+            # PSB scale block overflowing — reduce psb_scale
+            psb_scale = r.psbscale.get_scale()
+            new_scale = psb_scale / 2
+            new_scale = max(new_scale, 1/256)
+            r.psbscale.set_scale(new_scale)
+            print(f'fix_dsp_overflow: PSB scale overflow — psb_scale '
+                  f'{psb_scale:.4f} -> {new_scale:.4f}')
+            time.sleep(0.1)
+            changed = True
+
+        if pfb_ovf:
+            # PFB filterbank overflowing — increase fftshift popcount by one
+            current_shift = r.pfb.get_fftshift()
+            current_popcount = bin(current_shift).count('1')
+            new_popcount = current_popcount + 1
+            if new_popcount > 13:
+                print(f'fix_dsp_overflow: PFB fftshift already at max attenuation '
+                      f'({format(current_shift, "#016b")}), cannot add more')
+            else:
+                new_shift = int(fftshift_values[new_popcount])
+                r.pfb.set_fftshift(new_shift)
+                print(f'fix_dsp_overflow: PFB overflow — fftshift '
+                      f'{format(current_shift, "#016b")} -> {format(new_shift, "#016b")}')
+                time.sleep(0.1)
+                changed = True
+
+    # Ran out of iterations
+    _, details = check_dsp_overflow(r, duration_s)
+    print(f'fix_dsp_overflow: WARNING — overflow persists after {max_iterations} iterations')
+    return changed, details
 
 
 def optimise_tx_snr(r,config_dict=None):
