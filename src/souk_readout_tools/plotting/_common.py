@@ -184,7 +184,12 @@ def _normalise_iq(si, sq, units, info=None, config=None,
         mixer_qmc_gain = 1.0
         mixer_scale_is_1p0 = False
         if info.get('mixer_qmc_settings_adc') is not None:
-            mixer_qmc_gain = info['mixer_qmc_settings_adc'].get('GainCorrectionFactor', 1.0)
+            qmc = info['mixer_qmc_settings_adc']
+            # GainCorrectionFactor is only applied when EnableGain is set;
+            # when disabled the firmware reports a factor of 0.0, which must
+            # be treated as unity (no correction).
+            if qmc.get('EnableGain', 0):
+                mixer_qmc_gain = qmc.get('GainCorrectionFactor', 1.0)
         if info.get('mixer_scale_1p0_adc') is not None:
             mixer_scale_is_1p0 = info['mixer_scale_1p0_adc']
         # Undo mixer effects that were applied before the PFB
