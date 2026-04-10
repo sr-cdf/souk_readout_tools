@@ -5711,8 +5711,9 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
             candidate_amps = ref_amps / optimal_psb_scale
             dac_amps = np.abs(candidate_amps) / 2**(popcount_candidate + 1) * optimal_psb_scale
             total_dac_power = float(np.sum(dac_amps**2))
-            if total_dac_power > 1.0:
-                continue  # would overdrive DAC
+            peak_dac_amp = float(np.max(np.abs(dac_amps)))
+            if total_dac_power > 1.0 or peak_dac_amp >= 1.0:
+                continue  # would overdrive DAC (RMS or peak)
 
             # Valid solution — prefer higher psb_scale (better DAC utilisation,
             # secondary to the amplitude maximisation which is always satisfied)
