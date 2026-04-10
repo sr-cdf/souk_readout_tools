@@ -2345,7 +2345,7 @@ class ReadoutClient:
                        remove_phase_slope=True, 
                        optimise_tx_dynamic_range=True,
                        optimise_rx_gain=True,
-                       round_freqs_to_sample_rate=True,
+                       cal_freeze=True,
                        verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
@@ -2379,8 +2379,9 @@ class ReadoutClient:
             optimise_rx_gain (bool): If True, maximise ADC power utilisation and
                 optimise the PFB FFT shift for best RX dynamic range after tones
                 are configured. Calls maximise_rx_power(). Default is True.
-            round_freqs_to_sample_rate (bool): If True, attempt to minimise IMD effects by snapping
-                frequencies to integer multiples of the output sample rate. Default is True.
+            cal_freeze (bool): If True, freeze the ADC calibration after tones
+                are configured and before sweeping, then unfreeze after the sweep
+                completes. Prevents ADC drift during the sweep. Default is True.
             verbose (bool): Print progress information. Default is True.
 
         Returns:
@@ -2408,14 +2409,7 @@ class ReadoutClient:
             raise RuntimeError(f'Sweep already in progress ({p*100:.3f}%), wait for it to finish.')
         
         info = self.get_system_information()
-        
-        if round_freqs_to_sample_rate:
-            if info['acc_freq'] >= step_size_hz:
-                print(f'Warning: step_size_hz ({step_size_hz} Hz) is smaller than the output sample rate '
-                      f'({info["acc_freq"]} Hz), and round_freqs_to_sample_rate is True. This will cause '
-                      f'tone centre frequencies to be snapped to the same grid as the sweep steps, so the '
-                      f'effective frequency resolution will be limited to the sample rate, not the step size. '
-                      f'Consider setting step_size_hz >= {info["acc_freq"]} Hz or round_freqs_to_sample_rate=False.')
+                
         # Get RF frontend mixer configuration
         udc = self.config['rf_frontend']['connected']
         lo = self.config['rf_frontend']['tx_mixer_lo_frequency_hz']
@@ -2447,7 +2441,7 @@ class ReadoutClient:
 
         # Set defaults for bandwidth and center frequency
         if bandwidth_hz is None:
-            bandwidth_hz = rfmax - rfmin
+            bandwidth_hz = (rfmax - rfmin)*0.90 # the last few hz of bandwidth tend to screw up the tones somehow
         if center_freq_hz is None:
             center_freq_hz = (rfmax + rfmin) / 2
 
@@ -2467,25 +2461,23 @@ class ReadoutClient:
                 raise ValueError(f'Tone spacing must be greater than {dacclk/txnfft:.0f} Hz but is {spacings:.0f} Hz. '
                                f'Try fewer tones or wider bandwidth.')
 
+        # Calculate the center frequencies
         sweep_points = int(bandwidth_hz / step_size_hz / num_tones)
         sweep_span = spacings * (sweep_points - 1) / sweep_points
-
-        # Add small random offsets to avoid intermodulation distortion effects
-        offsetscale = 0.5 # if larger than one then segments will overlap, if zero there will be worst possible IMD
-        small_offsets = np.random.uniform(-sweep_span / sweep_points / 2 * offsetscale, 
-                                          +sweep_span / sweep_points / 2 * offsetscale, num_tones)
+        center_freqs = freqs + np.floor(sweep_points / 2) * spacings / sweep_points # converts start freqs to center freqs
         
+        # Add small random offsets to avoid intermodulation distortion effects
+        small_offset_scale = 0.9 # if larger than one then segments will overlap, if zero there will be worst possible IMD
+        small_offsets = np.random.uniform(-sweep_span / sweep_points / 2 * small_offset_scale, 
+                                          +sweep_span / sweep_points / 2 * small_offset_scale,
+                                          num_tones)
         # Dont't add the offset to the endpoints to avoid going out of band
         small_offsets[0] = 0.0
         small_offsets[-1] = 0.0
-        freqs += small_offsets
-        center_freqs = freqs + np.floor(sweep_points / 2) * spacings / sweep_points # converts start freqs to center freqs
-        
-        # Round to nearest integer multiple of output sample rate to minimise IMD effects
-        if round_freqs_to_sample_rate:
-            sample_rate = info['acc_freq']
-            center_freqs = np.round(center_freqs / sample_rate) * sample_rate
 
+        center_freqs += small_offsets
+
+        # Compute phases to minimise crest factor (Newman phases)
         tone_phases = self.generate_newman_phases(center_freqs)
 
         if verbose:
@@ -2519,6 +2511,7 @@ class ReadoutClient:
             if verbose:
                 print(f'  set_tone_powers(): {stp_response.get("status")}')
         else:
+            #should this be a no-op?
             self.set_tone_amplitudes(np.ones(num_tones))
 
         # Check for saturation/overflow before sweeping and attempt to fix
@@ -2559,6 +2552,12 @@ class ReadoutClient:
             if verbose:
                 print(f'  maximise_rx_power() -> {rx_result}')
 
+        # Freeze calibration before sweep
+        if cal_freeze:
+            if verbose:
+                print(f'  Freezing calibration...')
+            self.set_cal_freeze(True)
+
         # Perform the sweep
         response = self.perform_sweep(center_freqs, sweep_span,
                                       points=sweep_points,
@@ -2579,6 +2578,12 @@ class ReadoutClient:
             time.sleep(1.0)
         if verbose:
             print()  # Newline after progress
+
+        # Unfreeze calibration after sweep
+        if cal_freeze:
+            if verbose:
+                print(f'  Unfreezing calibration...')
+            self.set_cal_freeze(False)
 
         # Get and parse the sweep data
         s = self.parse_sweep_data(self.get_sweep_data(), apply_phase_correction=apply_phase_correction)
@@ -2609,6 +2614,8 @@ class ReadoutClient:
         s['step_size_hz'] = step_size_hz
         s['num_tones_used'] = num_tones
         s['sweep_points_per_tone'] = sweep_points
+        s['tone_powers_dbm'] = self.get_tone_powers(reference_plane=reference_plane) if tone_powers_dbm is not None else None
+        s['tone_powers_reference_plane'] = reference_plane
 
         return s
 
