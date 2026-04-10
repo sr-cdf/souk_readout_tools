@@ -1135,6 +1135,13 @@ class ReadoutServer:
                     result = firmware_lib.fix_adc_saturation(self.r,self.config, rf_peripherals=self.rf_peripherals)
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
+                elif request == 'fix_dsp_overflow':
+                    duration_s = message.get('duration_s', 0.5)
+                    max_iterations = message.get('max_iterations', 10)
+                    changed, details = firmware_lib.fix_dsp_overflow(self.r, duration_s=duration_s, max_iterations=max_iterations)
+                    result = {'changed': changed, 'details': details}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
                 # -- RF peripheral (attenuator / amp bypass) commands --
 
                 elif request == 'get_rf_peripheral_status':

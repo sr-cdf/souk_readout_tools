@@ -780,6 +780,11 @@ class ReadoutClient:
     def fix_adc_saturation(self):
         return self.send_request({'request': 'fix_adc_saturation'})
 
+    def fix_dsp_overflow(self, duration_s=0.5, max_iterations=10):
+        return self.send_request({'request': 'fix_dsp_overflow',
+                                  'duration_s': duration_s,
+                                  'max_iterations': max_iterations})
+
     # -- RF peripheral (attenuator / amp bypass) control --
 
     def get_rf_peripheral_status(self):
@@ -2514,7 +2519,52 @@ class ReadoutClient:
             #should this be a no-op?
             self.set_tone_amplitudes(np.ones(num_tones))
 
-        # Check for saturation/overflow before sweeping and attempt to fix
+        # # Check for saturation/overflow before sweeping and attempt to fix
+        # outps = self.check_output_saturation()
+        # inps = self.check_input_saturation()
+        # dspof = self.check_dsp_overflow()
+
+        # if outps['result']:
+        #     if verbose:
+        #         print(f'  DAC saturation detected — attempting fix...')
+        #     self.fix_dac_saturation()
+        #     outps = self.check_output_saturation()
+        #     if outps['result']:
+        #         raise RuntimeError(
+        #             f"DAC saturation persists. Reduce tone_powers_dbm or num_tones.")
+        # if inps['result']:
+        #     if verbose:
+        #         print(f'  ADC saturation detected — attempting fix...')
+        #     self.fix_adc_saturation()
+        #     inps = self.check_input_saturation()
+        #     if inps['result']:
+        #         raise RuntimeError(
+        #             f"ADC saturation persists. Reduce tone_powers_dbm or num_tones.")
+        # if dspof['result']:
+        #     if verbose:
+        #         print(f'  DSP overflow detected — attempting fix...')
+        #     self.fix_dsp_overflow()
+        #     dspof = self.check_dsp_overflow()
+        #     if dspof['result']:
+        #         raise RuntimeError(
+        #             f"DSP overflow persists. Reduce tone_powers_dbm or num_tones.")
+
+        # Optimise RX gain: maximise ADC power and PFB FFT shift
+        if optimise_rx_gain:
+            if verbose:
+                print(f'  Optimising RX gain...')
+            rx_result = self.maximise_rx_power()
+            if verbose:
+                print(f'  maximise_rx_power() -> {rx_result}')
+
+        # Freeze calibration before sweep
+        if cal_freeze:
+            if verbose:
+                print(f'  Freezing calibration...')
+            self.set_cal_freeze(True)
+
+
+        # Double check for saturation/overflow before sweeping and attempt to fix
         outps = self.check_output_saturation()
         inps = self.check_input_saturation()
         dspof = self.check_dsp_overflow()
@@ -2538,25 +2588,12 @@ class ReadoutClient:
         if dspof['result']:
             if verbose:
                 print(f'  DSP overflow detected — attempting fix...')
-            self.fix_dac_saturation()
+            self.fix_dsp_overflow()
             dspof = self.check_dsp_overflow()
             if dspof['result']:
                 raise RuntimeError(
                     f"DSP overflow persists. Reduce tone_powers_dbm or num_tones.")
 
-        # Optimise RX gain: maximise ADC power and PFB FFT shift
-        if optimise_rx_gain:
-            if verbose:
-                print(f'  Optimising RX gain...')
-            rx_result = self.maximise_rx_power()
-            if verbose:
-                print(f'  maximise_rx_power() -> {rx_result}')
-
-        # Freeze calibration before sweep
-        if cal_freeze:
-            if verbose:
-                print(f'  Freezing calibration...')
-            self.set_cal_freeze(True)
 
         # Perform the sweep
         response = self.perform_sweep(center_freqs, sweep_span,

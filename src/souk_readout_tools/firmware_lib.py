@@ -4311,11 +4311,13 @@ def fix_dsp_overflow(r, duration_s=0.5, max_iterations=10):
     """
     Fix DSP overflow by targeting the specific block(s) that are overflowing.
 
-    - PSB scale overflow  → reduce psb_scale by half
-    - PSB filterbank overflow → increase PSB fftshift popcount by one
-      (adds a divide-by-2 stage), then double psb_scale to compensate
-      output power (if no psbscale overflow results)
-    - PFB filterbank overflow → increase PFB fftshift popcount by one
+    Uses _find_best_psb_fftshift / _find_best_pfb_fftshift to sweep for the
+    optimal fftshift in one pass rather than incrementing one step at a time.
+
+    - PFB filterbank overflow → sweep for best PFB fftshift
+    - PSB filterbank overflow → sweep for best PSB fftshift (mutes output
+      during sweep), then compensate psb_scale for the fftshift change
+    - PSB scale overflow → halve psb_scale
 
     Repeats until no overflow is detected or max_iterations is reached.
 
@@ -4326,8 +4328,6 @@ def fix_dsp_overflow(r, duration_s=0.5, max_iterations=10):
     details : dict
         Final overflow check details.
     """
-    fftshift_values = (2**np.arange(14) - 1).astype(int)  # 0,1,3,7,...,8191
-    max_fftshift = int(fftshift_values[-1])
     changed = False
 
     for iteration in range(max_iterations):
@@ -4343,32 +4343,38 @@ def fix_dsp_overflow(r, duration_s=0.5, max_iterations=10):
         psb_ovf = details['psb_ovf_delta']
         pfb_ovf = details['pfb_ovf_delta']
 
+        if pfb_ovf:
+            # PFB filterbank overflowing — sweep for best fftshift
+            init_pfb_shift = r.pfb.get_fftshift()
+            best_pfb_shift, _ = _find_best_pfb_fftshift(r, duration_s)
+            print(f'fix_dsp_overflow: PFB overflow — fftshift '
+                  f'{format(init_pfb_shift, "#016b")} -> {format(best_pfb_shift, "#016b")}')
+            changed = True
+
         if psb_ovf:
-            # PSB filterbank overflowing — increase fftshift popcount by one
-            current_shift = r.psb.get_fftshift()
-            current_popcount = bin(current_shift).count('1')
-            new_popcount = current_popcount + 1
-            if new_popcount > 13:
-                print(f'fix_dsp_overflow: PSB fftshift already at max attenuation '
-                      f'({format(current_shift, "#016b")}), cannot add more')
-            else:
-                new_shift = int(fftshift_values[new_popcount])
-                # Compensate psb_scale to preserve output power (halved by
-                # the extra divide-by-2), but only if it won't overflow.
-                psb_scale = r.psbscale.get_scale()
-                compensated_scale = psb_scale * 2
-                r.psb.set_fftshift(new_shift)
-                if compensated_scale <= 255:
-                    r.psbscale.set_scale(compensated_scale)
-                    print(f'fix_dsp_overflow: PSB overflow — fftshift '
-                          f'{format(current_shift, "#016b")} -> {format(new_shift, "#016b")}, '
-                          f'psb_scale {psb_scale:.4f} -> {compensated_scale:.4f} (compensated)')
-                else:
-                    print(f'fix_dsp_overflow: PSB overflow — fftshift '
-                          f'{format(current_shift, "#016b")} -> {format(new_shift, "#016b")} '
-                          f'(psb_scale not compensated, would exceed max)')
-                time.sleep(0.1)
-                changed = True
+            # PSB filterbank overflowing — sweep for best fftshift.
+            # _find_best_psb_fftshift mutes psb_scale during the sweep
+            # and leaves it at 0; we restore and compensate afterwards.
+            init_psb_shift = r.psb.get_fftshift()
+            init_psb_scale = r.psbscale.get_scale()
+            best_psb_shift, _, _ = _find_best_psb_fftshift(r, duration_s)
+
+            # Compensate psb_scale for the fftshift gain change to
+            # preserve output power.
+            init_popcount = bin(init_psb_shift).count('1')
+            new_popcount = bin(best_psb_shift).count('1')
+            fftshift_gain_ratio = 2.0 ** (init_popcount - new_popcount)
+            compensated_scale = init_psb_scale / fftshift_gain_ratio
+            compensated_scale = max(compensated_scale, 1/256)
+            if compensated_scale > 255:
+                compensated_scale = 255
+            r.psbscale.set_scale(compensated_scale)
+            time.sleep(0.1)
+
+            print(f'fix_dsp_overflow: PSB overflow — fftshift '
+                  f'{format(init_psb_shift, "#016b")} -> {format(best_psb_shift, "#016b")}, '
+                  f'psb_scale {init_psb_scale:.4f} -> {compensated_scale:.4f} (compensated)')
+            changed = True
 
         if psbscale_ovf:
             # PSB scale block overflowing — reduce psb_scale
@@ -4380,22 +4386,6 @@ def fix_dsp_overflow(r, duration_s=0.5, max_iterations=10):
                   f'{psb_scale:.4f} -> {new_scale:.4f}')
             time.sleep(0.1)
             changed = True
-
-        if pfb_ovf:
-            # PFB filterbank overflowing — increase fftshift popcount by one
-            current_shift = r.pfb.get_fftshift()
-            current_popcount = bin(current_shift).count('1')
-            new_popcount = current_popcount + 1
-            if new_popcount > 13:
-                print(f'fix_dsp_overflow: PFB fftshift already at max attenuation '
-                      f'({format(current_shift, "#016b")}), cannot add more')
-            else:
-                new_shift = int(fftshift_values[new_popcount])
-                r.pfb.set_fftshift(new_shift)
-                print(f'fix_dsp_overflow: PFB overflow — fftshift '
-                      f'{format(current_shift, "#016b")} -> {format(new_shift, "#016b")}')
-                time.sleep(0.1)
-                changed = True
 
     # Ran out of iterations
     _, details = check_dsp_overflow(r, duration_s)
