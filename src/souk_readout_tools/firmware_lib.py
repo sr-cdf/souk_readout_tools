@@ -5575,7 +5575,8 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
                                tx_atten_range=(0.0, 31.5, 0.5),
                                tx_amp_s21_enabled=None,
                                tx_amp_s21_bypassed=None,
-                               tx_1db_comp=None):
+                               tx_1db_comp=None,
+                               crest_factor_db=12.0):
     """Compute optimal settings to achieve target powers at reference plane.
 
     Pure computation — no hardware access.  Uses calibration.calc_tone_amplitudes
@@ -5712,8 +5713,9 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
             dac_amps = np.abs(candidate_amps) / 2**(popcount_candidate + 1) * optimal_psb_scale
             total_dac_power = float(np.sum(dac_amps**2))
             peak_dac_amp = float(np.max(np.abs(dac_amps)))
-            if total_dac_power > 1.0 or peak_dac_amp >= 1.0:
-                continue  # would overdrive DAC (RMS or peak)
+            allowed_peak = 1.0 / (10**(crest_factor_db/20))
+            if total_dac_power > 1.0 or peak_dac_amp >= allowed_peak:
+                continue  # would overdrive DAC (RMS or peak with crest factor margin)
 
             # Valid solution — prefer higher psb_scale (better DAC utilisation,
             # secondary to the amplitude maximisation which is always satisfied)
@@ -6205,6 +6207,59 @@ def get_closest_bin_indices(freqs_hz, bin_centers_hz):
     if np.isscalar(freqs_hz) or freqs.ndim == 0:
         return int(closest)
     return closest
+
+
+def estimate_papr_db(freqs, amps, phases, sample_rate, duration_s=0.001, chunk_size=65536, verbose=True):
+    """
+    Estimate the time-domain PAPR (peak-to-average power ratio, dB) for a sum of tones over a simulated duration.
+    This version uses a for-loop over tones for each chunk (less vectorized, more memory-safe for some environments).
+
+    Parameters
+    ----------
+    freqs : array_like
+        Tone frequencies in Hz.
+    amps : array_like
+        Amplitudes of each tone (linear, not dB).
+    phases : array_like
+        Phase offsets for each tone (radians).
+    sample_rate : float
+        Sample rate in Hz (e.g., 2*adc_clk_hz).
+    duration_s : float
+        Duration to simulate in seconds (default 0.001).
+    chunk_size : int
+        Number of samples to process per chunk (default 65536).
+    verbose : bool
+        If True, print the simulated time and peak value for each chunk.
+
+    Returns
+    -------
+    papr_db : float
+        Peak-to-average power ratio in dB.
+    """
+    import numpy as np
+    freqs = np.asarray(freqs)
+    phases = np.asarray(phases)
+    amps = np.asarray(amps)
+    n_tones = len(amps)
+    n_samples = int(np.round(duration_s * sample_rate))
+    max_val = 0.0
+    total_chunks = (n_samples + chunk_size - 1) // chunk_size
+    for i in range(total_chunks):
+        start = i * chunk_size
+        end = min((i + 1) * chunk_size, n_samples)
+        t = np.arange(start, end) / sample_rate
+        block = np.zeros_like(t, dtype=np.complex128)
+        for k in range(n_tones):
+            block += amps[k] * np.exp(2j * np.pi * freqs[k] * t + 1j * phases[k])
+        abs_block = np.abs(block)
+        block_max = np.max(abs_block)
+        if verbose:
+            print(f"[FORLOOP {i}/{total_chunks}] Simulated time: {t[0]:.6f} to {t[-1]:.6f} s, chunk peak = {block_max:.6f}")
+        max_val = max(max_val, block_max)
+    avg_power = np.sum(amps ** 2)
+    papr = (max_val ** 2) / avg_power
+    papr_db = 10 * np.log10(papr)
+    return papr_db
 
 
 #include private functions when import * for debugging, to be removed later
