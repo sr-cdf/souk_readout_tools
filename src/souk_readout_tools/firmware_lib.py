@@ -5978,6 +5978,12 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         print(f'  DAC headroom: {dac_headroom_db:.1f} dB')
         set_tone_amplitudes(r, config_dict, amps)
 
+        # DAC Saturation Check
+        dac_saturation, dac_saturation_details = check_output_saturation(r, iterations=10)
+        if dac_saturation:
+            print('  WARNING: DAC output is saturating!')
+            warnings_list.append('DAC output is saturating!')
+
         achieved = get_tone_powers(r, config_dict, reference_plane=reference_plane)
         error = achieved - powers_dbm
         print(f'  Max power error: {np.max(np.abs(error)):.2f} dB')
@@ -5997,6 +6003,8 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
             'effective_bits_per_tone': eff_bits.tolist(),
             'amplitude_resolution_bits': amp_res_bits.tolist(),
             'dac_headroom_db': dac_headroom_db,
+            'dac_saturation': dac_saturation,
+            'dac_saturation_details': dac_saturation_details,
             'warnings': warnings_list,
         }
 
@@ -6076,6 +6084,12 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         print(f'  WARNING: {msg}')
         plan['warnings'].append(msg)
 
+    # ---- Phase 5: DAC Saturation Check ----
+    dac_saturation, dac_saturation_details = check_output_saturation(r, iterations=10)
+    if dac_saturation:
+        print('  WARNING: DAC output is saturating!')
+        plan['warnings'].append('DAC output is saturating!')
+
     result = {
         'target_powers_dbm': powers_dbm.tolist(),
         'reference_plane': reference_plane,
@@ -6091,6 +6105,8 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         'effective_bits_per_tone': plan['effective_bits_per_tone'],
         'amplitude_resolution_bits': plan['amplitude_resolution_bits'],
         'dac_headroom_db': plan['dac_headroom_db'],
+        'dac_saturation': dac_saturation,
+        'dac_saturation_details': dac_saturation_details,
         'warnings': plan['warnings'],
     }
 
