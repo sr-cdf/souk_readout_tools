@@ -5780,14 +5780,14 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
     # Dynamic range metrics
     popcount = bin(best_solution['psb_fftshift']).count('1')
     dac_amplitude_fs = np.abs(best_solution['amplitudes']) / 2**(popcount + 1) * best_solution['psb_scale']
-    total_dac_power = float(np.sum(dac_amplitude_fs**2))
+    peak_dac_amplitude = float(np.max(np.abs(dac_amplitude_fs)))
     with np.errstate(divide='ignore'):
         effective_bits = 16 + np.log2(np.where(dac_amplitude_fs > 0, dac_amplitude_fs, np.nan))
         amp_resolution_bits = np.log2(np.where(
             np.abs(best_solution['amplitudes']) > 0,
             np.abs(best_solution['amplitudes']) / 2**-12,
             np.nan))
-        dac_headroom_db = float(-10 * np.log10(total_dac_power)) if total_dac_power > 0 else float('inf')
+        dac_headroom_db = float(-20 * np.log10(peak_dac_amplitude)) if peak_dac_amplitude > 0 else float('inf')
 
     if max_tones_per_bin > 1:
         warnings_list.append(
@@ -5967,11 +5967,12 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         popcount = bin(p['psb_fftshift']).count('1')
         dac_amp_fs = np.abs(amps) / 2**(popcount + 1) * p['psb_scale']
         total_dac_power = float(np.sum(dac_amp_fs**2))
+        peak_dac_amplitude = float(np.max(np.abs(dac_amp_fs)))
         with np.errstate(divide='ignore'):
             eff_bits = 16 + np.log2(np.where(dac_amp_fs > 0, dac_amp_fs, np.nan))
             amp_res_bits = np.log2(np.where(
                 np.abs(amps) > 0, np.abs(amps) / 2**-12, np.nan))
-            dac_headroom_db = float(-10 * np.log10(total_dac_power)) if total_dac_power > 0 else float('inf')
+            dac_headroom_db = float(-20 * np.log10(peak_dac_amplitude)) if peak_dac_amplitude > 0 else float('inf')
 
         print(f'set_tone_powers: setting {len(powers_dbm)} tones at '
               f'reference_plane={reference_plane!r}')
