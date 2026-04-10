@@ -5625,7 +5625,7 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
         achievable, amplitudes, psb_fftshift, psb_scale,
         tx_attenuation_db, tx_amp_bypass, tx_bypass_amp_s21_db,
         effective_bits_per_tone, amplitude_resolution_bits,
-        warnings, failure_reason
+        dac_headroom_db, warnings, failure_reason
     """
     SCALEMIN, SCALEMAX = 1/256, 255
     max_amp = (1 - 2**-12) / max_tones_per_bin
@@ -5780,12 +5780,14 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
     # Dynamic range metrics
     popcount = bin(best_solution['psb_fftshift']).count('1')
     dac_amplitude_fs = np.abs(best_solution['amplitudes']) / 2**(popcount + 1) * best_solution['psb_scale']
+    total_dac_power = float(np.sum(dac_amplitude_fs**2))
     with np.errstate(divide='ignore'):
         effective_bits = 16 + np.log2(np.where(dac_amplitude_fs > 0, dac_amplitude_fs, np.nan))
         amp_resolution_bits = np.log2(np.where(
             np.abs(best_solution['amplitudes']) > 0,
             np.abs(best_solution['amplitudes']) / 2**-12,
             np.nan))
+        dac_headroom_db = float(-10 * np.log10(total_dac_power)) if total_dac_power > 0 else float('inf')
 
     if max_tones_per_bin > 1:
         warnings_list.append(
@@ -5797,6 +5799,7 @@ def _plan_tone_power_settings(powers_dbm, cal, reference_plane,
         'failure_reason': None,
         'effective_bits_per_tone': effective_bits.tolist(),
         'amplitude_resolution_bits': amp_resolution_bits.tolist(),
+        'dac_headroom_db': dac_headroom_db,
         'warnings': warnings_list,
     })
     return best_solution
@@ -5873,7 +5876,7 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         target_powers_dbm, reference_plane, achieved_powers_dbm, power_error_db,
         amplitudes, psb_fftshift, psb_scale, tx_attenuation_db, tx_amp_bypass,
         tx_bypass_amp_s21_db, optimised, effective_bits_per_tone,
-        amplitude_resolution_bits, warnings
+        amplitude_resolution_bits, dac_headroom_db, warnings
     """
     VALID_PLANES = ('dac', 'rf_output', 'detector')
     if reference_plane not in VALID_PLANES:
@@ -5963,13 +5966,16 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         # Dynamic range metrics for simple mode
         popcount = bin(p['psb_fftshift']).count('1')
         dac_amp_fs = np.abs(amps) / 2**(popcount + 1) * p['psb_scale']
+        total_dac_power = float(np.sum(dac_amp_fs**2))
         with np.errstate(divide='ignore'):
             eff_bits = 16 + np.log2(np.where(dac_amp_fs > 0, dac_amp_fs, np.nan))
             amp_res_bits = np.log2(np.where(
                 np.abs(amps) > 0, np.abs(amps) / 2**-12, np.nan))
+            dac_headroom_db = float(-10 * np.log10(total_dac_power)) if total_dac_power > 0 else float('inf')
 
         print(f'set_tone_powers: setting {len(powers_dbm)} tones at '
               f'reference_plane={reference_plane!r}')
+        print(f'  DAC headroom: {dac_headroom_db:.1f} dB')
         set_tone_amplitudes(r, config_dict, amps)
 
         achieved = get_tone_powers(r, config_dict, reference_plane=reference_plane)
@@ -5990,6 +5996,7 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
             'optimised': False,
             'effective_bits_per_tone': eff_bits.tolist(),
             'amplitude_resolution_bits': amp_res_bits.tolist(),
+            'dac_headroom_db': dac_headroom_db,
             'warnings': warnings_list,
         }
 
@@ -6050,6 +6057,7 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
               f'TX amp bypass: {plan["tx_amp_bypass"]}')
     print(f'  Effective DAC bits per tone: {min_eff_bits:.1f} '
           f'(worst case)')
+    print(f'  DAC headroom: {plan["dac_headroom_db"]:.1f} dB')
 
     for w in plan['warnings']:
         print(f'  WARNING: {w}')
@@ -6082,6 +6090,7 @@ def set_tone_powers(r, config_dict, powers_dbm, reference_plane='detector',
         'optimised': True,
         'effective_bits_per_tone': plan['effective_bits_per_tone'],
         'amplitude_resolution_bits': plan['amplitude_resolution_bits'],
+        'dac_headroom_db': plan['dac_headroom_db'],
         'warnings': plan['warnings'],
     }
 
