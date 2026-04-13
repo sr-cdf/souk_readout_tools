@@ -1690,9 +1690,9 @@ class ReadoutClient:
                 
                 #get bin indexes
                 udc = self.config['rf_frontend']['connected']
-                lo = self.config['rf_frontend']['tx_mixer_lo_frequency_hz'] if udc else 0.0
-                sb = self.config['rf_frontend']['tx_mixer_sideband'] if udc else 1
-                
+                lo = self.config['rf_frontend'].get('tx_mixer_lo_frequency_hz', 0.0) if udc else 0.0
+                sb = self.config['rf_frontend'].get('tx_mixer_sideband', 1) if udc else 1
+
                 adcclk = info['adc_clk_hz']
                 dacclk = adcclk
                 dacduc = info['dac_duc_mixer_frequency_hz']
@@ -2461,9 +2461,10 @@ class ReadoutClient:
         info = self.get_system_information()
                 
         # Get RF frontend mixer configuration
+        # TODO: if we have a frontend connected it might not have a mixer - needs updating.
         udc = self.config['rf_frontend']['connected']
-        lo = self.config['rf_frontend']['tx_mixer_lo_frequency_hz']
-        sb = self.config['rf_frontend']['tx_mixer_sideband']
+        lo = self.config['rf_frontend'].get('tx_mixer_lo_frequency_hz', 0.0) if udc else 0.0
+        sb = self.config['rf_frontend'].get('tx_mixer_sideband', +1) if udc else 1
         
         adcclk = info['adc_clk_hz']
         dacclk = adcclk
@@ -2479,6 +2480,7 @@ class ReadoutClient:
         rfmin = dacmin
         rfmax = dacmax
 
+        
         if udc:
             if sb == 1:
                 rfmin = lo + dacmin
