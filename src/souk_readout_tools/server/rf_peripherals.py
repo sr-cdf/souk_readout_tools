@@ -50,7 +50,7 @@ from souk_rf_mixerless_atten_amp_level import (
 # rudat.py must be on sys.path (e.g. pip install, or add its directory to
 # PYTHONPATH / sys.path before starting the server).
 try:
-    from rudat import Attenuator as RudatAttenuator, find_rudats
+    from souk_readout_tools.server.rudat import Attenuator as RudatAttenuator, find_rudats
     _RUDAT_AVAILABLE = True
 except ImportError:
     _RUDAT_AVAILABLE = False
