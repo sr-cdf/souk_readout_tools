@@ -271,7 +271,7 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
 
     if format in ('iq', 'magphase'):
         if fig is None:
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6))
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6),sharex=True)
         else:
             ax1, ax2 = fig.axes[:2]
 
