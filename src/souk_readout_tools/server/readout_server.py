@@ -25,6 +25,7 @@ Version: 1.1.0
 
 
 import asyncio, contextvars, functools
+import copy
 import importlib.metadata
 import json
 import struct
@@ -396,10 +397,11 @@ class ReadoutServer:
         print(f'Using pipeline {self.pipeline_id} directories:')
         print(f'  config: {self.user_config_dir}')
         print(f'  calibrations: {self.user_calibrations_dir}')
-        
+
         #server attributes
         self.config = None
         self.config_file = None
+        self.applied_config = None
         self.request_clients = []
         self.stream_clients = []
         self.sweep_task = None
@@ -482,6 +484,7 @@ class ReadoutServer:
             # 3) Pipeline resources init if needed
             if firmware_lib.needs_pipeline_initialising(self.r, self.config):
                 firmware_lib.initialise_pipeline_resources(self.r, self.config)
+                self.applied_config = copy.deepcopy(self.config)
 
             #re-establish firmware interfaces in case they were initially created before programming
             fw_config_file = self.config['firmware']['fw_config_file']
@@ -540,6 +543,7 @@ class ReadoutServer:
             firmware_lib.initialise_shared_resources(self.r, self.config)
             # 3) Pipeline resources
             firmware_lib.initialise_pipeline_resources(self.r, self.config)
+            self.applied_config = copy.deepcopy(self.config)
 
             #re-establish firmware interfaces in case they were initially created before programming
             fw_config_file = self.config['firmware']['fw_config_file']
@@ -571,6 +575,7 @@ class ReadoutServer:
         #server attributes
         self.config = None
         self.config_file = None
+        self.applied_config = None
         self.request_clients = []
         self.stream_clients = []
         self.sweep_task = None
@@ -700,7 +705,8 @@ class ReadoutServer:
         self.ensure_ready(level="pipeline")
     
         #force pipeline init
-        firmware_lib.initialise_pipeline_resources(self.r, self.config)        
+        firmware_lib.initialise_pipeline_resources(self.r, self.config)
+        self.applied_config = copy.deepcopy(self.config)
 
         return
 
@@ -767,7 +773,8 @@ class ReadoutServer:
         print('************************************************')
 
 
-        firmware_lib.apply_config(config_contents, self.r, self.config)
+        firmware_lib.apply_config(config_contents, self.r, self.applied_config)
+        self.applied_config = copy.deepcopy(config_contents)
         self.update_active_tone_indices()
 
         # Apply RF peripheral hardware settings (attenuators, amp bypass) from new config
