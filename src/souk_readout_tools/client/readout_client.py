@@ -654,6 +654,9 @@ class ReadoutClient:
     def get_sample_rate(self):
         return self.get_parameter('sample_rate_hz')
 
+    def get_telescope_time(self):
+        return self.get_parameter('telescope_time')
+
     def set_tone_frequencies(self, tone_frequencies):
         tone_frequencies = np.atleast_1d(tone_frequencies).tolist()
         return self.set_parameter('tone_frequencies',tone_frequencies)
@@ -993,7 +996,8 @@ class ReadoutClient:
         q_data = np.zeros((num_samples, num_tones), dtype='<i4')
         cnt = np.zeros(num_samples, dtype=int)
         err = np.zeros(num_samples, dtype=int)
-        flags = np.zeros((num_samples, 8), dtype=int)
+        tt = np.zeros(num_samples, dtype=np.uint64)
+        flags = np.zeros((num_samples, 6), dtype=int)
         for j in range(num_samples):
             packet_offset = j * datalen
             all_data = np.frombuffer(data_raw[packet_offset:packet_offset+datalen], dtype='<i4')
@@ -1001,7 +1005,10 @@ class ReadoutClient:
             q_data[j] = all_data[1::2][:num_tones]
             err[j] = all_data[-1]
             cnt[j] = all_data[-2]
-            flags[j] = all_data[-10:-2]
+            tt_lsb = int(all_data[-3]) & 0xFFFFFFFF
+            tt_msb = int(all_data[-4]) & 0xFFFFFFFF
+            tt[j] = (tt_msb << 32) + tt_lsb
+            flags[j] = all_data[-10:-4]
         data_dict = {'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
                     'num_tones':num_tones,
                     'num_samples':num_samples,
@@ -1011,7 +1018,8 @@ class ReadoutClient:
                     'q_data':{f'{i:04d}':q_data[:,i] for i in range(num_tones)},
                     'packet_counter':cnt,
                     'packet_error':err,
-                    'stream_flags':{f'flag{i}':flags[:,i] for i in range(8)}
+                    'telescope_time':tt,
+                    'stream_flags':{f'flag{i}':flags[:,i] for i in range(6)}
                     }
 
         return data_dict
@@ -1060,8 +1068,9 @@ class ReadoutClient:
                 header = []
                 for i in range(data_dict['num_tones']):
                     header.extend([f'i_data_{i:04d}', f'q_data_{i:04d}'])
-                header.extend(['packet_counter', 'packet_error'])
-                header.extend([f'flag{i}' for i in range(8)])
+                header.extend(['packet_counter', 'packet_error', 'telescope_time'])
+                num_flags = len(data_dict['stream_flags'])
+                header.extend([f'flag{i}' for i in range(num_flags)])
                 writer.writerow(header)
                 # Write the data rows
                 for j in range(data_dict['num_samples']):
@@ -1070,7 +1079,8 @@ class ReadoutClient:
                         row.extend([data_dict['i_data'][f'{i:04d}'][j], data_dict['q_data'][f'{i:04d}'][j]])
                     row.append(data_dict['packet_counter'][j])
                     row.append(data_dict['packet_error'][j])
-                    row.extend([data_dict['stream_flags'][f'flag{k}'][j] for k in range(8)])
+                    row.append(int(data_dict['telescope_time'][j]))
+                    row.extend([data_dict['stream_flags'][f'flag{k}'][j] for k in range(num_flags)])
                     writer.writerow(row)
 
         elif file_format == 'dirfile':
@@ -1128,7 +1138,12 @@ class ReadoutClient:
             data_dict['q_data'] = {f'{i:04d}':data[f'q_data_{i:04d}'].astype(int) for i in range(data_dict['num_tones'])}
             data_dict['packet_counter'] = data['packet_counter'].astype(int)
             data_dict['packet_error'] = data['packet_error'].astype(int)
-            data_dict['stream_flags'] = {f'flag{i}':data[f'flag{i}'].astype(int) for i in range(8)}
+            if 'telescope_time' in data.dtype.names:
+                data_dict['telescope_time'] = data['telescope_time'].astype(np.uint64)
+            else:
+                data_dict['telescope_time'] = np.zeros(len(data['packet_counter']), dtype=np.uint64)
+            num_flags = sum(1 for name in data.dtype.names if name.startswith('flag'))
+            data_dict['stream_flags'] = {f'flag{i}':data[f'flag{i}'].astype(int) for i in range(num_flags)}
 
         elif filename.endswith('.hdf5'):
             raise NotImplementedError("hdf5 format not yet implemented.")
@@ -1665,6 +1680,11 @@ class ReadoutClient:
         sweep_f = np.frombuffer(sweep_f_bytes, dtype='f8').reshape((num_points, num_tones)).copy()
         sweep_z = np.frombuffer(sweep_z_bytes, dtype='complex128').reshape((num_points, num_tones)).copy()
         sweep_e = np.frombuffer(sweep_e_bytes, dtype='complex128').reshape((num_points, num_tones)).copy()
+        if 'tt' in sweep_data['sweep']:
+            sweep_tt_bytes = base64.b64decode(sweep_data['sweep']['tt'])
+            sweep_tt = np.frombuffer(sweep_tt_bytes, dtype='u8').copy()
+        else:
+            sweep_tt = np.zeros(num_points, dtype=np.uint64)
 
         if apply_phase_correction:
                 
@@ -1719,7 +1739,8 @@ class ReadoutClient:
                         'sweep_i': sweep_i,
                         'sweep_q': sweep_q,
                         'sweep_ei': err_i,
-                        'sweep_eq': err_q
+                        'sweep_eq': err_q,
+                        'telescope_time': sweep_tt
                         }
         return data_dict
 
@@ -1766,6 +1787,8 @@ class ReadoutClient:
                 writer.writerow(['# samples_per_point', sweep_dict['samples_per_point']])
                 for key,value in sweep_dict['system_information'].items():
                     writer.writerow([f'# {key}', value])
+                if 'telescope_time' in sweep_dict:
+                    writer.writerow(['# telescope_time_per_point'] + [int(t) for t in sweep_dict['telescope_time']])
                 header = []
                 for k in range(len(sweep_dict['sweep_f'])):
                     header.extend([f'sweep_f_{k:04d}', f'sweep_i_{k:04d}', f'sweep_q_{k:04d}', f'err_i_{k:04d}', f'err_q_{k:04d}'])
@@ -1880,15 +1903,15 @@ class ReadoutClient:
         metadata['format'] = '<i4'
         metadata['index_err'] = 2*num_tones-1+10
         metadata['index_cnt'] = 2*num_tones-1+9
-        metadata['index_flag_7'] = 2*num_tones-1+8
-        metadata['index_flag_6'] = 2*num_tones-1+7
+        metadata['index_tt_lsb'] = 2*num_tones-1+8
+        metadata['index_tt_msb'] = 2*num_tones-1+7
         metadata['index_flag_5'] = 2*num_tones-1+6
         metadata['index_flag_4'] = 2*num_tones-1+5
         metadata['index_flag_3'] = 2*num_tones-1+4
         metadata['index_flag_2'] = 2*num_tones-1+3
         metadata['index_flag_1'] = 2*num_tones-1+2
         metadata['index_flag_0'] = 2*num_tones-1+1
-        metadata['ordering'] = 'I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, Q_tone1_sample0,..flags, cnt, err .'
+        metadata['ordering'] = 'I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, Q_tone1_sample0,..flags, tt_msb, tt_lsb, cnt, err .'
         metadata['system_information'] = info
 
         with open(filename+'.json','w') as file:
@@ -1934,8 +1957,11 @@ class ReadoutClient:
                             q = np.frombuffer(data[:tone_data_bytes:], dtype='<i4')[1::2]
                             err = np.frombuffer(data[datalen-4:datalen], dtype='<i4')
                             cnt = np.frombuffer(data[datalen-8:datalen-4], dtype='<i4')
+                            tt_lsb = int(np.frombuffer(data[datalen-12:datalen-8], dtype='<i4')[0]) & 0xFFFFFFFF
+                            tt_msb = int(np.frombuffer(data[datalen-16:datalen-12], dtype='<i4')[0]) & 0xFFFFFFFF
+                            tt = (tt_msb << 32) + tt_lsb
                             iq_data=i+1j*q
-                            print(f"Received IQ data: {err} {cnt} {iq_data.tolist()}\r",end='',flush=True)
+                            print(f"Received IQ data: err={err} cnt={cnt} tt={tt} {iq_data.tolist()}\r",end='',flush=True)
                     except KeyboardInterrupt:
                         break
 
@@ -1973,15 +1999,15 @@ class ReadoutClient:
         metadata['format'] = '<i4'
         metadata['index_err'] = 2*num_tones-1+10
         metadata['index_cnt'] = 2*num_tones-1+9
-        metadata['index_flag_7'] = 2*num_tones-1+8
-        metadata['index_flag_6'] = 2*num_tones-1+7
+        metadata['index_tt_lsb'] = 2*num_tones-1+8
+        metadata['index_tt_msb'] = 2*num_tones-1+7
         metadata['index_flag_5'] = 2*num_tones-1+6
         metadata['index_flag_4'] = 2*num_tones-1+5
         metadata['index_flag_3'] = 2*num_tones-1+4
         metadata['index_flag_2'] = 2*num_tones-1+3
         metadata['index_flag_1'] = 2*num_tones-1+2
         metadata['index_flag_0'] = 2*num_tones-1+1
-        metadata['ordering'] = 'I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, Q_tone1_sample0,..flags, cnt, err .'
+        metadata['ordering'] = 'I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, Q_tone1_sample0,..flags, tt_msb, tt_lsb, cnt, err .'
         metadata['system_information'] = info
 
         with open(filename+'.json','w') as file:
@@ -2025,8 +2051,11 @@ class ReadoutClient:
                             q = np.frombuffer(data[:tone_data_bytes:], dtype='<i4')[1::2]
                             err = np.frombuffer(data[datalen-4:datalen], dtype='<i4')
                             cnt = np.frombuffer(data[datalen-8:datalen-4], dtype='<i4')
+                            tt_lsb = int(np.frombuffer(data[datalen-12:datalen-8], dtype='<i4')[0]) & 0xFFFFFFFF
+                            tt_msb = int(np.frombuffer(data[datalen-16:datalen-12], dtype='<i4')[0]) & 0xFFFFFFFF
+                            tt = (tt_msb << 32) + tt_lsb
                             iq_data=i+1j*q
-                            print(f"Received IQ data: {err} {cnt} {iq_data.tolist()}\r",end='',flush=True)
+                            print(f"Received IQ data: err={err} cnt={cnt} tt={tt} {iq_data.tolist()}\r",end='',flush=True)
                     except KeyboardInterrupt:
                         break
                     except Exception as e:
@@ -2056,8 +2085,10 @@ class ReadoutClient:
         format = metadata['format']
         index_err = metadata['index_err']
         index_cnt = metadata['index_cnt']
+        index_tt_lsb = metadata.get('index_tt_lsb')
+        index_tt_msb = metadata.get('index_tt_msb')
         index_flag_0 = metadata['index_flag_0']
-        index_flag_7 = metadata['index_flag_7']
+        index_flag_5 = metadata.get('index_flag_5', metadata.get('index_flag_7', index_flag_0 + 5))
         info = metadata['system_information']
 
         data = np.fromfile(filename,dtype=format)
@@ -2066,7 +2097,13 @@ class ReadoutClient:
 
         err = data[index_err]
         cnt = data[index_cnt]
-        flags = data[index_flag_0:index_flag_7+1]
+        if index_tt_msb is not None and index_tt_lsb is not None:
+            tt_msb = data[index_tt_msb].astype(np.int64) & 0xFFFFFFFF
+            tt_lsb = data[index_tt_lsb].astype(np.int64) & 0xFFFFFFFF
+            tt = (tt_msb << 32) + tt_lsb
+        else:
+            tt = np.zeros(num_samples, dtype=np.uint64)
+        flags = data[index_flag_0:index_flag_5+1]
 
         i_data = data[:2*num_tones:2]
         q_data = data[1:2*num_tones:2]
@@ -2080,7 +2117,8 @@ class ReadoutClient:
                      'q_data':{f'{i:04d}':q_data[i] for i in range(num_tones)},
                      'packet_counter':cnt,
                      'packet_error':err,
-                     'stream_flags':{f'flag{i}':flags[i] for i in range(8)}
+                     'telescope_time':tt,
+                     'stream_flags':{f'flag{i}':flags[i] for i in range(flags.shape[0])}
                      }
         return data_dict
 
@@ -2130,9 +2168,10 @@ class ReadoutClient:
                 for key,value in info.items():
                     writer.writerow([f'# {key}', value])
 
+                num_flags = len(data_dict['stream_flags'])
                 header = []
-                header.extend(['packet_counter', 'packet_error'])
-                header.extend([f'flag{i}' for i in range(8)])
+                header.extend(['packet_counter', 'packet_error', 'telescope_time'])
+                header.extend([f'flag{i}' for i in range(num_flags)])
                 for i in range(data_dict['num_tones']):
                     header.extend([f'i_{i:04d}'])
                     header.extend([f'q_{i:04d}'])
@@ -2143,7 +2182,8 @@ class ReadoutClient:
                     row = []
                     row.append(data_dict['packet_counter'][j])
                     row.append(data_dict['packet_error'][j])
-                    row.extend([data_dict['stream_flags'][f'flag{k}'][j] for k in range(8)])
+                    row.append(int(data_dict['telescope_time'][j]))
+                    row.extend([data_dict['stream_flags'][f'flag{k}'][j] for k in range(num_flags)])
                     for i in range(data_dict['num_tones']):
                         row.extend([data_dict['i_data'][f'{i:04d}'][j]])
                         row.extend([data_dict['q_data'][f'{i:04d}'][j]])
@@ -2202,7 +2242,12 @@ class ReadoutClient:
             data_dict['q_data'] = q_data
             data_dict['packet_counter'] = data['packet_counter']
             data_dict['packet_error'] = data['packet_error']
-            data_dict['stream_flags'] = {f'flag{i}':data[f'flag{i}'] for i in range(8)}
+            if 'telescope_time' in data.dtype.names:
+                data_dict['telescope_time'] = data['telescope_time'].astype(np.uint64)
+            else:
+                data_dict['telescope_time'] = np.zeros(len(data['packet_counter']), dtype=np.uint64)
+            num_flags = sum(1 for name in data.dtype.names if name.startswith('flag'))
+            data_dict['stream_flags'] = {f'flag{i}':data[f'flag{i}'] for i in range(num_flags)}
 
         elif filename.endswith('.hdf5'):
             raise NotImplementedError("hdf5 format not yet implemented.")

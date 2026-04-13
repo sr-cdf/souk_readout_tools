@@ -36,25 +36,29 @@ SOUK Readout Tools is a Python package with tools for operating the MKID (Microw
 ### Architecture
 
 ```
-   Client Machine                      RFSoC
-┌────────────────────┐              ┌──────────────────────────────────────────────┐
-│  Python/IPython    │              │  ARM Processing System (PS)                  │
-│                    │              │                                              │
-│  ReadoutClient 0 ──┼── request────┼─ ReadoutServer 0 ───┐                        │
-│                  ──┼── stream ────┼─                    ├── firmware_lib         │
-│                    │              │                     │      │                 │
-│                    │              │                     │   souk_mkid_readout    │
-│  ReadoutClient 1 ──┼── request────┼─ ReadoutServer 1 ───┘  (firmware interface)  │
-│                  ──┼── stream ────┼─                           │                 │
-│                    │              │                            │                 │
-└────────────────────┘              ├────────────────────────────┼─────────────────┤
-                                    │  FPGA Programmable Logic (PL)                │
-                                    │                            │                 │
-                                    │                    ┌───────┴────────┐        │
-                                    │                    │  Pipeline 0    │        │
-                                    │                    │  Pipeline 1    │        │
-                                    │                    └────────────────┘        │
-                                    └──────────────────────────────────────────────┘
+ Client Machine (OCS)               RFSoC Board                                            
+┌─────────────────────┐            ┌──────────────────────────────────────────────────────┐
+│  Python/IPython     │            │  ARM Processing System (PS)                          │
+│                     │            │                                                      │
+│                     │            │   ┌── Ubuntu 24.04 (CASPER image) ───────────────┐   │
+│                     │            │   │                                              │   │
+│    ReadoutClient A ─┼─── TCP ────┼───┼──  ReadoutServer 0 ────┐                     │   │
+│                     │            │   │                        ├── souk_mkid_readout │   │
+│    ReadoutClient B ─┼─── TCP ────┼───┼──  ReadoutServer 1 ────┘          │          │   │
+│                     │            │   └───────────────────────────────────┼──────────┘   │
+│    ReadoutClient C ─┼─           ├───────────────────────────────────────┼──────────────┤
+│                     │            │  FPGA Programmable Logic (PL)         │              │
+│    ...              │            │                                       │              │
+│                     │            │   ┌── SOUK Firmware ──────────────────┴──────────┐   │
+│    ReadoutClient N ─┼─           │   │                                              │   │
+│                     │            │   │                   Pipeline 0     Pipeline 1  │   │
+│                     │            │   └───────────────────────┼──────────────┼───────┘   │
+│                     │            ├───────────────────────────┼──────────────┼───────────┤
+│                     │            │  RF Data Converter        │              │           │
+│                     │            │  (RFDC)                ┌──┴──┐        ┌──┴──┐        │
+│                     │            │                      DAC0   ADC0    DAC1   ADC1      │
+└─────────────────────┘            └────────────────────────┼─────┼────────┼─────┼────────┘
+                                                           TX0   RX0      TX1   RX1         
 ```
 
 Up to two independent readout pipelines can run on a single RFSoC board, each with its own server instance and client connection. Each pipeline uses separate TCP request and stream ports. The readout server runs on the ARM Processing System (PS) and communicates with the FPGA Programmable Logic (PL) through the `souk_mkid_readout` firmware interface library.
@@ -405,6 +409,9 @@ data = client.parse_samples(raw, num_tones)
 # Verify no dropped packets
 print(np.all(np.diff(data['packet_counter']) == 1))
 
+# Each sample includes a PTP telescope timestamp (64-bit integer)
+print(data['telescope_time'])
+
 # Plot magnitude of the first tone
 t = np.arange(len(data['packet_counter'])) / sample_rate
 z0 = data['i_data']['0000'] + 1j * data['q_data']['0000']
@@ -431,6 +438,14 @@ The accumulator output sample rate can be adjusted:
 ```python
 client.get_sample_rate()   # e.g. 500.0 Hz
 client.set_sample_rate(1000)
+```
+
+### Telescope Time (PTP Timestamp)
+
+The firmware reads PTP network time and attaches it to each accumulation. This 64-bit timestamp is included in every sample frame, sweep point, and stream packet. To read it on demand:
+
+```python
+tt = client.get_telescope_time()
 ```
 
 ---
@@ -487,7 +502,7 @@ client.send_fake_trigger()
 client.disable_triggered_stream()
 ```
 
-The packet counter increments every sample regardless of trigger, so trigger times can be inferred from counter gaps.
+The packet counter increments every sample regardless of trigger, so trigger times can be inferred from counter gaps. Each streamed frame also includes the PTP telescope timestamp (`telescope_time`).
 
 ---
 
@@ -525,7 +540,7 @@ plt.legend()
 plt.show()
 ```
 
-At the end of the sweep, tones are returned to the center frequencies.
+At the end of the sweep, tones are returned to the center frequencies. The parsed sweep data includes a `telescope_time` array with the PTP timestamp of the first sample at each sweep point.
 
 ---
 
@@ -1009,6 +1024,15 @@ Server-side commands (installed on the RFSoC):
 ## Changelog & Feature List
 
 ### v1.1.0 (Current)
+
+**Telescope Time (PTP Timestamps)**
+- PTP timestamps from the firmware are now included in every sample frame, stream packet, and sweep point.
+- `get_telescope_time()` client method for on-demand timestamp reads.
+- `read_tt_fast()` in `firmware_lib` reads the accumulator's `acc_tt_msb`/`acc_tt_lsb` registers via the fast local memory transport.
+- Frame slots previously used for unused flags 6 and 7 now carry the 64-bit timestamp (split as `tt_msb` / `tt_lsb`).
+- Parsed data dictionaries (`parse_samples`, `parse_stream`, `parse_sweep_data`) include a `telescope_time` field.
+- Sweep results include per-point telescope time (timestamp of the first sample at each sweep point).
+- CSV, JSON, and NPY exports include telescope time data.
 
 **RF Peripheral Controller**
 - `RFPeripheralController` with two backends: mixerless (I2C) and rudat (USB attenuators).

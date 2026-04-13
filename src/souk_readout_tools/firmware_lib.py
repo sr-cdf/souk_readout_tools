@@ -5068,13 +5068,34 @@ def get_fast_read_params(r_fast):
     for i in range(1,acc._n_parallel_chans):
         assert addrs[i] == addrs[i-1] + nbytes
     nbranch = len(addrs)
+    tt_msb_addr = acc.host.transport._get_device_address(f'{acc.prefix}acc_tt_msb')
+    tt_lsb_addr = acc.host.transport._get_device_address(f'{acc.prefix}acc_tt_lsb')
     params = {'acc':acc,
               'addrs':addrs,
               'nbytes':nbytes,
               'nbranch':nbranch,
-              'base_addr':addrs[0]}
+              'base_addr':addrs[0],
+              'tt_msb_addr':tt_msb_addr,
+              'tt_lsb_addr':tt_lsb_addr}
 
     return params
+
+
+def read_tt_fast(fast_read_params):
+    """
+    Read the PTP telescope time from the accumulator using the fast local memory transport.
+
+    :param fast_read_params: Parameters from get_fast_read_params()
+    :return: 64-bit telescope time as a Python int
+    """
+    acc = fast_read_params['acc']
+    mm = acc.host.transport.axil_mm
+    tt_msb_addr = fast_read_params['tt_msb_addr']
+    tt_lsb_addr = fast_read_params['tt_lsb_addr']
+    (msb,) = struct.unpack('<I', mm[tt_msb_addr:tt_msb_addr+4])
+    (lsb,) = struct.unpack('<I', mm[tt_lsb_addr:tt_lsb_addr+4])
+    return (msb << 32) + lsb
+
 
 def get_accumulator_snapshot(r, config_dict, tone_index):
     """
@@ -5132,7 +5153,8 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
     :param tone_indices: Array of output channel indices to read. With VACC, these may be
                         non-contiguous (e.g., [0, 6, 12] instead of [0, 1, 2]).
                         If None and num_tones is given, assumes contiguous indices [0..num_tones-1].
-    :return: (acc_cnt, data, error_flag) where data is complex values at specified tone indices
+    :return: (acc_cnt, data, error_flag, telescope_time) where data is complex values at specified tone indices
+             and telescope_time is the 64-bit PTP timestamp.
     """
     acc=fast_read_params['acc']
     addrs=fast_read_params['addrs']
@@ -5153,6 +5175,7 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
         for i in range(nbranch):
             raw = acc.host.transport.axil_mm[addrs[i]:addrs[i] + nbytes]
             dout[i::nbranch] = np.frombuffer(raw, dtype='<i4')
+    tt = read_tt_fast(fast_read_params)
     stop_acc_cnt = acc.get_acc_cnt()
     if start_acc_cnt != stop_acc_cnt:
         acc.logger.warning('Accumulation counter changed while reading data!')
@@ -5168,12 +5191,12 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
         result = np.empty(2 * len(tone_indices), dtype=dout.dtype)
         result[0::2] = dout[real_indices]
         result[1::2] = dout[imag_indices]
-        return start_acc_cnt, result, err
+        return start_acc_cnt, result, err, tt
     elif num_tones is None:
-        return start_acc_cnt, dout, err
+        return start_acc_cnt, dout, err, tt
     else:
         # Legacy behavior: assume contiguous indices
-        return start_acc_cnt, dout[:2*num_tones], err
+        return start_acc_cnt, dout[:2*num_tones], err, tt
 
 
 def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_point, direction):
@@ -5226,7 +5249,7 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
         tone_indices_p = tone_indices_arr[p] if tone_indices_arr is not None else np.arange(num_tones)
 
         for s in range(samples_per_point):
-            cnt,data,err = read_accumulated_data_fast(fast_read_params,
+            cnt,data,err,_tt = read_accumulated_data_fast(fast_read_params,
                                                       tone_indices=tone_indices_p)
             acc_counts[p,s] = cnt
             sweep_data[:,p,s] = data[::2]+1j*data[1::2]

@@ -994,6 +994,10 @@ class ReadoutServer:
                         ref_plane = message.get('reference_plane', 'detector')
                         value = firmware_lib.get_tone_powers(self.r,self.config,detailed_output=True,reference_plane=ref_plane)[1]
                         response = {'status': 'success', 'value': value}
+                    elif param_name == 'telescope_time':
+                        fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
+                        value = firmware_lib.read_tt_fast(fast_read_params)
+                        response = {'status': 'success', 'value': value}
                     elif param_name == 'cal_freeze':
                         value = firmware_lib.get_cal_freeze(self.r,self.config)
                         if value:
@@ -1001,7 +1005,7 @@ class ReadoutServer:
                         else:
                             self.stream_flags[FLAG_CAL_FREEZE].clear()
                         response = {'status': 'success', 'value': value}
-                    
+
                     await self.send_response(writer, response)
 
                 elif request == 'set':
@@ -1287,10 +1291,12 @@ class ReadoutServer:
                         sweep_f = self.latest_sweep_results['sweep_frequencies'].astype('f8')
                         sweep_z = self.latest_sweep_results['sweep_responses'].astype('complex128')
                         sweep_e = self.latest_sweep_results['sweep_sems'].astype('complex128')
+                        sweep_tt = self.latest_sweep_results['telescope_time'].astype('u8')
                         sweep = {}
                         sweep['f'] = base64.b64encode(sweep_f.tobytes()).decode()
                         sweep['z'] = base64.b64encode(sweep_z.tobytes()).decode()
                         sweep['e'] = base64.b64encode(sweep_e.tobytes()).decode()
+                        sweep['tt'] = base64.b64encode(sweep_tt.tobytes()).decode()
 
                         # for i in range(len(sweep_f[0])):
                         #     tone={}
@@ -1482,15 +1488,18 @@ class ReadoutServer:
         """
         num_headers = 10
 
-        cnt,data,err = firmware_lib.read_accumulated_data_fast(
+        cnt,data,err,tt = firmware_lib.read_accumulated_data_fast(
             fast_read_params, tone_indices=self.active_tone_indices)
+
+        tt_msb = (tt >> 32) & 0xFFFFFFFF
+        tt_lsb = tt & 0xFFFFFFFF
 
         frame = np.zeros(len(data)+num_headers,dtype='<i4')
         frame[:len(data)] = data
         frame[-1] = err
         frame[-2] = cnt
-        frame[-3] = int(self.stream_flags[7].is_set())
-        frame[-4] = int(self.stream_flags[6].is_set())
+        frame[-3] = tt_lsb
+        frame[-4] = tt_msb
         frame[-5] = int(self.stream_flags[5].is_set())
         frame[-6] = int(self.stream_flags[FLAG_CAL_FREEZE].is_set())
         frame[-7] = int(self.stream_flags[FLAG_SET_PHASES].is_set())
@@ -1719,6 +1728,7 @@ class ReadoutServer:
             acc_counts = np.zeros((samples_per_point,num_points),dtype=int)
             sweep_data = np.zeros((samples_per_point,num_points,num_tones),dtype=complex)
             acc_errs = np.zeros((samples_per_point,num_points),dtype=bool)
+            sweep_tt = np.zeros(num_points,dtype=np.uint64)
 
             for p in range(num_points):
                 # print('sweeping: setting tone frequencies',sweepfreqs[p])
@@ -1760,12 +1770,14 @@ class ReadoutServer:
                 # Get tone_indices for this sweep point - may change as tones cross FFT bins
                 tone_indices_p = tone_indices_arr[p] if tone_indices_arr is not None else np.arange(num_tones)
                 for s in range(samples_per_point):
-                    cnt,data,err = firmware_lib.read_accumulated_data_fast(
+                    cnt,data,err,tt = firmware_lib.read_accumulated_data_fast(
                                                             fast_read_params,
                                                             tone_indices=tone_indices_p)
                     acc_counts[s,p] = cnt
                     sweep_data[s,p] = data[::2]+1j*data[1::2]
                     acc_errs[s,p] = err
+                    if s == 0:
+                        sweep_tt[p] = tt
                 # time.sleep(0.001)
 
                 self.sweep_progress = float(p/(num_points-1))
@@ -1786,7 +1798,8 @@ class ReadoutServer:
                 'samples_per_point': samples_per_point,
                 'samples_per_second': firmware_lib.get_sample_rate(self.r_fast),
                 'accumulation_counts': acc_counts,
-                'accumulation_errors': acc_errs
+                'accumulation_errors': acc_errs,
+                'telescope_time': sweep_tt
                 }
             self.latest_sweep_data = {
                 'sweep_data': sweep_data
@@ -1808,7 +1821,8 @@ class ReadoutServer:
                 'samples_per_point': samples_per_point,
                 'samples_per_second': firmware_lib.get_sample_rate(self.r_fast),
                 'accumulation_counts': acc_counts,
-                'accumulation_errors': acc_errs
+                'accumulation_errors': acc_errs,
+                'telescope_time': sweep_tt
                 }
 
             pass

@@ -46,7 +46,7 @@ Each `ReadoutServer` uses two TCP ports - a **request port** for JSON command/re
 ### Capabilities
 
 - **Tone control** - set frequencies, amplitudes, and phases for up to 2048 readout tones per pipeline with full TX/RX power calibration through the entire signal chain (DSP → DAC → RF frontend → cryostat → detector). Tone updates happen on millisecond timescales, enabling fast resonator tracking.
-- **Data acquisition** - discrete samples, continuous streaming, triggered streaming, and single tone snapshots (1024 sample bursts at the pre-accumulator rate)
+- **Data acquisition** - discrete samples, continuous streaming, triggered streaming, and single tone snapshots (1024 sample bursts at the pre-accumulator rate). All data includes PTP telescope timestamps from the firmware for precise time synchronisation.
 - **Frequency sweeping** - wideband survey sweeps across the full RF band and targeted sweeps around individual resonances
 - **Resonance finding** - automated peak detection across multiple data formats (magnitude, phase, group delay, |dS21/df|, etc), plus an interactive PyQt5 GUI
 - **Retuning** - sweep-and-retune workflows to track drifting resonances using max-derivative or min-magnitude methods
