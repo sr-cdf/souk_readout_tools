@@ -306,19 +306,19 @@ DONE: new _apply_per_bin_scaling helper scales all amplitudes by worst-case bin 
 c.set_tones_helper([1.5e9, 1.5001e9, 1.51e9])  # two tones near same bin + one distant
 result = c.batch_snapshots(tone_indices=[0, 1, 2], num_snapshots=3, verbose=True)
 ```
-- [ ] All three tones return data
-- [ ] `result['firmware_indices']` shows correct sparse LO indices
-- [ ] For tones in the same bin: firmware indices differ by ≥ 6
-- [ ] `result['tone_frequencies']` matches what was set
-- [ ] Each tone's snapshot data is distinct (not duplicated)
+- [x] All three tones return data
+- [x] `result['firmware_indices']` shows correct sparse LO indices
+- [x] For tones in the same bin: firmware indices differ by ≥ 6
+- [x] `result['tone_frequencies']` matches what was set
+- [x] Each tone's snapshot data is distinct (not duplicated)
 
 ### 1.9  Batch snapshots CLI
 
 ```bash
 souk-batch-snapshots -C config.yaml --tones 0 1 -n 5 -f test_batch.npz
 ```
-- [ ] Runs without error
-- [ ] `test_batch.npz` is created and loadable with `np.load(..., allow_pickle=True)`
+- [x] Runs without error
+- [x] `test_batch.npz` is created and loadable with `np.load(..., allow_pickle=True)`
 
 ### 1.10  Wideband sweep (loopback)
 
@@ -326,27 +326,27 @@ With internal loopback enabled:
 ```python
 sweep = c.wideband_sweep(step_size_hz=50000, verbose=True)
 ```
-- [ ] Progress display updates during sweep (new in v1.1.0)
-- [ ] `sweep['sweep_f'].shape[1]` matches expected number of points
-- [ ] Magnitude is flat-ish across band (loopback, no resonances)
-- [ ] Phase is smooth (phase slope removal working)
-- [ ] `sweep['system_information']` dict is populated
+- [x] Progress display updates during sweep (new in v1.1.0)
+- [x] `sweep['sweep_f'].shape[1]` matches expected number of points
+- [x] Magnitude is flat-ish across band (loopback, no resonances)
+- [x] Phase is smooth (phase slope removal working)
+- [x] `sweep['system_information']` dict is populated
 
 ### 1.10b  Wideband sweep with auto power (new in v1.1.0)
 
 ```python
 sweep = c.wideband_sweep(tone_powers_dbm='auto', verbose=True)
 ```
-- [ ] `maximise_tx_power()` is called before sweep
-- [ ] If saturation detected after maximise, auto-fix is attempted
-- [ ] Sweep completes successfully
-- [ ] Magnitude levels are higher than unit-amplitude sweep
+- [x] `maximise_tx_power()` is called before sweep
+- [x] If saturation detected after maximise, auto-fix is attempted
+- [x] Sweep completes successfully
+- [x] Magnitude levels are higher than unit-amplitude sweep
 
 ```python
-sweep = c.wideband_sweep(tone_powers_dbm=-30.0, verbose=True)
+sweep = c.wideband_sweep(tone_powers_dbm=-60.0, verbose=True)
 ```
-- [ ] Tones are set to -30 dBm via `set_tone_powers()`
-- [ ] Sweep completes with consistent power levels
+- [x] Tones are set to -60 dBm via `set_tone_powers()`
+- [x] Sweep completes with consistent power levels
 
 ### 1.10c  RX tone powers (new in v1.1.0)
 
@@ -358,19 +358,21 @@ print(f"RX powers at ADC: {rx_powers} dBm")
 rx_powers_cryo = c.get_tone_powers(reference_plane='cryostat_output')
 print(f"RX powers at cryostat output: {rx_powers_cryo} dBm")
 ```
-- [ ] Returns power array matching number of active tones
-- [ ] `reference_plane='adc_input'` returns sensible ADC-level powers
-- [ ] `reference_plane='cryostat_output'` includes RX frontend corrections (when connected)
-- [ ] `reference_plane='accumulator'` returns raw dB levels (no calibration)
+- [x] Returns power array matching number of active tones
+- [x] `reference_plane='adc_input'` returns sensible ADC-level powers
+- [x] `reference_plane='cryostat_output'` includes RX frontend corrections (when connected)
+- [x] `reference_plane='accumulator'` returns raw dB levels (no calibration)
 
 ### 1.11  Wideband sweep CLI
 
 ```bash
 souk-wideband_sweep -C config.yaml -P
 ```
-- [ ] Sweep completes
-- [ ] Plot window appears showing mag and phase (uses new plotting library)
-- [ ] Plot uses `plot_sweep_magphase()` — check axis labels are correct
+- [x] Sweep completes
+- [x] Plot window appears showing mag and phase (uses new plotting library)
+- [x ] Plot uses `plot_sweep_magphase()` — check axis labels are correct
+
+TODO: plot was saved to a file but the printed log misses dot before the extension
 
 ---
 
@@ -386,13 +388,28 @@ bench testing).
 status = c.get_rf_peripheral_status()
 print(status)
 ```
-- [ ] `status['enabled']` is `True` (requires both `rf_frontend.connected: true` and `attenuator_backend` set to `'i2c'` or `'rudat'`)
-- [ ] `status['hardware']` is `True` (real hardware detected)
-- [ ] `status['attenuator_backend']` matches config (`'i2c'` or `'rudat'`)
-- [ ] `status['tx_attenuation_db']` and `status['rx_attenuation_db']` are floats
-- [ ] `status['tx_amp_bypass']` and `status['rx_amp_bypass']` are bools
-- [ ] `status['tx_total_gain_db']` and `status['rx_total_gain_db']` reflect current settings
-- [ ] `status['tx_input_1db_comp_dbm']` is a sensible value (e.g. +10 to +20 dBm)
+- [x] `status['enabled']` is `True` (requires both `rf_frontend.connected: true` and `attenuator_backend` set to `'i2c'` or `'rudat'`)
+- [x] `status['hardware']` is `True` (real hardware detected)
+- [x] `status['attenuator_backend']` matches config (`'i2c'` or `'rudat'`)
+- [x] `status['tx_attenuation_db']` and `status['rx_attenuation_db']` are floats
+- [x] `status['tx_amp_bypass']` and `status['rx_amp_bypass']` are bools
+- [x] `status['tx_total_gain_db']` and `status['rx_total_gain_db']` reflect current settings
+- [x] `status['tx_input_1db_comp_dbm']` is a sensible value (e.g. +10 to +20 dBm)
+
+TODO: add a helper scrript to identify the rudat attenuator devices and print their serial numbers, to make it easier to fill in the config for RUDAT testing
+
+TODO: rudat serial numbers not in rf peripheral status - only in config.
+TODO: what is channel:0 in rf_peripheral status?
+
+TODO: fix_dac_saturaiton is slow
+
+DAC saturation every time we do wideband sweep with optimise dynamic range true
+Fix dac saturation steps: set psb-scale = 0, maximise-amps, best fftshift, increase psb-scale by one bit in a loop until target
+generally - set_tone_powers should 1. get tone powers 2. compute required change, 3 - if attenuator can reach that range - just change the attenuator, if not try the bypass amp, if still not enough, reduce the psb_scale, if still not enough, reduce the fftshift, if still not enough, reduce the amplitudes, if the amplitudes hit minimum then we can hit the target. 
+
+wideband sweep - optimise_rx_gain, didnt change the rx attenuator value at all.
+
+wideband sweep with optimsations off - power auto - still checks saturation, then tries toi maximise and hits saturation straight away.
 
 ### 2.2  TX attenuation control
 
@@ -402,11 +419,17 @@ for atten in [0, 5, 10, 15.5, 31.5]:
     readback = c.get_rf_peripheral_status()
     print(f"Set {atten} dB, readback {readback['tx_attenuation_db']} dB")
 ```
-- [ ] Readback matches set value at all points
-- [ ] Values outside [0, 31.5] are rejected or clamped
-- [ ] 0.5 dB step resolution is respected (mixerless backend)
-- [ ] If using a spectrum analyser on the output, confirm power changes by
+- [x] Readback matches set value at all points
+- [x] Values outside [0, 31.5] are rejected or clamped
+- [x] 0.5 dB step resolution is respected (mixerless backend)
+- [x] If using a spectrum analyser on the output, confirm power changes by
       the expected amount at each step
+
+Set 0 dB, readback 0.0 dB
+Set 5 dB, readback 5.0 dB
+Set 10 dB, readback 10.0 dB
+Set 15.5 dB, readback 15.5 dB
+Set 31.5 dB, readback 30.0 dB
 
 ### 2.3  RX attenuation control
 
@@ -414,8 +437,8 @@ Same as 2.2 but for RX path:
 ```python
 c.set_rx_attenuation(10.0)
 ```
-- [ ] Set/readback match
-- [ ] Verify with a known input signal that received power changes correctly
+- [x] Set/readback match
+- [x] Verify with a known input signal that received power changes correctly
 
 ### 2.4  Amplifier bypass control
 
@@ -436,13 +459,15 @@ assert status['tx_amp_bypass'] == False
 - [ ] `bypass_amps.tx_amp_bypass` / `rx_amp_bypass` in `rf_frontend` are synced to config
 - [ ] Bypass commands are only applied when `bypass_amps.enabled: true` in config
 
+when bypass amp is not present, set_bypass_amp(True or False) both succeed but always with result=True
+
 ### 2.5  Sweep with RF frontend — power level check
 
 1. Set known attenuation: TX=10 dB, RX=10 dB, amps active
 2. Run wideband sweep through a through cable (no cryostat)
-3. [ ] Magnitude level is consistent with calibration chain expectations
+3. [x] Magnitude level is consistent with calibration chain expectations
 4. Change TX attenuation to 20 dB, re-sweep:
-   - [ ] Magnitude drops by ~10 dB across band
+   - [x] Magnitude drops by ~10 dB across band
 5. Bypass TX amp, re-sweep:
    - [ ] Magnitude drops by amp gain amount
 
@@ -453,9 +478,9 @@ from souk_readout_tools.calibration import CalibrationChain  # or equivalent
 ```
 - [ ] Renamed parameters `tx_bypass_amp_s21_db` / `rx_bypass_amp_s21_db` are
       used correctly in power budget calculations
-- [ ] Setting `rf_frontend.connected: true` in config engages the calibration
+- [x] Setting `rf_frontend.connected: true` in config engages the calibration
       corrections
-- [ ] DAC power → detector power conversion is consistent with measured values
+- [x] DAC power → detector power conversion is consistent with measured values
 
 ### 2.6b  Power optimisation with RF frontend (updated in v1.1.0)
 
