@@ -44,7 +44,8 @@ def _extract_traces(sweep_data, tones=None):
 
 def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                show_errors=True, multi_tone='overlay', fig=None, label=None,
-               units='raw', config=None, **kwargs):
+               units='raw', config=None, reference_plane='adc_input',
+               **kwargs):
     """
     General-purpose sweep plot.
 
@@ -63,10 +64,16 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             'peak' – normalise to the peak magnitude of the data.
             'adc_fs' – fraction of ADC full-scale.
             'dbfs' – dB relative to ADC full-scale.
-            'dbm' – estimated ADC input power in dBm.
+            'dbm' – estimated power in dBm at ``reference_plane``.
             All options except 'raw' and 'peak' require
             'system_information' in sweep_data.
         config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
+        reference_plane: Reference plane used when ``units='dbm'``.  One of
+            'adc_input' (default) or 'cryostat_output'.  The latter deembeds
+            the RX analog chain using the frequency-dependent calibration
+            entries in ``config['rf_frontend']`` and ``config['cryostat']``;
+            falls back to 'adc_input' with a warning if that cal is not
+            available.  Ignored when ``units != 'dbm'``.
         **kwargs: Passed to matplotlib plot/errorbar calls.
 
     Returns:
@@ -83,7 +90,8 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         normalised = []
         for f, si, sq, ei, eq, tidx in traces:
             si, sq, ei, eq, iq_label, mag_label = _normalise_iq(
-                si, sq, units, info, config=config, ei=ei, eq=eq)
+                si, sq, units, info, config=config, ei=ei, eq=eq,
+                reference_plane=reference_plane, frequencies=f)
             normalised.append((f, si, sq, ei, eq, tidx))
         traces = normalised
     else:
@@ -134,6 +142,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                 _plot_single_trace(axes[i, 0], axes[i, 1], f, si, sq, ei, eq,
                                    format, deembed, has_errors, trace_label,
                                    units=units, info=info, config=config,
+                                   reference_plane=reference_plane,
                                    iq_label=iq_label, mag_label=mag_label,
                                    **kwargs)
                 axes[i, 0].legend(fontsize='small')
@@ -177,6 +186,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
                            format, deembed, has_errors, trace_label,
                            units=units, info=info, config=config,
+                           reference_plane=reference_plane,
                            iq_label=iq_label, mag_label=mag_label,
                            **kwargs)
 
@@ -195,6 +205,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
 def _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
                         format, deembed, has_errors, label,
                         units='raw', info=None, config=None,
+                        reference_plane='adc_input',
                         iq_label='', mag_label='|S21| (dB)', **kwargs):
     """Plot a single trace on a pair of axes."""
     z = si + 1j * sq
@@ -205,7 +216,9 @@ def _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
     f_mhz = f / 1e6
 
     if format == 'magphase':
-        mag_db, phase = _compute_mag_phase_units(z, units, info=info, config=config)
+        mag_db, phase = _compute_mag_phase_units(
+            z, units, info=info, config=config,
+            reference_plane=reference_plane, frequencies=f)
         if has_errors and np.any(ei != 0):
             e_mag, e_phase = _propagate_errors_mag(si, sq, ei, eq)
             line, = ax1.plot(f_mhz, mag_db, linewidth=0.8, label=label, **kwargs)

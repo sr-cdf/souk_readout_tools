@@ -2,11 +2,161 @@
 Shared utilities for the plotting subpackage.
 """
 
+import os
+import warnings
+
 import numpy as np
 
 
 # Supported units for normalisation
 UNITS = ('raw', 'peak', 'adc_fs', 'dbfs', 'dbm')
+
+# Reference planes the plot-time calibration can report at when units='dbm'.
+#   'adc_input'       — power at the ADC input (requires firmware.adc_dbm_to_dbfs)
+#   'cryostat_output' — power at the cryostat output, i.e. at the RX port of
+#                       the cryostat, deembedding the RX analog chain
+#                       (requires rf_frontend + cryostat calibration entries)
+VALID_REFERENCE_PLANES = ('adc_input', 'cryostat_output')
+_REFERENCE_PLANE_LABELS = {
+    'adc_input': 'ADC input',
+    'cryostat_output': 'cryostat output',
+}
+
+# Directory that frequency-dependent cal files (referenced by filename in the
+# config) live in.  Must match firmware_lib.USER_DIR.
+_CAL_USER_DIR = os.path.expanduser('~/.souk_readout_tools/')
+
+
+def _resolve_cal_value(value, frequencies=None):
+    """Resolve a calibration entry to a scalar or per-frequency array.
+
+    Mirrors firmware_lib._resolve_cal_value but lives here so the plotting
+    subpackage doesn't have to import firmware_lib (which pulls in the
+    souk_mkid_readout runtime dependency).
+
+    Supported forms:
+      - None          → None
+      - scalar        → float (no frequencies needed)
+      - [[f, dB], …]  → per-sample nearest-neighbour, shape matches frequencies
+      - str           → CSV filename under ~/.souk_readout_tools/, same
+                        nearest-neighbour interpolation
+
+    Returns None when the value is array-like / file-backed but no
+    frequency axis has been provided — callers should treat that as
+    "calibration unavailable at plot time".
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    if frequencies is None:
+        return None
+    frequencies = np.asarray(frequencies, dtype=float)
+    if isinstance(value, str):
+        cal_f, cal_db = np.loadtxt(os.path.join(_CAL_USER_DIR, value), ndmin=2).T
+    else:
+        cal_f, cal_db = np.array(value, ndmin=2).T
+    flat = frequencies.ravel()
+    resolved = np.array([cal_db[np.argmin(np.abs(cal_f - f))] for f in flat])
+    return resolved.reshape(frequencies.shape)
+
+
+def _cal_or_zero(value, frequencies=None):
+    """_resolve_cal_value but maps None → 0.0 (scalar)."""
+    resolved = _resolve_cal_value(value, frequencies)
+    return 0.0 if resolved is None else resolved
+
+
+def _resolve_adc_dbm_to_dbfs(config, frequencies=None):
+    """Return the ADC dBFS→dBm offset, or None if unavailable.
+
+    Reads ``config['firmware']['adc_dbm_to_dbfs']``.  When the entry is a
+    scalar the result is a single float; when it's frequency-dependent
+    (array / CSV filename) and ``frequencies`` is provided, the result is
+    a per-sample array.  Returns None when the entry is missing, None, or
+    frequency-dependent without a frequency axis to interpolate onto.
+    """
+    if config is None:
+        return None
+    val = config.get('firmware', {}).get('adc_dbm_to_dbfs')
+    return _resolve_cal_value(val, frequencies)
+
+
+def _rx_chain_gain_db(frequencies, info, config):
+    """Per-sample RX analog chain gain from cryostat output to ADC input (dB).
+
+    Subtracting this from a power at the ADC input gives the equivalent
+    power at the cryostat output.  Sign conventions match
+    ``calibration.calc_adc_input_power``: S21 values add to the forward
+    gain, explicit loss/attenuator values subtract via their absolute
+    magnitude.  The ADC DSA value is read from
+    ``info['dsa']`` (captured at sweep/timestream time).
+
+    Frequency-dependent cal entries (CSV filename / [[f, dB], …]) are
+    resolved at each entry of ``frequencies``; scalar entries broadcast.
+
+    Returns 0.0 when neither rf_frontend nor cryostat is marked
+    ``connected: true``; returns None when the config is missing.
+    """
+    if config is None:
+        return None
+    rf = config.get('rf_frontend', {}) or {}
+    cryo = config.get('cryostat', {}) or {}
+    rf_connected = bool(rf.get('connected', False))
+    cryo_connected = bool(cryo.get('connected', False))
+    if not (rf_connected or cryo_connected):
+        return 0.0
+
+    rx_rf_s21 = 0.0
+    rx_if_s21 = 0.0
+    rx_bypass_amp_s21 = 0.0
+    rx_mixer_conv = 0.0
+    rx_combiner = 0.0
+    rx_atten = 0.0
+    cryo_output_s21 = 0.0
+
+    if rf_connected:
+        rx_rf_s21 = _cal_or_zero(rf.get('rx_rf_s21_db'), frequencies)
+        rx_if_s21 = _cal_or_zero(rf.get('rx_if_s21_db'), frequencies)
+        rx_bypass_amp_s21 = _cal_or_zero(rf.get('rx_bypass_amp_s21_db'), frequencies)
+        rx_mixer_conv = _cal_or_zero(rf.get('rx_mixer_conversion_loss_db'), frequencies)
+        rx_combiner = _cal_or_zero(rf.get('rx_combiner_loss_db'), frequencies)
+        rx_atten_raw = rf.get('rx_attenuator_value_db')
+        rx_atten = 0.0 if rx_atten_raw is None else float(rx_atten_raw)
+    if cryo_connected:
+        cryo_output_s21 = _cal_or_zero(cryo.get('output_s21_db'), frequencies)
+
+    adc_dsa_raw = (info or {}).get('dsa', 0)
+    adc_dsa_db = 0.0 if adc_dsa_raw is None else float(adc_dsa_raw)
+
+    return (
+        cryo_output_s21
+        + rx_bypass_amp_s21
+        + rx_rf_s21
+        - np.abs(rx_mixer_conv)
+        + rx_if_s21
+        - np.abs(rx_atten)
+        - np.abs(rx_combiner)
+        - np.abs(adc_dsa_db)
+    )
+
+
+def _reference_plane_offset_db(reference_plane, frequencies, info, config):
+    """dB offset to *add* to an ADC-input power to get power at the plane.
+
+    Returns None when the cal is unavailable (caller should warn and fall
+    back).  Returns 0.0 for ``'adc_input'`` (the identity).
+    """
+    if reference_plane == 'adc_input':
+        return 0.0
+    if reference_plane == 'cryostat_output':
+        gain = _rx_chain_gain_db(frequencies, info, config)
+        if gain is None:
+            return None
+        return -gain
+    raise ValueError(
+        f"reference_plane must be one of {VALID_REFERENCE_PLANES}, "
+        f"got {reference_plane!r}")
 
 
 def _get_pyplot():
@@ -114,7 +264,8 @@ def _digital_gain(info, config=None, pre_accumulation=False):
 
 
 def _normalise_iq(si, sq, units, info=None, config=None,
-                  pre_accumulation=False, ei=None, eq=None):
+                  pre_accumulation=False, ei=None, eq=None,
+                  reference_plane='adc_input', frequencies=None):
     """Normalise I/Q (and optionally error) arrays to the requested units.
 
     Args:
@@ -124,18 +275,34 @@ def _normalise_iq(si, sq, units, info=None, config=None,
             'peak'   – normalise to the peak magnitude of the data.
             'adc_fs' – fraction of ADC full-scale.
             'dbfs'   – dB relative to ADC full-scale.
-            'dbm'    – estimated ADC input power in dBm.
+            'dbm'    – estimated power in dBm at ``reference_plane``.
         info: system_information dict.  Required for 'adc_fs', 'dbfs',
             'dbm'; ignored for 'raw' and 'peak'.
         config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
         pre_accumulation: True for snapshot data.
         ei, eq: Optional error arrays (scaled identically for linear units).
+        reference_plane: Only meaningful when ``units='dbm'``.  One of
+            VALID_REFERENCE_PLANES.  ``'adc_input'`` (default) reports
+            power at the ADC input; ``'cryostat_output'`` additionally
+            deembeds the RX analog chain using the rf_frontend / cryostat
+            entries in ``config``.  Labels are updated to reflect the
+            chosen plane; the linear I/Q values themselves always remain
+            in the ADC-input FS scale so I-vs-Q plots keep their native
+            geometry — the plane-dependent offset is applied at the
+            log-magnitude step in ``_compute_mag_phase_units``.
+        frequencies: 1D array of per-sample frequencies (Hz), required
+            only for ``reference_plane='cryostat_output'`` when the RX
+            cal entries are frequency-dependent.
 
     Returns:
         (si, sq, ei, eq, iq_label, mag_label)
         where iq_label is the Y-axis label for I/Q plots and mag_label is
         the Y-axis label for magnitude plots.  ei, eq are None if not supplied.
     """
+    if reference_plane not in VALID_REFERENCE_PLANES:
+        raise ValueError(
+            f"reference_plane must be one of {VALID_REFERENCE_PLANES}, "
+            f"got {reference_plane!r}")
     if units == 'raw':
         return si, sq, ei, eq, '', '|S21| (dB)'
 
@@ -168,6 +335,32 @@ def _normalise_iq(si, sq, units, info=None, config=None,
         fs_eq = adc_eq / half_scale if adc_eq is not None else None
         return fs_i, fs_q, fs_ei, fs_eq, '(ADC FS)', '|S21| (ADC FS)'
 
+    if units == 'dbm':
+        # Check ADC cal availability; without it we can't produce dBm at any
+        # reference plane.
+        if _resolve_adc_dbm_to_dbfs(config, frequencies) is None:
+            warnings.warn(
+                "units='dbm' requested but config['firmware']['adc_dbm_to_dbfs'] "
+                "is not available — cannot compute dBm at the ADC input. "
+                "Falling back to 'dbfs'.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            units = 'dbfs'
+        elif reference_plane == 'cryostat_output':
+            # Need the RX chain cal to deembed; warn and drop back to
+            # adc_input if it's not available.
+            if _reference_plane_offset_db(
+                    reference_plane, frequencies, info, config) is None:
+                warnings.warn(
+                    "reference_plane='cryostat_output' requested but the "
+                    "RX analog chain calibration is not available in the "
+                    "config — falling back to reference_plane='adc_input'.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                reference_plane = 'adc_input'
+
     if units == 'dbfs':
         # Return linear FS values; magnitude will be computed as dBFS
         fs_i = adc_i / half_scale
@@ -178,9 +371,6 @@ def _normalise_iq(si, sq, units, info=None, config=None,
 
     if units == 'dbm':
         # Same linear scaling as dbfs; magnitude label changes
-        adc_dbm_to_dbfs = 12.0  # default
-        if config is not None:
-            adc_dbm_to_dbfs = config.get('firmware', {}).get('adc_dbm_to_dbfs', 12.0)
         mixer_qmc_gain = 1.0
         mixer_scale_is_1p0 = False
         if info.get('mixer_qmc_settings_adc') is not None:
@@ -216,29 +406,45 @@ def _normalise_iq(si, sq, units, info=None, config=None,
             fs_ei = ddc_ei / half_scale
             fs_eq = ddc_eq / half_scale
 
-        # Magnitude in dBFS, then shift to dBm
-        # The actual dBFS->dBm conversion is applied when computing magnitude,
-        # so we pass the linear FS values and adjust the label.
-        return fs_i, fs_q, fs_ei, fs_eq, '(dBm equiv.)', f'(dBm, offset={adc_dbm_to_dbfs:+g})'
+        # Linear I/Q are in ADC-input FS scale; the dBFS→dBm offset and
+        # any reference-plane shift are applied at the log-magnitude step
+        # in _compute_mag_phase_units so the I-vs-Q geometry is preserved.
+        plane_label = _REFERENCE_PLANE_LABELS[reference_plane]
+        iq_label = '(ADC input FS)'
+        mag_label = f'power @ {plane_label} (dBm)'
+        return fs_i, fs_q, fs_ei, fs_eq, iq_label, mag_label
 
     raise ValueError(f"Unknown units '{units}'. Use one of {UNITS}.")
 
 
-def _compute_mag_phase_units(z, units, info=None, config=None):
+def _compute_mag_phase_units(z, units, info=None, config=None,
+                              reference_plane='adc_input', frequencies=None):
     """Compute magnitude and phase with units-aware magnitude labels.
 
     For 'raw' and 'adc_fs', magnitude is 20*log10(|z|).
     For 'dbfs', magnitude is 20*log10(|z|) (z is already in FS units).
-    For 'dbm', magnitude is 20*log10(|z|) + adc_dbm_to_dbfs.
+    For 'dbm', magnitude is 20*log10(|z|) + adc_dbm_to_dbfs + plane_offset,
+    where plane_offset shifts from the ADC input to ``reference_plane``
+    (0 dB for ``'adc_input'``; -rx_chain_gain for ``'cryostat_output'``).
+
+    Must be called with the same (reference_plane, frequencies) that were
+    passed to ``_normalise_iq`` — the offset is applied here, not in the
+    linear normalisation.  If either the ADC cal or (for non-adc_input
+    planes) the RX chain cal is unavailable, the corresponding offset is
+    silently omitted so the result degrades gracefully to dBFS; the
+    warning has already been emitted by ``_normalise_iq``.
     """
     mag_db = 20 * np.log10(np.abs(z))
     phase = np.unwrap(np.angle(z))
 
-    if units == 'dbm' and info is not None:
-        adc_dbm_to_dbfs = 12.0
-        if config is not None:
-            adc_dbm_to_dbfs = config.get('firmware', {}).get('adc_dbm_to_dbfs', 12.0)
-        mag_db = mag_db + adc_dbm_to_dbfs
+    if units == 'dbm':
+        cal_db = _resolve_adc_dbm_to_dbfs(config, frequencies)
+        if cal_db is not None:
+            mag_db = mag_db + cal_db
+            plane_offset = _reference_plane_offset_db(
+                reference_plane, frequencies, info, config)
+            if plane_offset is not None:
+                mag_db = mag_db + plane_offset
 
     return mag_db, phase
 

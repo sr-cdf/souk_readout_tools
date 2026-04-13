@@ -80,7 +80,8 @@ def _compute_freq_diss(ts_data, tone_key, i_arr, q_arr, sweep_data):
 
 def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     deembed=False, sweep_data=None, fig=None, label=None,
-                    units='raw', config=None, **kwargs):
+                    units='raw', config=None, reference_plane='adc_input',
+                    **kwargs):
     """
     Plot timestream data in various formats.
 
@@ -100,10 +101,16 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             'peak' – normalise to the peak magnitude of the data.
             'adc_fs' – fraction of ADC full-scale.
             'dbfs' – dB relative to ADC full-scale.
-            'dbm' – estimated ADC input power in dBm.
+            'dbm' – estimated power in dBm at ``reference_plane``.
             All options except 'raw' and 'peak' require
             'system_information' in ts_data.
         config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
+        reference_plane: Reference plane used when ``units='dbm'``.  One of
+            'adc_input' (default) or 'cryostat_output'.  The latter
+            deembeds the RX analog chain using the calibration entries in
+            ``config['rf_frontend']`` and ``config['cryostat']`` at each
+            tone's frequency; falls back to 'adc_input' with a warning
+            if that cal is not available.
         **kwargs: Passed to matplotlib plot calls.
 
     Returns:
@@ -116,14 +123,32 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
     t_axis = np.arange(n_samples) / sample_rate
     info = ts_data.get('system_information')
 
+    # Look up each selected tone's RF frequency for cal resolution.
+    tone_freqs = None
+    if isinstance(info, dict):
+        tf = info.get('tone_frequencies')
+        if tf is not None:
+            tone_freqs = np.asarray(tf, dtype=float)
+
+    def _tone_frequency(key):
+        if tone_freqs is None:
+            return None
+        try:
+            return float(tone_freqs[int(key)])
+        except (IndexError, ValueError, TypeError):
+            return None
+
     # Normalise
     if units != 'raw':
         if units != 'peak' and (info is None or not isinstance(info, dict)):
             raise ValueError("ts_data must contain 'system_information' for non-raw units.")
         normalised = []
         for key, i_arr, q_arr in selected:
+            tone_f = _tone_frequency(key)
             ni, nq, _, _, iq_label, mag_label = _normalise_iq(
-                i_arr, q_arr, units, info, config=config)
+                i_arr, q_arr, units, info, config=config,
+                reference_plane=reference_plane,
+                frequencies=tone_f)
             normalised.append((key, ni, nq))
         selected = normalised
     else:
