@@ -674,7 +674,6 @@ def get_system_information(r,config_dict):
         else:
             print(bcolors.FAIL+'CRITICAL WARNING - RFDC settings not found, check that the DAC and ADC tiles/blocks are set correctly in the config to match the firmware'+bcolors.ENDC)
             print('Continuing regardless but the system will not work.')
-
     # RTS overvoltage flags
     rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
     info['rts_events'] = rts_details
