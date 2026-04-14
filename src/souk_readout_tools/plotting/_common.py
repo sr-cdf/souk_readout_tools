@@ -259,9 +259,11 @@ def _digital_gain(info, config=None, pre_accumulation=False):
     pfb_fftshift = info.get('pfb_fftshift', 0)
     pfb_gain = 2 ** (13 - bin(pfb_fftshift).count('1'))
 
-    rx_mix_scale = 1.0
+    rx_mix_scale = 0.7
     if config is not None:
         rx_mix_scale = config.get('firmware', {}).get('rx_mix_scale', 1.0)
+    if rx_mix_scale is None:
+        rx_mix_scale = 0.7
 
     if pre_accumulation:
         acc_gain = 1.0

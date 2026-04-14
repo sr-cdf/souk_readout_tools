@@ -371,9 +371,7 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
 
 def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
                                   deembed=False, fig=None, label=None,
-                                  units='raw', config=None,
-                                  reference_plane='adc_input',
-                                  **kwargs):
+                                  units='raw', config=None, **kwargs):
     """
     Overplot timestream I/Q points on the resonance circle from sweep data.
 
@@ -389,10 +387,7 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
             'raw' (default) - accumulator codes, no normalisation.
             'peak' - normalise to the peak magnitude of the data.
             'adc_fs' - fraction of ADC full-scale (linear voltage).
-            'dbfs' - dB relative to ADC full-scale.
-            'dbm' - estimated power in dBm at ``reference_plane``.
-        config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
-        reference_plane: Reference plane used when ``units='dbm'``.
+        config: Config dict (needed for non-default rx_mix_scale).
         **kwargs: Passed to plot calls.
 
     Returns:
@@ -416,6 +411,10 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
         sw_i, sw_q = si[:, tone_index].copy(), sq[:, tone_index].copy()
 
     # Normalise both sweep and timestream with the same units
+    if units in ('dbfs', 'dbm'):
+        raise ValueError(
+            f"units='{units}' is not supported for I vs Q plots — "
+            "use 'raw', 'peak', or 'adc_fs'.")
     info = ts_data.get('system_information') or sweep_data.get('system_information')
     iq_label = ''
     if units != 'raw':
@@ -424,10 +423,10 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
             raise ValueError("data must contain 'system_information' for non-raw units.")
         i_arr, q_arr, _, _, iq_label, _ = _normalise_iq(
             i_arr, q_arr, units, info, config=config,
-            reference_plane=reference_plane, frequencies=tone_f)
+            frequencies=tone_f)
         sw_i, sw_q, _, _, _, _ = _normalise_iq(
             sw_i, sw_q, units, info, config=config,
-            reference_plane=reference_plane, frequencies=sweep_f)
+            frequencies=sweep_f)
 
     z_ts = i_arr + 1j * q_arr
     z_sweep = sw_i + 1j * sw_q
@@ -437,26 +436,46 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
         z_sweep, deembed_params = _apply_deembedding(sweep_f, z_sweep, True)
         z_ts = _apply_deembedding(None, z_ts, deembed_params)[0]
 
-    if fig is None:
-        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+    # Compute phase for the frequency-domain panel
+    _, phase_sweep = _compute_mag_phase(z_sweep)
+    _, phase_ts = _compute_mag_phase(z_ts)
+    ts_info = ts_data.get('system_information') or {}
+    ts_tone_freqs = ts_info.get('tone_frequencies')
+    if ts_tone_freqs is not None:
+        tone_freq = float(np.asarray(ts_tone_freqs)[tone_index])
     else:
-        ax = fig.gca()
+        tone_freq = np.mean(sweep_f)
 
-    # Sweep circle
-    ax.plot(z_sweep.real, z_sweep.imag, '-', linewidth=1.5,
-            color='C0', label='Sweep', zorder=2)
-    # Timestream scatter
+    if fig is None:
+        fig, (ax_iq, ax_pf) = plt.subplots(1, 2, figsize=(14, 6))
+    else:
+        ax_iq, ax_pf = fig.axes[:2]
+
     ts_label = label if label is not None else 'Timestream'
-    ax.plot(z_ts.real, z_ts.imag, '.', markersize=1, alpha=0.3,
-            color='C1', label=ts_label, zorder=1, **kwargs)
 
-    ax.set_xlabel(f'I {iq_label}'.strip())
-    ax.set_ylabel(f'Q {iq_label}'.strip())
-    ax.set_aspect('equal', adjustable='datalim')
-    ax.legend()
+    # Left panel: I vs Q resonance circle
+    ax_iq.plot(z_sweep.real, z_sweep.imag, '-', linewidth=1.5,
+               color='C0', label='Sweep', zorder=2)
+    ax_iq.plot(z_ts.real, z_ts.imag, '.', markersize=1, alpha=0.3,
+               color='C1', label=ts_label, zorder=1, **kwargs)
+    ax_iq.set_xlabel(f'I {iq_label}'.strip())
+    ax_iq.set_ylabel(f'Q {iq_label}'.strip())
+    ax_iq.set_aspect('equal', adjustable='datalim')
+    ax_iq.legend(fontsize='small')
+
+    # Right panel: phase vs frequency
+    ax_pf.plot(sweep_f, phase_sweep, '-', linewidth=1.5,
+               color='C0', label='Sweep', zorder=2)
+    ax_pf.plot(np.full_like(phase_ts, tone_freq), phase_ts,
+               '.', markersize=1, alpha=0.3,
+               color='C1', label=ts_label, zorder=1, **kwargs)
+    ax_pf.set_xlabel('Frequency (Hz)')
+    ax_pf.set_ylabel('Phase (rad)')
+    ax_pf.legend(fontsize='small')
+
     title = f'Tone {tone_index} — Resonance Circle'
     if deembed:
         title += ' (deembedded)'
-    ax.set_title(title)
+    fig.suptitle(title)
     plt.tight_layout()
     return fig
