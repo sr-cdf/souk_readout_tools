@@ -117,7 +117,7 @@ The standard way to access the OS is with SSH over Ethernet. Verify you can conn
 ssh casper@10.11.11.11
 ```
 
-Network settings can be updated by modifying `/etc/network/interfaces.d/end0` and running `ifdown`/`ifup`.
+Network settings can be updated by modifying ```/etc/network/interfaces.d/end0``` and running `ifdown`/`ifup`.
 
 A debug serial interface is also available via the micro-USB connector on the board. The single USB cable provides two serial ports — the first (`/dev/ttyUSB0`) is for board management, and the second (`/dev/ttyUSB1`) is the boot console and Linux terminal. This is useful for initial setup or recovering from network issues:
 

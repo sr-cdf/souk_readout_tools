@@ -1152,9 +1152,10 @@ Server-side commands (installed on the RFSoC):
 
 Planned for upcoming releases:
 
+- More plots in the docs and examples.
 - Improved VACC tone backfilling for more efficient LO slot usage.
 - Dual-DAC mode support.
 - HDF5 export format support.
-- Resonator tracking (continuous retune loop with drift correction).
+- Automated resonator tracking (continuous retune loop with drift correction).
 - ADC calibration via loopback measurement.
 - Automated version numbering and release workflow.
