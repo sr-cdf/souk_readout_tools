@@ -79,7 +79,7 @@ Default ports: pipeline 0 uses 10000/20000, pipeline 1 uses 10001/20001.
 | `calibration.py` | RF power/amplitude calibration chain (DAC to detector) |
 | `peak_finder.py` | MKID resonance detection algorithms |
 | `fitting.py` | Nonlinear resonator model fitting (Khalil notch model) |
-| `resonator.py` | Resonance circle deembedding (cable delay, centering, rotation) |
+| `resonator.py` | Resonator S21 transforms: RF deembedding and phase centering |
 | `plotting/` | Plotting library for sweep, timestream, and snapshot data |
 | `measurement.py` | Parameter space measurement framework |
 | `mkid_finder_app.py` | PyQt5 GUI for interactive resonance finding |
@@ -113,7 +113,7 @@ sudo systemctl status readout_server_0
 
 #### 1. Network Setup
 
-Ensure the RFSoC (e.g. `10.11.11.11/24`) is connected and on the same subnet. Manually set the client machine's IP address to `10.11.11.1/24` (or equivalent).
+Ensure the RFSoC (default IP `10.11.11.11/24`) is connected and on the same subnet. For example, manually set the client machine's IP address to `10.11.11.1/24` (or equivalent).
 
 Verify connectivity:
 
@@ -360,11 +360,16 @@ client.get_tone_amplitudes()
 
 **By power in dBm** (accounts for all of the above, using calibration values from the config):
 ```python
-client.set_tone_powers([-20, -25])
+client.set_tone_powers([-20, -25], reference_plane='detector')
 
 # Detailed power breakdown through the signal chain:
 client.get_tone_powers(detailed_output=True)
 ```
+
+The tone powers can be set to the maximum level that avoids saturation of the RF chain by calling ```client.maximise_tx_power()```
+
+Simlarly, the ADC input level can be maximised by adjusting the RX attenuators and or DSA settings with a call to ```client.maximise_rx_power()```
+``
 
 ### Phases
 
@@ -385,6 +390,10 @@ client.set_tones_helper(freqs=[0.8e9, 1.5e9], powers_dbm=[-50, -55], phases=[0.0
 `powers_dbm` sets calibrated output power in dBm via `set_tone_powers()`. You can also pass `amps` (0 to 1.0) instead for uncalibrated amplitude control — `amps` is ignored if `powers_dbm` is provided.
 
 ---
+
+### Dynamic range optimisation
+
+Different combinations of internal firmware parameters and rf peripheral values can achieve the same tone powers in both the transimt and receive chains. The choice of parameters affects the dynamic range and noise performance of the system. For example, setting high per-tone amplitudes and high attenuator values reduces the impact DAC quantisation noise compared to using low amplitudes with low attenuation. The client provides methods `optimise_tx_snr()` and `optimise_rx_snr()` to automatically check and optimise the settings to provide the best SNR for a given power level. See [Power Calibration & Optimisation](#power-calibration--optimisation) for details.
 
 ## Acquiring Data
 
@@ -419,6 +428,11 @@ plt.plot(t, np.abs(z0))
 plt.xlabel('Time (s)')
 plt.ylabel('|S21|')
 plt.show()
+
+# or use the internal plotting tools
+from souk_readout_tools.plotting import plot_timestream
+fig = plot_timestream(data, tone_indices=[0], format = 'iq_vs_t',title='Timestream of Tone 0')
+plt.show()
 ```
 
 ### Export and Import
@@ -446,6 +460,12 @@ The firmware reads PTP network time and attaches it to each accumulation. This 6
 
 ```python
 tt = client.get_telescope_time()
+
+```
+The plotting tools can read the telescope time from the data:
+
+```
+plot_timestream(data,x_axis='telescope_time')
 ```
 
 ---
@@ -478,7 +498,7 @@ client.disable_stream()
 
 The receiver script can be stopped with `Ctrl-C` or left running for the next stream.
 
-### Parse Stream Data
+### Parse and Plot Stream Data
 
 ```python
 data = client.parse_stream('tmp_stream')
@@ -486,6 +506,12 @@ t = np.arange(len(data['packet_counter'])) / data['sample_rate']
 z0 = data['i_data']['0000'] + 1j * data['q_data']['0000']
 plt.plot(t, np.abs(z0))
 plt.show()
+```
+
+or use the plotting tool:
+
+```
+plot_timestream(data,x_axis='telescope_time')
 ```
 
 ### Triggered Streaming
@@ -794,8 +820,14 @@ fig = plot_sweep(sweep_data, format='magphase', show_errors=True)
 # I vs Q complex plane
 fig = plot_sweep(sweep_data, format='iq')
 
-# With deembedding (cable delay removal, circle centering, rotation)
+# With true RF deembedding (off-resonance → (1, 0))
 fig = plot_sweep(sweep_data, format='iq', deembed=True)
+
+# With phase centering (circle centred at origin, resonance on −real axis)
+fig = plot_sweep(sweep_data, format='iq', phase_center=True)
+
+# Both: deembed first, then phase-center the result
+fig = plot_sweep(sweep_data, format='iq', deembed=True, phase_center=True)
 
 # I and Q vs frequency
 fig = plot_sweep(sweep_data, format='iq_vs_f')
@@ -820,7 +852,7 @@ fig = plot_timestream_psd(parsed_samples, format='freq_diss', sweep_data=sweep)
 
 # Overlay timestream on resonance circle (debugging)
 from souk_readout_tools.plotting import plot_timestream_on_resonance
-fig = plot_timestream_on_resonance(parsed_samples, sweep, tone_index=0, deembed=True)
+fig = plot_timestream_on_resonance(parsed_samples, sweep, tone_index=0, phase_center=True)
 ```
 
 ### Snapshot and Batch Snapshot Plots
@@ -842,16 +874,30 @@ fig = plot_batch_snapshots(batch_data, format='iq_vs_t', psd=True, psd_method='a
 
 ## Resonator Analysis
 
-### Deembedding
+### Deembedding and Phase Centering
 
-The `souk_readout_tools.resonator` module provides S21 deembedding transforms:
+The `souk_readout_tools.resonator` module provides two independent S21 transforms:
 
 ```python
-from souk_readout_tools.resonator import deembed, remove_cable_delay
+from souk_readout_tools.resonator import (
+    deembed, apply_deembed_params,
+    phase_center, apply_phase_center_params,
+    remove_cable_delay,
+)
 
-# Full deembedding pipeline
-z_deembedded, params = deembed(frequencies, s21_complex)
-# params contains: tau, center, radius, rotation_angle
+# True RF deembedding: cable delay + baseline normalisation
+# Result: off-resonance at (1, 0), on-resonance near zero positive real
+z_deembedded, deembed_params = deembed(frequencies, s21_complex)
+# deembed_params contains: tau, baseline
+
+# Phase centering: circle centering + rotation
+# Result: circle centred at origin, resonance on negative real axis
+z_centered, pc_params = phase_center(s21_complex)
+# pc_params contains: center, radius, rotation_angle
+
+# Apply to timestream data (pre-computed params from sweep)
+z_ts_deembedded = apply_deembed_params(z_ts, deembed_params, frequency=tone_freq)
+z_ts_centered = apply_phase_center_params(z_ts, pc_params)
 
 # Cable delay removal only
 z_nodelay, tau = remove_cable_delay(frequencies, s21_complex)
@@ -1045,20 +1091,22 @@ Server-side commands (installed on the RFSoC):
 - CLI tool: `souk-batch-snapshots`.
 
 **Plotting Library (`souk_readout_tools.plotting`)**
-- `plot_sweep()` — S21 magnitude/phase, I/Q vs frequency, or complex plane, with deembedding and error bars.
+- `plot_sweep()` — S21 magnitude/phase, I/Q vs frequency, or complex plane, with deembedding, phase centering, and error bars.
 - `plot_timestream()` — I/Q, magnitude/phase, or frequency/dissipation vs time.
 - `plot_timestream_psd()` — power spectral density of timestream data.
 - `plot_timestream_on_resonance()` — overlay timestream points on sweep resonance circle.
 - `plot_snapshots()`, `plot_snapshots_psd()`, `plot_batch_snapshots()` — snapshot visualization with per-repetition, averaged, and concatenated modes.
-- All formats support optional deembedding via the `resonator` module.
+- All formats support optional deembedding and/or phase centering via the `resonator` module.
 - PSD utilities: `compute_psd()`, `compute_psd_averaged()`, `compute_psd_concatenated()`.
 
 **Resonator Analysis (`souk_readout_tools.resonator`)**
 - `remove_cable_delay()` — auto-estimate and remove electrical delay.
+- `deembed()` — true RF deembedding: cable delay + baseline normalisation (off-resonance → (1, 0)).
+- `apply_deembed_params()` — apply deembed to timestream data.
 - `center_circle()` — Kasa algebraic circle fit.
 - `rotate_to_real_axis()` — rotate resonance to negative real axis.
-- `deembed()` — full pipeline: delay → center → rotate.
-- `apply_deembed_params()` — apply sweep-derived transforms to timestream data.
+- `phase_center()` — circle centering + rotation (may act on raw or deembedded data).
+- `apply_phase_center_params()` — apply phase centering to timestream data.
 
 **Resonance Finding Enhancements**
 - `find_resonances(mode='targeted')` — per-tone resonance search with double/triple flagging.
@@ -1153,9 +1201,10 @@ Server-side commands (installed on the RFSoC):
 Planned for upcoming releases:
 
 - More plots in the docs and examples.
+- Automated resonator tracking (continuous retune loop with drift correction).
+- More interactive plotting features (eg step to next resonance, flag as good/bad)
+- ADC calibration via loopback measurement.
 - Improved VACC tone backfilling for more efficient LO slot usage.
 - Dual-DAC mode support.
 - HDF5 export format support.
-- Automated resonator tracking (continuous retune loop with drift correction).
-- ADC calibration via loopback measurement.
 - Automated version numbering and release workflow.

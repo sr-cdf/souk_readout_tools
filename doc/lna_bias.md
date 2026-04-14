@@ -7,8 +7,8 @@ library (shared with the RF peripherals module).
 
 ## What it does
 
-Each cryostat has 14 LNA channels (reference designators M17–M30), addressed
-by index 1–14.  Each readout pipeline maps to one LNA channel via the config
+Each cryostat has 14 LNA channels (reference designators M17-M30), addressed
+by index 1-14.  Each readout pipeline maps to one LNA channel via the config
 key `cryostat.lna_bias.lna_channel`.  The controller supports:
 
 - **Setting bias voltage** — by remote (iterative feedback, default) or local

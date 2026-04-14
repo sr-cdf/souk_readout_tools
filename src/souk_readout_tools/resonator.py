@@ -1,14 +1,23 @@
 """
 Resonator data transforms for MKID S21 analysis.
 
-Provides deembedding operations (cable delay removal, circle centering,
-rotation) as pure numerical transforms on complex S21 data, and a
-ResonatorCalibration class for vectorized IQ ↔ frequency/dissipation
-conversion.
+Provides two independent categories of transform on complex S21 data:
 
-These transforms are used by the plotting library when deembed=True,
-but can also be used independently for resonator characterisation and
-real-time readout.
+**Deembedding** (``deembed``) — the RF procedure for representing a
+notch resonator.  Removes cable delay and normalises by the
+off-resonance environment response so that the off-resonance point
+sits at (1, 0) and the on-resonance point lies near zero on the
+positive real axis (overcoupled case).
+
+**Phase centering** (``phase_center``) — translates the resonance
+circle so its algebraic center sits at the origin and rotates it so
+that the resonance point lies on the negative real axis (zero phase
+off-resonance).  Phase centering can be applied to raw *or*
+deembedded data.
+
+Also provides a ``ResonatorCalibration`` class for vectorized
+IQ - frequency/dissipation conversion that relies on the
+phase-centered representation.
 """
 
 import numpy as np
@@ -48,11 +57,12 @@ def center_circle(s21):
     """
     Translate the resonance circle so its algebraic center is at the origin.
 
-    Uses the Kasa algebraic circle fit to find the center and radius
-    of the resonance circle in the complex plane.
+    This is the first step of *phase centering*.  Uses the Kasa algebraic
+    circle fit to find the center and radius of the resonance circle in
+    the complex plane.
 
     Args:
-        s21: 1D complex array (cable delay should be removed first).
+        s21: 1D complex array (may be raw or cable-delay-corrected).
 
     Returns:
         s21_centered: Complex array with center subtracted.
@@ -108,6 +118,10 @@ def rotate_to_real_axis(s21, s21_at_resonance=None):
     """
     Rotate S21 so the resonance point lies on the negative real axis.
 
+    This is the second step of *phase centering* (after ``center_circle``).
+    The result places the off-resonance point near 0 rad and the
+    on-resonance point near ±π rad.
+
     Args:
         s21: 1D complex array (should already be centered).
         s21_at_resonance: Complex value at resonance. If None, uses
@@ -131,9 +145,27 @@ def rotate_to_real_axis(s21, s21_at_resonance=None):
     return s21_rotated, angle
 
 
+def _estimate_baseline(s21, n_edge=5):
+    """Estimate the off-resonance baseline from sweep edge points.
+
+    Averages ``n_edge`` points from each end of the sweep (assumed to be
+    far from resonance) to obtain a single complex baseline value.
+    """
+    s21 = np.asarray(s21, dtype=complex)
+    n = max(1, min(n_edge, len(s21) // 4))
+    edge_pts = np.concatenate([s21[:n], s21[-n:]])
+    return np.mean(edge_pts)
+
+
+# -- True RF deembedding ----------------------------------------------------
+
 def deembed(frequencies, s21, tau=None):
     """
-    Full deembedding pipeline: cable delay removal, circle centering, rotation.
+    True RF deembedding for a notch resonator.
+
+    Removes cable delay and normalises by the off-resonance baseline so
+    that the off-resonance point sits at (1, 0) and the on-resonance
+    point lies near zero on the positive real axis (overcoupled case).
 
     Args:
         frequencies: 1D array of frequencies in Hz.
@@ -141,19 +173,73 @@ def deembed(frequencies, s21, tau=None):
         tau: Cable delay in seconds. If None, auto-estimated.
 
     Returns:
-        s21_deembedded: Complex array after full deembedding.
+        s21_deembedded: Complex array in the standard notch resonator
+            representation.
         params: dict with keys:
             'tau': cable delay removed (seconds)
+            'baseline': complex off-resonance baseline value
+    """
+    s21_no_delay, tau = remove_cable_delay(frequencies, s21, tau=tau)
+    baseline = _estimate_baseline(s21_no_delay)
+    s21_deembedded = s21_no_delay / baseline
+
+    params = {
+        'tau': tau,
+        'baseline': baseline,
+    }
+    return s21_deembedded, params
+
+
+def apply_deembed_params(s21, params, frequency=None):
+    """
+    Apply deembed parameters to new data (e.g. timestream).
+
+    Divides by the off-resonance baseline.  For timestream data at a
+    known tone frequency, also removes the cable delay at that frequency.
+
+    Args:
+        s21: Complex array (or single complex value) to transform.
+        params: dict from ``deembed()`` with keys 'tau', 'baseline'.
+        frequency: Tone frequency in Hz.  When provided, cable delay is
+            removed at this frequency before baseline normalisation.
+            When None, only baseline normalisation is applied.
+
+    Returns:
+        s21_deembedded: Deembedded complex array.
+    """
+    s21 = np.asarray(s21, dtype=complex)
+    if frequency is not None and params.get('tau'):
+        s21 = s21 * np.exp(
+            1j * 2 * np.pi * np.asarray(frequency, dtype=float) * params['tau'])
+    return s21 / params['baseline']
+
+
+# -- Phase centering --------------------------------------------------------
+
+def phase_center(s21):
+    """
+    Phase-center S21 data: circle centering followed by rotation.
+
+    Translates the resonance circle so its algebraic center is at the
+    origin and rotates so that the resonance point lies on the negative
+    real axis (off-resonance near 0 rad, on-resonance near ±π rad).
+
+    Can be applied to raw, cable-delay-corrected, or deembedded data.
+
+    Args:
+        s21: 1D complex array.
+
+    Returns:
+        s21_centered: Phase-centered complex array.
+        params: dict with keys:
             'center': complex circle center
             'radius': float circle radius
             'rotation_angle': float rotation applied (radians)
     """
-    s21_nodelay, tau = remove_cable_delay(frequencies, s21, tau=tau)
-    s21_centered, center, radius = center_circle(s21_nodelay)
+    s21_centered, center, radius = center_circle(s21)
     s21_rotated, angle = rotate_to_real_axis(s21_centered)
 
     params = {
-        'tau': tau,
         'center': center,
         'radius': radius,
         'rotation_angle': angle,
@@ -161,37 +247,36 @@ def deembed(frequencies, s21, tau=None):
     return s21_rotated, params
 
 
-def apply_deembed_params(s21, params):
+def apply_phase_center_params(s21, params):
     """
-    Apply previously computed deembedding parameters to new data.
+    Apply phase-centering parameters to new data.
 
-    Useful for applying sweep-derived deembedding to timestream data.
+    Subtracts the circle center and applies the rotation.  Useful for
+    applying sweep-derived phase centering to timestream data.
 
     Args:
         s21: Complex array (or single complex value) to transform.
-        params: dict from deembed() with keys 'tau', 'center',
-                'rotation_angle'. Note: 'tau' is not applied here
-                since timestream data is at a single frequency.
+        params: dict from ``phase_center()`` with keys 'center',
+                'rotation_angle'.
 
     Returns:
-        s21_deembedded: Transformed complex array.
+        s21_centered: Phase-centered complex array.
     """
     s21 = np.asarray(s21, dtype=complex)
     s21_centered = s21 - params['center']
-    s21_rotated = s21_centered * np.exp(1j * params['rotation_angle'])
-    return s21_rotated
+    return s21_centered * np.exp(1j * params['rotation_angle'])
 
 
 class ResonatorCalibration:
     """
-    Cached calibration for vectorized IQ ↔ frequency/dissipation conversion.
+    Cached calibration for vectorized IQ - frequency/dissipation conversion.
 
-    Stores the deembedding parameters (cable delay, circle center, rotation)
-    along with the resonator model parameters (fr, Ql) needed to convert
-    between raw IQ and physical quantities.
+    Stores the phase-centering parameters (cable delay, circle center,
+    rotation) along with the resonator model parameters (fr, Ql) needed
+    to convert between raw IQ and physical quantities.
 
-    On the deembedded circle (centered at origin, resonance on negative
-    real axis), the exact Möbius inversion gives:
+    On the phase-centered circle (centered at origin, resonance on
+    negative real axis), the exact Möbius inversion gives:
 
         x = (f - fr) / fr = Re[-j * (z + r) / (2 * Ql * (r - z))]
 
@@ -227,9 +312,10 @@ class ResonatorCalibration:
         """
         Build from a fitting.FitResult.
 
-        Derives the deembedding geometry (center, radius, rotation) from
-        the fitted model parameters rather than from a Kasa circle fit,
-        so the calibration is fully consistent with the resonator model.
+        Derives the phase-centering geometry (center, radius, rotation)
+        from the fitted model parameters rather than from a Kasa circle
+        fit, so the calibration is fully consistent with the resonator
+        model.
         """
         fr = fit_result.fr
         Ql = fit_result.Ql
@@ -244,7 +330,7 @@ class ResonatorCalibration:
     @classmethod
     def from_sweep(cls, frequencies, s21, fr=None, Ql=None):
         """
-        Build from raw sweep data using the deembed pipeline.
+        Build from raw sweep data using cable delay removal + phase centering.
 
         Args:
             frequencies: 1D frequency array (Hz).
@@ -254,7 +340,8 @@ class ResonatorCalibration:
             Ql: Loaded quality factor. If None, estimated from the
                 3 dB bandwidth.
         """
-        s21_deembedded, params = deembed(frequencies, s21)
+        s21_no_delay, tau = remove_cable_delay(frequencies, s21)
+        _, pc_params = phase_center(s21_no_delay)
 
         if fr is None:
             fr = float(frequencies[np.argmin(np.abs(s21))])
@@ -271,31 +358,30 @@ class ResonatorCalibration:
                 bw = (frequencies[-1] - frequencies[0]) / 10
             Ql = float(fr / bw)
 
-        return cls(fr, Ql, params['tau'], params['center'],
-                   params['radius'], params['rotation_angle'])
+        return cls(fr, Ql, tau, pc_params['center'],
+                   pc_params['radius'], pc_params['rotation_angle'])
 
     @property
-    def deembed_params(self):
-        """Return a dict compatible with apply_deembed_params()."""
+    def phase_center_params(self):
+        """Return a phase-centering params dict for apply_phase_center_params()."""
         return {
-            'tau': self.tau,
             'center': self.center,
             'radius': self.radius,
             'rotation_angle': self.rotation_angle,
         }
 
-    # -- Deembedding ---------------------------------------------------------
+    # -- Phase centering -----------------------------------------------------
 
     def deembed_sweep(self, frequencies, s21):
         """
-        Deembed sweep data (frequency-dependent cable delay removal).
+        Phase-center sweep data (cable delay removal + centering + rotation).
 
         Args:
             frequencies: 1D frequency array (Hz).
             s21: Complex S21 array.
 
         Returns:
-            Complex array, fully deembedded.
+            Complex array, phase-centered.
         """
         s21 = np.asarray(s21, dtype=complex)
         z = s21 * np.exp(1j * 2 * np.pi * np.asarray(frequencies) * self.tau)
@@ -303,7 +389,7 @@ class ResonatorCalibration:
 
     def deembed_timestream(self, s21):
         """
-        Deembed timestream data (no cable delay removal — fixed tone).
+        Phase-center timestream data (centering + rotation, no cable delay).
 
         For timestream IQ at a fixed tone frequency, cable delay is a
         constant phase that is absorbed into the center/rotation. Use
@@ -313,20 +399,20 @@ class ResonatorCalibration:
             s21: Complex array of timestream IQ samples.
 
         Returns:
-            Complex array, centered and rotated.
+            Complex array, phase-centered (centered and rotated).
         """
         s21 = np.asarray(s21, dtype=complex)
         return (s21 - self.center) * self._rotation_phasor
 
     # -- Conversions ---------------------------------------------------------
 
-    def to_phase_amplitude(self, z_deembedded):
+    def to_phase_amplitude(self, z_centered):
         """
-        Convert deembedded IQ to (phase, normalised amplitude).
+        Convert phase-centered IQ to (phase, normalised amplitude).
 
         Args:
-            z_deembedded: Complex array on the deembedded circle
-                          (output of deembed_sweep or deembed_timestream).
+            z_centered: Complex array on the phase-centered circle
+                        (output of deembed_sweep or deembed_timestream).
 
         Returns:
             phase: Angle on the resonance circle (rad). Zero at the
@@ -334,25 +420,25 @@ class ResonatorCalibration:
             amplitude: |z| / radius. Unity on the model circle;
                        deviations indicate dissipation changes.
         """
-        phase = np.angle(z_deembedded)
-        amplitude = np.abs(z_deembedded) / self.radius
+        phase = np.angle(z_centered)
+        amplitude = np.abs(z_centered) / self.radius
         return phase, amplitude
 
-    def to_frequency_dissipation(self, z_deembedded):
+    def to_frequency_dissipation(self, z_centered):
         """
-        Convert deembedded IQ to (frequency shift, dissipation shift).
+        Convert phase-centered IQ to (frequency shift, dissipation shift).
 
         Uses the exact Möbius inversion of the resonance circle, valid
         for arbitrary detuning (not just small perturbations).
 
-        On the deembedded circle the model is:
+        On the phase-centered circle the model is:
             z = r * (-1 + 2j*Ql*x) / (1 + 2j*Ql*x),  x = (f-fr)/fr
 
         Inverting:
             x = Re[-j * (z + r) / (2*Ql * (r - z))]
 
         Args:
-            z_deembedded: Complex array on the deembedded circle.
+            z_centered: Complex array on the phase-centered circle.
 
         Returns:
             df: Frequency shift from resonance (Hz).
@@ -360,7 +446,7 @@ class ResonatorCalibration:
                 Zero on the model circle; positive = increased loss.
         """
         r = self.radius
-        z = np.asarray(z_deembedded, dtype=complex)
+        z = np.asarray(z_centered, dtype=complex)
         x = np.real(-1j * (z + r) / (2.0 * self.Ql * (r - z)))
         df = x * self.fr
         dd = np.abs(z) / r - 1.0
@@ -389,7 +475,8 @@ class ToneConverter:
     """
     Optimised IQ → (df, dd) converter for a single fixed tone frequency.
 
-    All per-tone constants are pre-computed so that each call is:
+    Pre-combines cable delay removal and phase centering into a single
+    complex multiply and add, so each call is:
         z_d = z * _multiply - _offset      (1 complex mul + 1 complex sub)
         x   = Re[-j*(z_d + r) / (2*Ql*(r - z_d))]  (Möbius inversion)
         df  = x * fr
@@ -427,14 +514,16 @@ class ToneConverter:
 
     def deembed(self, z):
         """
-        Deembed raw IQ without converting to frequency/dissipation.
+        Phase-center raw IQ without converting to frequency/dissipation.
 
-        Useful when you want the deembedded circle for plotting.
+        Applies cable delay removal + centering + rotation in a single
+        step.  Useful when you want the phase-centered circle for
+        plotting.
 
         Args:
             z: Raw complex IQ data (scalar or array).
 
         Returns:
-            Complex deembedded IQ.
+            Complex phase-centered IQ.
         """
         return z * self._multiply - self._offset

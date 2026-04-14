@@ -4835,7 +4835,7 @@ def fix_adc_saturation(r, config_dict, rf_peripherals=None):
             atten_max = rf_peripherals.ATTEN_MAX
             atten_step = rf_peripherals.ATTEN_STEP
             attenuations = np.arange(atten_min, atten_max + atten_step, atten_step)
-            print(f'  Searching RX attenuator ({atten_min}–{atten_max} dB)...')
+            print(f'  Searching RX attenuator ({atten_min}-{atten_max} dB)...')
 
             low_idx = 0
             high_idx = len(attenuations) - 1

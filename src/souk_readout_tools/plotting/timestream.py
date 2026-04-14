@@ -4,12 +4,13 @@ Timestream data plotting functions.
 Supports parsed timestream data (from ReadoutClient.parse_samples()) in
 multiple formats: I/Q, magnitude/phase, frequency/dissipation, and their
 PSDs. Includes a debugging overlay of timestream points on the resonance
-circle from sweep data.
+circle from sweep data, with optional deembedding or phase centering.
 """
 
 import numpy as np
-from ._common import (_get_pyplot, _compute_mag_phase, _apply_deembedding,
-                       ERRORBAR_STYLE, _resolve_label,
+from ._common import (_get_pyplot, _compute_mag_phase,
+                       _apply_deembed, _apply_phase_center,
+                       _resolve_label,
                        _normalise_iq, _compute_mag_phase_units, UNITS)
 from ._psd import compute_psd
 
@@ -109,8 +110,33 @@ def _compute_freq_diss(ts_data, tone_key, i_arr, q_arr, sweep_data):
     return frac_f, frac_d
 
 
+def _apply_transforms(z, deembed, phase_center):
+    """Apply deembed and/or phase_center to a complex array (no frequencies).
+
+    Returns (z_out, deembed_params, phase_center_params).
+    """
+    d_params = None
+    pc_params = None
+    if deembed:
+        z, d_params = _apply_deembed(None, z, deembed)
+    if phase_center:
+        z, pc_params = _apply_phase_center(z, phase_center)
+    return z, d_params, pc_params
+
+
+def _transform_title_suffix(deembed, phase_center):
+    """Return a parenthesised title suffix describing active transforms."""
+    parts = []
+    if deembed:
+        parts.append('deembedded')
+    if phase_center:
+        parts.append('phase-centered')
+    return f' ({", ".join(parts)})' if parts else ''
+
+
 def plot_timestream(ts_data, format='iq_vs_t', tones=None,
-                    deembed=False, sweep_data=None, fig=None, label=None,
+                    deembed=False, phase_center=False,
+                    sweep_data=None, fig=None, label=None,
                     units='raw', config=None, reference_plane='adc_input',
                     x_axis='time', **kwargs):
     """
@@ -121,10 +147,16 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             'sample_rate', 'num_samples'.
         format: 'iq' | 'iq_vs_t' | 'magphase' | 'freq_diss'
         tones: List of tone indices (int) to plot, or None for [0].
-        deembed: bool or deembed params dict. For 'iq' format, applies
-            deembedding. Requires sweep_data.
-        sweep_data: Sweep data dict. Required for 'freq_diss' format
-            and for deembed=True.
+        deembed: bool or deembed params dict.  Applies true RF
+            deembedding (baseline normalisation).  For timestream data
+            this must be a pre-computed params dict from
+            ``resonator.deembed()``.
+        phase_center: bool or phase-centering params dict.  Applies
+            circle centering and rotation.  For timestream data this
+            must be a pre-computed params dict from
+            ``resonator.phase_center()``, or True to compute from the
+            data directly.  Applied after deembedding when both are set.
+        sweep_data: Sweep data dict. Required for 'freq_diss' format.
         fig: Existing figure. If None, create new.
         label: Legend label. If None, uses an auto-incrementing index.
         units: Unit for I/Q normalisation.  One of:
@@ -193,6 +225,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
     if format == 'freq_diss' and sweep_data is None:
         raise ValueError("sweep_data is required for format='freq_diss'")
 
+    suffix = _transform_title_suffix(deembed, phase_center)
+
     if format == 'iq':
         if fig is None:
             fig, ax = plt.subplots(1, 1, figsize=(8, 8))
@@ -200,8 +234,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             ax = fig.gca()
         for key, i_arr, q_arr in selected:
             z = i_arr + 1j * q_arr
-            if deembed:
-                z, _ = _apply_deembedding(None, z, deembed)
+            z, _, _ = _apply_transforms(z, deembed, phase_center)
             trace_label = _resolve_label(ax, label,
                                          suffix=f'Tone {key}' if len(selected) > 1 else None)
             ax.plot(z.real, z.imag, '.', markersize=1,
@@ -210,10 +243,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         ax.set_ylabel(f'Q {iq_label}'.strip())
         ax.set_aspect('equal', adjustable='datalim')
         ax.legend(fontsize='small')
-        title = 'Timestream I vs Q'
-        if deembed:
-            title += ' (deembedded)'
-        ax.set_title(title)
+        ax.set_title('Timestream I vs Q' + suffix)
         plt.tight_layout()
         return fig
 
@@ -229,16 +259,14 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         z = i_arr + 1j * q_arr
 
         if format == 'iq_vs_t':
-            if deembed:
-                z, _ = _apply_deembedding(None, z, deembed)
+            z, _, _ = _apply_transforms(z, deembed, phase_center)
             ax1.plot(x_values, z.real, linewidth=0.5, label=trace_label, **kwargs)
             ax2.plot(x_values, z.imag, linewidth=0.5, label=trace_label, **kwargs)
             ax1.set_ylabel(f'I {iq_label}'.strip())
             ax2.set_ylabel(f'Q {iq_label}'.strip())
 
         elif format == 'magphase':
-            if deembed:
-                z, _ = _apply_deembedding(None, z, deembed)
+            z, _, _ = _apply_transforms(z, deembed, phase_center)
             mag_db, phase = _compute_mag_phase_units(z, units, info=info, config=config)
             ax1.plot(x_values, mag_db, linewidth=0.5, label=trace_label, **kwargs)
             ax2.plot(x_values, phase, linewidth=0.5, label=trace_label, **kwargs)
@@ -267,8 +295,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         'freq_diss': 'Frequency & Dissipation',
     }
     title = title_map.get(format, 'Timestream')
-    if deembed and format != 'freq_diss':
-        title += ' (deembedded)'
+    if format != 'freq_diss':
+        title += suffix
     fig.suptitle(title)
     plt.tight_layout()
     return fig
@@ -370,7 +398,9 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
 
 
 def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
-                                  deembed=False, fig=None, label=None,
+                                  deembed=False, phase_center=False,
+                                  unwrap=False,
+                                  fig=None, label=None,
                                   units='raw', config=None, **kwargs):
     """
     Overplot timestream I/Q points on the resonance circle from sweep data.
@@ -379,7 +409,12 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
         ts_data: dict from parse_samples().
         sweep_data: dict from parse_sweep_data() (per-tone).
         tone_index: int, which tone to plot.
-        deembed: bool, deembed both sweep and timestream.
+        deembed: bool, apply true RF deembedding (cable delay removal +
+            baseline normalisation) to both sweep and timestream.
+        phase_center: bool, apply phase centering (circle centering +
+            rotation) to both sweep and timestream.  Applied after
+            deembedding when both are True.
+        unwrap: bool, unwrap the phase.
         fig: Existing figure.
         label: Legend label for the timestream points. If None, uses
             'Timestream'.
@@ -431,14 +466,19 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     z_ts = i_arr + 1j * q_arr
     z_sweep = sw_i + 1j * sw_q
 
-    deembed_params = None
+    # Apply transforms to sweep (with frequencies) and timestream (without)
+    d_params = None
+    pc_params = None
     if deembed:
-        z_sweep, deembed_params = _apply_deembedding(sweep_f, z_sweep, True)
-        z_ts = _apply_deembedding(None, z_ts, deembed_params)[0]
+        z_sweep, d_params = _apply_deembed(sweep_f, z_sweep, True)
+        z_ts, _ = _apply_deembed(None, z_ts, d_params)
+    if phase_center:
+        z_sweep, pc_params = _apply_phase_center(z_sweep, True)
+        z_ts, _ = _apply_phase_center(z_ts, pc_params)
 
     # Compute phase for the frequency-domain panel
-    _, phase_sweep = _compute_mag_phase(z_sweep)
-    _, phase_ts = _compute_mag_phase(z_ts)
+    _, phase_sweep = _compute_mag_phase(z_sweep, unwrap=unwrap)
+    _, phase_ts = _compute_mag_phase(z_ts, unwrap=unwrap)
     ts_info = ts_data.get('system_information') or {}
     ts_tone_freqs = ts_info.get('tone_frequencies')
     if ts_tone_freqs is not None:
@@ -473,9 +513,7 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     ax_pf.set_ylabel('Phase (rad)')
     ax_pf.legend(fontsize='small')
 
-    title = f'Tone {tone_index} — Resonance Circle'
-    if deembed:
-        title += ' (deembedded)'
-    fig.suptitle(title)
+    suffix = _transform_title_suffix(deembed, phase_center)
+    fig.suptitle(f'Tone {tone_index} — Resonance Circle' + suffix)
     plt.tight_layout()
     return fig

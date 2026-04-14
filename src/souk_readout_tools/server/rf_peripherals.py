@@ -30,7 +30,7 @@ from souk_rf_mixerless_atten_amp_level import (
     SOUKRFMixerlessAttenAmpTransfer,
 )
 
-# Hardware imports – may fail on client machines.
+# Hardware imports - may fail on client machines.
 try:
     from smbus2 import SMBus
     from souk_rf_mixerless_module import (
@@ -41,12 +41,12 @@ try:
 except ImportError:
     _HW_AVAILABLE = False
 
-# Software mimic – always available.
+# Software mimic - always available.
 from souk_rf_mixerless_atten_amp_level import (
     mimicSOUKRFMixerlessModule,
 )
 
-# RUDAT USB attenuator support – optional.
+# RUDAT USB attenuator support - optional.
 # rudat.py must be on sys.path (e.g. pip install, or add its directory to
 # PYTHONPATH / sys.path before starting the server).
 try:
@@ -130,7 +130,7 @@ class RFPeripheralController:
     """
     Unified interface for the SOUK RF Mixerless Module.
 
-    Provides attenuator control (0–31.5 dB in 0.5 dB steps) and amplifier
+    Provides attenuator control (0-31.5 dB in 0.5 dB steps) and amplifier
     bypass for both TX and RX paths.  When hardware is available, commands
     are forwarded to the I2C-controlled module.  Otherwise a software mimic
     is used for offline modelling.
@@ -230,7 +230,7 @@ class RFPeripheralController:
                         for c in hw_configs
                     ]
                 else:
-                    # Use defaults – two channels, both MAX7329
+                    # Use defaults - two channels, both MAX7329
                     cfg_list = [
                         SOUKRFMixerlessModuleChnHWConfig.default_config(),
                         SOUKRFMixerlessModuleChnHWConfig.default_config(),
@@ -244,7 +244,7 @@ class RFPeripheralController:
                 self._sync_config_from_hardware()
             except Exception:
                 logger.exception(
-                    'Failed to initialise RF mixerless hardware – '
+                    'Failed to initialise RF mixerless hardware - '
                     'falling back to software mimic'
                 )
                 self._hw_module = None
@@ -263,7 +263,7 @@ class RFPeripheralController:
     # -- TX attenuation --
 
     def set_tx_attenuation(self, attenuation_db):
-        """Set TX variable attenuator (0–31.5 dB)."""
+        """Set TX variable attenuator (0-31.5 dB)."""
         self._set_attenuation('transmit_atten', attenuation_db)
 
     def get_tx_attenuation(self):
@@ -273,7 +273,7 @@ class RFPeripheralController:
     # -- RX attenuation --
 
     def set_rx_attenuation(self, attenuation_db):
-        """Set RX variable attenuator (0–31.5 dB)."""
+        """Set RX variable attenuator (0-31.5 dB)."""
         self._set_attenuation('recv_atten', attenuation_db)
 
     def get_rx_attenuation(self):

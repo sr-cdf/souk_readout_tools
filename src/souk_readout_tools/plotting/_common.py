@@ -173,19 +173,20 @@ def _get_pyplot():
     return plt
 
 
-def _compute_mag_phase(z):
+def _compute_mag_phase(z,unwrap=True):
     """
     Compute log magnitude (dB) and unwrapped phase from complex S21.
 
     Args:
         z: Complex array.
+        unwrap: Whether to unwrap the phase.
 
     Returns:
         log_mag: 20*log10(|z|) in dB.
         phase: Unwrapped phase in radians.
     """
     log_mag = 20 * np.log10(np.abs(z))
-    phase = np.unwrap(np.angle(z))
+    phase = np.unwrap(np.angle(z)) if unwrap else np.angle(z)
     return log_mag, phase
 
 
@@ -214,32 +215,59 @@ def _propagate_errors_mag(si, sq, ei, eq):
     return e_logmag, e_phase
 
 
-def _apply_deembedding(frequencies, z, deembed, params=None):
+def _apply_deembed(frequencies, z, deembed, frequency=None):
     """
-    Apply deembedding if requested.
+    Apply true RF deembedding (cable delay removal + baseline normalisation).
+
+    For sweep data (frequencies provided, ``deembed is True``), computes
+    deembedding from scratch.  For timestream data, pass pre-computed
+    params as ``deembed`` (a dict from ``resonator.deembed()``).
 
     Args:
-        frequencies: 1D frequency array (Hz).
+        frequencies: 1D frequency array (Hz), or None for timestream.
         z: 1D complex S21 array.
-        deembed: bool or dict. If True, compute deembedding. If dict,
-                 use as pre-computed params.
-        params: Pre-computed deembed params (alternative to passing as
-                deembed argument). If provided, applies these params.
+        deembed: bool or dict. If True, compute from scratch (requires
+            frequencies). If dict, use as pre-computed params.
+        frequency: Tone frequency (Hz) for cable delay removal when
+            applying pre-computed params to timestream data.
 
     Returns:
-        z_out: Processed complex array.
-        deembed_params: dict of deembedding parameters, or None.
+        z_out: Deembedded complex array (off-resonance at (1, 0)).
+        params: dict of deembed parameters, or None.
     """
-    if params is not None:
-        from .. import resonator
-        return resonator.apply_deembed_params(z, params), params
-
     if deembed is True:
         from .. import resonator
         return resonator.deembed(frequencies, z)
     elif isinstance(deembed, dict):
         from .. import resonator
-        return resonator.apply_deembed_params(z, deembed), deembed
+        return resonator.apply_deembed_params(z, deembed, frequency=frequency), deembed
+
+    return z, None
+
+
+def _apply_phase_center(z, phase_center):
+    """
+    Apply phase centering (circle centering + rotation).
+
+    For sweep or timestream data with ``phase_center is True``, computes
+    centering from scratch.  Pass pre-computed params (a dict from
+    ``resonator.phase_center()``) to apply to new data.
+
+    Args:
+        z: 1D complex S21 array.
+        phase_center: bool or dict. If True, compute from scratch. If
+            dict, use as pre-computed params.
+
+    Returns:
+        z_out: Phase-centered complex array.
+        params: dict of phase-centering parameters, or None.
+    """
+    if phase_center is True:
+        from .. import resonator
+        return resonator.phase_center(z)
+    elif isinstance(phase_center, dict):
+        from .. import resonator
+        return resonator.apply_phase_center_params(z, phase_center), phase_center
 
     return z, None
 
@@ -281,11 +309,11 @@ def _normalise_iq(si, sq, units, info=None, config=None,
     Args:
         si, sq: I and Q signal arrays.
         units: One of UNITS:
-            'raw'    – no normalisation (accumulator codes).
-            'peak'   – normalise to the peak magnitude of the data.
-            'adc_fs' – fraction of ADC full-scale.
-            'dbfs'   – dB relative to ADC full-scale.
-            'dbm'    – estimated power in dBm at ``reference_plane``.
+            'raw'    - no normalisation (accumulator codes).
+            'peak'   - normalise to the peak magnitude of the data.
+            'adc_fs' - fraction of ADC full-scale.
+            'dbfs'   - dB relative to ADC full-scale.
+            'dbm'    - estimated power in dBm at ``reference_plane``.
         info: system_information dict.  Required for 'adc_fs', 'dbfs',
             'dbm'; ignored for 'raw' and 'peak'.
         config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
@@ -428,7 +456,7 @@ def _normalise_iq(si, sq, units, info=None, config=None,
 
 
 def _compute_mag_phase_units(z, units, info=None, config=None,
-                              reference_plane='adc_input', frequencies=None):
+                              reference_plane='adc_input', frequencies=None, unwrap=True):
     """Compute magnitude and phase with units-aware magnitude labels.
 
     For 'raw' and 'adc_fs', magnitude is 20*log10(|z|).
@@ -445,7 +473,7 @@ def _compute_mag_phase_units(z, units, info=None, config=None,
     warning has already been emitted by ``_normalise_iq``.
     """
     mag_db = 20 * np.log10(np.abs(z))
-    phase = np.unwrap(np.angle(z))
+    phase = np.unwrap(np.angle(z)) if unwrap else np.angle(z)
 
     if units == 'dbm':
         cal_db = _resolve_adc_dbm_to_dbfs(config, frequencies)

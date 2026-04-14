@@ -3,7 +3,8 @@ Plotting library for SOUK MKID readout data.
 
 Provides visualization for sweep, timestream, and snapshot data in
 multiple formats (I/Q, magnitude/phase, frequency/dissipation) with
-optional deembedding. All functions return matplotlib Figure objects.
+optional deembedding and/or phase centering. All functions return
+matplotlib Figure objects.
 
 Sweep plots:
     plot_sweep, plot_sweep_iq, plot_sweep_magphase, plot_sweep_iq_vs_f

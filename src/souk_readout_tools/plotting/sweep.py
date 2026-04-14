@@ -3,12 +3,13 @@ Sweep data plotting functions.
 
 Supports wideband sweeps (single concatenated trace) and per-tone sweeps
 (multiple tones). Formats: I vs Q, I/Q vs frequency, magnitude/phase vs
-frequency, all with optional deembedding and error bars.
+frequency, all with optional deembedding or phase centering and error bars.
 """
 
 import numpy as np
 from ._common import (_get_pyplot, _compute_mag_phase, _propagate_errors_mag,
-                       _apply_deembedding, ERROR_FILL_STYLE, _resolve_label,
+                       _apply_deembed, _apply_phase_center,
+                       ERROR_FILL_STYLE, _resolve_label,
                        _normalise_iq, _compute_mag_phase_units, UNITS)
 
 
@@ -42,10 +43,43 @@ def _extract_traces(sweep_data, tones=None):
     return traces
 
 
+def _apply_transforms(f, z, deembed, phase_center, ei=None, eq=None):
+    """Apply deembed and/or phase_center to a complex trace and errors.
+
+    Returns (z_out, ei_out, eq_out, deembed_params, phase_center_params).
+    ei_out/eq_out are None when the input errors are None.
+    """
+    d_params = None
+    pc_params = None
+    if deembed:
+        z, d_params = _apply_deembed(f, z, deembed)
+        # Deembedding divides by a complex baseline — scale errors by
+        # the same factor so they remain consistent with the signal.
+        if d_params is not None and ei is not None:
+            baseline_mag = np.abs(d_params['baseline'])
+            ei = ei / baseline_mag
+            eq = eq / baseline_mag
+    if phase_center:
+        z, pc_params = _apply_phase_center(z, phase_center)
+        # Phase centering is a translation + rotation — neither changes
+        # the magnitude of the error, so ei/eq are unchanged.
+    return z, ei, eq, d_params, pc_params
+
+
+def _transform_title_suffix(deembed, phase_center):
+    """Return a parenthesised title suffix describing active transforms."""
+    parts = []
+    if deembed:
+        parts.append('deembedded')
+    if phase_center:
+        parts.append('phase-centered')
+    return f' ({", ".join(parts)})' if parts else ''
+
+
 def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
-               show_errors=True, multi_tone='overlay', fig=None, label=None,
-               units='raw', config=None, reference_plane='adc_input',
-               **kwargs):
+               phase_center=False, show_errors=True, multi_tone='overlay',
+               fig=None, label=None, units='raw', config=None,
+               reference_plane='adc_input', **kwargs):
     """
     General-purpose sweep plot.
 
@@ -54,23 +88,26 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             optionally 'sweep_ei', 'sweep_eq'.
         format: 'iq' | 'iq_vs_f' | 'magphase'
         tones: List of tone indices to plot, or None for all.
-        deembed: bool, apply deembedding (cable delay + centering + rotation).
+        deembed: bool, apply true RF deembedding (cable delay removal +
+            baseline normalisation).  Off-resonance → (1, 0).
+        phase_center: bool, apply phase centering (circle centering +
+            rotation).  Applied after deembedding when both are True.
         show_errors: bool, show error bars (line only, no caps).
         multi_tone: 'overlay' (shared axes) or 'grid' (one subplot per tone).
         fig: Existing figure. If None, create new.
         label: Legend label. If None, uses an auto-incrementing index.
         units: Unit for I/Q normalisation.  One of:
-            'raw' (default) – accumulator codes, no normalisation.
-            'peak' – normalise to the peak magnitude of the data.
-            'adc_fs' – fraction of ADC full-scale.
-            'dbfs' – dB relative to ADC full-scale.
-            'dbm' – estimated power in dBm at ``reference_plane``.
+            'raw' (default) - accumulator codes, no normalisation.
+            'peak' - normalise to the peak magnitude of the data.
+            'adc_fs' - fraction of ADC full-scale.
+            'dbfs' - dB relative to ADC full-scale.
+            'dbm' - estimated power in dBm at ``reference_plane``.
             All options except 'raw' and 'peak' require
             'system_information' in sweep_data.
         config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
         reference_plane: Reference plane used when ``units='dbm'``.  One of
-            'adc_input' (default) or 'cryostat_output'.  The latter deembeds
-            the RX analog chain using the frequency-dependent calibration
+            'adc_input' (default) or 'cryostat_output'.  The latter removes
+            the RX analog chain gain using the frequency-dependent calibration
             entries in ``config['rf_frontend']`` and ``config['cryostat']``;
             falls back to 'adc_input' with a warning if that cal is not
             available.  Ignored when ``units != 'dbm'``.
@@ -101,6 +138,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
     has_errors = show_errors and any(np.any(ei != 0) for _, _, _, ei, _, _ in traces)
     n_traces = len(traces)
     is_multi = n_traces > 1 and traces[0][5] is not None
+    suffix = _transform_title_suffix(deembed, phase_center)
 
     # Determine subplot layout
     if is_multi and multi_tone == 'grid':
@@ -115,8 +153,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             for i, (f, si, sq, ei, eq, tidx) in enumerate(traces):
                 ax = axes_flat[i]
                 z = si + 1j * sq
-                if deembed:
-                    z, _ = _apply_deembedding(f, z, deembed)
+                z, _, _, _, _ = _apply_transforms(f, z, deembed, phase_center)
                 trace_label = _resolve_label(ax, label, suffix=f'Tone {tidx}' if tidx is not None else None)
                 ax.plot(z.real, z.imag, linewidth=0.8, label=trace_label, **kwargs)
                 ax.set_aspect('equal', adjustable='datalim')
@@ -140,7 +177,8 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                 trace_label = _resolve_label(axes[i, 0], label,
                                              suffix=f'Tone {tidx}' if tidx is not None else None)
                 _plot_single_trace(axes[i, 0], axes[i, 1], f, si, sq, ei, eq,
-                                   format, deembed, has_errors, trace_label,
+                                   format, deembed, phase_center,
+                                   has_errors, trace_label,
                                    units=units, info=info, config=config,
                                    reference_plane=reference_plane,
                                    iq_label=iq_label, mag_label=mag_label,
@@ -158,8 +196,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             ax = fig.gca()
         for f, si, sq, ei, eq, tidx in traces:
             z = si + 1j * sq
-            if deembed:
-                z, _ = _apply_deembedding(f, z, deembed)
+            z, _, _, _, _ = _apply_transforms(f, z, deembed, phase_center)
             trace_label = _resolve_label(ax, label,
                                          suffix=f'Tone {tidx}' if tidx is not None else None)
             ax.plot(z.real, z.imag, linewidth=0.8, label=trace_label, **kwargs)
@@ -167,10 +204,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         ax.set_ylabel(f'Q {iq_label}'.strip())
         ax.set_aspect('equal', adjustable='datalim')
         ax.legend(fontsize='small')
-        title = 'S21 Complex Plane'
-        if deembed:
-            title += ' (deembedded)'
-        ax.set_title(title)
+        ax.set_title('S21 Complex Plane' + suffix)
         plt.tight_layout()
         return fig
 
@@ -184,7 +218,8 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         trace_label = _resolve_label(ax1, label,
                                      suffix=f'Tone {tidx}' if tidx is not None else None)
         _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
-                           format, deembed, has_errors, trace_label,
+                           format, deembed, phase_center,
+                           has_errors, trace_label,
                            units=units, info=info, config=config,
                            reference_plane=reference_plane,
                            iq_label=iq_label, mag_label=mag_label,
@@ -195,23 +230,22 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
 
     bw = sweep_data.get('bandwidth_hz')
     title = f'Sweep ({bw/1e6:.1f} MHz)' if bw else 'Sweep'
-    if deembed:
-        title += ' (deembedded)'
+    title += suffix
     fig.suptitle(title)
     plt.tight_layout()
     return fig
 
 
 def _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
-                        format, deembed, has_errors, label,
+                        format, deembed, phase_center,
+                        has_errors, label,
                         units='raw', info=None, config=None,
                         reference_plane='adc_input',
                         iq_label='', mag_label='|S21| (dB)', **kwargs):
     """Plot a single trace on a pair of axes."""
     z = si + 1j * sq
-    if deembed:
-        z, _ = _apply_deembedding(f, z, deembed)
-        si, sq = z.real, z.imag
+    z, ei, eq, _, _ = _apply_transforms(f, z, deembed, phase_center, ei, eq)
+    si, sq = z.real, z.imag
 
     f_mhz = f / 1e6
 

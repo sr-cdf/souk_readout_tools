@@ -13,7 +13,7 @@ signal paths.  It also includes RF component models that calculate transfer
 functions, total gain, and 1 dB compression points for the full signal chain.
 
 It also provides LNA bias monitoring and control for up to 14 cryogenic LNA
-channels (M17–M30).  Each channel can be read back (remote voltage, local
+channels (M17-M30).  Each channel can be read back (remote voltage, local
 voltage, bias current) and its bias set by targeting a local or remote
 voltage.  Channels are addressed via a two-level TCA9548 I2C switch tree.
 
@@ -21,7 +21,7 @@ Key hardware components on the module:
 
 | Component | Part | Notes |
 |-----------|------|-------|
-| Variable attenuator | ZX76-31R5A-PNS+ | 0–31.5 dB in 0.5 dB steps |
+| Variable attenuator | ZX76-31R5A-PNS+ | 0-31.5 dB in 0.5 dB steps |
 | Amplifier | ZX60-53LNB-S+ | 20.2 dB gain, bypassable |
 | Filter | BFCV-2895 | 1.8 dB insertion loss |
 | Equalizer | VEQY-5-63+ | 3.5 dB insertion loss |
@@ -132,7 +132,7 @@ print(f"TX input 1dB comp: {tx_transfer.input_1dB_comp:.1f} dBm")
 ### RUDAT USB attenuator
 
 The `rudat.py` module provides a stateless USB driver for Mini-Circuits
-RUDAT-6000-30 programmable attenuators.  Range is 0–30 dB in 0.25 dB steps.
+RUDAT-6000-30 programmable attenuators.  Range is 0-30 dB in 0.25 dB steps.
 
 ```python
 from souk_readout_tools.server.rudat import find_rudats, Attenuator
@@ -177,7 +177,7 @@ python -m souk_readout_tools.server.rudat
 
 `souk_lna_bias_control_monitor.py` provides the `SOUKLNABiasControlMonitor`
 class, which monitors and controls bias for up to 14 LNA channels (reference
-designators M17–M30).  Channels are multiplexed via a root/leaf pair of
+designators M17-M30).  Channels are multiplexed via a root/leaf pair of
 TCA9548 I2C switches.
 
 ```python
@@ -322,7 +322,7 @@ calibration chain gains, rather than trial-and-error hardware probing.
 
 The analog adjustment order is:
 1. Enable TX amplifier (maximum analog gain)
-2. Set minimum required programmable attenuation (0–31.5 dB)
+2. Set minimum required programmable attenuation (0-31.5 dB)
 3. If insufficient, bypass TX amplifier
 4. As a last resort, use RFDC DAC DSA (up to 12 dB)
 

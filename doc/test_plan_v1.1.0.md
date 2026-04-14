@@ -801,7 +801,7 @@ for r in fit_results[:5]:
           f"rms={r.residual_rms:.2e}, success={r.success}")
 ```
 - [ ] Most fits converge (`success=True`)
-- [ ] `Ql` values are physically reasonable (typically 1e3–1e6 for MKIDs)
+- [ ] `Ql` values are physically reasonable (typically 1e3-1e6 for MKIDs)
 - [ ] `Qi > Ql` (internal Q should exceed loaded Q)
 - [ ] `residual_rms` is small relative to the dip depth
 - [ ] Fitted `fr` values agree with peak-finder frequencies to within a linewidth
@@ -1110,7 +1110,7 @@ sweep1 = c1.wideband_sweep()
 | Wideband sweep + progress | 1.10, 1.11, 4.1 |
 | Wideband sweep auto power | 1.10b |
 | RX tone powers | 1.10c |
-| RF peripheral control | 2.1–2.5 |
+| RF peripheral control | 2.1-2.5 |
 | Power optimisation | 2.6b |
 | Attenuator backend switching | 2.7 |
 | LNA bias control | 2.8 |
@@ -1130,7 +1130,7 @@ sweep1 = c1.wideband_sweep()
 | ParameterSweep | 4.12 |
 | TimedMeasurement | 4.13 |
 | ConditionalMeasurement | 4.14 |
-| Dual pipeline | 5.1–5.3 |
+| Dual pipeline | 5.1-5.3 |
 | CLI: `souk-batch-snapshots` | 1.9 |
 | CLI: `souk-find-resonances` | 4.4, 4.7 |
 | CLI: `souk-wideband_sweep` | 1.11 |

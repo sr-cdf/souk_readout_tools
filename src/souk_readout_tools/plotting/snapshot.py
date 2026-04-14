@@ -11,12 +11,14 @@ overlay on shared axes.
 
 import numpy as np
 from ._common import (_get_pyplot, _compute_mag_phase, ERRORBAR_STYLE, _resolve_label,
+                       _apply_deembed, _apply_phase_center,
                        _normalise_iq, _compute_mag_phase_units, UNITS)
 from ._psd import compute_psd, compute_psd_averaged, compute_psd_concatenated
 
 
 def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
-                   deembed=False, fig=None, label=None,
+                   deembed=False, phase_center=False,
+                   fig=None, label=None,
                    units='raw', config=None, system_info=None, **kwargs):
     """
     Plot snapshot data for a single tone.
@@ -29,15 +31,19 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             'concatenate': join all end-to-end
             'overlay': plot each snapshot as a separate trace
             'mean': plot mean across snapshots
-        deembed: bool or deembed params dict.
+        deembed: bool or deembed params dict.  Applies true RF
+            deembedding (baseline normalisation).
+        phase_center: bool or phase-centering params dict.  Applies
+            circle centering and rotation.  Applied after deembedding
+            when both are set.
         fig: Existing figure.
         label: Legend label. If None, uses an auto-incrementing index.
         units: Unit for I/Q normalisation.  One of:
-            'raw' (default) – accumulator codes, no normalisation.
-            'peak' – normalise to the peak magnitude of the data.
-            'adc_fs' – fraction of ADC full-scale.
-            'dbfs' – dB relative to ADC full-scale.
-            'dbm' – estimated ADC input power in dBm.
+            'raw' (default) - accumulator codes, no normalisation.
+            'peak' - normalise to the peak magnitude of the data.
+            'adc_fs' - fraction of ADC full-scale.
+            'dbfs' - dB relative to ADC full-scale.
+            'dbm' - estimated ADC input power in dBm.
             All options except 'raw' and 'peak' require system_info.
         config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
         system_info: system_information dict.  Looked up from
@@ -83,8 +89,9 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             "Use 'concatenate', 'overlay', or 'mean'.")
 
     if deembed:
-        from ._common import _apply_deembedding
-        z_list = [_apply_deembedding(None, z, deembed)[0] for z in z_list]
+        z_list = [_apply_deembed(None, z, deembed)[0] for z in z_list]
+    if phase_center:
+        z_list = [_apply_phase_center(z, phase_center)[0] for z in z_list]
 
     # Apply normalisation to complex arrays
     if units != 'raw':
