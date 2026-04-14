@@ -28,6 +28,7 @@ from .timestream import (
     plot_timestream,
     plot_timestream_psd,
     plot_timestream_on_resonance,
+    TT_CLOCK_HZ,
 )
 from .snapshot import (
     plot_snapshots,

@@ -119,7 +119,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                     z, _ = _apply_deembedding(f, z, deembed)
                 trace_label = _resolve_label(ax, label, suffix=f'Tone {tidx}' if tidx is not None else None)
                 ax.plot(z.real, z.imag, linewidth=0.8, label=trace_label, **kwargs)
-                ax.set_aspect('equal')
+                ax.set_aspect('equal', adjustable='datalim')
                 ax.set_title(f'Tone {tidx}')
                 ax.set_xlabel(f'I {iq_label}'.strip())
                 ax.set_ylabel(f'Q {iq_label}'.strip())
@@ -165,7 +165,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             ax.plot(z.real, z.imag, linewidth=0.8, label=trace_label, **kwargs)
         ax.set_xlabel(f'I {iq_label}'.strip())
         ax.set_ylabel(f'Q {iq_label}'.strip())
-        ax.set_aspect('equal')
+        ax.set_aspect('equal', adjustable='datalim')
         ax.legend(fontsize='small')
         title = 'S21 Complex Plane'
         if deembed:

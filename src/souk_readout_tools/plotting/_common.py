@@ -16,10 +16,11 @@ UNITS = ('raw', 'peak', 'adc_fs', 'dbfs', 'dbm')
 #   'cryostat_output' — power at the cryostat output, i.e. at the RX port of
 #                       the cryostat, deembedding the RX analog chain
 #                       (requires rf_frontend + cryostat calibration entries)
-VALID_REFERENCE_PLANES = ('adc_input', 'cryostat_output')
+VALID_REFERENCE_PLANES = ('adc_input', 'cryostat_output', 'detector')
 _REFERENCE_PLANE_LABELS = {
     'adc_input': 'ADC input',
     'cryostat_output': 'cryostat output',
+    'detector': 'detector',
 }
 
 # Directory that frequency-dependent cal files (referenced by filename in the
@@ -53,7 +54,14 @@ def _resolve_cal_value(value, frequencies=None):
         return None
     frequencies = np.asarray(frequencies, dtype=float)
     if isinstance(value, str):
-        cal_f, cal_db = np.loadtxt(os.path.join(_CAL_USER_DIR, value), ndmin=2).T
+        cal_path = os.path.join(_CAL_USER_DIR, value)
+        if not os.path.isfile(cal_path):
+            warnings.warn(
+                f"Calibration file '{cal_path}' not found — "
+                "calibration unavailable at plot time.",
+                RuntimeWarning, stacklevel=3)
+            return None
+        cal_f, cal_db = np.loadtxt(cal_path, ndmin=2).T
     else:
         cal_f, cal_db = np.array(value, ndmin=2).T
     flat = frequencies.ravel()
@@ -149,7 +157,7 @@ def _reference_plane_offset_db(reference_plane, frequencies, info, config):
     """
     if reference_plane == 'adc_input':
         return 0.0
-    if reference_plane == 'cryostat_output':
+    if reference_plane in ('cryostat_output', 'detector'):
         gain = _rx_chain_gain_db(frequencies, info, config)
         if gain is None:
             return None
@@ -347,13 +355,13 @@ def _normalise_iq(si, sq, units, info=None, config=None,
                 stacklevel=3,
             )
             units = 'dbfs'
-        elif reference_plane == 'cryostat_output':
+        elif reference_plane in ('cryostat_output', 'detector'):
             # Need the RX chain cal to deembed; warn and drop back to
             # adc_input if it's not available.
             if _reference_plane_offset_db(
                     reference_plane, frequencies, info, config) is None:
                 warnings.warn(
-                    "reference_plane='cryostat_output' requested but the "
+                    f"reference_plane='{reference_plane}' requested but the "
                     "RX analog chain calibration is not available in the "
                     "config — falling back to reference_plane='adc_input'.",
                     RuntimeWarning,

@@ -13,6 +13,37 @@ from ._common import (_get_pyplot, _compute_mag_phase, _apply_deembedding,
                        _normalise_iq, _compute_mag_phase_units, UNITS)
 from ._psd import compute_psd
 
+# PTP clock rate: telescope_time counts per second
+TT_CLOCK_HZ = 30720000
+
+
+def _build_x_axis(ts_data, x_axis='time'):
+    """Build x-axis array and label from timestream data.
+
+    Args:
+        ts_data: parsed timestream dict.
+        x_axis: 'time' (seconds from sample_rate), 'sample' (sample index),
+            'acc_count' (packet_counter), or 'telescope_time' (PTP seconds).
+
+    Returns:
+        (x_values, x_label) tuple.
+    """
+    n = ts_data.get('num_samples', len(next(iter(ts_data['i_data'].values()))))
+    if x_axis == 'time':
+        return np.arange(n) / ts_data['sample_rate'], 'Time (s)'
+    elif x_axis == 'sample':
+        return np.arange(n), 'Sample number'
+    elif x_axis == 'acc_count':
+        cnt = np.asarray(ts_data['packet_counter'], dtype=float)
+        return cnt, 'Accumulation count'
+    elif x_axis == 'telescope_time':
+        tt = np.asarray(ts_data['telescope_time'], dtype=float) / TT_CLOCK_HZ
+        return tt, 'Telescope time (s)'
+    else:
+        raise ValueError(
+            f"Unknown x_axis '{x_axis}'. "
+            "Use 'time', 'sample', 'acc_count', or 'telescope_time'.")
+
 
 def _get_tone_data(ts_data, tones=None):
     """
@@ -81,7 +112,7 @@ def _compute_freq_diss(ts_data, tone_key, i_arr, q_arr, sweep_data):
 def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     deembed=False, sweep_data=None, fig=None, label=None,
                     units='raw', config=None, reference_plane='adc_input',
-                    **kwargs):
+                    x_axis='time', **kwargs):
     """
     Plot timestream data in various formats.
 
@@ -97,20 +128,25 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         fig: Existing figure. If None, create new.
         label: Legend label. If None, uses an auto-incrementing index.
         units: Unit for I/Q normalisation.  One of:
-            'raw' (default) – accumulator codes, no normalisation.
-            'peak' – normalise to the peak magnitude of the data.
-            'adc_fs' – fraction of ADC full-scale.
-            'dbfs' – dB relative to ADC full-scale.
-            'dbm' – estimated power in dBm at ``reference_plane``.
+            'raw' (default) - accumulator codes, no normalisation.
+            'peak' - normalise to the peak magnitude of the data.
+            'adc_fs' - fraction of ADC full-scale.
+            'dbfs' - dB relative to ADC full-scale.
+            'dbm' - estimated power in dBm at ``reference_plane``.
             All options except 'raw' and 'peak' require
             'system_information' in ts_data.
         config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
         reference_plane: Reference plane used when ``units='dbm'``.  One of
-            'adc_input' (default) or 'cryostat_output'.  The latter
-            deembeds the RX analog chain using the calibration entries in
-            ``config['rf_frontend']`` and ``config['cryostat']`` at each
-            tone's frequency; falls back to 'adc_input' with a warning
-            if that cal is not available.
+            'adc_input' (default), 'cryostat_output', or 'detector'.
+            'cryostat_output'/'detector' deembed the RX analog chain using
+            the calibration entries in ``config['rf_frontend']`` and
+            ``config['cryostat']`` at each tone's frequency; falls back to
+            'adc_input' with a warning if that cal is not available.
+        x_axis: X-axis for time-domain formats.  One of:
+            'time' (default) - seconds from sample rate.
+            'sample' - sample index (0, 1, 2, ...).
+            'acc_count' - accumulation counter (packet_counter).
+            'telescope_time' - PTP telescope time in seconds.
         **kwargs: Passed to matplotlib plot calls.
 
     Returns:
@@ -119,8 +155,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
     plt = _get_pyplot()
     selected = _get_tone_data(ts_data, tones)
     sample_rate = ts_data['sample_rate']
-    n_samples = ts_data.get('num_samples', len(selected[0][1]))
-    t_axis = np.arange(n_samples) / sample_rate
+    x_values, x_label = _build_x_axis(ts_data, x_axis)
     info = ts_data.get('system_information')
 
     # Look up each selected tone's RF frequency for cal resolution.
@@ -173,7 +208,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     label=trace_label, **kwargs)
         ax.set_xlabel(f'I {iq_label}'.strip())
         ax.set_ylabel(f'Q {iq_label}'.strip())
-        ax.set_aspect('equal')
+        ax.set_aspect('equal', adjustable='datalim')
         ax.legend(fontsize='small')
         title = 'Timestream I vs Q'
         if deembed:
@@ -196,8 +231,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         if format == 'iq_vs_t':
             if deembed:
                 z, _ = _apply_deembedding(None, z, deembed)
-            ax1.plot(t_axis, z.real, linewidth=0.5, label=trace_label, **kwargs)
-            ax2.plot(t_axis, z.imag, linewidth=0.5, label=trace_label, **kwargs)
+            ax1.plot(x_values, z.real, linewidth=0.5, label=trace_label, **kwargs)
+            ax2.plot(x_values, z.imag, linewidth=0.5, label=trace_label, **kwargs)
             ax1.set_ylabel(f'I {iq_label}'.strip())
             ax2.set_ylabel(f'Q {iq_label}'.strip())
 
@@ -205,16 +240,16 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             if deembed:
                 z, _ = _apply_deembedding(None, z, deembed)
             mag_db, phase = _compute_mag_phase_units(z, units, info=info, config=config)
-            ax1.plot(t_axis, mag_db, linewidth=0.5, label=trace_label, **kwargs)
-            ax2.plot(t_axis, phase, linewidth=0.5, label=trace_label, **kwargs)
+            ax1.plot(x_values, mag_db, linewidth=0.5, label=trace_label, **kwargs)
+            ax2.plot(x_values, phase, linewidth=0.5, label=trace_label, **kwargs)
             ax1.set_ylabel(mag_label)
             ax2.set_ylabel('Phase (rad)')
 
         elif format == 'freq_diss':
             frac_f, frac_d = _compute_freq_diss(ts_data, key, i_arr, q_arr,
                                                  sweep_data)
-            ax1.plot(t_axis, frac_f, linewidth=0.5, label=trace_label, **kwargs)
-            ax2.plot(t_axis, frac_d, linewidth=0.5, label=trace_label, **kwargs)
+            ax1.plot(x_values, frac_f, linewidth=0.5, label=trace_label, **kwargs)
+            ax2.plot(x_values, frac_d, linewidth=0.5, label=trace_label, **kwargs)
             ax1.set_ylabel('Fractional frequency shift')
             ax2.set_ylabel('Fractional dissipation shift')
 
@@ -223,7 +258,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                 f"Unknown format '{format}'. "
                 "Use 'iq', 'iq_vs_t', 'magphase', or 'freq_diss'.")
 
-    ax2.set_xlabel('Time (s)')
+    ax2.set_xlabel(x_label)
     ax1.legend(fontsize='small')
     ax2.legend(fontsize='small')
     title_map = {
@@ -336,6 +371,8 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
 
 def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
                                   deembed=False, fig=None, label=None,
+                                  units='raw', config=None,
+                                  reference_plane='adc_input',
                                   **kwargs):
     """
     Overplot timestream I/Q points on the resonance circle from sweep data.
@@ -348,6 +385,14 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
         fig: Existing figure.
         label: Legend label for the timestream points. If None, uses
             'Timestream'.
+        units: Unit for I/Q normalisation.  One of:
+            'raw' (default) - accumulator codes, no normalisation.
+            'peak' - normalise to the peak magnitude of the data.
+            'adc_fs' - fraction of ADC full-scale (linear voltage).
+            'dbfs' - dB relative to ADC full-scale.
+            'dbm' - estimated power in dBm at ``reference_plane``.
+        config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
+        reference_plane: Reference plane used when ``units='dbm'``.
         **kwargs: Passed to plot calls.
 
     Returns:
@@ -356,7 +401,6 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     plt = _get_pyplot()
     selected = _get_tone_data(ts_data, tones=[tone_index])
     key, i_arr, q_arr = selected[0]
-    z_ts = i_arr + 1j * q_arr
 
     # Extract sweep trace for this tone
     sf = np.atleast_2d(sweep_data['sweep_f'])
@@ -366,10 +410,27 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     is_wideband = sweep_data.get('wideband_sweep', False)
     if is_wideband or sf.shape[0] == 1:
         sweep_f = sf[0]
-        z_sweep = si[0] + 1j * sq[0]
+        sw_i, sw_q = si[0].copy(), sq[0].copy()
     else:
         sweep_f = sf[:, tone_index]
-        z_sweep = si[:, tone_index] + 1j * sq[:, tone_index]
+        sw_i, sw_q = si[:, tone_index].copy(), sq[:, tone_index].copy()
+
+    # Normalise both sweep and timestream with the same units
+    info = ts_data.get('system_information') or sweep_data.get('system_information')
+    iq_label = ''
+    if units != 'raw':
+        tone_f = np.mean(sweep_f) if sweep_f is not None else None
+        if units != 'peak' and (info is None or not isinstance(info, dict)):
+            raise ValueError("data must contain 'system_information' for non-raw units.")
+        i_arr, q_arr, _, _, iq_label, _ = _normalise_iq(
+            i_arr, q_arr, units, info, config=config,
+            reference_plane=reference_plane, frequencies=tone_f)
+        sw_i, sw_q, _, _, _, _ = _normalise_iq(
+            sw_i, sw_q, units, info, config=config,
+            reference_plane=reference_plane, frequencies=sweep_f)
+
+    z_ts = i_arr + 1j * q_arr
+    z_sweep = sw_i + 1j * sw_q
 
     deembed_params = None
     if deembed:
@@ -389,9 +450,9 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     ax.plot(z_ts.real, z_ts.imag, '.', markersize=1, alpha=0.3,
             color='C1', label=ts_label, zorder=1, **kwargs)
 
-    ax.set_xlabel('I')
-    ax.set_ylabel('Q')
-    ax.set_aspect('equal')
+    ax.set_xlabel(f'I {iq_label}'.strip())
+    ax.set_ylabel(f'Q {iq_label}'.strip())
+    ax.set_aspect('equal', adjustable='datalim')
     ax.legend()
     title = f'Tone {tone_index} — Resonance Circle'
     if deembed:

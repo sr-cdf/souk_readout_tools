@@ -107,7 +107,7 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             ax.plot(z.real, z.imag, '.', markersize=1, label=trace_label, **kwargs)
         ax.set_xlabel(f'I {iq_label}'.strip())
         ax.set_ylabel(f'Q {iq_label}'.strip())
-        ax.set_aspect('equal')
+        ax.set_aspect('equal', adjustable='datalim')
         ax.legend(fontsize='small')
         ax.set_title(f'Tone {tone_index} — I vs Q')
         plt.tight_layout()
@@ -265,7 +265,7 @@ def plot_batch_snapshots(batch_data, format='iq_vs_t', repetitions='concatenate'
 
             ax.plot(z.real, z.imag, '.', markersize=1,
                     label=_resolve_label(ax, label), **kwargs)
-            ax.set_aspect('equal')
+            ax.set_aspect('equal', adjustable='datalim')
             ax.set_ylabel(f'Tone {tidx}\n({freqs[tidx]/1e6:.3f} MHz)')
             ax.legend(fontsize='small')
             if row == n_tones - 1:
