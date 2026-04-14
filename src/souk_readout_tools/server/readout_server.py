@@ -741,6 +741,8 @@ class ReadoutServer:
         print(f'Found config file: {config_file}')
         self.config = config
         self.config_file = config_file
+        with open(config_file, 'r') as file:
+            self.config_raw_text = file.read()
 
         return config
     
@@ -947,7 +949,8 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'pull_config':
-                    await self.send_response(writer, {'status': 'success', 'config_filename': self.config_file, 'config_contents': yaml.dump(self.config,sort_keys=False)})
+                    config_text = getattr(self, 'config_raw_text', None) or yaml.dump(self.config, sort_keys=False)
+                    await self.send_response(writer, {'status': 'success', 'config_filename': self.config_file, 'config_contents': config_text})
 
                 elif request == 'set_default_config':
                     config_filename = message.get('config_filename')

@@ -320,6 +320,7 @@ class ReadoutClient:
         response = self.send_request(message)
         if response['status'] == 'success':
             config_contents = response['config_contents']
+            self.config_raw_text = config_contents
             self.config = yaml.safe_load(config_contents)
             self.pipeline_id = self.config.get('firmware', {}).get('pipeline_id', 0)
             print(f'Config pulled from server (pipeline {self.pipeline_id})')
@@ -378,6 +379,7 @@ class ReadoutClient:
         self.config_dir = os.path.dirname(filename)
 
         # Write any in-memory calibration files and rewrite config paths
+        config_text = getattr(self, 'config_raw_text', None)
         if self.calibration_files:
             local_cal_dir = os.path.join(self.config_dir, 'calibrations')
             os.makedirs(local_cal_dir, exist_ok=True)
@@ -392,10 +394,16 @@ class ReadoutClient:
                     continue
                 basename = os.path.basename(value)
                 if basename in self.calibration_files:
-                    self.config[section][key] = os.path.join('calibrations', basename)
+                    new_path = os.path.join('calibrations', basename)
+                    if config_text is not None:
+                        config_text = config_text.replace(value, new_path)
+                    self.config[section][key] = new_path
 
         with open(filename, 'w') as f:
-            yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
+            if config_text is not None:
+                f.write(config_text)
+            else:
+                yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
         print(f'Config saved to {filename}')
 
     def push_config(self, push_calibration_files=True):
