@@ -196,7 +196,7 @@ from souk_readout_tools.config_utils import copy_template_config
 
 ensure_pipeline_dirs(0)
 copy_template_config(
-    config_file='/home/casper/.souk_readout_tools/pipeline_0/config/p0_config.yaml',
+    destination='/home/casper/.souk_readout_tools/pipeline_0/config/p0_config.yaml',
     pipeline_id=0,
     config_id='souk_krm_pipeline0',
     created_by='myself',
@@ -205,7 +205,7 @@ copy_template_config(
 
 ensure_pipeline_dirs(1)
 copy_template_config(
-    config_file='/home/casper/.souk_readout_tools/pipeline_1/config/p1_config.yaml',
+    destination='/home/casper/.souk_readout_tools/pipeline_1/config/p1_config.yaml',
     pipeline_id=1,
     config_id='souk_krm_pipeline1',
     created_by='myself',
