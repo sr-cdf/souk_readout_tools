@@ -1,13 +1,26 @@
 import sys
 import os
 import traceback
+import logging
+import signal
+import faulthandler
 
-try:
-    from importlib.resources import  files  # Python 3.9+
-except ImportError:
-    from importlib_resources import  files  # Python < 3.9
+# Enable faulthandler to get tracebacks on segfaults
+faulthandler.enable()
+
+from importlib.resources import files
 
 import numpy as np
+
+# Configure logging - set to WARNING for normal use, DEBUG for troubleshooting
+# Set MKID_FINDER_DEBUG=1 environment variable for debug output
+_log = logging.getLogger(__name__)
+_log_level = logging.DEBUG if os.environ.get('MKID_FINDER_DEBUG') else logging.WARNING
+_log.setLevel(_log_level)
+if not _log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+    _log.addHandler(_handler)
 
 from scipy.signal import butter, filtfilt, find_peaks, peak_widths
 from scipy.ndimage import median_filter
@@ -39,7 +52,7 @@ try:
 except AttributeError:
     StepType = QAbstractSpinBox.DefaultStepType
 
-from PyQt5.QtCore import Qt, QSettings, QByteArray, QPoint, QTimer, QEvent, QItemSelection, QItemSelectionModel,QRegExp,QPropertyAnimation
+from PyQt5.QtCore import Qt, QSettings, QByteArray, QPoint, QTimer, QEvent, QItemSelection, QItemSelectionModel, QRegExp, QPropertyAnimation, QThread, pyqtSignal, QObject
 from PyQt5.QtGui import QIcon,QRegExpValidator,QPixmap,QPainter
 from PyQt5 import QtGui
 
@@ -86,10 +99,10 @@ class Resonance:
 
     def analyse(self, frequencies, logmag_data, filtered_data, peak_direction, peak_idx):
         """Perform analysis and store results."""
-        print(f'Resonance, analyse, {frequencies[peak_idx]/1e6}')
+        _log.debug(f'Resonance.analyse at {frequencies[peak_idx]/1e6:.3f} MHz')
         self.peak_idx = peak_idx
         i_p1 = min(len(frequencies)-1, peak_idx + 1)
-        i_n1 = min(0, peak_idx - 1)
+        i_n1 = max(0, peak_idx - 1)
 
         self.frequency = frequencies[peak_idx]
         frequency_step = (frequencies[i_p1] - frequencies[i_n1]) / (i_p1 - i_n1)
@@ -107,7 +120,7 @@ class Resonance:
             dip_depth = max(logmag_data[mask]) - min(logmag_data[mask])
             
         except Exception as e:
-            print(f"Error in analyse method: {e}")
+            _log.warning(f"Error in analyse method: {e}")
             width_hz = frequency_step
             fwhm = width_hz
             q_factor = self.frequency / fwhm
@@ -173,7 +186,7 @@ class DataLoader():
         else:
             QMessageBox.warning(None, "Error", f"File type not supported: {ext}")
             return None,None
-        print(f'loaded {len(f)} points, shape={f.shape}')
+        _log.debug(f'loaded {len(f)} points, shape={f.shape}')
 
         return f,z
 
@@ -196,15 +209,15 @@ class DataLoader():
         return frequencies, s21_complex
 
     def load_from_npy(self, filename):
-        print(filename)
+        _log.debug(f'Loading npy file: {filename}')
         data = np.load(filename,allow_pickle=True)
         if data.dtype == np.object_:
             #try load readout_client sweep
             data = data.item()
             try:
-                print(data.keys())
-                f = data['sweep_f']
-                z = data['sweep_i']+1j*data['sweep_q']    
+                _log.debug(f'npy keys: {data.keys()}')
+                f = np.atleast_1d(data['sweep_f']).ravel()
+                z = np.atleast_1d(data['sweep_i']).ravel()+1j*np.atleast_1d(data['sweep_q']).ravel()    
             except Exception as e:
                     QMessageBox.warning(None, "Error", "Failed to interpret file as a sweep: "+filename)
                     raise(e)
@@ -236,7 +249,7 @@ class DataLoader():
             frequencies = data[:, 0]
             s21_complex = data[:, 1] + 1j * data[:, 2]
         except Exception as e:
-            print(f'not a txt file with columns = f,i,q: {e}')  
+            _log.error(f'not a txt file with columns = f,i,q: {e}')  
             QMessageBox.warning(None, "Error", f'not a txt file with columns = f,i,q: {e}')
             raise(e)
         return frequencies, s21_complex
@@ -291,7 +304,7 @@ class FilterManager():
         self.median_kernel_size = int(value)
 
     def filter_data(self, data):
-        print('filter_data')
+        _log.debug('filter_data')
         self.align_with_sample_interval(len(data))
         data = self.perform_highpass(data, self.highpass_edge)
         data = self.perform_lowpass(data, self.lowpass_edge)
@@ -299,7 +312,7 @@ class FilterManager():
         return data
 
     def align_with_sample_interval(self, num_samples):
-        print('align_with_sample_interval')
+        _log.debug('align_with_sample_interval')
         # self.highpass_edge = self.highpass_edge %  (1./num_samples)
         # self.lowpass_edge = self.lowpass_edge % (1./num_samples)
 
@@ -397,7 +410,7 @@ class PeakFinderManager():
 
 
     def perform_find_peaks(self, data):
-        print('perform_find_peaks',data)
+        _log.debug(f'perform_find_peaks, data shape={data.shape if hasattr(data,"shape") else len(data)}')
         params = self.get_finder_params()
         prominence = (params['prominence_min'], params['prominence_max']) if params['prominence_enabled'] else None
         width = (params['width_min'], params['width_max']) if params['width_enabled'] else None
@@ -411,7 +424,7 @@ class PeakFinderManager():
         distance = max(1,distance/frequency_stepsize) if distance is not None else None
 
         try:
-            print('find_peaks')
+            _log.debug('calling find_peaks')
             peaks, properties = find_peaks(
                 data * peak_direction,
                 prominence=prominence,
@@ -426,10 +439,157 @@ class PeakFinderManager():
 
         except Exception as e:
             tb=traceback.format_exc()
-            print(f"Error in find_peaks: {e}\n{tb}")
+            _log.error(f"Error in find_peaks: {e}\n{tb}")
             raise(e)
 
     
+
+class AnalysisWorker(QObject):
+    """
+    Worker that runs filtering, peak finding, and resonance analysis in a background thread.
+    Emits signals when done so the UI can update.
+    """
+    finished = pyqtSignal(object)  # Emits analysis results or Exception
+    progress = pyqtSignal(str)     # Emits status messages
+    
+    def __init__(self, filter_manager, peak_finder_manager, raw_data, frequencies, log_magnitude, params):
+        super().__init__()
+        self.filter_manager = filter_manager
+        self.peak_finder_manager = peak_finder_manager
+        self.raw_data = raw_data
+        self.frequencies = frequencies
+        self.log_magnitude = log_magnitude
+        self.params = params
+        self._cancelled = False
+    
+    def cancel(self):
+        self._cancelled = True
+    
+    def run(self):
+        try:
+            if self._cancelled:
+                self.finished.emit(None)  # Signal cancellation
+                return
+            
+            self.progress.emit("Applying filter...")
+            # Apply filtering
+            self.filter_manager.set_filter_params(self.params['filter_params'])
+            filtered_data = self.filter_manager.filter_data(self.raw_data)
+            
+            if self._cancelled:
+                self.finished.emit(None)  # Signal cancellation
+                return
+            
+            self.progress.emit("Finding peaks...")
+            # Find peaks
+            self.peak_finder_manager.set_finder_parameters(self.params['finder_params'])
+            result = self.peak_finder_manager.perform_find_peaks(filtered_data)
+            
+            if self._cancelled:
+                self.finished.emit(None)  # Signal cancellation
+                return
+            
+            if isinstance(result, Exception):
+                self.finished.emit(result)
+                return
+            
+            peaks, peak_properties = result
+            
+            if self._cancelled:
+                self.finished.emit(None)  # Signal cancellation
+                return
+            
+            self.progress.emit(f"Analyzing {len(peaks)} resonances...")
+            
+            # Vectorized analysis - do ALL peaks at once
+            analysis_results = self._analyze_all_peaks(
+                peaks, filtered_data, self.frequencies, self.log_magnitude,
+                self.params['finder_params']['peak_direction']
+            )
+            
+            if self._cancelled:
+                self.finished.emit(None)  # Signal cancellation
+                return
+            
+            self.finished.emit({
+                'filtered_data': filtered_data,
+                'peaks': peaks,
+                'peak_properties': peak_properties,
+                'analysis_results': analysis_results
+            })
+                
+        except Exception as e:
+            _log.exception(f"Error in analysis worker: {e}")
+            self.finished.emit(e)
+    
+    def _analyze_all_peaks(self, peaks, filtered_data, frequencies, log_magnitude, peak_direction):
+        """
+        Vectorized analysis of all peaks at once - much faster than individual calls.
+        Returns a dict of arrays with results for each peak.
+        """
+        if len(peaks) == 0:
+            return {
+                'frequencies': np.array([]),
+                'fwhm': np.array([]),
+                'q_factor': np.array([]),
+                'qc': np.array([]),
+                'qi': np.array([]),
+                'dip_depth': np.array([]),
+                'marker_mag': np.array([]),
+                'marker_filt': np.array([]),
+            }
+        
+        n_peaks = len(peaks)
+        freq_step = np.mean(np.abs(np.diff(frequencies[:100])))  # Approximate frequency step
+        
+        # Adjust data for peak direction (once, not per peak)
+        adjusted_data = peak_direction * filtered_data
+        
+        # Call peak_widths ONCE for all peaks - this is the key optimization
+        try:
+            results_half = peak_widths(adjusted_data, peaks, rel_height=0.5)
+            widths_samples = results_half[0]  # Width in samples for all peaks
+        except Exception as e:
+            _log.warning(f"peak_widths failed: {e}")
+            widths_samples = np.ones(n_peaks)
+        
+        # Vectorized calculations
+        peak_frequencies = frequencies[peaks]
+        widths_hz = widths_samples * freq_step
+        widths_hz = np.where(widths_hz > 0, widths_hz, freq_step)  # Avoid zeros
+        fwhm = widths_hz
+        q_factor = peak_frequencies / fwhm
+        
+        # Calculate dip depths - this still needs a loop but is fast
+        dip_depths = np.zeros(n_peaks)
+        for i, (peak_idx, fw) in enumerate(zip(peaks, fwhm)):
+            if self._cancelled:
+                break
+            half_width = 5 * fw / 2
+            mask = (frequencies < peak_frequencies[i] + half_width) & \
+                   (frequencies > peak_frequencies[i] - half_width)
+            if np.any(mask):
+                dip_depths[i] = np.max(log_magnitude[mask]) - np.min(log_magnitude[mask])
+        
+        # Vectorized Q calculations
+        with np.errstate(divide='ignore', invalid='ignore'):
+            qc = q_factor / (1 - 10**(-dip_depths/20))
+            qc = np.where(dip_depths > 0, qc, np.inf)
+            qi = 1 / (1/q_factor - 1/qc)
+            qi = np.where(np.isfinite(qi), qi, np.inf)
+        
+        return {
+            'peak_idx': peaks,
+            'frequencies': peak_frequencies,
+            'fwhm': fwhm,
+            'q_factor': q_factor,
+            'qc': qc,
+            'qi': qi,
+            'dip_depth': dip_depths,
+            'marker_mag': log_magnitude[peaks],
+            'marker_filt': filtered_data[peaks],
+        }
+
 
 class ResonanceFinderApp(QMainWindow):
     """
@@ -527,6 +687,12 @@ class ResonanceFinderApp(QMainWindow):
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.timeout.connect(self._doCoalescedRefresh)
+        self._batch_draw = False  # When True, defer draw_idle calls until batch ends
+
+        # Background analysis thread
+        self._analysis_thread = None
+        self._analysis_worker = None
+        self._analysis_pending = False  # True if new analysis requested while one is running
 
 
         # Build the UI
@@ -562,11 +728,21 @@ class ResonanceFinderApp(QMainWindow):
 
     def _doCoalescedRefresh(self):
         self._refresh_pending = False
-        self.refreshUI()
+        try:
+            self.refreshUI()
+        except Exception as e:
+            _log.exception(f"Error in _doCoalescedRefresh: {e}")
+
+    def _drawAllCanvases(self):
+        """Single combined draw call for all canvases."""
+        self.canvas_raw.draw_idle()
+        self.canvas_filtered.draw_idle()
+        self.canvas_active_raw.draw_idle()
+        self.canvas_active_filtered.draw_idle()
 
     #get started
     def loadSettings(self):
-        print('loadSettings')
+        _log.debug('loadSettings')
         self.is_loading_settings = True
         try:
             self.loadSettingsWindowGeometry()
@@ -579,12 +755,11 @@ class ResonanceFinderApp(QMainWindow):
             self.scheduleRefresh(0)
         except Exception as e:
             tb=traceback.format_exc()
-            print('Error loading settings:',e)
-            print(tb)
+            _log.error(f'Error loading settings: {e}\n{tb}')
         self.is_loading_settings = False
 
     def saveSettings(self):
-        print('saveSettings')
+        _log.debug('saveSettings')
         self.saveSettingsWindowGeometry()
         self.saveSettingsSplitterSizes()
         self.saveSettingsFilename()
@@ -594,60 +769,60 @@ class ResonanceFinderApp(QMainWindow):
         
 
     def loadSettingsWindowGeometry(self):
-        print('loadSettingsWindowGeometry')
+        _log.debug('loadSettingsWindowGeometry')
         self.settings.beginGroup("MainWindow")
         self.restoreGeometry(self.settings.value("geometry")) if self.settings.value("geometry") is not None else None
         self.restoreState(self.settings.value("windowState")) if self.settings.value("windowState") is not None else None
         self.settings.endGroup()
 
     def saveSettingsWindowGeometry(self):
-        print('saveSettingsWindowGeometry')
+        _log.debug('saveSettingsWindowGeometry')
         self.settings.beginGroup("MainWindow")
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("windowState", self.saveState())
         self.settings.endGroup()
 
     def loadSettingsSplitterSizes(self):
-        print('loadSettingsSplitterSizes')
+        _log.debug('loadSettingsSplitterSizes')
         self.settings.beginGroup("MainWindow")
         splitter_sizes = self.settings.value("splitterSizes", defaultValue=[200, 200],type=int)
         self.hsplitter.setSizes(splitter_sizes)
         self.settings.endGroup()
 
     def saveSettingsSplitterSizes(self):
-        print('saveSettingsSplitterSizes')
+        _log.debug('saveSettingsSplitterSizes')
         self.settings.beginGroup("MainWindow")
         self.settings.setValue("splitterSizes", self.hsplitter.sizes())
         self.settings.endGroup()
 
     def loadSettingsFilename(self):
-        print('loadSettingsFilename')
+        _log.debug('loadSettingsFilename')
         self.settings.beginGroup("Analysis")
         filename = self.settings.value("filename", defaultValue=None)
         self.settings.endGroup()
         self.filename = filename
         
     def saveSettingsFilename(self):
-        print('saveSettingsFilename')
+        _log.debug('saveSettingsFilename')
         self.settings.beginGroup("Analysis")
         self.settings.setValue("filename", self.filename if self.filename is not None else '')
         self.settings.endGroup()
 
     def loadSettingsActiveFormat(self):
-        print('loadSettingsActiveFormat')
+        _log.debug('loadSettingsActiveFormat')
         self.settings.beginGroup('Analysis')
         active_format = self.settings.value('active_format', 'Log Magnitude dB')
         self.settings.endGroup()
         self.active_format = active_format
 
     def saveSettingsActiveFormat(self):
-        print('saveSettingsActiveFormat')
+        _log.debug('saveSettingsActiveFormat')
         self.settings.beginGroup('Analysis')
         self.settings.setValue('active_format', self.active_format)
         self.settings.endGroup()
 
     def loadSettingsFilterParameters(self):
-        print('loadSettingsFilterParameters')
+        _log.debug('loadSettingsFilterParameters')
         self.settings.beginGroup('Filter')
         highpass_edge = self.settings.value('highpass_edge', 0.0, type=float)
         lowpass_edge = self.settings.value('lowpass_edge', 1.0, type=float)
@@ -657,7 +832,7 @@ class ResonanceFinderApp(QMainWindow):
         self.filterManager.set_filter_params(params)
         
     def saveSettingsFilterParameters(self):
-        print('saveSettingsFilterParameters')
+        _log.debug('saveSettingsFilterParameters')
         params = self.filterManager.get_filter_params()
         self.settings.beginGroup('Filter')
         self.settings.setValue('highpass_edge', params['highpass_edge'])
@@ -666,7 +841,7 @@ class ResonanceFinderApp(QMainWindow):
         self.settings.endGroup()
     
     def loadSettingsFinderParameters(self):
-        print('loadSettingsFinderParameters')
+        _log.debug('loadSettingsFinderParameters')
         for format in self.analysis_formats:
             self.settings.beginGroup(f'Finder/{format}')
             params = {
@@ -692,8 +867,77 @@ class ResonanceFinderApp(QMainWindow):
         active_params = self.peak_finder_params[self.active_format]
         self.peakFinderManager.set_finder_parameters(active_params)
 
+    def apply_cli_overrides(self, args):
+        """Apply command-line argument overrides to settings and refresh UI."""
+        changed = False
+
+        if args.format:
+            format_map = {
+                'lin_mag': 'Lin Magnitude V',
+                'log_mag': 'Log Magnitude dB',
+                'phase': 'Phase rad',
+                'unwrapped_phase': 'Unwrapped Phase rad',
+                'group_delay': 'Group Delay us (-dphi/df)',
+                'complex_gradient': 'Complex Gradient V/Hz (speed)',
+                'sin_iq': 'Sin(IQ,dIdQ) (?)',
+            }
+            self.active_format = format_map[args.format]
+            changed = True
+
+        # Filter overrides
+        filter_params = self.filterManager.get_filter_params()
+        if args.highpass is not None:
+            filter_params['highpass_edge'] = args.highpass
+            changed = True
+        if args.lowpass is not None:
+            filter_params['lowpass_edge'] = args.lowpass
+            changed = True
+        if args.median_kernel is not None:
+            filter_params['median_kernel_size'] = args.median_kernel
+            changed = True
+        self.filterManager.set_filter_params(filter_params)
+
+        # Peak finder overrides (applied to active format)
+        finder_params = self.peak_finder_params[self.active_format]
+        if args.prominence_min is not None:
+            finder_params['prominence_enabled'] = True
+            finder_params['prominence_min'] = args.prominence_min
+            changed = True
+        if args.prominence_max is not None:
+            finder_params['prominence_enabled'] = True
+            finder_params['prominence_max'] = args.prominence_max
+            changed = True
+        if args.width_min is not None:
+            finder_params['width_enabled'] = True
+            finder_params['width_min'] = args.width_min
+            changed = True
+        if args.width_max is not None:
+            finder_params['width_enabled'] = True
+            finder_params['width_max'] = args.width_max
+            changed = True
+        if args.distance is not None:
+            finder_params['distance_enabled'] = True
+            finder_params['distance_value'] = args.distance
+            changed = True
+        if args.direction is not None:
+            finder_params['peak_direction'] = 1 if args.direction == 'peaks' else -1
+            changed = True
+        self.peakFinderManager.set_finder_parameters(finder_params)
+
+        # Sync UI to reflect overrides and reprocess
+        if changed:
+            self.setUIAnalysisFormat()
+            if len(self.frequencies) > 0:
+                self.applyFiltering()
+                self.updateResonances()
+                self.scheduleRefresh(0)
+
+        # Load file (overrides saved filename, triggers its own reprocessing)
+        if args.sweep_file:
+            self.loadFile(args.sweep_file)
+
     def saveSettingsFinderParameters(self):
-        print('saveSettingsFinderParameters')
+        _log.debug('saveSettingsFinderParameters')
         for format, params in self.peak_finder_params.items():
             self.settings.beginGroup(f'Finder/{format}')
             for key, value in params.items():
@@ -704,14 +948,14 @@ class ResonanceFinderApp(QMainWindow):
     
 
     def loadFile(self,filename=None):
-        print('loadFile')
+        _log.debug('loadFile')
         if not filename:
             filename = self.filename
         if not filename:
-            print('No filename provided')
+            _log.debug('No filename provided')
             return
         try:
-            print('loading',filename)
+            _log.info(f'loading {filename}')
             self.frequencies, self.s21_complex = self.dataLoader.load_file(filename)
             self.filename = filename
             self.saveSettingsFilename()
@@ -730,15 +974,15 @@ class ResonanceFinderApp(QMainWindow):
             
 
     def postLoadDataSetup(self):
-        print('postLoadDataSetup')
+        _log.debug('postLoadDataSetup')
     
     def handleLoadError(self, e):
         tb=traceback.format_exc()
-        print(f"Error loading file: {e}\n{tb}")
+        _log.error(f"Error loading file: {e}\n{tb}")
         QMessageBox.warning(None, "Error", f"Error loading file: {e}\n{tb}")
 
     def updateDataArrays(self):
-        print('updateDataArrays')
+        _log.debug('updateDataArrays')
         self.frequency_stepsize = np.mean(median_filter(np.diff(self.frequencies),3))
         self.magnitude = np.abs(self.s21_complex)
         self.log_magnitude = 20*np.log10(self.magnitude)
@@ -750,14 +994,14 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def applyFiltering(self):
-        print('applyFiltering')
+        _log.debug('applyFiltering')
         raw_data = self.getDataToFilter() 
         filter_params = self.getFilterParameters()
         self.filterManager.set_filter_params(filter_params)
         self.filtered_data = self.filterManager.filter_data(raw_data)
     
     def getDataToFilter(self):
-        print('getDataToFilter')
+        _log.debug('getDataToFilter')
         analysis_format = self.active_format
 
         if analysis_format == "Lin Magnitude V":
@@ -775,35 +1019,35 @@ class ResonanceFinderApp(QMainWindow):
         elif analysis_format == "sin(IQ,didq)":
             data = self.sin_di_dq.copy()
         else:
-            print(analysis_format,'?')
+            _log.debug(f'Unknown format: {analysis_format}, using log_magnitude')
             data = self.log_magnitude.copy()
         return data
         
     def getFilterParameters(self):
-        print('getFilterParameters')
+        _log.debug('getFilterParameters')
         return self.filterManager.get_filter_params()
     
     def setFilterParams(self,params):
-        print('setFilterParams')
+        _log.debug('setFilterParams')
         self.filterManager.set_filter_params(params)
     
 
     def updateResonances(self):
-        print('updateResonances')
+        _log.debug('updateResonances')
         self.performPeakFinding()
         self.updateResonancesList()
         self.updateResonanceNames()
 
 
     def performPeakFinding(self):
-        print('performPeakFinding')
+        _log.debug('performPeakFinding')
         # self.getPeakFinderParameters()
         params = self.peak_finder_params[self.active_format]
-        print(self.frequency_stepsize,type(self.frequency_stepsize))
+        _log.debug(f'frequency_stepsize={self.frequency_stepsize}, type={type(self.frequency_stepsize)}')
         params['frequency_stepsize'] = self.frequency_stepsize
         self.peakFinderManager.set_finder_parameters(params)
         result = self.peakFinderManager.perform_find_peaks(self.filtered_data)
-        print(result)
+        _log.debug(f'Peak finding result: {len(result[0]) if result else 0} peaks')
         if type(result) is Exception:
             raise result
         else:
@@ -812,7 +1056,7 @@ class ResonanceFinderApp(QMainWindow):
             self.peak_properties = peak_properties
 
     def updateResonancesList(self):
-        print('updateResonancesList')
+        _log.debug('updateResonancesList')
         # Save old resonances to match with new peaks
         old_resonances = self.resonances.copy()
         self.resonances.clear()
@@ -846,6 +1090,152 @@ class ResonanceFinderApp(QMainWindow):
         self.refreshResonancesTable(full=True)
 
         return
+
+    def startBackgroundAnalysis(self):
+        """Start filtering, peak finding, and analysis in a background thread."""
+        _log.debug('startBackgroundAnalysis')
+        
+        # If analysis is already running, mark that we need to restart
+        if self._analysis_thread is not None and self._analysis_thread.isRunning():
+            _log.debug('Analysis already running, will restart after completion')
+            self._analysis_pending = True
+            if self._analysis_worker:
+                self._analysis_worker.cancel()
+            return
+        
+        # Get current parameters
+        raw_data = self.getDataToFilter()
+        filter_params = self.getFilterParameters()
+        finder_params = self.peak_finder_params[self.active_format].copy()
+        finder_params['frequency_stepsize'] = self.frequency_stepsize
+        
+        params = {
+            'filter_params': filter_params,
+            'finder_params': finder_params
+        }
+        
+        # Create worker and thread
+        self._analysis_thread = QThread()
+        self._analysis_worker = AnalysisWorker(
+            FilterManager(),  # Use fresh instances to avoid thread conflicts
+            PeakFinderManager(),
+            raw_data,
+            self.frequencies.copy(),  # Pass frequency and magnitude data for analysis
+            self.log_magnitude.copy(),
+            params
+        )
+        self._analysis_worker.moveToThread(self._analysis_thread)
+        
+        # Connect signals
+        self._analysis_thread.started.connect(self._analysis_worker.run)
+        self._analysis_worker.progress.connect(self._onAnalysisProgress)
+        self._analysis_worker.finished.connect(self._onAnalysisFinished)
+        self._analysis_worker.finished.connect(self._analysis_thread.quit)
+        self._analysis_thread.finished.connect(self._cleanupAnalysisThread)
+        
+        # Show status and start
+        self.label_analysis_status.setText("Processing...")
+        self._analysis_thread.start()
+    
+    def _onAnalysisProgress(self, message):
+        """Handle progress updates from the worker."""
+        _log.debug(f'Analysis progress: {message}')
+        self.label_analysis_status.setText(message)
+    
+    def _onAnalysisFinished(self, result):
+        """Handle completion of background analysis."""
+        _log.debug('_onAnalysisFinished')
+        
+        if isinstance(result, Exception):
+            _log.error(f"Analysis failed: {result}")
+            self.label_analysis_status.setText(f"Error: {result}")
+            return
+        
+        if result is None:
+            # Cancelled
+            self.label_analysis_status.setText("")
+            return
+        
+        # Unpack results (now includes pre-computed analysis)
+        self.filtered_data = result['filtered_data']
+        self.peaks = result['peaks']
+        self.peak_properties = result['peak_properties']
+        analysis = result['analysis_results']
+        
+        # Update resonances list using pre-computed analysis
+        self.label_analysis_status.setText("Updating resonances...")
+        QApplication.processEvents()
+        
+        self._updateResonancesFromAnalysis(analysis)
+        
+        # Refresh UI
+        self.label_analysis_status.setText("")
+        self.scheduleRefresh(0)
+    
+    def _updateResonancesFromAnalysis(self, analysis):
+        """
+        Update resonances list using pre-computed vectorized analysis results.
+        Much faster than calling analyse() individually.
+        """
+        _log.debug('_updateResonancesFromAnalysis')
+        
+        # Save old resonances to match with new peaks
+        old_resonances = self.resonances.copy()
+        self.resonances.clear()
+        frequency_tolerance = self.frequency_stepsize if self.frequency_stepsize else 1e6
+        
+        n_peaks = len(analysis['frequencies'])
+        
+        for i in range(n_peaks):
+            peak_freq = analysis['frequencies'][i]
+            matched_resonance = None
+            
+            # Match with existing resonances
+            for resonance in old_resonances:
+                if abs(resonance.frequency - peak_freq) <= frequency_tolerance:
+                    matched_resonance = resonance
+                    old_resonances.remove(resonance)
+                    break
+            
+            if matched_resonance:
+                resonance = matched_resonance
+            else:
+                resonance = Resonance(id=len(self.resonances))
+            
+            # Apply pre-computed analysis results directly
+            resonance.peak_idx = analysis['peak_idx'][i]
+            resonance.frequency = analysis['frequencies'][i]
+            resonance.fwhm = analysis['fwhm'][i]
+            resonance.q_factor = analysis['q_factor'][i]
+            resonance.qc = analysis['qc'][i]
+            resonance.qi = analysis['qi'][i]
+            resonance.dip_depth = analysis['dip_depth'][i]
+            resonance.marker_freq = resonance.frequency
+            resonance.marker_mag = analysis['marker_mag'][i]
+            resonance.marker_filt = analysis['marker_filt'][i]
+            
+            self.resonances.append(resonance)
+        
+        self.updateResonanceIndexes()
+        self.updateResonanceNames()  # Update names before refreshing table
+        self.updateActiveResonanceIndex()
+        self.refreshResonancesTable(full=True)
+    
+    def _cleanupAnalysisThread(self):
+        """Clean up thread resources and restart if pending."""
+        _log.debug('_cleanupAnalysisThread')
+        if self._analysis_worker:
+            self._analysis_worker.deleteLater()
+            self._analysis_worker = None
+        if self._analysis_thread:
+            self._analysis_thread.deleteLater()
+            self._analysis_thread = None
+        
+        # If another analysis was requested while we were running, start it now
+        if self._analysis_pending:
+            self._analysis_pending = False
+            # Use a short timer to let the event loop settle
+            QTimer.singleShot(10, self.startBackgroundAnalysis)
     
     # def getResonanceIndex(self,resonance_id):
     #     print('getResonanceIndex')
@@ -859,14 +1249,14 @@ class ResonanceFinderApp(QMainWindow):
     #     return self.resonances[resonance_index].id
 
     def updateResonanceIndexes(self):
-        print('updateResonanceIndexes')
+        _log.debug('updateResonanceIndexes')
         for i in range(len(self.resonances)):
             self.resonances[i].set_id(i)
 
 
     def updateResonanceNames(self):
         n=0
-        print('updateResonanceNames')
+        _log.debug('updateResonanceNames')
         for i in range(len(self.resonances)):
             if self.resonances[i].save:
                 self.resonances[i].set_name('%04d'%n)
@@ -876,7 +1266,7 @@ class ResonanceFinderApp(QMainWindow):
         return
             
     def updateActiveResonanceIndex(self):
-        print('updateActiveResonanceIndex')
+        _log.debug('updateActiveResonanceIndex')
         for i in range(len(self.resonances)):
             if self.resonances[i].is_active:
                 self.active_resonance_index = i
@@ -890,7 +1280,7 @@ class ResonanceFinderApp(QMainWindow):
     #     self.active_resonance_index = resonance_index
 
     def updateResonanceSelection(self):
-        print('updateResonanceSelection')
+        _log.debug('updateResonanceSelection')
         self.selected_resonance_indexes = []
         for i in range(len(self.resonances)):
             if self.resonances[i].is_selected:
@@ -898,7 +1288,7 @@ class ResonanceFinderApp(QMainWindow):
         
 
     def addResonance(self, frequency_mhz=None, refreshUI=True):
-        print('addResonance',frequency_mhz)
+        _log.debug(f'addResonance {frequency_mhz}')
         if frequency_mhz is None:
             if self.active_resonance_index is not None:
                 default_value = self.resonances[self.active_resonance_index].frequency / 1e6
@@ -907,7 +1297,7 @@ class ResonanceFinderApp(QMainWindow):
             frequency_mhz, ok = QInputDialog.getDouble(self, "Add Resonance","Enter new frequency (MHz):",
                                                         value=default_value, decimals=6)
             if not ok:
-                print('No frequency entered')
+                _log.debug('No frequency entered')
                 return
         frequency = frequency_mhz * 1e6
         # Find the closest peak index
@@ -931,9 +1321,9 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def editResonance(self, resonance_index, new_frequency_mhz=None,refreshUI=True):
-        print('editResonance')
+        _log.debug('editResonance')
         if (resonance_index <0) or (resonance_index>=len(self.resonances)):
-            print(f'invalid index,{resonance_index}/{len(self.resonances)}')
+            _log.debug(f'invalid index,{resonance_index}/{len(self.resonances)}')
             return
         resonance = self.resonances[resonance_index]
 
@@ -965,7 +1355,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def deleteResonance(self,resonance_index,refreshUI=True):
-        print('deleteResonance')
+        _log.debug('deleteResonance')
         for i in range(len(self.resonances)):
             if self.resonances[i].id == resonance_index:
                 self.resonances.pop(i)
@@ -983,7 +1373,7 @@ class ResonanceFinderApp(QMainWindow):
             self.refreshUI()
 
     def deleteResonances(self,resonance_indexes,refreshUI=True):
-        print('deleteResonances')
+        _log.debug('deleteResonances')
         for i in range(len(resonance_indexes)):
             for j in range(len(self.resonances)):
                 if self.resonances[j].id == resonance_indexes[i]:
@@ -1002,7 +1392,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def deleteSelectedResonances(self,refreshUI=True):
-        print('deleteSelectedResonances')
+        _log.debug('deleteSelectedResonances')
         # dialog to warn about deletion...
         if not self.selected_resonance_indexes:
             if self.active_resonance_index is None:
@@ -1030,10 +1420,17 @@ class ResonanceFinderApp(QMainWindow):
             return
         self._in_refresh = True
         try:
-            print('refreshUI')
+            _log.debug('refreshUI')
             self.refreshControls()
-            self.refreshPlots()
-            self.refreshMarkers()
+            # Batch all drawing operations
+            self._batch_draw = True
+            try:
+                self.refreshPlots()
+                self.refreshMarkers()
+            finally:
+                self._batch_draw = False
+            # Single draw call at end for all canvases
+            self._drawAllCanvases()
             # self.refreshFigures()
             self.refreshActiveResonance()
             self.updateNavigationButtons()
@@ -1041,6 +1438,8 @@ class ResonanceFinderApp(QMainWindow):
             self.refreshPeakFinderLabels()
             self.refreshActiveResonanceLabel()
             self.refreshResonancesLabel()
+        except Exception as e:
+            _log.exception(f"Error in refreshUI: {e}")
         finally:
             self._in_refresh = False
 
@@ -1061,20 +1460,28 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def refreshControls(self):
-        print('refreshControls')
+        _log.debug('refreshControls')
         self.setUIAnalysisFormat()
         # self.setUIFilterParameters() # called by setUIAnalysisFormat
         # self.setUIPeakFinderParameters() # called by setUIAnalysisFormat
 
     def refreshPlots(self):
-        print('updatePlots')
-        self.plotRaw()
-        self.plotFiltered()
-        self.plotActiveRaw()
-        self.plotActiveFiltered()
+        _log.debug('refreshPlots')
+        was_batching = self._batch_draw
+        self._batch_draw = True
+        try:
+            self.plotRaw()
+            self.plotFiltered()
+            self.plotActiveRaw()
+            self.plotActiveFiltered()
+        finally:
+            self._batch_draw = was_batching
+        # Only draw if we initiated the batch (not called from another batched method)
+        if not was_batching:
+            self._drawAllCanvases()
 
     def plotRaw(self):
-        print('plotRaw')
+        _log.debug('plotRaw')
         if self.fig_raw is None:
             self.ax_raw.set_xlabel("Frequency (MHz)")
             self.ax_raw.set_ylabel("Magnitude (dB)")
@@ -1083,10 +1490,11 @@ class ResonanceFinderApp(QMainWindow):
         self.ax_raw.relim()
         self.ax_raw.autoscale_view()
         self.ax_raw.margins(0.02,0.2)
-        self.canvas_raw.draw_idle()
+        if not self._batch_draw:
+            self.canvas_raw.draw_idle()
 
     def plotFiltered(self):
-        print('plotFiltered')
+        _log.debug('plotFiltered')
         if self.fig_filtered is None:
             self.ax_filtered.set_xlabel("Frequency (MHz)")
             self.ax_filtered.set_ylabel(self.active_format)
@@ -1096,10 +1504,11 @@ class ResonanceFinderApp(QMainWindow):
         self.ax_filtered.relim()
         self.ax_filtered.autoscale_view()
         self.ax_filtered.margins(0.02,0.2)
-        self.canvas_filtered.draw_idle()
+        if not self._batch_draw:
+            self.canvas_filtered.draw_idle()
 
     def plotActiveRaw(self):
-        print('plotActiveRaw')
+        _log.debug('plotActiveRaw')
         if self.fig_active_raw is None:
             self.ax_active_raw.set_xlabel("Frequency (MHz)")
             self.ax_active_raw.set_ylabel("Magnitude (dB)")
@@ -1108,10 +1517,11 @@ class ResonanceFinderApp(QMainWindow):
         self.ax_active_raw.relim()
         self.ax_active_raw.autoscale_view()
         self.ax_active_raw.margins(0.02,0.2)
-        self.canvas_active_raw.draw_idle()
+        if not self._batch_draw:
+            self.canvas_active_raw.draw_idle()
     
     def plotActiveFiltered(self):
-        print('plotActiveFiltered')
+        _log.debug('plotActiveFiltered')
         if self.fig_active_filtered is None:
             self.ax_active_filtered.set_xlabel("Frequency (MHz)")
             self.ax_active_filtered.set_ylabel(self.active_format)
@@ -1121,10 +1531,11 @@ class ResonanceFinderApp(QMainWindow):
         self.ax_active_filtered.relim()
         self.ax_active_filtered.autoscale_view()
         self.ax_active_filtered.margins(0.02,0.2)
-        self.canvas_active_filtered.draw_idle()
+        if not self._batch_draw:
+            self.canvas_active_filtered.draw_idle()
 
     def refreshFigures(self):
-        print('refreshFigures')
+        _log.debug('refreshFigures')
         # only do layout work here; autoscale already handled per-plot refresh
         for figure in (self.fig_raw, self.fig_filtered, self.fig_active_raw, self.fig_active_filtered):
             if figure is None:
@@ -1137,8 +1548,9 @@ class ResonanceFinderApp(QMainWindow):
                     continue
                 figure.tight_layout()
             except Exception as e:
-                print("tight_layout skipped during resize:", repr(e))
-            figure.canvas.draw_idle()
+                _log.debug("tight_layout skipped during resize: %r", e)
+            if not self._batch_draw:
+                figure.canvas.draw_idle()
         # print('refreshFigures')
         # for ax in [self.ax_raw, self.ax_filtered, self.ax_active_raw, self.ax_active_filtered]:
         #     if ax is not None:
@@ -1172,7 +1584,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def refreshResonancesTable(self, full=False):
-        print('updateResonancesTable', 'full' if full else 'incremental')
+        _log.debug(f"refreshResonancesTable {'full' if full else 'incremental'}")
 
         if full:
             self.resonances_table.setUpdatesEnabled(False)
@@ -1196,7 +1608,7 @@ class ResonanceFinderApp(QMainWindow):
         #     self.resonances_table.scrollToItem(self.resonances_table.item(self.active_resonance_index, 1))
 
     def updateResonancesTableRow(self, row, resonance):
-        print('updateResonancesTableRow',row)
+        _log.debug(f'updateResonancesTableRow {row}')
         
         # Save checkbox
         save_checkbox = self.resonances_table.cellWidget(row, 0)
@@ -1276,7 +1688,7 @@ class ResonanceFinderApp(QMainWindow):
         
 
     def onSaveCheckboxChanged(self,state):
-        print('onSaveCheckboxChanged')
+        _log.debug('onSaveCheckboxChanged')
         checkbox = self.sender()
         id = checkbox.property('resonance_id')
         for resonance in self.resonances:
@@ -1290,45 +1702,44 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def initMarkerTexts0(self):
-        # slow as hell for 10000 markers
-        print('initMarkerTexts')
-        print('initMarkerTexts: mtexts')
+        # slow as hell for 10000 markers - DEPRECATED, use initMarkerTexts instead
+        _log.debug('initMarkerTexts0')
+        _log.debug('initMarkerTexts0: mtexts')
         mtexts = ["ignored"] + ["%04d"%i for i in range(self.max_num_text_labels)] 
-        print('initMarkerTexts: mobjs')
+        _log.debug('initMarkerTexts0: mobjs')
         mobjs = [matplotlib.markers.MarkerStyle("$"+t+"$") for t in mtexts]
-        print('initMarkerTexts: mpaths')
+        _log.debug('initMarkerTexts0: mpaths')
         mpaths = [mobj.get_path() for mobj in mobjs]
         rotation = matplotlib.transforms.Affine2D().rotate_deg(90)
         translation = matplotlib.transforms.Affine2D().translate(0, -1.0)
-        print('initMarkerTexts: transforms')
+        _log.debug('initMarkerTexts0: transforms')
         transforms = [mobj.get_transform() + rotation + translation for mobj in mobjs]
-        print('initMarkerTexts: transformedmpaths')
+        _log.debug('initMarkerTexts0: transformedmpaths')
         transformedmpaths = [mpath.transformed(transform) for mpath, transform in zip(mpaths, transforms)]
-        print('initMarkerTexts: marker_text_dict')
+        _log.debug('initMarkerTexts0: marker_text_dict')
         self.marker_text_dict = dict(zip(mtexts,transformedmpaths))
 
 
     def initMarkerTexts(self):
-        print('initMarkerTexts')
+        _log.debug('initMarkerTexts')
 
         # 1) Build the list of marker labels:
-        print('initMarkerTexts: mtexts')
+        _log.debug('initMarkerTexts: mtexts')
         mtexts = ["ignored"] + [f"{i:04d}" for i in range(self.max_num_text_labels)]
 
         # 2) Create/cache digit paths & widths once (0–9):
-        print('initMarkerTexts: digit_paths')
+        _log.debug('initMarkerTexts: digit_paths')
         FONT_PROP = matplotlib.font_manager.FontProperties(size=10,weight='ultralight')
         digit_verts = {}
         digit_codes = {}
         digit_widths = {}
 
-        # for d in "0123456789":
-        for d in [chr(i) for i in range(128)]:
-            # Create a path for this single character (NOT LaTeX).
+        # Cache characters used in labels: digits, "ignored", minus, period.
+        for d in set("0123456789-.ignored"):
             dp = TextPath((0, 0), d, prop=FONT_PROP)
             # Cache its vertices, codes, and bounding-box width
-            digit_verts[d] = dp.vertices  # shape (N,2)
-            digit_codes[d] = dp.codes    # shape (N,)
+            digit_verts[d] = np.asarray(dp.vertices)  # shape (N,2)
+            digit_codes[d] = np.asarray(dp.codes)     # shape (N,)
             digit_widths[d] = dp.get_extents().width
 
         def _make_path_from_digits(label):
@@ -1367,13 +1778,13 @@ class ResonanceFinderApp(QMainWindow):
             return Path(all_verts, all_codes)
         # 3) Build the final transform (rotation + translation):
         #    same as in your original code.
-        print('initMarkerTexts: transforms')
+        _log.debug('initMarkerTexts: transforms')
         rotation = Affine2D().rotate_deg(90)
         translation = Affine2D().translate(0,-20)
         final_transform = rotation + translation
 
         # 4) Create each label path, then apply the final transform
-        print('initMarkerTexts: transformedmpaths')
+        _log.debug('initMarkerTexts: transformedmpaths')
         marker_text_dict = {}
         for t in mtexts:
             base_path = _make_path_from_digits(t)
@@ -1381,11 +1792,11 @@ class ResonanceFinderApp(QMainWindow):
             marker_text_dict[t] = base_path.transformed(final_transform)
 
         # 5) Store in self
-        print('initMarkerTexts: marker_text_dict')
+        _log.debug('initMarkerTexts: marker_text_dict')
         self.marker_text_dict = marker_text_dict
 
     def addMarkerText(self,mtext):
-        print('addMarkerText')
+        _log.debug('addMarkerText')
         if mtext not in self.marker_text_dict:
             FONT_PROP = matplotlib.font_manager.FontProperties(size=10,weight='ultralight')
             digit_verts = {}
@@ -1432,19 +1843,19 @@ class ResonanceFinderApp(QMainWindow):
 
                 return Path(all_verts, all_codes)
             
-            print('initMarkerTexts: transforms')
+            _log.debug('addMarkerText: transforms')
             rotation = Affine2D().rotate_deg(90)
             translation = Affine2D().translate(0,-20)
             final_transform = rotation + translation
 
-            print('initMarkerTexts: marker_text_dict')
+            _log.debug('addMarkerText: marker_text_dict')
             base_path = _make_path_from_digits(mtext)
             self.marker_text_dict[mtext] = base_path.transformed(final_transform)
 
 
 
     def refreshMarkers(self):
-        print('refreshMarkers')
+        _log.debug('refreshMarkers')
         marker_freqs = np.array([resonance.frequency for resonance in self.resonances],dtype=float)
         marker_mags = np.array([resonance.marker_mag for resonance in self.resonances],dtype=float)
         marker_filts = np.array([resonance.marker_filt for resonance in self.resonances],dtype=float)
@@ -1552,10 +1963,8 @@ class ResonanceFinderApp(QMainWindow):
             sc_afilt.set_paths(paths)
             self._cached_marker_labels = labels_tuple
 
-        self.canvas_raw.draw_idle()
-        self.canvas_filtered.draw_idle()
-        self.canvas_active_raw.draw_idle()
-        self.canvas_active_filtered.draw_idle()
+        if not self._batch_draw:
+            self._drawAllCanvases()
 
 
 
@@ -1596,38 +2005,47 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def refreshActiveResonance(self):
-        print('refreshActiveResonance')
+        _log.debug('refreshActiveResonance')
         self.refreshActiveResonanceIndex()
         self.refreshActiveResonancePlots()
         self.refreshActiveResonanceTable()
         self.refreshActiveResonanceMarkers()
+        self.refreshActiveResonanceLabel()
         self.updateNavigationButtons()
     
     def refreshActiveResonanceIndex(self):
-        print('refreshActiveResonanceIndex')
+        _log.debug('refreshActiveResonanceIndex')
         for i in range(len(self.resonances)):
             if self.resonances[i].is_active:
                 self.active_resonance_index = i
                 return
         self.active_resonance_index = None
     
-    def setActiveResonanceIndex(self,index):
-        print('setActiveResonanceIndex', index)
+    def setActiveResonanceIndex(self, index, refresh=True):
+        _log.debug(f'setActiveResonanceIndex {index}')
+        
+        # Early exit if no change
         if index == self.active_resonance_index:
             return
-            # clamp / validate
+        
+        # Validate index
         if index is not None and (index < 0 or index >= len(self.resonances)):
             index = None
-
-        available_ids = [resonance.id for resonance in self.resonances]
-        if index not in available_ids:
-            index = None
-        for r in self.resonances:
-            r.set_active_state(r.id == index)
+        
+        # Only update the two affected resonances (old active and new active)
+        old_index = self.active_resonance_index
+        if old_index is not None and 0 <= old_index < len(self.resonances):
+            self.resonances[old_index].set_active_state(False)
+        
+        if index is not None:
+            self.resonances[index].set_active_state(True)
+        
         self.active_resonance_index = index
-        print('active resonance index:', self.active_resonance_index)
-        # don't call refreshActiveResonance() here
-        self.scheduleRefresh()
+        _log.debug(f'active resonance index: {self.active_resonance_index}')
+        
+        # Only refresh if requested (allows batching multiple changes)
+        if refresh:
+            self.refreshActiveResonance()
 
 
         # print('setActiveResonanceIndex',index)
@@ -1643,7 +2061,7 @@ class ResonanceFinderApp(QMainWindow):
     
 
     def nextActiveResonance(self):
-        print('nextActiveResonance')
+        _log.debug('nextActiveResonance')
         if not self.resonances:
             return
         num_resonances = len(self.resonances)
@@ -1657,7 +2075,7 @@ class ResonanceFinderApp(QMainWindow):
         self.setActiveResonanceIndex(next_idx)
     
     def prevActiveResonance(self):
-        print('prevActiveResonance')
+        _log.debug('prevActiveResonance')
         if not self.resonances:
             return
         num_resonances = len(self.resonances)
@@ -1671,14 +2089,14 @@ class ResonanceFinderApp(QMainWindow):
         self.setActiveResonanceIndex(prev_idx)
 
     def refreshActiveResonancePlots(self):
-        print('refreshActiveResonancePlots')
+        _log.debug('refreshActiveResonancePlots')
         if self.active_resonance_index is not None:
             resonance_index = self.active_resonance_index
             try:
                 resonance = self.resonances[resonance_index]
 
             except:
-                print('resonance not found')
+                _log.debug('resonance not found')
                 return
             r = self.resonances[self.active_resonance_index]
             f0 = r.frequency
@@ -1716,8 +2134,9 @@ class ResonanceFinderApp(QMainWindow):
             self.ax_active_raw.set_ylim(raw_min - B*dy_raw, raw_max + T*dy_raw)
             self.ax_active_filtered.set_ylim(fil_min - B*dy_fil, fil_max + T*dy_fil)
 
-            self.canvas_active_raw.draw_idle()
-            self.canvas_active_filtered.draw_idle()
+            if not self._batch_draw:
+                self.canvas_active_raw.draw_idle()
+                self.canvas_active_filtered.draw_idle()
             # f = resonance.frequency
             # fwhm = resonance.fwhm
             # if fwhm is None or fwhm <= 0:
@@ -1759,12 +2178,13 @@ class ResonanceFinderApp(QMainWindow):
             self.ax_active_filtered.autoscale_view()
             self.ax_active_filtered.margins(0.02,0.2)
         
-            self.canvas_active_raw.draw_idle()
-            self.canvas_active_filtered.draw_idle()
+            if not self._batch_draw:
+                self.canvas_active_raw.draw_idle()
+                self.canvas_active_filtered.draw_idle()
 
     
     def refreshActiveResonanceTable(self):
-        print('refreshActiveResonanceTable')
+        _log.debug('refreshActiveResonanceTable')
 
         new_row = self.active_resonance_index
         old_row = self._last_active_row
@@ -1813,12 +2233,12 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def refreshActiveResonanceMarkers(self):
-        print('refreshActiveResonanceMarkers')
+        _log.debug('refreshActiveResonanceMarkers')
         self.refreshMarkers()
     
 
     def refreshSelectedResonances(self):
-        print('refreshSelectedResonances')
+        _log.debug('refreshSelectedResonances')
         self.getSelectedResonances()
         self.refreshSelectedResonancesTable()
         self.refreshSelectedResonancesMarkers()
@@ -1827,7 +2247,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def getSelectedResonances(self):
-        print('getSelectedResonances')
+        _log.debug('getSelectedResonances')
         selected = [i for i, r in enumerate(self.resonances) if r.is_selected]
         self.selected_resonance_indexes = selected
         return selected
@@ -1840,17 +2260,19 @@ class ResonanceFinderApp(QMainWindow):
         #         selected_resonance_indexes.append(i)
         # self.selected_resonance_indexes = selected_resonance_indexes
 
-    def setSelectedResonances(self,resonance_indexes):
-        print('setSelectedResonances')
-        for i in range(len(self.resonances)):
-            resonance = self.resonances[i]
-            resonance.set_selected_state(i in resonance_indexes)
+    def setSelectedResonances(self, resonance_indexes, refresh=True):
+        _log.debug('setSelectedResonances')
+        # Use set for O(1) lookup instead of O(n) list membership
+        index_set = set(resonance_indexes)
+        for i, resonance in enumerate(self.resonances):
+            resonance.set_selected_state(i in index_set)
         self.selected_resonance_indexes = resonance_indexes
-        self.refreshSelectedResonances()
+        if refresh:
+            self.refreshSelectedResonances()
 
     
     def refreshSelectedResonancesTable(self):
-        print('refreshSelectedResonancesTable')
+        _log.debug('refreshSelectedResonancesTable')
         selected_rows = self.selected_resonance_indexes
         selection_model = self.resonances_table.selectionModel()
         selection = QItemSelection()
@@ -1861,11 +2283,11 @@ class ResonanceFinderApp(QMainWindow):
         selection_model.select(selection, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
 
     def refreshSelectedResonancesMarkers(self):
-        print('refreshSelectedResonancesMarkers')
+        _log.debug('refreshSelectedResonancesMarkers')
         self.refreshMarkers()
     
     def deselectAllResonances(self):
-        print('deselectAllResonances')
+        _log.debug('deselectAllResonances')
         for i in range(len(self.resonances)):
             resonance = self.resonances[i]
             resonance.set_selected_state(False)
@@ -1873,7 +2295,7 @@ class ResonanceFinderApp(QMainWindow):
 
     
     def toggleSaveSelectedResonances(self):
-        print('toggleSaveSelectedResonances')
+        _log.debug('toggleSaveSelectedResonances')
         selected = [r.is_selected for r in self.resonances]
         if not(any(selected)):
             [resonance.toggle_save_state() for resonance in self.resonances if resonance.is_active]
@@ -1886,7 +2308,7 @@ class ResonanceFinderApp(QMainWindow):
         self.updateNavigationButtons()
 
     def toggleSaveAllResonances(self):
-        print('toggleSaveAll')
+        _log.debug('toggleSaveAll')
         save = [resonance.save for resonance in self.resonances]
         if not(any(save)):
             [resonance.set_save_state(True) for resonance in self.resonances]
@@ -1915,7 +2337,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def updateNavigationButtons(self):
-        print('updateNavigationButtons')
+        _log.debug('updateNavigationButtons')
         has_resonances = len(self.resonances)!=0
         has_active = self.active_resonance_index is not None
         has_selection = bool(self.selected_resonance_indexes)
@@ -1927,7 +2349,7 @@ class ResonanceFinderApp(QMainWindow):
         self.button_toggle_save_all.setEnabled(has_resonances)
 
     def refreshPeakFinderLabels(self):
-        print('updatePeakFinderLabels')
+        _log.debug('refreshPeakFinderLabels')
         labels = self.peak_finder_labels.get(self.active_format, None)
         if labels:
             self.label_prominence.setText(labels.get('prominence', 'Prominence'))
@@ -1946,7 +2368,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def refreshResonancesLabel(self):
-        print('refreshResonancesLabel')
+        _log.debug('refreshResonancesLabel')
         num_resonances = len(self.resonances)
         num_saved_resonances = sum([1 for resonance in self.resonances if resonance.save])
         self.label_num_resonances.setText(
@@ -1954,7 +2376,7 @@ class ResonanceFinderApp(QMainWindow):
     )
 
     def refreshActiveResonanceLabel(self):
-        print('refreshActiveResonanceLabel')
+        _log.debug('refreshActiveResonanceLabel')
         if self.active_resonance_index is not None:
             resonance = self.resonances[self.active_resonance_index]
             self.label_analysis.setText(f'Active Resonance: {resonance.name}\nFrequency: {resonance.frequency/1e6:.6f} MHz\nDip depth: {resonance.dip_depth:.3f} dB\nFWHM: {resonance.fwhm:.3f} Hz\nQr: {resonance.q_factor:.3f}\nQc: {resonance.qc:.3f}\nQi: {resonance.qi:.3f}\nSave: {resonance.save}')
@@ -1966,12 +2388,12 @@ class ResonanceFinderApp(QMainWindow):
                 self.label_analysis.setText("No resonances found\n\nTry adjusting parameters")
 
     def closeEvent(self, event):
-        print('closeEvent')
+        _log.debug('closeEvent')
         self.saveSettings()
         super().closeEvent(event)  # Ensure the base class method is called
 
     def initUI(self):
-        print('initUI')
+        _log.debug('initUI')
         self.initUILayout()
         self.initUIActions()
         self.initUIControls()
@@ -1979,7 +2401,7 @@ class ResonanceFinderApp(QMainWindow):
         
 
     def initUIActions(self):
-        print('initUIActions')
+        _log.debug('initUIActions')
         self.toggle_save_action = QAction("Toggle Save", self)
         self.toggle_save_action.setShortcut(Qt.Key_Space)
         self.toggle_save_action.triggered.connect(self.toggleSaveSelectedResonances)
@@ -2024,7 +2446,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def initUIControls(self):
-        print('initUIControls')
+        _log.debug('initUIControls')
         self.is_loading_settings = True
         self.setUIAnalysisFormat()
         # self.setUIFilterParameters() # called by setUIAnalysisFormat
@@ -2032,35 +2454,33 @@ class ResonanceFinderApp(QMainWindow):
         self.is_loading_settings = False
 
     def setUIAnalysisFormat(self):
-        print('setUIAnalysisFormat')
+        _log.debug('setUIAnalysisFormat')
         format = self.active_format
         self.combo_analysis_format.setCurrentText(format)
         self.setUIFilterParameters()
         self.setUIPeakFinderParameters()
 
     def getUIAnalysisFormat(self):
-        print('getUIAnalysisFormat')
+        _log.debug('getUIAnalysisFormat')
         return self.combo_analysis_format.currentText()
     
     def onAnalysisFormatChanged(self):
-        print('onAnalysisFormatChanged')
+        _log.debug('onAnalysisFormatChanged')
         format = self.getUIAnalysisFormat()
         if not self.is_loading_settings:
             self.active_format = format
             self.setUIFilterParameters()
             self.setUIPeakFinderParameters()
             self.saveSettingsActiveFormat()
-            self.applyFiltering()
-            self.updateResonances()
-            # self.refreshUI()
-            self.scheduleRefresh(0)
+            # Use background processing for responsive UI
+            self.startBackgroundAnalysis()
         else:
             # print('Ignoring format change during settings load')
             pass
 
 
     def setUIFilterParameters(self):
-        print('setUIFilterParameters')
+        _log.debug('setUIFilterParameters')
         params = self.filterManager.get_filter_params()
         was_loading_settings = self.is_loading_settings
         self.is_loading_settings = True
@@ -2070,7 +2490,7 @@ class ResonanceFinderApp(QMainWindow):
         self.is_loading_settings = was_loading_settings
 
     def getUIFilterParameters(self):
-        print('getUIFilterParameters')
+        _log.debug('getUIFilterParameters')
         params = {
             'lowpass_edge': self.spin_lowpass.value(),
             'highpass_edge': self.spin_highpass.value(),
@@ -2079,22 +2499,20 @@ class ResonanceFinderApp(QMainWindow):
         return params
 
     def onFilterParameterChanged(self):
-        print('onFilterParameterChanged')
+        _log.debug('onFilterParameterChanged')
         if not self.is_loading_settings:
             params = self.getUIFilterParameters()
-            print(params)
+            _log.debug(f'filter params: {params}')
             self.filterManager.set_filter_params(params)
-            self.applyFiltering()
             self.saveSettingsFilterParameters()
-            self.updateResonances()
-            # self.refreshUI()
-            self.scheduleRefresh(0)
+            # Use background processing for responsive UI
+            self.startBackgroundAnalysis()
         else:
             # print('Ignoring parameter change during settings load')
             pass
 
     def setUIPeakFinderParameters(self):
-        print('setUIPeakFinderParameters')
+        _log.debug('setUIPeakFinderParameters')
         format = self.active_format
         params = self.peak_finder_params.get(format, {})
 
@@ -2217,7 +2635,7 @@ class ResonanceFinderApp(QMainWindow):
         self.is_loading_settings = was_loading_settings
     
     def getUIPeakFinderParameters(self):
-        print('getUIPeakFinderParameters')
+        _log.debug('getUIPeakFinderParameters')
         params = {
             'prominence_enabled': self.check_prominence.isChecked(),
             'prominence_min': self.spin_prominence_min.value(),
@@ -2239,7 +2657,7 @@ class ResonanceFinderApp(QMainWindow):
         return params
 
     def onPeakFinderParameterChanged(self):
-        print('onPeakFinderParameterChanged')
+        _log.debug('onPeakFinderParameterChanged')
         # Save current parameters into the dictionary, manager and settings
         if not self.is_loading_settings:
             params = self.getUIPeakFinderParameters()
@@ -2247,9 +2665,8 @@ class ResonanceFinderApp(QMainWindow):
             self.peak_finder_params[self.active_format] = params
             self.peakFinderManager.set_finder_parameters(params)
             self.saveSettingsFinderParameters()
-            self.updateResonances()
-            # self.refreshUI()
-            self.scheduleRefresh(0)
+            # Use background processing for responsive UI
+            self.startBackgroundAnalysis()
         else:
             # print('Ignoring parameter change during settings load')
             pass
@@ -2325,6 +2742,7 @@ class ResonanceFinderApp(QMainWindow):
         self.line_raw, = self.ax_raw.plot([],[],picker=True, pickradius=5)
         self.ax_raw.set_xlabel("Frequency (MHz)")
         self.ax_raw.set_ylabel("Magnitude (dB)")
+        self.ax_raw.ticklabel_format(useOffset=False)
         self.canvas_raw = FigureCanvas(self.fig_raw)
         self.toolbar_raw = NavigationToolbar(self.canvas_raw, self)
         raw_sweep_layout.addWidget(self.toolbar_raw)
@@ -2339,6 +2757,7 @@ class ResonanceFinderApp(QMainWindow):
         self.line_filtered, = self.ax_filtered.plot([],[],picker=True, pickradius=5)
         self.ax_filtered.set_xlabel("Frequency (MHz)")
         self.ax_filtered.set_ylabel("Magnitude (dB)")
+        self.ax_filtered.ticklabel_format(useOffset=False)
         self.canvas_filtered = FigureCanvas(self.fig_filtered)
         self.toolbar_filtered = NavigationToolbar(self.canvas_filtered, self)
         filtered_sweep_layout.addWidget(self.toolbar_filtered)
@@ -2356,6 +2775,7 @@ class ResonanceFinderApp(QMainWindow):
         self.line_active_raw, = self.ax_active_raw.plot([],[],picker=True, pickradius=5)
         self.ax_active_raw.set_xlabel("Frequency (MHz)")
         self.ax_active_raw.set_ylabel("Magnitude (dB)")
+        self.ax_active_raw.ticklabel_format(useOffset=False)
         self.canvas_active_raw = FigureCanvas(self.fig_active_raw)
         zoom_raw_layout.addWidget(self.canvas_active_raw)
 
@@ -2368,6 +2788,7 @@ class ResonanceFinderApp(QMainWindow):
         self.line_active_filtered, = self.ax_active_filtered.plot([],[],picker=True, pickradius=5)
         self.ax_active_filtered.set_xlabel("Frequency (MHz)")
         self.ax_active_filtered.set_ylabel("Magnitude (dB)")
+        self.ax_active_filtered.ticklabel_format(useOffset=False)
         self.canvas_active_filtered = FigureCanvas(self.fig_active_filtered)
         zoom_filtered_layout.addWidget(self.canvas_active_filtered)
 
@@ -2612,11 +3033,14 @@ class ResonanceFinderApp(QMainWindow):
 
 
         self.label_num_resonances = QLabel("Resonances found: n/a")
+        self.label_analysis_status = QLabel("")  # Status indicator for background processing
+        self.label_analysis_status.setStyleSheet("color: #666; font-style: italic;")
         self.button_fixids = QPushButton("Fix IDs")
         self.button_save = QPushButton("Save/Export")
 
         resonances_layout.addWidget(self.resonances_table)
         resonances_layout.addWidget(self.label_num_resonances)
+        resonances_layout.addWidget(self.label_analysis_status)
         # resonances_layout.addWidget(self.button_fixids) #need to implement correct naming of unsaved resonances
         resonances_layout.addWidget(self.button_save)
         self.group_resonances.setLayout(resonances_layout)
@@ -2632,7 +3056,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def initUIConnections(self):
-        print('initUIConnections')
+        _log.debug('initUIConnections')
 
         # Splitter events for debouncing
         self.hsplitter.splitterMoved.connect(self.onSplitterMoved)
@@ -2694,11 +3118,14 @@ class ResonanceFinderApp(QMainWindow):
         Called once the window resizing has finished.
         Perform any layout updates or redraws here.
         """
-        print('onResizeFinished')
-        self.refreshFigures()
+        _log.debug('onResizeFinished')
+        try:
+            self.refreshFigures()
+        except Exception as e:
+            _log.exception(f"Error in onResizeFinished: {e}")
 
     def onSplitterMoved(self, pos, index):
-        print('onSplitterMoved')
+        _log.debug('onSplitterMoved')
         if self.hsplitter_timer:
             self.hsplitter_timer.start(200)
 
@@ -2708,115 +3135,107 @@ class ResonanceFinderApp(QMainWindow):
         Called once the splitter has finished moving.
         Perform any layout updates or redraws here.
         """
-        print('onSplitterMoveFinished')
-        self.refreshFigures()        
+        _log.debug('onSplitterMoveFinished')
+        try:
+            self.refreshFigures()
+        except Exception as e:
+            _log.exception(f"Error in onSplitterMoveFinished: {e}")        
 
     def onOpen(self):
-        print('onOpen')
+        _log.debug('onOpen')
         self.openFile()
 
     def onSave(self):
-        print('onSave')
+        _log.debug('onSave')
         self.saveResonances()
 
     def onFixIDs(self):
-        print('onFixIDs')
+        _log.debug('onFixIDs')
         self.fixResonanceIDs()
         # self.refreshUI()
         self.scheduleRefresh(0)
 
     def onAddResonance(self):
-        print('onAddResonance')
+        _log.debug('onAddResonance')
         self.addResonance()
         # self.refreshUI()
         self.scheduleRefresh(0)
 
     def onEditResonance(self):
-        print('onEditResonance')
+        _log.debug('onEditResonance')
         self.editResonance(self.active_resonance_index)
         # self.refreshUI()
         self.scheduleRefresh(0)
         
     def onDeleteResonance(self):
-        print('onDeleteResonance')
+        _log.debug('onDeleteResonance')
         self.deleteSelectedResonances()
         # self.refreshUI()
         self.scheduleRefresh(0)
 
     def onNextResonance(self):
-        print('onNextResonance')
+        _log.debug('onNextResonance')
         self.nextActiveResonance()
         # self.refreshUI() # will be called later
 
     def onPreviousResonance(self):
-        print('onPreviousResonance')
+        _log.debug('onPreviousResonance')
         self.prevActiveResonance()
         # self.refreshUI() # will be called later
 
     def onToggleSave(self):
-        print('onToggleSave')
+        _log.debug('onToggleSave')
         self.toggleSaveSelectedResonances()
         # self.refreshUI()
         self.scheduleRefresh(0)
 
     def onToggleSaveAll(self):
-        print('onToggleSaveAll')
+        _log.debug('onToggleSaveAll')
         self.toggleSaveAllResonances()
         # self.refreshUI()
         self.scheduleRefresh(0)
 
     def onResonanceTableCellClicked(self, row, column):
-        print('onResonanceTableCellClicked')
-        self.setActiveResonanceIndex(row)
-        # self.refreshUI()
-        self.scheduleRefresh(0)
+        # Note: selectionChanged already handles this, so we only need to
+        # ensure the active resonance is set. Don't trigger extra refresh.
+        _log.debug('onResonanceTableCellClicked')
+        # Already handled by onResonanceTableSelectionChanged
+        pass
 
 
     def onResonanceTableSelectionChanged(self):
-        print('onResonanceTableSelectionChanged')
-        selected_resonances = self.getSelectedResonances()
+        _log.debug('onResonanceTableSelectionChanged')
         selected_indexes = [i.row() for i in self.resonances_table.selectionModel().selectedRows()]
-
-        if selected_resonances is not None:
-            if len(selected_resonances) == 0:
-                if len(selected_indexes) == 0 :
-                    pass
-                elif len(selected_indexes) == 1:
-                    self.setActiveResonanceIndex(selected_indexes[0])
-                    self.setSelectedResonances(selected_indexes)
-                elif len(selected_indexes) > 1:
-                    self.setSelectedResonances(selected_indexes)
-            else:
-                if  len(selected_indexes) > 0 :
-                    self.setSelectedResonances(selected_indexes)
-                    self.setActiveResonanceIndex(selected_indexes[-1])
-                elif len(selected_indexes) > 1:
-                    self.setSelectedResonances(selected_indexes)
+        
+        # Batch updates without triggering refreshes
+        if selected_indexes:
+            # Set active to last selected, don't refresh yet
+            self.setActiveResonanceIndex(selected_indexes[-1], refresh=False)
+            # Set selection, don't refresh yet  
+            self.setSelectedResonances(selected_indexes, refresh=False)
         else:
-            if len(selected_indexes) == 0:
-                self.setSelectedResonances(selected_indexes)
-            elif  len(selected_indexes) > 0 :
-                self.setActiveResonanceIndex(selected_indexes[-1])
-                self.setSelectedResonances(selected_indexes)
-
-            elif len(selected_indexes) > 1:
-                self.setSelectedResonances(selected_indexes)
-
-
-        # self.refreshUI()
-        self.scheduleRefresh(0)
+            self.setSelectedResonances([], refresh=False)
+        
+        # Refresh only what's needed, avoiding duplicate marker refreshes
+        self.refreshActiveResonancePlots()
+        self.refreshActiveResonanceTable()
+        self.refreshActiveResonanceLabel()  # Update the analysis details label
+        self.refreshSelectedResonancesTable()
+        self.refreshMarkers()  # Only once for both active and selected
+        self.updateNavigationButtons()
+        self.refreshResonancesLabel()
 
 
 
     def toggleSelectionMode(self, state):
-        print('toggleSelectionMode')
+        _log.debug('toggleSelectionMode')
         if state == Qt.Checked:
             self.activateRectangleSelectors()
         else:
             self.deactivateRectangleSelectors()
 
     def activateRectangleSelectors(self):
-        print('activateRectangleSelectors')
+        _log.debug('activateRectangleSelectors')
         axes_list = [self.ax_raw, self.ax_filtered, self.ax_active_raw, self.ax_active_filtered]  # List of axes to enable selection on
         for ax in axes_list:
             ax.set_autoscale_on(False)
@@ -2845,7 +3264,7 @@ class ResonanceFinderApp(QMainWindow):
         self.canvas_active_filtered.setCursor(Qt.CrossCursor)
         
     def deactivateRectangleSelectors(self):
-        print('deactivateRectangleSelectors')
+        _log.debug('deactivateRectangleSelectors')
         for selector in self.rectangle_selectors.values():
             selector.set_active(False)
         axes_list = [self.ax_raw, self.ax_filtered, self.ax_active_raw, self.ax_active_filtered]  # List of axes to enable selection on
@@ -2858,15 +3277,18 @@ class ResonanceFinderApp(QMainWindow):
         self.canvas_active_filtered.setCursor(Qt.ArrowCursor)
 
     def onSelectRectangle(self, eclick, erelease):
-        print('onSelectRectangle')
-        ax = eclick.inaxes
-        if ax is None:
-            return
-        self.handleRectangleSelection(ax, eclick, erelease)
+        _log.debug('onSelectRectangle')
+        try:
+            ax = eclick.inaxes
+            if ax is None:
+                return
+            self.handleRectangleSelection(ax, eclick, erelease)
+        except Exception as e:
+            _log.exception(f"Error in onSelectRectangle: {e}")
 
 
     def handleRectangleSelection(self, ax, eclick, erelease):
-        print('handleRectangleSelection')
+        _log.debug('handleRectangleSelection')
         # Get rectangle coordinates in data units
         x_min, x_max = sorted([eclick.xdata, erelease.xdata])
         y_min, y_max = sorted([eclick.ydata, erelease.ydata])
@@ -2889,7 +3311,7 @@ class ResonanceFinderApp(QMainWindow):
                 y_value = y_data[resonance.peak_idx]
                 if x_min <= freq_mhz <= x_max and y_min <= y_value <= y_max:
                     selected_indices.append(idx)
-        print(selected_indices)
+        _log.debug(f'Selected indices: {selected_indices}')
         if not selected_indices:
             # QMessageBox.information(self, "Selection", "No resonances found in the selected area.")
             pass
@@ -2905,7 +3327,7 @@ class ResonanceFinderApp(QMainWindow):
         """
         Show a right-click menu for the given resonance index.
         """
-        print('showResonanceContextMenu')
+        _log.debug('showResonanceContextMenu')
         menu = QMenu()
 
         action_add = QAction("Add Resonance", self)
@@ -2929,7 +3351,7 @@ class ResonanceFinderApp(QMainWindow):
    
 
     def showEmptySpaceContextMenu(self, event):
-        print('showEmptySpaceContextMenu')
+        _log.debug('showEmptySpaceContextMenu')
         menu = QMenu()
         action_add_new = QAction("Add Resonance Here", self)
         action_add_new.triggered.connect(lambda: self.addResonance(frequency_mhz=event.xdata))
@@ -2941,7 +3363,7 @@ class ResonanceFinderApp(QMainWindow):
         Return the resonance index if the click is within pick_tolerance (pixels) of a marker,
         or None if not near any marker.
         """
-        print('getClickedResonanceIndex')
+        _log.debug('getClickedResonanceIndex')
         if event.inaxes == self.ax_raw:
             xdata, ydata = self.marker_line_raw.get_data()
         elif event.inaxes == self.ax_filtered:
@@ -2975,47 +3397,51 @@ class ResonanceFinderApp(QMainWindow):
         This method is called whenever a mouse button is pressed on one of the Matplotlib canvases.
         We’ll route the event to onAxesLeftClick or onAxesRightClick as needed.
         """
-        print('onAxesButtonPress')
-        # If user is in Pan/Zoom mode, ignore
-        if event.inaxes == self.ax_raw:
-            if self.toolbar_raw.mode != '':
+        _log.debug('onAxesButtonPress')
+        try:
+            # If user is in Pan/Zoom mode, ignore
+            # Note: Only main plots (raw/filtered) have toolbars; active plots do not
+            if event.inaxes == self.ax_raw:
+                if self.toolbar_raw.mode != '':
+                    return
+            elif event.inaxes == self.ax_filtered:
+                if self.toolbar_filtered.mode != '':
+                    return
+            elif event.inaxes == self.ax_active_raw:
+                # Active raw plot has no toolbar, so always process clicks
+                pass
+            elif event.inaxes == self.ax_active_filtered:
+                # Active filtered plot has no toolbar, so always process clicks
+                pass
+            else:
                 return
-        elif event.inaxes == self.ax_filtered:
-            if self.toolbar_filtered.mode != '':
-                return
-        elif event.inaxes == self.ax_active_raw:
-            if self.toolbar_active_raw.mode != '':
-                return
-        elif event.inaxes == self.ax_active_filtered:
-            if self.toolbar_active_filtered.mode != '':
-                return
-        else:
-            return
-        
-        if event.button == 1:   # Left-click
-            self.onAxesLeftClick(event)
-        elif event.button == 3: # Right-click
-            self.onAxesRightClick(event)
+            
+            if event.button == 1:   # Left-click
+                self.onAxesLeftClick(event)
+            elif event.button == 3: # Right-click
+                self.onAxesRightClick(event)
+        except Exception as e:
+            _log.exception(f"Error in onAxesButtonPress: {e}")
 
 
     def onAxesRightClick(self, event):
         """
         Right-click logic. Show a context menu depending on whether we clicked near a marker.
         """
-        print('onAxesRightClick')
+        _log.debug('onAxesRightClick')
         pick_tolerance = 10
         clicked_index = self.getClickedResonanceIndex(event, pick_tolerance)
         
         if clicked_index is not None:
             # Right-click near a resonance marker -> show resonance context menu
-            print(f"Right-click near resonance index={clicked_index}")
+            _log.debug(f"Right-click near resonance index={clicked_index}")
             self.setActiveResonanceIndex(clicked_index)
             # self.refreshUI()
             self.scheduleRefresh(0)
             self.showResonanceContextMenu(clicked_index, event)
         else:
             # Right-click in empty space -> show empty context menu (or do nothing)
-            print("Right-click in empty space.")
+            _log.debug("Right-click in empty space.")
             self.showEmptySpaceContextMenu(event)
 
 
@@ -3024,24 +3450,24 @@ class ResonanceFinderApp(QMainWindow):
         Left-click logic. If near a marker, select that resonance.
         Otherwise, you might do something like adding a new resonance or ignoring.
         """
-        print('onAxesLeftClick')
+        _log.debug('onAxesLeftClick')
         # Tolerance in pixels
         pick_tolerance = 10  
         clicked_index = self.getClickedResonanceIndex(event, pick_tolerance)
         
         if clicked_index is not None:
             # Found a resonance near the click
-            print(f"Left-click near resonance index={clicked_index}")
+            _log.debug(f"Left-click near resonance index={clicked_index}")
             self.setActiveResonanceIndex(clicked_index)
             # self.refreshUI()
             self.scheduleRefresh(0)
         else:
             # Clicked empty space (not near a marker)
-            print("Left-click in empty space.")
+            _log.debug("Left-click in empty space.")
             pass
 
     def addResonanceAtPlotPosition(self, event):
-        print('addResonanceAtPlotPosition',event)
+        _log.debug(f'addResonanceAtPlotPosition {event}')
         ax = event.inaxes
         if ax is None or event.xdata is None:
             return
@@ -3050,7 +3476,7 @@ class ResonanceFinderApp(QMainWindow):
         self.addResonance(initial_freq_mhz=freq_mhz)
 
     def editResonanceAtPlotPosition(self, resonance_idx):
-        print('editResonanceAtPlotPosition',resonance_idx)
+        _log.debug(f'editResonanceAtPlotPosition {resonance_idx}')
         if resonance_idx is None:
             QMessageBox.information(self, "Edit Resonance", "No resonance selected.")
             return
@@ -3059,7 +3485,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def deleteResonanceAtPosition(self, resonance_idx):
-        print('deleteResonanceAtPosition',resonance_idx)
+        _log.debug(f'deleteResonanceAtPosition {resonance_idx}')
         if resonance_idx is None:
             QMessageBox.information(self, "Delete Resonance", "No resonance selected.")
             return
@@ -3084,7 +3510,7 @@ class ResonanceFinderApp(QMainWindow):
             self.zoom_filt_canvas.draw_idle()
 
     def toggleSaveResonanceAtPosition(self, resonance_idx):
-        print('toggleSaveResonanceAtPosition',resonance_idx)
+        _log.debug(f'toggleSaveResonanceAtPosition {resonance_idx}')
         if resonance_idx is None:
             QMessageBox.information(self, "Toggle Save Resonance", "No resonance selected.")
             return
@@ -3098,7 +3524,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def openFile(self):
-        print('openFile')
+        _log.debug('openFile')
         options = QFileDialog.Options()
         lastfile = self.settings.value("lastFile", "")
         last_dir = os.path.dirname(lastfile) if lastfile else ""
@@ -3107,10 +3533,10 @@ class ResonanceFinderApp(QMainWindow):
         if filename:
             self.loadFile(filename)
         else:
-            print('No file selected.')
+            _log.debug('No file selected.')
 
     def saveResonances(self):
-        print('saveResonances')
+        _log.debug('saveResonances')
         options = QFileDialog.Options()
         if os.path.splitext(self.label_filename.text())[-1] == '.fits':
             default_ext = '.txt'
@@ -3252,10 +3678,12 @@ class SplashScreen(QSplashScreen):
         Animate the windowOpacity from 1.0 to 0.0 over 'duration' milliseconds.
         Then close the splash screen.
         """
+        from PyQt5.QtCore import QEasingCurve
         self.anim = QPropertyAnimation(self, b"windowOpacity", self)
         self.anim.setDuration(duration)
         self.anim.setStartValue(1.0)
         self.anim.setEndValue(0.0)
+        self.anim.setEasingCurve(QEasingCurve.InQuad)
         self.anim.finished.connect(self.close)
         self.anim.start()
 
@@ -3277,7 +3705,67 @@ class SplashScreen(QSplashScreen):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="SOUK MKID Resonance Finder GUI. "
+        "Note: MKID finding can also be done via Python script or "
+        "interactive session using the souk_readout_tools library directly; "
+        "this GUI provides a convenient interactive interface.")
+    parser.add_argument('sweep_file', nargs='?', default=None,
+                        help='Sweep data file to load (.fits, .npy, or .txt)')
+    parser.add_argument('-f', '--format', default=None,
+                        choices=['lin_mag', 'log_mag', 'phase', 'unwrapped_phase',
+                                 'group_delay', 'complex_gradient', 'sin_iq'],
+                        help='Analysis format')
+    parser.add_argument('--highpass', type=float, default=None,
+                        help='Highpass filter cutoff (normalised, 0-1)')
+    parser.add_argument('--lowpass', type=float, default=None,
+                        help='Lowpass filter cutoff (normalised, 0-1)')
+    parser.add_argument('--median-kernel', type=int, default=None,
+                        help='Median filter kernel size')
+    parser.add_argument('--prominence-min', type=float, default=None,
+                        help='Minimum peak prominence (dip depth)')
+    parser.add_argument('--prominence-max', type=float, default=None,
+                        help='Maximum peak prominence')
+    parser.add_argument('--width-min', type=float, default=None,
+                        help='Minimum peak width in Hz')
+    parser.add_argument('--width-max', type=float, default=None,
+                        help='Maximum peak width in Hz')
+    parser.add_argument('--distance', type=float, default=None,
+                        help='Minimum spacing between peaks in Hz')
+    parser.add_argument('--direction', choices=['peaks', 'dips'], default=None,
+                        help='Search for peaks (upward) or dips (downward)')
+    parser.add_argument('--reset-settings', action='store_true',
+                        help='Clear all saved settings (window size, filter '
+                        'parameters, etc.) and start with defaults. Useful if '
+                        'corrupted settings are causing crashes.')
+    args = parser.parse_args()
+
+    # Install global exception handler to prevent silent crashes
+    def exception_hook(exctype, value, tb):
+        """Global exception handler that logs exceptions instead of crashing silently."""
+        error_msg = ''.join(traceback.format_exception(exctype, value, tb))
+        _log.error(f"Unhandled exception:\n{error_msg}")
+        # Also print to stderr for visibility
+        sys.stderr.write(f"FATAL ERROR:\n{error_msg}\n")
+        sys.stderr.flush()
+        # Show message box if possible
+        try:
+            QMessageBox.critical(None, "Fatal Error",
+                f"An unexpected error occurred:\n\n{exctype.__name__}: {value}\n\n"
+                f"See console/log for full traceback.")
+        except:
+            pass
+        # Call default handler
+        sys.__excepthook__(exctype, value, tb)
+
+    sys.excepthook = exception_hook
+
     app = QApplication(sys.argv)
+
+    if args.reset_settings:
+        QSettings("mkid_resonance_finder", "ResonanceFinder2").clear()
+        print("Settings cleared.")
 
     iconpng = str(files("souk_readout_tools").joinpath("mkid_finder_app.png"))
     iconico = str(files("souk_readout_tools").joinpath("mkid_finder_app.ico"))
@@ -3293,9 +3781,10 @@ def main():
     QApplication.processEvents()
 
     window = ResonanceFinderApp(splash)
+    window.apply_cli_overrides(args)
     window.show()
 
-    splash.fadeOut(duration=3000)
+    splash.fadeOut(duration=1500)
 
     app.exec_()
 

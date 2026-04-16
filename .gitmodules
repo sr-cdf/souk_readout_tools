@@ -1,0 +1,3 @@
+[submodule "src/souk_readout_tools/server/souk-peripherals-control"]
+	path = src/souk_readout_tools/server/souk-peripherals-control
+	url = https://github.com/WeiDaZhang/souk-peripherals-control.git

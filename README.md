@@ -1,124 +1,158 @@
 # SOUK Readout Tools
 
-This repo hosts the tools required to operate the SOUK MKID Readout system.
+## The SOUK Detector Readout System
 
-These are early days, so please report any issues or feature requests, no matter how small.
+Simons Observatory: UK (SOUK) uses Microwave Kinetic Inductance Detectors (MKIDs) to observe the cosmic microwave background across two telescopes. Each MKID is a superconducting resonator whose resonance frequency shifts in response to absorbed photons - the readout system's job is to continuously probe these resonances and record the detector responses.
 
-Also, take a look in the [doc](doc) directory for more information. Especially the [getting started](doc/getting_started.md) guide.
+The readout hardware is based on AMD/Xilinx RFSoC (Radio Frequency System-on-Chip) boards. Each board runs the [`souk-firmware`](https://github.com/realtimeradio/souk-firmware) dual-pipeline firmware providing **two independent RF readout channels**, each capable of driving and measuring up to 2048 tones simultaneously across a wide RF bandwidth. The full SOUK instrument uses **7 boards per telescope** (28 RF networks in total), with all boards managed from a single host machine.
 
-## Readout Server
 
-The readout server software runs on the RFSoC boards and uses the lower level [souk_mkid_readout](https://github.com/realtimeradio/souk-firmware) library to talk to the FPGA firmware. It listens for requests from external clients to perform high level actions such as sweeping, tuning, streaming and general housekeeping, returning raw data to the client for further processing.
 
-To start the server process manually, run ther following on the board: `[casper@rfsoc]$ sudo /home/casper/py38venv/bin/python3 readout_server.py`
+## What This Package Does
 
-A systemd service file is available to enable automatic starting of the server process on power up, and automatic restarting if it crashes. See the note below for instructions on setting this up.
+`souk_readout_tools` is the Python control and data acquisition package for this system. It uses a **client-server architecture** with `ReadoutClient` and `ReadoutServer` classes:
 
-## Readout Client
-
-The readout client software is for general users to run on their laptops or desktops. Commands are sent to the server to set up and take measurements. The raw data that gets returned can be parsed, analysed and exported.
-
-See the [getting started](doc/getting_started.md) info in [doc](doc) for more details.
-
-Once the system is set up and an appropriate config file is available, it should be simple to connect to the board and start taking measurements.
-
-Useful scripts for common tasks can be found in [client_scripts](client_scripts) or the client can be started in an interactive python shell, for example:
+- The **server** runs on each RFSoC's ARM processor. It interfaces with the FPGA firmware through the [souk_mkid_readout](https://github.com/realtimeradio/souk-firmware) library and controls RF peripheral hardware (attenuators, amplifiers, etc.) via `souk-peripherals-control`. One server instance runs per pipeline (two per board), managing hardware state, configuration, and data tranmission.
+- The **client** runs on a remote machine and connects to an individual pipeline's server over TCP. It provides the high-level API for measurements, data acquisition, and basic analysis tools for inspecting data quality.
 
 ```
-    (client_venv)[user@client-machine]$ ipython
-
-    In [1]: import readout_client, numpy as np, matplotlib.pyplot as plt
-
-    In [2]: client = readout_client.ReadoutClient(config_file='config/config.yaml')
-
-    In [3]: client.get_server_status()
-    Out[3]:
-    {'process_name': 'readout_daemon',
-     'ip_addresses': '10.11.11.11 192.168.2.224',
-     'pwd': '/home/casper/src/readout_server',
-    ....}
-
-    In [4]: client.get_sample_rate()
-    Out[4]: 500.0
-
-    In [5]: num_tones = len(client.get_tone_frequencies())
-
-    In [6]: raw_samples = client.get_samples(500)
-    Received 500 samples in ~0.9946386814117432 seconds (~502.6951086301245 samples per second)
-
-    In [7]: data = readout_client.ReadoutClient.parse_samples(raw_samples,num_tones)
-
-    In [8]: print( np.all(np.diff(data['packet_counter']) == 1) )
-    True
-
-    In [9]: t = np.arange(len(data['packet_counter'])) / client.get_sample_rate()
-
-    In [10]: z0 = data['i_data']['0000'] + 1j*data['q_data']['0000']
-
-    In [11]: plt.plot(t, np.abs(z0))
-    Out[11]: [<matplotlib.lines.Line2D at 0x7f5fda517580>]
-
-    In [12]: plt.show()
+ Client Machine (OCS)               RFSoC Board                                            
+┌─────────────────────┐            ┌──────────────────────────────────────────────────────┐
+│  Python/IPython     │            │  ARM Processing System (PS)                          │
+│                     │            │                                                      │
+│                     │            │   ┌── Ubuntu 24.04 (CASPER image) ───────────────┐   │
+│                     │            │   │                                              │   │
+│    ReadoutClient A ─┼─── TCP ────┼───┼──  ReadoutServer 0 ────┐                     │   │
+│                     │            │   │                        ├── souk_mkid_readout │   │
+│    ReadoutClient B ─┼─── TCP ────┼───┼──  ReadoutServer 1 ────┘          │          │   │
+│                     │            │   └───────────────────────────────────┼──────────┘   │
+│    ReadoutClient C ─┼─           ├───────────────────────────────────────┼──────────────┤
+│                     │            │  FPGA Programmable Logic (PL)         │              │
+│    ...              │            │                                       │              │
+│                     │            │   ┌── SOUK Firmware ──────────────────┴──────────┐   │
+│    ReadoutClient N ─┼─           │   │                                              │   │
+│                     │            │   │                   Pipeline 0     Pipeline 1  │   │
+│                     │            │   └───────────────────────┼──────────────┼───────┘   │
+│                     │            ├───────────────────────────┼──────────────┼───────────┤
+│                     │            │  RF Data Converter        │              │           │
+│                     │            │  (RFDC)                ┌──┴──┐        ┌──┴──┐        │
+│                     │            │                      DAC0   ADC0    DAC1   ADC1      │
+└─────────────────────┘            └────────────────────────┼─────┼────────┼─────┼────────┘
+                                                           TX0   RX0      TX1   RX1         
 ```
 
-## Config File
+Each `ReadoutServer` uses two TCP ports - a **request port** for JSON command/response control and a **stream port** for binary data transfer.
 
-A config file is required to operate the system. It is read by both the client and the server. It contains all the configuration information necessary to operate the system. An example config file is provided in [config](config). By default, the client and server will look for a file called `config.yaml` in the `config` directory. This can be a symlink to the actual config file if desired.
+### Capabilities
 
-The main section are:
+- **Tone control** - set frequencies, amplitudes, and phases for up to 2048 readout tones per pipeline with full TX/RX power calibration through the entire signal chain (DSP → DAC → RF frontend → cryostat → detector). Tone updates happen on millisecond timescales, enabling fast resonator tracking.
+- **Data acquisition** - discrete samples, continuous streaming, triggered streaming, and single tone snapshots (1024 sample bursts at the pre-accumulator rate). All data includes PTP telescope timestamps from the firmware for precise time synchronisation.
+- **Frequency sweeping** - wideband survey sweeps across the full RF band and targeted sweeps around individual resonances
+- **Resonance finding** - automated peak detection across multiple data formats (magnitude, phase, group delay, |dS21/df|, etc), plus an interactive PyQt5 GUI
+- **Retuning** - sweep-and-retune workflows to track drifting resonances using max-derivative or min-magnitude methods
+- **Power management** - automatic TX/RX level optimisation with saturation detection, dynamic range management, and calibrated power control in dBm at any reference plane in the signal chain
+- **ADC calibration freeze** - freeze the RFSoC's internal ADC calibration during observations to eliminate drift noise, with periodic defrost for recalibration
+- **Dual-pipeline support** - two independent pipelines per board with three-level initialisation (program FPGA → shared resources → per-pipeline resources) to prevent cross-pipeline disruption
+- **VACC multitone** (v7.9+) - multiple tones per FFT bin with automatic LO index management and sparse tone index handling
+- **Configuration sync** - YAML-based config with `push_config()`/`pull_config()` for client-server synchronisation, including automatic calibration file transfer
+- **Server infrastructure** - async TCP server with systemd daemon support, multi-client streaming, and remote status monitoring
+- **Measurement framework** - parameter space measurement tools and higher-level scripts for characterisation campaigns
+- **Analysis utilities** - built-in tools for parsing raw data, plotting in various formats, fitting resonance and noise models, and extracting detector parameters.
 
-`rfsoc_host:` for the IP address of the RFSoC board, communication ports and other board specific information
+## Quick Start (Client)
 
-`firmware:` for default firmware parameter settings and DAC/ADC paramters and calibrations
+Most users only need the client. The server should already be running on the RFSoC.
 
-`rf_frontend:` for tone frequency and power calibrations relating to analog up/down converters
+Clone the repository and initialise submodules:
+```bash
+git clone https://github.com/sr-cdf/souk_readout_tools
+cd souk_readout_tools
+git submodule init && git submodule update
+```
 
-`cryostat:` for cryo channel RF calibrations, optical setup information and temperature logs
+Create a python virtual environment and install:
 
-`detector:` for detector specific information
+```bash
+python3 -m venv client_venv
+source ./client_venv/bin/activate
+pip install .
+```
 
-## Client Scripts
+On Windows, use `python -m venv` and `.\client_venv\Scripts\Activate.ps1` instead.
 
-The client scripts are a collection of useful scripts for common tasks. They are written in python and can be run from the command line or imported into an interactive python shell.
+Connect to a running server and pull its config:
 
-Examples include: TBD
+```python
+from souk_readout_tools.client.readout_client import ReadoutClient
+
+client = ReadoutClient(address='10.11.11.11', request_port=10000)
+client.pull_config(save_as='my_config.yaml')
+```
+
+Or create a config from the bundled template:
+
+```python
+from souk_readout_tools.config_utils import copy_template_config
+copy_template_config('my_config.yaml', pipeline_id=0)
+```
+
+Then connect, initialise, set tones, and acquire data:
+
+```python
+client = ReadoutClient(config_file='my_config.yaml')
+client.ensure_ready()
+
+client.set_tone_frequencies([0.800e9, 1.500e9]) # frequencies in Hz
+client.set_tone_powers([-50, -55], reference_plane='detector') # powers in dBm
+
+raw = client.get_samples(500)
+data = client.parse_samples(raw, num_tones=2)
+
+# Plot the timestream
+from souk_readout_tools.plotting import plot_timestream
+plot_timestream(data)
+```
+
+For full installation details (including server setup, SD card imaging, and daemon configuration), see the [Installation Guide](doc/installation.md).
+
+## CLI Tools
+
+**Client** (installed on your machine):
+
+| Command | Description |
+|---------|-------------|
+| `souk-connection-test` | Test connectivity to the readout server (`-C config.yaml` or `-a address`) |
+| `souk-wideband_sweep` | Perform a wideband frequency sweep |
+| `souk-mkid-finder-app` | Launch the interactive MKID resonance finder GUI |
+| `souk-batch-snapshots` | Acquire pre-accumulator snapshots across tones |
+| `souk-find-resonances` | Find resonances from sweep data |
+
+**Server** (installed on the RFSoC):
+
+| Command | Description |
+|---------|-------------|
+| `souk-readout-server` | Start the readout server (optional config path, `-p` for pipeline) |
+| `souk-enable-daemon` | Enable the server as a systemd service (`-p 0 1` for both pipelines) |
+| `souk-disable-daemon` | Disable the server systemd service(s) |
 
 ## Documentation
 
-The [doc](doc) directory contains documentation for the project. This includes getting started guides, API documentation, example ipython notebooks and other useful information.
+| Document | Description |
+|----------|-------------|
+| [Installation Guide](doc/installation.md) | Full client and server installation, SD card setup, daemon configuration |
+| [Getting Started](doc/getting_started.md) | Configuration, usage guide, and worked examples for all features |
+| [Dual Pipeline](doc/dual_pipeline.md) | Dual-pipeline setup, initialisation model, and multi-server operation |
+| [v7.9 Multitone Notes](doc/v79-multitone-notes.md) | VACC multitone design notes and constraints |
 
-## Calibrations
+## Configuration
 
-The [calibrations](calibrations) directory contains calibration data for the system. This includes calibration files and S2P files for tone frequency and power calibrations for the RF-DAC, RF-ADC, analog front-end, cryo channel and detectors. The choices of calibration files are set in the config file.
+YAML-based configuration with five sections: `rfsoc_host`, `firmware`, `rf_frontend`, `cryostat`, and `detector`. A template config with all parameters and defaults is bundled with the package. Config files live wherever you choose on the client side - keep them with your measurement data.
 
-## Misc:
+The standard workflow is: create or pull a config, edit hardware-/firmware-specific settings, connect with it, and use `push_config()` / `pull_config()` to synchronise with the server. Calibration files referenced in the config are transferred automatically.
 
-### Readout server service
+See [Getting Started - Configuration](doc/getting_started.md#configuration) for details.
 
-To install the systemd service on the RFSoC ARM processor, follow these steps:
+## Requirements
 
-Copy the service file to the systemd service directory with `sudo cp readout_server.py /etc/systemd/system/`
-
-Reload the systemd manager configuration with `sudo systemctl daemon-reload`
-
-Start the service with `sudo systemctl start readout_server`
-
-Enable the service to start on boot with `sudo systemctl enable readout_server`
-
-Verify the service is running with `sudo systemctl status readout_server`
-
-You can also stop the service with `sudo systemctl stop readout_server` and disable it with `sudo systemctl disable readout_server`.
-
-Remember to restart the server after any software updates with `sudo systemctl restart readout_server`
-
-For more information on systemd services, you can refer to the official documentation: https://www.freedesktop.org/software/system
-
-Standard output and error are redirected to the system logand the identifier for the server process is 'readout_server'. Inspect the log with `sudo journalctl -xu readout_server`.
-
-Monitor the system log in real time with `sudo journalctl -f -xu readout_server`.
-
-The server process name is set to `readout_daemon`, unless it is started manually, in which case it is set to `readout_server` or read from the environment variable READOUT_SERVER_NAME.
-
-
-
-[def]: URL
+- **Client:** Python >= 3.10. Tested on Linux (Python 3.10, 3.12) and Windows (Python 3.12). Dependencies: numpy, scipy, matplotlib, pyyaml, ipython, pyqt5.
+- **Server:** Python >= 3.10 on the Xilinx/RFSoC CASPER Linux image. Requires `souk_mkid_readout` from the [souk-firmware](https://github.com/realtimeradio/souk-firmware) repository.

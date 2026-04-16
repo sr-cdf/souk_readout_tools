@@ -1,1 +1,2 @@
 recursive-include src/souk_readout_tools/data *
+recursive-include src/souk_readout_tools/server/souk-peripherals-control *.py

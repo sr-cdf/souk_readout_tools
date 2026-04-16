@@ -1,0 +1,36 @@
+#################################
+#
+# Systemd service for the SOUK MKID readout server (pipeline 1).
+#
+# Only install this if running dual-pipeline firmware.
+#
+# See also readout_server.service for pipeline 0.
+#
+# Use souk-enable-daemon -p 1 to install, or souk-disable-daemon -p 1 to remove.
+#
+# Manual usage:
+#   sudo systemctl start readout_server_1
+#   sudo systemctl status readout_server_1
+#   sudo journalctl -f -xu readout_server_1
+#
+###################################
+
+
+[Unit]
+Description=SOUK MKID Readout Server (Pipeline 1)
+After=networking.service krc-utils.service
+Requires=networking.service krc-utils.service
+
+[Service]
+SyslogIdentifier=readout_server_1
+WorkingDirectory=/home/casper/.souk_readout_tools/pipeline_1
+Environment=READOUT_SERVER_NAME=readout_daemon_1
+ExecStart=/home/casper/py3.12-venv/bin/souk-readout-server -p 1
+Restart=always
+RestartSec=5
+User=root
+Environment=PYTHONUNBUFFERED=1
+Nice=-20
+
+[Install]
+WantedBy=multi-user.target
