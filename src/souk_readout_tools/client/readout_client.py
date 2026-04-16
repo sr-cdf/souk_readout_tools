@@ -690,7 +690,7 @@ class ReadoutClient:
         return np.atleast_1d(self.get_parameter('tone_phases'))
 
     def set_tone_powers(self, tone_powers_dbm, reference_plane='detector',
-                        optimise_dynamic_range=False):
+                        optimise_dynamic_range=False, rx_policy='protect'):
         """Set tone powers to specified levels in dBm.
 
         Parameters
@@ -703,12 +703,23 @@ class ReadoutClient:
         optimise_dynamic_range : bool
             If True, maximise DAC bit utilisation and adjust the analog
             chain (attenuator, amp bypass, DSA) to hit the target power.
+        rx_policy : str
+            How to manage the RX path when the TX power change risks
+            saturating the ADC.  One of:
+
+            - ``'protect'`` (default) — if ADC saturates, increase RX
+              attenuation or DSA to clear it and warn.
+            - ``'compensate'`` — mirror TX power changes onto the RX
+              path to keep round-trip power constant.
+            - ``'raise'`` — raise error if ADC saturates.
+            - ``'none'`` — don't touch the RX path.
         """
         tone_powers_dbm = np.atleast_1d(tone_powers_dbm).tolist()
         message = {'request': 'set', 'param': 'tone_powers',
                    'value': tone_powers_dbm,
                    'reference_plane': reference_plane,
-                   'optimise_dynamic_range': optimise_dynamic_range}
+                   'optimise_dynamic_range': optimise_dynamic_range,
+                   'rx_policy': rx_policy}
         response = self.send_request(message)
         if response.get('status') != 'success':
             print(f"Error setting tone powers: {response.get('message')}")
@@ -759,11 +770,11 @@ class ReadoutClient:
         else:
             return np.atleast_1d(self.get_parameter('tone_powers', reference_plane=reference_plane))
 
-    def check_input_saturation(self,iterations=10):
+    def check_input_saturation(self,iterations=250):
         message = {'request': 'check_input_saturation','iterations':iterations}
         return self.send_request(message)
 
-    def check_output_saturation(self,iterations=10):
+    def check_output_saturation(self,iterations=250):
         message = {'request': 'check_output_saturation','iterations':iterations}
         return self.send_request(message)
 
@@ -773,14 +784,42 @@ class ReadoutClient:
     
     # TODO: Add option to save the resulting parameters to the config file after
     #       maximise/optimise/fix operations (requires save_config, see push_config TODO).
-    def maximise_tx_power(self, headroom_db=2.0):
-        return self.send_request({'request': 'maximise_tx_power', 'headroom_db': headroom_db})
+    def maximise_tx_power(self, headroom_db=2.0, reference_plane='dac',
+                          power_limit_dbm=None, rx_policy='protect'):
+        """Maximise TX output power at the chosen reference plane.
+
+        Parameters
+        ----------
+        headroom_db : float
+            Safety margin below DAC saturation (default 2.0 dB).
+        reference_plane : str
+            'dac' (default), 'rf_output', or 'detector'.
+        power_limit_dbm : float or None
+            Maximum allowed tone power in dBm at the reference plane.
+        rx_policy : str
+            How to manage the RX path when TX power increases risk
+            saturating the ADC.  One of:
+
+            - ``'protect'`` (default) — if ADC saturates, increase RX
+              attenuation or DSA to clear it and warn.
+            - ``'compensate'`` — mirror TX power changes onto the RX
+              path to keep round-trip power constant.
+            - ``'raise'`` — raise error if ADC saturates.
+            - ``'none'`` — don't touch the RX path.
+        """
+        msg = {'request': 'maximise_tx_power', 'headroom_db': headroom_db,
+               'reference_plane': reference_plane, 'rx_policy': rx_policy}
+        if power_limit_dbm is not None:
+            msg['power_limit_dbm'] = power_limit_dbm
+        return self.send_request(msg)
 
     def maximise_rx_power(self, headroom_db=1.0):
         return self.send_request({'request': 'maximise_rx_power', 'headroom_db': headroom_db})
 
-    def optimise_tx_snr(self):
-        return self.send_request({'request': 'optimise_tx_snr'})
+    def optimise_tx_snr(self, reference_plane='detector', headroom_db=2.0):
+        return self.send_request({'request': 'optimise_tx_snr',
+                                  'reference_plane': reference_plane,
+                                  'headroom_db': headroom_db})
 
     def optimise_rx_snr(self):
         return self.send_request({'request': 'optimise_rx_snr'})
@@ -1228,21 +1267,23 @@ class ReadoutClient:
                 'tone_index': tone_index,
                 'sample_rate': snapshot_rate,
                 'num_snapshots': num_snapshots,
-                'len_snapshot': len(snapshot)}
+                'len_snapshot': result.shape[1] if result is not None else 0}
 
     def batch_snapshots(self, tone_indices=None, num_snapshots=10,
                         export_file=None, plot=False, verbose=True):
         """
-        Acquire pre-accumulator snapshots for multiple tones.
+        Acquire pre-accumulator snapshots for multiple tones in a single
+        server request.
 
-        Iterates over the requested tone indices, acquiring num_snapshots
-        snapshots per tone via get_accumulator_snapshots().
+        Uses batch_accumulator_snapshots on the server so the
+        tone-to-firmware-channel lookup happens once, and all data streams
+        over a single TCP connection.
 
         Note on indexing: tone_indices are user-facing ordinal indices
         (0, 1, 2, ...) corresponding to the order tones were set, not
         firmware LO channel indices (which may be non-contiguous due to
         VACC constraints). The translation to firmware channels happens
-        inside get_accumulator_snapshots().
+        server-side.
 
         Args:
             tone_indices: List of user-facing tone indices to snapshot,
@@ -1279,22 +1320,63 @@ class ReadoutClient:
                     raise ValueError(
                         f"Tone index {idx} out of range (0 to {n_tones - 1})")
 
+        info = self.get_system_information()
+        acc_len = info['acc_len']
+        accumulated_rate = self.get_sample_rate()
+        snapshot_rate = accumulated_rate * acc_len
+
+        # Single server request for all tones
         results = {}
-        sample_rate = None
-        for i, tidx in enumerate(tone_indices):
+        total_frames = len(tone_indices) * num_snapshots
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((self.request_server_address, self.request_server_port))
+            message = {'request': 'batch_accumulator_snapshots',
+                       'tone_indices': tone_indices,
+                       'num_snapshots': num_snapshots}
+            message_data = json.dumps(message).encode()
+            message_len = struct.pack('>I', len(message_data))
+            s.sendall(message_len + message_data)
+
+            t0 = time.time()
+            for i, tidx in enumerate(tone_indices):
+                if verbose:
+                    fw_idx = fw_indices[tidx] if tidx < len(fw_indices) else '?'
+                    print(f"Snapshotting tone {tidx} (fw chan {fw_idx}, "
+                          f"{i+1}/{len(tone_indices)}, "
+                          f"{freqs[tidx]/1e6:.3f} MHz)...")
+                tone_data = None
+                for j in range(num_snapshots):
+                    raw_datalen = s.recv(4)
+                    if not raw_datalen:
+                        raise RuntimeError("Server closed connection unexpectedly")
+                    datalen = struct.unpack('>I', raw_datalen)[0]
+                    data_buf = bytearray(datalen)
+                    view = memoryview(data_buf)
+                    received_len = 0
+                    while received_len < datalen:
+                        packet_len = s.recv_into(view[received_len:], datalen - received_len)
+                        if packet_len == 0:
+                            break
+                        received_len += packet_len
+                    if received_len < datalen:
+                        raise RuntimeError(f"Expected {datalen} bytes, got {received_len}")
+                    snapshot = np.frombuffer(data_buf, dtype=np.complex128)
+                    if tone_data is None:
+                        tone_data = np.zeros((num_snapshots, len(snapshot)), dtype=np.complex128)
+                    tone_data[j] = snapshot
+                results[tidx] = {
+                    'snapshots': tone_data,
+                    'tone_index': tidx,
+                    'sample_rate': snapshot_rate,
+                }
+            t1 = time.time()
             if verbose:
-                fw_idx = fw_indices[tidx] if tidx < len(fw_indices) else '?'
-                print(f"Snapshotting tone {tidx} (fw chan {fw_idx}, "
-                      f"{i+1}/{len(tone_indices)}, "
-                      f"{freqs[tidx]/1e6:.3f} MHz)...")
-            snap = self.get_accumulator_snapshots(tidx, num_snapshots)
-            results[tidx] = snap
-            if sample_rate is None:
-                sample_rate = snap['sample_rate']
+                print(f"Received {total_frames} snapshots for {len(tone_indices)} tones "
+                      f"in {t1-t0:.3f}s ({total_frames/(t1-t0):.1f} snapshots/s)")
 
         output = {
             'results': results,
-            'sample_rate': sample_rate,
+            'sample_rate': snapshot_rate,
             'num_snapshots': num_snapshots,
             'tone_frequencies': freqs,
             'firmware_indices': fw_indices,
@@ -2559,7 +2641,7 @@ class ReadoutClient:
         self.set_tone_frequencies(center_freqs)
         self.set_tone_phases(tone_phases)
 
-        if tone_powers_dbm == 'auto':
+        if isinstance(tone_powers_dbm, str) and tone_powers_dbm == 'auto':
             # Maximum power/dynamic-range: set unit amplitudes first, then maximise
             self.set_tone_amplitudes(np.ones(num_tones))
             result = self.maximise_tx_power()
@@ -2618,7 +2700,7 @@ class ReadoutClient:
                 print(f'  Optimising RX gain...')
             rx_result = self.maximise_rx_power()
             if verbose:
-                print(f'  maximise_rx_power() -> {rx_result}')
+                print(f'  maximise_rx_power() -> {rx_result["status"]}')
 
         # Freeze calibration before sweep
         if cal_freeze:

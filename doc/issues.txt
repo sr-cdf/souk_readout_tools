@@ -93,3 +93,61 @@ reboot over usb serial:
 Ubuntu 24.04.4 LTS krm4 ttyPS0
 
 krm4 login: 
+
+
+failed to program, then after coming back next morning, seen this
+[97706.714407] fpga_manager fpga0: Error while writing image data to FPGA
+[173247.116720] rcu: INFO: rcu_sched detected stalls on CPUs/tasks:
+[173247.122731] rcu:    2-...0: (15 ticks this GP) idle=c42/1/0x4000000000000000 softirq=71349/71351 fqs=2626 
+
+tried this and os has frozen:
+Apr 15 09:47:34 krm4 readout_server_0[2716]: b'{"request": "hard_reset"}'
+Apr 15 09:47:34 krm4 readout_server_0[2716]: ************************************************
+Apr 15 09:47:34 krm4 readout_server_0[2716]: init_server
+Apr 15 09:47:34 krm4 readout_server_0[2716]: config_file: /home/casper/.souk_readout_tools/pipeline_0/config/config.yaml
+Apr 15 09:47:34 krm4 readout_server_0[2716]: ensure_ready: False
+Apr 15 09:47:34 krm4 readout_server_0[2716]: force_ready: True
+Apr 15 09:47:34 krm4 readout_server_0[2716]: ************************************************
+Apr 15 09:47:34 krm4 readout_server_0[2716]: ************************************************
+Apr 15 09:47:34 krm4 readout_server_0[2716]: load_config
+Apr 15 09:47:34 krm4 readout_server_0[2716]: config_file: /home/casper/.souk_readout_tools/pipeline_0/config/config.yaml
+Apr 15 09:47:34 krm4 readout_server_0[2716]: ************************************************
+Apr 15 09:47:34 krm4 readout_server_0[2716]: Found config file: /home/casper/.souk_readout_tools/pipeline_0/config/config.yaml
+--frozen--
+
+usb debug console reset
+
+
+again hard reset failed, ssh stops responding, os frozen needs usb serial reset
+
+Apr 15 10:54:40 krm4 readout_server_0[985]: 2026-04-15 10:54:40,956 - souk_mkid_readout.souk_mkid_readout:localhost:0 - INFO - Programming with /home/casper/souk-firmware/firmware/src/souk_dual_pipeline_krm/outputs/souk_dual_pipeline_krm_2026-02-11_2059.fpg
+Apr 15 10:54:52 krm4 readout_server_0[985]: 2026-04-15 10:54:52.10 ERROR localhost transport_katcp.py:653 - localhost: no programming informs yet. Odd?
+Apr 15 10:54:52 krm4 readout_server_0[985]: ERROR:localhost:localhost: no programming informs yet. Odd?
+Apr 15 10:54:52 krm4 readout_server_0[985]: Error handling request client ('10.11.11.1', 43410): localhost: no programming informs yet. Odd?
+Apr 15 10:54:52 krm4 readout_server_0[985]: Traceback (most recent call last):
+Apr 15 10:54:52 krm4 readout_server_0[985]:   File "/home/casper/py3.12-venv/lib/python3.12/site-packages/casperfpga/transport_katcp.py", line 651, in upload_to_ram_and_program
+Apr 15 10:54:52 krm4 readout_server_0[985]:     inf = unhandled_informs_queue.get(block=True, timeout=timeout)
+Apr 15 10:54:52 krm4 readout_server_0[985]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Apr 15 10:54:52 krm4 readout_server_0[985]:   File "/usr/lib/python3.12/queue.py", line 179, in get
+Apr 15 10:54:52 krm4 readout_server_0[985]:     raise Empty
+Apr 15 10:54:52 krm4 readout_server_0[985]: _queue.Empty
+Apr 15 10:54:52 krm4 readout_server_0[985]: During handling of the above exception, another exception occurred:
+Apr 15 10:54:52 krm4 readout_server_0[985]: Traceback (most recent call last):
+Apr 15 10:54:52 krm4 readout_server_0[985]:   File "/home/casper/py3.12-venv/lib/python3.12/site-packages/souk_readout_tools/server/readout_server.py", line 910, in handle_request_client
+Apr 15 10:54:52 krm4 readout_server_0[985]:     self.init_server(config_file,ensure_ready=False, force_ready=True)
+Apr 15 10:54:52 krm4 readout_server_0[985]:   File "/home/casper/py3.12-venv/lib/python3.12/site-packages/souk_readout_tools/server/readout_server.py", line 619, in init_server
+Apr 15 10:54:52 krm4 readout_server_0[985]:     self.force_ready(level='pipeline')
+Apr 15 10:54:52 krm4 readout_server_0[985]:   File "/home/casper/py3.12-venv/lib/python3.12/site-packages/souk_readout_tools/server/readout_server.py", line 541, in force_ready
+Apr 15 10:54:52 krm4 readout_server_0[985]:     self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
+Apr 15 10:54:52 krm4 readout_server_0[985]:                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Apr 15 10:54:52 krm4 readout_server_0[985]:   File "/home/casper/py3.12-venv/lib/python3.12/site-packages/souk_readout_tools/firmware_lib.py", line 376, in reload_firmware
+Apr 15 10:54:52 krm4 readout_server_0[985]:     r.program()
+Apr 15 10:54:52 krm4 readout_server_0[985]:   File "/home/casper/py3.12-venv/lib/python3.12/site-packages/souk_mkid_readout/souk_mkid_readout.py", line 234, in program
+Apr 15 10:54:52 krm4 readout_server_0[985]:     self._cfpga.upload_to_ram_and_program(realpath)
+Apr 15 10:54:52 krm4 readout_server_0[985]:   File "/home/casper/py3.12-venv/lib/python3.12/site-packages/casperfpga/casperfpga.py", line 348, in upload_to_ram_and_program
+Apr 15 10:54:52 krm4 readout_server_0[985]:     rv = self.transport.upload_to_ram_and_program(
+Apr 15 10:54:52 krm4 readout_server_0[985]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Apr 15 10:54:52 krm4 readout_server_0[985]:   File "/home/casper/py3.12-venv/lib/python3.12/site-packages/casperfpga/transport_katcp.py", line 654, in upload_to_ram_and_program
+Apr 15 10:54:52 krm4 readout_server_0[985]:     raise RuntimeError('%s: no programming informs yet. '
+Apr 15 10:54:52 krm4 readout_server_0[985]: RuntimeError: localhost: no programming informs yet. Odd?
+Apr 15 10:54:52 krm4 readout_server_0[985]: request client disconnected: ('10.11.11.1', 43410)

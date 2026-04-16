@@ -483,7 +483,7 @@ class ReadoutServer:
                 firmware_lib.initialise_shared_resources(self.r, self.config)
             # 3) Pipeline resources init if needed
             if firmware_lib.needs_pipeline_initialising(self.r, self.config):
-                firmware_lib.initialise_pipeline_resources(self.r, self.config)
+                firmware_lib.initialise_pipeline_resources(self.r, self.r_fast, self.config)
                 self.applied_config = copy.deepcopy(self.config)
 
             #re-establish firmware interfaces in case they were initially created before programming
@@ -542,7 +542,7 @@ class ReadoutServer:
             # 2) Shared resources
             firmware_lib.initialise_shared_resources(self.r, self.config)
             # 3) Pipeline resources
-            firmware_lib.initialise_pipeline_resources(self.r, self.config)
+            firmware_lib.initialise_pipeline_resources(self.r, self.r_fast, self.config)
             self.applied_config = copy.deepcopy(self.config)
 
             #re-establish firmware interfaces in case they were initially created before programming
@@ -705,7 +705,7 @@ class ReadoutServer:
         self.ensure_ready(level="pipeline")
     
         #force pipeline init
-        firmware_lib.initialise_pipeline_resources(self.r, self.config)
+        firmware_lib.initialise_pipeline_resources(self.r, self.r_fast, self.config)
         self.applied_config = copy.deepcopy(self.config)
 
         return
@@ -775,7 +775,7 @@ class ReadoutServer:
         print('************************************************')
 
 
-        firmware_lib.apply_config(config_contents, self.r, self.applied_config)
+        firmware_lib.apply_config(config_contents, self.r, self.r_fast, self.applied_config)
         self.applied_config = copy.deepcopy(config_contents)
         self.update_active_tone_indices()
 
@@ -998,11 +998,11 @@ class ReadoutServer:
                         response = {'status': 'success', 'value': value.tolist()}
                     elif param_name == 'tone_powers':
                         ref_plane = message.get('reference_plane', 'detector')
-                        value = firmware_lib.get_tone_powers(self.r,self.config,reference_plane=ref_plane)
+                        value = firmware_lib.get_tone_powers(self.r,self.config,reference_plane=ref_plane,rf_peripherals=self.rf_peripherals)
                         response = {'status': 'success', 'value': value.tolist()}
                     elif param_name == 'tone_powers_detailed':
                         ref_plane = message.get('reference_plane', 'detector')
-                        value = firmware_lib.get_tone_powers(self.r,self.config,detailed_output=True,reference_plane=ref_plane)[1]
+                        value = firmware_lib.get_tone_powers(self.r,self.config,detailed_output=True,reference_plane=ref_plane,rf_peripherals=self.rf_peripherals)[1]
                         response = {'status': 'success', 'value': value}
                     elif param_name == 'telescope_time':
                         fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
@@ -1056,11 +1056,13 @@ class ReadoutServer:
                         await asyncio.sleep(0)
                         ref_plane = message.get('reference_plane', 'detector')
                         opt_dr = message.get('optimise_dynamic_range', False)
+                        rx_pol = message.get('rx_policy', 'protect')
                         result = firmware_lib.set_tone_powers(
-                            self.r, self.config, param_value,
+                            self.r, self.r_fast, self.config, param_value,
                             reference_plane=ref_plane,
                             optimise_dynamic_range=opt_dr,
-                            rf_peripherals=self.rf_peripherals)
+                            rf_peripherals=self.rf_peripherals,
+                            rx_policy=rx_pol)
                         self.stream_flags[FLAG_SET_AMPS].clear()
                         await asyncio.sleep(0)
                         response = {'status': 'success', 'result': result}
@@ -1103,12 +1105,12 @@ class ReadoutServer:
 
                 elif request == 'check_input_saturation':
                     iterations = message.get('iterations')
-                    result,details = firmware_lib.check_input_saturation(self.r,iterations=iterations)
+                    result,details = firmware_lib.check_input_saturation(self.r,self.r_fast,iterations=iterations)
                     await self.send_response(writer, {'status': 'success', 'result': result, 'details': details})
-                
+
                 elif request == 'check_output_saturation':
                     iterations = message.get('iterations')
-                    result,details = firmware_lib.check_output_saturation(self.r,iterations=iterations)
+                    result,details = firmware_lib.check_output_saturation(self.r_fast,iterations=iterations)
                     await self.send_response(writer, {'status': 'success', 'result': result, 'details': details})
 
                 elif request == 'check_dsp_overflow':
@@ -1118,7 +1120,13 @@ class ReadoutServer:
 
                 elif request == 'maximise_tx_power':
                     headroom_db = message.get('headroom_db', 2.0)
-                    amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.maximise_tx_power(self.r,self.config, headroom_db=headroom_db)
+                    reference_plane = message.get('reference_plane', 'dac')
+                    power_limit_dbm = message.get('power_limit_dbm', None)
+                    rx_policy = message.get('rx_policy', 'protect')
+                    amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.maximise_tx_power(
+                        self.r, self.r_fast, self.config, headroom_db=headroom_db,
+                        reference_plane=reference_plane, rf_peripherals=self.rf_peripherals,
+                        power_limit_dbm=power_limit_dbm, rx_policy=rx_policy)
                     result = {'amps': amps.tolist(), 'psb_fft_shift': psb_fft_shift, 'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
@@ -1126,27 +1134,32 @@ class ReadoutServer:
                     kwargs = {'rf_peripherals': self.rf_peripherals}
                     if 'headroom_db' in message:
                         kwargs['headroom_db'] = message['headroom_db']
-                    dsa,pfb_fft_shift,dsp,adc,rx_atten = firmware_lib.maximise_rx_power(self.r,self.config, **kwargs)
+                    dsa,pfb_fft_shift,dsp,adc,rx_atten = firmware_lib.maximise_rx_power(self.r,self.r_fast,self.config, **kwargs)
                     result = {'dsa': dsa, 'pfb_fft_shift': pfb_fft_shift, 'dsp_ovf': dsp, 'adc_levels': adc, 'rx_attenuation_db': rx_atten}
                     await self.send_response(writer, {'status': 'success', 'result': result})
                 
                 elif request == 'optimise_tx_snr':
-                    amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.optimise_tx_snr(self.r,self.config)
+                    kwargs = {'rf_peripherals': self.rf_peripherals}
+                    if 'reference_plane' in message:
+                        kwargs['reference_plane'] = message['reference_plane']
+                    if 'headroom_db' in message:
+                        kwargs['headroom_db'] = message['headroom_db']
+                    amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.optimise_tx_snr(self.r,self.r_fast,self.config, **kwargs)
                     result = {'amps': amps.tolist(), 'psb_fft_shift': psb_fft_shift, 'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
                     await self.send_response(writer, {'status': 'success', 'result': result})
                 
                 elif request == 'optimise_rx_snr':
-                    pfb_fft_shift,dsp,adc = firmware_lib.optimise_rx_snr(self.r,self.config, rf_peripherals=self.rf_peripherals)
+                    pfb_fft_shift,dsp,adc = firmware_lib.optimise_rx_snr(self.r,self.r_fast,self.config, rf_peripherals=self.rf_peripherals)
                     result = {'pfb_fft_shift': pfb_fft_shift, 'dsp_ovf': dsp, 'adc_levels': adc}
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'fix_dac_saturation':
-                    psb_scale, dsp, dac = firmware_lib.fix_dac_saturation(self.r,self.config)
+                    psb_scale, dsp, dac = firmware_lib.fix_dac_saturation(self.r,self.r_fast,self.config)
                     result = {'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
                     await self.send_response(writer, {'status': 'success', 'result': result})
                 
                 elif request == 'fix_adc_saturation':
-                    result = firmware_lib.fix_adc_saturation(self.r,self.config, rf_peripherals=self.rf_peripherals)
+                    result = firmware_lib.fix_adc_saturation(self.r,self.r_fast,self.config, rf_peripherals=self.rf_peripherals)
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'fix_dsp_overflow':
@@ -1254,12 +1267,18 @@ class ReadoutServer:
                 elif request == 'get_accumulator_snapshots':
                     tone_index = message.get('tone_index')
                     num_snapshots = message.get('num_snapshots')
-                    task = asyncio.create_task(self.get_accumulator_snapshots(writer, tone_index, num_snapshots))
+                    task = asyncio.create_task(self.batch_accumulator_snapshots(writer, [tone_index], num_snapshots))
+                    self.tasks.append(task)
+
+                elif request == 'batch_accumulator_snapshots':
+                    tone_indices = message.get('tone_indices')
+                    num_snapshots = message.get('num_snapshots')
+                    task = asyncio.create_task(self.batch_accumulator_snapshots(writer, tone_indices, num_snapshots))
                     self.tasks.append(task)
 
                 elif request == 'get_adc_snapshot':
                     try:
-                        snapshot = firmware_lib.get_adc_snapshot(self.r)
+                        snapshot = firmware_lib.get_adc_snapshot_fast(self.r_fast)
                         data = base64.b64encode(snapshot.tobytes()).decode()
                         result = {'snapshot': data, 'length': len(snapshot)}
                         await self.send_response(writer, {'status': 'success', 'result': result})
@@ -1268,7 +1287,7 @@ class ReadoutServer:
 
                 elif request == 'get_dac_snapshot':
                     try:
-                        dac0, dac1 = firmware_lib.get_dac_snapshot(self.r)
+                        dac0, dac1 = firmware_lib.get_dac_snapshot_fast(self.r_fast)
                         data0 = base64.b64encode(dac0.tobytes()).decode()
                         data1 = base64.b64encode(dac1.tobytes()).decode()
                         result = {'dac0': data0, 'dac1': data1, 'length': len(dac0)}
@@ -1564,34 +1583,36 @@ class ReadoutServer:
             writer.close()
             await writer.wait_closed()
 
-    async def get_accumulator_snapshots(self, writer, tone_index, num_snapshots):
+    async def batch_accumulator_snapshots(self, writer, tone_indices, num_snapshots):
         """
-        Acquire num_snapshots pre-accumulation snapshots for a single tone
-        and send to client.
+        Acquire num_snapshots pre-accumulation snapshots for multiple tones
+        and stream to client.
 
-        Each snapshot is 1024 complex samples at full rate (before accumulation).
+        Resolves tone-to-firmware-channel mapping once, then iterates over
+        tones and snapshots using the fast devmem path.
+
+        Wire format: for each tone, num_snapshots frames of (4-byte big-endian
+        length prefix + raw complex128 data).
         """
         try:
-            # Resolve tone index to firmware channel once
             details = firmware_lib.get_tone_frequencies(self.r, self.config, detailed_output=True)[1]
             firmware_indices = details['rx']['tone_indices']
-            if tone_index >= len(firmware_indices):
-                raise ValueError(f'Tone index {tone_index} out of range '
-                                 f'(only {len(firmware_indices)} tones active)')
-            fw_chan = firmware_indices[tone_index]
-            acc = self.r.accumulators[0]
-            acc.set_snapshot_chan(fw_chan)
 
-            for _ in range(num_snapshots):
-                data = np.asarray(acc.get_new_snapshot(), dtype=np.complex128)
-                data_bytes = data.tobytes()
-                data_len = struct.pack('>I', len(data_bytes))
-                writer.write(data_len + data_bytes)
-                await writer.drain()
+            for tone_index in tone_indices:
+                if tone_index >= len(firmware_indices):
+                    raise ValueError(f'Tone index {tone_index} out of range '
+                                     f'(only {len(firmware_indices)} tones active)')
+                fw_chan = firmware_indices[tone_index]
+                for _ in range(num_snapshots):
+                    data = np.asarray(firmware_lib._read_accumulator_snapshot_fast(self.r_fast, fw_chan), dtype=np.complex128)
+                    data_bytes = data.tobytes()
+                    data_len = struct.pack('>I', len(data_bytes))
+                    writer.write(data_len + data_bytes)
+                    await writer.drain()
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"Error getting accumulator snapshots: {e}")
+            print(f"Error getting batch accumulator snapshots: {e}")
             print(traceback.format_exc())
         finally:
             self.tasks.remove(asyncio.current_task())

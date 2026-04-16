@@ -348,10 +348,13 @@ class RFPeripheralController:
         """Return a dict summarising the current peripheral state."""
         if not self.enabled:
             return {'enabled': False}
-        return {
+        status = {
             'enabled': True,
             'hardware': self.is_hardware,
             'attenuator_backend': self.attenuator_backend,
+            # channel: I2C MUX channel for the mixerless module hardware.
+            # For RUDAT backends this defaults to pipeline_id and is
+            # informational only (RUDAT devices are addressed by serial number).
             'channel': self._channel,
             'tx_attenuation_db': self.get_tx_attenuation(),
             'rx_attenuation_db': self.get_rx_attenuation(),
@@ -362,6 +365,11 @@ class RFPeripheralController:
             'tx_input_1db_comp_dbm': self.get_tx_input_1db_comp(),
             'rx_input_1db_comp_dbm': self.get_rx_input_1db_comp(),
         }
+        if self.attenuator_backend == 'rudat':
+            rf_cfg = self.config.get('rf_frontend', {})
+            status['rudat_tx_serial'] = rf_cfg.get('rudat_tx_serial')
+            status['rudat_rx_serial'] = rf_cfg.get('rudat_rx_serial')
+        return status
 
     # -- config application --
 
@@ -462,3 +470,95 @@ class RFPeripheralController:
         mod = self._module()
         atten_amp = mod._get_atten_amp(self._channel, dev_name)
         return atten_amp.atten_amp_level.amp.total_gain_il
+
+
+# ---------------------------------------------------------------------
+# Generic attenuator discovery
+# ---------------------------------------------------------------------
+
+def find_attenuators():
+    """Discover all connected programmable attenuators and print their details.
+
+    Searches for:
+    - Mini-Circuits RUDAT USB attenuators (via pyusb)
+    - I2C attenuators on the SOUK RF Mixerless Module (via smbus2)
+
+    Returns a list of dicts with keys: backend, serial, bus, address, model.
+    """
+    results = []
+
+    # -- RUDAT USB attenuators --
+    if _RUDAT_AVAILABLE:
+        try:
+            rudats = find_rudats()
+            for serial, info in rudats.items():
+                from souk_readout_tools.server.rudat import Attenuator as _Att
+                att = _Att(info['bus'], info['address'])
+                model = att.get_model()
+                results.append({
+                    'backend': 'rudat',
+                    'serial': serial,
+                    'bus': info['bus'],
+                    'address': info['address'],
+                    'model': model,
+                })
+        except Exception as e:
+            print(f'RUDAT discovery error: {e}')
+    else:
+        print('RUDAT support not available (pyusb not installed)')
+
+    # -- I2C attenuators (souk-peripherals-control) --
+    if _HW_AVAILABLE:
+        for bus_num in range(4):
+            try:
+                bus = SMBus(bus_num)
+                cfg_list = [
+                    SOUKRFMixerlessModuleChnHWConfig.default_config(),
+                    SOUKRFMixerlessModuleChnHWConfig.default_config(),
+                ]
+                mod = SOUKRFMixerlessModule(bus, cfg_list)
+                for ch in range(2):
+                    try:
+                        atten_amp = mod._get_atten_amp(ch, 'transmit_atten')
+                        results.append({
+                            'backend': 'i2c',
+                            'serial': None,
+                            'bus': bus_num,
+                            'address': None,
+                            'model': f'SOUK RF Mixerless Module ch{ch}',
+                        })
+                    except Exception:
+                        pass
+                bus.close()
+            except Exception:
+                pass
+    else:
+        print('I2C support not available (smbus2 not installed)')
+
+    return results
+
+
+def _cli_main():
+    """CLI entry point for souk-find-attenuators."""
+    print('\nSearching for programmable attenuators...\n')
+    results = find_attenuators()
+    if not results:
+        print('No programmable attenuators found.')
+    else:
+        print(f'Found {len(results)} attenuator(s):\n')
+        for r in results:
+            print(f'  Backend: {r["backend"]}')
+            if r['serial'] is not None:
+                print(f'  Serial:  {r["serial"]}')
+            if r['model'] is not None:
+                print(f'  Model:   {r["model"]}')
+            print(f'  Bus:     {r["bus"]}', end='')
+            if r['address'] is not None:
+                print(f', Address: {r["address"]}')
+            else:
+                print()
+            print()
+
+
+if __name__ == '__main__':
+    _cli_main()

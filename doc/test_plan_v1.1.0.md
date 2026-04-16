@@ -396,20 +396,23 @@ print(status)
 - [x] `status['tx_total_gain_db']` and `status['rx_total_gain_db']` reflect current settings
 - [x] `status['tx_input_1db_comp_dbm']` is a sensible value (e.g. +10 to +20 dBm)
 
-TODO: add a helper scrript to identify the rudat attenuator devices and print their serial numbers, to make it easier to fill in the config for RUDAT testing
+RESOLVED: `souk-find-attenuators` CLI added (server entry point) — discovers RUDAT USB and I2C attenuators, prints serial numbers.
 
-TODO: rudat serial numbers not in rf peripheral status - only in config.
-TODO: what is channel:0 in rf_peripheral status?
+RESOLVED: RUDAT serial numbers now included in `rf_peripheral_status` when using RUDAT backend (`rudat_tx_serial`, `rudat_rx_serial`).
 
-TODO: fix_dac_saturaiton is slow
+RESOLVED: `channel` field in `rf_peripheral_status` is the I2C MUX channel for the mixerless module. For RUDAT backends it defaults to `pipeline_id` and is informational only. Documented in code.
 
-DAC saturation every time we do wideband sweep with optimise dynamic range true
-Fix dac saturation steps: set psb-scale = 0, maximise-amps, best fftshift, increase psb-scale by one bit in a loop until target
-generally - set_tone_powers should 1. get tone powers 2. compute required change, 3 - if attenuator can reach that range - just change the attenuator, if not try the bypass amp, if still not enough, reduce the psb_scale, if still not enough, reduce the fftshift, if still not enough, reduce the amplitudes, if the amplitudes hit minimum then we can hit the target. 
+RESOLVED: `fix_dac_saturation` simplified — halves psb_scale until clear (no binary search), reduced sleep/iteration counts. Much faster.
 
-wideband sweep - optimise_rx_gain, didnt change the rx attenuator value at all.
+RESOLVED: `set_tone_powers` with `optimise_dynamic_range=True` now uses a waterfall strategy: maximise digital gain first, then absorb excess power with attenuator > amp bypass > psb_scale reduction. Removed combinatorial planner.
 
-wideband sweep with optimsations off - power auto - still checks saturation, then tries toi maximise and hits saturation straight away.
+RESOLVED: `maximise_tx_power` uses multi-resolution psb_scale ramp (6dB > 3dB > 1dB > 0.5dB steps) with DAC snapshot estimate for starting value. Removed binary search and complex PSB overflow fallback.
+
+RESOLVED: `maximise_rx_power` simplified — no more bisection or boundary tracking. Steps attenuator/DSA directly based on snapshot headroom estimates.
+
+RESOLVED: `optimise_rx_snr` rewritten to prefer RX attenuator over DSA for gain control (better noise performance). Transfers DSA attenuation to RX attenuator.
+
+RESOLVED: `fix_adc_saturation` uses linear stepping (3dB attenuator, 2dB DSA) instead of binary search. Reduced sleep from 1s to 0.1s.
 
 ### 2.2  TX attenuation control
 

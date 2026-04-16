@@ -86,7 +86,8 @@ if install_server:
     entry_points['console_scripts'].extend([
         'souk-readout-server=souk_readout_tools.server.readout_server:main',
         'souk-enable-daemon=souk_readout_tools.server.server_scripts.souk_enable_daemon:main',
-        'souk-disable-daemon=souk_readout_tools.server.server_scripts.souk_disable_daemon:main'
+        'souk-disable-daemon=souk_readout_tools.server.server_scripts.souk_disable_daemon:main',
+        'souk-find-attenuators=souk_readout_tools.server.rf_peripherals:_cli_main',
     ])
 
 setup(
