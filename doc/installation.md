@@ -416,7 +416,7 @@ Generate a config from the bundled template, then edit it with your hardware-spe
 from souk_readout_tools.config_utils import copy_template_config
 
 # Creates a config file with default settings for pipeline 0
-copy_template_config(config_file='my_config.yaml', pipeline_id=0,
+copy_template_config(destination='my_config.yaml', pipeline_id=0,
                      config_id='krm4_pipeline0',
                      created_by='me',
                      comments='My first config')
