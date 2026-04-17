@@ -18,14 +18,11 @@ config:
 # --- RFSoC host connection settings ---
 # address: IP address of the RFSoC board
 # request_port / stream_port: offset by pipeline_id (e.g. pipeline 0 = 10000, pipeline 1 = 10001)
-# clock_source: 'internal' or 'external' clock reference
 rfsoc_host:
   hardware_id: "unnamed_rfsoc"
   address: "10.11.11.11"
   request_port: 10000
   stream_port: 20000
-  clock_source: "internal"
-  trigger_source_pin: 0
   comments:
 
 # --- Firmware and RFDC settings ---
@@ -34,6 +31,11 @@ rfsoc_host:
 firmware:
   fw_config_file: "/home/casper/souk-firmware/software/control_sw/config/souk-dual-pipeline-krm.yaml"
   pipeline_id: 0
+  # clock_source: 'internal' for on-board 12.8 MHz oscillator, 'external' for 10 MHz reference on clk0.
+  # This is a board-level setting — both pipeline configs should specify the same value.
+  clock_source: "internal"
+  # trigger_source_pin: GPIO pin index used for the external trigger input.
+  trigger_source_pin: 0
   # RFDC tile/block mapping — must match the firmware configuration:
   #   Pipeline 0: DACs {0/0} and {0/2}, ADC {2/0}
   #   Pipeline 1: DACs {1/0} and {1/2}, ADC {3/0}
@@ -59,7 +61,7 @@ firmware:
     internal_loopback: false
     psb_scale: 1
     psb_fftshift: 0b00000011111111
-    pfb_fftshift: 0b0000001111111
+    pfb_fftshift: 0b00000011111111
     nyquist_zone: 1                   # Sets DAC/ADC mixer frequencies automatically to +/-2*adc_clk_hz/4 (zone 1) or +/-2*adc_clk_hz*3/4 (zone 2)
     dsa: 0
     vop: 20000                       # WARNING: not rated above 20000uA in gen3 with 2.5V V_dac_vtt; up to 40500uA adds nonlinearity

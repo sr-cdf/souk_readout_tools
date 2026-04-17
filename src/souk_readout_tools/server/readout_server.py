@@ -425,7 +425,7 @@ class ReadoutServer:
         self.rf_peripherals = None
 
         #initialize server (this will load config again, but that's fine)
-        self.init_server(resolved_config_file, ensure_ready=False, force_ready=False)
+        self.init_server(resolved_config_file, ensure_ready=True, force_ready=False)
     
     
     def ensure_ready(self, config_file=None, level="pipeline"):
@@ -599,7 +599,11 @@ class ReadoutServer:
         self.server_address = '0.0.0.0'
         self.request_server_port = self.config['rfsoc_host']['request_port']
         self.stream_server_port = self.config['rfsoc_host']['stream_port']
-        self.trigger_source_pin = self.config['rfsoc_host']['trigger_source_pin']
+        # trigger_source_pin: prefer firmware section, fall back to rfsoc_host for older configs
+        self.trigger_source_pin = self.config.get('firmware', {}).get(
+            'trigger_source_pin',
+            self.config.get('rfsoc_host', {}).get('trigger_source_pin', 0)
+        )
         
         #interface with firmware
         fw_config_file = self.config['firmware']['fw_config_file']
@@ -613,7 +617,12 @@ class ReadoutServer:
             ensure_ready=False
 
         if ensure_ready:
-            self.ensure_ready(level="pipeline")
+            try:
+                self.ensure_ready(level="pipeline")
+            except Exception as e:
+                print(bcolors.FAIL + f'ensure_ready failed: {e}' + bcolors.ENDC)
+                print(bcolors.WARNING + 'Server will remain at server init level. '
+                      'Use a client to diagnose and retry (ensure_ready / hard_reset).' + bcolors.ENDC)
 
         if force_ready:
             self.force_ready(level='pipeline')

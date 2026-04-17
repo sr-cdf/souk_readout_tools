@@ -65,6 +65,16 @@ When driving N tones simultaneously, each tone's contribution to the total wavef
 
 Use Newman phases (`client.generate_newman_phases(freqs)`) to minimise crest factor. This allows higher per-tone power before the composite waveform clips the DAC.
 
+To check the PAPR for a given tone configuration, use the crest factor calculator in `firmware_lib`:
+
+```python
+from souk_readout_tools.firmware_lib import estimate_papr_db
+
+papr = estimate_papr_db(freqs, amps, phases, sample_rate)
+```
+
+This simulates the time-domain composite waveform and returns the PAPR in dB. Useful for verifying that phase choices and tone arrangements keep the crest factor low before committing settings to hardware.
+
 ---
 
 ## Setting Tone Powers

@@ -136,7 +136,7 @@ The CASPER image includes the `souk_mkid_readout` firmware interface library fro
 
 The FPGA (programmable logic) does not require any manual setup. Three things happen automatically on the board:
 
-- **Clock configuration:** The PL clocks (LMK/LMX chips) are configured on boot by the `krc-utils` service. The default source is the on-board 12.8 MHz oscillator. To use an external 10 MHz reference, set `rfsoc_host.clock_source: "external"` in the config and push it, or use `client.set_clock_source('external')`. See [clock_source.md](clock_source.md) for details.
+- **Clock configuration:** The PL clocks (LMK/LMX chips) are configured on boot by the `krc-utils` service. The default source is the on-board 12.8 MHz oscillator. To use an external 10 MHz reference, set `firmware.clock_source: "external"` in the config and push it, or use `client.set_clock_source('external')`. The server also verifies that clocks are locked before programming the FPGA. See [clock_source.md](clock_source.md) for details.
 - **Device tree overlay:** The Xilinx device tree overlay is applied by Linux at boot to expose the PL peripherals to the PS operating system.
 - **Bitfile programming:** The FPGA bitfile is programmed automatically by the readout server when a client calls `ensure_ready()`. You should not need to program the FPGA manually.
 
@@ -250,7 +250,8 @@ nano ~/.souk_readout_tools/pipeline_1/config/p1_config.yaml
 | `rfsoc_host.address` | `10.11.11.11` | `10.11.11.11` | Needed for server |
 | `rfsoc_host.request_port` | `10000` (auto) | `10001` (auto) | Needed for server |
 | `rfsoc_host.stream_port` | `20000` (auto) | `20001` (auto) | Needed for server |
-| `rfsoc_host.clock_source` | `internal` | `internal` | Board-level — must match between pipelines ([details](clock_source.md)) |
+| `firmware.clock_source` | `internal` | `internal` | Board-level — must match between pipelines ([details](clock_source.md)) |
+| `firmware.trigger_source_pin` | `0` | `0` | GPIO pin for external trigger input |
 | `firmware.fw_config_file` | Path to firmware config YAML | Path to firmware config YAML | Needed for server |
 | `firmware.pipeline_id` | `0` (auto) | `1` (auto) | Auto-set |
 | `firmware.dac0_tile` / `block` | `0` / `0` (auto) | `1` / `0` (auto) | Auto-set |

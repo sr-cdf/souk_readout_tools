@@ -13,6 +13,7 @@ import yaml
 import struct
 import subprocess
 import threading
+import fcntl
 
 try:
     import souk_mkid_readout
@@ -34,6 +35,8 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 USER_DIR = os.path.expanduser('~/.souk_readout_tools/')
+FPGA_PROGRAM_LOCK = os.path.join(USER_DIR, '.fpga_program.lock')
+SHARED_INIT_LOCK = os.path.join(USER_DIR, '.shared_init.lock')
 
 autosync_time_delay = 0.001 #seconds
 
@@ -369,41 +372,150 @@ def needs_initialising(r,config_dict):
     return needs_initialising_shared or needs_initialising_pipeline
 
 
+def ensure_clocks_locked(config_dict, max_retries=1):
+    """
+    Verify PLL clocks are locked, retrying clock init if needed.
+
+    Reads the desired clock_source from the config (firmware section,
+    falling back to rfsoc_host for older configs).  If clocks are not
+    locked, re-applies the clock configuration and checks again.
+
+    Parameters
+    ----------
+    config_dict : dict
+        The system configuration dictionary.
+    max_retries : int
+        Number of times to re-apply clock config before giving up.
+
+    Returns
+    -------
+    dict
+        Clock status dict (see :func:`get_clock_status`).
+
+    Raises
+    ------
+    RuntimeError
+        If clocks cannot be locked after retries.
+    """
+    status = get_clock_status()
+    if status.get('all_locked', False):
+        print(bcolors.OKGREEN + 'Clocks locked.' + bcolors.ENDC)
+        return status
+
+    # Clocks not locked — attempt to re-apply clock source from config
+    desired_clock = config_dict.get('firmware', {}).get(
+        'clock_source',
+        config_dict.get('rfsoc_host', {}).get('clock_source')
+    )
+    current_clock = get_clock_source()
+
+    for attempt in range(max_retries):
+        print(bcolors.WARNING + f'Clocks not locked (attempt {attempt + 1}/{max_retries}). '
+              f'Re-applying clock source: {desired_clock or current_clock}' + bcolors.ENDC)
+        try:
+            status = set_clock_source(desired_clock or current_clock)
+        except (ValueError, FileNotFoundError) as exc:
+            print(bcolors.FAIL + f'Failed to set clock source: {exc}' + bcolors.ENDC)
+            continue
+        if status.get('all_locked', False):
+            print(bcolors.OKGREEN + 'Clocks locked after re-init.' + bcolors.ENDC)
+            return status
+
+    # Still not locked
+    suggestion = ""
+    if desired_clock == 'external':
+        suggestion = (" Config specifies 'external' clock — if no 10 MHz reference is "
+                      "connected, change firmware.clock_source to 'internal'.")
+    elif desired_clock == 'internal':
+        suggestion = (" Config specifies 'internal' clock — if the on-board oscillator "
+                      "is not functioning, check hardware.")
+    raise RuntimeError(
+        f'Clocks failed to lock after {max_retries} attempt(s). '
+        f'Status: {status}.{suggestion}'
+    )
+
+
 def reload_firmware(config_dict):
     """
     Program/reprogram and return interfaces.
 
+    Verifies clocks are locked before programming.
+
     IMPORTANT: This and any second pipeline will need initialising. Do not initialise shared or pipeline resources here.
     """
     print(bcolors.WARNING+'Reloading firmware: all shared/pipeline resources will need re-initialising'+bcolors.ENDC)
+
+    # Ensure clocks are locked before programming the FPGA
+    ensure_clocks_locked(config_dict)
+
     fw_config_file = config_dict['firmware']['fw_config_file']
     pipeline_id = config_dict['firmware']['pipeline_id']
-    r = create_standard_readout_interface(fw_config_file,pipeline_id=pipeline_id)
-    r_fast = create_fast_readout_interface(fw_config_file,pipeline_id=pipeline_id)
-    r.program()
 
-    fw_type = r.fpga.get_firmware_type()
-    if fw_type==2:
-        if pipeline_id!=0:
-            raise ValueError(f'Pipeline ID {pipeline_id} does not exist in type 2 single pipeline firmware: {fw_config_file}')
-    elif fw_type==3:
-        if pipeline_id not in [0,1]:
-            raise ValueError(f'Pipeline ID {pipeline_id} does not exist in type 3 dual pipeline firmware: {fw_config_file}')
+    # Acquire cross-pipeline file lock to prevent concurrent programming.
+    # fcntl.flock is automatically released if the process crashes.
+    os.makedirs(os.path.dirname(FPGA_PROGRAM_LOCK), exist_ok=True)
+    lock_fd = open(FPGA_PROGRAM_LOCK, 'w')
+    try:
+        print(f'Acquiring FPGA programming lock ({FPGA_PROGRAM_LOCK}) ...')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        print('FPGA programming lock acquired.')
+
+        r = create_standard_readout_interface(fw_config_file,pipeline_id=pipeline_id)
+        r_fast = create_fast_readout_interface(fw_config_file,pipeline_id=pipeline_id)
+        r.program()
+
+        fw_type = r.fpga.get_firmware_type()
+        if fw_type==2:
+            if pipeline_id!=0:
+                raise ValueError(f'Pipeline ID {pipeline_id} does not exist in type 2 single pipeline firmware: {fw_config_file}')
+        elif fw_type==3:
+            if pipeline_id not in [0,1]:
+                raise ValueError(f'Pipeline ID {pipeline_id} does not exist in type 3 dual pipeline firmware: {fw_config_file}')
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+        print('FPGA programming lock released.')
 
     return r, r_fast
 
 
 
 def initialise_shared_resources(r,config_dict):
+    """
+    Initialise shared firmware blocks with cross-pipeline file lock.
+
+    On dual-pipeline systems both servers may call this concurrently.
+    The lock ensures only one pipeline performs the initialisation;
+    the second re-checks and skips if it has already been done.
+    """
     _shared_block_names = ['common', 'adc_snapshot', 'dac_snapshot', 'zoomfft', 'zoomacc', 'gen_cordic', 'gen_lut', 'autocorr']
 
-    #read from config
-    ## no common block configurations in use right now
+    # Acquire cross-pipeline file lock to prevent concurrent shared resource init.
+    # fcntl.flock is automatically released if the process crashes.
+    os.makedirs(os.path.dirname(SHARED_INIT_LOCK), exist_ok=True)
+    lock_fd = open(SHARED_INIT_LOCK, 'w')
+    try:
+        print(f'Acquiring shared resource init lock ({SHARED_INIT_LOCK}) ...')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        print('Shared resource init lock acquired.')
 
-    #initialise and setup blocks
-    r.initialize_shared_blocks()
+        # Re-check inside the lock: another pipeline may have already initialised.
+        if not needs_shared_resource_initialising(r, config_dict):
+            print('Shared resources already initialised by another pipeline, skipping.')
+            return
 
-    #nothing to setup right now
+        #read from config
+        ## no common block configurations in use right now
+
+        #initialise and setup blocks
+        r.initialize_shared_blocks()
+
+        #nothing to setup right now
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+        print('Shared resource init lock released.')
+
     return
 
 def initialise_pipeline_resources(r,r_fast,config_dict):
@@ -758,11 +870,12 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
             print(bcolors.WARNING + 'WARNING: rfsoc_host configuration changed. These parameters cannot be applied remotely. '
                   'Log into the RFSoC directly to make these changes.' + bcolors.ENDC)
 
-    # Apply clock source from rfsoc_host (cross-pipeline shared setting).
+    # Apply clock source (cross-pipeline shared setting).
+    # Prefer firmware section; fall back to rfsoc_host for older configs.
     # This is always applied unconditionally.  Clock source is a board-level
     # resource shared across pipelines — no coordination is performed between
     # server instances, so ensure both pipeline configs specify the same value.
-    desired_clock = new_rfsoc_host.get('clock_source')
+    desired_clock = fwconf.get('clock_source', new_rfsoc_host.get('clock_source'))
     if desired_clock is not None:
         print(f'apply_config: setting clock_source = {desired_clock}  '
               '(cross-pipeline setting — ensure both pipeline configs agree)')

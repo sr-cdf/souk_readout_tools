@@ -145,6 +145,7 @@ For full installation details (including server setup, SD card imaging, and daem
 | [Dual Pipeline](doc/dual_pipeline.md) | Dual-pipeline setup, initialisation model, and multi-server operation |
 | [Clock Source](doc/clock_source.md) | PL reference clock selection (internal/external) and PLL status |
 | [v7.9 Multitone Notes](doc/v79-multitone-notes.md) | VACC multitone design notes and constraints |
+| [Changelog](CHANGELOG.md) | Version history, feature list, and roadmap |
 
 ## Configuration
 

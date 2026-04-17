@@ -110,19 +110,21 @@ print(client.get_clock_status())
 
 ### Via the Config File
 
-The config file's `rfsoc_host.clock_source` field is applied whenever the config is pushed to the server:
+The config file's `firmware.clock_source` field is applied whenever the config is pushed to the server:
 
 ```yaml
-rfsoc_host:
+firmware:
   clock_source: "external"   # or "internal"
 ```
 
 ```python
-client.config['rfsoc_host']['clock_source'] = 'external'
+client.config['firmware']['clock_source'] = 'external'
 client.push_config()
 ```
 
 The clock source is applied unconditionally on every config push. Since this is a board-level setting shared across pipelines, ensure both pipeline configs specify the same value — no coordination is performed between server instances.
+
+> **Note:** In earlier versions, `clock_source` was under `rfsoc_host`. The server accepts both locations for backwards compatibility, but new configs should use `firmware.clock_source`.
 
 ### Manually on the RFSoC
 
