@@ -1016,6 +1016,14 @@ class ReadoutServer:
                             self.stream_flags[FLAG_CAL_FREEZE].clear()
                         response = {'status': 'success', 'value': value}
 
+                    elif param_name == 'clock_source':
+                        value = firmware_lib.get_clock_source()
+                        response = {'status': 'success', 'value': value}
+
+                    elif param_name == 'clock_status':
+                        value = firmware_lib.get_clock_status()
+                        response = {'status': 'success', 'value': value}
+
                     await self.send_response(writer, response)
 
                 elif request == 'set':
@@ -1080,8 +1088,13 @@ class ReadoutServer:
                     elif param_name == 'burst_mode':
                         firmware_lib.set_burst_mode(self.r, param_value)
                         response = {'status': 'success'}
-                    
 
+                    elif param_name == 'clock_source':
+                        try:
+                            status = firmware_lib.set_clock_source(param_value)
+                            response = {'status': 'success', 'clock_status': status}
+                        except (ValueError, FileNotFoundError) as exc:
+                            response = {'status': 'error', 'message': str(exc)}
 
                     await self.send_response(writer, response)
 

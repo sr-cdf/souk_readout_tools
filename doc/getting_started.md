@@ -20,6 +20,7 @@ SOUK Readout Tools is a Python package with tools for operating the MKID (Microw
 - [Resonance Finding](#resonance-finding)
 - [Retuning](#retuning)
 - [Power Calibration & Optimisation](#power-calibration--optimisation)
+- [Clock Source](#clock-source)
 - [Pre-Accumulator Snapshots](#pre-accumulator-snapshots)
 - [Plotting](#plotting)
 - [Resonator Analysis](#resonator-analysis)
@@ -548,9 +549,7 @@ client.perform_sweep(centers, spans, num_points, samples_per_point, direction='u
 client.get_sweep_progress()  # 0.0 to 1.0
 
 # Wait for completion and retrieve data
-import time
-while client.get_server_status()['latest_sweep_data_valid'] == False:
-    time.sleep(1)
+client.wait_for_sweep()
 
 raw_sweep = client.get_sweep_data()
 data = client.parse_sweep_data(raw_sweep)
@@ -566,7 +565,17 @@ plt.legend()
 plt.show()
 ```
 
-At the end of the sweep, tones are returned to the center frequencies. The parsed sweep data includes a `telescope_time` array with the PTP timestamp of the first sample at each sweep point.
+or use the internal plotting tools:
+
+```python
+from souk_readout_tools.plotting import plot_sweep
+fig = plot_sweep(data, format='magphase',multitone='overlay', title='Frequency Sweep')
+plt.show()
+```
+
+At the end of the sweep, tones are returned to the center frequencies. 
+
+The parsed sweep data includes a `telescope_time` array with the PTP timestamp of the first sample taken at each sweep point.
 
 ---
 
@@ -576,13 +585,17 @@ The wideband sweep covers the full RF bandwidth (or a specified sub-band) using 
 
 ```python
 sweep_data = client.wideband_sweep(
-    bandwidth_hz=None,               # None = full bandwidth
-    center_freq_hz=None,             # None = center of band
+    bandwidth_hz=None,               # None = defaults to 90% of full bandwidth
+    center_freq_hz=None,             # None = defaults to center of band
     step_size_hz=10000,              # frequency step size
     num_tones=1024,                  # number of parallel tones
     samples_per_point=10,            # accumulation per point
     tone_powers_dbm=-50,             # per-tone power in dBm (scalar or array), or 'auto'
+    reference_plane='detector',      # reference plane for tone power calibration
     remove_phase_slope=True,         # remove linear phase slope
+    optimise_tx_dynamic_range=True,  # automatically adjust TX parameters to maximise dynamic range
+    optimise_rx_gain=True,           # automatically adjust RX gain/attenuation to maximise SNR without saturation
+
     verbose=True
 )
 
@@ -594,8 +607,17 @@ plt.xlabel('Frequency (GHz)')
 plt.ylabel('|S21| (dB)')
 plt.show()
 ```
+or use the internal plotting tools:
 
-The wideband sweep automatically checks for ADC/DAC saturation before proceeding. A CLI tool is also available:
+```python
+from souk_readout_tools.plotting import plot_sweep
+fig = plot_sweep(data, format='magphase',multitone='overlay', title='Frequency Sweep')
+plt.show()
+```
+
+The wideband sweep automatically checks for ADC/DAC saturation before proceeding. 
+
+A CLI tool is also available:
 
 ```bash
 souk-wideband_sweep
@@ -645,7 +667,7 @@ Pass `filter_params` and `finder_params` to control the detection sensitivity:
 from souk_readout_tools.peak_finder import FilterParams, PeakFinderParams
 
 filt = FilterParams(highpass_edge=0.001, lowpass_edge=0.5, median_kernel_size=51)
-peaks = PeakFinderParams(prominence=3.0, min_width=3, max_num_peaks=500)
+peaks = PeakFinderParams(prominence=3.0, min_width=3e3, max_num_peaks=500)
 
 resonances = client.find_resonances(sweep_data, filter_params=filt, finder_params=peaks)
 ```
@@ -658,7 +680,7 @@ For interactive resonance finding with visual feedback, use the MKID Finder App:
 souk-mkid-finder-app
 ```
 
-This launches a PyQt5 GUI where you can load sweep data, adjust filter and peak-finding parameters, and visually inspect the detected resonances.
+This launches a PyQt5 GUI where you can load sweep data, adjust filter and peak-finding parameters, visually inspect/select the detected resonances and save the results.
 
 ---
 
@@ -677,8 +699,7 @@ client.perform_retune(
 )
 
 # Wait for completion
-while client.get_server_status()['latest_sweep_data_valid'] == False:
-    time.sleep(1)
+client.wait_for_sweep()
 
 # Tones are now placed at the detected resonance frequencies
 new_freqs = client.get_tone_frequencies()
@@ -713,13 +734,13 @@ The client provides methods to automatically optimise power levels and fix satur
 ```python
 client.maximise_tx_power()     # Maximise transmit power without clipping
 client.maximise_rx_power()     # Maximise receive power without clipping
-client.optimise_tx_snr()       # Optimise TX signal-to-noise
-client.optimise_rx_snr()       # Optimise RX signal-to-noise
+client.optimise_tx_snr()       # Optimise TX signal-to-noise without changing power
+client.optimise_rx_snr()       # Optimise RX signal-to-noise - minimises rx attenuation
 client.fix_dac_saturation()    # Auto-fix DAC clipping
 client.fix_adc_saturation()    # Auto-fix ADC clipping
 ```
 
-`maximise_tx_power()` and `maximise_rx_power()` accept a `headroom_db` parameter (default 2.0 dB) that sets the safety margin below saturation:
+`maximise_tx_power()` and `maximise_rx_power()` accept a `headroom_db` parameter (default 1.0 dB) that sets the safety margin below saturation:
 
 ```python
 client.maximise_tx_power(headroom_db=3.0)   # 3 dB below saturation
@@ -736,7 +757,7 @@ client.get_tone_powers()                              # at detector (default)
 client.get_tone_powers(reference_plane='dac')          # at DAC output
 client.get_tone_powers(reference_plane='rf_output')    # at RF frontend output
 
-# RX power estimation from accumulated IQ data
+# RX power estimation based on the accumulated IQ data values
 client.get_tone_powers(reference_plane='adc_input')             # at ADC input
 client.get_tone_powers(reference_plane='cryostat_output')       # at cryostat output
 ```
@@ -744,7 +765,7 @@ client.get_tone_powers(reference_plane='cryostat_output')       # at cryostat ou
 `set_tone_powers()` returns a result dict with `achieved_powers_dbm`, `power_error_db`, and `warnings`:
 
 ```python
-result = client.set_tone_powers([-20, -25], optimise_dynamic_range=True)
+result = client.set_tone_powers([-20, -25], reference_plane='dac', optimise_dynamic_range=True)
 # Warnings (e.g. power clamping, compression) are printed automatically
 ```
 
@@ -768,6 +789,35 @@ The calibration should be periodically unfrozen between observations to ensure t
 
 ---
 
+## Clock Source
+
+The RFSoC PL clocks can be referenced to either the on-board 12.8 MHz oscillator (**internal**) or an external 10 MHz reference (**external**). This is a board-level setting that affects both pipelines.
+
+```python
+# Check current source and PLL lock status
+client.get_clock_source()    # 'internal' or 'external'
+client.get_clock_status()    # per-chip lock status
+
+# Switch to external 10 MHz reference
+client.set_clock_source('external')
+
+# Switch back to internal
+client.set_clock_source('internal')
+```
+
+The clock source is also applied automatically when pushing a config — set `rfsoc_host.clock_source` in the config file:
+
+```yaml
+rfsoc_host:
+  clock_source: "external"
+```
+
+Clock source and PLL lock status are included in `get_system_information()`.
+
+Since this is a shared resource, both pipeline configs should specify the same `clock_source` value. See [clock_source.md](clock_source.md) for full details, manual procedures, and troubleshooting.
+
+---
+
 ## Pre-Accumulator Snapshots
 
 For high time-resolution data on a single tone, acquire snapshots from the pre-accumulator stage. Each snapshot contains 1024 complex samples at the FFT output rate (before accumulation), which is `acc_len` times faster than the normal sample rate:
@@ -787,7 +837,7 @@ This is useful for diagnostics, characterising noise at higher frequencies, or f
 
 ### Batch Snapshots
 
-To acquire snapshots across multiple tones in one call:
+To acquire snapshots across multiple tones (one afer the other) in one call:
 
 ```python
 # All tones, 20 snapshots each, save to file and plot
@@ -834,6 +884,7 @@ fig = plot_sweep(sweep_data, format='iq_vs_f')
 
 # Per-tone grid (one subplot per tone) instead of overlay
 fig = plot_sweep(per_tone_sweep, tones=[0, 1, 2], multi_tone='grid')
+
 ```
 
 ### Timestream Plots
@@ -844,7 +895,7 @@ from souk_readout_tools.plotting import plot_timestream, plot_timestream_psd
 # I and Q vs time
 fig = plot_timestream(parsed_samples, format='iq_vs_t', tones=[0, 1])
 
-# Frequency and dissipation noise (requires sweep data for gradient)
+# Frequency and dissipation response timestreams (requires sweep data for conversion)
 fig = plot_timestream(parsed_samples, format='freq_diss', sweep_data=sweep)
 
 # Power spectral density
@@ -861,7 +912,7 @@ fig = plot_timestream_on_resonance(parsed_samples, sweep, tone_index=0, phase_ce
 from souk_readout_tools.plotting import plot_snapshots, plot_snapshots_psd, plot_batch_snapshots
 
 # Single tone: time domain (mean, concatenated, or overlay)
-fig = plot_snapshots(snap_data, format='iq_vs_t', repetitions='mean')
+fig = plot_snapshots(snap_data, format='iq_vs_t', repetitions='overlay')
 
 # Single tone: averaged PSD with error bars from repetition variance
 fig = plot_snapshots_psd(snap_data, method='averaged', show_errors=True)
@@ -1012,7 +1063,7 @@ The system supports two independent readout pipelines on a single RFSoC board, a
 
 ### Quick Summary
 
-1. Create two config files with different `pipeline_id` (0 and 1), different ports, and correct RFDC tile/block mappings. Use `copy_template_config()` with `pipeline_id=0` and `pipeline_id=1`.
+1. Create two config files with different `pipeline_id` (0 and 1), different tcp ports, and correct RFDC tile/block mappings. Use `copy_template_config()` with `pipeline_id=0` and `pipeline_id=1`.
 
 2. Start two server instances on the RFSoC:
    ```bash
@@ -1126,6 +1177,13 @@ Server-side commands (installed on the RFSoC):
 - Abstract `measure_func(client) → dict` pattern works with any readout measurement.
 - `save_measurement()` for exporting results.
 
+**Clock Source Control**
+- `get_clock_source()` / `set_clock_source()` for reading and setting the PL reference clock (internal 12.8 MHz or external 10 MHz).
+- `get_clock_status()` for querying PLL lock status of all clock chips (LMK04208 + LMX2594s).
+- Clock source and lock status included in `get_system_information()`.
+- `apply_config()` enforces `rfsoc_host.clock_source` on every config push.
+- See [clock_source.md](clock_source.md) for full details and manual procedures.
+
 **System Information**
 - `get_system_information()` reports software versions, git info, and RFDC RTS events.
 - `check_rfdc_rts_events()` for DAC/ADC overvoltage sticky flag checking.
@@ -1199,12 +1257,14 @@ Server-side commands (installed on the RFSoC):
 ## Future Developments
 
 Planned for upcoming releases:
-
-- More plots in the docs and examples.
+- 
+- Quick on/off resonance switching for noise measurements.  
+- Blind tone management and common-mode noise removal.
 - Automated resonator tracking (continuous retune loop with drift correction).
+- More plots in the docs and examples.
 - More interactive plotting features (eg step to next resonance, flag as good/bad)
 - ADC calibration via loopback measurement.
 - Improved VACC tone backfilling for more efficient LO slot usage.
-- Dual-DAC mode support.
+- Dual-DAC mode support for improved dynamic range.
 - HDF5 export format support.
 - Automated version numbering and release workflow.

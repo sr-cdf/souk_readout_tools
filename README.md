@@ -52,6 +52,7 @@ Each `ReadoutServer` uses two TCP ports - a **request port** for JSON command/re
 - **Retuning** - sweep-and-retune workflows to track drifting resonances using max-derivative or min-magnitude methods
 - **Power management** - automatic TX/RX level optimisation with saturation detection, dynamic range management, and calibrated power control in dBm at any reference plane in the signal chain
 - **ADC calibration freeze** - freeze the RFSoC's internal ADC calibration during observations to eliminate drift noise, with periodic defrost for recalibration
+- **Clock source control** - select internal (12.8 MHz) or external (10 MHz) PL reference clock with PLL lock status monitoring
 - **Dual-pipeline support** - two independent pipelines per board with three-level initialisation (program FPGA → shared resources → per-pipeline resources) to prevent cross-pipeline disruption
 - **VACC multitone** (v7.9+) - multiple tones per FFT bin with automatic LO index management and sparse tone index handling
 - **Configuration sync** - YAML-based config with `push_config()`/`pull_config()` for client-server synchronisation, including automatic calibration file transfer
@@ -142,6 +143,7 @@ For full installation details (including server setup, SD card imaging, and daem
 | [Installation Guide](doc/installation.md) | Full client and server installation, SD card setup, daemon configuration |
 | [Getting Started](doc/getting_started.md) | Configuration, usage guide, and worked examples for all features |
 | [Dual Pipeline](doc/dual_pipeline.md) | Dual-pipeline setup, initialisation model, and multi-server operation |
+| [Clock Source](doc/clock_source.md) | PL reference clock selection (internal/external) and PLL status |
 | [v7.9 Multitone Notes](doc/v79-multitone-notes.md) | VACC multitone design notes and constraints |
 
 ## Configuration

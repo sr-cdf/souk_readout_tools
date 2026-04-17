@@ -8,6 +8,7 @@ import warnings
 import numpy as np
 import time
 import os
+import pwd
 import yaml
 import struct
 import subprocess
@@ -595,6 +596,12 @@ def get_system_information(r,config_dict):
     info['souk_firmware_commit'] = _get_git_commit('/home/casper/souk-firmware')
     info['souk_peripherals_commit'] = _get_git_commit('/home/casper/souk_readout_tools/src/souk_readout_tools/server/souk-peripherals-control')
 
+    # Clock source and PLL lock status (cross-pipeline)
+    info['clock_source'] = get_clock_source()
+    clock_status = get_clock_status()
+    info['clock_locked'] = clock_status.get('all_locked', False)
+    info['clock_chips'] = clock_status.get('chips', [])
+
     info['fpga_status'] = r.fpga.get_status()[0]
     info['fpg_file'] = r.fpgfile
     info['pipeline_id'] = r.pipeline_id
@@ -742,12 +749,27 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
                       f'This requires re-initialisation of firmware resources.' + bcolors.ENDC)
 
     # Check for rfsoc_host parameter changes
+    new_rfsoc_host = new_config_dict.get('rfsoc_host', {})
     if prev_config_dict is not None:
-        new_rfsoc_host = new_config_dict.get('rfsoc_host', {})
         prev_rfsoc_host = prev_config_dict.get('rfsoc_host', {})
-        if new_rfsoc_host != prev_rfsoc_host:
+        non_clock_changed = {k for k in set(new_rfsoc_host) | set(prev_rfsoc_host)
+                             if k != 'clock_source' and new_rfsoc_host.get(k) != prev_rfsoc_host.get(k)}
+        if non_clock_changed:
             print(bcolors.WARNING + 'WARNING: rfsoc_host configuration changed. These parameters cannot be applied remotely. '
                   'Log into the RFSoC directly to make these changes.' + bcolors.ENDC)
+
+    # Apply clock source from rfsoc_host (cross-pipeline shared setting).
+    # This is always applied unconditionally.  Clock source is a board-level
+    # resource shared across pipelines — no coordination is performed between
+    # server instances, so ensure both pipeline configs specify the same value.
+    desired_clock = new_rfsoc_host.get('clock_source')
+    if desired_clock is not None:
+        print(f'apply_config: setting clock_source = {desired_clock}  '
+              '(cross-pipeline setting — ensure both pipeline configs agree)')
+        try:
+            set_clock_source(desired_clock)
+        except (ValueError, FileNotFoundError) as exc:
+            print(bcolors.FAIL + f'Failed to set clock source: {exc}' + bcolors.ENDC)
 
     # Helper to check if a value changed
     def changed(key):
@@ -5923,6 +5945,150 @@ def get_cal_freeze(r,config_dict):
     freeze = r.rfdc.core.get_cal_freeze(adc_tile,adc_block)
     print('freeze',freeze)
     return bool(int(freeze['CalFrozen']))
+
+
+# ---------------------------------------------------------------------------
+# Clock source control via krc-utils
+# ---------------------------------------------------------------------------
+
+KRC_UTILS_BIN = '/home/casper/krc-utils/krc-utils'
+KRC_CLOCK_DIR = '/etc/krc-utils.d/clock.d'
+KRC_LMK_SYMLINK = os.path.join(KRC_CLOCK_DIR, 'lmk04208.txt')
+
+# Map user-facing names to the LMK config filenames
+_CLOCK_SOURCE_FILES = {
+    'internal': 'lmk04208_in_12M8_out_122M88.txt',
+    'external': 'lmk04208_in_10M_clk0_out_122M88.txt',
+}
+# Reverse lookup: filename -> source name
+_CLOCK_FILE_TO_SOURCE = {v: k for k, v in _CLOCK_SOURCE_FILES.items()}
+
+
+def get_clock_source():
+    """
+    Read the current clock source selection from the LMK symlink.
+
+    Returns
+    -------
+    str
+        'internal', 'external', or 'unknown' if the symlink target is
+        not recognised.
+    """
+    try:
+        target = os.readlink(KRC_LMK_SYMLINK)
+        basename = os.path.basename(target)
+        return _CLOCK_FILE_TO_SOURCE.get(basename, 'unknown')
+    except OSError as exc:
+        print(bcolors.FAIL + f'Failed to read clock source symlink: {exc}' + bcolors.ENDC)
+        return 'unknown'
+
+
+def get_clock_status():
+    """
+    Query the PLL lock status of all clock chips via ``krc-utils status``.
+
+    Returns
+    -------
+    dict
+        Keys: 'all_locked' (bool), 'chips' (list of dicts with 'name' and
+        'status' for each clock chip).
+    """
+    try:
+        result = subprocess.run(
+            [KRC_UTILS_BIN, 'status'],
+            capture_output=True, text=True, timeout=10,
+        )
+        chips = []
+        for line in result.stdout.strip().splitlines():
+            # Lines look like: "[lmk04208.0] status: locked"
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                name_part, status_part = line.split('] status:')
+                name = name_part.strip().lstrip('[').strip()
+                status = status_part.strip()
+                chips.append({'name': name, 'status': status})
+            except ValueError:
+                continue
+        all_locked = all(c['status'] == 'locked' for c in chips) if chips else False
+        return {'all_locked': all_locked, 'chips': chips}
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        print(bcolors.FAIL + f'Failed to query clock status: {exc}' + bcolors.ENDC)
+        return {'all_locked': False, 'chips': [], 'error': str(exc)}
+
+
+def set_clock_source(source):
+    """
+    Set the reference clock source and apply the new configuration.
+
+    Parameters
+    ----------
+    source : str
+        'internal' for the on-board 12.8 MHz oscillator, or
+        'external' for a 10 MHz reference on clk0.
+
+    Returns
+    -------
+    dict
+        Clock status after applying the change (see :func:`get_clock_status`).
+
+    Raises
+    ------
+    ValueError
+        If *source* is not 'internal' or 'external'.
+    """
+    source = source.strip().lower()
+    if source not in _CLOCK_SOURCE_FILES:
+        raise ValueError(f"clock_source must be 'internal' or 'external', got '{source}'")
+
+    target_file = _CLOCK_SOURCE_FILES[source]
+    target_path = os.path.join(KRC_CLOCK_DIR, target_file)
+
+    # Verify the target config file exists
+    if not os.path.isfile(target_path):
+        raise FileNotFoundError(f'Clock config file not found: {target_path}')
+
+    # Check if already set to the requested source
+    current = get_clock_source()
+    if current == source:
+        print(f'Clock source already set to {source}, re-applying settings.')
+
+    # Update symlink — remove old, create new
+    print(f'Setting clock source: {source} -> {target_file}')
+    if os.path.islink(KRC_LMK_SYMLINK) or os.path.exists(KRC_LMK_SYMLINK):
+        os.unlink(KRC_LMK_SYMLINK)
+    os.symlink(target_file, KRC_LMK_SYMLINK)
+
+    # Ensure casper owns the symlink (server often runs as root)
+    try:
+        pw = pwd.getpwnam('casper')
+        os.lchown(KRC_LMK_SYMLINK, pw.pw_uid, pw.pw_gid)
+    except (KeyError, OSError) as exc:
+        print(bcolors.WARNING + f'Could not chown symlink to casper: {exc}' + bcolors.ENDC)
+
+    # Apply the new clock configuration
+    print('Applying clock configuration via krc-utils init ...')
+    try:
+        result = subprocess.run(
+            [KRC_UTILS_BIN, 'init'],
+            capture_output=True, text=True, timeout=30,
+        )
+        print(result.stdout)
+        if result.returncode != 0:
+            print(bcolors.FAIL + f'krc-utils init returned non-zero exit code: {result.returncode}' + bcolors.ENDC)
+            if result.stderr:
+                print(result.stderr)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        print(bcolors.FAIL + f'Failed to run krc-utils init: {exc}' + bcolors.ENDC)
+        return {'all_locked': False, 'chips': [], 'error': str(exc)}
+
+    # Return the lock status after applying
+    status = get_clock_status()
+    if not status.get('all_locked', False):
+        print(bcolors.WARNING + 'WARNING: Not all clocks are locked after setting clock source.' + bcolors.ENDC)
+    return status
+
 
 def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='detector',
                     rf_peripherals=None):

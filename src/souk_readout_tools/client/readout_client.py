@@ -955,6 +955,37 @@ class ReadoutClient:
     def set_cal_freeze(self,freeze):
         return self.set_parameter('cal_freeze',freeze)
 
+    def get_clock_source(self):
+        """Get the current reference clock source ('internal' or 'external')."""
+        return self.get_parameter('clock_source')
+
+    def set_clock_source(self, source):
+        """Set the reference clock source.
+
+        Parameters
+        ----------
+        source : str
+            'internal' for the on-board 12.8 MHz oscillator, or
+            'external' for a 10 MHz reference on clk0.
+
+        Returns
+        -------
+        dict
+            Server response including clock lock status after applying.
+        """
+        return self.set_parameter('clock_source', source)
+
+    def get_clock_status(self):
+        """Get PLL lock status of all clock chips.
+
+        Returns
+        -------
+        dict
+            Keys: 'all_locked' (bool), 'chips' (list of dicts with
+            'name' and 'status' per chip).
+        """
+        return self.get_parameter('clock_status')
+
     def get_samples(self, num_samples,incl_system_info=True,burst=False):
         """
         Acquire num_samples samples from the readout server and return concatenated raw data.
