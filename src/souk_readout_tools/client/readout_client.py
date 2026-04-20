@@ -3215,29 +3215,54 @@ class ReadoutClient:
                 f'Too few unmasked points ({len(included_idx)}) for smoothing. '
                 f'Reduce mask_hwhm_factor.')
 
-        if n_pts > 1 and median_filter_mhz > 0:
-            freq_span_mhz = (freqs[-1] - freqs[0]) / 1e6
-            if freq_span_mhz > 0:
-                pts_per_mhz = n_pts / freq_span_mhz
-                kernel = max(3, int(round(pts_per_mhz * median_filter_mhz)))
-                if kernel % 2 == 0:
-                    kernel += 1
-                if len(included_idx) > kernel:
-                    if medfilt is not None:
-                        tau_ns_work[included_idx] = medfilt(
-                            tau_ns_work[included_idx],
-                            kernel_size=min(kernel, len(included_idx) | 1))
-                    else:
-                        half = kernel // 2
-                        filtered = tau_ns_work[included_idx].copy()
-                        for i in range(len(included_idx)):
-                            lo = max(0, i - half)
-                            hi = min(len(included_idx), i + half + 1)
-                            filtered[i] = np.median(tau_ns_work[included_idx[lo:hi]])
-                        tau_ns_work[included_idx] = filtered
-                    if verbose:
-                        print(f'  Median filter: kernel {kernel} points '
-                              f'({kernel/pts_per_mhz:.1f} MHz)')
+        # Compute filter kernels and edge-padding width (in points) up front.
+        # Padding replicates the edge values so that the median and savgol
+        # filters see a flat continuation instead of running into a boundary.
+        freq_span_mhz = (freqs[-1] - freqs[0]) / 1e6 if n_pts > 1 else 0.0
+        pts_per_mhz = n_pts / freq_span_mhz if freq_span_mhz > 0 else 0.0
+        med_kernel = 0
+        savgol_window = 0
+
+        if pts_per_mhz > 0 and median_filter_mhz > 0:
+            med_kernel = max(3, int(round(pts_per_mhz * median_filter_mhz)))
+            if med_kernel % 2 == 0:
+                med_kernel += 1
+
+        if (savgol_filter is not None and pts_per_mhz > 0
+                and n_pts > savgol_poly_order + 2):
+            savgol_window = max(savgol_poly_order + 2,
+                                int(round(pts_per_mhz * savgol_mhz)))
+            if savgol_window % 2 == 0:
+                savgol_window += 1
+            savgol_window = min(savgol_window,
+                                n_pts if n_pts % 2 == 1 else n_pts - 1)
+
+        pad_n = 2 * max(med_kernel, savgol_window)
+
+        if n_pts > 1 and med_kernel >= 3 and len(included_idx) > med_kernel:
+            # Pad with edge values, filter, then trim
+            vals = tau_ns_work[included_idx]
+            padded = np.concatenate([
+                np.full(pad_n, vals[0]),
+                vals,
+                np.full(pad_n, vals[-1]),
+            ])
+            if medfilt is not None:
+                ks = min(med_kernel, len(padded) if len(padded) % 2 == 1
+                         else len(padded) - 1)
+                padded = medfilt(padded, kernel_size=ks)
+            else:
+                half = med_kernel // 2
+                filtered = padded.copy()
+                for i in range(len(padded)):
+                    lo = max(0, i - half)
+                    hi = min(len(padded), i + half + 1)
+                    filtered[i] = np.median(padded[lo:hi])
+                padded = filtered
+            tau_ns_work[included_idx] = padded[pad_n:pad_n + len(included_idx)]
+            if verbose:
+                print(f'  Median filter: kernel {med_kernel} points '
+                      f'({med_kernel/pts_per_mhz:.1f} MHz)')
 
         # --- interpolate across masked regions before savgol --------------------
         tau_for_savgol = tau_ns_work.copy()
@@ -3249,15 +3274,18 @@ class ReadoutClient:
                 tau_ns_work[included_idx])
 
         # --- Savitzky-Golay filter ---------------------------------------------
-        freq_span_mhz = (freqs[-1] - freqs[0]) / 1e6
-        if savgol_filter is not None and freq_span_mhz > 0 and n_pts > savgol_poly_order + 2:
-            pts_per_mhz = n_pts / freq_span_mhz
-            savgol_window = max(savgol_poly_order + 2, int(round(pts_per_mhz * savgol_mhz)))
-            if savgol_window % 2 == 0:
-                savgol_window += 1
-            savgol_window = min(savgol_window, n_pts if n_pts % 2 == 1 else n_pts - 1)
-
-            tau_ns_smooth = savgol_filter(tau_for_savgol, savgol_window, savgol_poly_order)
+        if savgol_window >= savgol_poly_order + 2:
+            # Pad with edge values, filter, then trim
+            padded = np.concatenate([
+                np.full(pad_n, tau_for_savgol[0]),
+                tau_for_savgol,
+                np.full(pad_n, tau_for_savgol[-1]),
+            ])
+            sw_padded = min(savgol_window,
+                            len(padded) if len(padded) % 2 == 1
+                            else len(padded) - 1)
+            tau_ns_smooth = savgol_filter(padded, sw_padded, savgol_poly_order)
+            tau_ns_smooth = tau_ns_smooth[pad_n:pad_n + n_pts]
 
             if verbose:
                 print(f'  Savitzky-Golay filter: window {savgol_window} points '

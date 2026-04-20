@@ -85,6 +85,70 @@ def _resolve_group_delay_cal(group_delay_cal, frequencies):
     return tau_ns.reshape(frequencies.shape) * 1e-9
 
 
+def _integrate_group_delay(group_delay_cal, frequencies):
+    """Integrate a group delay calibration to recover cumulative phase.
+
+    Group delay is the derivative of phase: τ(f) = -1/(2π) dφ/df.
+    Recovering the phase requires integration, not multiplication by f.
+    For a constant delay the integral reduces to 2πfτ, but for
+    frequency-dependent delay the pointwise product 2πf·τ(f) is wrong.
+
+    Args:
+        group_delay_cal: Group delay calibration (same formats as
+            ``_resolve_group_delay_cal``).
+        frequencies: 1-D array of frequencies in Hz.
+
+    Returns:
+        phase: 1-D array of cumulative phase in radians (same shape as
+        *frequencies*).
+    """
+    frequencies = np.asarray(frequencies, dtype=float)
+
+    # Scalar delay: integral is 2π·f·τ exactly
+    if not isinstance(group_delay_cal, dict) and np.ndim(group_delay_cal) == 0:
+        tau_s = float(group_delay_cal) * 1e-9
+        return 2 * np.pi * frequencies * tau_s
+
+    # Extract calibration grid
+    if isinstance(group_delay_cal, dict):
+        cal_f = np.asarray(group_delay_cal['frequencies'], dtype=float).ravel()
+        cal_tau_ns = np.asarray(group_delay_cal['tau_ns'], dtype=float).ravel()
+    else:
+        arr = np.asarray(group_delay_cal, dtype=float)
+        cal_f = arr[:, 0]
+        cal_tau_ns = arr[:, 1]
+
+    order = np.argsort(cal_f)
+    cal_f = cal_f[order]
+    cal_tau_s = cal_tau_ns[order] * 1e-9
+
+    # Cumulative trapezoidal integration on the calibration grid.
+    df = np.diff(cal_f)
+    avg_tau = (cal_tau_s[:-1] + cal_tau_s[1:]) / 2
+    cum_phase = np.zeros(len(cal_f))
+    cum_phase[1:] = np.cumsum(2 * np.pi * avg_tau * df)
+
+    # Re-zero so that the phase is 0 at the first target frequency.
+    # This avoids inventing phase below the calibration grid and keeps
+    # the correction relative to the start of the data being corrected.
+    f0 = float(frequencies.ravel()[0])
+    phase_at_f0 = float(np.interp(f0, cal_f, cum_phase))
+    cum_phase -= phase_at_f0
+
+    # Interpolate cumulative phase to target frequencies, with linear
+    # extrapolation using the edge group delay values
+    flat = frequencies.ravel()
+    phase = np.interp(flat, cal_f, cum_phase)
+    below = flat < cal_f[0]
+    above = flat > cal_f[-1]
+    if np.any(below):
+        phase[below] = cum_phase[0] + 2 * np.pi * cal_tau_s[0] * (flat[below] - cal_f[0])
+    if np.any(above):
+        phase[above] = cum_phase[-1] + 2 * np.pi * cal_tau_s[-1] * (flat[above] - cal_f[-1])
+
+    return phase.reshape(frequencies.shape)
+
+
 def remove_group_delay(frequencies, s21, group_delay_cal):
     """
     Remove frequency-dependent group delay from S21 data.
@@ -92,6 +156,10 @@ def remove_group_delay(frequencies, s21, group_delay_cal):
     Like ``remove_cable_delay`` but uses a frequency-dependent calibration
     instead of a single scalar delay.  The calibration is typically produced
     by ``ReadoutClient.measure_path_group_delay()``.
+
+    The phase accumulated by a frequency-dependent group delay τ(f) is
+    φ(f) = 2π ∫ τ(f') df', *not* 2πf·τ(f).  This function integrates
+    the calibration to obtain the correct phase correction.
 
     Args:
         frequencies: 1-D array of frequencies in Hz.
@@ -109,7 +177,8 @@ def remove_group_delay(frequencies, s21, group_delay_cal):
     frequencies = np.asarray(frequencies, dtype=float)
     s21 = np.asarray(s21, dtype=complex)
     tau_s = _resolve_group_delay_cal(group_delay_cal, frequencies)
-    s21_corrected = s21 * np.exp(1j * 2 * np.pi * frequencies * tau_s)
+    phase = _integrate_group_delay(group_delay_cal, frequencies)
+    s21_corrected = s21 * np.exp(1j * phase)
     return s21_corrected, tau_s
 
 
@@ -281,8 +350,8 @@ def apply_deembed_params(s21, params, frequency=None):
     if frequency is not None:
         group_delay_cal = params.get('group_delay_cal')
         if group_delay_cal is not None:
-            tau_s = _resolve_group_delay_cal(group_delay_cal, np.atleast_1d(frequency))
-            s21 = s21 * np.exp(1j * 2 * np.pi * np.asarray(frequency, dtype=float) * tau_s)
+            phase = _integrate_group_delay(group_delay_cal, np.atleast_1d(frequency))
+            s21 = s21 * np.exp(1j * phase)
         elif params.get('tau') is not None:
             s21 = s21 * np.exp(
                 1j * 2 * np.pi * np.asarray(frequency, dtype=float) * params['tau'])
