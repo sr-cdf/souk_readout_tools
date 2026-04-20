@@ -163,7 +163,7 @@ The installer auto-detects the platform and installs client components on non-Xi
 
 ## Configuration
 
-Configuration is YAML-based. A template config is bundled with the package.
+Configuration is YAML-based. A template config is bundled with the package. The primary purpose of the initial config is to set the **RFSoC IP address** so the server and client know how to communicate — all other settings can be adjusted later.
 
 ### Config File Structure
 
@@ -181,21 +181,37 @@ The main sections are:
 
 On the client side, config files live wherever you choose. Keep them with your project or measurement data. The standard workflow is to maintain a local config file, connect with it, and push changes to the RFSoC.
 
+> **Note:** Before creating a config, `cd` to the directory where you want to keep your project files and data — the config will be written to your current working directory. For example:
+> ```bash
+> mkdir -p ~/my_mkid_project && cd ~/my_mkid_project
+> ```
+
 Create a new config from the bundled template:
 
 ```python
 from souk_readout_tools.config_utils import copy_template_config
-copy_template_config(config_file='my_config.yaml', pipeline_id=0)
+copy_template_config(destination='my_config.yaml', pipeline_id=0)
 ```
+
+To create a config for **Nyquist zone 2** operation, pass `nyquist_zone=2`:
+
+```python
+copy_template_config(destination='my_config.yaml', pipeline_id=0, nyquist_zone=2)
+```
+
+This sets the `nyquist_zone` key in the config, which controls the DAC DUC and ADC DDC mixer frequencies automatically. Zone 1 uses mixer frequencies of +/-fs/4 (~1228.8 MHz) and zone 2 uses +/-3*fs/4 (~3686.4 MHz). Tone frequencies should be set in the RF band corresponding to the configured zone — e.g. for zone 2, frequencies will be in the second Nyquist band above fs/2.
 
 ### Preparing a Config File
 
+The minimum you need to set to get started is the **RFSoC IP address** — this tells the client where to connect and the server where to listen. Everything else can be left as defaults and adjusted later.
+
 Edit the config file with your hardware-specific settings. The most important parameters to set are:
 
-- `rfsoc_host.address` - The RFSoC IP address
+- `rfsoc_host.address` - The RFSoC IP address (e.g. `10.11.11.11`) — **set this first**
 - `rfsoc_host.request_port` / `stream_port` - TCP ports (must be unique per pipeline)
 - `firmware.fw_config_file` - Path to the firmware config YAML on the RFSoC
 - `firmware.pipeline_id` - Pipeline index (0 or 1)
+- `firmware.defaults.nyquist_zone` - Nyquist zone (1 or 2) — set this if operating in the second Nyquist zone
 - `firmware.dac*_tile`, `dac*_block`, `adc_tile`, `adc_block` - RFDC channel mapping
 - `rf_frontend.*` - Analog frontend configuration for your setup
 
@@ -281,14 +297,63 @@ client = ReadoutClient(config_file='my_config.yaml')
 client.pull_config()  # updates in memory only, nothing written to disk
 ```
 
-### Requesting Information
+### Syncing Live Hardware State into the Config
 
-Check the server status and firmware configuration:
+`sync_config_from_system()` is the inverse of `apply_config()`: rather than pushing config values to the hardware, it reads the current hardware state and writes it back into the in-memory config.  This is useful when the system has been adjusted interactively (e.g. attenuators tuned, tone frequencies retuned, DSP parameters changed) and you want to capture that state so it can be persisted with `save_config()` or `push_config()`.
+
+Fields updated by `sync_config_from_system()`:
+
+- `firmware.defaults` — accumulator length, sync delay, DSP parameters (VOP, Nyquist zone, mixer scales, QMC settings, DSA, DUC/DDC mixer frequencies)
+- `firmware.defaults.frequencies/amplitudes/phases` — current tone state
+- `rf_frontend` — TX/RX attenuator values and amplifier bypass states (if the RF frontend is connected and the peripherals controller is available)
 
 ```python
-client.get_server_status()
-client.get_system_information()
+# Capture the current running state into the config
+client.sync_config_from_system()
+
+# Inspect what changed
+print(client.config['firmware']['defaults'])
+
+# Persist locally
+client.save_config()
+
+# Or push back to the RFSoC so it survives a reboot
+client.push_config()
 ```
+
+`sync_config_from_system()` does **not** write to disk and does not push to the server — those are separate explicit steps.  It only modifies the client's in-memory `config` dict.
+
+### Requesting Information
+
+The `get_info()` method returns structured system information organised into named sections:
+
+```python
+# Default sections (fast — server, versions, clock, fpga, rfdc, pipeline, tones, rf_frontend, lna)
+info = client.get_info()
+
+# Specific sections only
+info = client.get_info(['tones', 'rfdc'])
+
+# Everything including diagnostics, config, calibrations
+info = client.get_info('all')
+
+# Each section has a 'ready' flag and section-specific keys
+print(info['tones']['count'])
+print(info['rfdc']['dsa'])
+print(info['server']['initialisation_level'])
+```
+
+For quick periodic monitoring, use `health_check()`:
+
+```python
+health = client.health_check()
+# Returns compact pass/fail bools:
+#   initialisation_level, clock_locked, streaming, sweeping,
+#   adc_saturated, dac_saturated, dsp_overflow, rts_events,
+#   tone_count, client_count, rf_frontend_available, lna_available
+```
+
+Legacy methods `get_server_status()` and `get_system_information()` are still available for backward compatibility but `get_info()` is preferred.
 
 ---
 
@@ -321,6 +386,31 @@ client.hard_reset()
 ```
 
 After a hard reset, both pipeline servers need to run `ensure_ready()` to recover.
+
+### Pipeline DSP Parameters
+
+Individual DSP pipeline parameters can be read and set directly via the client:
+
+```python
+# Accumulation length (controls sample rate)
+client.get_acc_len()
+client.set_acc_len(2**15)
+
+# PSB scale (global output waveform scaling)
+client.get_psb_scale()
+client.set_psb_scale(0)
+
+# Internal loopback (DAC output fed back to ADC input)
+client.get_internal_loopback()
+client.set_internal_loopback(True)
+```
+
+These are also available in the `pipeline` section of `get_info()`:
+
+```python
+pipeline = client.get_info(['pipeline'])['pipeline']
+print(pipeline['acc_len'], pipeline['psb_scale'], pipeline['psb_fftshift'])
+```
 
 ---
 
@@ -366,6 +456,8 @@ client.set_tone_powers([-20, -25], reference_plane='detector')
 # Detailed power breakdown through the signal chain:
 client.get_tone_powers(detailed_output=True)
 ```
+
+By default, `set_tone_powers` automatically optimises the dynamic range — it maximises DAC bit utilisation and adjusts the analog chain (attenuator, amp bypass, DSA) to hit the target power. To skip optimisation for faster execution (e.g. during sweeps where the analog chain is already configured), pass `optimise_dynamic_range=False`.
 
 The tone powers can be set to the maximum level that avoids saturation of the RF chain by calling ```client.maximise_tx_power()```
 
@@ -569,7 +661,7 @@ or use the internal plotting tools:
 
 ```python
 from souk_readout_tools.plotting import plot_sweep
-fig = plot_sweep(data, format='magphase',multitone='overlay', title='Frequency Sweep')
+fig = plot_sweep(data, format='magphase', multi_tone='overlay', title='Frequency Sweep')
 plt.show()
 ```
 
@@ -611,7 +703,7 @@ or use the internal plotting tools:
 
 ```python
 from souk_readout_tools.plotting import plot_sweep
-fig = plot_sweep(data, format='magphase',multitone='overlay', title='Frequency Sweep')
+fig = plot_sweep(data, format='magphase', multi_tone='overlay', title='Frequency Sweep')
 plt.show()
 ```
 
@@ -812,7 +904,13 @@ firmware:
   clock_source: "external"
 ```
 
-Clock source and PLL lock status are included in `get_system_information()`.
+Clock source and PLL lock status are available via `get_info(['clock'])`:
+
+```python
+clock = client.get_info(['clock'])['clock']
+print(clock['source'])      # 'internal' or 'external'
+print(clock['all_locked'])  # True if all PLLs are locked
+```
 
 Since this is a shared resource, both pipeline configs should specify the same `clock_source` value. See [clock_source.md](clock_source.md) for full details, manual procedures, and troubleshooting.
 

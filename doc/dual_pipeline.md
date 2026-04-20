@@ -31,7 +31,7 @@ You can confirm at runtime by reading the firmware type reported by the FPGA:
   - `2` for single-pipeline firmware
   - `3` for dual-pipeline firmware
 
-You can also check the output of `client.get_system_information()` and confirm it reports the expected `fw_type` in the `fpga_status` metadata.
+You can also check with `client.get_info(['fpga'])` and confirm it reports the expected `fw_type` in the `fpga_status` metadata.
 
 ### 1.4 RFDC tile/block mapping differs per pipeline
 Each pipeline uses different DAC/ADC channels. Your two config files must specify the correct RFDC {tile/block} values. The correct mapping for v7.9 firmwares and later is:
@@ -183,11 +183,11 @@ from souk_readout_tools.client.readout_client import ReadoutClient
 client0 = ReadoutClient(config_file="config_pipeline_0.yaml")
 client1 = ReadoutClient(config_file="config_pipeline_1.yaml")
 
-info0 = client0.get_system_information()
-info1 = client1.get_system_information()
+info0 = client0.get_info(['server', 'fpga'])
+info1 = client1.get_info(['server', 'fpga'])
 
-print(info0["pipeline_id"])  # expected: 0
-print(info1["pipeline_id"])  # expected: 1
+print(info0['server']['pipeline_id'])  # expected: 0
+print(info1['server']['pipeline_id'])  # expected: 1
 ```
 
 The pipeline ID is read from the config file automatically. Alternatively, if the servers are already configured and running, you can connect by address and pull configs to create local config files for subsequent use:

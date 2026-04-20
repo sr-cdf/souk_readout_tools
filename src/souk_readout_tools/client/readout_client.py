@@ -90,6 +90,7 @@ CAL_FILE_KEYS = [
     ('rf_frontend', 'rx_mixer_conversion_loss_db'),
     ('rf_frontend', 'tx_bypass_amp_s21_db'),
     ('rf_frontend', 'rx_bypass_amp_s21_db'),
+    ('rf_frontend', 'path_group_delay_ns'),
     ('cryostat', 'input_s21_db'),
     ('cryostat', 'output_s21_db'),
 ]
@@ -188,6 +189,11 @@ class ReadoutClient:
         self.system_information = None
         self.parameters = {}
         self.calibration_files = {}  # basename -> contents, populated by pull_config
+
+    @property
+    def cal_dir(self):
+        """Directory for calibration files (``{config_dir}/calibrations/``)."""
+        return os.path.join(self.config_dir, 'calibrations')
 
     @staticmethod
     def _resolve_export_path(filename, file_format, supported, default=None):
@@ -381,10 +387,9 @@ class ReadoutClient:
         # Write any in-memory calibration files and rewrite config paths
         config_text = getattr(self, 'config_raw_text', None)
         if self.calibration_files:
-            local_cal_dir = os.path.join(self.config_dir, 'calibrations')
-            os.makedirs(local_cal_dir, exist_ok=True)
+            os.makedirs(self.cal_dir, exist_ok=True)
             for basename, contents in self.calibration_files.items():
-                dest = os.path.join(local_cal_dir, basename)
+                dest = os.path.join(self.cal_dir, basename)
                 with open(dest, 'w') as f:
                     f.write(contents)
             # Rewrite config paths to local relative form
@@ -471,10 +476,10 @@ class ReadoutClient:
         rel_to_config = os.path.join(self.config_dir, path_str)
         if os.path.isfile(rel_to_config):
             return os.path.abspath(rel_to_config)
-        # 3. Basename in calibrations/ next to config
-        cal_dir = os.path.join(self.config_dir, 'calibrations', os.path.basename(path_str))
-        if os.path.isfile(cal_dir):
-            return os.path.abspath(cal_dir)
+        # 3. Basename in cal_dir
+        cal_path = os.path.join(self.cal_dir, os.path.basename(path_str))
+        if os.path.isfile(cal_path):
+            return os.path.abspath(cal_path)
         return None
 
 
@@ -524,6 +529,7 @@ class ReadoutClient:
             return response
 
     def get_system_information(self):
+        """Legacy flat-dict system information. Prefer get_info() instead."""
         message = {'request': 'get_system_information'}
         response = self.send_request(message)
         if response['status'] == 'success':
@@ -531,6 +537,51 @@ class ReadoutClient:
             return response['data']
         else:
             print(f"Error getting system information: {response['message']}")
+            return response
+
+    def get_info(self, sections=None):
+        """Get structured system information by section.
+
+        Parameters
+        ----------
+        sections : list of str or ``'all'``, optional
+            Which sections to include.  ``None`` returns the default set
+            (server, versions, clock, fpga, rfdc, pipeline, tones,
+            rf_frontend, lna).  ``'all'`` includes diagnostics, config,
+            calibrations, resonators, and registers as well.
+
+        Returns
+        -------
+        dict
+            ``{section_name: section_dict, ...}`` where each section dict
+            contains a ``'ready'`` bool and section-specific keys.
+        """
+        message = {'request': 'get_info'}
+        if sections is not None:
+            message['sections'] = sections
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            return response['data']
+        else:
+            print(f"Error getting info: {response.get('message', 'unknown error')}")
+            return response
+
+    def health_check(self):
+        """Quick system health summary for intermittent polling.
+
+        Returns
+        -------
+        dict
+            Compact health indicators including initialisation_level,
+            clock_locked, streaming/sweeping state, saturation/overflow
+            bools, tone_count, client_count, and resonator tracking status.
+        """
+        message = {'request': 'health_check'}
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            return response['data']
+        else:
+            print(f"Error getting health check: {response.get('message', 'unknown error')}")
             return response
 
     def sync_config_from_system(self):
@@ -689,8 +740,81 @@ class ReadoutClient:
     def get_tone_phases(self):
         return np.atleast_1d(self.get_parameter('tone_phases'))
 
+    def _warn_zero_phases(self):
+        """Check if all tone phases are zero and warn about crest factor.
+
+        When multiple tones all have phase = 0, the first sample of every
+        cosine waveform lines up perfectly, giving worst-case crest factor
+        and risking DAC saturation / clipping.
+        """
+        import warnings
+        try:
+            phases = self.get_tone_phases()
+        except Exception:
+            return  # can't check — don't block the operation
+        if len(phases) > 1 and np.all(phases == 0):
+            warnings.warn(
+                "\n*** ALL TONE PHASES ARE ZERO ***\n"
+                "This produces the worst-case crest factor because every tone's "
+                "cosine waveform peaks at the same instant, causing maximum coherent "
+                "addition and risking DAC saturation / clipping.\n"
+                "Consider calling set_tone_phases() with generate_newman_phases(freqs) "
+                "or generate_random_phases(freqs) before proceeding.",
+                stacklevel=3
+            )
+
+    # -- Pipeline DSP parameters --
+
+    def set_sync_delay(self, value):
+        """Set the sync delay (integer)."""
+        return self.set_parameter('sync_delay', int(value))
+
+    def get_sync_delay(self):
+        """Get the current sync delay."""
+        return self.get_parameter('sync_delay')
+
+    def set_acc_len(self, value):
+        """Set the accumulation length (integer)."""
+        return self.set_parameter('acc_len', int(value))
+
+    def get_acc_len(self):
+        """Get the current accumulation length."""
+        return self.get_parameter('acc_len')
+
+    def set_internal_loopback(self, enabled):
+        """Enable or disable the internal loopback."""
+        return self.set_parameter('internal_loopback', bool(enabled))
+
+    def get_internal_loopback(self):
+        """Get the internal loopback state."""
+        return self.get_parameter('internal_loopback')
+
+    def set_psb_scale(self, value):
+        """Set the PSB scale factor (integer)."""
+        return self.set_parameter('psb_scale', int(value))
+
+    def get_psb_scale(self):
+        """Get the current PSB scale factor."""
+        return self.get_parameter('psb_scale')
+
+    def set_psb_fftshift(self, value):
+        """Set the PSB FFT shift pattern (integer bitmask)."""
+        return self.set_parameter('psb_fftshift', int(value))
+
+    def get_psb_fftshift(self):
+        """Get the current PSB FFT shift pattern."""
+        return self.get_parameter('psb_fftshift')
+
+    def set_pfb_fftshift(self, value):
+        """Set the PFB FFT shift pattern (integer bitmask)."""
+        return self.set_parameter('pfb_fftshift', int(value))
+
+    def get_pfb_fftshift(self):
+        """Get the current PFB FFT shift pattern."""
+        return self.get_parameter('pfb_fftshift')
+
     def set_tone_powers(self, tone_powers_dbm, reference_plane='detector',
-                        optimise_dynamic_range=False, rx_policy='protect'):
+                        optimise_dynamic_range=True, rx_policy='protect'):
         """Set tone powers to specified levels in dBm.
 
         Parameters
@@ -701,8 +825,9 @@ class ReadoutClient:
             Where the target power is specified: 'dac', 'rf_output', or
             'detector' (default).
         optimise_dynamic_range : bool
-            If True, maximise DAC bit utilisation and adjust the analog
-            chain (attenuator, amp bypass, DSA) to hit the target power.
+            If True (default), maximise DAC bit utilisation and adjust
+            the analog chain (attenuator, amp bypass, DSA) to hit the
+            target power.  Set to False to skip optimisation for speed.
         rx_policy : str
             How to manage the RX path when the TX power change risks
             saturating the ADC.  One of:
@@ -930,6 +1055,7 @@ class ReadoutClient:
         })
 
     def enable_stream(self):
+        self._warn_zero_phases()
         message = {'request': 'enable_stream'}
         return self.send_request(message)
 
@@ -938,6 +1064,7 @@ class ReadoutClient:
         return self.send_request(message)
 
     def enable_triggered_stream(self):
+        self._warn_zero_phases()
         message = {'request': 'enable_triggered_stream'}
         return self.send_request(message)
 
@@ -994,6 +1121,7 @@ class ReadoutClient:
         size depends on the number of active tones. The per-frame byte
         count is stored in sample_data['frame_bytes'] for parse_samples.
         """
+        self._warn_zero_phases()
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((self.request_server_address, self.request_server_port))
             message = {'request': 'get_samples', 'num_samples': num_samples, 'burst': burst}
@@ -1640,7 +1768,7 @@ class ReadoutClient:
         else:
             raise ValueError(f"Unsupported file_format '{file_format}'. Use 'npy' or 'json'.")
 
-    def perform_sweep(self, centers, spans, points, samples_per_point,direction='up'):
+    def perform_sweep(self, centers, spans, points, samples_per_point,direction='up', phases=None):
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(centers)
         if response['status'] != 'success':
@@ -1648,6 +1776,11 @@ class ReadoutClient:
             return response
         centers=np.atleast_1d(centers)
         spans=np.atleast_1d(spans)
+
+        if phases is not None:
+            self.set_tone_phases(np.atleast_1d(phases))
+        else:
+            self._warn_zero_phases()
 
         message = {
             'request': 'sweep',
@@ -1659,7 +1792,7 @@ class ReadoutClient:
         }
         return self.send_request(message)
 
-    def perform_retune(self, centers, spans, points, samples_per_point, direction='up', method='max_gradient', freq_offsets=None):
+    def perform_retune(self, centers, spans, points, samples_per_point, direction='up', method='max_gradient', freq_offsets=None, phases=None):
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(centers)
         if response['status'] != 'success':
@@ -1667,6 +1800,11 @@ class ReadoutClient:
             return response
         centers=np.atleast_1d(centers)
         spans=np.atleast_1d(spans)
+
+        if phases is not None:
+            self.set_tone_phases(np.atleast_1d(phases))
+        else:
+            self._warn_zero_phases()
 
         #handle freq_offsets, if None, all zeros, if scalar, make array of that value, if array, ensure correct length
         if freq_offsets is None:
@@ -2513,6 +2651,60 @@ class ReadoutClient:
 
     # TODO: Add a tone_powers parameter to wideband_sweep to allow specifying
     #       power levels across the band (e.g. per-tone or per-band).
+    def parse_wideband_sweep(self, sweep_data, remove_phase_slope=True,
+                             apply_phase_correction=False):
+        """
+        Parse raw sweep data from the server as a wideband sweep.
+
+        Takes the raw sweep data dictionary (from get_sweep_data()) and produces
+        a single concatenated trace across all tones, as if it were a single-tone
+        sweep covering the full bandwidth.
+
+        This is the same parsing that wideband_sweep() applies internally. Use it
+        when you have already collected sweep data with wideband-style tone
+        configuration and want to post-process it without re-running the sweep.
+
+        Args:
+            sweep_data: Raw sweep data dictionary from get_sweep_data().
+            remove_phase_slope (bool): Remove linear phase slope from the
+                concatenated sweep data. Default is True.
+            apply_phase_correction (bool): Correct for phase jumps at filterbank
+                channel edges. Default is False. DEPRECATED.
+
+        Returns:
+            dict: Parsed wideband sweep data with keys:
+                - 'sweep_f': Array of frequencies [1, N_total_points]
+                - 'sweep_i': Array of I values [1, N_total_points]
+                - 'sweep_q': Array of Q values [1, N_total_points]
+                - 'sweep_ei': Array of I errors [1, N_total_points]
+                - 'sweep_eq': Array of Q errors [1, N_total_points]
+                - 'wideband_sweep': True
+                - Plus other metadata from parse_sweep_data
+        """
+        s = self.parse_sweep_data(sweep_data, apply_phase_correction=apply_phase_correction)
+        f = s['sweep_f']
+        z = s['sweep_i'] + 1j * s['sweep_q']
+
+        # Concatenate all tones
+        fcat = np.ravel(f.T)
+        zcat = np.ravel(z.T)
+
+        # Optionally remove linear phase slope
+        if remove_phase_slope:
+            phicat = np.unwrap(np.angle(zcat))
+            slope = np.nanmedian(np.gradient(phicat, fcat))
+            zcat *= np.exp(-1j * (slope * fcat))
+
+        # Reformat as single-row arrays (like a single-tone sweep covering all frequencies)
+        s['sweep_f'] = np.array([fcat])
+        s['sweep_i'] = np.array([np.real(zcat)])
+        s['sweep_q'] = np.array([np.imag(zcat)])
+        s['sweep_ei'] = np.array([np.ravel(s['sweep_ei'].T)])
+        s['sweep_eq'] = np.array([np.ravel(s['sweep_eq'].T)])
+
+        s['wideband_sweep'] = True
+        return s
+
     def wideband_sweep(self, bandwidth_hz=None, center_freq_hz=None, step_size_hz=10000,
                        num_tones=1024, samples_per_point=10, tone_powers_dbm='auto',
                        reference_plane='detector',
@@ -2798,30 +2990,12 @@ class ReadoutClient:
                 print(f'  Unfreezing calibration...')
             self.set_cal_freeze(False)
 
-        # Get and parse the sweep data
-        s = self.parse_sweep_data(self.get_sweep_data(), apply_phase_correction=apply_phase_correction)
-        f = s['sweep_f']
-        z = s['sweep_i'] + 1j * s['sweep_q']
+        # Get and parse the sweep data as a wideband sweep
+        s = self.parse_wideband_sweep(self.get_sweep_data(),
+                                      remove_phase_slope=remove_phase_slope,
+                                      apply_phase_correction=apply_phase_correction)
 
-        # Concatenate all tones
-        fcat = np.ravel(f.T)
-        zcat = np.ravel(z.T)
-
-        # Optionally remove linear phase slope
-        if remove_phase_slope:
-            phicat = np.unwrap(np.angle(zcat))
-            slope = np.nanmedian(np.gradient(phicat, fcat))
-            zcat *= np.exp(-1j * (slope * fcat))
-
-        # Reformat as single-row arrays (like a single-tone sweep covering all frequencies)
-        s['sweep_f'] = np.array([fcat])
-        s['sweep_i'] = np.array([np.real(zcat)])
-        s['sweep_q'] = np.array([np.imag(zcat)])
-        s['sweep_ei'] = np.array([np.ravel(s['sweep_ei'].T)])
-        s['sweep_eq'] = np.array([np.ravel(s['sweep_eq'].T)])
-        
-        # Add metadata
-        s['wideband_sweep'] = True
+        # Add wideband_sweep-specific metadata
         s['bandwidth_hz'] = bandwidth_hz
         s['center_freq_hz'] = center_freq_hz
         s['step_size_hz'] = step_size_hz
@@ -2914,6 +3088,242 @@ class ReadoutClient:
             self.set_tone_amplitudes(amps)
         self.set_tone_phases(phases)
         return
+
+    def measure_path_group_delay(self,
+                                 sweep_data=None,
+                                 kid_frequencies=None,
+                                 kid_q_factors=None,
+                                 mask_hwhm_factor=10.0,
+                                 median_filter_mhz=10.0,
+                                 savgol_mhz=10.0,
+                                 savgol_poly_order=3,
+                                 save_to_config=False,
+                                 save_to_csv=None,
+                                 verbose=True,
+                                 **sweep_kwargs):
+        """
+        Measure the full TX+RX path group delay across the band.
+
+        Performs (or re-uses) a wideband sweep, computes the phase gradient
+        (group delay) across the band, suppresses MKID resonance contributions,
+        and returns a smooth group-delay vs frequency calibration.
+
+        Filtering strategy
+        ------------------
+        1. **Phase derivative** — group delay is computed from
+           ``np.gradient(unwrap(phase), freqs)``.
+
+        2. **Resonance masking** — if ``kid_frequencies`` and ``kid_q_factors``
+           are supplied, frequency channels within ``mask_hwhm_factor`` × HWHM
+           of each resonance are excluded from subsequent filtering.
+
+        3. **Median filter** — a sliding median of width ``median_filter_mhz``
+           is applied to the unmasked group-delay points.  This removes
+           outliers and resonance-tail contributions.
+
+        4. **Savitzky-Golay filter** — a Savitzky-Golay filter with window
+           ``savgol_mhz`` and order ``savgol_poly_order`` produces the final
+           smooth calibration.  Masked regions are filled by interpolation
+           before filtering.
+
+        Args:
+            sweep_data (dict, optional): Existing wideband sweep dict (from
+                ``wideband_sweep()``).  If None a new sweep is performed using
+                ``**sweep_kwargs``.
+            kid_frequencies (array-like, optional): Known MKID resonance
+                frequencies in Hz.  Used with ``kid_q_factors`` to build
+                frequency masks that exclude resonance regions.
+            kid_q_factors (array-like, optional): Loaded Q factors (Ql) for
+                each resonance in ``kid_frequencies``.  If scalar, the same
+                value is used for all resonances.  Required if
+                ``kid_frequencies`` is provided; defaults to 10 000 if omitted.
+            mask_hwhm_factor (float): Half-width of the exclusion zone around
+                each resonance, expressed as a multiple of the HWHM
+                (= fr / (2 * Ql)).  Default 10 — catches the main Lorentzian
+                body and near tails.
+            median_filter_mhz (float): Width of the sliding median filter
+                (MHz).  Default 20 MHz.
+            savgol_mhz (float): Window width of the Savitzky-Golay filter
+                (MHz).  Default 20 MHz.
+            savgol_poly_order (int): Polynomial order of the Savitzky-Golay
+                filter.  Default 3.
+            save_to_config (bool): If True, write the calibration to a CSV
+                file and set ``rf_frontend.path_group_delay_ns`` in the
+                config to the CSV basename so that ``push_config()`` will
+                transfer it.  Uses ``save_to_csv`` as the filename, or
+                ``path_group_delay.csv`` by default.
+            save_to_csv (str, optional): If a file path is given, write a
+                two-column CSV (``freq_hz,tau_ns``) to that path.  When
+                combined with ``save_to_config``, also updates the config.
+            verbose (bool): Print progress and summary.  Default True.
+            **sweep_kwargs: Passed to ``wideband_sweep()`` when ``sweep_data``
+                is None.
+
+        Returns:
+            dict with keys:
+                ``'frequencies'``: 1-D array of frequencies (Hz).
+                ``'tau_ns'``: 1-D array of smooth group delay values (ns).
+                ``'tau_ns_raw'``: 1-D array of raw (unfiltered) group delay (ns).
+                ``'mask'``: boolean array, True where data was included.
+                ``'sweep_data'``: the sweep dict used (new or supplied).
+        """
+        import numpy as np
+        try:
+            from scipy.signal import medfilt, savgol_filter
+        except ImportError:
+            medfilt = None
+            savgol_filter = None
+
+        # --- acquire sweep data -------------------------------------------------
+        if sweep_data is None:
+            if verbose:
+                print('measure_path_group_delay: performing wideband sweep...')
+            sweep_kwargs.setdefault('remove_phase_slope', False)
+            sweep_data = self.wideband_sweep(verbose=verbose, **sweep_kwargs)
+
+        freqs = np.asarray(sweep_data['sweep_f'], dtype=float).ravel()
+        s21 = (np.asarray(sweep_data['sweep_i'], dtype=float).ravel() +
+               1j * np.asarray(sweep_data['sweep_q'], dtype=float).ravel())
+
+        # Sort by frequency (wideband sweep may have tiled segments)
+        order = np.argsort(freqs)
+        freqs = freqs[order]
+        s21 = s21[order]
+
+        n_pts = len(freqs)
+
+        # --- raw group delay from phase gradient --------------------------------
+        phase = np.unwrap(np.angle(s21))
+        dphase_df = np.gradient(phase, freqs)
+        tau_ns_raw = -dphase_df / (2.0 * np.pi) * 1e9
+
+        # --- resonance mask -----------------------------------------------------
+        mask = np.ones(n_pts, dtype=bool)  # True = include
+
+        if kid_frequencies is not None:
+            kid_frequencies = np.atleast_1d(np.asarray(kid_frequencies, dtype=float))
+            if kid_q_factors is None:
+                q_arr = np.full(len(kid_frequencies), 1e4)
+            else:
+                q_arr = np.broadcast_to(
+                    np.atleast_1d(np.asarray(kid_q_factors, dtype=float)),
+                    kid_frequencies.shape).copy()
+
+            for fr, Ql in zip(kid_frequencies, q_arr):
+                hwhm = fr / (2.0 * max(Ql, 1.0))
+                half_width = mask_hwhm_factor * hwhm
+                mask &= ~((freqs >= fr - half_width) & (freqs <= fr + half_width))
+
+            n_masked = np.sum(~mask)
+            if verbose:
+                print(f'  Resonance masking: excluded {n_masked} of {n_pts} points '
+                      f'({100*n_masked/n_pts:.1f}%) around {len(kid_frequencies)} resonances')
+
+        # --- median filter on included data ------------------------------------
+        tau_ns_work = tau_ns_raw.copy()
+        included_idx = np.where(mask)[0]
+
+        if len(included_idx) < 3:
+            raise RuntimeError(
+                f'Too few unmasked points ({len(included_idx)}) for smoothing. '
+                f'Reduce mask_hwhm_factor.')
+
+        if n_pts > 1 and median_filter_mhz > 0:
+            freq_span_mhz = (freqs[-1] - freqs[0]) / 1e6
+            if freq_span_mhz > 0:
+                pts_per_mhz = n_pts / freq_span_mhz
+                kernel = max(3, int(round(pts_per_mhz * median_filter_mhz)))
+                if kernel % 2 == 0:
+                    kernel += 1
+                if len(included_idx) > kernel:
+                    if medfilt is not None:
+                        tau_ns_work[included_idx] = medfilt(
+                            tau_ns_work[included_idx],
+                            kernel_size=min(kernel, len(included_idx) | 1))
+                    else:
+                        half = kernel // 2
+                        filtered = tau_ns_work[included_idx].copy()
+                        for i in range(len(included_idx)):
+                            lo = max(0, i - half)
+                            hi = min(len(included_idx), i + half + 1)
+                            filtered[i] = np.median(tau_ns_work[included_idx[lo:hi]])
+                        tau_ns_work[included_idx] = filtered
+                    if verbose:
+                        print(f'  Median filter: kernel {kernel} points '
+                              f'({kernel/pts_per_mhz:.1f} MHz)')
+
+        # --- interpolate across masked regions before savgol --------------------
+        tau_for_savgol = tau_ns_work.copy()
+        excluded_idx = np.where(~mask)[0]
+        if len(excluded_idx) > 0:
+            tau_for_savgol[excluded_idx] = np.interp(
+                freqs[excluded_idx],
+                freqs[included_idx],
+                tau_ns_work[included_idx])
+
+        # --- Savitzky-Golay filter ---------------------------------------------
+        freq_span_mhz = (freqs[-1] - freqs[0]) / 1e6
+        if savgol_filter is not None and freq_span_mhz > 0 and n_pts > savgol_poly_order + 2:
+            pts_per_mhz = n_pts / freq_span_mhz
+            savgol_window = max(savgol_poly_order + 2, int(round(pts_per_mhz * savgol_mhz)))
+            if savgol_window % 2 == 0:
+                savgol_window += 1
+            savgol_window = min(savgol_window, n_pts if n_pts % 2 == 1 else n_pts - 1)
+
+            tau_ns_smooth = savgol_filter(tau_for_savgol, savgol_window, savgol_poly_order)
+
+            if verbose:
+                print(f'  Savitzky-Golay filter: window {savgol_window} points '
+                      f'({savgol_window/pts_per_mhz:.1f} MHz), order {savgol_poly_order}')
+        else:
+            tau_ns_smooth = tau_for_savgol
+            if verbose:
+                print('  Savitzky-Golay filter: skipped (scipy not available or too few points)')
+
+        if verbose:
+            tau_mean = float(np.mean(tau_ns_smooth))
+            tau_min = float(np.min(tau_ns_smooth))
+            tau_max = float(np.max(tau_ns_smooth))
+            print(f'  Smoothed group delay: '
+                  f'τ = {tau_mean:.2f} ns (range {tau_min:.2f}–{tau_max:.2f} ns)')
+
+        result = {
+            'frequencies': freqs,
+            'tau_ns': tau_ns_smooth,
+            'tau_ns_raw': tau_ns_raw,
+            'mask': mask,
+            'sweep_data': sweep_data,
+        }
+
+        # --- save to CSV --------------------------------------------------------
+        # When save_to_config is True but no CSV path given, generate one
+        # automatically so we don't bloat the config with huge inline arrays.
+        if save_to_csv is None and save_to_config:
+            import os
+            os.makedirs(self.cal_dir, exist_ok=True)
+            save_to_csv = os.path.join(self.cal_dir, 'path_group_delay.csv')
+
+        if save_to_csv is not None:
+            import csv, os
+            save_to_csv = os.path.abspath(save_to_csv)
+            with open(save_to_csv, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['freq_hz', 'tau_ns'])
+                for f, tau in zip(freqs, tau_ns_smooth):
+                    writer.writerow([f'{f:.3f}', f'{tau:.6f}'])
+            if verbose:
+                print(f'  Saved group delay calibration to {save_to_csv}')
+            if save_to_config and self.config is not None:
+                # Store the local path so _resolve_local_cal_path can find it;
+                # push_config rewrites it to the server-relative form.
+                self.config.setdefault('rf_frontend', {})['path_group_delay_ns'] = save_to_csv
+                basename = os.path.basename(save_to_csv)
+                with open(save_to_csv) as f:
+                    self.calibration_files[basename] = f.read()
+                if verbose:
+                    print(f'  Config rf_frontend.path_group_delay_ns set to "{save_to_csv}"')
+
+        return result
 
     def find_resonances(self, sweep_data=None, mode='wideband',
                         data_format='log_magnitude',

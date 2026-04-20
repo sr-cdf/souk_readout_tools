@@ -215,7 +215,7 @@ def _propagate_errors_mag(si, sq, ei, eq):
     return e_logmag, e_phase
 
 
-def _apply_deembed(frequencies, z, deembed, frequency=None):
+def _apply_deembed(frequencies, z, deembed, frequency=None, group_delay_cal=None):
     """
     Apply true RF deembedding (cable delay removal + baseline normalisation).
 
@@ -230,6 +230,9 @@ def _apply_deembed(frequencies, z, deembed, frequency=None):
             frequencies). If dict, use as pre-computed params.
         frequency: Tone frequency (Hz) for cable delay removal when
             applying pre-computed params to timestream data.
+        group_delay_cal: Frequency-dependent group delay calibration
+            (from ``measure_path_group_delay()``).  Forwarded to
+            ``resonator.deembed()`` when computing from scratch.
 
     Returns:
         z_out: Deembedded complex array (off-resonance at (1, 0)).
@@ -237,7 +240,7 @@ def _apply_deembed(frequencies, z, deembed, frequency=None):
     """
     if deembed is True:
         from .. import resonator
-        return resonator.deembed(frequencies, z)
+        return resonator.deembed(frequencies, z, group_delay_cal=group_delay_cal)
     elif isinstance(deembed, dict):
         from .. import resonator
         return resonator.apply_deembed_params(z, deembed, frequency=frequency), deembed

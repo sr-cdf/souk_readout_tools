@@ -51,13 +51,13 @@ print(status)
 # ]}
 ```
 
-Clock source and lock status are also included in `get_system_information()`:
+Clock source and lock status are also available via `get_info()`:
 
 ```python
-info = client.get_system_information()
-print(info['clock_source'])   # 'internal' or 'external'
-print(info['clock_locked'])   # True if all PLLs are locked
-print(info['clock_chips'])    # per-chip lock status
+clock = client.get_info(['clock'])['clock']
+print(clock['source'])       # 'internal' or 'external'
+print(clock['all_locked'])   # True if all PLLs are locked
+print(clock['chips'])        # per-chip lock status
 ```
 
 ### Manually on the RFSoC

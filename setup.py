@@ -87,12 +87,13 @@ if install_server:
         'souk-readout-server=souk_readout_tools.server.readout_server:main',
         'souk-enable-daemon=souk_readout_tools.server.server_scripts.souk_enable_daemon:main',
         'souk-disable-daemon=souk_readout_tools.server.server_scripts.souk_disable_daemon:main',
+        'souk-restart-daemon=souk_readout_tools.server.server_scripts.souk_restart_daemon:main',
         'souk-find-attenuators=souk_readout_tools.server.rf_peripherals:_cli_main',
     ])
 
 setup(
     name='souk_readout_tools',
-    version='1.1.0',
+    version='1.1.1',
     description='Tools for the SOUK readout',
     author='Sam Rowe',
     author_email='sam.rowe@astro.cf.ac.uk',

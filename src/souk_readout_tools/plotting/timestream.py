@@ -185,6 +185,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         matplotlib.figure.Figure
     """
     plt = _get_pyplot()
+    custom_title = kwargs.pop('title', None)
     selected = _get_tone_data(ts_data, tones)
     sample_rate = ts_data['sample_rate']
     x_values, x_label = _build_x_axis(ts_data, x_axis)
@@ -243,7 +244,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         ax.set_ylabel(f'Q {iq_label}'.strip())
         ax.set_aspect('equal', adjustable='datalim')
         ax.legend(fontsize='small')
-        ax.set_title('Timestream I vs Q' + suffix)
+        ax.set_title(custom_title if custom_title is not None
+                     else 'Timestream I vs Q' + suffix)
         plt.tight_layout()
         return fig
 
@@ -289,14 +291,17 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
     ax2.set_xlabel(x_label)
     ax1.legend(fontsize='small')
     ax2.legend(fontsize='small')
-    title_map = {
-        'iq_vs_t': 'Timestream',
-        'magphase': 'Timestream',
-        'freq_diss': 'Frequency & Dissipation',
-    }
-    title = title_map.get(format, 'Timestream')
-    if format != 'freq_diss':
-        title += suffix
+    if custom_title is not None:
+        title = custom_title
+    else:
+        title_map = {
+            'iq_vs_t': 'Timestream',
+            'magphase': 'Timestream',
+            'freq_diss': 'Frequency & Dissipation',
+        }
+        title = title_map.get(format, 'Timestream')
+        if format != 'freq_diss':
+            title += suffix
     fig.suptitle(title)
     plt.tight_layout()
     return fig

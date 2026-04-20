@@ -112,6 +112,17 @@ rf_frontend:
   # --- RF path characterisation ---
   # These values describe the gain/loss of each component in the signal chain.
   # Each can be a scalar (dB), a [freq_hz, dB] array, or a path to a CSV file.
+  #
+  # path_group_delay_ns: full TX+RX round-trip group delay (cable delay).
+  #   Used by resonator fitting and deembedding to seed the phase-slope
+  #   estimate instead of relying on auto-detection from the S21 phase.
+  #   Formats accepted:
+  #     scalar        — constant delay in nanoseconds, e.g. 120.5
+  #     [[f, tau], …] — frequency-dependent pairs: freq in Hz, delay in ns
+  #     "filename.csv"— path to a two-column CSV (freq_hz, tau_ns); treated
+  #                     as a calibration file and transferred with push/pull.
+  #   Measure with client.measure_path_group_delay().
+  path_group_delay_ns:
   tx_combiner_loss_db:
   rx_combiner_loss_db:
   tx_if_s21_db:

@@ -410,9 +410,14 @@ The GUI dependencies (PyQt5) are skipped automatically on the Xilinx platform si
 
 Config files live wherever you choose — keep them with your project or measurement data. The standard workflow is to maintain a local config file for a particular setup, connect with it, and push/pull changes to/from the firmware pipeline on the RFSoC.
 
+> **Note:** Before creating a config, `cd` to the directory where you want to keep your project files and data — the config will be written to your current working directory:
+> ```bash
+> mkdir -p ~/my_mkid_project && cd ~/my_mkid_project
+> ```
+
 **Option A: Create a config from the template (standard)**
 
-Generate a config from the bundled template, then edit it with your hardware-specific settings and push it to the server:
+Generate a config from the bundled template, then edit it with your hardware-specific settings and push it to the server. The minimum you need to set is the **RFSoC IP address** (`rfsoc_host.address`) so the client knows where to connect:
 
 ```python
 from souk_readout_tools.config_utils import copy_template_config
@@ -423,7 +428,8 @@ copy_template_config(destination='my_config.yaml', pipeline_id=0,
                      created_by='me',
                      comments='My first config')
 
-# Edit my_config.yaml with your system-specific settings, then connect:
+# Edit my_config.yaml — at minimum, set rfsoc_host.address to your RFSoC IP.
+# Then connect and push the config to the server:
 from souk_readout_tools.client.readout_client import ReadoutClient
 client = ReadoutClient(config_file='my_config.yaml')
 client.push_config()
@@ -475,20 +481,21 @@ Once you have a config file and a running server, verify that commands round-tri
 from souk_readout_tools.client.readout_client import ReadoutClient
 
 client = ReadoutClient(config_file='my_config.yaml')
-print(client.get_server_status())  
+info = client.get_info()
+print(info['server']['initialisation_level'])  # should be 'pipeline'
+print(info['fpga'])                            # FPGA status and clock
+print(info['tones']['count'])                  # number of active tones
 
-#Check FPGA status and firmware version
-print(client.get_system_information())  
+# Quick health check
+print(client.health_check())
 
 # If RF peripherals are enabled in the config, verify hardware control:
-print(client.get_rf_peripheral_status())
+print(info['rf_frontend'])
 client.set_tx_attenuation(10.0)
-print(client.get_rf_peripheral_status())  # should show tx_attenuation_db = 10.0
-
-
+print(client.get_info(['rf_frontend'])['rf_frontend']['tx_attenuation_db'])  # should be 10.0
 ```
 
-If `get_system_information()` returns successfully, the client-server link is working and the firmware is accessible.
+If `get_info()` returns successfully, the client-server link is working and the firmware is accessible.
 
 ---
 

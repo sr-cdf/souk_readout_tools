@@ -462,8 +462,12 @@ def reload_firmware(config_dict):
 
         r = create_standard_readout_interface(fw_config_file,pipeline_id=pipeline_id)
         r_fast = create_fast_readout_interface(fw_config_file,pipeline_id=pipeline_id)
+        print("Deprogram")
+        r.fpga.host.deprogram()
+        time.sleep(1)
+        print("Program")
         r.program()
-
+        time.sleep(1)
         fw_type = r.fpga.get_firmware_type()
         if fw_type==2:
             if pipeline_id!=0:
@@ -673,59 +677,43 @@ def _get_git_commit(repo_path):
         return None
 
 
-def get_system_information(r,config_dict):
+def get_system_information(r, config_dict):
+    """Legacy flat-dict system information.
 
-    pipeline_id = config_dict['firmware']['pipeline_id']
-    dac0_tile = config_dict['firmware']['dac0_tile']
-    dac0_block = config_dict['firmware']['dac0_block']
-    dac1_tile = config_dict['firmware']['dac1_tile']
-    dac1_block = config_dict['firmware']['dac1_block']
-    adc_tile = config_dict['firmware']['adc_tile']
-    adc_block = config_dict['firmware']['adc_block']
+    Deprecated — use the structured info_* section helpers or the server
+    get_info() dispatcher instead.  This function is retained for backward
+    compatibility and rebuilds the original flat dict from the new helpers.
+    """
+    warnings.warn('get_system_information() is deprecated, use get_info() sections instead',
+                  DeprecationWarning, stacklevel=2)
 
     info = {}
 
-    # Software version information
-    try:
-        import importlib.metadata
-        info['souk_readout_tools_version'] = importlib.metadata.version('souk_readout_tools')
-    except Exception:
-        info['souk_readout_tools_version'] = None
+    # Versions
+    v = info_versions()
+    for k in ('souk_readout_tools_version', 'souk_mkid_readout_sw_version',
+              'souk_mkid_readout_fw_version', 'souk_readout_tools_commit',
+              'souk_firmware_commit', 'souk_peripherals_commit'):
+        info[k] = v.get(k)
 
-    try:
-        info['souk_mkid_readout_sw_version'] = souk_mkid_readout.__version__
-    except (NameError, AttributeError):
-        info['souk_mkid_readout_sw_version'] = None
+    # Clock
+    c = info_clock()
+    info['clock_source'] = c['source']
+    info['clock_locked'] = c['all_locked']
+    info['clock_chips'] = c['chips']
 
-    # Supported firmware version from the souk_mkid_readout package
-    try:
-        info['souk_mkid_readout_fw_version'] = souk_mkid_readout.__fwversion__
-    except (NameError, AttributeError):
-        info['souk_mkid_readout_fw_version'] = None
+    # FPGA
+    f = info_fpga(r)
+    info['fpga_status'] = f.get('fpga_status')
+    info['fpg_file'] = f.get('fpg_file')
+    info['pipeline_id'] = f.get('pipeline_id')
+    info['adc_clk_hz'] = f.get('adc_clk_hz')
 
-    # Git repository commit IDs (source repos on the RFSoC)
-    info['souk_readout_tools_commit'] = _get_git_commit('/home/casper/souk_readout_tools')
-    info['souk_firmware_commit'] = _get_git_commit('/home/casper/souk-firmware')
-    info['souk_peripherals_commit'] = _get_git_commit('/home/casper/souk_readout_tools/src/souk_readout_tools/server/souk-peripherals-control')
-
-    # Clock source and PLL lock status (cross-pipeline)
-    info['clock_source'] = get_clock_source()
-    clock_status = get_clock_status()
-    info['clock_locked'] = clock_status.get('all_locked', False)
-    info['clock_chips'] = clock_status.get('chips', [])
-
-    info['fpga_status'] = r.fpga.get_status()[0]
-    info['fpg_file'] = r.fpgfile
-    info['pipeline_id'] = r.pipeline_id
-    info['adc_clk_hz'] = r.adc_clk_hz
-
-    # Determine initialisation level from attribute availability
-    # (the needs_*() checks are done by the caller / get_server_status)
-    # Shared blocks: common, adc_snapshot, dac_snapshot, zoomfft, zoomacc, gen_cordic, gen_lut, autocorr
-    # Pipeline blocks: sync, input, pfb, pfbtvg, chanselect, mixer, psb_chanselect, psb, psbscale, accumulator0, accumulator1, output, out_delay
-    programmed = r.fpga.is_programmed()
+    # Initialisation level (reproduced here for backward compat)
+    programmed = r is not None and r.fpga.is_programmed()
     shared_ready = programmed and hasattr(r, 'autocorr')
-    pipeline_ready = shared_ready and hasattr(r, 'output') and hasattr(r, 'accumulators') and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0
+    pipeline_ready = (shared_ready and hasattr(r, 'output') and hasattr(r, 'accumulators')
+                      and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0)
     if pipeline_ready:
         info['initialisation_level'] = 'pipeline'
     elif shared_ready:
@@ -735,88 +723,266 @@ def get_system_information(r,config_dict):
     else:
         info['initialisation_level'] = 'not_programmed'
 
-    # Pipeline block parameters (output, sync, input, pfb, psb, psbscale, mixer, accumulators)
-    if pipeline_ready:
-        info['output_mode'] = r.output.get_status()[0]['mode']
-        info['sync_delay'] = r.sync.get_delay()
-        info['internal_loopback'] = r.input.loopback_enabled()
-        info['psb_scale'] = r.psbscale.get_scale()
-        info['psb_fftshift'] = r.psb.get_fftshift()
-        info['pfb_fftshift'] = r.pfb.get_fftshift()
-        info['acc_len'] = r.accumulators[0].get_acc_len()
-        info['acc_freq'] = get_sample_rate(r)
-    else:
-        info['output_mode'] = None
-        info['sync_delay'] = None
-        info['internal_loopback'] = None
-        info['psb_scale'] = None
-        info['psb_fftshift'] = None
-        info['pfb_fftshift'] = None
-        info['acc_len'] = None
-        info['acc_freq'] = None
+    # Pipeline
+    p = info_pipeline(r)
+    info['output_mode'] = p.get('output_mode')
+    info['sync_delay'] = p.get('sync_delay')
+    info['internal_loopback'] = p.get('internal_loopback')
+    info['psb_scale'] = p.get('psb_scale')
+    info['psb_fftshift'] = p.get('psb_fftshift')
+    info['pfb_fftshift'] = p.get('pfb_fftshift')
+    info['acc_len'] = p.get('acc_len')
+    info['acc_freq'] = p.get('acc_freq_hz')
 
-    #rfdc info will be missing keys if the dac and adc tiles/blocks are not set to match those in the firmware
-    #lets check we can read dsa on the adc and vop on each dac before trying to read them
+    # RFDC
+    rd = info_rfdc(r, config_dict)
+    for k in ('dsa', 'vop_dac0', 'vop_dac1', 'dac_duc_mixer_frequency_hz',
+              'adc_ddc_mix_frequency_hz', 'nyquist_zone_adc', 'nyquist_zone_dac0',
+              'nyquist_zone_dac1', 'mixer_scale_1p0_dac0', 'mixer_scale_1p0_dac1',
+              'mixer_scale_1p0_adc', 'adc_cal_frozen', 'rts_events'):
+        info[k] = rd.get(k)
+    # Legacy keys use 'mixer_qmc_settings_*' prefix
+    info['mixer_qmc_settings_dac0'] = rd.get('qmc_settings_dac0')
+    info['mixer_qmc_settings_dac1'] = rd.get('qmc_settings_dac1')
+    info['mixer_qmc_settings_adc'] = rd.get('qmc_settings_adc')
 
-    has_rfdc = hasattr(r, 'rfdc')
-    correct_adc = has_rfdc and r.rfdc.core.get_dsa(adc_tile,adc_block).get('dsa',None) is not None
-    correct_dac0 = has_rfdc and r.rfdc.core.get_output_current(dac0_tile,dac0_block).get('current',None) is not None
-    correct_dac1 = has_rfdc and r.rfdc.core.get_output_current(dac1_tile,dac1_block).get('current',None) is not None
-    if correct_adc and correct_dac0 and correct_dac1:
-        info['dsa'] = r.rfdc.core.get_dsa(adc_tile,adc_block)['dsa']
-        info['vop_dac0'] = r.rfdc.core.get_output_current(dac0_tile,dac0_block)['current']
-        info['vop_dac1'] = r.rfdc.core.get_output_current(dac1_tile,dac1_block)['current']
-        info['dac_duc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)['Freq'])*1e6
-        info['adc_ddc_mix_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['Freq'])*1e6
-        info['nyquist_zone_adc'] = r.rfdc.core.get_nyquist_zone(adc_tile,adc_block,r.rfdc.core.ADC_TILE)
-        info['nyquist_zone_dac0'] = r.rfdc.core.get_nyquist_zone(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)
-        info['nyquist_zone_dac1'] = r.rfdc.core.get_nyquist_zone(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE)
-        info['mixer_scale_1p0_dac0'] = r.rfdc.core.get_mixer_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0
-        info['mixer_scale_1p0_dac1'] = r.rfdc.core.get_mixer_settings(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0
-        info['mixer_scale_1p0_adc'] = r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0
-        info['mixer_qmc_settings_dac0'] = r.rfdc.core.get_qmc_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)
-        info['mixer_qmc_settings_dac1'] = r.rfdc.core.get_qmc_settings(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE)
-        info['mixer_qmc_settings_adc'] = r.rfdc.core.get_qmc_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)
-        info['adc_cal_frozen'] = get_cal_freeze(r,config_dict)
-    else:
-        info['dsa'] = 0
-        info['vop_dac0'] = 0
-        info['vop_dac1'] = 0
-        info['dac_duc_mixer_frequency_hz'] = 0
-        info['adc_ddc_mix_frequency_hz'] = 0
-        info['nyquist_zone_adc'] = 1
-        info['nyquist_zone_dac0'] = 1
-        info['nyquist_zone_dac1'] = 1
-        info['mixer_scale_1p0_dac0'] = None
-        info['mixer_scale_1p0_dac1'] = None
-        info['mixer_scale_1p0_adc'] = None
-        info['mixer_qmc_settings_dac0'] = None
-        info['mixer_qmc_settings_dac1'] = None
-        info['mixer_qmc_settings_adc'] = None
-        info['adc_cal_frozen'] = None
-        if not has_rfdc:
-            print(bcolors.FAIL+'CRITICAL WARNING - RFDC block not found, the FPGA may not be programmed'+bcolors.ENDC)
-        else:
-            print(bcolors.FAIL+'CRITICAL WARNING - RFDC settings not found, check that the DAC and ADC tiles/blocks are set correctly in the config to match the firmware'+bcolors.ENDC)
-            print('Continuing regardless but the system will not work.')
-    # RTS overvoltage flags
-    rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
-    info['rts_events'] = rts_details
+    # Tones
+    t = info_tones(r, config_dict)
+    info['tone_frequencies'] = t.get('frequencies_hz')
+    info['tone_amplitudes'] = t.get('amplitudes')
+    info['tone_phases'] = t.get('phases_rad')
+    info['tone_indices'] = t.get('firmware_indices')
 
-    if pipeline_ready:
-        freqs_detailed = get_tone_frequencies(r,config_dict,detailed_output=True)
-        info['tone_frequencies'] = freqs_detailed[0].tolist()
-        info['tone_amplitudes'] = get_tone_amplitudes(r,config_dict).tolist()
-        info['tone_phases'] = get_tone_phases(r,config_dict).tolist()
-        info['tone_indices'] = freqs_detailed[1]['rx']['tone_indices']
-    else:
-        info['tone_frequencies'] = None
-        info['tone_amplitudes'] = None
-        info['tone_phases'] = None
-        info['tone_indices'] = None
     print('system information:')
     for key, value in info.items():
         print(f'{key}: {value}\n')
+
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Structured info section helpers (used by server get_info dispatcher)
+# ---------------------------------------------------------------------------
+
+def info_versions():
+    """Software versions and git commit IDs."""
+    info = {}
+    try:
+        import importlib.metadata
+        info['souk_readout_tools_version'] = importlib.metadata.version('souk_readout_tools')
+    except Exception:
+        info['souk_readout_tools_version'] = None
+    try:
+        info['souk_mkid_readout_sw_version'] = souk_mkid_readout.__version__
+    except (NameError, AttributeError):
+        info['souk_mkid_readout_sw_version'] = None
+    try:
+        info['souk_mkid_readout_fw_version'] = souk_mkid_readout.__fwversion__
+    except (NameError, AttributeError):
+        info['souk_mkid_readout_fw_version'] = None
+    info['souk_readout_tools_commit'] = _get_git_commit('/home/casper/souk_readout_tools')
+    info['souk_firmware_commit'] = _get_git_commit('/home/casper/souk-firmware')
+    info['souk_peripherals_commit'] = _get_git_commit('/home/casper/souk_readout_tools/src/souk_readout_tools/server/souk-peripherals-control')
+    return {'ready': True, **info}
+
+
+def info_clock():
+    """Clock source and PLL lock status."""
+    source = get_clock_source()
+    status = get_clock_status()
+    return {
+        'ready': True,
+        'source': source,
+        'all_locked': status.get('all_locked', False),
+        'chips': status.get('chips', []),
+    }
+
+
+def info_fpga(r):
+    """FPGA programming state and base parameters."""
+    programmed = r is not None and r.fpga.is_programmed()
+    if not programmed:
+        return {'ready': False, 'fpga_status': None, 'fpg_file': None,
+                'pipeline_id': None, 'adc_clk_hz': None}
+    return {
+        'ready': True,
+        'fpga_status': r.fpga.get_status()[0],
+        'fpg_file': r.fpgfile,
+        'pipeline_id': r.pipeline_id,
+        'adc_clk_hz': r.adc_clk_hz,
+    }
+
+
+def info_rfdc(r, config_dict):
+    """RFDC settings — needs FPGA programmed."""
+    dac0_tile = config_dict['firmware']['dac0_tile']
+    dac0_block = config_dict['firmware']['dac0_block']
+    dac1_tile = config_dict['firmware']['dac1_tile']
+    dac1_block = config_dict['firmware']['dac1_block']
+    adc_tile = config_dict['firmware']['adc_tile']
+    adc_block = config_dict['firmware']['adc_block']
+
+    has_rfdc = r is not None and hasattr(r, 'rfdc')
+    correct_adc = has_rfdc and r.rfdc.core.get_dsa(adc_tile, adc_block).get('dsa', None) is not None
+    correct_dac0 = has_rfdc and r.rfdc.core.get_output_current(dac0_tile, dac0_block).get('current', None) is not None
+    correct_dac1 = has_rfdc and r.rfdc.core.get_output_current(dac1_tile, dac1_block).get('current', None) is not None
+
+    if not (correct_adc and correct_dac0 and correct_dac1):
+        if not has_rfdc:
+            print(bcolors.FAIL + 'CRITICAL WARNING - RFDC block not found, the FPGA may not be programmed' + bcolors.ENDC)
+        else:
+            print(bcolors.FAIL + 'CRITICAL WARNING - RFDC settings not found, check that the DAC and ADC tiles/blocks are set correctly in the config to match the firmware' + bcolors.ENDC)
+        return {
+            'ready': False,
+            'dsa': 0, 'vop_dac0': 0, 'vop_dac1': 0,
+            'dac_duc_mixer_frequency_hz': 0, 'adc_ddc_mixer_frequency_hz': 0,
+            'nyquist_zone_adc': 1, 'nyquist_zone_dac0': 1, 'nyquist_zone_dac1': 1,
+            'mixer_scale_1p0_dac0': None, 'mixer_scale_1p0_dac1': None, 'mixer_scale_1p0_adc': None,
+            'qmc_settings_dac0': None, 'qmc_settings_dac1': None, 'qmc_settings_adc': None,
+            'adc_cal_frozen': None, 'rts_events': {'rts_available': False},
+        }
+
+    rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
+    return {
+        'ready': True,
+        'dsa': r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'],
+        'vop_dac0': r.rfdc.core.get_output_current(dac0_tile, dac0_block)['current'],
+        'vop_dac1': r.rfdc.core.get_output_current(dac1_tile, dac1_block)['current'],
+        'dac_duc_mixer_frequency_hz': float(r.rfdc.core.get_mixer_settings(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE)['Freq']) * 1e6,
+        'adc_ddc_mixer_frequency_hz': float(r.rfdc.core.get_mixer_settings(adc_tile, adc_block, r.rfdc.core.ADC_TILE)['Freq']) * 1e6,
+        'nyquist_zone_adc': r.rfdc.core.get_nyquist_zone(adc_tile, adc_block, r.rfdc.core.ADC_TILE),
+        'nyquist_zone_dac0': r.rfdc.core.get_nyquist_zone(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE),
+        'nyquist_zone_dac1': r.rfdc.core.get_nyquist_zone(dac1_tile, dac1_block, r.rfdc.core.DAC_TILE),
+        'mixer_scale_1p0_dac0': r.rfdc.core.get_mixer_settings(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0,
+        'mixer_scale_1p0_dac1': r.rfdc.core.get_mixer_settings(dac1_tile, dac1_block, r.rfdc.core.DAC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0,
+        'mixer_scale_1p0_adc': r.rfdc.core.get_mixer_settings(adc_tile, adc_block, r.rfdc.core.ADC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0,
+        'qmc_settings_dac0': r.rfdc.core.get_qmc_settings(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE),
+        'qmc_settings_dac1': r.rfdc.core.get_qmc_settings(dac1_tile, dac1_block, r.rfdc.core.DAC_TILE),
+        'qmc_settings_adc': r.rfdc.core.get_qmc_settings(adc_tile, adc_block, r.rfdc.core.ADC_TILE),
+        'adc_cal_frozen': get_cal_freeze(r, config_dict),
+        'rts_events': rts_details,
+    }
+
+
+def info_pipeline(r):
+    """DSP pipeline block parameters — needs pipeline init."""
+    pipeline_ready = (r is not None and hasattr(r, 'accumulators')
+                      and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0)
+    if not pipeline_ready:
+        return {
+            'ready': False,
+            'output_mode': None, 'sync_delay': None, 'internal_loopback': None,
+            'psb_scale': None, 'psb_fftshift': None, 'pfb_fftshift': None,
+            'acc_len': None, 'acc_freq_hz': None,
+        }
+    return {
+        'ready': True,
+        'output_mode': r.output.get_status()[0]['mode'],
+        'sync_delay': r.sync.get_delay(),
+        'internal_loopback': r.input.loopback_enabled(),
+        'psb_scale': r.psbscale.get_scale(),
+        'psb_fftshift': r.psb.get_fftshift(),
+        'pfb_fftshift': r.pfb.get_fftshift(),
+        'acc_len': r.accumulators[0].get_acc_len(),
+        'acc_freq_hz': get_sample_rate(r),
+    }
+
+
+def info_tones(r, config_dict):
+    """Tone frequencies, amplitudes, phases, powers, and firmware indices."""
+    pipeline_ready = (r is not None and hasattr(r, 'accumulators')
+                      and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0)
+    if not pipeline_ready:
+        return {
+            'ready': False,
+            'count': 0, 'frequencies_hz': None, 'amplitudes': None,
+            'phases_rad': None, 'powers_dbm': None, 'firmware_indices': None,
+            'detailed_frequency_info': None,
+        }
+    freqs_detailed = get_tone_frequencies(r, config_dict, detailed_output=True)
+    freqs = freqs_detailed[0]
+    details = freqs_detailed[1]
+    amps = get_tone_amplitudes(r, config_dict)
+    phases = get_tone_phases(r, config_dict)
+    try:
+        powers = get_tone_powers(r, config_dict)
+    except Exception:
+        powers = np.array([])
+    return {
+        'ready': True,
+        'count': len(freqs),
+        'frequencies_hz': freqs.tolist(),
+        'amplitudes': amps.tolist(),
+        'phases_rad': phases.tolist(),
+        'powers_dbm': powers.tolist() if len(powers) > 0 else None,
+        'firmware_indices': details['rx']['tone_indices'],
+        'detailed_frequency_info': details,
+    }
+
+
+def info_diagnostics(r, r_fast, config_dict):
+    """Saturation, overflow, and signal levels (expensive — captures snapshots)."""
+    pipeline_ready = (r is not None and hasattr(r, 'accumulators')
+                      and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0)
+    if not pipeline_ready:
+        return {'ready': False, 'adc_saturation': None, 'dac_saturation': None, 'dsp_overflow': None}
+
+    adc_sat, adc_details = check_input_saturation(r, r_fast, iterations=25, verbose=False)
+    dac_sat, dac_details = check_output_saturation(r_fast, iterations=25, verbose=False)
+    dsp_ovf, dsp_details = check_dsp_overflow(r, duration_s=0.1, verbose=False)
+    return {
+        'ready': True,
+        'adc_saturation': {'saturated': adc_sat, **adc_details},
+        'dac_saturation': {'saturated': dac_sat, **dac_details},
+        'dsp_overflow': {'overflow': dsp_ovf, **dsp_details},
+    }
+
+
+def info_calibrations(r, config_dict):
+    """Resolved calibration values currently in effect."""
+    # Check if tones are set for per-tone interpolation
+    pipeline_ready = (r is not None and hasattr(r, 'accumulators')
+                      and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0)
+
+    info = {
+        'ready': True,
+        'dac0_dbfs_to_dbm': config_dict['firmware'].get('dac0_dbfs_to_dbm'),
+        'dac1_dbfs_to_dbm': config_dict['firmware'].get('dac1_dbfs_to_dbm'),
+        'adc_dbm_to_dbfs': config_dict['firmware'].get('adc_dbm_to_dbfs'),
+        'vop_current_fullscale': config_dict['firmware'].get('vop_current_fullscale'),
+    }
+
+    rf = config_dict.get('rf_frontend', {})
+    cryo = config_dict.get('cryostat', {})
+    cal_keys_rf = [
+        'tx_combiner_loss_db', 'rx_combiner_loss_db',
+        'tx_if_s21_db', 'rx_if_s21_db',
+        'tx_rf_s21_db', 'rx_rf_s21_db',
+        'tx_mixer_conversion_loss_db', 'rx_mixer_conversion_loss_db',
+    ]
+
+    if pipeline_ready:
+        try:
+            freqs = get_tone_frequencies(r, config_dict)
+            freq_axis = freqs
+        except Exception:
+            freq_axis = None
+    else:
+        freq_axis = None
+
+    for key in cal_keys_rf:
+        raw = rf.get(key)
+        if freq_axis is not None and raw is not None:
+            try:
+                resolved = _resolve_cal_value(raw, freq_axis)
+                info[key] = resolved.tolist() if hasattr(resolved, 'tolist') else resolved
+            except Exception:
+                info[key] = raw
+        else:
+            info[key] = raw
+
+    info['cryostat_input_s21_db'] = cryo.get('input_s21_db')
+    info['cryostat_output_s21_db'] = cryo.get('output_s21_db')
 
     return info
 

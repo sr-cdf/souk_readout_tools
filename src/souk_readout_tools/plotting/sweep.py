@@ -43,7 +43,8 @@ def _extract_traces(sweep_data, tones=None):
     return traces
 
 
-def _apply_transforms(f, z, deembed, phase_center, ei=None, eq=None):
+def _apply_transforms(f, z, deembed, phase_center, ei=None, eq=None,
+                      group_delay_cal=None):
     """Apply deembed and/or phase_center to a complex trace and errors.
 
     Returns (z_out, ei_out, eq_out, deembed_params, phase_center_params).
@@ -52,7 +53,8 @@ def _apply_transforms(f, z, deembed, phase_center, ei=None, eq=None):
     d_params = None
     pc_params = None
     if deembed:
-        z, d_params = _apply_deembed(f, z, deembed)
+        z, d_params = _apply_deembed(f, z, deembed,
+                                     group_delay_cal=group_delay_cal)
         # Deembedding divides by a complex baseline — scale errors by
         # the same factor so they remain consistent with the signal.
         if d_params is not None and ei is not None:
@@ -79,7 +81,7 @@ def _transform_title_suffix(deembed, phase_center):
 def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                phase_center=False, show_errors=True, multi_tone='overlay',
                fig=None, label=None, units='raw', config=None,
-               reference_plane='adc_input', **kwargs):
+               reference_plane='adc_input', group_delay_cal=None, **kwargs):
     """
     General-purpose sweep plot.
 
@@ -111,12 +113,17 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             entries in ``config['rf_frontend']`` and ``config['cryostat']``;
             falls back to 'adc_input' with a warning if that cal is not
             available.  Ignored when ``units != 'dbm'``.
+        group_delay_cal: Frequency-dependent group delay calibration from
+            ``measure_path_group_delay()``.  Used when ``deembed=True`` to
+            remove the measured path group delay instead of auto-estimating
+            a scalar cable delay.
         **kwargs: Passed to matplotlib plot/errorbar calls.
 
     Returns:
         matplotlib.figure.Figure
     """
     plt = _get_pyplot()
+    custom_title = kwargs.pop('title', None)
     traces = _extract_traces(sweep_data, tones)
     info = sweep_data.get('system_information')
 
@@ -153,7 +160,8 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             for i, (f, si, sq, ei, eq, tidx) in enumerate(traces):
                 ax = axes_flat[i]
                 z = si + 1j * sq
-                z, _, _, _, _ = _apply_transforms(f, z, deembed, phase_center)
+                z, _, _, _, _ = _apply_transforms(f, z, deembed, phase_center,
+                                                  group_delay_cal=group_delay_cal)
                 trace_label = _resolve_label(ax, label, suffix=f'Tone {tidx}' if tidx is not None else None)
                 ax.plot(z.real, z.imag, linewidth=0.8, label=trace_label, **kwargs)
                 ax.set_aspect('equal', adjustable='datalim')
@@ -164,6 +172,8 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             # Hide unused axes
             for i in range(n_traces, len(axes_flat)):
                 axes_flat[i].set_visible(False)
+            if custom_title is not None:
+                fig.suptitle(custom_title)
             plt.tight_layout()
             return fig
         else:
@@ -182,9 +192,12 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                                    units=units, info=info, config=config,
                                    reference_plane=reference_plane,
                                    iq_label=iq_label, mag_label=mag_label,
+                                   group_delay_cal=group_delay_cal,
                                    **kwargs)
                 axes[i, 0].legend(fontsize='small')
                 axes[i, 1].legend(fontsize='small')
+            if custom_title is not None:
+                fig.suptitle(custom_title)
             plt.tight_layout()
             return fig
 
@@ -196,7 +209,8 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             ax = fig.gca()
         for f, si, sq, ei, eq, tidx in traces:
             z = si + 1j * sq
-            z, _, _, _, _ = _apply_transforms(f, z, deembed, phase_center)
+            z, _, _, _, _ = _apply_transforms(f, z, deembed, phase_center,
+                                                  group_delay_cal=group_delay_cal)
             trace_label = _resolve_label(ax, label,
                                          suffix=f'Tone {tidx}' if tidx is not None else None)
             ax.plot(z.real, z.imag, linewidth=0.8, label=trace_label, **kwargs)
@@ -204,7 +218,8 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         ax.set_ylabel(f'Q {iq_label}'.strip())
         ax.set_aspect('equal', adjustable='datalim')
         ax.legend(fontsize='small')
-        ax.set_title('S21 Complex Plane' + suffix)
+        ax.set_title(custom_title if custom_title is not None
+                     else 'S21 Complex Plane' + suffix)
         plt.tight_layout()
         return fig
 
@@ -223,14 +238,18 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                            units=units, info=info, config=config,
                            reference_plane=reference_plane,
                            iq_label=iq_label, mag_label=mag_label,
+                           group_delay_cal=group_delay_cal,
                            **kwargs)
 
     ax1.legend(fontsize='small')
     ax2.legend(fontsize='small')
 
-    bw = sweep_data.get('bandwidth_hz')
-    title = f'Sweep ({bw/1e6:.1f} MHz)' if bw else 'Sweep'
-    title += suffix
+    if custom_title is not None:
+        title = custom_title
+    else:
+        bw = sweep_data.get('bandwidth_hz')
+        title = f'Sweep ({bw/1e6:.1f} MHz)' if bw else 'Sweep'
+        title += suffix
     fig.suptitle(title)
     plt.tight_layout()
     return fig
@@ -241,10 +260,12 @@ def _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,
                         has_errors, label,
                         units='raw', info=None, config=None,
                         reference_plane='adc_input',
-                        iq_label='', mag_label='|S21| (dB)', **kwargs):
+                        iq_label='', mag_label='|S21| (dB)',
+                        group_delay_cal=None, **kwargs):
     """Plot a single trace on a pair of axes."""
     z = si + 1j * sq
-    z, ei, eq, _, _ = _apply_transforms(f, z, deembed, phase_center, ei, eq)
+    z, ei, eq, _, _ = _apply_transforms(f, z, deembed, phase_center, ei, eq,
+                                        group_delay_cal=group_delay_cal)
     si, sq = z.real, z.imag
 
     f_mhz = f / 1e6

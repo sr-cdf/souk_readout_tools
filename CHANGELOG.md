@@ -1,6 +1,27 @@
 # Changelog & Feature List
 
-## v1.1.0 (Current)
+## v1.2.0 (Current)
+
+**Structured Info System**
+- `get_info(sections)` replaces the monolithic `get_system_information()` with 14 named sections: `server`, `versions`, `clock`, `fpga`, `rfdc`, `pipeline`, `tones`, `rf_frontend`, `lna`, `diagnostics`, `config`, `calibrations`, `resonators`, `registers`.
+- Each section includes a `ready` flag indicating whether its data could be read from hardware.
+- Default call excludes expensive sections (`diagnostics`, `config`, `calibrations`, `resonators`, `registers`); use `'all'` for everything.
+- `health_check()` for compact intermittent polling — returns pass/fail bools for clock lock, ADC/DAC saturation, DSP overflow, RTS events, plus key state indicators.
+- `rf_frontend` section now includes full signal chain description: hardware identity, attenuator backend details (I2C bus/channel or RUDAT serial numbers), live attenuator/amp state, derived gain/compression, and updownconverter characterisation (LO frequency, sideband, mixer/combiner losses, IF/RF S21).
+- `lna` section includes controller status and bias readings (voltage, current) for all 14 channels.
+- `config` section returns raw YAML config text with comments preserved, plus `config_matches_applied` (in-memory config vs last applied to firmware).
+- `calibrations` section returns resolved per-tone calibration values (after frequency-dependent interpolation).
+- `resonators` section placeholder for future resonator detuning tracking module.
+- `registers` section placeholder for future full firmware register dump.
+- `tone_indices` renamed to `firmware_indices` in new info output (backward-compatible key retained in legacy `get_system_information()`).
+- Server activity flags (`streaming`, `triggered_streaming`, `sweeping`) now exposed in `server` section.
+- `firmware_interface_ready` / `firmware_fast_interface_ready` checks added (verifies blocks are present, not just that the object exists).
+
+**Pipeline Parameter Access**
+- New client methods: `set_sync_delay()` / `get_sync_delay()`, `set_acc_len()` / `get_acc_len()`, `set_internal_loopback()` / `get_internal_loopback()`, `set_psb_scale()` / `get_psb_scale()`, `set_psb_fftshift()` / `get_psb_fftshift()`, `set_pfb_fftshift()` / `get_pfb_fftshift()`.
+- Previously these could only be set via `apply_config()`.
+
+## v1.1.0
 
 **Telescope Time (PTP Timestamps)**
 - PTP timestamps from the firmware are now included in every sample frame, stream packet, and sweep point.
@@ -63,6 +84,18 @@
 - Clock source and lock status included in `get_system_information()`.
 - `apply_config()` enforces `firmware.clock_source` on every config push.
 - See [clock_source.md](doc/clock_source.md) for full details and manual procedures.
+
+**Path Group Delay Calibration**
+- `measure_path_group_delay()` client method measures the full TX+RX round-trip group delay (cable delay) across the band from a wideband sweep.
+- Three-stage filtering: resonance masking (using known MKID frequencies and Q-factors to exclude ±N×HWHM around each resonance), median filter on the phase-gradient spectrum to suppress Lorentzian tails, and a low-order polynomial fit to produce a smooth, continuously defined group-delay vs frequency model.
+- New config field `rf_frontend.path_group_delay_ns` accepts a scalar (ns), inline `[[freq_hz, tau_ns], …]` list, or path to a two-column CSV calibration file.
+- Results can be saved inline to the config or as a CSV calibration file via `save_to_config` / `save_to_csv` arguments; CSV files are registered and transferred automatically with `push_config()` / `pull_config()`.
+- `path_group_delay_ns` added to `CAL_FILE_KEYS` so file-backed calibrations are handled consistently with all other RF path calibrations.
+
+**souk-restart-daemon**
+- New `souk-restart-daemon` server command to restart the readout server systemd service(s) without a full disable/re-enable cycle.
+- Supports `-p 0`, `-p 1`, and `-p 0 1` flags (default: pipeline 0).
+- Backed by `restart_systemd_service.sh`, deployed alongside the existing install/remove scripts on first server start.
 
 **Crest Factor Calculator**
 - `estimate_papr_db()` in `firmware_lib` for computing the peak-to-average power ratio (dB) of a multitone waveform. Simulates the time-domain composite signal to verify phase/amplitude choices before applying to hardware.

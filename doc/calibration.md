@@ -16,6 +16,7 @@ How to calibrate the SOUK readout signal chain for accurate power measurements.
 - [Cryostat Chain](#cryostat-chain)
 - [Example Workflow](#example-workflow)
 - [Reference Planes](#reference-planes)
+- [Path Group Delay Calibration](#path-group-delay-calibration)
 
 ---
 
@@ -348,7 +349,7 @@ When the peripheral controller is enabled (regardless of backend):
 - `tx_attenuator_value_db` and `rx_attenuator_value_db` are programmed to the hardware attenuator on config push or `apply_config()`.
 - The in-memory config is updated after every hardware change via `_sync_config()`, so subsequent `get_tone_powers()` / `set_tone_powers()` calls see the correct values.
 - `set_tone_powers(optimise_dynamic_range=True)` adjusts the attenuator (and amp bypass if available) automatically.
-- `get_system_information()` reports the current peripheral state.
+- `get_info(['rf_frontend'])` reports the full RF frontend state including attenuators, bypass, gain, compression points, and updownconverter characterisation.
 - `get_rf_peripheral_status()` returns attenuator values, bypass state, total path gain, and 1 dB compression points.
 
 ### Client API
@@ -441,6 +442,81 @@ powers, details = client.get_tone_powers(detailed_output=True)
 ```
 
 This enables ADC calibration via loopback: compare `get_tone_powers(reference_plane='rf_output')` (known TX power) with `get_tone_powers(reference_plane='adc_input')` (estimated RX power) to derive the ADC calibration correction.
+
+---
+
+## Path Group Delay Calibration
+
+The round-trip cable delay (TX + RX path) adds a frequency-dependent
+phase slope to S21 data.  Resonator fitting and deembedding need to remove
+this slope.  By default a single scalar delay is auto-estimated from the
+phase gradient, but a measured frequency-dependent calibration gives better
+results, especially when the delay varies across the band.
+
+### Measuring the group delay
+
+```python
+gd = client.measure_path_group_delay(save_to_config=True, save_to_csv='group_delay.csv')
+client.push_config()   # saves calibration to RFSoC
+```
+
+The result `gd` is a dict with `'frequencies'` and `'tau_ns'` arrays.
+`save_to_config=True` stores it in `config['rf_frontend']['path_group_delay_ns']`
+so it persists across sessions.
+
+### Applying the group delay
+
+There are three ways to use the calibration, depending on your workflow.
+
+**1. Direct removal on S21 data**
+
+Use `resonator.remove_group_delay()` to get corrected S21 arrays directly:
+
+```python
+from souk_readout_tools import resonator
+
+s = client.parse_sweep_data(client.get_sweep_data())
+f = s['sweep_f'][:,0]
+z = s['sweep_i'][:,0] + 1j * s['sweep_q'][:,0]
+
+# Remove using the measurement result dict
+z_corrected, tau = resonator.remove_group_delay(f, z, gd)
+
+# Or using the calibration from config
+z_corrected, tau = resonator.remove_group_delay(
+    f, z, client.config['rf_frontend']['path_group_delay_ns'])
+```
+
+**2. Via deembedding (plotting and analysis)**
+
+Pass `group_delay_cal` to `deembed()` or `plot_sweep()`.  This replaces the
+auto-estimated scalar cable delay with the measured calibration:
+
+```python
+from souk_readout_tools import resonator
+from souk_readout_tools.plotting import plot_sweep
+
+# Deembed with measured group delay
+z_deembedded, params = resonator.deembed(f, z, group_delay_cal=gd)
+
+# Plot with deembedding using measured group delay
+plot_sweep(s, deembed=True, group_delay_cal=gd)
+```
+
+**3. Pre-process before resonator fitting**
+
+Remove the bulk group delay before fitting so the fitter only needs to
+handle small residual delay:
+
+```python
+from souk_readout_tools import resonator, fitting
+
+z_corrected, _ = resonator.remove_group_delay(f, z, gd)
+result = fitting.fit_resonance(f, z_corrected)
+```
+
+The fitter still has a free `tau` parameter that will capture any small
+residual delay not accounted for by the calibration.
 
 ---
 

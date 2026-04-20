@@ -35,8 +35,8 @@ def get_template_config_path():
     return str(importlib_files('souk_readout_tools').joinpath('data', 'config', 'template_config.yaml'))
 
 
-def copy_template_config(destination, pipeline_id=0, config_id=None,
-                         created_by=None, comments=None):
+def copy_template_config(destination, pipeline_id=0, nyquist_zone=1,
+                         config_id=None, created_by=None, comments=None):
     """
     Copy the template config to a destination file, updating pipeline-specific fields.
 
@@ -45,6 +45,10 @@ def copy_template_config(destination, pipeline_id=0, config_id=None,
     Args:
         destination: Path to write the config file.
         pipeline_id: Pipeline ID (0 or 1) to set in the template.
+        nyquist_zone: Nyquist zone (1 or 2). Sets the ``nyquist_zone`` key
+            in the config, which controls the DAC/ADC mix-mode setting and 
+            mixer frequencies: zone 1 uses fs/4 (~1228.8 MHz), zone 2 uses 
+            3*fs/4 (~3686.4 MHz). Default is 1.
         config_id: Optional config identifier string.
         created_by: Optional author/creator string.
         comments: Optional comments string.
@@ -82,6 +86,16 @@ def copy_template_config(destination, pipeline_id=0, config_id=None,
             count=1,
         )
 
+    # Nyquist zone
+    if nyquist_zone not in (1, 2):
+        raise ValueError(f'nyquist_zone must be 1 or 2, got {nyquist_zone}')
+    if nyquist_zone != 1:
+        text = re.sub(
+            r'(nyquist_zone:\s*)1',
+            rf'\g<1>{nyquist_zone}',
+            text,
+        )
+
     # Pipeline-specific fields
     text = re.sub(
         r'(pipeline_id:\s*)0',
@@ -113,5 +127,6 @@ def copy_template_config(destination, pipeline_id=0, config_id=None,
     if ownership is not None:
         os.chown(destination, *ownership)
 
-    print(f'Template config written to {destination}')
+    print(f'Template config written to {destination} '
+          f'(pipeline {pipeline_id}, Nyquist zone {nyquist_zone})')
     print(f'Edit this file with your system-specific settings before use.')

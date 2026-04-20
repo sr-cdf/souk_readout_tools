@@ -53,6 +53,66 @@ def remove_cable_delay(frequencies, s21, tau=None):
     return s21_corrected, tau
 
 
+def _resolve_group_delay_cal(group_delay_cal, frequencies):
+    """Resolve a group delay calibration to a per-frequency tau array in seconds.
+
+    Accepts the same formats as ``rf_frontend.path_group_delay_ns`` in the
+    config:
+
+    - scalar (float) — constant delay in nanoseconds.
+    - ``[[freq_hz, tau_ns], ...]`` — frequency-dependent pairs; linearly
+      interpolated to *frequencies*.
+    - result dict from ``measure_path_group_delay()`` — uses the
+      ``'frequencies'`` and ``'tau_ns'`` keys.
+
+    Returns:
+        tau_s: 1-D array of delay values in **seconds**, same length as
+        *frequencies*.
+    """
+    frequencies = np.asarray(frequencies, dtype=float)
+
+    if isinstance(group_delay_cal, dict):
+        cal_f = np.asarray(group_delay_cal['frequencies'], dtype=float).ravel()
+        cal_tau_ns = np.asarray(group_delay_cal['tau_ns'], dtype=float).ravel()
+    elif np.ndim(group_delay_cal) == 0:
+        return np.full(frequencies.shape, float(group_delay_cal) * 1e-9)
+    else:
+        arr = np.asarray(group_delay_cal, dtype=float)
+        cal_f = arr[:, 0]
+        cal_tau_ns = arr[:, 1]
+
+    tau_ns = np.interp(frequencies.ravel(), cal_f, cal_tau_ns)
+    return tau_ns.reshape(frequencies.shape) * 1e-9
+
+
+def remove_group_delay(frequencies, s21, group_delay_cal):
+    """
+    Remove frequency-dependent group delay from S21 data.
+
+    Like ``remove_cable_delay`` but uses a frequency-dependent calibration
+    instead of a single scalar delay.  The calibration is typically produced
+    by ``ReadoutClient.measure_path_group_delay()``.
+
+    Args:
+        frequencies: 1-D array of frequencies in Hz.
+        s21: 1-D complex array of S21 values.
+        group_delay_cal: Group delay calibration.  Accepted formats:
+            - scalar (ns) — constant delay.
+            - ``[[freq_hz, tau_ns], ...]`` — frequency-dependent pairs.
+            - result dict from ``measure_path_group_delay()`` with keys
+              ``'frequencies'`` and ``'tau_ns'``.
+
+    Returns:
+        s21_corrected: Complex array with group delay removed.
+        tau_s: 1-D array of delay values removed (seconds).
+    """
+    frequencies = np.asarray(frequencies, dtype=float)
+    s21 = np.asarray(s21, dtype=complex)
+    tau_s = _resolve_group_delay_cal(group_delay_cal, frequencies)
+    s21_corrected = s21 * np.exp(1j * 2 * np.pi * frequencies * tau_s)
+    return s21_corrected, tau_s
+
+
 def center_circle(s21):
     """
     Translate the resonance circle so its algebraic center is at the origin.
@@ -159,7 +219,7 @@ def _estimate_baseline(s21, n_edge=5):
 
 # -- True RF deembedding ----------------------------------------------------
 
-def deembed(frequencies, s21, tau=None):
+def deembed(frequencies, s21, tau=None, group_delay_cal=None):
     """
     True RF deembedding for a notch resonator.
 
@@ -171,21 +231,31 @@ def deembed(frequencies, s21, tau=None):
         frequencies: 1D array of frequencies in Hz.
         s21: 1D complex array of S21 values.
         tau: Cable delay in seconds. If None, auto-estimated.
+            Ignored when ``group_delay_cal`` is provided.
+        group_delay_cal: Frequency-dependent group delay calibration
+            (from ``measure_path_group_delay()``).  When provided, used
+            instead of a scalar ``tau``.  Accepted formats: scalar (ns),
+            ``[[freq_hz, tau_ns], ...]``, or result dict.
 
     Returns:
         s21_deembedded: Complex array in the standard notch resonator
             representation.
         params: dict with keys:
-            'tau': cable delay removed (seconds)
+            'tau': cable delay removed (seconds; scalar or array)
             'baseline': complex off-resonance baseline value
+            'group_delay_cal': the calibration used, or None
     """
-    s21_no_delay, tau = remove_cable_delay(frequencies, s21, tau=tau)
+    if group_delay_cal is not None:
+        s21_no_delay, tau = remove_group_delay(frequencies, s21, group_delay_cal)
+    else:
+        s21_no_delay, tau = remove_cable_delay(frequencies, s21, tau=tau)
     baseline = _estimate_baseline(s21_no_delay)
     s21_deembedded = s21_no_delay / baseline
 
     params = {
         'tau': tau,
         'baseline': baseline,
+        'group_delay_cal': group_delay_cal,
     }
     return s21_deembedded, params
 
@@ -208,9 +278,14 @@ def apply_deembed_params(s21, params, frequency=None):
         s21_deembedded: Deembedded complex array.
     """
     s21 = np.asarray(s21, dtype=complex)
-    if frequency is not None and params.get('tau'):
-        s21 = s21 * np.exp(
-            1j * 2 * np.pi * np.asarray(frequency, dtype=float) * params['tau'])
+    if frequency is not None:
+        group_delay_cal = params.get('group_delay_cal')
+        if group_delay_cal is not None:
+            tau_s = _resolve_group_delay_cal(group_delay_cal, np.atleast_1d(frequency))
+            s21 = s21 * np.exp(1j * 2 * np.pi * np.asarray(frequency, dtype=float) * tau_s)
+        elif params.get('tau') is not None:
+            s21 = s21 * np.exp(
+                1j * 2 * np.pi * np.asarray(frequency, dtype=float) * params['tau'])
     return s21 / params['baseline']
 
 
@@ -328,7 +403,7 @@ class ResonatorCalibration:
         return cls(fr, Ql, tau, center, radius, rotation_angle)
 
     @classmethod
-    def from_sweep(cls, frequencies, s21, fr=None, Ql=None):
+    def from_sweep(cls, frequencies, s21, fr=None, Ql=None, group_delay_cal=None):
         """
         Build from raw sweep data using cable delay removal + phase centering.
 
@@ -339,8 +414,14 @@ class ResonatorCalibration:
                 the minimum |S21| point.
             Ql: Loaded quality factor. If None, estimated from the
                 3 dB bandwidth.
+            group_delay_cal: Frequency-dependent group delay calibration
+                (from ``measure_path_group_delay()``).  When provided,
+                used instead of auto-estimated scalar cable delay.
         """
-        s21_no_delay, tau = remove_cable_delay(frequencies, s21)
+        if group_delay_cal is not None:
+            s21_no_delay, tau = remove_group_delay(frequencies, s21, group_delay_cal)
+        else:
+            s21_no_delay, tau = remove_cable_delay(frequencies, s21)
         _, pc_params = phase_center(s21_no_delay)
 
         if fr is None:

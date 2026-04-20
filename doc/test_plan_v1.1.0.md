@@ -1104,7 +1104,7 @@ sweep1 = c1.wideband_sweep()
 | Systemd daemon setup | 0.8 |
 | RUDAT driver | 0.9 |
 | Template config | 0.10, 2.9 |
-| `get_system_information()` | 1.1, 1.10 |
+| `get_system_information()` / `get_info()` | 1.1, 1.10 |
 | `check_rfdc_rts_events()` | 1.2 |
 | `sync_config_from_system()` | 1.3 |
 | `push_config()` / `pull_config()` | 1.5 |

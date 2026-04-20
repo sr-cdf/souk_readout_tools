@@ -222,7 +222,8 @@ def _ensure_daemon_files(dirs, pipeline_id):
         if SUDO and os.path.exists(daemon_dir):
             os.chown(daemon_dir, TARGET_UID, TARGET_GID)
 
-        for script in ('install_systemd_service.sh', 'remove_systemd_service.sh'):
+        for script in ('install_systemd_service.sh', 'remove_systemd_service.sh',
+                       'restart_systemd_service.sh'):
             dst_script = os.path.join(daemon_dir, script)
             if not os.path.exists(dst_script):
                 shutil.copy2(str(pkg_daemon_dir.joinpath(script)), dst_script)
@@ -827,14 +828,14 @@ class ReadoutServer:
         return system_information
     
     def get_server_status(self):
-        """
-        Get the status of the server.
-        This function is called when a client sends a 'server_status' request.
-        """
+        """Legacy server status dict.
 
-        programmed = not firmware_lib.needs_programming(self.r,self.config)
-        shared_ready = not firmware_lib.needs_shared_resource_initialising(self.r,self.config)
-        pipeline_ready = not firmware_lib.needs_pipeline_initialising(self.r,self.config)
+        Deprecated — prefer ``get_info()`` which returns structured sections.
+        This rebuilds the original flat format for backward compatibility.
+        """
+        programmed = not firmware_lib.needs_programming(self.r, self.config)
+        shared_ready = not firmware_lib.needs_shared_resource_initialising(self.r, self.config)
+        pipeline_ready = not firmware_lib.needs_pipeline_initialising(self.r, self.config)
 
         status = {
             'process_name': self.process_name,
@@ -844,7 +845,9 @@ class ReadoutServer:
             'pwd': os.getcwd(),
             'sys.executable': sys.executable,
             'sys.argv': sys.argv,
-            'uname': os.uname().nodename+' '+os.uname().sysname+' '+os.uname().release + ' ' + os.uname().version + ' ' + os.uname().machine,
+            'uname': (os.uname().nodename + ' ' + os.uname().sysname + ' '
+                      + os.uname().release + ' ' + os.uname().version
+                      + ' ' + os.uname().machine),
             'python_version': sys.version,
             'server_version': importlib.metadata.version('souk_readout_tools'),
             'config_file': self.config_file,
@@ -869,7 +872,321 @@ class ReadoutServer:
             'lna_bias': self.lna_controller.get_status() if getattr(self, 'lna_controller', None) else {'enabled': False},
         }
         return status
-    
+
+    # ------------------------------------------------------------------
+    # Structured info system
+    # ------------------------------------------------------------------
+
+    DEFAULT_INFO_SECTIONS = [
+        'server', 'versions', 'clock', 'fpga', 'rfdc',
+        'pipeline', 'tones', 'rf_frontend', 'lna',
+    ]
+    ALL_INFO_SECTIONS = DEFAULT_INFO_SECTIONS + [
+        'diagnostics', 'config', 'calibrations', 'resonators', 'registers',
+    ]
+
+    def get_info(self, sections=None):
+        """Return system information organised by named sections.
+
+        Parameters
+        ----------
+        sections : list of str or ``'all'``, optional
+            Which sections to include.  ``None`` returns
+            ``DEFAULT_INFO_SECTIONS`` (fast path — excludes diagnostics,
+            config, calibrations, resonators, and registers).
+            ``'all'`` returns every section including expensive ones.
+        """
+        dispatchers = {
+            'server':       self._info_server,
+            'versions':     self._info_versions,
+            'clock':        self._info_clock,
+            'fpga':         self._info_fpga,
+            'rfdc':         self._info_rfdc,
+            'pipeline':     self._info_pipeline,
+            'tones':        self._info_tones,
+            'rf_frontend':  self._info_rf_frontend,
+            'lna':          self._info_lna,
+            'diagnostics':  self._info_diagnostics,
+            'config':       self._info_config,
+            'calibrations': self._info_calibrations,
+            'resonators':   self._info_resonators,
+            'registers':    self._info_registers,
+        }
+        if sections is None:
+            sections = self.DEFAULT_INFO_SECTIONS
+        elif sections == 'all':
+            sections = self.ALL_INFO_SECTIONS
+        return {s: dispatchers[s]() for s in sections if s in dispatchers}
+
+    def health_check(self):
+        """Compact health summary for intermittent polling."""
+        # Initialisation level
+        programmed = self.r is not None and self.r.fpga.is_programmed()
+        shared_ready = programmed and hasattr(self.r, 'autocorr')
+        pipeline_ready = (shared_ready and hasattr(self.r, 'accumulators')
+                          and len(self.r.accumulators) > 0
+                          and self.r.accumulators[0].get_acc_len() > 0)
+        if pipeline_ready:
+            init_level = 'pipeline'
+        elif shared_ready:
+            init_level = 'shared'
+        elif programmed:
+            init_level = 'programmed'
+        else:
+            init_level = 'not_programmed'
+
+        clock = firmware_lib.get_clock_status()
+
+        # Diagnostics — only run if pipeline is ready
+        adc_sat = dac_sat = dsp_ovf = False
+        if pipeline_ready:
+            try:
+                adc_sat, _ = firmware_lib.check_input_saturation(
+                    self.r, self.r_fast, iterations=10, verbose=False)
+            except Exception:
+                pass
+            try:
+                dac_sat, _ = firmware_lib.check_output_saturation(
+                    self.r_fast, iterations=10, verbose=False)
+            except Exception:
+                pass
+            try:
+                dsp_ovf, _ = firmware_lib.check_dsp_overflow(
+                    self.r, duration_s=0.05, verbose=False)
+            except Exception:
+                pass
+
+        # RTS events
+        rts_any = False
+        try:
+            rts_any, _ = firmware_lib.check_rfdc_rts_events(self.r, clear=False)
+        except Exception:
+            pass
+
+        # Tone count
+        tone_count = 0
+        if pipeline_ready:
+            try:
+                tone_count = len(firmware_lib.get_tone_frequencies(self.r, self.config))
+            except Exception:
+                pass
+
+        return {
+            'initialisation_level': init_level,
+            'clock_locked': clock.get('all_locked', False),
+            'streaming': self.e_stream_enabled.is_set() and self.stream_task is not None and not self.stream_task.done(),
+            'triggered_streaming': self.e_triggered_stream_enabled.is_set() and self.triggered_stream_task is not None and not self.triggered_stream_task.done(),
+            'sweeping': self.sweep_task is not None and not self.sweep_task.done(),
+            'rts_events': rts_any,
+            'adc_saturated': adc_sat,
+            'dac_saturated': dac_sat,
+            'dsp_overflow': dsp_ovf,
+            'rf_frontend_available': (getattr(self, 'rf_peripherals', None) is not None
+                                      and self.rf_peripherals.enabled
+                                      and self.rf_peripherals.is_hardware),
+            'lna_available': (getattr(self, 'lna_controller', None) is not None
+                              and self.lna_controller.enabled
+                              and self.lna_controller.is_hardware),
+            'tone_count': tone_count,
+            'client_count': len(self.request_clients),
+            'resonators_tracking': False,  # placeholder until tracking module
+            'max_detuning_hz': None,       # placeholder
+        }
+
+    # -- Section helpers for get_info --
+
+    def _info_server(self):
+        programmed = self.r is not None and self.r.fpga.is_programmed()
+        shared_ready = programmed and hasattr(self.r, 'autocorr')
+        pipeline_ready = (shared_ready and hasattr(self.r, 'accumulators')
+                          and len(self.r.accumulators) > 0
+                          and self.r.accumulators[0].get_acc_len() > 0)
+        if pipeline_ready:
+            init_level = 'pipeline'
+        elif shared_ready:
+            init_level = 'shared'
+        elif programmed:
+            init_level = 'programmed'
+        else:
+            init_level = 'not_programmed'
+
+        return {
+            'ready': True,
+            'process_name': self.process_name,
+            'ip_addresses': self.ip_addresses,
+            'pipeline_id': self.pipeline_id,
+            'pipeline_dirs': self.pipeline_dirs,
+            'pwd': os.getcwd(),
+            'sys_executable': sys.executable,
+            'sys_argv': sys.argv,
+            'uname': (os.uname().nodename + ' ' + os.uname().sysname + ' '
+                      + os.uname().release + ' ' + os.uname().version
+                      + ' ' + os.uname().machine),
+            'python_version': sys.version,
+            'server_version': importlib.metadata.version('souk_readout_tools'),
+            'config_file': self.config_file,
+            'initialisation_level': init_level,
+            'request_clients': len(self.request_clients),
+            'request_client_addrs': [c.get_extra_info('peername') for c in self.request_clients],
+            'stream_clients': len(self.stream_clients),
+            'stream_client_addrs': [c.get_extra_info('peername') for c in self.stream_clients],
+            'streaming': self.e_stream_enabled.is_set() and self.stream_task is not None and not self.stream_task.done(),
+            'triggered_streaming': (self.e_triggered_stream_enabled.is_set()
+                                    and self.triggered_stream_task is not None
+                                    and not self.triggered_stream_task.done()),
+            'sweeping': self.sweep_task is not None and not self.sweep_task.done(),
+            'task_count': len(self.tasks),
+            'latest_sweep_data_valid': self.latest_sweep_data_valid,
+            'firmware_interface_exists': bool(self.r),
+            'firmware_interface_ready': bool(self.r) and hasattr(self.r, 'accumulators'),
+            'firmware_fast_interface_exists': bool(self.r_fast),
+            'firmware_fast_interface_ready': bool(self.r_fast) and hasattr(self.r_fast, 'adc_clk_hz'),
+        }
+
+    def _info_versions(self):
+        return firmware_lib.info_versions()
+
+    def _info_clock(self):
+        return firmware_lib.info_clock()
+
+    def _info_fpga(self):
+        return firmware_lib.info_fpga(self.r)
+
+    def _info_rfdc(self):
+        return firmware_lib.info_rfdc(self.r, self.config)
+
+    def _info_pipeline(self):
+        return firmware_lib.info_pipeline(self.r)
+
+    def _info_tones(self):
+        return firmware_lib.info_tones(self.r, self.config)
+
+    def _info_rf_frontend(self):
+        rf = getattr(self, 'rf_peripherals', None)
+        rf_cfg = self.config.get('rf_frontend', {})
+
+        if rf is None or not rf.enabled:
+            return {'ready': False, 'connected': rf_cfg.get('connected', False)}
+
+        info = {
+            'ready': True,
+            'connected': rf_cfg.get('connected', False),
+            'hardware_id': rf_cfg.get('hardware_id'),
+            'hardware_available': rf.is_hardware,
+            'attenuator_backend': rf_cfg.get('attenuator_backend'),
+        }
+
+        # Backend-specific identity
+        backend = rf_cfg.get('attenuator_backend', '')
+        if backend == 'i2c':
+            mod_cfg = rf_cfg.get('mixerless_module', {})
+            info['i2c_bus'] = mod_cfg.get('i2c_bus')
+            info['i2c_channel'] = mod_cfg.get('channel')
+        elif backend == 'rudat':
+            info['rudat_tx_serial'] = rf_cfg.get('rudat_tx_serial')
+            info['rudat_rx_serial'] = rf_cfg.get('rudat_rx_serial')
+
+        # Live controllable state
+        info['tx_attenuation_db'] = rf.get_tx_attenuation()
+        info['rx_attenuation_db'] = rf.get_rx_attenuation()
+        info['tx_amp_bypass'] = rf.get_tx_amp_bypass()
+        info['rx_amp_bypass'] = rf.get_rx_amp_bypass()
+
+        # Derived gain / compression
+        info['tx_total_gain_db'] = rf.get_tx_total_gain()
+        info['rx_total_gain_db'] = rf.get_rx_total_gain()
+        info['tx_input_1db_comp_dbm'] = rf.get_tx_input_1db_comp()
+        info['rx_input_1db_comp_dbm'] = rf.get_rx_input_1db_comp()
+
+        # Updownconverter characterisation (from config)
+        for key in ('tx_mixer_lo_frequency_hz', 'rx_mixer_lo_frequency_hz',
+                     'tx_mixer_sideband', 'rx_mixer_sideband',
+                     'tx_mixer_conversion_loss_db', 'rx_mixer_conversion_loss_db',
+                     'tx_combiner_loss_db', 'rx_combiner_loss_db',
+                     'tx_if_s21_db', 'rx_if_s21_db',
+                     'tx_rf_s21_db', 'rx_rf_s21_db',
+                     'tx_bypass_amp_s21_db', 'rx_bypass_amp_s21_db',
+                     'loopback'):
+            info[key] = rf_cfg.get(key)
+
+        return info
+
+    def _info_lna(self):
+        lna = getattr(self, 'lna_controller', None)
+        cryo_cfg = self.config.get('cryostat', {})
+        lna_cfg = cryo_cfg.get('lna_bias', {})
+
+        if lna is None or not lna.enabled:
+            return {'ready': False, 'enabled': lna_cfg.get('enabled', False)}
+
+        info = {
+            'ready': True,
+            'enabled': True,
+            'hardware_available': lna.is_hardware,
+            'i2c_bus': lna_cfg.get('i2c_bus'),
+            'lna_channel': lna.lna_channel,
+            'lna_model': cryo_cfg.get('lna_model'),
+        }
+
+        # Bias readings
+        if lna.is_hardware:
+            try:
+                info['bias_readings'] = lna.get_lna_bias_status_all()
+            except Exception:
+                info['bias_readings'] = None
+        else:
+            info['bias_readings'] = None
+
+        return info
+
+    def _info_diagnostics(self):
+        return firmware_lib.info_diagnostics(self.r, self.r_fast, self.config)
+
+    def _info_config(self):
+        config_text = getattr(self, 'config_raw_text', None) or yaml.dump(self.config, sort_keys=False)
+        config_id = None
+        try:
+            config_id = self.config.get('config', {}).get('config_id')
+        except Exception:
+            pass
+
+        matches_applied = False
+        if self.applied_config is not None and self.config is not None:
+            try:
+                matches_applied = self.config == self.applied_config
+            except Exception:
+                pass
+
+        return {
+            'ready': True,
+            'config_file': self.config_file,
+            'config_id': config_id,
+            'config_text': config_text,
+            'config_matches_applied': matches_applied,
+        }
+
+    def _info_calibrations(self):
+        return firmware_lib.info_calibrations(self.r, self.config)
+
+    def _info_resonators(self):
+        """Resonator detuning tracking — placeholder until tracking module."""
+        return {
+            'ready': False,
+            'tracking_enabled': False,
+            'tone_count': 0,
+            'driven_frequencies_hz': None,
+            'estimated_resonant_frequencies_hz': None,
+            'detuning_hz': None,
+            'fractional_detuning': None,
+            'accumulated_phase_rad': None,
+            'tracking_timestamp': None,
+            'tracking_interval_s': None,
+        }
+
+    def _info_registers(self):
+        """Full firmware register dump — placeholder."""
+        return {'ready': False, 'available': False, 'dump': None}
+
     async def handle_request_client(self, reader, writer):
         """
         Handle a request client connection.
@@ -987,6 +1304,15 @@ class ReadoutServer:
                     info = self.get_system_information()
                     await self.send_response(writer, {'status': 'success', 'data': info})
 
+                elif request == 'get_info':
+                    sections = message.get('sections', None)
+                    info = self.get_info(sections)
+                    await self.send_response(writer, {'status': 'success', 'data': info})
+
+                elif request == 'health_check':
+                    result = self.health_check()
+                    await self.send_response(writer, {'status': 'success', 'data': result})
+
                 elif request == 'get':
                     param_name = message.get('param')
                     response = {'status': 'error', 'message': f'Invalid parameter name {param_name}'}
@@ -1031,6 +1357,25 @@ class ReadoutServer:
 
                     elif param_name == 'clock_status':
                         value = firmware_lib.get_clock_status()
+                        response = {'status': 'success', 'value': value}
+
+                    elif param_name == 'sync_delay':
+                        value = self.r.sync.get_delay()
+                        response = {'status': 'success', 'value': value}
+                    elif param_name == 'acc_len':
+                        value = self.r.accumulators[0].get_acc_len()
+                        response = {'status': 'success', 'value': value}
+                    elif param_name == 'internal_loopback':
+                        value = self.r.input.loopback_enabled()
+                        response = {'status': 'success', 'value': value}
+                    elif param_name == 'psb_scale':
+                        value = self.r.psbscale.get_scale()
+                        response = {'status': 'success', 'value': value}
+                    elif param_name == 'psb_fftshift':
+                        value = self.r.psb.get_fftshift()
+                        response = {'status': 'success', 'value': value}
+                    elif param_name == 'pfb_fftshift':
+                        value = self.r.pfb.get_fftshift()
                         response = {'status': 'success', 'value': value}
 
                     await self.send_response(writer, response)
@@ -1104,6 +1449,25 @@ class ReadoutServer:
                             response = {'status': 'success', 'clock_status': status}
                         except (ValueError, FileNotFoundError) as exc:
                             response = {'status': 'error', 'message': str(exc)}
+
+                    elif param_name == 'sync_delay':
+                        self.r.sync.set_delay(int(param_value))
+                        response = {'status': 'success'}
+                    elif param_name == 'acc_len':
+                        self.r.accumulators[0].set_acc_len(int(param_value))
+                        response = {'status': 'success'}
+                    elif param_name == 'internal_loopback':
+                        self.r.input.enable_loopback(bool(param_value))
+                        response = {'status': 'success'}
+                    elif param_name == 'psb_scale':
+                        self.r.psbscale.set_scale(int(param_value))
+                        response = {'status': 'success'}
+                    elif param_name == 'psb_fftshift':
+                        self.r.psb.set_fftshift(int(param_value))
+                        response = {'status': 'success'}
+                    elif param_name == 'pfb_fftshift':
+                        self.r.pfb.set_fftshift(int(param_value))
+                        response = {'status': 'success'}
 
                     await self.send_response(writer, response)
 
@@ -1549,8 +1913,8 @@ class ReadoutServer:
         cnt,data,err,tt = firmware_lib.read_accumulated_data_fast(
             fast_read_params, tone_indices=self.active_tone_indices)
 
-        tt_msb = (tt >> 32) & 0xFFFFFFFF
-        tt_lsb = tt & 0xFFFFFFFF
+        tt_msb = np.uint32((tt >> 32) & 0xFFFFFFFF).view(np.int32)
+        tt_lsb = np.uint32(tt & 0xFFFFFFFF).view(np.int32)
 
         frame = np.zeros(len(data)+num_headers,dtype='<i4')
         frame[:len(data)] = data
@@ -1598,7 +1962,7 @@ class ReadoutServer:
                 #cnt,data,err = firmware_lib.read_accumulated_data_fast(self.r_fast,fast_read_params)
                 # # data_bytes = data.tobytes()
 
-                payload, cnt, err =  self.prepare_frame(fast_read_params,burst=burst)
+                payload, cnt, err =  self.prepare_frame(fast_read_params)
                 
                 writer.write(payload)
                 await writer.drain()
