@@ -409,7 +409,7 @@ These are also available in the `pipeline` section of `get_info()`:
 
 ```python
 pipeline = client.get_info(['pipeline'])['pipeline']
-print(pipeline['acc_len'], pipeline['psb_scale'], pipeline['psb_fftshift'])
+print(pipeline['acc_len'], pipeline['psb_scale'], pipeline['internal_loopback'])
 ```
 
 ---
@@ -684,7 +684,6 @@ sweep_data = client.wideband_sweep(
     samples_per_point=10,            # accumulation per point
     tone_powers_dbm=-50,             # per-tone power in dBm (scalar or array), or 'auto'
     reference_plane='detector',      # reference plane for tone power calibration
-    remove_phase_slope=True,         # remove linear phase slope
     optimise_tx_dynamic_range=True,  # automatically adjust TX parameters to maximise dynamic range
     optimise_rx_gain=True,           # automatically adjust RX gain/attenuation to maximise SNR without saturation
 

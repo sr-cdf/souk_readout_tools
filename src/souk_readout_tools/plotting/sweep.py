@@ -61,6 +61,12 @@ def _apply_transforms(f, z, deembed, phase_center, ei=None, eq=None,
             baseline_mag = np.abs(d_params['baseline'])
             ei = ei / baseline_mag
             eq = eq / baseline_mag
+    elif group_delay_cal is not None:
+        # Remove group delay without full deembedding (no baseline
+        # normalisation).  This corrects the linear phase slope so that
+        # phase-vs-frequency plots show the resonator response only.
+        from ..resonator import remove_group_delay
+        z, _ = remove_group_delay(f, z, group_delay_cal)
     if phase_center:
         z, pc_params = _apply_phase_center(z, phase_center)
         # Phase centering is a translation + rotation — neither changes

@@ -29,7 +29,7 @@ def wideband_sweep(config_file=None, address=None, request_port=None,
                    bandwidth_hz=None, center_freq_hz=None,
                    step_size_hz=10000, num_tones=1024, samples_per_point=10,
                    tone_powers_dbm=None,
-                   ignore_phase_correction=True, remove_phase_slope=True,
+                   ignore_phase_correction=True,
                    filename=None, filetype='npy',
                    plot_data=True):
     """
@@ -60,6 +60,7 @@ def wideband_sweep(config_file=None, address=None, request_port=None,
         ignore_phase_correction (bool): DEPRECATED. Phase correction is no longer needed
                                         following firmware fixes. Default is True (no correction).
         filename (str): Filename to save the data to. Default is tmp_wideband_sweep in cwd.
+
         filetype (str): Type of file to save. Default is 'npy'.
         plot_data (bool): Plot the data after saving. Default is True.
 
@@ -89,7 +90,6 @@ def wideband_sweep(config_file=None, address=None, request_port=None,
         samples_per_point=samples_per_point,
         tone_powers_dbm=tone_powers_dbm,
         apply_phase_correction=not ignore_phase_correction,
-        remove_phase_slope=remove_phase_slope,
         verbose=True
     )
     
@@ -176,8 +176,6 @@ def main():
                         help='Output filename (without extension). Default: tmp_wideband_sweep in current directory.')
     parser.add_argument('-t', '--filetype', type=str, default='npy',
                         help='Output file format (npy, csv, etc.).')
-    parser.add_argument('--no_remove_phase_slope', action='store_true',
-                        help='Do not remove linear phase slope from the sweep data.')
     parser.add_argument('-P', '--plot_data', action='store_true',
                         help='Plot the data after saving.')
 
@@ -247,7 +245,6 @@ def main():
             samples_per_point=args.samples_per_point,
             tone_powers_dbm=tone_powers_dbm,
             ignore_phase_correction=ignore_correction,
-            remove_phase_slope=not args.no_remove_phase_slope,
             filename=args.filename,
             filetype=args.filetype,
             plot_data=args.plot_data,

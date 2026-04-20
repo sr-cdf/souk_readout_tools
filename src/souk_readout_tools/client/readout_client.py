@@ -2651,7 +2651,7 @@ class ReadoutClient:
 
     # TODO: Add a tone_powers parameter to wideband_sweep to allow specifying
     #       power levels across the band (e.g. per-tone or per-band).
-    def parse_wideband_sweep(self, sweep_data, remove_phase_slope=True,
+    def parse_wideband_sweep(self, sweep_data,
                              apply_phase_correction=False):
         """
         Parse raw sweep data from the server as a wideband sweep.
@@ -2666,8 +2666,6 @@ class ReadoutClient:
 
         Args:
             sweep_data: Raw sweep data dictionary from get_sweep_data().
-            remove_phase_slope (bool): Remove linear phase slope from the
-                concatenated sweep data. Default is True.
             apply_phase_correction (bool): Correct for phase jumps at filterbank
                 channel edges. Default is False. DEPRECATED.
 
@@ -2689,12 +2687,6 @@ class ReadoutClient:
         fcat = np.ravel(f.T)
         zcat = np.ravel(z.T)
 
-        # Optionally remove linear phase slope
-        if remove_phase_slope:
-            phicat = np.unwrap(np.angle(zcat))
-            slope = np.nanmedian(np.gradient(phicat, fcat))
-            zcat *= np.exp(-1j * (slope * fcat))
-
         # Reformat as single-row arrays (like a single-tone sweep covering all frequencies)
         s['sweep_f'] = np.array([fcat])
         s['sweep_i'] = np.array([np.real(zcat)])
@@ -2709,7 +2701,6 @@ class ReadoutClient:
                        num_tones=1024, samples_per_point=10, tone_powers_dbm='auto',
                        reference_plane='detector',
                        apply_phase_correction=False,
-                       remove_phase_slope=True, 
                        optimise_tx_dynamic_range=True,
                        optimise_rx_gain=True,
                        cal_freeze=True,
@@ -2739,8 +2730,6 @@ class ReadoutClient:
             apply_phase_correction (bool): DEPRECATED. Correct for phase jumps at filterbank
                                            channel edges. Default is False. This correction is
                                            no longer needed following firmware fixes.
-            remove_phase_slope (bool): Remove linear phase slope from the sweep data.
-                                       Default is True.
             optimise_tx_dynamic_range (bool): If True, maximise DAC bit utilisation and
                 adjust the TX analog chain when setting tone powers. Default is True.
             optimise_rx_gain (bool): If True, maximise ADC power utilisation and
@@ -2992,7 +2981,6 @@ class ReadoutClient:
 
         # Get and parse the sweep data as a wideband sweep
         s = self.parse_wideband_sweep(self.get_sweep_data(),
-                                      remove_phase_slope=remove_phase_slope,
                                       apply_phase_correction=apply_phase_correction)
 
         # Add wideband_sweep-specific metadata
@@ -3178,7 +3166,6 @@ class ReadoutClient:
         if sweep_data is None:
             if verbose:
                 print('measure_path_group_delay: performing wideband sweep...')
-            sweep_kwargs.setdefault('remove_phase_slope', False)
             sweep_data = self.wideband_sweep(verbose=verbose, **sweep_kwargs)
 
         freqs = np.asarray(sweep_data['sweep_f'], dtype=float).ravel()
