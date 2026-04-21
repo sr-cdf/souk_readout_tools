@@ -6225,6 +6225,21 @@ def get_cal_freeze(r,config_dict):
     print('freeze',freeze)
     return bool(int(freeze['CalFrozen']))
 
+def refresh_adc_cal(r, config_dict, adc_cal_settle_time=2.0):
+    """
+    Refresh the ADC calibration by unfreezing, waiting for the calibration
+    to settle, then freezing again.
+
+    Args:
+        r: The FPGA register interface.
+        config_dict: Configuration dictionary.
+        adc_cal_settle_time (float): Seconds to wait for calibration to settle
+            after unfreezing. Default 2.0.
+    """
+    set_cal_freeze(r, config_dict, False)
+    time.sleep(adc_cal_settle_time)
+    set_cal_freeze(r, config_dict, True)
+
 
 # ---------------------------------------------------------------------------
 # Clock source control via krc-utils

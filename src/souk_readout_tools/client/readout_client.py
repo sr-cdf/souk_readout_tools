@@ -1082,6 +1082,18 @@ class ReadoutClient:
     def set_cal_freeze(self,freeze):
         return self.set_parameter('cal_freeze',freeze)
 
+    def refresh_adc_cal(self, adc_cal_settle_time=2.0):
+        """
+        Refresh the ADC calibration by unfreezing, waiting for it to settle,
+        then freezing again.
+
+        Args:
+            adc_cal_settle_time (float): Seconds to wait for calibration to
+                settle after unfreezing. Default 2.0.
+        """
+        message = {'request': 'refresh_adc_cal', 'adc_cal_settle_time': adc_cal_settle_time}
+        return self.send_request(message)
+
     def get_clock_source(self):
         """Get the current reference clock source ('internal' or 'external')."""
         return self.get_parameter('clock_source')
@@ -1768,7 +1780,27 @@ class ReadoutClient:
         else:
             raise ValueError(f"Unsupported file_format '{file_format}'. Use 'npy' or 'json'.")
 
-    def perform_sweep(self, centers, spans, points, samples_per_point,direction='up', phases=None):
+    def perform_sweep(self, centers, spans, points, samples_per_point,direction='up', phases=None, refresh_adc_cal=True, adc_cal_settle_time=2.0):
+        """
+        Perform a frequency sweep.
+
+        ADC calibration is always frozen before sweeping and left frozen
+        afterwards. By default the calibration is refreshed first (unfreeze,
+        settle, freeze) so it adapts to the current tone configuration.
+
+        Args:
+            centers: Center frequencies for sweep tones.
+            spans: Sweep span(s).
+            points: Number of sweep points.
+            samples_per_point: Number of samples per sweep point.
+            direction: Sweep direction, 'up' or 'down'. Default 'up'.
+            phases: Tone phases. If None, warns about zero phases.
+            refresh_adc_cal (bool): If True (default), refresh ADC calibration
+                before sweeping (unfreeze, settle, freeze). If False, skip
+                the refresh but still ensure the calibration is frozen.
+            adc_cal_settle_time (float): Seconds to wait for ADC calibration
+                to settle. Default 2.0.
+        """
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(centers)
         if response['status'] != 'success':
@@ -1788,11 +1820,33 @@ class ReadoutClient:
             'spans': spans.tolist(),
             'points': points,
             'samples_per_point': samples_per_point,
-            'direction': direction
+            'direction': direction,
+            'refresh_adc_cal': refresh_adc_cal,
+            'adc_cal_settle_time': adc_cal_settle_time
         }
         return self.send_request(message)
 
-    def perform_retune(self, centers, spans, points, samples_per_point, direction='up', method='max_gradient', freq_offsets=None, phases=None):
+    def perform_retune(self, centers, spans, points, samples_per_point, direction='up', method='max_gradient', freq_offsets=None, phases=None, refresh_adc_cal=True, adc_cal_settle_time=2.0):
+        """
+        Perform a retune sweep to find optimal tone frequencies.
+
+        ADC calibration is always frozen before sweeping and left frozen
+        afterwards. By default the calibration is refreshed first.
+
+        Args:
+            centers: Center frequencies for sweep tones.
+            spans: Sweep span(s).
+            points: Number of sweep points.
+            samples_per_point: Number of samples per sweep point.
+            direction: Sweep direction, 'up' or 'down'. Default 'up'.
+            method: Retune method, 'max_gradient' or 'min_mag'. Default 'max_gradient'.
+            freq_offsets: Frequency offsets for noise estimation. Default None (zeros).
+            phases: Tone phases. If None, warns about zero phases.
+            refresh_adc_cal (bool): If True (default), refresh ADC calibration
+                before sweeping. If False, skip refresh but still ensure frozen.
+            adc_cal_settle_time (float): Seconds to wait for ADC calibration
+                to settle. Default 2.0.
+        """
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(centers)
         if response['status'] != 'success':
@@ -1831,7 +1885,9 @@ class ReadoutClient:
             'samples_per_point': samples_per_point,
             'direction': direction,
             'method': method,
-            'freq_offsets': freq_offsets.tolist()
+            'freq_offsets': freq_offsets.tolist(),
+            'refresh_adc_cal': refresh_adc_cal,
+            'adc_cal_settle_time': adc_cal_settle_time
         }
         return self.send_request(message)
 
@@ -2703,7 +2759,7 @@ class ReadoutClient:
                        apply_phase_correction=False,
                        optimise_tx_dynamic_range=True,
                        optimise_rx_gain=True,
-                       cal_freeze=True,
+                       refresh_adc_cal=True,
                        verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
@@ -2735,9 +2791,10 @@ class ReadoutClient:
             optimise_rx_gain (bool): If True, maximise ADC power utilisation and
                 optimise the PFB FFT shift for best RX dynamic range after tones
                 are configured. Calls maximise_rx_power(). Default is True.
-            cal_freeze (bool): If True, freeze the ADC calibration after tones
-                are configured and before sweeping, then unfreeze after the sweep
-                completes. Prevents ADC drift during the sweep. Default is True.
+            refresh_adc_cal (bool): If True (default), refresh ADC calibration
+                before sweeping (unfreeze, settle, freeze). If False, skip
+                the refresh but still ensure the calibration is frozen.
+                Calibration is always left frozen after the sweep.
             verbose (bool): Print progress information. Default is True.
 
         Returns:
@@ -2914,11 +2971,28 @@ class ReadoutClient:
             if verbose:
                 print(f'  maximise_rx_power() -> {rx_result["status"]}')
 
-        # Freeze calibration before sweep
-        if cal_freeze:
+        # ADC calibration management before sweep
+        # ADC calibration: always frozen before sweep, left frozen after
+        if refresh_adc_cal:
+            # Full refresh: unfreeze, settle, freeze
+            if verbose:
+                print(f'  Refreshing ADC calibration...')
+            self.set_cal_freeze(False)
+            if verbose:
+                print(f'  Waiting for ADC calibration to settle...')
+            time.sleep(2.0)
             if verbose:
                 print(f'  Freezing calibration...')
             self.set_cal_freeze(True)
+        else:
+            # Ensure frozen, settling first if needed
+            if not self.get_cal_freeze():
+                if verbose:
+                    print(f'  Waiting for ADC calibration to settle...')
+                time.sleep(2.0)
+                if verbose:
+                    print(f'  Freezing calibration...')
+                self.set_cal_freeze(True)
 
 
         # Double check for saturation/overflow before sweeping and attempt to fix
@@ -2972,12 +3046,6 @@ class ReadoutClient:
             time.sleep(1.0)
         if verbose:
             print()  # Newline after progress
-
-        # Unfreeze calibration after sweep
-        if cal_freeze:
-            if verbose:
-                print(f'  Unfreezing calibration...')
-            self.set_cal_freeze(False)
 
         # Get and parse the sweep data as a wideband sweep
         s = self.parse_wideband_sweep(self.get_sweep_data(),

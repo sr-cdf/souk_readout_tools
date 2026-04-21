@@ -1695,11 +1695,13 @@ class ReadoutServer:
                         points = message.get('points')
                         samples_per_point = message.get('samples_per_point')
                         direction = message.get('direction')
+                        refresh_adc_cal = message.get('refresh_adc_cal', True)
+                        adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
                         #print('asyncio create task, sweep task')
                         self.sweep_task = asyncio.create_task(
-                            self.sweep(centers, spans, points, samples_per_point, direction)
+                            self.sweep(centers, spans, points, samples_per_point, direction, refresh_adc_cal=refresh_adc_cal, adc_cal_settle_time=adc_cal_settle_time)
                         )
-                        
+
                         #print('await send response')
                         await self.send_response(writer, {'status': 'success', 'message': 'Sweep in progress'})
                     else:
@@ -1796,12 +1798,28 @@ class ReadoutServer:
                         direction = message.get('direction')
                         method = message.get('method')
                         freq_offsets = message.get('freq_offsets', None)
+                        refresh_adc_cal = message.get('refresh_adc_cal', True)
+                        adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
                         self.sweep_task = asyncio.create_task(
-                            self.retune(centers, spans, points, samples_per_point, direction, method, freq_offsets)
+                            self.retune(centers, spans, points, samples_per_point, direction, method, freq_offsets, refresh_adc_cal=refresh_adc_cal, adc_cal_settle_time=adc_cal_settle_time)
                         )
                         await self.send_response(writer, {'status': 'success', 'message': 'Retune in progress'})
                     else:
                         await self.send_response(writer, {'status': 'error', 'message': 'Sweep or retune already in progress'})
+
+                elif request == 'refresh_adc_cal':
+                    # Inline rather than firmware_lib.refresh_adc_cal() to use
+                    # async sleep and keep the stream flag in sync.
+                    try:
+                        adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
+                        firmware_lib.set_cal_freeze(self.r, self.config, False)
+                        self.stream_flags[FLAG_CAL_FREEZE].clear()
+                        await asyncio.sleep(adc_cal_settle_time)
+                        firmware_lib.set_cal_freeze(self.r, self.config, True)
+                        self.stream_flags[FLAG_CAL_FREEZE].set()
+                        await self.send_response(writer, {'status': 'success'})
+                    except Exception as e:
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
 
                 elif request == 'cancel':
                     if self.sweep_task:
@@ -2095,16 +2113,30 @@ class ReadoutServer:
                 print(traceback.format_exc())
                 await asyncio.sleep(0.1)
 
-    async def sweep(self, centers, spans, points, samples_per_point, direction):
+    async def sweep(self, centers, spans, points, samples_per_point, direction, refresh_adc_cal=True, adc_cal_settle_time=2.0):
         """
         A coroutine that performs a frequency sweep and stores the results in self.latest_sweep_data.
+
+        ADC calibration is always frozen before sweeping and left frozen
+        afterwards. By default the calibration is refreshed first (unfreeze,
+        settle, freeze) so it adapts to the current tone configuration. Set
+        refresh_adc_cal=False to skip the refresh and sweep immediately with the
+        existing frozen calibration.
+
+        Args:
+            refresh_adc_cal (bool): If True (default), refresh ADC calibration
+                before sweeping (unfreeze, settle, freeze). If False, ensure
+                the calibration is frozen (settling first if not already
+                frozen) but skip the full refresh.
+            adc_cal_settle_time (float): Seconds to wait for ADC calibration to settle.
+                Default 2.0.
         """
-        
+
         try:
-            
+
             self.latest_sweep_data_valid = False
             self.sweep_progress = 0.0
-            
+
             centers = np.atleast_1d(centers)
             spans = np.atleast_1d(spans)
             if len(spans)==1:
@@ -2126,6 +2158,28 @@ class ReadoutServer:
 
             print('Setting initial tone frequencies')
             firmware_lib.set_tone_frequencies(self.r,self.config,centers,autosync=True)
+
+            # ADC calibration: always frozen before sweep, left frozen after
+            # Note: uses inline set_cal_freeze rather than firmware_lib.refresh_adc_cal()
+            # because we need async sleep to avoid blocking the event loop.
+            if refresh_adc_cal:
+                # Full refresh: unfreeze, settle, freeze
+                print('Refreshing ADC calibration...')
+                firmware_lib.set_cal_freeze(self.r, self.config, False)
+                self.stream_flags[FLAG_CAL_FREEZE].clear()
+                print(f'Waiting {adc_cal_settle_time}s for ADC calibration to settle...')
+                await asyncio.sleep(adc_cal_settle_time)
+                print('Freezing ADC calibration')
+                firmware_lib.set_cal_freeze(self.r, self.config, True)
+                self.stream_flags[FLAG_CAL_FREEZE].set()
+            else:
+                # Ensure frozen, settling first if needed
+                if not firmware_lib.get_cal_freeze(self.r, self.config):
+                    print(f'Waiting {adc_cal_settle_time}s for ADC calibration to settle...')
+                    await asyncio.sleep(adc_cal_settle_time)
+                    print('Freezing ADC calibration')
+                    firmware_lib.set_cal_freeze(self.r, self.config, True)
+                    self.stream_flags[FLAG_CAL_FREEZE].set()
 
             print('Preparing sweep')
             num_tones = len(centers) 
@@ -2257,11 +2311,17 @@ class ReadoutServer:
             print(f"Error performing sweep: {e}")
             print(traceback.format_exc())
         
-    async def retune(self, center, span, points, samples_per_point, direction, method,freq_offsets=None):
+    async def retune(self, center, span, points, samples_per_point, direction, method,freq_offsets=None, refresh_adc_cal=True, adc_cal_settle_time=2.0):
         """
         A coroutine that performs a frequency sweep, finds the resonance peaks using the specified method, and sets the tones to the peak frequencies.
+
+        Args:
+            refresh_adc_cal (bool): If True (default), refresh ADC calibration
+                before sweeping. If False, skip refresh but still ensure frozen.
+            adc_cal_settle_time (float): Seconds to wait for ADC calibration to settle.
+                Default 2.0.
         """
-       
+
         center = np.atleast_1d(center)
         span = np.atleast_1d(span)
         if len(span)==1:
@@ -2271,7 +2331,7 @@ class ReadoutServer:
         samples_per_point=int(samples_per_point)
         assert direction in ('up','down')
 
-       
+
         #handle freq_offsets, if None, all zeros, if scalar, make array of that value, if array, ensure correct length
         if freq_offsets is None:
             freq_offsets = np.zeros_like(center)
@@ -2283,12 +2343,12 @@ class ReadoutServer:
             raise ValueError("freq_offsets must be None, a scalar, or have the same shape as centers")
         if np.any(np.abs(freq_offsets) > span/2):
             print("Warning: some freq_offsets are larger than half the span, which may cause tones to be set outside the sweep range")
-        
+
         try:
             if method not in ('max_gradient','min_mag'):
                 raise ValueError(f'Invalid retune method "{method}", must be "max_gradient" or "min_mag"')
-            
-            await self.sweep(center, span, points, samples_per_point, direction)
+
+            await self.sweep(center, span, points, samples_per_point, direction, refresh_adc_cal=refresh_adc_cal, adc_cal_settle_time=adc_cal_settle_time)
 
             # sweep_f = self.latest_sweep_data['f']
             # sweep_z = self.latest_sweep_data['z']
