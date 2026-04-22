@@ -2776,11 +2776,15 @@ class ReadoutClient:
             num_tones (int): Number of tones to use in the sweep. More tones = fewer sweep
                              steps but wider spacing. Default is 1024.
             samples_per_point (int): Number of samples to integrate per sweep point. Default is 10.
-            tone_powers_dbm (float or array-like or 'auto'): Tone power in dBm.
+            tone_powers_dbm (float or array-like or 'auto' or None): Tone power in dBm.
                 If 'auto', calls maximise_tx_power() to optimise the dynamic range.
                 If a scalar, all tones are set to uniform power at this level (the
                 strongest tone achieves the specified power at the reference plane).
                 If an array (must match num_tones), per-tone powers are applied.
+                If None, tone amplitudes are left untouched — useful when repeating
+                a sweep after only an external change (e.g. TX attenuator) with the
+                same num_tones. Typically pair with optimise_rx_gain=False so the
+                RX chain is not re-adjusted either.
                 Default is 'auto'.
             reference_plane (str): Where tone_powers_dbm is specified: 'dac',
                 'rf_output', or 'detector' (default).
@@ -2931,8 +2935,9 @@ class ReadoutClient:
             if verbose:
                 print(f'  set_tone_powers(): {stp_response.get("status")}')
         else:
-            #should this be a no-op?
-            self.set_tone_amplitudes(np.ones(num_tones))
+            # tone_powers_dbm is None: leave tone amplitudes untouched
+            if verbose:
+                print(f'  tone_powers_dbm=None: leaving existing tone amplitudes unchanged')
 
         # # Check for saturation/overflow before sweeping and attempt to fix
         # outps = self.check_output_saturation()
