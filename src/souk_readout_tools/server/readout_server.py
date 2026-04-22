@@ -26,6 +26,7 @@ Version: 1.1.0
 
 import asyncio, contextvars, functools
 import copy
+import datetime
 import importlib.metadata
 import json
 import struct
@@ -344,6 +345,7 @@ class ReadoutServer:
         check_if_running_on_rfsoc_arm()
         self.process_name = set_process_name()
         self.ip_addresses = get_host_ips()
+        self.server_start_unix_s = time.time()
         
         # Step 1: Use pipeline_id hint to find default config if none specified
         initial_pipeline_id = pipeline_id if pipeline_id is not None else 0
@@ -879,7 +881,7 @@ class ReadoutServer:
 
     DEFAULT_INFO_SECTIONS = [
         'server', 'versions', 'clock', 'fpga', 'rfdc',
-        'pipeline', 'tones', 'rf_frontend', 'lna',
+        'pipeline', 'tones', 'rf_frontend', 'lna', 'rfsoc_sensors',
     ]
     ALL_INFO_SECTIONS = DEFAULT_INFO_SECTIONS + [
         'diagnostics', 'config', 'calibrations', 'resonators', 'registers',
@@ -906,6 +908,7 @@ class ReadoutServer:
             'tones':        self._info_tones,
             'rf_frontend':  self._info_rf_frontend,
             'lna':          self._info_lna,
+            'rfsoc_sensors': self._info_rfsoc_sensors,
             'diagnostics':  self._info_diagnostics,
             'config':       self._info_config,
             'calibrations': self._info_calibrations,
@@ -1010,6 +1013,13 @@ class ReadoutServer:
         else:
             init_level = 'not_programmed'
 
+        now_unix_s = time.time()
+        try:
+            with open('/proc/uptime', 'r') as fh:
+                board_uptime_s = float(fh.read().split()[0])
+        except Exception:
+            board_uptime_s = None
+
         return {
             'ready': True,
             'process_name': self.process_name,
@@ -1026,6 +1036,12 @@ class ReadoutServer:
             'server_version': importlib.metadata.version('souk_readout_tools'),
             'config_file': self.config_file,
             'initialisation_level': init_level,
+            'current_time_unix_s': now_unix_s,
+            'current_time_iso': datetime.datetime.fromtimestamp(now_unix_s, datetime.timezone.utc).isoformat(),
+            'server_start_unix_s': self.server_start_unix_s,
+            'server_start_iso': datetime.datetime.fromtimestamp(self.server_start_unix_s, datetime.timezone.utc).isoformat(),
+            'server_uptime_s': now_unix_s - self.server_start_unix_s,
+            'board_uptime_s': board_uptime_s,
             'request_clients': len(self.request_clients),
             'request_client_addrs': [c.get_extra_info('peername') for c in self.request_clients],
             'stream_clients': len(self.stream_clients),
@@ -1138,6 +1154,9 @@ class ReadoutServer:
             info['bias_readings'] = None
 
         return info
+
+    def _info_rfsoc_sensors(self):
+        return firmware_lib.info_rfsoc_sensors()
 
     def _info_diagnostics(self):
         return firmware_lib.info_diagnostics(self.r, self.r_fast, self.config)

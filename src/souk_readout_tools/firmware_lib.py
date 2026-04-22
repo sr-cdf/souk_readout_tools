@@ -938,6 +938,52 @@ def info_diagnostics(r, r_fast, config_dict):
     }
 
 
+def info_rfsoc_sensors(sensor_path='/sys/bus/iio/devices/iio:device0/'):
+    """RFSoC on-chip IIO sensor readings (temperatures in C, voltages in V).
+
+    Reads every ``in_*_raw`` entry exposed by the PS/PL SYSMON via IIO and
+    converts it using the accompanying ``_scale`` and ``_offset`` sysfs files
+    (offset applies only to temperature sensors).  Sensor keys are the raw
+    sysfs names (minus ``in_`` and ``_raw``) so duplicated short names like
+    ``vccams`` or ``vccint`` on both PS and PL rails do not collide.
+    """
+    import glob
+    info = {'ready': False, 'available': False, 'sensor_path': sensor_path,
+            'temperatures_c': {}, 'voltages_v': {}, 'other': {}}
+    if not os.path.isdir(sensor_path):
+        return info
+
+    def _read_float(fname):
+        with open(fname, 'r') as fh:
+            return float(fh.read())
+
+    raw_files = sorted(glob.glob(os.path.join(sensor_path, 'in_*_raw')))
+    if not raw_files:
+        return info
+
+    info['available'] = True
+    for raw_file in raw_files:
+        base = os.path.basename(raw_file)[3:-4]  # strip 'in_' and '_raw'
+        try:
+            raw = _read_float(raw_file)
+            scale = _read_float(os.path.join(sensor_path, 'in_' + base + '_scale'))
+            offset = 0.0
+            if base.startswith('temp'):
+                offset = _read_float(os.path.join(sensor_path, 'in_' + base + '_offset'))
+            value = scale * (raw + offset) / 1000.0
+        except Exception:
+            continue
+        if base.startswith('temp'):
+            info['temperatures_c'][base] = value
+        elif base.startswith('voltage'):
+            info['voltages_v'][base] = value
+        else:
+            info['other'][base] = value
+
+    info['ready'] = True
+    return info
+
+
 def info_calibrations(r, config_dict):
     """Resolved calibration values currently in effect."""
     # Check if tones are set for per-tone interpolation

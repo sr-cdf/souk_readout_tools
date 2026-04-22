@@ -3,7 +3,8 @@
 ## v1.2.0 (Current)
 
 **Structured Info System**
-- `get_info(sections)` replaces the monolithic `get_system_information()` with 14 named sections: `server`, `versions`, `clock`, `fpga`, `rfdc`, `pipeline`, `tones`, `rf_frontend`, `lna`, `diagnostics`, `config`, `calibrations`, `resonators`, `registers`.
+- `get_info(sections)` replaces the monolithic `get_system_information()` with 15 named sections: `server`, `versions`, `clock`, `fpga`, `rfdc`, `pipeline`, `tones`, `rf_frontend`, `lna`, `rfsoc_sensors`, `diagnostics`, `config`, `calibrations`, `resonators`, `registers`.
+- `rfsoc_sensors` section reports on-chip PS/PL SYSMON readings via IIO sysfs: die temperatures (C) and supply voltages (V), keyed by the raw sensor names so PS/PL rails with duplicate short names (e.g. `vccams`, `vccint`) stay distinct.
 - Each section includes a `ready` flag indicating whether its data could be read from hardware.
 - Default call excludes expensive sections (`diagnostics`, `config`, `calibrations`, `resonators`, `registers`); use `'all'` for everything.
 - `health_check()` for compact intermittent polling — returns pass/fail bools for clock lock, ADC/DAC saturation, DSP overflow, RTS events, plus key state indicators.

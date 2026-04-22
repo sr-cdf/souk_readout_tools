@@ -547,8 +547,9 @@ class ReadoutClient:
         sections : list of str or ``'all'``, optional
             Which sections to include.  ``None`` returns the default set
             (server, versions, clock, fpga, rfdc, pipeline, tones,
-            rf_frontend, lna).  ``'all'`` includes diagnostics, config,
-            calibrations, resonators, and registers as well.
+            rf_frontend, lna, rfsoc_sensors).  ``'all'`` includes
+            diagnostics, config, calibrations, resonators, and registers
+            as well.
 
         Returns
         -------
