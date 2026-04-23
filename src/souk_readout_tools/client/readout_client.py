@@ -3037,7 +3037,6 @@ class ReadoutClient:
             raise RuntimeError(f"Sweep failed: {response['message']}")
 
         # Wait for sweep to complete
-        import time
         while True:
             p = self.get_sweep_progress()
             if verbose:
