@@ -245,7 +245,7 @@ client = ReadoutClient(address='10.11.11.11', request_port=10000)
 Config files and calibration files are always held **in memory** on the client. Pushing always writes to the server's persistent storage. Saving to the client's local disk is optional and only happens when explicitly requested.
 
 - **`push_config()`** sends the in-memory config to the server (always persisted on the RFSoC). Any calibration file paths in the config are resolved on the client, and the referenced files are automatically pushed to the server's pipeline calibrations directory. The local config is not modified.
-- **`pull_config()`** fetches the config and any referenced calibration files from the server **into memory**. Nothing is written to disk unless `save_as` is provided or `save_config()` is called.
+- **`pull_config()`** fetches the active config file and any referenced calibration files from the server **into memory**. It does not include live hardware adjustments. Nothing is written to disk unless `save_as` is provided or `save_config()` is called.
 - **`save_config()`** writes the in-memory config to a local YAML file. If calibration files were pulled from the server, they are written to a `calibrations/` directory next to the config file, and the config paths are rewritten to local relative paths.
 
 This means calibration file paths in the config are portable: `push_config` resolves local paths and transfers the files to the server, `pull_config` + `save_config` fetches them back and creates local copies.
@@ -303,16 +303,19 @@ client.pull_config()  # updates in memory only, nothing written to disk
 
 Fields updated by `sync_config_from_system()`:
 
-- `firmware.defaults` — accumulator length, sync delay, DSP parameters (VOP, Nyquist zone, mixer scales, QMC settings, DSA, DUC/DDC mixer frequencies)
+- `firmware.defaults` — accumulator length, sync delay, RFDC parameters (VOP, Nyquist zone, mixer scales, QMC settings, DSA, DUC/DDC mixer frequencies)
 - `firmware.defaults.frequencies/amplitudes/phases` — current tone state
-- `rf_frontend` — TX/RX attenuator values and amplifier bypass states (if the RF frontend is connected and the peripherals controller is available)
+- `rf_frontend.attenuator.tx_value_db` / `rx_value_db` — current attenuator settings
+- `rf_frontend.bypass_amps.tx_amp_bypass` / `rx_amp_bypass` and `tx_s21_db` / `rx_s21_db` — current amp bypass states and live S21 values (when the peripherals controller is available)
+- `cryostat.lna_bias` — current LNA bias setting for this pipeline when the controller is enabled
 
 ```python
 # Capture the current running state into the config
 client.sync_config_from_system()
 
-# Inspect what changed
+# Inspect what was synced
 print(client.config['firmware']['defaults'])
+print(client.config['rf_frontend']['attenuator'])
 
 # Persist locally
 client.save_config()
@@ -321,7 +324,15 @@ client.save_config()
 client.push_config()
 ```
 
-`sync_config_from_system()` does **not** write to disk and does not push to the server — those are separate explicit steps.  It only modifies the client's in-memory `config` dict.
+`sync_config_from_system()` returns the updated config dict; the synced state
+also lives on `client.config`.  It does **not** write to disk unless `save_as`
+is supplied, and it does not push to the server — those are separate explicit
+steps.
+
+`pull_config()` is intentionally separate: it overwrites the client's
+in-memory config with the active config file from the server only. Runtime
+hardware state is available via `get_info()` / status calls, and is copied into
+config only by an explicit sync/capture call.
 
 ### Requesting Information
 
@@ -352,8 +363,6 @@ health = client.health_check()
 #   adc_saturated, dac_saturated, dsp_overflow, rts_events,
 #   tone_count, client_count, rf_frontend_available, lna_available
 ```
-
-Legacy methods `get_server_status()` and `get_system_information()` are still available for backward compatibility but `get_info()` is preferred.
 
 ---
 
@@ -462,7 +471,6 @@ By default, `set_tone_powers` automatically optimises the dynamic range — it m
 The tone powers can be set to the maximum level that avoids saturation of the RF chain by calling ```client.maximise_tx_power()```
 
 Simlarly, the ADC input level can be maximised by adjusting the RX attenuators and or DSA settings with a call to ```client.maximise_rx_power()```
-``
 
 ### Phases
 
@@ -1212,4 +1220,3 @@ Server-side commands (installed on the RFSoC):
 | `souk-readout-server` | Start the readout server (`-p` flag for pipeline ID) |
 | `souk-enable-daemon` | Enable the server as a systemd daemon |
 | `souk-disable-daemon` | Disable the server daemon |
-

@@ -25,13 +25,13 @@ def main():
         else:
             print(bcolors.FAIL + 'Provide --config_file or --address (with --port).' + bcolors.ENDC)
             return
-        result = client.get_server_status()
-        
-        if result['status']=='success':
+        result = client.get_info(['server'])
+
+        if isinstance(result, dict) and 'server' in result:
             print(bcolors.OKGREEN+'Success'+bcolors.ENDC)
-            print(f"SOUK Readout Server running on {result['message']['ip_addresses']}")
+            print(f"SOUK Readout Server running on {result['server']['ip_addresses']}")
         else:
-            msg = result.get('message', 'Unknown error')
+            msg = result.get('message', 'Unknown error') if isinstance(result, dict) else result
             print(bcolors.FAIL + f'Failed: {msg}' + bcolors.ENDC)
             if 'Connection refused' in str(msg):
                 print(bcolors.WARNING + 'Hint: ensure souk-readout-server is running on the target host '

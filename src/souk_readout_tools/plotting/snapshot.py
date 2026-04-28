@@ -46,8 +46,8 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             'dbm' - estimated ADC input power in dBm.
             All options except 'raw' and 'peak' require system_info.
         config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
-        system_info: system_information dict.  Looked up from
-            snapshot_data['system_information'] if not provided.
+        system_info: structured info dict.  Looked up from
+            snapshot_data['info'] if not provided.
         **kwargs: Passed to plot calls.
 
     Returns:
@@ -58,12 +58,12 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
     sample_rate = snapshot_data['sample_rate']
     tone_index = snapshot_data['tone_index']
     n_snap, n_samples = snapshots.shape
-    info = system_info or snapshot_data.get('system_information')
+    info = system_info or snapshot_data.get('info')
 
     # Normalise I/Q label setup
     if units != 'raw':
         if units != 'peak' and info is None:
-            raise ValueError("system_info (or snapshot_data['system_information']) "
+            raise ValueError("system_info (or snapshot_data['info']) "
                              "is required for non-raw units.")
         # Probe labels from a dummy call
         _, _, _, _, iq_label, mag_label = _normalise_iq(

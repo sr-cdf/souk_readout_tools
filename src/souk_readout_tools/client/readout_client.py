@@ -20,12 +20,14 @@ Example general usage:
 
     In [2]: client = readout_client.ReadoutClient()
 
-    In [3]: client.get_server_status()
+    In [3]: client.get_info(['server'])
     Out[3]:
-    {'process_name': 'readout_daemon',
-     'ip_addresses': '10.11.11.11 192.168.2.224',
-     'pwd': '/home/casper/readout_server',
-    ....}
+    {'server':
+        {'process_name': 'readout_daemon',
+         'ip_addresses': '10.11.11.11 192.168.2.224',
+         'pwd': '/home/casper/readout_server',
+         ....}
+    }
 
     In [4]: client.get_sample_rate()
     Out[4]: 500.0
@@ -74,8 +76,9 @@ from souk_readout_tools.config_utils import get_template_config_path, copy_templ
 
 
 # Config keys whose string values are calibration file paths.
-# Each entry is (section, key).  These fields can also hold scalars,
-# inline [freq, dB] arrays, or None — only strings trigger file handling.
+# Each entry is a path tuple of arbitrary depth into the config dict.
+# These fields can also hold scalars, inline [freq, dB] arrays, or None —
+# only strings trigger file handling.
 CAL_FILE_KEYS = [
     ('firmware', 'dac0_dbfs_to_dbm'),
     ('firmware', 'dac1_dbfs_to_dbm'),
@@ -88,12 +91,37 @@ CAL_FILE_KEYS = [
     ('rf_frontend', 'rx_rf_s21_db'),
     ('rf_frontend', 'tx_mixer_conversion_loss_db'),
     ('rf_frontend', 'rx_mixer_conversion_loss_db'),
-    ('rf_frontend', 'tx_bypass_amp_s21_db'),
-    ('rf_frontend', 'rx_bypass_amp_s21_db'),
+    ('rf_frontend', 'bypass_amps', 'tx_s21_db'),
+    ('rf_frontend', 'bypass_amps', 'rx_s21_db'),
     ('rf_frontend', 'path_group_delay_ns'),
     ('cryostat', 'input_s21_db'),
     ('cryostat', 'output_s21_db'),
 ]
+
+
+def _cal_path_get(cfg, path):
+    """Walk a path tuple into a nested dict; return None if any step is missing."""
+    cur = cfg
+    for k in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+        if cur is None:
+            return None
+    return cur
+
+
+def _cal_path_set(cfg, path, value):
+    """Walk a path tuple into a nested dict, creating intermediate dicts as needed."""
+    cur = cfg
+    for k in path[:-1]:
+        cur = cur.setdefault(k, {})
+    cur[path[-1]] = value
+
+
+def _cal_path_str(path):
+    """Render a path tuple as 'a.b.c' for log/error messages."""
+    return '.'.join(path)
 
 
 class bcolors:
@@ -108,6 +136,7 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 class ReadoutClient:
+    
     def __init__(self, config_file=None, address=None, request_port=None, stream_port=None):
         """
         Initialize the ReadoutClient.
@@ -186,7 +215,6 @@ class ReadoutClient:
             print()
             raise ValueError('ReadoutClient requires either config_file or address.')
 
-        self.system_information = None
         self.parameters = {}
         self.calibration_files = {}  # basename -> contents, populated by pull_config
 
@@ -309,7 +337,12 @@ class ReadoutClient:
 
     def pull_config(self, save_as=None, pull_calibration_files=True):
         """
-        Pull the running config from the server and load it into this client.
+        Pull the active config file from the server and load it into this client.
+
+        This fetches the desired/applied config file only. Live hardware state
+        is not patched into the config; use ``sync_config_from_system()`` when
+        you explicitly want to capture current runtime settings into a new
+        local config.
 
         Calibration file paths in the config are detected and the file contents
         are fetched into memory (``self.calibration_files``).  Nothing is written
@@ -347,8 +380,8 @@ class ReadoutClient:
         Does not write to disk or modify config paths — that happens in
         save_config().
         """
-        for section, key in CAL_FILE_KEYS:
-            value = self.config.get(section, {}).get(key)
+        for path in CAL_FILE_KEYS:
+            value = _cal_path_get(self.config, path)
             if not isinstance(value, str):
                 continue
             basename = os.path.basename(value)
@@ -361,7 +394,7 @@ class ReadoutClient:
                 print(f'  Pulled calibration file: {basename}')
             else:
                 print(f'  WARNING: could not pull calibration file {basename} '
-                      f'for {section}.{key}')
+                      f'for {_cal_path_str(path)}')
 
     def save_config(self, filename=None):
         """
@@ -393,8 +426,8 @@ class ReadoutClient:
                 with open(dest, 'w') as f:
                     f.write(contents)
             # Rewrite config paths to local relative form
-            for section, key in CAL_FILE_KEYS:
-                value = self.config.get(section, {}).get(key)
+            for path in CAL_FILE_KEYS:
+                value = _cal_path_get(self.config, path)
                 if not isinstance(value, str):
                     continue
                 basename = os.path.basename(value)
@@ -402,7 +435,7 @@ class ReadoutClient:
                     new_path = os.path.join('calibrations', basename)
                     if config_text is not None:
                         config_text = config_text.replace(value, new_path)
-                    self.config[section][key] = new_path
+                    _cal_path_set(self.config, path, new_path)
 
         with open(filename, 'w') as f:
             if config_text is not None:
@@ -431,22 +464,22 @@ class ReadoutClient:
         pipeline_id = push_config.get('firmware', {}).get('pipeline_id', 0)
 
         if push_calibration_files:
-            for section, key in CAL_FILE_KEYS:
-                value = push_config.get(section, {}).get(key)
+            for path in CAL_FILE_KEYS:
+                value = _cal_path_get(push_config, path)
                 if not isinstance(value, str):
                     continue
                 # Resolve the local file path
                 local_path = self._resolve_local_cal_path(value)
                 if local_path is None:
-                    print(f'  WARNING: calibration file not found for {section}.{key}: {value}')
+                    print(f'  WARNING: calibration file not found for {_cal_path_str(path)}: {value}')
                     continue
                 # Push the file to the server
                 self.push_calibration(local_path)
                 # Rewrite the config path to server-relative form
                 basename = os.path.basename(local_path)
                 server_path = f'pipeline_{pipeline_id}/calibrations/{basename}'
-                push_config[section][key] = server_path
-                print(f'  {section}.{key}: pushed {basename}, path -> {server_path}')
+                _cal_path_set(push_config, path, server_path)
+                print(f'  {_cal_path_str(path)}: pushed {basename}, path -> {server_path}')
 
         config_contents = yaml.dump(push_config, sort_keys=False)
         message = {'request': 'push_config', 'config_filename': name, 'config_contents': config_contents}
@@ -519,26 +552,6 @@ class ReadoutClient:
         message = {'request': 'cancel'}
         return self.send_request(message)
 
-    def get_server_status(self):
-        message = {'request': 'server_status'}
-        response = self.send_request(message)
-        if response['status'] == 'success':
-            return response
-        else:
-            print(f"Error getting server status: {response['message']}")
-            return response
-
-    def get_system_information(self):
-        """Legacy flat-dict system information. Prefer get_info() instead."""
-        message = {'request': 'get_system_information'}
-        response = self.send_request(message)
-        if response['status'] == 'success':
-            self.system_information = response['data']
-            return response['data']
-        else:
-            print(f"Error getting system information: {response['message']}")
-            return response
-
     def get_info(self, sections=None):
         """Get structured system information by section.
 
@@ -585,61 +598,67 @@ class ReadoutClient:
             print(f"Error getting health check: {response.get('message', 'unknown error')}")
             return response
 
-    def sync_config_from_system(self):
+    def sync_config_from_system(self, save_as=None):
         """
         Update the in-memory config with live hardware state from the server.
 
         Fetches system information and writes the current firmware settings
-        back into config['firmware']['defaults'], and current tone
-        frequencies/amplitudes/phases into the defaults section.  This
-        captures the running state so that save_config() or push_config()
-        will persist it.
+        back into config['firmware']['defaults'], current tone
+        frequencies/amplitudes/phases into the defaults section, and the
+        current RF peripheral state (attenuator dB values, amp bypass
+        state) into config['rf_frontend'].  This captures the running
+        state so that save_config() or push_config() will persist it.
 
-        Does not write to disk — call save_config() afterwards to save.
-
-        Returns the system_information dict.
+        Does not write to disk unless ``save_as`` is provided — call
+        save_config() afterwards to save.
+        Returns the updated config dict; inspect ``self.config`` directly to
+        see what was synced.
         """
         if self.config is None:
             raise RuntimeError('No config loaded. Use pull_config() or load a config file first.')
 
-        info = self.get_system_information()
-        if not isinstance(info, dict) or 'pipeline_id' not in info:
-            raise RuntimeError(f'Failed to get system information: {info}')
+        info = self.get_info(['server', 'pipeline', 'rfdc', 'tones'])
+        if not isinstance(info, dict) or 'server' not in info:
+            raise RuntimeError(f'Failed to get info: {info}')
+
+        pipeline = info.get('pipeline', {})
+        rfdc = info.get('rfdc', {})
+        tones = info.get('tones', {})
 
         defaults = self.config.setdefault('firmware', {}).setdefault('defaults', {})
 
-        # Direct mappings: system_info key -> defaults key
-        DIRECT_MAPS = {
-            'sync_delay':                'sync_delay',
-            'acc_len':                   'acc_len',
-            'internal_loopback':         'internal_loopback',
-            'psb_scale':                 'psb_scale',
-            'psb_fftshift':              'psb_fftshift',
-            'pfb_fftshift':              'pfb_fftshift',
-            'dsa':                       'dsa',
-            'dac_duc_mixer_frequency_hz': 'dac_duc_mixer_frequency_hz',
-            'adc_ddc_mix_frequency_hz':  'adc_ddc_mixer_frequency_hz',
-        }
-        for info_key, defaults_key in DIRECT_MAPS.items():
-            if info_key in info and info[info_key] is not None:
-                defaults[defaults_key] = info[info_key]
+        # Direct mappings: (source_section, source_key) -> defaults key
+        DIRECT_MAPS = [
+            (pipeline, 'sync_delay',                'sync_delay'),
+            (pipeline, 'acc_len',                   'acc_len'),
+            (pipeline, 'internal_loopback',         'internal_loopback'),
+            (pipeline, 'psb_scale',                 'psb_scale'),
+            (pipeline, 'psb_fftshift',              'psb_fftshift'),
+            (pipeline, 'pfb_fftshift',              'pfb_fftshift'),
+            (rfdc,     'dsa',                       'dsa'),
+            (rfdc,     'dac_duc_mixer_frequency_hz', 'dac_duc_mixer_frequency_hz'),
+            (rfdc,     'adc_ddc_mixer_frequency_hz', 'adc_ddc_mixer_frequency_hz'),
+        ]
+        for src, info_key, defaults_key in DIRECT_MAPS:
+            if info_key in src and src[info_key] is not None:
+                defaults[defaults_key] = src[info_key]
 
         # VOP — use dac0 value
-        if info.get('vop_dac0') is not None and info['vop_dac0'] != 0:
-            defaults['vop'] = int(info['vop_dac0'])
+        if rfdc.get('vop_dac0') is not None and rfdc['vop_dac0'] != 0:
+            defaults['vop'] = int(rfdc['vop_dac0'])
 
         # Mixer scale modes
-        if info.get('mixer_scale_1p0_dac0') is not None:
-            defaults['dac_mixer_scale_1p0'] = bool(info['mixer_scale_1p0_dac0'])
-        if info.get('mixer_scale_1p0_adc') is not None:
-            defaults['adc_mixer_scale_1p0'] = bool(info['mixer_scale_1p0_adc'])
+        if rfdc.get('mixer_scale_1p0_dac0') is not None:
+            defaults['dac_mixer_scale_1p0'] = bool(rfdc['mixer_scale_1p0_dac0'])
+        if rfdc.get('mixer_scale_1p0_adc') is not None:
+            defaults['adc_mixer_scale_1p0'] = bool(rfdc['mixer_scale_1p0_adc'])
 
         # Nyquist zone — use DAC0 value
-        if info.get('nyquist_zone_dac0') is not None and info['nyquist_zone_dac0'] != 1:
-            defaults['nyquist_zone'] = int(info['nyquist_zone_dac0'])
+        if rfdc.get('nyquist_zone_dac0') is not None:
+            defaults['nyquist_zone'] = int(rfdc['nyquist_zone_dac0'])
 
         # QMC settings from DAC0
-        dac_qmc = info.get('mixer_qmc_settings_dac0')
+        dac_qmc = rfdc.get('qmc_settings_dac0')
         if dac_qmc is not None:
             if 'GainCorrectionFactor' in dac_qmc:
                 defaults['dac_qmc_gain'] = dac_qmc['GainCorrectionFactor']
@@ -649,7 +668,7 @@ class ReadoutClient:
                 defaults['dac_qmc_phase'] = dac_qmc['PhaseCorrectionFactor']
 
         # QMC settings from ADC
-        adc_qmc = info.get('mixer_qmc_settings_adc')
+        adc_qmc = rfdc.get('qmc_settings_adc')
         if adc_qmc is not None:
             if 'GainCorrectionFactor' in adc_qmc:
                 defaults['adc_qmc_gain'] = adc_qmc['GainCorrectionFactor']
@@ -659,35 +678,78 @@ class ReadoutClient:
                 defaults['adc_qmc_phase'] = adc_qmc['PhaseCorrectionFactor']
 
         # Tone state
-        if 'tone_frequencies' in info:
-            defaults['frequencies'] = info['tone_frequencies']
-        if 'tone_amplitudes' in info:
-            defaults['amplitudes'] = info['tone_amplitudes']
-        if 'tone_phases' in info:
-            defaults['phases'] = info['tone_phases']
+        if tones.get('frequencies_hz') is not None:
+            defaults['frequencies'] = tones['frequencies_hz']
+        if tones.get('amplitudes') is not None:
+            defaults['amplitudes'] = tones['amplitudes']
+        if tones.get('phases_rad') is not None:
+            defaults['phases'] = tones['phases_rad']
 
         # RF frontend peripheral state (attenuator, amp bypass)
         rf_response = self.get_rf_peripheral_status()
         rf_status = rf_response.get('result', {}) if isinstance(rf_response, dict) else {}
         rf = self.config.setdefault('rf_frontend', {})
+        atten = rf.setdefault('attenuator', {})
         bypass = rf.setdefault('bypass_amps', {})
-        if isinstance(rf_status, dict) and rf_status.get('enabled'):
-            rf['tx_attenuator_value_db'] = rf_status['tx_attenuation_db']
-            rf['rx_attenuator_value_db'] = rf_status['rx_attenuation_db']
-            bypass['tx_amp_bypass'] = rf_status['tx_amp_bypass']
-            bypass['rx_amp_bypass'] = rf_status['rx_amp_bypass']
+        rf_enabled = isinstance(rf_status, dict) and rf_status.get('enabled')
+        readable_attenuation = rf_enabled and (
+            rf_status.get('hardware')
+            or rf_status.get('attenuator_backend') == 'fixed'
+        )
+        if readable_attenuation:
+            atten['tx_value_db'] = rf_status.get('tx_attenuation_db')
+            atten['rx_value_db'] = rf_status.get('rx_attenuation_db')
+            if 'tx_amp_bypass' in rf_status:
+                bypass['tx_amp_bypass'] = rf_status['tx_amp_bypass']
+            if 'rx_amp_bypass' in rf_status:
+                bypass['rx_amp_bypass'] = rf_status['rx_amp_bypass']
+            if 'tx_bypass_amp_s21_db' in rf_status:
+                bypass['tx_s21_db'] = rf_status['tx_bypass_amp_s21_db']
+            if 'rx_bypass_amp_s21_db' in rf_status:
+                bypass['rx_s21_db'] = rf_status['rx_bypass_amp_s21_db']
+            if not rf_status.get('supports_bypass_amps', False):
+                bypass['tx_amp_bypass'] = None
+                bypass['rx_amp_bypass'] = None
+                bypass['tx_s21_db'] = None
+                bypass['rx_s21_db'] = None
         else:
-            rf['tx_attenuator_value_db'] = None
-            rf['rx_attenuator_value_db'] = None
+            atten['tx_value_db'] = None
+            atten['rx_value_db'] = None
             bypass['tx_amp_bypass'] = None
             bypass['rx_amp_bypass'] = None
+            bypass['tx_s21_db'] = None
+            bypass['rx_s21_db'] = None
 
-        n_changed = sum(1 for k in DIRECT_MAPS.values() if k in defaults)
-        print(f'Config defaults updated from live system state '
-              f'({n_changed} parameters, {len(defaults.get("frequencies", []))} tones)')
+        lna_response = self.get_lna_controller_status()
+        lna_status = lna_response.get('result', {}) if isinstance(lna_response, dict) else {}
+        if isinstance(lna_status, dict) and lna_status.get('enabled'):
+            lna_cfg = self.config.setdefault('cryostat', {}).setdefault('lna_bias', {})
+            for src, dst in (
+                ('backend', 'backend'),
+                ('lna_channel', 'lna_channel'),
+                ('bias_voltage_v', 'bias_voltage_v'),
+                ('soft_off', 'soft_off'),
+                ('method', 'method'),
+                ('blind', 'blind'),
+            ):
+                if src in lna_status and lna_status[src] is not None:
+                    lna_cfg[dst] = lna_status[src]
+
+        n_changed = sum(1 for _, _, k in DIRECT_MAPS if k in defaults)
+        n_tones = len(defaults.get("frequencies", []))
+        # The raw text from pull_config() is now stale because this method
+        # intentionally creates a new captured config.
+        self.config_raw_text = None
+        print(f'Config captured from live system state '
+              f'({n_changed} parameters, {n_tones} tones)')
+        if save_as is not None:
+            self.save_config(save_as)
         print('Use save_config() to write to disk, or push_config() to persist on the server.')
+        return self.config
 
-        return info
+    def sync_config_to_local(self, save_as=None):
+        """Capture current runtime settings into this client's local config."""
+        return self.sync_config_from_system(save_as=save_as)
 
     def set_parameter(self, param_name, param_value):
         message = {'request': 'set', 'param': param_name, 'value': param_value}
@@ -993,7 +1055,7 @@ class ReadoutClient:
     # --- LNA bias control ---
 
     def get_lna_controller_status(self):
-        """Get LNA bias controller status (enabled, hardware, lna_channel)."""
+        """Get LNA bias controller status and configured soft-off state."""
         return self.send_request({'request': 'get_lna_controller_status'})
 
     def get_lna_bias_status(self, channel=None):
@@ -1022,10 +1084,18 @@ class ReadoutClient:
             voltage_v: Target voltage in volts.
             channel: LNA channel index (1-14). Defaults to this pipeline's configured channel.
             method: 'remote' (iterative feedback, default) or 'local' (direct DAC).
-            blind: If True and method='remote', skip LNA voltage validation.
+            blind: If True and method='remote', skip the LNA voltage sanity
+                check (``v_remote > v_lna > 0``).  Use this if the iterative
+                feedback algorithm rejects valid setpoints because the
+                downstream LNA is not yet powered or drawing current.
 
         Returns:
-            dict with achieved voltage and any error message.
+            On success: ``{'status': 'success', 'result': {...}}`` where
+            ``result`` includes ``channel``, ``voltage_v`` (achieved), ``method``,
+            ``message``, and ``success: True``.
+
+            On failure (remote-feedback rejection): ``{'status': 'error',
+            'message': ..., 'result': {..., 'success': False}}``.
         """
         msg = {
             'request': 'set_lna_bias_voltage',
@@ -1037,16 +1107,41 @@ class ReadoutClient:
             msg['channel'] = int(channel)
         return self.send_request(msg)
 
+    def soft_off_lna_bias(self, channel=None):
+        """Drive one LNA bias channel to its minimum local voltage.
+
+        This is a soft off only: the LNA rail is not fully disabled because
+        the bias board does not expose a software shutdown pin.
+
+        Args:
+            channel: LNA channel index (1-14). Defaults to this pipeline's
+                configured channel.
+
+        Returns:
+            ``{'status': 'success', 'result': {...}}`` on success. The result
+            includes ``soft_off: True`` and a message noting that this is not a
+            hard power cut.
+        """
+        msg = {'request': 'soft_off_lna_bias'}
+        if channel is not None:
+            msg['channel'] = int(channel)
+        return self.send_request(msg)
+
     def set_lna_bias_voltage_all(self, voltage_v, method='remote', blind=False):
         """Set LNA bias voltage for all 14 channels.
 
         Args:
             voltage_v: Target voltage in volts.
             method: 'remote' (default) or 'local'.
-            blind: If True and method='remote', skip LNA voltage validation.
+            blind: If True and method='remote', skip the LNA voltage sanity
+                check (``v_remote > v_lna > 0``).
 
         Returns:
-            dict of per-channel results keyed by channel index.
+            On full success: ``{'status': 'success', 'result': {chn: {...}, ...}}``.
+
+            If any channel fails: ``{'status': 'error', 'message': ...,
+            'result': {chn: {..., 'success': bool}, ...}}``.  Channels that
+            did succeed still have their per-channel results populated.
         """
         return self.send_request({
             'request': 'set_lna_bias_voltage_all',
@@ -1054,6 +1149,16 @@ class ReadoutClient:
             'method': method,
             'blind': blind,
         })
+
+    def soft_off_lna_bias_all(self):
+        """Drive all LNA bias channels to their minimum local voltage.
+
+        Returns:
+            ``{'status': 'success', 'result': {chn: {...}, ...}}`` if every
+            channel succeeds. If unconfigured channels are present the response
+            is ``status: error`` with per-channel results.
+        """
+        return self.send_request({'request': 'soft_off_lna_bias_all'})
 
     def enable_stream(self):
         self._warn_zero_phases()
@@ -1169,14 +1274,14 @@ class ReadoutClient:
             t1=time.time()
             print(f"Received {num_samples} samples in ~{t1-t0} seconds (~{num_samples/(t1-t0)} samples per second)")
             if incl_system_info:
-                info = self.get_system_information()
+                info = self.get_info('all')
             else:
-                info = {'system_information':'No system information requested'}
+                info = {}
             sample_rate = self.get_sample_rate()
             # Trim buffer to actual data received
             data_raw = data_raw[:write_offset]
             sample_data = {'data_raw':data_raw,'sample_rate':sample_rate,
-                           'system_information':info,'frame_bytes':frame_bytes}
+                           'info':info,'frame_bytes':frame_bytes}
             return sample_data
 
 
@@ -1188,14 +1293,14 @@ class ReadoutClient:
         The server sends only active tones in user order, so the data
         is already correctly ordered. Frame size is determined from
         sample_data['frame_bytes'] (set by get_samples) or derived
-        from tone_indices in system_information.
+        from firmware_indices in the info['tones'] section.
 
         Falls back to 2048 channels for data from older servers that
         send all channels.
         """
         data_raw = sample_data['data_raw']
         sample_rate = sample_data['sample_rate']
-        info = sample_data['system_information']
+        info = sample_data['info']
         num_headers = 10
 
         # Determine frame size and num_tones
@@ -1203,7 +1308,7 @@ class ReadoutClient:
             frame_bytes = sample_data['frame_bytes']
             num_tones = (frame_bytes // 4 - num_headers) // 2
         elif num_tones is None:
-            tone_indices = info.get('tone_indices')
+            tone_indices = info.get('tones', {}).get('firmware_indices')
             if tone_indices is not None:
                 num_tones = len(tone_indices)
             else:
@@ -1232,7 +1337,7 @@ class ReadoutClient:
                     'num_tones':num_tones,
                     'num_samples':num_samples,
                     'sample_rate':sample_rate,
-                    'system_information':info,
+                    'info':info,
                     'i_data':{f'{i:04d}':i_data[:,i] for i in range(num_tones)},
                     'q_data':{f'{i:04d}':q_data[:,i] for i in range(num_tones)},
                     'packet_counter':cnt,
@@ -1281,8 +1386,12 @@ class ReadoutClient:
                 writer.writerow(['# num_tones', data_dict['num_tones']])
                 writer.writerow(['# num_samples', data_dict['num_samples']])
                 writer.writerow(['# sample_rate', data_dict['sample_rate']])
-                for key,value in data_dict['system_information'].items():
-                    writer.writerow([f'# {key}', value])
+                for section, section_data in data_dict['info'].items():
+                    if isinstance(section_data, dict):
+                        for key, value in section_data.items():
+                            writer.writerow([f'# {section}.{key}', value])
+                    else:
+                        writer.writerow([f'# {section}', section_data])
                 # Write the header for i_data, q_data, packet_counter, packet_error, and stream_flags
                 header = []
                 for i in range(data_dict['num_tones']):
@@ -1430,8 +1539,7 @@ class ReadoutClient:
             print(f"Received {num_snapshots} snapshots in {t1-t0:.3f}s "
                   f"({num_snapshots/(t1-t0):.1f} snapshots/s)")
 
-        info = self.get_system_information()
-        acc_len = info['acc_len']
+        acc_len = self.get_info(['pipeline'])['pipeline']['acc_len']
         accumulated_rate = self.get_sample_rate()
         snapshot_rate = accumulated_rate * acc_len
 
@@ -1492,8 +1600,7 @@ class ReadoutClient:
                     raise ValueError(
                         f"Tone index {idx} out of range (0 to {n_tones - 1})")
 
-        info = self.get_system_information()
-        acc_len = info['acc_len']
+        acc_len = self.get_info(['pipeline'])['pipeline']['acc_len']
         accumulated_rate = self.get_sample_rate()
         snapshot_rate = accumulated_rate * acc_len
 
@@ -1600,7 +1707,7 @@ class ReadoutClient:
         Returns:
             dict with keys:
                 'snapshot': complex128 array of shape (4096,).
-                'system_information': System info at time of capture.
+                'info': Structured info dict at time of capture.
         """
         response = self.send_request({'request': 'get_adc_snapshot'})
         if response['status'] != 'success':
@@ -1609,10 +1716,10 @@ class ReadoutClient:
         snapshot = np.frombuffer(
             base64.b64decode(result['snapshot']), dtype=np.complex128,
         ).copy()
-        info = self.get_system_information()
+        info = self.get_info('all')
         return {
             'snapshot': snapshot,
-            'system_information': info,
+            'info': info,
             'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
         }
 
@@ -1624,7 +1731,7 @@ class ReadoutClient:
             dict with keys:
                 'dac0': complex128 array of shape (4096,).
                 'dac1': complex128 array of shape (4096,).
-                'system_information': System info at time of capture.
+                'info': Structured info dict at time of capture.
         """
         response = self.send_request({'request': 'get_dac_snapshot'})
         if response['status'] != 'success':
@@ -1636,11 +1743,11 @@ class ReadoutClient:
         dac1 = np.frombuffer(
             base64.b64decode(result['dac1']), dtype=np.complex128,
         ).copy()
-        info = self.get_system_information()
+        info = self.get_info('all')
         return {
             'dac0': dac0,
             'dac1': dac1,
-            'system_information': info,
+            'info': info,
             'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
         }
 
@@ -1659,7 +1766,7 @@ class ReadoutClient:
         snapshot = snapshot_data['snapshot']
         return {
             'date': snapshot_data.get('date', ''),
-            'system_information': snapshot_data.get('system_information', {}),
+            'info': snapshot_data.get('info', {}),
             'length': len(snapshot),
             'adc_i': snapshot.real,
             'adc_q': snapshot.imag,
@@ -1683,7 +1790,7 @@ class ReadoutClient:
         dac1 = snapshot_data['dac1']
         return {
             'date': snapshot_data.get('date', ''),
-            'system_information': snapshot_data.get('system_information', {}),
+            'info': snapshot_data.get('info', {}),
             'length': len(dac0),
             'dac0_i': dac0.real,
             'dac0_q': dac0.imag,
@@ -1984,7 +2091,7 @@ class ReadoutClient:
             dict: Parsed sweep data with 'sweep_f', 'sweep_i', 'sweep_q', 'sweep_ei', 
                   'sweep_eq' arrays and metadata.
         """
-        info = sweep_data['system_information']
+        info = sweep_data['info']
         date = sweep_data['date']
         num_tones = int(sweep_data['num_tones'])
         num_points = int(sweep_data['num_points'])
@@ -2013,10 +2120,10 @@ class ReadoutClient:
                 if sb is None:
                     sb = 1
 
-                adcclk = info['adc_clk_hz']
+                adcclk = info['fpga']['adc_clk_hz']
                 dacclk = adcclk
-                dacduc = info['dac_duc_mixer_frequency_hz']
-                dacnyq = info['nyquist_zone_dac0']
+                dacduc = info['rfdc']['dac_duc_mixer_frequency_hz']
+                dacnyq = info['rfdc']['nyquist_zone_dac0']
                 txnfft = 8192
                 rxnfft = 8192
                 bin_freqs = np.fft.fftfreq(txnfft, 1.0/(dacclk))
@@ -2054,7 +2161,7 @@ class ReadoutClient:
                         'num_tones': num_tones,
                         'num_points': num_points,
                         'samples_per_point': samples_per_point,
-                        'system_information': info,
+                        'info': info,
                         'sweep_f': sweep_f,
                         'sweep_i': sweep_i,
                         'sweep_q': sweep_q,
@@ -2105,8 +2212,12 @@ class ReadoutClient:
                 writer.writerow(['# num_tones', sweep_dict['num_tones']])
                 writer.writerow(['# num_points', sweep_dict['num_points']])
                 writer.writerow(['# samples_per_point', sweep_dict['samples_per_point']])
-                for key,value in sweep_dict['system_information'].items():
-                    writer.writerow([f'# {key}', value])
+                for section, section_data in sweep_dict['info'].items():
+                    if isinstance(section_data, dict):
+                        for key, value in section_data.items():
+                            writer.writerow([f'# {section}.{key}', value])
+                    else:
+                        writer.writerow([f'# {section}', section_data])
                 if 'telescope_time' in sweep_dict:
                     writer.writerow(['# telescope_time_per_point'] + [int(t) for t in sweep_dict['telescope_time']])
                 header = []
@@ -2205,10 +2316,10 @@ class ReadoutClient:
         if filename is None:
             filename = os.path.join(os.getcwd(), 'tmp_stream')
             print(f"No filename specified, writing to {filename}")
-        info = self.get_system_information()
+        info = self.get_info('all')
 
-        # Determine num_tones from system info (server sends only active tones)
-        tone_indices = info.get('tone_indices')
+        # Determine num_tones from info (server sends only active tones)
+        tone_indices = info.get('tones', {}).get('firmware_indices')
         if num_tones is None:
             num_tones = len(tone_indices) if tone_indices is not None else 2048
 
@@ -2232,7 +2343,7 @@ class ReadoutClient:
         metadata['index_flag_1'] = 2*num_tones-1+2
         metadata['index_flag_0'] = 2*num_tones-1+1
         metadata['ordering'] = 'I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, Q_tone1_sample0,..flags, tt_msb, tt_lsb, cnt, err .'
-        metadata['system_information'] = info
+        metadata['info'] = info
 
         with open(filename+'.json','w') as file:
             json.dump(metadata,file,indent=4)
@@ -2301,10 +2412,10 @@ class ReadoutClient:
             filename = os.path.join(os.getcwd(), 'tmp_triggered_stream')
             print(f"No filename specified, writing to {filename}")
 
-        info = self.get_system_information()
+        info = self.get_info('all')
 
-        # Determine num_tones from system info (server sends only active tones)
-        tone_indices = info.get('tone_indices')
+        # Determine num_tones from info (server sends only active tones)
+        tone_indices = info.get('tones', {}).get('firmware_indices')
         if num_tones is None:
             num_tones = len(tone_indices) if tone_indices is not None else 2048
 
@@ -2328,7 +2439,7 @@ class ReadoutClient:
         metadata['index_flag_1'] = 2*num_tones-1+2
         metadata['index_flag_0'] = 2*num_tones-1+1
         metadata['ordering'] = 'I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, Q_tone1_sample0,..flags, tt_msb, tt_lsb, cnt, err .'
-        metadata['system_information'] = info
+        metadata['info'] = info
 
         with open(filename+'.json','w') as file:
             json.dump(metadata,file,indent=4)
@@ -2409,7 +2520,7 @@ class ReadoutClient:
         index_tt_msb = metadata.get('index_tt_msb')
         index_flag_0 = metadata['index_flag_0']
         index_flag_5 = metadata.get('index_flag_5', metadata.get('index_flag_7', index_flag_0 + 5))
-        info = metadata['system_information']
+        info = metadata['info']
 
         data = np.fromfile(filename,dtype=format)
         data = data.reshape(-1,2*num_tones+10).swapaxes(0,1)
@@ -2432,7 +2543,7 @@ class ReadoutClient:
                      'num_tones':num_tones,
                      'num_samples':num_samples,
                      'sample_rate':sample_rate,
-                     'system_information':info,
+                     'info':info,
                      'i_data':{f'{i:04d}':i_data[i] for i in range(num_tones)},
                      'q_data':{f'{i:04d}':q_data[i] for i in range(num_tones)},
                      'packet_counter':cnt,
@@ -2451,7 +2562,7 @@ class ReadoutClient:
         num_tones = data_dict['num_tones']
         num_samples = data_dict['num_samples']
         sample_rate = data_dict['sample_rate']
-        info = data_dict['system_information']
+        info = data_dict['info']
         i_data = data_dict['i_data']
         q_data = data_dict['q_data']
         cnt = data_dict['packet_counter']
@@ -2485,8 +2596,12 @@ class ReadoutClient:
                 writer.writerow(['# num_tones', num_tones])
                 writer.writerow(['# num_samples', num_samples])
                 writer.writerow(['# sample_rate',sample_rate])
-                for key,value in info.items():
-                    writer.writerow([f'# {key}', value])
+                for section, section_data in info.items():
+                    if isinstance(section_data, dict):
+                        for key, value in section_data.items():
+                            writer.writerow([f'# {section}.{key}', value])
+                    else:
+                        writer.writerow([f'# {section}', section_data])
 
                 num_flags = len(data_dict['stream_flags'])
                 header = []
@@ -2594,15 +2709,18 @@ class ReadoutClient:
         If the frequency spacing is not exactly equal, the phases are offset to account for the spacing. For largely varying spacings, this method is pretty much the same as picking random frequencies.
 
         """
-        freqs=np.atleast_1d(freqs)
-        n=len(freqs)
+        freqs = np.atleast_1d(freqs)
+        n = len(freqs)
         if n == 1:
             return np.zeros(1)
-        freqssorted = np.sort(freqs)
-        k = np.arange(len(freqs))
-        # k = (freqs-freqssorted[0]) / (freqssorted[-1] - freqssorted[0])*(n-1)
-        #k should range from 0 to n-1, and elements are proportional to the frequencies
-        return np.pi*k**2/n
+        # Sort frequencies and get sort order
+        sort_idx = np.argsort(freqs)
+        inv_sort_idx = np.argsort(sort_idx)
+        k = np.arange(n)
+        # Compute phases for sorted frequencies
+        phases_sorted = np.pi * k**2 / n
+        # Return phases in the original order
+        return phases_sorted[inv_sort_idx]
 
     @staticmethod
     def calculate_frequency_and_dissipation_noise(sweep_frequencies,sweep_complex_data,timestream_tone_frequency,timestream_complex_data,smooth_window_hz=1000):
@@ -2811,7 +2929,7 @@ class ReadoutClient:
                 - 'sweep_eq': Array of Q errors [1, N_total_points]
                 - 'num_tones': Number of tones used
                 - 'samples_per_point': Samples per point
-                - 'system_information': System info at time of sweep
+                - 'info': Structured info dict at time of sweep
                 - Plus other metadata from parse_sweep_data
 
         Raises:
@@ -2826,8 +2944,8 @@ class ReadoutClient:
         if p != 0.0 and p != 1.0:
             raise RuntimeError(f'Sweep already in progress ({p*100:.3f}%), wait for it to finish.')
         
-        info = self.get_system_information()
-                
+        info = self.get_info(['fpga', 'rfdc'])
+
         # Get RF frontend mixer configuration
         # TODO: if we have a frontend connected it might not have a mixer - needs updating.
         udc = self.config['rf_frontend']['connected']
@@ -2837,10 +2955,10 @@ class ReadoutClient:
             lo = 0.0
         if sb is None:
             sb = 1
-        
-        adcclk = info['adc_clk_hz']
+
+        adcclk = info['fpga']['adc_clk_hz']
         dacclk = adcclk
-        dacduc = info['dac_duc_mixer_frequency_hz']
+        dacduc = info['rfdc']['dac_duc_mixer_frequency_hz']
         txnfft = 8192
         
         # Calculate baseband and RF frequency limits
@@ -3405,6 +3523,7 @@ class ReadoutClient:
                 # Store the local path so _resolve_local_cal_path can find it;
                 # push_config rewrites it to the server-relative form.
                 self.config.setdefault('rf_frontend', {})['path_group_delay_ns'] = save_to_csv
+                self.config_raw_text = None
                 basename = os.path.basename(save_to_csv)
                 with open(save_to_csv) as f:
                     self.calibration_files[basename] = f.read()
@@ -3539,6 +3658,52 @@ class ReadoutClient:
         """
         resonances = self.find_resonances(sweep_data, **kwargs)
         return np.array([r.frequency for r in resonances])
+
+
+    def open_kid_finder_app(self, sweep_data=None, sweep_file=None, prompt_save=False):
+        """
+        Launch the KID Finder App GUI with the given sweep data.
+        Args:
+            sweep_data: Sweep data dictionary (as returned by wideband_sweep or parse_sweep_data).
+            sweep_file: Path to a sweep .npy file. If not provided and sweep_data is given, a temp file is used.
+            prompt_save: If True and sweep_data is given, prompt the user to save the file instead of using a temp file.
+        """
+        import subprocess, sys, tempfile, os
+        import numpy as np
+        from pathlib import Path
+
+        if sweep_file is None and sweep_data is not None:
+            if prompt_save:
+                # Prompt user for save location (simple CLI prompt)
+                out_path = input("Enter filename to save sweep data (or leave blank for temp file): ").strip()
+                if out_path:
+                    np.save(out_path, sweep_data)
+                    sweep_file = out_path
+                else:
+                    tmp = tempfile.NamedTemporaryFile(suffix='.npy', delete=False)
+                    np.save(tmp.name, sweep_data)
+                    sweep_file = tmp.name
+            else:
+                tmp = tempfile.NamedTemporaryFile(suffix='.npy', delete=False)
+                np.save(tmp.name, sweep_data)
+                sweep_file = tmp.name
+        elif sweep_file is None:
+            raise ValueError("Must provide either sweep_data or sweep_file.")
+
+        # Find the mkid_finder_app.py script location
+        app_path = Path(__file__).parent.parent / "mkid_finder_app.py"
+        if not app_path.exists():
+            raise FileNotFoundError(f"Could not find mkid_finder_app.py at {app_path}")
+
+        # Launch the app with the sweep file as argument
+        cmd = [sys.executable, str(app_path), str(sweep_file)]
+        try:
+            subprocess.Popen(cmd)
+        except Exception as e:
+            print(f"Failed to launch KID Finder App: {e}")
+            raise
+
+
 
 
 if __name__=='__main__':

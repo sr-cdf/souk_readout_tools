@@ -126,10 +126,12 @@ def _rx_chain_gain_db(frequencies, info, config):
     if rf_connected:
         rx_rf_s21 = _cal_or_zero(rf.get('rx_rf_s21_db'), frequencies)
         rx_if_s21 = _cal_or_zero(rf.get('rx_if_s21_db'), frequencies)
-        rx_bypass_amp_s21 = _cal_or_zero(rf.get('rx_bypass_amp_s21_db'), frequencies)
+        rx_bypass_amp_s21 = _cal_or_zero(
+            rf.get('bypass_amps', {}).get('rx_s21_db'), frequencies,
+        )
         rx_mixer_conv = _cal_or_zero(rf.get('rx_mixer_conversion_loss_db'), frequencies)
         rx_combiner = _cal_or_zero(rf.get('rx_combiner_loss_db'), frequencies)
-        rx_atten_raw = rf.get('rx_attenuator_value_db')
+        rx_atten_raw = rf.get('attenuator', {}).get('rx_value_db')
         rx_atten = 0.0 if rx_atten_raw is None else float(rx_atten_raw)
     if cryo_connected:
         cryo_output_s21 = _cal_or_zero(cryo.get('output_s21_db'), frequencies)
@@ -276,18 +278,20 @@ def _apply_phase_center(z, phase_center):
 
 
 def _digital_gain(info, config=None, pre_accumulation=False):
-    """Compute the total digital gain from system_information and config.
+    """Compute the total digital gain from the structured info dict and config.
 
     Returns the linear scale factor that was applied to ADC codes to produce
     the raw I/Q values.  Dividing raw values by this factor recovers ADC
     amplitude in codes.
 
     Args:
-        info: system_information dict (from sweep_data or ts_data).
+        info: structured info dict (from sweep_data or ts_data) with at
+            least a 'pipeline' section.
         config: Optional config dict.  Only needed when rx_mix_scale != 1.
         pre_accumulation: True for snapshot data (no acc_len contribution).
     """
-    pfb_fftshift = info.get('pfb_fftshift', 0)
+    pipeline = info.get('pipeline', {}) if info else {}
+    pfb_fftshift = pipeline.get('pfb_fftshift', 0) or 0
     pfb_gain = 2 ** (13 - bin(pfb_fftshift).count('1'))
 
     rx_mix_scale = 0.7
@@ -299,7 +303,7 @@ def _digital_gain(info, config=None, pre_accumulation=False):
     if pre_accumulation:
         acc_gain = 1.0
     else:
-        acc_gain = float(info.get('acc_len', 1))
+        acc_gain = float(pipeline.get('acc_len', 1) or 1)
 
     return pfb_gain * rx_mix_scale * acc_gain
 
@@ -317,7 +321,7 @@ def _normalise_iq(si, sq, units, info=None, config=None,
             'adc_fs' - fraction of ADC full-scale.
             'dbfs'   - dB relative to ADC full-scale.
             'dbm'    - estimated power in dBm at ``reference_plane``.
-        info: system_information dict.  Required for 'adc_fs', 'dbfs',
+        info: structured info dict.  Required for 'adc_fs', 'dbfs',
             'dbm'; ignored for 'raw' and 'peak'.
         config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
         pre_accumulation: True for snapshot data.
@@ -414,15 +418,16 @@ def _normalise_iq(si, sq, units, info=None, config=None,
         # Same linear scaling as dbfs; magnitude label changes
         mixer_qmc_gain = 1.0
         mixer_scale_is_1p0 = False
-        if info.get('mixer_qmc_settings_adc') is not None:
-            qmc = info['mixer_qmc_settings_adc']
+        rfdc = info.get('rfdc', {}) if info else {}
+        if rfdc.get('qmc_settings_adc') is not None:
+            qmc = rfdc['qmc_settings_adc']
             # GainCorrectionFactor is only applied when EnableGain is set;
             # when disabled the firmware reports a factor of 0.0, which must
             # be treated as unity (no correction).
             if qmc.get('EnableGain', 0):
                 mixer_qmc_gain = qmc.get('GainCorrectionFactor', 1.0)
-        if info.get('mixer_scale_1p0_adc') is not None:
-            mixer_scale_is_1p0 = info['mixer_scale_1p0_adc']
+        if rfdc.get('mixer_scale_1p0_adc') is not None:
+            mixer_scale_is_1p0 = rfdc['mixer_scale_1p0_adc']
         # Undo mixer effects that were applied before the PFB
         ddc_i = adc_i.copy()
         ddc_q = adc_q.copy()

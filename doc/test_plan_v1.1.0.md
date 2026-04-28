@@ -4,6 +4,12 @@ This plan covers all v1.1.0 changes that touch hardware and software. Tests
 are grouped into stages by what equipment is needed. Work through them in
 order — each stage builds confidence for the next.
 
+Note: this is a historical v1.1.0 validation plan. The current v1.1.1 config
+uses nested `rf_frontend.attenuator`, `rf_frontend.mixerless_module`,
+`rf_frontend.bypass_amps`, and `cryostat.lna_bias` backend fields; use
+`template_config.yaml`, `doc/rf_peripherals.md`, and `doc/lna_bias.md` for
+current config key names.
+
 Stage 0 validates the fresh OS image install before any hardware interaction.
 
 ---
@@ -181,19 +187,19 @@ essential.
 2. From the client machine:
    ```python
    c = ReadoutClient(config_file='config.yaml')
-   info = c.get_system_information()
+   info = c.get_info()
    ```
 3. Verify the returned dict contains:
-   - [x] `souk_readout_tools_version` matches `1.1.0`
-   - [ ] `souk_mkid_readout_sw_version` is a version string (software/driver version)
-   - [ ] `souk_mkid_readout_fw_version` is a version string (supported firmware version)
-   - [ ] `fpg_file` matches what was loaded
-   - [x] `pipeline_id` matches config
-   - [x] `adc_clk_hz` is sensible (e.g. 2.4576 GHz)
-   - [x] `tone_frequencies`, `tone_amplitudes`, `tone_phases` are lists
-   - [x] `rts_events` dict is present with boolean flags
-   - [ ] `souk_readout_tools_git` is a short commit hash string (or None)
-   - [ ] `souk_firmware_git` is a short commit hash string (or None)
+   - [x] `info['versions']['souk_readout_tools_version']` matches `1.1.0`
+   - [ ] `info['versions']['souk_mkid_readout_sw_version']` is a version string (software/driver version)
+   - [ ] `info['versions']['souk_mkid_readout_fw_version']` is a version string (supported firmware version)
+   - [ ] `info['fpga']['fpg_file']` matches what was loaded
+   - [x] `info['server']['pipeline_id']` matches config
+   - [x] `info['fpga']['adc_clk_hz']` is sensible (e.g. 2.4576 GHz)
+   - [x] `info['tones']['frequencies_hz']`, `['amplitudes']`, `['phases_rad']` are lists
+   - [x] `info['rfdc']['rts_events']` dict is present with boolean flags
+   - [ ] `info['versions']['souk_readout_tools_commit']` is a short commit hash string (or None)
+   - [ ] `info['versions']['souk_firmware_commit']` is a short commit hash string (or None)
 
 DONE - git info simplified to commit hash only from fixed paths (/home/casper/souk_readout_tools, /home/casper/souk-firmware). souk_mkid_readout_version renamed to souk_mkid_readout_sw_version. New souk_mkid_readout_fw_version from __fwversion__. firmware_version key removed.
 
@@ -201,8 +207,8 @@ DONE - git info simplified to commit hash only from fixed paths (/home/casper/so
 
 1. With no signal applied (or loopback off), read RTS events:
    ```python
-   info = c.get_system_information()
-   print(info['rts_events'])
+   info = c.get_info(['rfdc'])
+   print(info['rfdc']['rts_events'])
    ```
 2. [ x] All `rts_over_*` flags should be `False` in quiescent state
 3. If internal loopback is available, set tones at full scale and re-check:
@@ -263,7 +269,7 @@ c2.pull_config(save_as='pulled_config.yaml')
 - [x] Creating a new client from the pulled config connects successfully:
   ```python
   c3 = ReadoutClient(config_file='pulled_config.yaml')
-  c3.get_server_status()
+  c3.get_info(['server'])
   ```
 
 DONE: souk-enable-daemon / souk-disable-daemon docs updated to not use sudo (they call sudo internally)
@@ -330,7 +336,7 @@ sweep = c.wideband_sweep(step_size_hz=50000, verbose=True)
 - [x] `sweep['sweep_f'].shape[1]` matches expected number of points
 - [x] Magnitude is flat-ish across band (loopback, no resonances)
 - [x] Phase is smooth (phase slope removal working)
-- [x] `sweep['system_information']` dict is populated
+- [x] `sweep['info']` dict is populated
 
 ### 1.10b  Wideband sweep with auto power (new in v1.1.0)
 
@@ -458,8 +464,8 @@ assert status['tx_amp_bypass'] == False
 - [ ] TX amp bypass toggles correctly
 - [ ] RX amp bypass toggles correctly (repeat for RX)
 - [ ] Total gain changes appropriately when amp is bypassed vs active
-- [ ] `tx_bypass_amp_s21_db` / `rx_bypass_amp_s21_db` in `rf_frontend` are auto-updated by `_sync_config`
-- [ ] `bypass_amps.tx_amp_bypass` / `rx_amp_bypass` in `rf_frontend` are synced to config
+- [ ] `get_rf_peripheral_status()` reports live `tx_bypass_amp_s21_db` / `rx_bypass_amp_s21_db`
+- [ ] `sync_config_from_system()` captures `bypass_amps.tx_amp_bypass` / `rx_amp_bypass` into a local config
 - [ ] Bypass commands are only applied when `bypass_amps.enabled: true` in config
 
 when bypass amp is not present, set_bypass_amp(True or False) both succeed but always with result=True
@@ -1104,7 +1110,7 @@ sweep1 = c1.wideband_sweep()
 | Systemd daemon setup | 0.8 |
 | RUDAT driver | 0.9 |
 | Template config | 0.10, 2.9 |
-| `get_system_information()` / `get_info()` | 1.1, 1.10 |
+| `get_info()` | 1.1, 1.10 |
 | `check_rfdc_rts_events()` | 1.2 |
 | `sync_config_from_system()` | 1.3 |
 | `push_config()` / `pull_config()` | 1.5 |

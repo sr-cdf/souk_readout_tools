@@ -370,6 +370,8 @@ class PeakFinderManager():
         self.distance_value = None
         self.peak_direction = None
         self.frequency_stepsize = 1
+        self.f_low = None
+        self.f_high = None
 
     def get_finder_params(self):
         params = {'prominence_enabled':self.prominence_enabled,
@@ -387,7 +389,9 @@ class PeakFinderManager():
                   'distance_enabled':self.distance_enabled,
                   'distance_value':self.distance_value,
                   'peak_direction':self.peak_direction,
-                  'frequency_stepsize':float(self.frequency_stepsize)}
+                  'frequency_stepsize':float(self.frequency_stepsize),
+                  'f_low':self.f_low,
+                  'f_high':self.f_high}
         return params
 
     def set_finder_parameters(self,params):
@@ -407,9 +411,11 @@ class PeakFinderManager():
         self.distance_value = params.get('distance_value', self.distance_value)
         self.peak_direction = params.get('peak_direction', self.peak_direction)
         self.frequency_stepsize = params.get('frequency_stepsize', self.frequency_stepsize)
+        self.f_low = params.get('f_low', self.f_low)
+        self.f_high = params.get('f_high', self.f_high)
 
 
-    def perform_find_peaks(self, data):
+    def perform_find_peaks(self, data, frequencies=None):
         _log.debug(f'perform_find_peaks, data shape={data.shape if hasattr(data,"shape") else len(data)}')
         params = self.get_finder_params()
         prominence = (params['prominence_min'], params['prominence_max']) if params['prominence_enabled'] else None
@@ -419,6 +425,18 @@ class PeakFinderManager():
         distance = (params['distance_value']) if params['distance_enabled'] else None
         peak_direction = params['peak_direction']
         frequency_stepsize = params['frequency_stepsize']
+        f_low = params['f_low']
+        f_high = params['f_high']
+        def finite_or_none(value):
+            if value is None:
+                return None
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return None
+            return value if np.isfinite(value) else None
+        f_low = finite_or_none(f_low)
+        f_high = finite_or_none(f_high)
 
         width = (max(1,width[0]/frequency_stepsize),max(1,width[1]/frequency_stepsize)) if width is not None else None
         distance = max(1,distance/frequency_stepsize) if distance is not None else None
@@ -433,6 +451,16 @@ class PeakFinderManager():
                 threshold=threshold,
                 height=height
             )
+            if (f_low is not None or f_high is not None) and frequencies is not None:
+                frequencies = np.asarray(frequencies)
+                peak_freqs = frequencies[peaks]
+                mask = np.ones(len(peaks), dtype=bool)
+                if f_low is not None:
+                    mask &= peak_freqs >= f_low
+                if f_high is not None:
+                    mask &= peak_freqs <= f_high
+                peaks = peaks[mask]
+                properties = {key: value[mask] for key, value in properties.items()}
             peaks = peaks[:self.max_num_peaks]
             properties = {key: value[:self.max_num_peaks] for key, value in properties.items()}
             return peaks, properties
@@ -483,7 +511,7 @@ class AnalysisWorker(QObject):
             self.progress.emit("Finding peaks...")
             # Find peaks
             self.peak_finder_manager.set_finder_parameters(self.params['finder_params'])
-            result = self.peak_finder_manager.perform_find_peaks(filtered_data)
+            result = self.peak_finder_manager.perform_find_peaks(filtered_data, self.frequencies)
             
             if self._cancelled:
                 self.finished.emit(None)  # Signal cancellation
@@ -645,13 +673,13 @@ class ResonanceFinderApp(QMainWindow):
 
         # Peak finding
         self.peak_finder_labels = {
-            'Lin Magnitude V':                 {'direction': 'Direction (peak or dip)','prominence': 'Prominence (dip depth) [V]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [V]', 'threshold': 'Threshold (?) [V]'},
-            'Log Magnitude dB':                {'direction': 'Direction (peak or dip)','prominence': 'Prominence (dip depth) [dB]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [dB]', 'threshold': 'Threshold (?) [dB]'},
-            'Phase rad':                       {'direction': 'Direction (peak or dip)','prominence': 'Prominence (peak depth) [rad]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [rad]', 'threshold': 'Threshold (?) [rad]'},
-            'Unwrapped Phase rad':             {'direction': 'Direction (peak or dip)','prominence': 'Prominence (peak depth) [rad]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [rad]', 'threshold': 'Threshold (?) [rad]'},
-            'Group Delay us (-dphi/df)':       {'direction': 'Direction (peak or dip)','prominence': 'Prominence (peak height) [us]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [us]', 'threshold': 'Threshold (?) [us]'},
-            'Complex Gradient V/Hz (speed)':   {'direction': 'Direction (peak or dip)','prominence': 'Prominence (peak height) [V/Hz]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [V/Hz]', 'threshold': 'Threshold (?) [V/Hz]'},
-            'Sin(IQ,dIdQ) (?)':                {'direction': 'Direction (peak or dip)','prominence': 'Prominence (peak height) [?]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [?]', 'threshold': 'Threshold (?) [?]'}
+            'Lin Magnitude V':                 {'direction': 'Direction (peak or dip)','prominence': 'Prominence (dip depth) [V]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [V]', 'threshold': 'Threshold (?) [V]', 'frequency_limits': 'Frequency Limits [MHz]'},
+            'Log Magnitude dB':                {'direction': 'Direction (peak or dip)','prominence': 'Prominence (dip depth) [dB]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [dB]', 'threshold': 'Threshold (?) [dB]', 'frequency_limits': 'Frequency Limits [MHz]'},
+            'Phase rad':                       {'direction': 'Direction (peak or dip)','prominence': 'Prominence (peak depth) [rad]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [rad]', 'threshold': 'Threshold (?) [rad]', 'frequency_limits': 'Frequency Limits [MHz]'},
+            'Unwrapped Phase rad':             {'direction': 'Direction (peak or dip)','prominence': 'Prominence (peak depth) [rad]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [rad]', 'threshold': 'Threshold (?) [rad]', 'frequency_limits': 'Frequency Limits [MHz]'},
+            'Group Delay us (-dphi/df)':       {'direction': 'Direction (peak or dip)','prominence': 'Prominence (peak height) [us]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [us]', 'threshold': 'Threshold (?) [us]', 'frequency_limits': 'Frequency Limits [MHz]'},
+            'Complex Gradient V/Hz (speed)':   {'direction': 'Direction (peak or dip)','prominence': 'Prominence (peak height) [V/Hz]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [V/Hz]', 'threshold': 'Threshold (?) [V/Hz]', 'frequency_limits': 'Frequency Limits [MHz]'},
+            'Sin(IQ,dIdQ) (?)':                {'direction': 'Direction (peak or dip)','prominence': 'Prominence (peak height) [?]', 'width': 'Width (linewidth) [Hz]','distance': 'Distance (spacing) [Hz]', 'height': 'Height (?) [?]', 'threshold': 'Threshold (?) [?]', 'frequency_limits': 'Frequency Limits [MHz]'}
         }
         self.peak_finder_params = {}
 
@@ -842,6 +870,15 @@ class ResonanceFinderApp(QMainWindow):
     
     def loadSettingsFinderParameters(self):
         _log.debug('loadSettingsFinderParameters')
+        def optional_float(key):
+            value = self.settings.value(key, None)
+            if value is None or value == '':
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
         for format in self.analysis_formats:
             self.settings.beginGroup(f'Finder/{format}')
             params = {
@@ -860,7 +897,9 @@ class ResonanceFinderApp(QMainWindow):
                 'distance_enabled': self.settings.value('distance_enabled', True, type=bool),
                 'distance_value': self.settings.value('distance_value', 1000.0, type=float),
                 'peak_direction': self.settings.value('peak_direction', 1, type=int),
-                'frequency_stepsize': self.settings.value('frequency_stepsize', 1.0, type=float)
+                'frequency_stepsize': self.settings.value('frequency_stepsize', 1.0, type=float),
+                'f_low': optional_float('f_low'),
+                'f_high': optional_float('f_high')
             }
             self.settings.endGroup()
             self.peak_finder_params[format] = params
@@ -919,6 +958,12 @@ class ResonanceFinderApp(QMainWindow):
             finder_params['distance_enabled'] = True
             finder_params['distance_value'] = args.distance
             changed = True
+        if args.f_low is not None:
+            finder_params['f_low'] = args.f_low
+            changed = True
+        if args.f_high is not None:
+            finder_params['f_high'] = args.f_high
+            changed = True
         if args.direction is not None:
             finder_params['peak_direction'] = 1 if args.direction == 'peaks' else -1
             changed = True
@@ -941,6 +986,9 @@ class ResonanceFinderApp(QMainWindow):
         for format, params in self.peak_finder_params.items():
             self.settings.beginGroup(f'Finder/{format}')
             for key, value in params.items():
+                if value is None:
+                    self.settings.remove(key)
+                    continue
                 if key == 'frequency_stepsize':
                     value = float(value)
                 self.settings.setValue(key, value)
@@ -961,6 +1009,7 @@ class ResonanceFinderApp(QMainWindow):
             self.saveSettingsFilename()
 
             self.updateDataArrays()
+            self.setDefaultFrequencyLimitsFromSweep()
             self.applyFiltering()
             self.updateResonances()
             # self.refreshUI()
@@ -992,6 +1041,38 @@ class ResonanceFinderApp(QMainWindow):
         self.complex_gradient = np.abs(np.gradient(self.s21_complex, self.frequencies))
         self.sin_di_dq = np.sin(self.phase)*np.gradient(self.magnitude, self.frequencies)
 
+    def getSweepFrequencyLimits(self):
+        _log.debug('getSweepFrequencyLimits')
+        if len(self.frequencies) == 0:
+            return None, None
+        finite_freqs = self.frequencies[np.isfinite(self.frequencies)]
+        if len(finite_freqs) == 0:
+            return None, None
+        return float(np.min(finite_freqs)), float(np.max(finite_freqs))
+
+    def setDefaultFrequencyLimitsFromSweep(self):
+        _log.debug('setDefaultFrequencyLimitsFromSweep')
+        sweep_low, sweep_high = self.getSweepFrequencyLimits()
+        if sweep_low is None or sweep_high is None:
+            return
+
+        def needs_default(value):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return True
+            return (not np.isfinite(value)) or value < sweep_low or value > sweep_high
+
+        for params in self.peak_finder_params.values():
+            if needs_default(params.get('f_low')):
+                params['f_low'] = sweep_low
+            if needs_default(params.get('f_high')):
+                params['f_high'] = sweep_high
+            if params['f_low'] > params['f_high']:
+                params['f_low'] = sweep_low
+                params['f_high'] = sweep_high
+
+        self.peakFinderManager.set_finder_parameters(self.peak_finder_params[self.active_format])
 
     def applyFiltering(self):
         _log.debug('applyFiltering')
@@ -1046,7 +1127,7 @@ class ResonanceFinderApp(QMainWindow):
         _log.debug(f'frequency_stepsize={self.frequency_stepsize}, type={type(self.frequency_stepsize)}')
         params['frequency_stepsize'] = self.frequency_stepsize
         self.peakFinderManager.set_finder_parameters(params)
-        result = self.peakFinderManager.perform_find_peaks(self.filtered_data)
+        result = self.peakFinderManager.perform_find_peaks(self.filtered_data, self.frequencies)
         _log.debug(f'Peak finding result: {len(result[0]) if result else 0} peaks')
         if type(result) is Exception:
             raise result
@@ -2357,6 +2438,7 @@ class ResonanceFinderApp(QMainWindow):
             self.label_distance.setText(labels.get('distance', 'Distance'))
             self.label_height.setText(labels.get('height', 'Height'))
             self.label_threshold.setText(labels.get('threshold', 'Threshold'))
+            self.label_frequency_limits.setText(labels.get('frequency_limits', 'Frequency Limits'))
             self.label_peak_direction.setText(labels.get('peak_direction', 'Peak Direction'))
         else:
             self.label_prominence.setText("Prominence")
@@ -2364,6 +2446,7 @@ class ResonanceFinderApp(QMainWindow):
             self.label_distance.setText("Distance")
             self.label_height.setText("Height")
             self.label_threshold.setText("Threshold")
+            self.label_frequency_limits.setText("Frequency Limits [MHz]")
             self.label_peak_direction.setText("Peak Direction")
 
 
@@ -2518,6 +2601,16 @@ class ResonanceFinderApp(QMainWindow):
 
         was_loading_settings = self.is_loading_settings
         self.is_loading_settings = True
+
+        sweep_low, sweep_high = self.getSweepFrequencyLimits()
+        if sweep_low is None:
+            sweep_low = 0.0
+        if sweep_high is None:
+            sweep_high = sweep_low
+        f_low = params.get('f_low', sweep_low)
+        f_high = params.get('f_high', sweep_high)
+        f_low = sweep_low if f_low is None else f_low
+        f_high = sweep_high if f_high is None else f_high
         
         # Set parameters into UI controls
         if format=="Log Magnitude dB":
@@ -2632,6 +2725,8 @@ class ResonanceFinderApp(QMainWindow):
             self.check_distance.setChecked(params.get('distance_enabled', True))
             self.spin_distance_min.setValue(params.get('distance_value', 1000))
             self.combo_peak_direction.setCurrentIndex([1,-1].index(params.get('peak_direction', 1)))
+        self.spin_frequency_low.setValue(f_low / 1e6)
+        self.spin_frequency_high.setValue(f_high / 1e6)
         self.is_loading_settings = was_loading_settings
     
     def getUIPeakFinderParameters(self):
@@ -2651,7 +2746,9 @@ class ResonanceFinderApp(QMainWindow):
             'height_max': self.spin_height_max.value(),
             'distance_enabled': self.check_distance.isChecked(),
             'distance_value': self.spin_distance_min.value(),
-            'peak_direction': [1,-1][self.combo_peak_direction.currentIndex()]
+            'peak_direction': [1,-1][self.combo_peak_direction.currentIndex()],
+            'f_low': self.spin_frequency_low.value() * 1e6,
+            'f_high': self.spin_frequency_high.value() * 1e6
         }
         self.peak_finder_params[self.active_format] = params
         return params
@@ -3007,6 +3104,28 @@ class ResonanceFinderApp(QMainWindow):
         peak_finder_layout.addWidget(self.spin_threshold_max,row,5)
 
         row += 1
+        self.label_frequency_limits = QLabel("Frequency Limits [MHz]")
+        self.spin_frequency_low = ScientificSpinBox()
+        self.spin_frequency_low.setKeyboardTracking(False)
+        self.spin_frequency_low.setGroupSeparatorShown(True)
+        self.spin_frequency_low.setStepType(StepType)
+        self.spin_frequency_low.setDecimals(6)
+        self.spin_frequency_low.setRange(-np.inf, np.inf)
+        self.spin_frequency_low.setValue(0.0)
+        self.spin_frequency_high = ScientificSpinBox()
+        self.spin_frequency_high.setKeyboardTracking(False)
+        self.spin_frequency_high.setGroupSeparatorShown(True)
+        self.spin_frequency_high.setStepType(StepType)
+        self.spin_frequency_high.setDecimals(6)
+        self.spin_frequency_high.setRange(-np.inf, np.inf)
+        self.spin_frequency_high.setValue(0.0)
+        peak_finder_layout.addWidget(self.label_frequency_limits,row,0)
+        peak_finder_layout.addWidget(QLabel("Low"),row,2)
+        peak_finder_layout.addWidget(self.spin_frequency_low,row,3)
+        peak_finder_layout.addWidget(QLabel("High"),row,4)
+        peak_finder_layout.addWidget(self.spin_frequency_high,row,5)
+
+        row += 1
         self.label_peak_direction = QLabel("Peak Direction")
         self.combo_peak_direction = QComboBox()
         self.combo_peak_direction.addItems(["Peaks","Dips"])
@@ -3087,7 +3206,8 @@ class ResonanceFinderApp(QMainWindow):
                         self.spin_width_min, self.spin_width_max, 
                         self.spin_threshold_min, self.spin_threshold_max, 
                         self.spin_height_min, self.spin_height_max, 
-                        self.spin_distance_min]:
+                        self.spin_distance_min,
+                        self.spin_frequency_low, self.spin_frequency_high]:
             spinbox.valueChanged.connect(self.onPeakFinderParameterChanged)
         self.combo_peak_direction.currentIndexChanged.connect(self.onPeakFinderParameterChanged)
 
@@ -3733,6 +3853,10 @@ def main():
                         help='Maximum peak width in Hz')
     parser.add_argument('--distance', type=float, default=None,
                         help='Minimum spacing between peaks in Hz')
+    parser.add_argument('--f-low', type=float, default=None,
+                        help='Drop detected peaks below this frequency in Hz')
+    parser.add_argument('--f-high', type=float, default=None,
+                        help='Drop detected peaks above this frequency in Hz')
     parser.add_argument('--direction', choices=['peaks', 'dips'], default=None,
                         help='Search for peaks (upward) or dips (downward)')
     parser.add_argument('--reset-settings', action='store_true',

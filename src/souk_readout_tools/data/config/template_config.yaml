@@ -91,23 +91,51 @@ firmware:
 
 # --- RF Frontend ---
 # Describes the RF signal chain between the RFSoC and the cryostat.
-# Set 'connected: true' to enable programmable attenuator control and
-# RF frontend calibration corrections.
+# Set 'connected: true' to include RF frontend calibration corrections and,
+# for controllable backends, RF peripheral control.
 rf_frontend:
-  connected: false
-  hardware_id: "souk-mixerless-module"
+  connected: true
+  hardware_id: "module1"             # unique name of this physical RF frontend
+                                     # (e.g. "module1" or "souk-mixerless-module-01");
+                                     # surfaced in get_info, server logs, calibration files
+
+  # --- SOUK mixerless module hardware settings ---
+  # Set connected: true if the active RF frontend IS a SOUK mixerless module
+  # (which exposes both i2c attenuators and bypass amps). Set connected: false
+  # for non-mixerless RF frontends (e.g. a RUDAT bench setup).
+  mixerless_module:
+    connected: true
+    rf_channel: 0                    # which channel (0 or 1) of the module
+                                     # this pipeline drives
 
   # --- Attenuator control ---
-  # The attenuator backend selects how programmable attenuators are controlled:
-  #   'i2c'   — uses the SOUK RF Mixerless Module on-board I2C attenuators
-  #   'rudat' — uses Mini-Circuits RUDAT USB attenuators
-  # Leave blank for manual (non-programmable) attenuators.
-  attenuator_backend: "i2c"
-  tx_attenuator_value_db:
-  rx_attenuator_value_db:
-  # --- Example RUDAT configuration (uncomment if attenuator_backend: rudat) ---
-  # rudat_tx_serial: "12345"          # serial number of TX RUDAT attenuator
-  # rudat_rx_serial: "12346"          # serial number of RX RUDAT attenuator
+  # backend: i2c   uses the SOUK mixerless module's on-board attenuators
+  #                (requires mixerless_module.connected: true above)
+  # backend: rudat uses Mini-Circuits RUDAT USB attenuators
+  # backend: fixed uses the tx/rx values below as fixed, non-controllable
+  #                attenuation values (explicit manual attenuator mode)
+  attenuator:
+    backend: "i2c"
+    tx_value_db: 30.0
+    rx_value_db: 30.0
+    # --- Example RUDAT configuration (only used if backend: rudat) ---
+    # rudat_tx_serial: "12345"        # serial number of TX RUDAT attenuator
+    # rudat_rx_serial: "12346"        # serial number of RX RUDAT attenuator
+    rudat_tx_serial:
+    rudat_rx_serial:
+
+  # --- Bypassable amplifier controls ---
+  # Available on the SOUK mixerless module. Set enabled: true to allow
+  # software control of the TX/RX amplifier bypass state.
+  bypass_amps:
+    enabled: true
+    tx_amp_bypass: true
+    rx_amp_bypass: true
+    # Bypass-amp S21 values used as desired/captured config values.
+    # Live hardware values are used at runtime and can be captured with
+    # sync_config_from_system().
+    tx_s21_db: 0
+    rx_s21_db: 0
 
   # --- RF path characterisation ---
   # These values describe the gain/loss of each component in the signal chain.
@@ -136,29 +164,14 @@ rf_frontend:
   tx_mixer_sideband:
   rx_mixer_sideband:
   loopback: false
-  # Amplifier S21 values — auto-updated when bypass_amps are controlled by hardware
-  tx_bypass_amp_s21_db: 0
-  rx_bypass_amp_s21_db: 0
-
-  # --- Bypassable amplifier controls ---
-  # Available on the SOUK RF Mixerless Module. Set enabled: true to allow
-  # software control of the TX/RX amplifier bypass state.
-  bypass_amps:
-    enabled: false
-    tx_amp_bypass: false
-    rx_amp_bypass: false
-
-  # --- I2C settings for SOUK RF Mixerless Module ---
-  # Only used when attenuator_backend: i2c
-  mixerless_module:
-    i2c_bus: 0
-    channel: 0                       # hardware channel (usually matches pipeline_id)
 
   comments:
 
 # --- Cryostat ---
 # Describes the cryostat and its RF connections.
 cryostat:
+  # Controls whether cryostat RF S21 terms are included in the calibration
+  # chain. LNA bias control is independent; use lna_bias.enabled below.
   connected: false
   cryostat_id:
   input_channel_id:
@@ -168,13 +181,22 @@ cryostat:
   lna_model:
 
   # --- LNA bias control ---
-  # Controls the cryostat LNA bias via the SOUK LNA bias board (I2C).
+  # Controls/describes the cryostat LNA bias.
+  # This can be enabled even when cryostat.connected is false.
   # There are 14 LNA channels per cryostat (indices 1-14).
   # Set lna_channel to the LNA index that this readout pipeline is connected to.
+  # backend: i2c   uses the SOUK LNA bias board on the RFSoC I2C bus
+  # backend: fixed records a fixed, non-controllable bias value
   lna_bias:
-    enabled: false
-    i2c_bus: 0
+    enabled: true
+    backend: "i2c"
     lna_channel: 1                   # LNA index (1-14) for this readout pipeline
+    bias_voltage_v: 1.5              # applied on config push/apply when enabled
+    soft_off: false                  # true drives channel to min local voltage; not a hard power cut
+    method: "local"                 # 'remote' feedback or 'local' DAC set
+    blind: false                     # remote method only; skip LNA-voltage sanity check
+    i2c:
+      bus: 0
 
   thermometry_log_file:
   optical_setup:

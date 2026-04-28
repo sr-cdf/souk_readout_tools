@@ -42,7 +42,6 @@ import base64
 
 from importlib.resources import files as importlib_files
 from souk_readout_tools.config_utils import copy_template_config
-
 import argparse
 
 import time
@@ -633,7 +632,7 @@ class ReadoutServer:
 
         #see if we can succesfully load system information
         try:
-            system_information = self.get_system_information()
+            self.get_info()
             self.update_active_tone_indices()
         except Exception as e:
             print(bcolors.WARNING+'Warning: could not get system information from firmware:',e,bcolors.ENDC)
@@ -646,31 +645,43 @@ class ReadoutServer:
         if firmware_lib.needs_pipeline_initialising(self.r,self.config):
             print(bcolors.WARNING+'Warning: pipeline resources need initialising'+bcolors.ENDC)
 
-        #initialize rf peripheral controller (attenuators, amp bypass)
+        # initialise rf peripheral controller (attenuators, amp bypass)
         try:
             self.rf_peripherals = RFPeripheralController(self.config, self.pipeline_id)
-            if self.rf_peripherals.enabled:
-                print(f'{bcolors.OKGREEN}RF frontend initialised ({self.rf_peripherals.attenuator_backend}){bcolors.ENDC}')
-                status = self.rf_peripherals.get_status()
-                print(f'  TX atten: {status["tx_attenuation_db"]:.1f} dB, '
-                      f'amp bypass: {status["tx_amp_bypass"]}, '
-                      f'total gain: {status["tx_total_gain_db"]:.1f} dB')
-                print(f'  RX atten: {status["rx_attenuation_db"]:.1f} dB, '
-                      f'amp bypass: {status["rx_amp_bypass"]}, '
-                      f'total gain: {status["rx_total_gain_db"]:.1f} dB')
         except Exception as e:
             print(bcolors.WARNING+f'Warning: RF peripheral init failed: {e}'+bcolors.ENDC)
             self.rf_peripherals = None
 
-        # Initialize LNA bias controller
+        if self.rf_peripherals is not None and self.rf_peripherals.enabled:
+            colour = bcolors.OKGREEN if self.rf_peripherals.is_hardware else bcolors.WARNING
+            print(f'{colour}RF frontend initialised '
+                  f'({self.rf_peripherals.attenuator_backend}, '
+                  f'hardware_available={self.rf_peripherals.is_hardware}){bcolors.ENDC}')
+            if (self.rf_peripherals.is_hardware
+                    or self.rf_peripherals.attenuator_backend == 'fixed'):
+                status = self.rf_peripherals.get_status()
+                tx_bypass = status.get('tx_amp_bypass', '—')
+                rx_bypass = status.get('rx_amp_bypass', '—')
+                print(f'  TX atten: {status["tx_attenuation_db"]:.1f} dB, '
+                      f'amp bypass: {tx_bypass}, '
+                      f'total gain: {status["tx_total_gain_db"]:.1f} dB')
+                print(f'  RX atten: {status["rx_attenuation_db"]:.1f} dB, '
+                      f'amp bypass: {rx_bypass}, '
+                      f'total gain: {status["rx_total_gain_db"]:.1f} dB')
+
+        # initialise LNA bias controller
         try:
             self.lna_controller = LNABiasController(self.config, self.pipeline_id)
-            if self.lna_controller.enabled:
-                print(f'{bcolors.OKGREEN}LNA bias controller initialised '
-                      f'(channel {self.lna_controller.lna_channel}){bcolors.ENDC}')
         except Exception as e:
             print(bcolors.WARNING+f'Warning: LNA bias init failed: {e}'+bcolors.ENDC)
             self.lna_controller = None
+
+        if self.lna_controller is not None and self.lna_controller.enabled:
+            colour = bcolors.OKGREEN if self.lna_controller.is_hardware else bcolors.WARNING
+            print(f'{colour}LNA bias controller initialised '
+                  f'({self.lna_controller.backend}, '
+                  f'channel {self.lna_controller.lna_channel}, '
+                  f'hardware_available={self.lna_controller.is_hardware}){bcolors.ENDC}')
 
         return
    
@@ -757,7 +768,22 @@ class ReadoutServer:
             self.config_raw_text = file.read()
 
         return config
-    
+
+    def _render_config_text(self):
+        """YAML text for the active config file.
+
+        ``pull_config()`` deliberately returns the desired/applied config file,
+        not a live-state patched view. Runtime hardware state is available via
+        status/info calls and can be explicitly captured by the client.
+        """
+        if self.config_file and os.path.exists(self.config_file):
+            with open(self.config_file, 'r') as file:
+                return file.read()
+        raw = getattr(self, 'config_raw_text', None)
+        if raw:
+            return raw
+        return yaml.dump(self.config, sort_keys=False)
+
     def set_config(self, config_filename, config_contents, default=True):
         """
         Apply a new configuration and re-initialise the firmware
@@ -791,11 +817,25 @@ class ReadoutServer:
         self.applied_config = copy.deepcopy(config_contents)
         self.update_active_tone_indices()
 
-        # Apply RF peripheral hardware settings (attenuators, amp bypass) from new config
-        if self.rf_peripherals is not None and self.rf_peripherals.enabled:
-            self.rf_peripherals.apply_config(config_contents)
-
         self.ensure_ready(config_file=filename, level="pipeline")
+
+        # Rebind/rebuild RF peripheral control after ensure_ready() reloads
+        # self.config, then apply the requested RF settings to that live dict.
+        try:
+            self.rf_peripherals = RFPeripheralController(self.config, self.pipeline_id)
+            if self.rf_peripherals.enabled:
+                self.rf_peripherals.apply_config(config_contents)
+        except Exception as e:
+            print(bcolors.WARNING+f'Warning: RF peripheral re-init failed: {e}'+bcolors.ENDC)
+            self.rf_peripherals = None
+
+        try:
+            self.lna_controller = LNABiasController(self.config, self.pipeline_id)
+            if self.lna_controller.enabled:
+                self.lna_controller.apply_config(config_contents)
+        except Exception as e:
+            print(bcolors.WARNING+f'Warning: LNA bias re-init failed: {e}'+bcolors.ENDC)
+            self.lna_controller = None
 
         if default:
             defaultname = os.path.join(self.user_config_dir, 'default_config.lnk')
@@ -818,62 +858,6 @@ class ReadoutServer:
 
         return
         
-
-    def get_system_information(self):
-        """
-        Get the system information from the firmware.
-        This function is called when a client sends a 'get_system_information' request.
-        Not properly implemented yet.
-        """
-
-        system_information = firmware_lib.get_system_information(self.r,self.config)
-        return system_information
-    
-    def get_server_status(self):
-        """Legacy server status dict.
-
-        Deprecated — prefer ``get_info()`` which returns structured sections.
-        This rebuilds the original flat format for backward compatibility.
-        """
-        programmed = not firmware_lib.needs_programming(self.r, self.config)
-        shared_ready = not firmware_lib.needs_shared_resource_initialising(self.r, self.config)
-        pipeline_ready = not firmware_lib.needs_pipeline_initialising(self.r, self.config)
-
-        status = {
-            'process_name': self.process_name,
-            'ip_addresses': self.ip_addresses,
-            'pipeline_id': self.pipeline_id,
-            'pipeline_dirs': self.pipeline_dirs,
-            'pwd': os.getcwd(),
-            'sys.executable': sys.executable,
-            'sys.argv': sys.argv,
-            'uname': (os.uname().nodename + ' ' + os.uname().sysname + ' '
-                      + os.uname().release + ' ' + os.uname().version
-                      + ' ' + os.uname().machine),
-            'python_version': sys.version,
-            'server_version': importlib.metadata.version('souk_readout_tools'),
-            'config_file': self.config_file,
-            'request_clients': len(self.request_clients),
-            'request_client_addrs': [client.get_extra_info('peername') for client in self.request_clients],
-            'stream_clients': len(self.stream_clients),
-            'stream_client_addrs': [client.get_extra_info('peername') for client in self.stream_clients],
-            'stream_task_started': self.stream_task is not None and not self.stream_task.done(),
-            'stream_enabled': self.e_stream_enabled.is_set(),
-            'triggered_stream_task_started': self.triggered_stream_task is not None and not self.triggered_stream_task.done(),
-            'triggered_stream_enabled': self.e_triggered_stream_enabled.is_set(),
-            'sweep_task_running': self.sweep_task is not None and not self.sweep_task.done(),
-            'tasks': len(self.tasks),
-            'firmware_interface_exists': bool(self.r),
-            'firmware_fast_interface_exists': bool(self.r_fast),
-            'firmware_programmed': programmed,
-            'firmware_shared_resources_ready': shared_ready,
-            'firmware_pipeline_resources_ready': pipeline_ready,
-            'system_information': self.get_system_information(),
-            'latest_sweep_data_valid': self.latest_sweep_data_valid,
-            'rf_frontend': self.rf_peripherals.get_status() if getattr(self, 'rf_peripherals', None) else {'enabled': False},
-            'lna_bias': self.lna_controller.get_status() if getattr(self, 'lna_controller', None) else {'enabled': False},
-        }
-        return status
 
     # ------------------------------------------------------------------
     # Structured info system
@@ -1080,48 +1064,59 @@ class ReadoutServer:
     def _info_rf_frontend(self):
         rf = getattr(self, 'rf_peripherals', None)
         rf_cfg = self.config.get('rf_frontend', {})
+        attn_cfg   = rf_cfg.get('attenuator', {}) or {}
+        mixerless_cfg = rf_cfg.get('mixerless_module', {}) or {}
 
         if rf is None or not rf.enabled:
             return {'ready': False, 'connected': rf_cfg.get('connected', False)}
 
+        status = rf.get_status()
         info = {
             'ready': True,
             'connected': rf_cfg.get('connected', False),
             'hardware_id': rf_cfg.get('hardware_id'),
             'hardware_available': rf.is_hardware,
-            'attenuator_backend': rf_cfg.get('attenuator_backend'),
+            'controllable': rf.is_controllable,
+            'supports_bypass_amps': rf.supports_bypass_amps,
+            'attenuator_backend': rf.attenuator_backend,
+            'rf_channel': mixerless_cfg.get('rf_channel'),
         }
 
         # Backend-specific identity
-        backend = rf_cfg.get('attenuator_backend', '')
-        if backend == 'i2c':
-            mod_cfg = rf_cfg.get('mixerless_module', {})
-            info['i2c_bus'] = mod_cfg.get('i2c_bus')
-            info['i2c_channel'] = mod_cfg.get('channel')
-        elif backend == 'rudat':
-            info['rudat_tx_serial'] = rf_cfg.get('rudat_tx_serial')
-            info['rudat_rx_serial'] = rf_cfg.get('rudat_rx_serial')
+        if rf.attenuator_backend == 'rudat':
+            info['rudat_tx_serial'] = attn_cfg.get('rudat_tx_serial')
+            info['rudat_rx_serial'] = attn_cfg.get('rudat_rx_serial')
 
-        # Live controllable state
-        info['tx_attenuation_db'] = rf.get_tx_attenuation()
-        info['rx_attenuation_db'] = rf.get_rx_attenuation()
-        info['tx_amp_bypass'] = rf.get_tx_amp_bypass()
-        info['rx_amp_bypass'] = rf.get_rx_amp_bypass()
+        # Live state from hardware, or explicit fixed values from config.
+        if rf.is_hardware or rf.attenuator_backend == 'fixed':
+            info['tx_attenuation_db'] = status.get('tx_attenuation_db')
+            info['rx_attenuation_db'] = status.get('rx_attenuation_db')
+            info['tx_total_gain_db'] = status.get('tx_total_gain_db')
+            info['rx_total_gain_db'] = status.get('rx_total_gain_db')
+            info['tx_input_1db_comp_dbm'] = status.get('tx_input_1db_comp_dbm')
+            info['rx_input_1db_comp_dbm'] = status.get('rx_input_1db_comp_dbm')
+        else:
+            info['tx_attenuation_db'] = None
+            info['rx_attenuation_db'] = None
+            info['tx_total_gain_db'] = None
+            info['rx_total_gain_db'] = None
+            info['tx_input_1db_comp_dbm'] = None
+            info['rx_input_1db_comp_dbm'] = None
 
-        # Derived gain / compression
-        info['tx_total_gain_db'] = rf.get_tx_total_gain()
-        info['rx_total_gain_db'] = rf.get_rx_total_gain()
-        info['tx_input_1db_comp_dbm'] = rf.get_tx_input_1db_comp()
-        info['rx_input_1db_comp_dbm'] = rf.get_rx_input_1db_comp()
+        # Bypass-amp state (only when the mixerless module is the active frontend)
+        if rf.supports_bypass_amps:
+            info['tx_amp_bypass'] = status.get('tx_amp_bypass')
+            info['rx_amp_bypass'] = status.get('rx_amp_bypass')
+            info['tx_bypass_amp_s21_db'] = status.get('tx_bypass_amp_s21_db')
+            info['rx_bypass_amp_s21_db'] = status.get('rx_bypass_amp_s21_db')
 
-        # Updownconverter characterisation (from config)
+        # Updownconverter characterisation (from config, flat keys)
         for key in ('tx_mixer_lo_frequency_hz', 'rx_mixer_lo_frequency_hz',
                      'tx_mixer_sideband', 'rx_mixer_sideband',
                      'tx_mixer_conversion_loss_db', 'rx_mixer_conversion_loss_db',
                      'tx_combiner_loss_db', 'rx_combiner_loss_db',
                      'tx_if_s21_db', 'rx_if_s21_db',
                      'tx_rf_s21_db', 'rx_rf_s21_db',
-                     'tx_bypass_amp_s21_db', 'rx_bypass_amp_s21_db',
                      'loopback'):
             info[key] = rf_cfg.get(key)
 
@@ -1133,14 +1128,25 @@ class ReadoutServer:
         lna_cfg = cryo_cfg.get('lna_bias', {})
 
         if lna is None or not lna.enabled:
-            return {'ready': False, 'enabled': lna_cfg.get('enabled', False)}
+            return {
+                'ready': False,
+                'enabled': lna_cfg.get('enabled', False),
+                'cryostat_connected': cryo_cfg.get('connected', False),
+            }
 
+        lna_status = lna.get_status()
         info = {
             'ready': True,
             'enabled': True,
+            'cryostat_connected': cryo_cfg.get('connected', False),
             'hardware_available': lna.is_hardware,
-            'i2c_bus': lna_cfg.get('i2c_bus'),
+            'controllable': lna.is_controllable,
+            'backend': lna.backend,
             'lna_channel': lna.lna_channel,
+            'bias_voltage_v': lna_status.get('bias_voltage_v'),
+            'soft_off': lna_status.get('soft_off', False),
+            'method': lna_status.get('method', lna.DEFAULT_METHOD),
+            'blind': lna_status.get('blind', lna.DEFAULT_BLIND),
             'lna_model': cryo_cfg.get('lna_model'),
         }
 
@@ -1150,6 +1156,10 @@ class ReadoutServer:
                 info['bias_readings'] = lna.get_lna_bias_status_all()
             except Exception:
                 info['bias_readings'] = None
+        elif lna.backend == 'fixed':
+            info['bias_readings'] = {
+                lna.lna_channel: lna.get_lna_bias_status()
+            }
         else:
             info['bias_readings'] = None
 
@@ -1162,7 +1172,7 @@ class ReadoutServer:
         return firmware_lib.info_diagnostics(self.r, self.r_fast, self.config)
 
     def _info_config(self):
-        config_text = getattr(self, 'config_raw_text', None) or yaml.dump(self.config, sort_keys=False)
+        config_text = self._render_config_text()
         config_id = None
         try:
             config_id = self.config.get('config', {}).get('config_id')
@@ -1232,11 +1242,7 @@ class ReadoutServer:
                 message = json.loads(data.decode())
                 request = message.get('request')
 
-                if request == 'server_status':
-                    status = self.get_server_status()
-                    await self.send_response(writer, {'status': 'success', 'message': status})
-
-                elif request == 'ensure_ready':
+                if request == 'ensure_ready':
                     level = message.get('level', 'pipeline')
                     config_file = message.get('config_filename', None)
                     if config_file is None:
@@ -1245,7 +1251,7 @@ class ReadoutServer:
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
                         self.ensure_ready(config_file=config_file, level=level)
-                        await self.send_response(writer, {'status': 'success', 'server_status': self.get_server_status()})
+                        await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'hard_reset':
                     config_file = message.get('config_filename', None)
@@ -1255,7 +1261,7 @@ class ReadoutServer:
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
                         self.init_server(config_file,ensure_ready=False, force_ready=True)
-                        await self.send_response(writer, {'status': 'success', 'server_status': self.get_server_status()})
+                        await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'initialise_server':
                     config_file = message.get('config_filename')
@@ -1294,7 +1300,7 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'pull_config':
-                    config_text = getattr(self, 'config_raw_text', None) or yaml.dump(self.config, sort_keys=False)
+                    config_text = self._render_config_text()
                     await self.send_response(writer, {'status': 'success', 'config_filename': self.config_file, 'config_contents': config_text})
 
                 elif request == 'set_default_config':
@@ -1318,10 +1324,6 @@ class ReadoutServer:
                     with open(os.path.join(self.user_calibrations_dir,os.path.basename(cal_filename))) as file:
                         cal_contents = file.read()
                     await self.send_response(writer, {'status': 'success', 'cal_contents': cal_contents})
-
-                elif request == 'get_system_information':
-                    info = self.get_system_information()
-                    await self.send_response(writer, {'status': 'success', 'data': info})
 
                 elif request == 'get_info':
                     sections = message.get('sections', None)
@@ -1410,7 +1412,7 @@ class ReadoutServer:
                     elif param_name == 'tone_frequencies':
                         self.stream_flags[FLAG_SET_FREQS].set()
                         await asyncio.sleep(0)
-                        firmware_lib.set_tone_frequencies(self.r, self.config, param_value)
+                        firmware_lib.set_tone_frequencies_fast(self.r, self.r_fast, self.config, param_value)
                         self.update_active_tone_indices()
                         self.stream_flags[FLAG_SET_FREQS].clear()
                         await asyncio.sleep(0)
@@ -1545,8 +1547,18 @@ class ReadoutServer:
                     kwargs = {'rf_peripherals': self.rf_peripherals}
                     if 'headroom_db' in message:
                         kwargs['headroom_db'] = message['headroom_db']
-                    dsa,pfb_fft_shift,dsp,adc,rx_atten = firmware_lib.maximise_rx_power(self.r,self.r_fast,self.config, **kwargs)
-                    result = {'dsa': dsa, 'pfb_fft_shift': pfb_fft_shift, 'dsp_ovf': dsp, 'adc_levels': adc, 'rx_attenuation_db': rx_atten}
+                    dsa, pfb_fft_shift, dsp, adc, rx_atten = firmware_lib.maximise_rx_power(self.r, self.r_fast, self.config, **kwargs)
+                    # Get RX amp bypass state if available
+                    has_bypass_amps = hasattr(self.rf_peripherals, 'get_rx_amp_bypass')
+                    rx_amp_bypass = self.rf_peripherals.get_rx_amp_bypass() if has_bypass_amps else None
+                    result = {
+                        'dsa': dsa,
+                        'pfb_fft_shift': pfb_fft_shift,
+                        'dsp_ovf': dsp,
+                        'adc_levels': adc,
+                        'rx_attenuation_db': rx_atten,
+                        'rx_amp_bypass': rx_amp_bypass
+                    }
                     await self.send_response(writer, {'status': 'success', 'result': result})
                 
                 elif request == 'optimise_tx_snr':
@@ -1659,7 +1671,28 @@ class ReadoutServer:
                     result = self.lna_controller.set_lna_bias_voltage(
                         voltage_v, channel, method, blind,
                     )
-                    await self.send_response(writer, {'status': 'success', 'result': result})
+                    if not result.get('success', True):
+                        await self.send_response(writer, {
+                            'status': 'error',
+                            'message': result.get('message', 'LNA bias set failed'),
+                            'result': result,
+                        })
+                    else:
+                        await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'soft_off_lna_bias':
+                    channel = message.get('channel')
+                    if channel is not None:
+                        channel = int(channel)
+                    result = self.lna_controller.soft_off_lna_bias(channel)
+                    if not result.get('success', True):
+                        await self.send_response(writer, {
+                            'status': 'error',
+                            'message': result.get('message', 'LNA soft off failed'),
+                            'result': result,
+                        })
+                    else:
+                        await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'set_lna_bias_voltage_all':
                     voltage_v = float(message.get('voltage_v'))
@@ -1668,7 +1701,35 @@ class ReadoutServer:
                     result = self.lna_controller.set_lna_bias_voltage_all(
                         voltage_v, method, blind,
                     )
-                    await self.send_response(writer, {'status': 'success', 'result': result})
+                    failed = [r for r in result.values() if not r.get('success', True)]
+                    if failed:
+                        msgs = '; '.join(
+                            f"chn {r['channel']}: {r.get('message', 'failed')}"
+                            for r in failed
+                        )
+                        await self.send_response(writer, {
+                            'status': 'error',
+                            'message': f'{len(failed)}/{len(result)} channels failed: {msgs}',
+                            'result': result,
+                        })
+                    else:
+                        await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'soft_off_lna_bias_all':
+                    result = self.lna_controller.soft_off_lna_bias_all()
+                    failed = [r for r in result.values() if not r.get('success', True)]
+                    if failed:
+                        msgs = '; '.join(
+                            f"chn {r['channel']}: {r.get('message', 'failed')}"
+                            for r in failed
+                        )
+                        await self.send_response(writer, {
+                            'status': 'error',
+                            'message': f'{len(failed)}/{len(result)} channels failed: {msgs}',
+                            'result': result,
+                        })
+                    else:
+                        await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'get_samples':
                     num_samples = message.get('num_samples')
@@ -1755,7 +1816,7 @@ class ReadoutServer:
                               'num_points': len(sweep_f),
                               'samples_per_point': self.latest_sweep_results['samples_per_point'],
                               'sweep': sweep,
-                              'system_information': self.get_system_information()}
+                              'info': self.get_info('all')}
                         
 
                         await self.send_response(writer, {'status': 'success', 'data': data})
@@ -1795,7 +1856,7 @@ class ReadoutServer:
                         data += f'# num_points: {len(sweep_f)}\n'
                         data += f'# samples_per_point: {self.latest_sweep_results["samples_per_point"]}\n'
                         
-                        data += '# system_info: '+str(self.get_system_information()) +'\n'
+                        data += '# info: '+str(self.get_info('all')) +'\n'
                         data += '#' + ' '.join([f'sweep_f_{k:04d} sweep_i_{k:04d} sweep_q_{k:04d} err_i_{k:04d} err_q_{k:04d}' for k in range(len(sweep_f))]) + '\n'
 
                         for j in range(len(sweep_f)):
@@ -2151,6 +2212,10 @@ class ReadoutServer:
                 Default 2.0.
         """
 
+        sweep_tone_amplitudes = None
+        sweep_tone_phases = None
+        init_psb_scale = None
+
         try:
 
             self.latest_sweep_data_valid = False
@@ -2176,7 +2241,20 @@ class ReadoutServer:
                     initial_freqs[i] = centers[i]
 
             print('Setting initial tone frequencies')
-            firmware_lib.set_tone_frequencies(self.r,self.config,centers,autosync=True)
+            firmware_lib.set_tone_frequencies_fast(self.r,self.r_fast,self.config,centers,autosync=True)
+            try:
+                sweep_tone_amplitudes = firmware_lib.get_tone_amplitudes(
+                    self.r, self.config)
+                sweep_tone_phases = firmware_lib.get_tone_phases(
+                    self.r, self.config)
+            except Exception as e:
+                print(f'Warning: could not preserve sweep tone amplitudes/phases: {e}')
+                sweep_tone_amplitudes = None
+                sweep_tone_phases = None
+            if sweep_tone_amplitudes is not None and len(sweep_tone_amplitudes) != len(centers):
+                sweep_tone_amplitudes = None
+            if sweep_tone_phases is not None and len(sweep_tone_phases) != len(centers):
+                sweep_tone_phases = None
 
             # ADC calibration: always frozen before sweep, left frozen after
             # Note: uses inline set_cal_freeze rather than firmware_lib.refresh_adc_cal()
@@ -2217,8 +2295,31 @@ class ReadoutServer:
             # fast_write_params = []
             # for p in range(num_points):
             #     fast_write_params.append(firmware_lib.prepare_tone_frequency_settings_fast(self.r, self.config, sweepfreqs[p]))
-            fast_sweep_params = firmware_lib.prepare_sweep_settings_fast(self.r_fast,self.config,sweepfreqs)
-            
+            fast_sweep_params = firmware_lib.prepare_sweep_settings_fast(
+                self.r_fast, self.config, sweepfreqs,
+                tone_amplitudes=sweep_tone_amplitudes,
+                tone_phases=sweep_tone_phases)
+
+            # If tone amplitudes were globally scaled down to protect the VACC,
+            # raise psb_scale by the inverse to keep absolute output power.
+            amplitude_scale_factor = fast_sweep_params.get('amplitude_scale_factor', 1.0)
+            if amplitude_scale_factor and amplitude_scale_factor < 1.0:
+                psb_scale_min = 1.0 / 256
+                psb_scale_max = 255.0
+                init_psb_scale = self.r.psbscale.get_scale()
+                desired_scale = init_psb_scale / amplitude_scale_factor
+                new_scale = float(np.clip(desired_scale, psb_scale_min, psb_scale_max))
+                self.r.psbscale.set_scale(new_scale)
+                if new_scale < desired_scale:
+                    shortfall_db = 20 * np.log10(new_scale / desired_scale)
+                    print(f'Warning: psb_scale clipped to {new_scale:.4f} '
+                          f'(wanted {desired_scale:.4f} to fully compensate '
+                          f'amplitude scaling of {amplitude_scale_factor:.4f}); '
+                          f'sweep absolute power reduced by {-shortfall_db:.2f} dB')
+                else:
+                    print(f'psb_scale raised {init_psb_scale:.4f} -> {new_scale:.4f} '
+                          f'to compensate for amplitude scaling of {amplitude_scale_factor:.4f}')
+
             # Get tone_indices array - shape (num_points, num_tones)
             # These may change at each sweep point as tones cross FFT bin boundaries
             tone_indices_arr = fast_sweep_params.get('tone_indices')
@@ -2283,7 +2384,15 @@ class ReadoutServer:
                 await asyncio.sleep(0.0001)
 
             # print('reset initial freqs:',initial_freqs)
-            firmware_lib.set_tone_frequencies(self.r,self.config,initial_freqs,autosync=True)
+            firmware_lib.set_tone_frequencies_fast(
+                self.r, self.r_fast, self.config, initial_freqs,
+                autosync=True,
+                tone_amplitudes=sweep_tone_amplitudes,
+                tone_phases=sweep_tone_phases)
+
+            if init_psb_scale is not None:
+                self.r.psbscale.set_scale(init_psb_scale)
+                init_psb_scale = None
 
             sweep_responses = np.mean(sweep_data.real,axis=0) + 1j*np.mean(sweep_data.imag,axis=0)
             sweep_stds = np.std(sweep_data.real,axis=0) + 1j*np.std(sweep_data.imag,axis=0)
@@ -2311,7 +2420,14 @@ class ReadoutServer:
 
         except asyncio.CancelledError:
             print('ayncio sweep cancelled')
-            firmware_lib.set_tone_frequencies(self.r,self.config,initial_freqs,autosync=True)
+            firmware_lib.set_tone_frequencies_fast(
+                self.r, self.r_fast, self.config, initial_freqs,
+                autosync=True,
+                tone_amplitudes=sweep_tone_amplitudes,
+                tone_phases=sweep_tone_phases)
+            if init_psb_scale is not None:
+                self.r.psbscale.set_scale(init_psb_scale)
+                init_psb_scale = None
             self.latest_sweep_results = {
                 'sweep_frequencies': sweepfreqs,
                 'sweep_responses': sweep_responses,
@@ -2329,7 +2445,13 @@ class ReadoutServer:
             self.sweep_progress = float(1.0)
             print(f"Error performing sweep: {e}")
             print(traceback.format_exc())
-        
+        finally:
+            if init_psb_scale is not None:
+                try:
+                    self.r.psbscale.set_scale(init_psb_scale)
+                except Exception as e:
+                    print(f'Warning: could not restore psb_scale={init_psb_scale}: {e}')
+
     async def retune(self, center, span, points, samples_per_point, direction, method,freq_offsets=None, refresh_adc_cal=True, adc_cal_settle_time=2.0):
         """
         A coroutine that performs a frequency sweep, finds the resonance peaks using the specified method, and sets the tones to the peak frequencies.
@@ -2394,7 +2516,7 @@ class ReadoutServer:
 
             print('Retune freqs = found freqs + freq offsets = ',retune_freqs)
 
-            firmware_lib.set_tone_frequencies(self.r,self.config,retune_freqs)
+            firmware_lib.set_tone_frequencies_fast(self.r,self.r_fast,self.config,retune_freqs)
             self.update_active_tone_indices()
             # print('New frequencies:',firmware_lib.get_tone_frequencies(self.r,self.config))
 

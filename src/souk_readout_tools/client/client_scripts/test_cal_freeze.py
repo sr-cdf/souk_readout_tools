@@ -25,7 +25,7 @@ process = start_stream_receiver()
 time.sleep(1.0)
 
 #enable streaming in the server if it is not already enabled
-if client.get_server_status()['stream_enabled']:
+if client.get_info(['server'])['server']['streaming']:
     remember_to_disable_stream = False
 else:
     print("Enabling streaming")

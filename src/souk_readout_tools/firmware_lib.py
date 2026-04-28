@@ -574,7 +574,10 @@ def initialise_pipeline_resources(r,r_fast,config_dict):
     sync_delay = defaults.get('sync_delay',None)
     acc_len = defaults.get('acc_len',None)
     dac_duc_mixer_frequency_hz = defaults.get('dac_duc_mixer_frequency_hz',None)
-    adc_ddc_mix_frequency_hz = defaults.get('adc_ddc_mix_frequency_hz',None)
+    adc_ddc_mixer_frequency_hz = defaults.get(
+        'adc_ddc_mixer_frequency_hz',
+        defaults.get('adc_ddc_mix_frequency_hz', None),
+    )
     nyquist_zone = defaults.get('nyquist_zone',None)
     dac_mixer_scale_1p0 = defaults.get('dac_mixer_scale_1p0',None)
     adc_mixer_scale_1p0 = defaults.get('adc_mixer_scale_1p0',None)
@@ -602,13 +605,10 @@ def initialise_pipeline_resources(r,r_fast,config_dict):
     if dac_duc_mixer_frequency_hz is not None:
         r.rfdc.core.set_fine_mixer_freq(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE,dac_duc_mixer_frequency_hz/1e6)
         r.rfdc.core.set_fine_mixer_freq(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE,dac_duc_mixer_frequency_hz/1e6)
-    if adc_ddc_mix_frequency_hz is not None:
-        r.rfdc.core.set_fine_mixer_freq(adc_tile,adc_block,r.rfdc.core.ADC_TILE,adc_ddc_mix_frequency_hz/1e6)
+    if adc_ddc_mixer_frequency_hz is not None:
+        r.rfdc.core.set_fine_mixer_freq(adc_tile,adc_block,r.rfdc.core.ADC_TILE,adc_ddc_mixer_frequency_hz/1e6)
     if nyquist_zone is not None:
         set_nyquist_zone(r,config_dict,nyquist_zone,inv_sinc=False)
-    # Ensure config has current mixer frequencies (set_nyquist_zone may have updated them)
-    config_dict['firmware']['defaults']['dac_duc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)['Freq'])*1e6
-    config_dict['firmware']['defaults']['adc_ddc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['Freq'])*1e6
     if dac_mixer_scale_1p0 is not None:
         if dac_mixer_scale_1p0:
             r.rfdc.core.set_mixer_scale(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE,r.rfdc.core.MIX_SCALE_1P0)
@@ -638,7 +638,12 @@ def initialise_pipeline_resources(r,r_fast,config_dict):
     if pfb_fftshift is not None:
         r.pfb.set_fftshift(pfb_fftshift)
     if frequencies:
-        set_tone_frequencies(r, config_dict, frequencies)
+        try:
+            r_fast.mixer.host.transport.axil_mm
+            r_fast.mixer.host.transport._get_device_address
+            set_tone_frequencies_fast(r, r_fast, config_dict, frequencies)
+        except AttributeError:
+            set_tone_frequencies(r, config_dict, frequencies)
     if amplitudes:
         set_tone_amplitudes(r, config_dict, amplitudes)
     if phases:
@@ -675,89 +680,6 @@ def _get_git_commit(repo_path):
             return commit
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
-
-
-def get_system_information(r, config_dict):
-    """Legacy flat-dict system information.
-
-    Deprecated — use the structured info_* section helpers or the server
-    get_info() dispatcher instead.  This function is retained for backward
-    compatibility and rebuilds the original flat dict from the new helpers.
-    """
-    warnings.warn('get_system_information() is deprecated, use get_info() sections instead',
-                  DeprecationWarning, stacklevel=2)
-
-    info = {}
-
-    # Versions
-    v = info_versions()
-    for k in ('souk_readout_tools_version', 'souk_mkid_readout_sw_version',
-              'souk_mkid_readout_fw_version', 'souk_readout_tools_commit',
-              'souk_firmware_commit', 'souk_peripherals_commit'):
-        info[k] = v.get(k)
-
-    # Clock
-    c = info_clock()
-    info['clock_source'] = c['source']
-    info['clock_locked'] = c['all_locked']
-    info['clock_chips'] = c['chips']
-
-    # FPGA
-    f = info_fpga(r)
-    info['fpga_status'] = f.get('fpga_status')
-    info['fpg_file'] = f.get('fpg_file')
-    info['pipeline_id'] = f.get('pipeline_id')
-    info['adc_clk_hz'] = f.get('adc_clk_hz')
-
-    # Initialisation level (reproduced here for backward compat)
-    programmed = r is not None and r.fpga.is_programmed()
-    shared_ready = programmed and hasattr(r, 'autocorr')
-    pipeline_ready = (shared_ready and hasattr(r, 'output') and hasattr(r, 'accumulators')
-                      and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0)
-    if pipeline_ready:
-        info['initialisation_level'] = 'pipeline'
-    elif shared_ready:
-        info['initialisation_level'] = 'shared'
-    elif programmed:
-        info['initialisation_level'] = 'programmed'
-    else:
-        info['initialisation_level'] = 'not_programmed'
-
-    # Pipeline
-    p = info_pipeline(r)
-    info['output_mode'] = p.get('output_mode')
-    info['sync_delay'] = p.get('sync_delay')
-    info['internal_loopback'] = p.get('internal_loopback')
-    info['psb_scale'] = p.get('psb_scale')
-    info['psb_fftshift'] = p.get('psb_fftshift')
-    info['pfb_fftshift'] = p.get('pfb_fftshift')
-    info['acc_len'] = p.get('acc_len')
-    info['acc_freq'] = p.get('acc_freq_hz')
-
-    # RFDC
-    rd = info_rfdc(r, config_dict)
-    for k in ('dsa', 'vop_dac0', 'vop_dac1', 'dac_duc_mixer_frequency_hz',
-              'adc_ddc_mix_frequency_hz', 'nyquist_zone_adc', 'nyquist_zone_dac0',
-              'nyquist_zone_dac1', 'mixer_scale_1p0_dac0', 'mixer_scale_1p0_dac1',
-              'mixer_scale_1p0_adc', 'adc_cal_frozen', 'rts_events'):
-        info[k] = rd.get(k)
-    # Legacy keys use 'mixer_qmc_settings_*' prefix
-    info['mixer_qmc_settings_dac0'] = rd.get('qmc_settings_dac0')
-    info['mixer_qmc_settings_dac1'] = rd.get('qmc_settings_dac1')
-    info['mixer_qmc_settings_adc'] = rd.get('qmc_settings_adc')
-
-    # Tones
-    t = info_tones(r, config_dict)
-    info['tone_frequencies'] = t.get('frequencies_hz')
-    info['tone_amplitudes'] = t.get('amplitudes')
-    info['tone_phases'] = t.get('phases_rad')
-    info['tone_indices'] = t.get('firmware_indices')
-
-    print('system information:')
-    for key, value in info.items():
-        print(f'{key}: {value}\n')
-
-    return info
 
 
 # ---------------------------------------------------------------------------
@@ -1132,22 +1054,23 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
             r.rfdc.core.set_fine_mixer_freq(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE, dac_duc_mixer_frequency_hz/1e6)
             r.rfdc.core.set_fine_mixer_freq(dac1_tile, dac1_block, r.rfdc.core.DAC_TILE, dac_duc_mixer_frequency_hz/1e6)
 
-    if changed('adc_ddc_mix_frequency_hz'):
-        adc_ddc_mix_frequency_hz = defaults.get('adc_ddc_mix_frequency_hz')
-        if adc_ddc_mix_frequency_hz is not None:
-            print(f'apply_config: setting adc_ddc_mix_frequency_hz = {adc_ddc_mix_frequency_hz}')
-            r.rfdc.core.set_fine_mixer_freq(adc_tile, adc_block, r.rfdc.core.ADC_TILE, adc_ddc_mix_frequency_hz/1e6)
+    def changed_any(*keys):
+        return any(changed(key) for key in keys)
+
+    if changed_any('adc_ddc_mixer_frequency_hz', 'adc_ddc_mix_frequency_hz'):
+        adc_ddc_mixer_frequency_hz = defaults.get(
+            'adc_ddc_mixer_frequency_hz',
+            defaults.get('adc_ddc_mix_frequency_hz'),
+        )
+        if adc_ddc_mixer_frequency_hz is not None:
+            print(f'apply_config: setting adc_ddc_mixer_frequency_hz = {adc_ddc_mixer_frequency_hz}')
+            r.rfdc.core.set_fine_mixer_freq(adc_tile, adc_block, r.rfdc.core.ADC_TILE, adc_ddc_mixer_frequency_hz/1e6)
 
     if changed('nyquist_zone'):
         nyquist_zone = defaults.get('nyquist_zone')
         if nyquist_zone is not None:
             print(f'apply_config: setting nyquist_zone = {nyquist_zone}')
             set_nyquist_zone(r, new_config_dict, nyquist_zone, inv_sinc=False)
-
-    # Ensure config has current mixer frequencies after any changes
-    if changed('dac_duc_mixer_frequency_hz') or changed('adc_ddc_mix_frequency_hz') or changed('nyquist_zone'):
-        new_config_dict['firmware']['defaults']['dac_duc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)['Freq'])*1e6
-        new_config_dict['firmware']['defaults']['adc_ddc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['Freq'])*1e6
 
     if changed('dac_mixer_scale_1p0'):
         dac_mixer_scale_1p0 = defaults.get('dac_mixer_scale_1p0')
@@ -1213,7 +1136,12 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
         frequencies = defaults.get('frequencies', [])
         if frequencies:
             print(f'apply_config: setting frequencies ({len(frequencies)} tones)')
-            set_tone_frequencies(r, new_config_dict, frequencies)
+            try:
+                r_fast.mixer.host.transport.axil_mm
+                r_fast.mixer.host.transport._get_device_address
+                set_tone_frequencies_fast(r, r_fast, new_config_dict, frequencies)
+            except AttributeError:
+                set_tone_frequencies(r, new_config_dict, frequencies)
 
     if changed('amplitudes'):
         amplitudes = defaults.get('amplitudes', [])
@@ -1337,10 +1265,6 @@ def set_nyquist_zone(r,config_dict,nyquist_zone,inv_sinc=False):
         else:
             r.rfdc.core.set_invsinc_fir(dac0_tile,dac0_block,r.rfdc.core.INVSINC_FIR_DISABLED)
             r.rfdc.core.set_invsinc_fir(dac1_tile,dac1_block,r.rfdc.core.INVSINC_FIR_DISABLED)
-
-    # Store actual mixer frequencies in config so fast functions can access them without RFDC
-    config_dict['firmware']['defaults']['dac_duc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE)['Freq'])*1e6
-    config_dict['firmware']['defaults']['adc_ddc_mixer_frequency_hz'] = float(r.rfdc.core.get_mixer_settings(adc_tile,adc_block,r.rfdc.core.ADC_TILE)['Freq'])*1e6
 
     return
 
@@ -2146,8 +2070,53 @@ def compute_vacc_tone_indices(tx_nearest_bins, n_lo, min_tone_separation=6):
     return tone_indices
 
 
+def _validate_per_tone_values(values, num_tones, name):
+    if values is None:
+        return None
+    values = np.atleast_1d(values).astype(float)
+    if len(values) != num_tones:
+        raise ValueError(
+            f'Number of {name} ({len(values)}) must match number of tones ({num_tones})')
+    return values
 
-def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indices=None, min_tone_separation=6):
+
+def _get_current_per_tone_values(getter, r, config_dict, num_tones):
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            values = np.atleast_1d(getter(r, config_dict))
+    except Exception:
+        return None
+    if len(values) != num_tones:
+        return None
+    return values
+
+
+def _max_tones_per_bin(bin_indices):
+    bin_indices = np.asarray(bin_indices)
+    if bin_indices.size == 0:
+        return 0
+    if bin_indices.ndim == 1:
+        _, counts = np.unique(bin_indices, return_counts=True)
+        return int(np.max(counts)) if counts.size else 0
+    return max(_max_tones_per_bin(row) for row in bin_indices)
+
+
+def _protect_tone_amplitudes_for_vacc(tone_amplitudes, max_tones_per_bin):
+    tone_amplitudes = np.asarray(tone_amplitudes, dtype=float)
+    max_tones_per_bin = max(1, int(max_tones_per_bin))
+    max_amp = (1 - 2**-12) / max_tones_per_bin
+    peak_amp = float(np.max(np.abs(tone_amplitudes))) if tone_amplitudes.size else 0.0
+    if peak_amp <= max_amp or peak_amp == 0:
+        return tone_amplitudes, 1.0, max_amp
+    scale_factor = max_amp / peak_amp
+    return tone_amplitudes * scale_factor, scale_factor, max_amp
+
+
+
+def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indices=None,
+                                    min_tone_separation=6, tone_amplitudes=None,
+                                    tone_phases=None):
     """
     Prepare the tone frequency settings for applying to the RFSOC.
 
@@ -2270,6 +2239,11 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
     ri_steps_tx = np.cos(phase_incs_tx) + 1j*np.sin(phase_incs_tx)
     ri_steps_rx = np.cos(phase_incs_rx) + 1j*np.sin(phase_incs_rx)
 
+    tone_amplitudes = _validate_per_tone_values(
+        tone_amplitudes, num_tones, 'tone_amplitudes')
+    tone_phases = _validate_per_tone_values(
+        tone_phases, num_tones, 'tone_phases')
+
     # Build full-sized arrays with values at the correct tone_indices positions
     # This is required because prepare_control_buffer_data expects full arrays
     n_chans = r.mixer.n_chans
@@ -2283,12 +2257,30 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
     ri_steps_tx_full[tone_indices] = ri_steps_tx
     ri_steps_rx_full[tone_indices] = ri_steps_rx
 
+    lo_control_values = {
+        'tx': {
+            'phase_steps': phase_incs_tx_full,
+            'ri_steps': ri_steps_tx_full,
+        },
+        'rx': {
+            'phase_steps': phase_incs_rx_full,
+            'ri_steps': ri_steps_rx_full,
+        },
+    }
+    if tone_amplitudes is not None:
+        scaling_full = np.zeros(n_chans, dtype=float)
+        scaling_full[tone_indices] = tone_amplitudes
+        lo_control_values['tx']['scaling'] = scaling_full
+        lo_control_values['rx']['scaling'] = scaling_full
+    if tone_phases is not None:
+        phase_offsets_full = np.zeros(n_chans, dtype=float)
+        phase_offsets_full[tone_indices] = tone_phases
+        lo_control_values['tx']['phase_offsets'] = phase_offsets_full
+        lo_control_values['rx']['phase_offsets'] = phase_offsets_full
+
     #prepare the formatted lo control buffer values
     buf = get_next_buffer_idx(r)
-    v = prepare_control_buffer_data(r,buf,{'tx':{'phase_steps':phase_incs_tx_full,
-                                            'ri_steps':ri_steps_tx_full},
-                                      'rx':{'phase_steps':phase_incs_rx_full,
-                                            'ri_steps':ri_steps_rx_full}})
+    v = prepare_control_buffer_data(r, buf, lo_control_values)
 
     # phase_incs_tx_formatted = _format_phase_steps(phase_incs_tx,r.mixer._phase_bp)
     # phase_incs_rx_formatted = _format_phase_steps(phase_incs_rx,r.mixer._phase_bp)
@@ -2388,7 +2380,10 @@ def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True):
     r.sync.sw_sync()
     return
 
-def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, tone_indices=None, min_tone_separation=6, detailed_output=False):
+def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
+                                         tone_indices=None, min_tone_separation=6,
+                                         detailed_output=False,
+                                         tone_amplitudes=None, tone_phases=None):
     """
     Prepare the tone frequency settings for applying to the RFSOC.
 
@@ -2422,14 +2417,17 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, tone_
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
     defaults = config_dict['firmware']['defaults']
-    dac_nyquist_zone = defaults['nyquist_zone']
-    adc_nyquist_zone = defaults['nyquist_zone']
-    # DUC/DDC mixer frequencies: use stored values if available, otherwise derive from nyquist zone
+    dac_nyquist_zone = defaults.get('nyquist_zone')
+    adc_nyquist_zone = defaults.get('nyquist_zone')
     _fs = 2 * r.adc_clk_hz  # RFDC sampling frequency
-    duc_frequency = defaults.get('dac_duc_mixer_frequency_hz',
-        _fs / 4 if dac_nyquist_zone == 1 else -_fs * 3 / 4)
-    ddc_frequency = defaults.get('adc_ddc_mixer_frequency_hz',
-        -_fs / 4 if adc_nyquist_zone == 1 else _fs * 3 / 4)
+    if dac_nyquist_zone is not None:
+        duc_frequency = _fs / 4 if int(dac_nyquist_zone) == 1 else -_fs * 3 / 4
+    else:
+        duc_frequency = defaults.get('dac_duc_mixer_frequency_hz', 0)
+    if adc_nyquist_zone is not None:
+        ddc_frequency = -_fs / 4 if int(adc_nyquist_zone) == 1 else _fs * 3 / 4
+    else:
+        ddc_frequency = defaults.get('adc_ddc_mixer_frequency_hz', 0)
 
     #constants
     nc = r.mixer.n_chans
@@ -2512,6 +2510,11 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, tone_
     ri_steps_tx = np.cos(phase_incs_tx) + 1j*np.sin(phase_incs_tx)
     ri_steps_rx = np.cos(phase_incs_rx) + 1j*np.sin(phase_incs_rx)
 
+    tone_amplitudes = _validate_per_tone_values(
+        tone_amplitudes, num_tones, 'tone_amplitudes')
+    tone_phases = _validate_per_tone_values(
+        tone_phases, num_tones, 'tone_phases')
+
     # #zero pad out to nchans
     # phase_incs_tx = np.pad(phase_incs_tx, (0,nc-len(phase_incs_tx)), 'constant', constant_values=(0,0))
     # phase_incs_rx = np.pad(phase_incs_rx, (0,nc-len(phase_incs_rx)), 'constant', constant_values=(0,0))
@@ -2519,11 +2522,18 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, tone_
     # ri_steps_rx = np.pad(ri_steps_rx, (0,nc-len(ri_steps_rx)), 'constant', constant_values=(0,0))
 
     # Pass tone_indices to prepare_control_buffer_data_fast for correct sparse indexing
-    v,i = prepare_control_buffer_data_fast(r,0,{'tx':{'phase_steps':phase_incs_tx,
-                                            'ri_steps':ri_steps_tx},
-                                      'rx':{'phase_steps':phase_incs_rx,
-                                            'ri_steps':ri_steps_rx}},
-                                      tone_indices=tone_indices)
+    lo_control_values = {
+        'tx': {'phase_steps': phase_incs_tx, 'ri_steps': ri_steps_tx},
+        'rx': {'phase_steps': phase_incs_rx, 'ri_steps': ri_steps_rx},
+    }
+    if tone_amplitudes is not None:
+        lo_control_values['tx']['scaling'] = tone_amplitudes
+        lo_control_values['rx']['scaling'] = tone_amplitudes
+    if tone_phases is not None:
+        lo_control_values['tx']['phase_offsets'] = tone_phases
+        lo_control_values['rx']['phase_offsets'] = tone_phases
+    v,i = prepare_control_buffer_data_fast(r, 0, lo_control_values,
+                                           tone_indices=tone_indices)
     # #format the phase increments and ri steps for the mixer LOs
     # phase_incs_tx_formatted = _format_phase_steps(phase_incs_tx,r.mixer._phase_bp,fmt='<i4')
     # phase_incs_rx_formatted = _format_phase_steps(phase_incs_rx,r.mixer._phase_bp,fmt='<i4')
@@ -2572,7 +2582,9 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies, tone_
         return tone_settings_dict
 
 
-def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone_separation=6, detailed_output=False):
+def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
+                                min_tone_separation=6, detailed_output=False,
+                                tone_amplitudes=None, tone_phases=None):
     """
     Prepare sweep step settings with VACC-aware tone index assignment.
 
@@ -2596,14 +2608,17 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
     defaults = config_dict['firmware']['defaults']
-    dac_nyquist_zone = defaults['nyquist_zone']
-    adc_nyquist_zone = defaults['nyquist_zone']
-    # DUC/DDC mixer frequencies: use stored values if available, otherwise derive from nyquist zone
+    dac_nyquist_zone = defaults.get('nyquist_zone')
+    adc_nyquist_zone = defaults.get('nyquist_zone')
     _fs = 2 * r_fast.adc_clk_hz  # RFDC sampling frequency
-    duc_frequency = defaults.get('dac_duc_mixer_frequency_hz',
-        _fs / 4 if dac_nyquist_zone == 1 else -_fs * 3 / 4)
-    ddc_frequency = defaults.get('adc_ddc_mixer_frequency_hz',
-        -_fs / 4 if adc_nyquist_zone == 1 else _fs * 3 / 4)
+    if dac_nyquist_zone is not None:
+        duc_frequency = _fs / 4 if int(dac_nyquist_zone) == 1 else -_fs * 3 / 4
+    else:
+        duc_frequency = defaults.get('dac_duc_mixer_frequency_hz', 0)
+    if adc_nyquist_zone is not None:
+        ddc_frequency = -_fs / 4 if int(adc_nyquist_zone) == 1 else _fs * 3 / 4
+    else:
+        ddc_frequency = defaults.get('adc_ddc_mixer_frequency_hz', 0)
 
     #constants
     nc = r_fast.mixer.n_chans
@@ -2675,6 +2690,23 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone
     #get the nearest filterbank center frequencies for each tone
     tx_nearest_bins = get_closest_bin_indices(dbb_freqs_tx, all_tx_bin_centers_hz)
     rx_nearest_bins = get_closest_bin_indices(dbb_freqs_rx, all_rx_bin_centers_hz)
+    max_tones_per_bin = _max_tones_per_bin(tx_nearest_bins)
+
+    tone_amplitudes = _validate_per_tone_values(
+        tone_amplitudes, num_tones, 'tone_amplitudes')
+    tone_phases = _validate_per_tone_values(
+        tone_phases, num_tones, 'tone_phases')
+    amplitude_scale_factor = 1.0
+    vacc_max_amplitude = None
+    if tone_amplitudes is not None:
+        tone_amplitudes, amplitude_scale_factor, vacc_max_amplitude = (
+            _protect_tone_amplitudes_for_vacc(
+                tone_amplitudes, max_tones_per_bin))
+        if amplitude_scale_factor < 1.0:
+            print(
+                f'prepare_sweep_settings_fast: reducing tone amplitudes by '
+                f'{amplitude_scale_factor:.4f} for up to '
+                f'{max_tones_per_bin} tones per FFT bin during sweep')
 
     #get the frequency offsets for each tone
     tx_freq_offsets_hz = dbb_freqs_tx - all_tx_bin_centers_hz[tx_nearest_bins]
@@ -2740,12 +2772,25 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone
         # ri_steps_tx_formatted_padded[p,:len(ri_steps_tx_formatted[p])] = ri_steps_tx_formatted[p]
         # ri_steps_rx_formatted_padded[p,:len(ri_steps_rx_formatted[p])] = ri_steps_rx_formatted[p]
         print('prep_sweep, prep_buf',p)
-        allv[p], alli[p] = prepare_control_buffer_data_fast(r_fast,allbuf[p],
-                                                            {'tx':{'phase_steps':phase_incs_tx[p],
-                                                                   'ri_steps':ri_steps_tx[p]},
-                                                             'rx':{'phase_steps':phase_incs_rx[p],
-                                                                   'ri_steps':ri_steps_rx[p]}},
-                                                            tone_indices=tone_indices_arr[p])
+        lo_control_values = {
+            'tx': {
+                'phase_steps': phase_incs_tx[p],
+                'ri_steps': ri_steps_tx[p],
+            },
+            'rx': {
+                'phase_steps': phase_incs_rx[p],
+                'ri_steps': ri_steps_rx[p],
+            },
+        }
+        if tone_amplitudes is not None:
+            lo_control_values['tx']['scaling'] = tone_amplitudes
+            lo_control_values['rx']['scaling'] = tone_amplitudes
+        if tone_phases is not None:
+            lo_control_values['tx']['phase_offsets'] = tone_phases
+            lo_control_values['rx']['phase_offsets'] = tone_phases
+        allv[p], alli[p] = prepare_control_buffer_data_fast(
+            r_fast, allbuf[p], lo_control_values,
+            tone_indices=tone_indices_arr[p])
         #set the filterbank channel maps
         # v7.9: use inmap for psb_chanselect (chanmap_psb_inmap[lo_index] = fft_bin)
         chanmap_psb_inmap[p, tone_indices_arr[p]] = tx_nearest_bins[p]
@@ -2780,7 +2825,10 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies, min_tone
                             'skip_chanmap_psb_inmap':skip_chanmap_psb_inmap,
                             'skip_chanmap_pfb':skip_chanmap_pfb,
                             'tone_indices':tone_indices_arr,
-                            'num_tones':num_tones}
+                            'num_tones':num_tones,
+                            'max_tones_per_bin':max_tones_per_bin,
+                            'amplitude_scale_factor':amplitude_scale_factor,
+                            'vacc_max_amplitude':vacc_max_amplitude}
 
     return sweep_settings_dict
 
@@ -3083,7 +3131,10 @@ def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, 
     #     r_fast.sync.sw_sync()
 
 
-def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None, min_tone_separation=6, autosync=True, detailed_output=False):
+def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
+                         min_tone_separation=6, autosync=True,
+                         detailed_output=False, tone_amplitudes=None,
+                         tone_phases=None):
     """
     Set the tone frequencies in the RFSOC.
 
@@ -3109,10 +3160,20 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None, mi
     TODO: account for dual dac mode, for now assume all on dac 0
 
     """
+    num_tones = len(np.atleast_1d(tone_frequencies))
+    if tone_amplitudes is None:
+        tone_amplitudes = _get_current_per_tone_values(
+            get_tone_amplitudes, r, config_dict, num_tones)
+    if tone_phases is None:
+        tone_phases = _get_current_per_tone_values(
+            get_tone_phases, r, config_dict, num_tones)
 
-    tone_frequency_settings, details = prepare_tone_frequency_settings(r, config_dict, tone_frequencies,
-                                                                        tone_indices=tone_indices,
-                                                                        min_tone_separation=min_tone_separation)
+    tone_frequency_settings, details = prepare_tone_frequency_settings(
+        r, config_dict, tone_frequencies,
+        tone_indices=tone_indices,
+        min_tone_separation=min_tone_separation,
+        tone_amplitudes=tone_amplitudes,
+        tone_phases=tone_phases)
     apply_tone_frequency_settings(r, tone_frequency_settings, autosync=autosync)
 
     r.sync.arm_sync(wait=False)
@@ -3124,7 +3185,10 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None, mi
     else:
         return
 
-def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies, tone_indices=None, min_tone_separation=6, autosync=True):
+def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
+                              tone_indices=None, min_tone_separation=6,
+                              autosync=True, tone_amplitudes=None,
+                              tone_phases=None):
     """
     Set the tone frequencies in the RFSOC using the fast firmware interface.
 
@@ -3147,10 +3211,20 @@ def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies, tone_ind
                          (only used when tone_indices is None). Default is 6.
     autosync: if True, sync after setting tones
     """
+    num_tones = len(np.atleast_1d(tone_frequencies))
+    if tone_amplitudes is None:
+        tone_amplitudes = _get_current_per_tone_values(
+            get_tone_amplitudes, r, config_dict, num_tones)
+    if tone_phases is None:
+        tone_phases = _get_current_per_tone_values(
+            get_tone_phases, r, config_dict, num_tones)
 
-    tone_frequency_settings = prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
-                                                                    tone_indices=tone_indices,
-                                                                    min_tone_separation=min_tone_separation)
+    tone_frequency_settings = prepare_tone_frequency_settings_fast(
+        r_fast, config_dict, tone_frequencies,
+        tone_indices=tone_indices,
+        min_tone_separation=min_tone_separation,
+        tone_amplitudes=tone_amplitudes,
+        tone_phases=tone_phases)
     apply_tone_frequency_settings_fast(r, r_fast, tone_frequency_settings, autosync=autosync)
 
     return
@@ -3426,8 +3500,6 @@ def set_tone_phases(r, config_dict, tone_phases, autosync=True):
 
 
 
-
-
 def psb_chanselect_set_channel_outmap_pre79(r, outmap):
     """
     *** vectorised version of set_channel_outmap for psb_chanselect***
@@ -3552,7 +3624,22 @@ def psb_chanselect_get_channel_outmap_pre79(r):
         return outmap
 
 
-# New function to set channel in-map for the VACC-based PSB reorder
+def psb_chanselect_set_channel_inmap_slow(r, inmap):
+    """
+    Slow KATCP/builtin version of psb_chanselect_set_channel_inmap.
+    Kept for comparing the fast direct-memory implementation at runtime.
+    """
+    r.psb_chanselect.set_channel_inmap(inmap)
+
+
+def psb_chanselect_get_channel_inmap_slow(r):
+    """
+    Slow KATCP/builtin version of psb_chanselect_get_channel_inmap.
+    Kept for comparing the fast direct-memory implementation at runtime.
+    """
+    return r.psb_chanselect.get_channel_inmap()
+
+
 def psb_chanselect_set_channel_inmap(r, inmap):
     """
     Remap the channels such that input channel `i`
@@ -3563,47 +3650,102 @@ def psb_chanselect_set_channel_inmap(r, inmap):
         output channel 0.
     :type inmap: list
     """
+    psb = r.psb_chanselect
 
-    r.psb_chanselect.set_channel_inmap(inmap)
-    if False:
-            
-        if not hasattr(r.psb_chanselect, '_cached_block_id'):
-            n_exp = r.psb_chanselect._expansion_factor
-            n_par_samp = r.psb_chanselect.n_parallel_samples
-            n_par_chans = r.psb_chanselect.n_parallel_chans_out
+    if not hasattr(psb, '_fast_inmap_cached'):
+        n_exp = psb._expansion_factor
+        reorder_depth = psb._reorder_depth
+        n_parallel_samples = psb.n_parallel_samples
+        n_parallel_chans_out = psb.n_parallel_chans_out
+        n_chans_out = psb.n_chans_out
+        discard_bin = np.uint32(psb.DISCARD_BIN)
+        outchans = np.arange(n_chans_out, dtype=np.int64)
+        block_id = ((outchans // n_parallel_samples) % n_exp).astype(np.intp)
+        block_offset = (
+            (outchans // n_parallel_chans_out) * n_parallel_samples
+            + (outchans % n_parallel_samples)
+        ).astype(np.intp)
 
-            r.psb_chanselect._c_n_exp = n_exp
-            r.psb_chanselect._c_n_chans_in = r.psb_chanselect.n_chans_in
-            r.psb_chanselect._c_n_chans_out = r.psb_chanselect.n_chans_out
-            r.psb_chanselect._c_discard_bin = r.psb_chanselect.DISCARD_BIN
-            r.psb_chanselect._c_discard_bit = r.psb_chanselect.DISCARD_BIT
-            r.psb_chanselect._c_addr_mask = r.psb_chanselect.ADDR_MASK
+        serial_maps_blank = np.empty((n_exp, reorder_depth), dtype=np.uint32)
+        serial_maps_blank[:] = discard_bin
+        offset_to_outchan = np.empty((n_exp, reorder_depth), dtype=np.uint32)
+        offset_to_outchan[:] = discard_bin
+        offset_to_outchan[block_id, block_offset] = outchans.astype(np.uint32)
+        map_regs = [f'map{i}_{psb._map_reg}' for i in range(n_exp)]
 
-            outchans = np.arange(r.psb_chanselect._c_n_chans_out)
-            r.psb_chanselect._cached_block_id = (outchans // n_par_samp) % n_exp
-            r.psb_chanselect._cached_block_offset = (outchans // n_par_chans) * n_par_samp + (outchans % n_par_samp)
+        psb._fast_inmap_n_exp = n_exp
+        psb._fast_inmap_reorder_depth = reorder_depth
+        psb._fast_inmap_n_chans_in = psb.n_chans_in
+        psb._fast_inmap_n_chans_out = n_chans_out
+        psb._fast_inmap_discard_bin = discard_bin
+        psb._fast_inmap_discard_bit = np.uint32(psb.DISCARD_BIT)
+        psb._fast_inmap_addr_mask = np.uint32(psb.ADDR_MASK)
+        psb._fast_inmap_block_id = block_id
+        psb._fast_inmap_block_offset = block_offset
+        psb._fast_inmap_serial_maps_blank = serial_maps_blank
+        psb._fast_inmap_offset_to_outchan = offset_to_outchan
+        psb._fast_inmap_input_idx = np.arange(psb.n_chans_in)
+        psb._fast_inmap_map_regs = map_regs
+        psb._fast_inmap_fast_nbytes = reorder_depth * 4
+        psb._fast_inmap_fast_dtype = np.dtype('<u4')
+        psb._fast_inmap_slow_dtype = np.dtype('u4').newbyteorder(np.dtype(psb._map_format).byteorder)
+        try:
+            psb._fast_inmap_mm = psb.host.transport.axil_mm
+            psb._fast_inmap_map_addrs = [
+                psb.host.transport._get_device_address(f'{psb.prefix}{reg}')
+                for reg in map_regs
+            ]
+            psb._fast_inmap_use_devmem = True
+        except AttributeError:
+            psb._fast_inmap_mm = None
+            psb._fast_inmap_map_addrs = None
+            psb._fast_inmap_use_devmem = False
+        psb._fast_inmap_cached = True
 
-            r.psb_chanselect._cached_lookup = np.full((n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=int)
-            r.psb_chanselect._cached_lookup[r.psb_chanselect._cached_block_id, r.psb_chanselect._cached_block_offset] = outchans
+    n_chans_in = psb._fast_inmap_n_chans_in
+    n_chans_out = psb._fast_inmap_n_chans_out
+    discard_bin = psb._fast_inmap_discard_bin
+    discard_bit = psb._fast_inmap_discard_bit
 
-        # Initialize with DISCARD_BIN (has DISCARD_BIT set)
-        serial_maps = np.full((r.psb_chanselect._c_n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=np.uint32)
+    inmap_i64 = np.asarray(inmap, dtype=np.int64)
+    if inmap_i64.ndim != 1:
+        raise ValueError('PSB channel inmap must be a 1D array')
+    if len(inmap_i64) > n_chans_in:
+        raise ValueError(f'PSB channel inmap has {len(inmap_i64)} entries, '
+                         f'but firmware has only {n_chans_in} input channels')
 
-        inmap = np.asarray(inmap, dtype=np.uint32)
-        # Filter out discarded entries (those with DISCARD_BIT set)
-        valid_mask = (inmap & r.psb_chanselect._c_discard_bit) == 0
-        valid_inmap = inmap[valid_mask]
-        nin = len(valid_inmap)
+    serial_maps = psb._fast_inmap_serial_maps_blank.copy()
 
-        # Vectorized assignment
-        input_indices = np.where(valid_mask)[0][:nin]
-        serial_maps[r.psb_chanselect._cached_block_id[valid_inmap], input_indices] = r.psb_chanselect._cached_block_offset[valid_inmap]
+    inmap_u32 = np.empty(len(inmap_i64), dtype=np.uint32)
+    inmap_u32[:] = discard_bin
+    non_negative = inmap_i64 >= 0
+    inmap_u32[non_negative] = inmap_i64[non_negative].astype(np.uint32)
+    valid = non_negative & ((inmap_u32 & discard_bit) == 0)
 
-        # Write to hardware
-        for i in range(r.psb_chanselect._c_n_exp):
-            r.psb_chanselect.write(f'map{i}_{r.psb_chanselect._map_reg}', serial_maps[i].tobytes())
+    valid_outputs = inmap_i64[valid]
+    if np.any(valid_outputs >= n_chans_out):
+        bad = int(valid_outputs[valid_outputs >= n_chans_out][0])
+        raise ValueError(f'PSB channel inmap contains invalid output channel {bad}; '
+                         f'max valid channel is {n_chans_out - 1}')
 
-    
+    input_indices = np.nonzero(valid)[0].astype(np.intp)
+    if len(input_indices):
+        valid_outputs = valid_outputs.astype(np.intp)
+        serial_maps[psb._fast_inmap_block_id[valid_outputs], input_indices] = (
+            psb._fast_inmap_block_offset[valid_outputs].astype(np.uint32)
+        )
+
+    if psb._fast_inmap_use_devmem:
+        mm = psb._fast_inmap_mm
+        fast_dtype = psb._fast_inmap_fast_dtype
+        fast_nbytes = psb._fast_inmap_fast_nbytes
+        for i, addr in enumerate(psb._fast_inmap_map_addrs):
+            data = serial_maps[i].astype(fast_dtype, copy=False).tobytes()
+            mm[addr:addr + fast_nbytes] = data
+    else:
+        slow_dtype = psb._fast_inmap_slow_dtype
+        for i, reg in enumerate(psb._fast_inmap_map_regs):
+            psb.write(reg, serial_maps[i].astype(slow_dtype, copy=False).tobytes())
 
 
 def psb_chanselect_get_channel_inmap(r):
@@ -3613,50 +3755,102 @@ def psb_chanselect_get_channel_inmap(r):
         corresponds to the output channel to which input `i` contributes.
     :rtype: list
     """
-    im = r.psb_chanselect.get_channel_inmap()
-    return im
-    if False:
-            
-        if not hasattr(r.psb_chanselect, '_cached_block_id'):
-            n_exp = r.psb_chanselect._expansion_factor
-            n_par_samp = r.psb_chanselect.n_parallel_samples
-            n_par_chans = r.psb_chanselect.n_parallel_chans_out
+    psb = r.psb_chanselect
 
-            r.psb_chanselect._c_n_exp = n_exp
-            r.psb_chanselect._c_n_chans_in = r.psb_chanselect.n_chans_in
-            r.psb_chanselect._c_n_chans_out = r.psb_chanselect.n_chans_out
-            r.psb_chanselect._c_discard_bin = r.psb_chanselect.DISCARD_BIN
-            r.psb_chanselect._c_discard_bit = r.psb_chanselect.DISCARD_BIT
-            r.psb_chanselect._c_addr_mask = r.psb_chanselect.ADDR_MASK
+    if not hasattr(psb, '_fast_inmap_cached'):
+        n_exp = psb._expansion_factor
+        reorder_depth = psb._reorder_depth
+        n_parallel_samples = psb.n_parallel_samples
+        n_parallel_chans_out = psb.n_parallel_chans_out
+        n_chans_out = psb.n_chans_out
+        discard_bin = np.uint32(psb.DISCARD_BIN)
+        outchans = np.arange(n_chans_out, dtype=np.int64)
+        block_id = ((outchans // n_parallel_samples) % n_exp).astype(np.intp)
+        block_offset = (
+            (outchans // n_parallel_chans_out) * n_parallel_samples
+            + (outchans % n_parallel_samples)
+        ).astype(np.intp)
+        offset_to_outchan = np.empty((n_exp, reorder_depth), dtype=np.uint32)
+        offset_to_outchan[:] = discard_bin
+        offset_to_outchan[block_id, block_offset] = outchans.astype(np.uint32)
+        serial_maps_blank = np.empty((n_exp, reorder_depth), dtype=np.uint32)
+        serial_maps_blank[:] = discard_bin
+        map_regs = [f'map{i}_{psb._map_reg}' for i in range(n_exp)]
 
-            outchans = np.arange(r.psb_chanselect._c_n_chans_out)
-            r.psb_chanselect._cached_block_id = (outchans // n_par_samp) % n_exp
-            r.psb_chanselect._cached_block_offset = (outchans // n_par_chans) * n_par_samp + (outchans % n_par_samp)
+        psb._fast_inmap_n_exp = n_exp
+        psb._fast_inmap_reorder_depth = reorder_depth
+        psb._fast_inmap_n_chans_in = psb.n_chans_in
+        psb._fast_inmap_n_chans_out = n_chans_out
+        psb._fast_inmap_discard_bin = discard_bin
+        psb._fast_inmap_discard_bit = np.uint32(psb.DISCARD_BIT)
+        psb._fast_inmap_addr_mask = np.uint32(psb.ADDR_MASK)
+        psb._fast_inmap_block_id = block_id
+        psb._fast_inmap_block_offset = block_offset
+        psb._fast_inmap_serial_maps_blank = serial_maps_blank
+        psb._fast_inmap_offset_to_outchan = offset_to_outchan
+        psb._fast_inmap_input_idx = np.arange(psb.n_chans_in)
+        psb._fast_inmap_map_regs = map_regs
+        psb._fast_inmap_fast_nbytes = reorder_depth * 4
+        psb._fast_inmap_fast_dtype = np.dtype('<u4')
+        psb._fast_inmap_slow_dtype = np.dtype('u4').newbyteorder(np.dtype(psb._map_format).byteorder)
+        try:
+            psb._fast_inmap_mm = psb.host.transport.axil_mm
+            psb._fast_inmap_map_addrs = [
+                psb.host.transport._get_device_address(f'{psb.prefix}{reg}')
+                for reg in map_regs
+            ]
+            psb._fast_inmap_use_devmem = True
+        except AttributeError:
+            psb._fast_inmap_mm = None
+            psb._fast_inmap_map_addrs = None
+            psb._fast_inmap_use_devmem = False
+        psb._fast_inmap_cached = True
 
-            r.psb_chanselect._cached_lookup = np.full((n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=int)
-            r.psb_chanselect._cached_lookup[r.psb_chanselect._cached_block_id, r.psb_chanselect._cached_block_offset] = outchans
+    n_exp = psb._fast_inmap_n_exp
+    reorder_depth = psb._fast_inmap_reorder_depth
+    n_chans_in = psb._fast_inmap_n_chans_in
+    serial_maps = np.empty((n_exp, reorder_depth), dtype=np.uint32)
+    if psb._fast_inmap_use_devmem:
+        mm = psb._fast_inmap_mm
+        fast_dtype = psb._fast_inmap_fast_dtype
+        fast_nbytes = psb._fast_inmap_fast_nbytes
+        for i, addr in enumerate(psb._fast_inmap_map_addrs):
+            raw = mm[addr:addr + fast_nbytes]
+            serial_maps[i] = np.frombuffer(raw, dtype=fast_dtype).copy()
+    else:
+        slow_dtype = psb._fast_inmap_slow_dtype
+        nbytes = reorder_depth * slow_dtype.itemsize
+        for i, reg in enumerate(psb._fast_inmap_map_regs):
+            raw = psb.read(reg, nbytes)
+            serial_maps[i] = np.frombuffer(raw, dtype=slow_dtype).astype(np.uint32)
 
-        # Read the reorder memory contents
-        nbytes = r.psb_chanselect._reorder_depth * np.dtype(np.uint32).itemsize
-        serial_maps = np.full((r.psb_chanselect._c_n_exp, r.psb_chanselect._reorder_depth), r.psb_chanselect._c_discard_bin, dtype=np.uint32)
-        for i in range(r.psb_chanselect._c_n_exp):
-            serial_maps[i] = np.frombuffer(r.psb_chanselect.read(f'map{i}_{r.psb_chanselect._map_reg}', nbytes), dtype=np.uint32).view(np.uint32)
+    serial_maps = serial_maps[:, :n_chans_in]
+    is_valid = (serial_maps & psb._fast_inmap_discard_bit) == 0
+    has_mapping = np.any(is_valid, axis=0)
+    first_exp = np.argmax(is_valid, axis=0)
+    stored = (serial_maps[first_exp, psb._fast_inmap_input_idx] & psb._fast_inmap_addr_mask).astype(np.intp)
 
-        # Check for valid mappings: entries without DISCARD_BIT set
-        is_valid = (serial_maps[:, :r.psb_chanselect._c_n_chans_in] & r.psb_chanselect._c_discard_bit) == 0
-        first_exp = np.argmax(is_valid, axis=0)
-        has_mapping = np.any(is_valid, axis=0)
+    inmap = np.empty(n_chans_in, dtype=np.uint32)
+    inmap[:] = psb._fast_inmap_discard_bin
 
-        # Gather stored values and lookup
-        input_idx = np.arange(r.psb_chanselect._c_n_chans_in)
-        # Mask out the discard bit to get actual offset values
-        stored = (serial_maps[first_exp, input_idx] & r.psb_chanselect._c_addr_mask).astype(int)
+    stored_ok = stored < reorder_depth
+    valid = has_mapping & stored_ok
+    if np.any(valid):
+        inmap[valid] = psb._fast_inmap_offset_to_outchan[first_exp[valid], stored[valid]]
 
-        # Build result
-        inmap = np.full(r.psb_chanselect._c_n_chans_in, r.psb_chanselect._c_discard_bin, dtype=int)
-        inmap[has_mapping] = r.psb_chanselect._cached_lookup[first_exp[has_mapping], stored[has_mapping]]
+    invalid = has_mapping & ~stored_ok
+    if np.any(invalid):
+        logger = getattr(psb, 'logger', None)
+        if logger is not None:
+            bad_input = int(np.nonzero(invalid)[0][0])
+            logger.warning(
+                'psb_chanselect_get_channel_inmap: unexpected mapping value '
+                '0x%08x for input %d; treating as discard',
+                int(serial_maps[first_exp[bad_input], bad_input]),
+                bad_input,
+            )
 
-        return inmap
+    return inmap
 
 
 
@@ -3906,6 +4100,22 @@ def psb_chanselect_get_channel_inmap(r):
 
 
 
+def chanselect_set_channel_outmap_slow(r, outmap, descramble_input=None):
+    """
+    Slow KATCP/builtin version of chanselect_set_channel_outmap.
+    Kept for comparing the fast direct-memory implementation at runtime.
+    """
+    r.chanselect.set_channel_outmap(outmap, descramble_input=descramble_input)
+
+
+def chanselect_get_channel_outmap_slow(r, descramble_input=None):
+    """
+    Slow KATCP/builtin version of chanselect_get_channel_outmap.
+    Kept for comparing the fast direct-memory implementation at runtime.
+    """
+    return r.chanselect.get_channel_outmap(descramble_input=descramble_input)
+
+
 def chanselect_set_channel_outmap(r, outmap, descramble_input=None):
     """
     *** vectorised version of set_channel_outmap for chanselect***
@@ -3927,54 +4137,96 @@ def chanselect_set_channel_outmap(r, outmap, descramble_input=None):
 
     """
 
-    outmap = np.array(outmap, dtype=int)
+    chanselect = r.chanselect
+    if not hasattr(chanselect, '_fast_outmap_cached'):
+        serial_map_blank = np.zeros(chanselect._reorder_depth, dtype=np.int32)
+        parallel_map_blank = np.empty(chanselect._reorder_depth, dtype=np.int32)
+        parallel_map_blank[:] = chanselect._reduction_factor + 1
+        map_reg = f'map0_{chanselect._map_reg}'
+        pmap_reg = 'pmap'
 
-    serial_map = np.zeros(r.chanselect._reorder_depth)
+        chanselect._fast_outmap_reorder_depth = chanselect._reorder_depth
+        chanselect._fast_outmap_n_chans_out = chanselect.n_chans_out
+        chanselect._fast_outmap_n_parallel_chans_in = chanselect.n_parallel_chans_in
+        chanselect._fast_outmap_n_parallel_samples = chanselect.n_parallel_samples
+        chanselect._fast_outmap_disabled_parallel_path = chanselect._reduction_factor + 1
+        chanselect._fast_outmap_max_input = len(chanselect._descramble_order)
+        chanselect._fast_outmap_serial_map_blank = serial_map_blank
+        chanselect._fast_outmap_parallel_map_blank = parallel_map_blank
+        chanselect._fast_outmap_map_reg = map_reg
+        chanselect._fast_outmap_pmap_reg = pmap_reg
+        chanselect._fast_outmap_fast_nbytes = chanselect._reorder_depth * 4
+        chanselect._fast_outmap_fast_dtype = np.dtype('<i4')
+        chanselect._fast_outmap_slow_map_dtype = np.dtype(chanselect._map_format)
+        chanselect._fast_outmap_slow_pmap_dtype = np.dtype(chanselect._pmap_format)
+        try:
+            chanselect._fast_outmap_mm = chanselect.host.transport.axil_mm
+            chanselect._fast_outmap_map_addr = chanselect.host.transport._get_device_address(
+                f'{chanselect.prefix}{map_reg}')
+            chanselect._fast_outmap_pmap_addr = chanselect.host.transport._get_device_address(
+                f'{chanselect.prefix}{pmap_reg}')
+            chanselect._fast_outmap_use_devmem = True
+        except AttributeError:
+            chanselect._fast_outmap_mm = None
+            chanselect._fast_outmap_map_addr = None
+            chanselect._fast_outmap_pmap_addr = None
+            chanselect._fast_outmap_use_devmem = False
+        chanselect._fast_outmap_cached = True
 
-    #  parallel_map = (r.chanselect._reduction_factor + 1) * np.ones(r.chanselect._reorder_depth)
-    if not hasattr(r.chanselect,'_parallel_map_convenience'):
-        r.chanselect._parallel_map_convenience = (r.chanselect._reduction_factor + 1) * np.ones(r.chanselect._reorder_depth)
-    parallel_map = r.chanselect._parallel_map_convenience.copy()
+    n_chans_out = chanselect._fast_outmap_n_chans_out
+    max_input = chanselect._fast_outmap_max_input
 
+    outmap = np.asarray(outmap, dtype=int).copy()
     nout = len(outmap)
+    if nout > n_chans_out:
+        raise ValueError(f'PFB channel outmap has {nout} entries, '
+                         f'but firmware has only {n_chans_out} output channels')
+
     outmap_isnt_n1 = outmap != -1
-    if descramble_input or (descramble_input is None and r.chanselect._descramble_default):
-        #for i in range(nout):
-        #    if outmap[i] == -1:
-        #        continue
-        #    outmap[i] = r.chanselect._descramble_order[outmap[i]]
-        outmap[outmap_isnt_n1] = r.chanselect._descramble_order[outmap[outmap_isnt_n1]]
+    if np.any(outmap < -1):
+        bad = int(outmap[outmap < -1][0])
+        raise ValueError(f'PFB channel outmap contains invalid channel {bad}')
 
-    # block_id = np.zeros(nout)
-    # block_s_offset = np.zeros(nout)
-    # block_p_offset = np.zeros(nout)
+    if np.any(outmap[outmap_isnt_n1] >= max_input):
+        bad = int(outmap[outmap_isnt_n1][outmap[outmap_isnt_n1] >= max_input][0])
+        raise ValueError(f'PFB channel outmap contains invalid input channel {bad}; '
+                         f'max valid channel is {max_input - 1}')
 
-    # block_id[:] = outmap // r.chanselect.n_parallel_chans_in
-    # block_s_offset[:] = (outmap % r.chanselect.n_parallel_chans_in) % r.chanselect.n_parallel_samples
-    # block_p_offset[:] = (outmap % r.chanselect.n_parallel_chans_in) // r.chanselect.n_parallel_samples
+    if descramble_input or (descramble_input is None and chanselect._descramble_default):
+        outmap[outmap_isnt_n1] = chanselect._descramble_order[outmap[outmap_isnt_n1]]
 
-    block_id = outmap // r.chanselect.n_parallel_chans_in
-    opp      = outmap % r.chanselect.n_parallel_chans_in
-    block_s_offset = (opp) % r.chanselect.n_parallel_samples
-    block_p_offset = (opp) // r.chanselect.n_parallel_samples
+    serial_map = chanselect._fast_outmap_serial_map_blank.copy()
+    parallel_map = chanselect._fast_outmap_parallel_map_blank.copy()
 
-    serial_map[0:nout] = (block_id * r.chanselect.n_parallel_samples) + block_s_offset
+    output_positions = np.nonzero(outmap_isnt_n1)[0].astype(np.intp)
+    selected_inputs = outmap[outmap_isnt_n1].astype(np.intp)
+    if len(selected_inputs):
+        n_parallel_chans_in = chanselect._fast_outmap_n_parallel_chans_in
+        n_parallel_samples = chanselect._fast_outmap_n_parallel_samples
+        block_id = selected_inputs // n_parallel_chans_in
+        input_parallel_position = selected_inputs % n_parallel_chans_in
+        block_s_offset = input_parallel_position % n_parallel_samples
+        block_p_offset = input_parallel_position // n_parallel_samples
 
-    # parallel_map[0:nout] = block_p_offset
-    # parallel_map[0:nout][outmap == -1] = r.chanselect._reduction_factor + 1
+        serial_map[output_positions] = (
+            block_id * n_parallel_samples + block_s_offset
+        ).astype(np.int32)
+        parallel_map[output_positions] = block_p_offset.astype(np.int32)
 
-    parallel_map[:nout] = np.where(outmap_isnt_n1, block_p_offset, r.chanselect._reduction_factor + 1)
+    if chanselect._fast_outmap_use_devmem:
+        mm = chanselect._fast_outmap_mm
+        fast_dtype = chanselect._fast_outmap_fast_dtype
+        fast_nbytes = chanselect._fast_outmap_fast_nbytes
+        data = serial_map.astype(fast_dtype, copy=False).tobytes()
+        mm[chanselect._fast_outmap_map_addr:chanselect._fast_outmap_map_addr + fast_nbytes] = data
 
-
-    try:
-        # if using fast firmware interface
-        addr = r.chanselect.host.transport._get_device_address(f'{r.chanselect.prefix}map0_{r.chanselect._map_reg}')
-        r.chanselect.host.transport.axil_mm[addr:addr+len(serial_map)*4]= serial_map.astype('<i4').tobytes()
-        addr = r.chanselect.host.transport._get_device_address(f'{r.chanselect.prefix}pmap')
-        r.chanselect.host.transport.axil_mm[addr:addr+len(parallel_map)*4]= parallel_map.astype('<i4').tobytes()
-    except AttributeError:
-        r.chanselect.write(f'map0_{r.chanselect._map_reg}', serial_map.astype(r.chanselect._map_format).tobytes())
-        r.chanselect.write('pmap', parallel_map.astype(r.chanselect._pmap_format).tobytes())
+        data = parallel_map.astype(fast_dtype, copy=False).tobytes()
+        mm[chanselect._fast_outmap_pmap_addr:chanselect._fast_outmap_pmap_addr + fast_nbytes] = data
+    else:
+        chanselect.write(chanselect._fast_outmap_map_reg,
+                         serial_map.astype(chanselect._fast_outmap_slow_map_dtype, copy=False).tobytes())
+        chanselect.write(chanselect._fast_outmap_pmap_reg,
+                         parallel_map.astype(chanselect._fast_outmap_slow_pmap_dtype, copy=False).tobytes())
 
 
 
@@ -3991,25 +4243,83 @@ def chanselect_get_channel_outmap(r, descramble_input=None):
     :rtype: list
     """
 
-    nbytes = r.chanselect._reorder_depth * np.dtype(r.chanselect._map_format).itemsize
-    serial_map = np.frombuffer(r.chanselect.read(f'map0_{r.chanselect._map_reg}', nbytes), dtype=r.chanselect._map_format)
-    nbytes = r.chanselect._reorder_depth * np.dtype(r.chanselect._pmap_format).itemsize
-    parallel_map = np.frombuffer(r.chanselect.read('pmap', nbytes), dtype=r.chanselect._pmap_format)
+    chanselect = r.chanselect
+    if not hasattr(chanselect, '_fast_outmap_cached'):
+        serial_map_blank = np.zeros(chanselect._reorder_depth, dtype=np.int32)
+        parallel_map_blank = np.empty(chanselect._reorder_depth, dtype=np.int32)
+        parallel_map_blank[:] = chanselect._reduction_factor + 1
+        map_reg = f'map0_{chanselect._map_reg}'
+        pmap_reg = 'pmap'
 
-    block_id = serial_map // r.chanselect.n_parallel_samples
-    block_s_offset = serial_map % r.chanselect.n_parallel_samples
+        chanselect._fast_outmap_reorder_depth = chanselect._reorder_depth
+        chanselect._fast_outmap_n_chans_out = chanselect.n_chans_out
+        chanselect._fast_outmap_n_parallel_chans_in = chanselect.n_parallel_chans_in
+        chanselect._fast_outmap_n_parallel_samples = chanselect.n_parallel_samples
+        chanselect._fast_outmap_disabled_parallel_path = chanselect._reduction_factor + 1
+        chanselect._fast_outmap_max_input = len(chanselect._descramble_order)
+        chanselect._fast_outmap_serial_map_blank = serial_map_blank
+        chanselect._fast_outmap_parallel_map_blank = parallel_map_blank
+        chanselect._fast_outmap_map_reg = map_reg
+        chanselect._fast_outmap_pmap_reg = pmap_reg
+        chanselect._fast_outmap_fast_nbytes = chanselect._reorder_depth * 4
+        chanselect._fast_outmap_fast_dtype = np.dtype('<i4')
+        chanselect._fast_outmap_slow_map_dtype = np.dtype(chanselect._map_format)
+        chanselect._fast_outmap_slow_pmap_dtype = np.dtype(chanselect._pmap_format)
+        try:
+            chanselect._fast_outmap_mm = chanselect.host.transport.axil_mm
+            chanselect._fast_outmap_map_addr = chanselect.host.transport._get_device_address(
+                f'{chanselect.prefix}{map_reg}')
+            chanselect._fast_outmap_pmap_addr = chanselect.host.transport._get_device_address(
+                f'{chanselect.prefix}{pmap_reg}')
+            chanselect._fast_outmap_use_devmem = True
+        except AttributeError:
+            chanselect._fast_outmap_mm = None
+            chanselect._fast_outmap_map_addr = None
+            chanselect._fast_outmap_pmap_addr = None
+            chanselect._fast_outmap_use_devmem = False
+        chanselect._fast_outmap_cached = True
+
+    reorder_depth = chanselect._fast_outmap_reorder_depth
+    if chanselect._fast_outmap_use_devmem:
+        mm = chanselect._fast_outmap_mm
+        fast_dtype = chanselect._fast_outmap_fast_dtype
+        fast_nbytes = chanselect._fast_outmap_fast_nbytes
+
+        raw = mm[chanselect._fast_outmap_map_addr:chanselect._fast_outmap_map_addr + fast_nbytes]
+        serial_map = np.frombuffer(raw, dtype=fast_dtype).copy()
+
+        raw = mm[chanselect._fast_outmap_pmap_addr:chanselect._fast_outmap_pmap_addr + fast_nbytes]
+        parallel_map = np.frombuffer(raw, dtype=fast_dtype).copy()
+    else:
+        slow_map_dtype = chanselect._fast_outmap_slow_map_dtype
+        slow_pmap_dtype = chanselect._fast_outmap_slow_pmap_dtype
+        nbytes = reorder_depth * slow_map_dtype.itemsize
+        raw = chanselect.read(chanselect._fast_outmap_map_reg, nbytes)
+        serial_map = np.frombuffer(raw, dtype=slow_map_dtype).astype(np.int32)
+
+        nbytes = reorder_depth * slow_pmap_dtype.itemsize
+        raw = chanselect.read(chanselect._fast_outmap_pmap_reg, nbytes)
+        parallel_map = np.frombuffer(raw, dtype=slow_pmap_dtype).astype(np.int32)
+
+    n_parallel_samples = chanselect._fast_outmap_n_parallel_samples
+    block_id = serial_map // n_parallel_samples
+    block_s_offset = serial_map % n_parallel_samples
     block_p_offset = parallel_map
 
-    outmap = r.chanselect.n_parallel_chans_in * block_id + block_s_offset + (r.chanselect.n_parallel_samples * block_p_offset)
-    outmap[parallel_map == r.chanselect._reduction_factor + 1] = -1
-    if descramble_input or (descramble_input is None and r.chanselect._descramble_default):
+    outmap = (
+        chanselect._fast_outmap_n_parallel_chans_in * block_id
+        + block_s_offset
+        + (n_parallel_samples * block_p_offset)
+    )
+    outmap[parallel_map == chanselect._fast_outmap_disabled_parallel_path] = -1
+    if descramble_input or (descramble_input is None and chanselect._descramble_default):
         # for i in range(len(outmap)):
         #     if outmap[i] == -1:
         #         continue
-        #     outmap[i] = r.chanselect._scramble_order[outmap[i]]
+        #     outmap[i] = chanselect._scramble_order[outmap[i]]
 
         outmap_isnt_n1 = outmap != -1
-        outmap[outmap_isnt_n1] = r.chanselect._scramble_order[outmap[outmap_isnt_n1]]
+        outmap[outmap_isnt_n1] = chanselect._scramble_order[outmap[outmap_isnt_n1]]
 
     return outmap
 
@@ -4302,16 +4612,19 @@ def _gather_tx_chain_params(r, config_dict, rf_peripherals=None):
     dac_fs_bits = config_dict['firmware']['dac_fullscale_bits']
     vop_current_fs = config_dict['firmware']['vop_current_fullscale']
 
-    has_rf = rf_peripherals is not None and rf_peripherals.enabled
+    has_rf = _rf_has_readable_attenuator(rf_peripherals)
+    has_live_rf = has_rf and getattr(rf_peripherals, 'is_hardware', False)
 
     # Resolve calibration values (scalar / file / array → per-tone)
     dac_dbfs_to_dbm = _resolve_cal_value(config_dict['firmware']['dac0_dbfs_to_dbm'], analog_freq)
     tx_combiner_loss_db = _resolve_cal_value(config_dict['rf_frontend']['tx_combiner_loss_db'], analog_freq)
 
-    # TX attenuator: read from hardware if available, else config, else 0
-    tx_attenuator_value_db = config_dict['rf_frontend']['tx_attenuator_value_db']
-    if tx_attenuator_value_db is None and has_rf:
+    # TX attenuator: read live hardware state when available, else config, else 0.
+    tx_attenuator_value_db = None
+    if has_live_rf:
         tx_attenuator_value_db = rf_peripherals.get_tx_attenuation()
+    if tx_attenuator_value_db is None:
+        tx_attenuator_value_db = config_dict['rf_frontend'].get('attenuator', {}).get('tx_value_db')
     if tx_attenuator_value_db is None:
         tx_attenuator_value_db = 0
 
@@ -4319,8 +4632,14 @@ def _gather_tx_chain_params(r, config_dict, rf_peripherals=None):
     tx_mixer_conversion_loss_db = _resolve_cal_value(config_dict['rf_frontend']['tx_mixer_conversion_loss_db'], analog_freq)
     tx_rf_s21_db = _resolve_cal_value(config_dict['rf_frontend']['tx_rf_s21_db'], rf_freq)
 
-    # TX amp S21: use bypass or enabled value from hardware if config is default
-    tx_bypass_amp_s21_db = _resolve_cal_value(config_dict['rf_frontend'].get('tx_bypass_amp_s21_db', 0), rf_freq)
+    # TX bypass-amp S21: read live hardware state when available, else config.
+    if _rf_supports_bypass_amps(rf_peripherals):
+        tx_bypass_amp_s21_db = rf_peripherals._get_amp_s21('transmit_atten')
+    else:
+        tx_bypass_amp_s21_db = _resolve_cal_value(
+            config_dict['rf_frontend'].get('bypass_amps', {}).get('tx_s21_db', 0),
+            rf_freq,
+        )
 
     cryostat_input_s21_db = _resolve_cal_value(config_dict['cryostat']['input_s21_db'], rf_freq)
 
@@ -4526,6 +4845,36 @@ def _apply_per_bin_scaling(r, config_dict, amps):
 RX_POLICIES = ('protect', 'compensate', 'raise', 'none')
 
 
+def _rf_supports_bypass_amps(rf_peripherals):
+    """True when the active RF frontend has controllable bypass amps."""
+    return bool(
+        rf_peripherals is not None
+        and rf_peripherals.enabled
+        and getattr(rf_peripherals, 'supports_bypass_amps', False)
+    )
+
+
+def _rf_has_controllable_attenuator(rf_peripherals):
+    """True when the active RF attenuator can be changed by software."""
+    return bool(
+        rf_peripherals is not None
+        and rf_peripherals.enabled
+        and getattr(rf_peripherals, 'is_controllable', False)
+    )
+
+
+def _rf_has_readable_attenuator(rf_peripherals):
+    """True when attenuation can be read from hardware or fixed config."""
+    return bool(
+        rf_peripherals is not None
+        and rf_peripherals.enabled
+        and (
+            getattr(rf_peripherals, 'is_hardware', False)
+            or getattr(rf_peripherals, 'attenuator_backend', None) == 'fixed'
+        )
+    )
+
+
 def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                      tx_power_change_db=None):
     """Check and optionally protect the RX path after a TX power change.
@@ -4608,7 +4957,7 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
     DSA_MAX = 27
-    has_rf = rf_peripherals is not None and rf_peripherals.enabled
+    has_rf = _rf_has_controllable_attenuator(rf_peripherals)
 
     # --- Compensate mode: proactively mirror TX change onto RX path ---
     if rx_policy == 'compensate' and tx_power_change_db is not None:
@@ -4804,7 +5153,7 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
         raise ValueError(f"reference_plane must be 'dac', 'rf_output', or 'detector', "
                          f"got '{reference_plane}'")
 
-    has_rf = rf_peripherals is not None and rf_peripherals.enabled
+    has_rf = _rf_has_controllable_attenuator(rf_peripherals)
 
     init_dac_saturation, _ = check_output_saturation(r_fast, iterations=250, verbose=False)
     if init_dac_saturation:
@@ -4919,7 +5268,11 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
         if has_rf:
             print(f'  step 4: maximise analog chain')
             # Enable TX amplifier
-            current_bypass = rf_peripherals.get_tx_amp_bypass()
+            if _rf_supports_bypass_amps(rf_peripherals):
+                current_bypass = rf_peripherals.get_tx_amp_bypass()
+            else:
+                current_bypass = None
+
             if current_bypass:
                 # Check model S21 in both states to see if amp has any effect
                 s21_bypassed = rf_peripherals._get_amp_s21('transmit_atten')
@@ -4940,8 +5293,10 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
                     _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                                      tx_power_change_db=expected_gain_db)
                     tx_amp_bypass = False
-            else:
+            elif current_bypass is False:
                 tx_amp_bypass = False
+            else:
+                print('    TX amp: not available — skipping')
 
             # Reduce TX attenuator gradually (3 dB steps), checking the
             # RX path after each step via _apply_rx_policy.
@@ -5157,7 +5512,7 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
     if reference_plane not in ('dac', 'rf_output', 'detector'):
         raise ValueError(f"reference_plane must be 'dac', 'rf_output', or 'detector', "
                          f"got '{reference_plane}'")
-    has_rf = rf_peripherals is not None and rf_peripherals.enabled
+    has_rf = _rf_has_controllable_attenuator(rf_peripherals)
 
     init_dac_saturation, _ = check_output_saturation(r_fast, iterations=250, verbose=False)
     if init_dac_saturation:
@@ -5380,7 +5735,8 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
     DSA_MAX = 27
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
-    has_rf = rf_peripherals is not None and rf_peripherals.enabled
+    has_rf = _rf_has_controllable_attenuator(rf_peripherals)
+    has_bypass_amps = _rf_supports_bypass_amps(rf_peripherals)
 
     def _get_dsa():
         return int(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
@@ -5400,9 +5756,13 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
 
     init_dsa = _get_dsa()
     init_rx_atten = rf_peripherals.get_rx_attenuation() if has_rf else None
-    init_rx_amp_bypass = rf_peripherals.get_rx_amp_bypass() if has_rf else None
-    print(f'  init: DSA={init_dsa} dB'
-          + (f', RX atten={init_rx_atten:.1f} dB, RX amp bypass={init_rx_amp_bypass}' if has_rf else ''))
+    init_rx_amp_bypass = rf_peripherals.get_rx_amp_bypass() if has_bypass_amps else None
+    init_rf_msg = ''
+    if has_rf:
+        init_rf_msg = f', RX atten={init_rx_atten:.1f} dB'
+        if has_bypass_amps:
+            init_rf_msg += f', RX amp bypass={init_rx_amp_bypass}'
+    print(f'  init: DSA={init_dsa} dB' + init_rf_msg)
 
     # --- Handle RTS over-voltage (hidden firmware DSA) ---
     rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
@@ -5479,8 +5839,11 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
                     sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
 
         # --- Try enabling RX amp ---
-        print('  step 4: try enabling RX amp')
-        if rf_peripherals.get_rx_amp_bypass():
+        if has_bypass_amps:
+            print('  step 4: try enabling RX amp')
+        else:
+            print('  step 4: RX amp not available — skipping')
+        if has_bypass_amps and rf_peripherals.get_rx_amp_bypass():
             # Check model S21 in both states to see if amp has any effect
             s21_bypassed = rf_peripherals._get_amp_s21('recv_atten')
             rf_peripherals.set_rx_amp_bypass(False)
@@ -5532,7 +5895,8 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None):
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
     DSA_MAX = 27
-    has_rf = rf_peripherals is not None and rf_peripherals.enabled
+    has_rf = _rf_has_controllable_attenuator(rf_peripherals)
+    has_bypass_amps = _rf_supports_bypass_amps(rf_peripherals)
 
     def _make_result():
         check_rfdc_rts_events(r, clear=True)
@@ -5540,7 +5904,7 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None):
         sat, lvls = check_input_saturation(r, r_fast, iterations=500, verbose=False)
         d = float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
         ra = rf_peripherals.get_rx_attenuation() if has_rf else None
-        ab = rf_peripherals.get_rx_amp_bypass() if has_rf else None
+        ab = rf_peripherals.get_rx_amp_bypass() if has_bypass_amps else None
         return {'dsa': d, 'adc_levels': lvls, 'rx_attenuation_db': ra,
                 'rx_amp_bypass': ab, 'saturation': sat}
 
@@ -5570,7 +5934,7 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None):
     print('fix_adc_saturation: ADC saturation detected')
 
     # --- Step 1: Bypass RX amplifier ---
-    if has_rf and not rf_peripherals.get_rx_amp_bypass():
+    if has_bypass_amps and not rf_peripherals.get_rx_amp_bypass():
         # Check model S21 to see if bypassing would reduce gain
         s21_enabled = rf_peripherals._get_amp_s21('recv_atten')
         rf_peripherals.set_rx_amp_bypass(True)
@@ -5651,7 +6015,7 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0, rf_periph
     """
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
-    has_rf = rf_peripherals is not None and rf_peripherals.enabled
+    has_rf = _rf_has_controllable_attenuator(rf_peripherals)
 
     print('optimise_rx_snr')
 
@@ -6145,19 +6509,23 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
     initial_freqs = get_tone_frequencies(r, config_dict)
     if len(initial_freqs)==0:
         initial_freqs = centers
+    sweep_tone_amplitudes = _get_current_per_tone_values(
+        get_tone_amplitudes, r, config_dict, num_tones)
+    sweep_tone_phases = _get_current_per_tone_values(
+        get_tone_phases, r, config_dict, num_tones)
 
     fast_read_params = get_fast_read_params(r_fast)
 
     # Prepare sweep settings - this computes tone_indices for each point
     # as they may change when tones cross FFT bin boundaries
-    fast_sweep_params = prepare_sweep_settings_fast(r_fast, config_dict, sweepfreqs.T)  # transpose to (num_points, num_tones)
+    fast_sweep_params = prepare_sweep_settings_fast(
+        r_fast, config_dict, sweepfreqs.T,
+        tone_amplitudes=sweep_tone_amplitudes,
+        tone_phases=sweep_tone_phases)  # transpose to (num_points, num_tones)
     tone_indices_arr = fast_sweep_params.get('tone_indices')  # shape: (num_points, num_tones)
 
     for p in range(num_points):
-        set_tone_frequencies(r,
-                             config_dict,
-                             sweepfreqs[:,p],
-                             autosync=True)
+        apply_sweep_step_fast(r, r_fast, fast_sweep_params, p, autosync=True)
 
         # Get tone_indices for this sweep point
         tone_indices_p = tone_indices_arr[p] if tone_indices_arr is not None else np.arange(num_tones)
@@ -6169,7 +6537,10 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
             sweep_data[:,p,s] = data[::2]+1j*data[1::2]
             acc_errs[p,s] = err
 
-    set_tone_frequencies(r,config_dict,initial_freqs,autosync=True)
+    set_tone_frequencies_fast(
+        r, r_fast, config_dict, initial_freqs, autosync=True,
+        tone_amplitudes=sweep_tone_amplitudes,
+        tone_phases=sweep_tone_phases)
 
     sweep_responses = np.mean(sweep_data.real,axis=1) + 1j*np.mean(sweep_data.imag,axis=1)
     sweep_stds = np.std(sweep_data.real,axis=1) + 1j*np.std(sweep_data.imag,axis=1)
@@ -6221,7 +6592,7 @@ def perform_retune(r, r_fast,config_dict, centers, spans, points, samples_per_po
             min_mag = np.argmin(mags)
             retune_freqs[t] = freqs[min_mag] + freq_offsets[t]
 
-    set_tone_frequencies(r,config_dict,retune_freqs)
+    set_tone_frequencies_fast(r, r_fast, config_dict, retune_freqs)
     results['retune_freqs'] = retune_freqs
 
     return results
@@ -6462,7 +6833,7 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
 
     need_rx = reference_plane in RX_PLANES or detailed_output
 
-    has_rf = rf_peripherals is not None and rf_peripherals.enabled
+    has_rf = _rf_has_readable_attenuator(rf_peripherals)
 
     # ---- TX chain ----
     p = _gather_tx_chain_params(r, config_dict, rf_peripherals=rf_peripherals)
@@ -6503,15 +6874,21 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
 
         # RX frontend parameters
         rx_combiner_loss_db = config_dict['rf_frontend'].get('rx_combiner_loss_db', 0) or 0
-        rx_attenuator_value_db = config_dict['rf_frontend'].get('rx_attenuator_value_db', None)
-        if rx_attenuator_value_db is None and has_rf:
+        has_live_rf = has_rf and getattr(rf_peripherals, 'is_hardware', False)
+        rx_attenuator_value_db = None
+        if has_live_rf:
             rx_attenuator_value_db = rf_peripherals.get_rx_attenuation()
+        if rx_attenuator_value_db is None:
+            rx_attenuator_value_db = config_dict['rf_frontend'].get('attenuator', {}).get('rx_value_db', None)
         if rx_attenuator_value_db is None:
             rx_attenuator_value_db = 0
         rx_if_s21_db = config_dict['rf_frontend'].get('rx_if_s21_db', 0) or 0
         rx_mixer_conversion_loss_db = config_dict['rf_frontend'].get('rx_mixer_conversion_loss_db', 0) or 0
         rx_rf_s21_db = config_dict['rf_frontend'].get('rx_rf_s21_db', 0) or 0
-        rx_bypass_amp_s21_db = config_dict['rf_frontend'].get('rx_bypass_amp_s21_db', 0) or 0
+        if _rf_supports_bypass_amps(rf_peripherals):
+            rx_bypass_amp_s21_db = rf_peripherals._get_amp_s21('recv_atten')
+        else:
+            rx_bypass_amp_s21_db = config_dict['rf_frontend'].get('bypass_amps', {}).get('rx_s21_db', 0) or 0
         cryostat_output_s21_db = config_dict['cryostat'].get('output_s21_db', 0) or 0
 
         if not p['rf_connected']:
@@ -6637,11 +7014,12 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         powers_dbm = np.full(n_tones, powers_dbm[0])
 
     # ---- Gather RF peripheral info ----
-    has_rf = (rf_peripherals is not None and rf_peripherals.enabled
+    has_rf = (_rf_has_controllable_attenuator(rf_peripherals)
               and reference_plane != 'dac')
+    has_bypass_amps = has_rf and _rf_supports_bypass_amps(rf_peripherals)
     s21_enabled = 0.0
     s21_bypassed = 0.0
-    if has_rf:
+    if has_bypass_amps:
         current_bypass = rf_peripherals.get_tx_amp_bypass()
         if current_bypass:
             s21_bypassed = float(rf_peripherals._get_amp_s21('transmit_atten'))
@@ -6880,7 +7258,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
     # delta < 0: achieved < target → need to increase power (reduce attenuation / enable amp)
     tx_atten_db = float(cal['tx_attenuator_value_db'] if np.isscalar(
         cal['tx_attenuator_value_db']) else np.mean(cal['tx_attenuator_value_db']))
-    tx_amp_bypass = rf_peripherals.get_tx_amp_bypass() if has_rf else None
+    tx_amp_bypass = rf_peripherals.get_tx_amp_bypass() if has_bypass_amps else None
     tx_amp_s21 = cal['tx_bypass_amp_s21_db']
 
     if abs(delta_db) > 0.5:
@@ -6896,7 +7274,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
                 # --- Need MORE power: reduce attenuation, enable amp ---
 
                 # 4a: Enable TX amp if bypassed
-                if tx_amp_bypass:
+                if has_bypass_amps and tx_amp_bypass:
                     amp_gain = s21_enabled - s21_bypassed
                     if amp_gain > 0.5:
                         rf_peripherals.set_tx_amp_bypass(False)
@@ -6946,7 +7324,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
                     tx_atten_db = new_atten
 
                 # 4b: Bypass TX amp if still excess
-                if remaining > 0.5 and not tx_amp_bypass:
+                if has_bypass_amps and remaining > 0.5 and tx_amp_bypass is False:
                     amp_gain = s21_enabled - s21_bypassed
                     if amp_gain > 0.5:
                         rf_peripherals.set_tx_amp_bypass(True)
@@ -7054,8 +7432,10 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
     print(f'  result:')
     print(f'    fftshift: {format(best_fftshift, "#016b")} (popcount {popcount})')
     print(f'    psb_scale: {optimal_psb_scale:.4f}')
-    if has_rf:
+    if has_bypass_amps:
         print(f'    TX atten: {tx_atten_db:.1f} dB, TX amp bypass: {tx_amp_bypass}')
+    elif has_rf:
+        print(f'    TX atten: {tx_atten_db:.1f} dB')
     print(f'    effective DAC bits (worst): {float(np.nanmin(eff_bits)):.1f}')
     print(f'    DAC headroom (measured): {dac_headroom_db:.1f} dB')
 

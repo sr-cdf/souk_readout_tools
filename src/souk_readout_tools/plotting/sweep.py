@@ -85,7 +85,7 @@ def _transform_title_suffix(deembed, phase_center):
 
 
 def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
-               phase_center=False, show_errors=True, multi_tone='overlay',
+               phase_center=False, show_errors=None, multi_tone='overlay',
                fig=None, label=None, units='raw', config=None,
                reference_plane='adc_input', group_delay_cal=None, **kwargs):
     """
@@ -100,7 +100,12 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             baseline normalisation).  Off-resonance → (1, 0).
         phase_center: bool, apply phase centering (circle centering +
             rotation).  Applied after deembedding when both are True.
-        show_errors: bool, show error bars (line only, no caps).
+        show_errors: True/False/None.  None (default) draws error fills for
+            per-tone sweeps but skips them for wideband sweeps, where the
+            concatenated trace can be hundreds of thousands of points and
+            ``fill_between`` becomes the dominant render cost.  Pass ``True``
+            to force errors on (slow for large wideband sweeps) or ``False``
+            to always skip.
         multi_tone: 'overlay' (shared axes) or 'grid' (one subplot per tone).
         fig: Existing figure. If None, create new.
         label: Legend label. If None, uses an auto-incrementing index.
@@ -111,7 +116,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             'dbfs' - dB relative to ADC full-scale.
             'dbm' - estimated power in dBm at ``reference_plane``.
             All options except 'raw' and 'peak' require
-            'system_information' in sweep_data.
+            'info' in sweep_data.
         config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
         reference_plane: Reference plane used when ``units='dbm'``.  One of
             'adc_input' (default) or 'cryostat_output'.  The latter removes
@@ -131,12 +136,12 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
     plt = _get_pyplot()
     custom_title = kwargs.pop('title', None)
     traces = _extract_traces(sweep_data, tones)
-    info = sweep_data.get('system_information')
+    info = sweep_data.get('info')
 
     # Normalise traces
     if units != 'raw':
         if units != 'peak' and info is None:
-            raise ValueError("sweep_data must contain 'system_information' for non-raw units.")
+            raise ValueError("sweep_data must contain 'info' for non-raw units.")
         normalised = []
         for f, si, sq, ei, eq, tidx in traces:
             si, sq, ei, eq, iq_label, mag_label = _normalise_iq(
@@ -148,6 +153,9 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         iq_label = ''
         mag_label = '|S21| (dB)'
 
+    if show_errors is None:
+        # Auto: skip error fills on wideband sweeps where fill_between is slow.
+        show_errors = not sweep_data.get('wideband_sweep', False)
     has_errors = show_errors and any(np.any(ei != 0) for _, _, _, ei, _, _ in traces)
     n_traces = len(traces)
     is_multi = n_traces > 1 and traces[0][5] is not None

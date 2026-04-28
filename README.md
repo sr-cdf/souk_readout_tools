@@ -135,6 +135,11 @@ For full installation details (including server setup, SD card imaging, and daem
 | `souk-readout-server` | Start the readout server (optional config path, `-p` for pipeline) |
 | `souk-enable-daemon` | Enable the server as a systemd service (`-p 0 1` for both pipelines) |
 | `souk-disable-daemon` | Disable the server systemd service(s) |
+| `souk-restart-daemon` | Restart the server systemd service(s) without reinstalling them |
+| `souk-find-attenuators` | Discover RUDAT and SOUK mixerless-module attenuators (`--status` for live values) |
+| `souk-find-bypass-amps` | Discover SOUK mixerless-module bypass amplifiers (`--status` for bypass state) |
+| `souk-find-lnas` | Discover populated LNA bias monitors (`--status` for voltage/current readings) |
+| `souk-rf-peripherals-status` | Combined attenuator, bypass-amplifier, and LNA status report |
 
 ## Documentation
 
@@ -142,6 +147,9 @@ For full installation details (including server setup, SD card imaging, and daem
 |----------|-------------|
 | [Installation Guide](doc/installation.md) | Full client and server installation, SD card setup, daemon configuration |
 | [Getting Started](doc/getting_started.md) | Configuration, usage guide, and worked examples for all features |
+| [Calibration](doc/calibration.md) | Power calibration model and RF signal-chain configuration |
+| [RF Peripherals](doc/rf_peripherals.md) | RF attenuator, bypass amplifier, and discovery tooling |
+| [LNA Bias](doc/lna_bias.md) | Cryostat LNA bias control, soft-off, and status monitoring |
 | [Dual Pipeline](doc/dual_pipeline.md) | Dual-pipeline setup, initialisation model, and multi-server operation |
 | [Clock Source](doc/clock_source.md) | PL reference clock selection (internal/external) and PLL status |
 | [v7.9 Multitone Notes](doc/v79-multitone-notes.md) | VACC multitone design notes and constraints |

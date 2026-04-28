@@ -166,7 +166,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             'dbfs' - dB relative to ADC full-scale.
             'dbm' - estimated power in dBm at ``reference_plane``.
             All options except 'raw' and 'peak' require
-            'system_information' in ts_data.
+            'info' in ts_data.
         config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
         reference_plane: Reference plane used when ``units='dbm'``.  One of
             'adc_input' (default), 'cryostat_output', or 'detector'.
@@ -189,12 +189,12 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
     selected = _get_tone_data(ts_data, tones)
     sample_rate = ts_data['sample_rate']
     x_values, x_label = _build_x_axis(ts_data, x_axis)
-    info = ts_data.get('system_information')
+    info = ts_data.get('info')
 
     # Look up each selected tone's RF frequency for cal resolution.
     tone_freqs = None
     if isinstance(info, dict):
-        tf = info.get('tone_frequencies')
+        tf = info.get('tones', {}).get('frequencies_hz')
         if tf is not None:
             tone_freqs = np.asarray(tf, dtype=float)
 
@@ -209,7 +209,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
     # Normalise
     if units != 'raw':
         if units != 'peak' and (info is None or not isinstance(info, dict)):
-            raise ValueError("ts_data must contain 'system_information' for non-raw units.")
+            raise ValueError("ts_data must contain 'info' for non-raw units.")
         normalised = []
         for key, i_arr, q_arr in selected:
             tone_f = _tone_frequency(key)
@@ -455,12 +455,12 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
         raise ValueError(
             f"units='{units}' is not supported for I vs Q plots — "
             "use 'raw', 'peak', or 'adc_fs'.")
-    info = ts_data.get('system_information') or sweep_data.get('system_information')
+    info = ts_data.get('info') or sweep_data.get('info')
     iq_label = ''
     if units != 'raw':
         tone_f = np.mean(sweep_f) if sweep_f is not None else None
         if units != 'peak' and (info is None or not isinstance(info, dict)):
-            raise ValueError("data must contain 'system_information' for non-raw units.")
+            raise ValueError("data must contain 'info' for non-raw units.")
         i_arr, q_arr, _, _, iq_label, _ = _normalise_iq(
             i_arr, q_arr, units, info, config=config,
             frequencies=tone_f)
@@ -484,8 +484,8 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     # Compute phase for the frequency-domain panel
     _, phase_sweep = _compute_mag_phase(z_sweep, unwrap=unwrap)
     _, phase_ts = _compute_mag_phase(z_ts, unwrap=unwrap)
-    ts_info = ts_data.get('system_information') or {}
-    ts_tone_freqs = ts_info.get('tone_frequencies')
+    ts_info = ts_data.get('info') or {}
+    ts_tone_freqs = ts_info.get('tones', {}).get('frequencies_hz')
     if ts_tone_freqs is not None:
         tone_freq = float(np.asarray(ts_tone_freqs)[tone_index])
     else:

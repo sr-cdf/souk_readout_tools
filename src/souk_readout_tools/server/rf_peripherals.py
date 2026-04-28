@@ -1,15 +1,25 @@
 """
 Abstraction layer for RF peripheral hardware (attenuators, amplifier bypass).
 
-Supports multiple backends:
-- **souk-peripherals-control** (default): I2C-controlled SOUK RF Mixerless
-  Module with variable attenuator and bypassable amplifier per path.
-- **rudat**: Mini-Circuits RUDAT USB attenuators (attenuator-only, no amp
-  bypass). Useful for bench testing without the mixerless module.
+The active RF frontend is identified by ``rf_frontend.hardware_id``. When the
+SOUK mixerless module is the active frontend (``mixerless_module.connected:
+true``), the controller drives it via i2c (smbus2) — that hardware provides
+both i2c attenuators and bypassable amplifiers on the same MAX7329 chips.
 
-Hardware control requires smbus2 (mixerless) or pyusb (RUDAT) on the server.
-When neither is available, a software-only mimic is used for offline
-transfer-function analysis.
+Independent dimensions:
+
+- ``rf_frontend.mixerless_module.connected`` — whether the SOUK mixerless
+  module is the active RF frontend. Drives bypass-amp support and (when
+  attenuator backend is ``i2c``) the attenuator role.
+- ``rf_frontend.attenuator.backend`` — how programmable attenuators are
+  controlled: ``i2c`` (uses the mixerless module's on-board attenuators),
+  ``rudat`` (Mini-Circuits USB), or ``fixed`` (explicit non-controllable
+  values from config).
+
+Hardware init is soft-fail: if the underlying device doesn't respond, the
+relevant slot stays ``None`` and a loud error is logged. Subsequent set/get
+calls then raise ``RuntimeError`` so clients see a real error instead of a
+silent fake-success.
 """
 
 import logging
@@ -23,14 +33,14 @@ _SUBMODULE_DIR = os.path.join(os.path.dirname(__file__), 'souk-peripherals-contr
 if _SUBMODULE_DIR not in sys.path:
     sys.path.insert(0, _SUBMODULE_DIR)
 
-# Import the software-only model classes (no smbus2 required).
+# Software-only model classes (no smbus2 required).
 from souk_rf_mixerless_atten_amp_level import (
     SOUKRFMixerlessTransmitAttenAmpLevel,
     SOUKRFMixerlessRecvAttenAmpLevel,
     SOUKRFMixerlessAttenAmpTransfer,
 )
 
-# Hardware imports - may fail on client machines.
+# Hardware imports — may fail on client machines.
 try:
     from smbus2 import SMBus
     from souk_rf_mixerless_module import (
@@ -41,12 +51,7 @@ try:
 except ImportError:
     _HW_AVAILABLE = False
 
-# Software mimic - always available.
-from souk_rf_mixerless_atten_amp_level import (
-    mimicSOUKRFMixerlessModule,
-)
-
-# RUDAT USB attenuator support - optional.
+# RUDAT USB attenuator support — optional.
 # rudat.py must be on sys.path (e.g. pip install, or add its directory to
 # PYTHONPATH / sys.path before starting the server).
 try:
@@ -56,34 +61,43 @@ except ImportError:
     _RUDAT_AVAILABLE = False
 
 
+def _mixerless_module_hw_config_list():
+    """Per-channel hw_config matching the production-board wiring of the
+    SOUK mixerless module. Mirror of souk_rf_mixerless_module.main().
+
+    The submodule's ``SOUKRFMixerlessModuleChnHWConfig.default_config()``
+    does NOT match the wired i2c addresses — do not use it here. When the
+    submodule eventually exposes the true production defaults, this helper
+    can delegate to that instead.
+    """
+    if not _HW_AVAILABLE:
+        return None
+    return [
+        SOUKRFMixerlessModuleChnHWConfig(
+            r8_r13="R8", r9_r14="R9", r12_r17="R17",
+            r18_r21="R21", r19_r22="R19", r20_r23="R23",
+            u4_type="MAX7329", u8_type="MAX7329",
+        ),
+        SOUKRFMixerlessModuleChnHWConfig(
+            r8_r13="R8", r9_r14="R14", r12_r17="R17",
+            r18_r21="R21", r19_r22="R22", r20_r23="R23",
+            u4_type="MAX7329", u8_type="MAX7329",
+        ),
+    ]
+
+
 # ---------------------------------------------------------------------
-# RUDAT adapter — presents two USB attenuators with the same interface
-# that RFPeripheralController expects from _module().
+# RUDAT adapter — pure attenuator (no bypass amp).
 # ---------------------------------------------------------------------
-
-class _RudatStubAmpLevel:
-    """Stub for the amp portion — no amp present, 0 dB contribution."""
-    total_gain_il = 0.0
-
-class _RudatStubAttenAmpLevel:
-    """Stub atten_amp_level for RUDAT (attenuator-only, no amp)."""
-    def __init__(self):
-        self.amp = _RudatStubAmpLevel()
-        self.total_gain_il = 0.0
-        self.input_1dB_comp = 999.0  # effectively unlimited
-
-class _RudatStubAttenAmp:
-    """Stub returned by _get_atten_amp for RUDAT."""
-    def __init__(self):
-        self.atten_amp_level = _RudatStubAttenAmpLevel()
-
 
 class RudatAdapter:
     """
-    Adapts two RUDAT USB attenuators to the interface expected by
-    RFPeripheralController._module().
+    Adapts two RUDAT USB attenuators to the attenuator interface used by
+    RFPeripheralController.
 
-    No bypass amplifier — amp methods are no-ops returning fixed values.
+    RUDAT is a pure attenuator. Bypass amps are a property of the RF
+    frontend (currently only the SOUK mixerless module has them) and are
+    handled separately by the controller — not stubbed here.
 
     Parameters
     ----------
@@ -98,10 +112,6 @@ class RudatAdapter:
             'transmit_atten': tx_rudat,
             'recv_atten': rx_rudat,
         }
-        self._bypass_state = {
-            'transmit_atten': True,   # no amp — always "bypassed"
-            'recv_atten': True,
-        }
 
     def set_attenuation(self, channel, dev_name, attenuation_db):
         self._attens[dev_name].att = float(attenuation_db)
@@ -109,44 +119,38 @@ class RudatAdapter:
     def get_attenuation_value(self, channel, dev_name):
         return float(self._attens[dev_name].att)
 
-    def set_amp_bypass_state(self, channel, dev_name, bypass):
-        # No amp to bypass — accept the call but do nothing.
-        pass
-
-    def get_amp_bypass_state(self, channel, dev_name):
-        return True  # always bypassed (no amp)
-
-    def _get_atten_amp(self, channel, dev_name):
-        stub = _RudatStubAttenAmp()
-        atten = self.get_attenuation_value(channel, dev_name)
-        stub.atten_amp_level.total_gain_il = -abs(atten)
-        return stub
-
     def get_transfer(self, channel):
         return None  # not applicable for standalone attenuators
 
 
 class RFPeripheralController:
     """
-    Unified interface for the SOUK RF Mixerless Module.
+    Unified interface for RF peripheral hardware.
 
-    Provides attenuator control (0-31.5 dB in 0.5 dB steps) and amplifier
-    bypass for both TX and RX paths.  When hardware is available, commands
-    are forwarded to the I2C-controlled module.  Otherwise a software mimic
-    is used for offline modelling.
+    Owns two independent components:
 
-    After every state change the controller updates the supplied config dict
-    in memory so that the calibration chain sees the correct values.
+    - ``_attenuator``: the active programmable-attenuator driver (the
+      SOUK mixerless module when ``attenuator.backend == 'i2c'``, a
+      ``RudatAdapter`` when ``backend == 'rudat'``, or ``None`` for fixed
+      values / hardware init failures).
+    - ``_mixerless_module``: the ``SOUKRFMixerlessModule`` instance, present
+      iff ``mixerless_module.connected: true``. Drives bypass amps and
+      (when the attenuator backend is i2c) the attenuator role.
+
+    Both slots are soft-fail: if hardware init raises, the slot stays
+    ``None``, the controller still reports ``enabled=True``, and subsequent
+    set/get calls raise ``RuntimeError``.
 
     Parameters
     ----------
     config_dict : dict
-        The live server config (modified in place).
+        The desired server config. Runtime hardware state is kept separately
+        in ``runtime_state`` and does not modify this dict.
     pipeline_id : int
-        Pipeline index, used to select the hardware channel.
+        Pipeline index, used as the default rf_channel.
     """
 
-    # -- attenuation limits (hardware) --
+    # -- attenuation limits (mixerless module hardware) --
     ATTEN_MIN = 0.0
     ATTEN_MAX = 31.5
     ATTEN_STEP = 0.5
@@ -154,43 +158,88 @@ class RFPeripheralController:
     def __init__(self, config_dict, pipeline_id=0):
         self.config = config_dict
         self.pipeline_id = pipeline_id
-        self._hw_module = None
-        self._mimic_module = None
+        self._attenuator = None
+        self._mixerless_module = None
+        self.runtime_state = {
+            'attenuator': {},
+            'bypass_amps': {},
+        }
 
-        rf_cfg = config_dict.get('rf_frontend', {})
-        mod_cfg = rf_cfg.get('mixerless_module', {})
+        rf_cfg        = config_dict.get('rf_frontend', {})
+        mixerless_cfg = rf_cfg.get('mixerless_module', {}) or {}
+        attn_cfg      = rf_cfg.get('attenuator', {}) or {}
 
         connected = rf_cfg.get('connected', False)
-        attenuator_backend = rf_cfg.get('attenuator_backend') or None
-        self.enabled = connected and attenuator_backend is not None
+        self.hardware_id = rf_cfg.get('hardware_id')
+        self._attenuator_backend = attn_cfg.get('backend') or None
+        self.enabled = connected and self._attenuator_backend is not None
+        self._channel = mixerless_cfg.get('rf_channel', pipeline_id)
+
         if not connected:
             logger.info('RF frontend not connected in config')
             return
-        if attenuator_backend is None:
+        if self._attenuator_backend is None:
             logger.info('No programmable attenuator backend configured')
             return
-        if attenuator_backend not in ('i2c', 'rudat'):
+        if self._attenuator_backend not in ('i2c', 'rudat', 'fixed'):
             raise ValueError(
-                f"Unknown attenuator_backend '{attenuator_backend}'. "
-                f"Supported: 'i2c', 'rudat'"
+                f"Unknown attenuator backend '{self._attenuator_backend}'. "
+                f"Supported: 'i2c', 'rudat', 'fixed'"
             )
 
-        self._i2c_bus_num = mod_cfg.get('i2c_bus', 0)
-        self._channel = mod_cfg.get('channel', pipeline_id)
+        mixerless_connected = bool(mixerless_cfg.get('connected', False))
 
-        # -- RUDAT attenuator backend --
-        if attenuator_backend == 'rudat':
+        # 1. If the mixerless module is connected, bring it up. That single
+        #    instance fills whichever roles it's wired to: attenuator (when
+        #    attenuator.backend == 'i2c') and/or bypass amps.
+        if mixerless_connected:
+            if not _HW_AVAILABLE:
+                logger.error(
+                    "mixerless_module.connected: true but smbus2 / "
+                    "souk-peripherals-control are not installed — "
+                    "subsequent attenuator/bypass calls will fail."
+                )
+            else:
+                try:
+                    bus = SMBus(0)
+                    self._mixerless_module = SOUKRFMixerlessModule(
+                        bus, _mixerless_module_hw_config_list(),
+                    )
+                    logger.info(
+                        'SOUK mixerless module %r initialised, rf_channel %d',
+                        self.hardware_id, self._channel,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to initialise SOUK mixerless module %r — "
+                        "subsequent attenuator/bypass calls will fail.",
+                        self.hardware_id,
+                    )
+
+        # 2. Wire up the attenuator according to backend.
+        if self._attenuator_backend == 'fixed':
+            logger.info('Using fixed attenuator values from config')
+
+        elif self._attenuator_backend == 'i2c':
+            if not mixerless_connected:
+                logger.warning(
+                    "attenuator.backend == 'i2c' requires "
+                    "mixerless_module.connected: true; ignoring."
+                )
+            self._attenuator = self._mixerless_module  # may be None on init failure
+
+        elif self._attenuator_backend == 'rudat':
             if not _RUDAT_AVAILABLE:
                 raise ImportError(
                     'RUDAT backend selected but rudat module not found. '
                     'Install pyusb and ensure rudat.py is on sys.path.'
                 )
-            tx_serial = rf_cfg.get('rudat_tx_serial')
-            rx_serial = rf_cfg.get('rudat_rx_serial')
+            tx_serial = attn_cfg.get('rudat_tx_serial')
+            rx_serial = attn_cfg.get('rudat_rx_serial')
             if tx_serial is None or rx_serial is None:
                 raise ValueError(
-                    'RUDAT backend requires rudat_tx_serial and '
-                    'rudat_rx_serial in rf_frontend config'
+                    'RUDAT backend requires attenuator.rudat_tx_serial and '
+                    'attenuator.rudat_rx_serial in rf_frontend config'
                 )
             rudats = find_rudats()
             tx_key = int(tx_serial) if str(tx_serial).isdigit() else tx_serial
@@ -207,7 +256,7 @@ class RFPeripheralController:
                 )
             tx_att = RudatAttenuator(rudats[tx_key]['bus'], rudats[tx_key]['address'])
             rx_att = RudatAttenuator(rudats[rx_key]['bus'], rudats[rx_key]['address'])
-            self._hw_module = RudatAdapter(tx_att, rx_att)
+            self._attenuator = RudatAdapter(tx_att, rx_att)
             self.ATTEN_MIN = max(tx_att.att_min, rx_att.att_min)
             self.ATTEN_MAX = min(tx_att.att_max, rx_att.att_max)
             self.ATTEN_STEP = max(tx_att.resolution, rx_att.resolution)
@@ -215,52 +264,34 @@ class RFPeripheralController:
                 'RUDAT attenuators initialised: TX serial %s, RX serial %s',
                 tx_serial, rx_serial,
             )
-            self._sync_config_from_hardware()
-            return
 
-        # -- I2C attenuator backend (default) --
-        hw_configs = mod_cfg.get('hw_config', None)
-
-        if _HW_AVAILABLE:
-            try:
-                bus = SMBus(self._i2c_bus_num)
-                if hw_configs is not None:
-                    cfg_list = [
-                        SOUKRFMixerlessModuleChnHWConfig(**c)
-                        for c in hw_configs
-                    ]
-                else:
-                    # Use defaults - two channels, both MAX7329
-                    cfg_list = [
-                        SOUKRFMixerlessModuleChnHWConfig.default_config(),
-                        SOUKRFMixerlessModuleChnHWConfig.default_config(),
-                    ]
-                self._hw_module = SOUKRFMixerlessModule(bus, cfg_list)
-                logger.info(
-                    'RF mixerless module initialised on I2C bus %d, channel %d',
-                    self._i2c_bus_num, self._channel,
-                )
-                # Sync initial hardware state into config.
-                self._sync_config_from_hardware()
-            except Exception:
-                logger.exception(
-                    'Failed to initialise RF mixerless hardware - '
-                    'falling back to software mimic'
-                )
-                self._hw_module = None
-
-        if self._hw_module is None:
-            self._mimic_module = mimicSOUKRFMixerlessModule()
-            logger.info('Using software mimic for RF mixerless module')
+        # Sync initial state from hardware into runtime_state (only updates
+        # fields for components that actually came up).
+        self._sync_runtime_state_from_hardware()
 
     # -- public properties --
 
     @property
     def is_hardware(self):
-        """True if controlling real hardware."""
-        return self._hw_module is not None
+        """True when the configured attenuator backend is responding."""
+        return self._attenuator is not None
 
-    # -- TX attenuation --
+    @property
+    def is_controllable(self):
+        """True when attenuation can be changed by software."""
+        return self._attenuator is not None
+
+    @property
+    def supports_bypass_amps(self):
+        """True iff the SOUK mixerless module is connected and responding."""
+        return self._mixerless_module is not None
+
+    @property
+    def attenuator_backend(self):
+        """Name of the active attenuator backend."""
+        return self._attenuator_backend or 'none'
+
+    # -- TX/RX attenuation --
 
     def set_tx_attenuation(self, attenuation_db):
         """Set TX variable attenuator (0-31.5 dB)."""
@@ -270,8 +301,6 @@ class RFPeripheralController:
         """Get current TX variable attenuator setting in dB."""
         return self._get_attenuation('transmit_atten')
 
-    # -- RX attenuation --
-
     def set_rx_attenuation(self, attenuation_db):
         """Set RX variable attenuator (0-31.5 dB)."""
         self._set_attenuation('recv_atten', attenuation_db)
@@ -280,95 +309,134 @@ class RFPeripheralController:
         """Get current RX variable attenuator setting in dB."""
         return self._get_attenuation('recv_atten')
 
-    # -- TX amplifier bypass --
+    # -- TX/RX amplifier bypass --
 
     def set_tx_amp_bypass(self, bypass):
         """Set TX amplifier bypass state (True = bypassed)."""
-        self._set_amp_bypass('transmit_atten', bypass)
+        self._require_bypass_amps()
+        self._mixerless_module.set_amp_bypass_state(
+            self._channel, 'transmit_atten', bool(bypass),
+        )
+        self._sync_runtime_state('transmit_atten')
 
     def get_tx_amp_bypass(self):
         """Get TX amplifier bypass state."""
-        return self._get_amp_bypass('transmit_atten')
-
-    # -- RX amplifier bypass --
+        self._require_bypass_amps()
+        return self._mixerless_module.get_amp_bypass_state(
+            self._channel, 'transmit_atten',
+        )
 
     def set_rx_amp_bypass(self, bypass):
         """Set RX amplifier bypass state (True = bypassed)."""
-        self._set_amp_bypass('recv_atten', bypass)
+        self._require_bypass_amps()
+        self._mixerless_module.set_amp_bypass_state(
+            self._channel, 'recv_atten', bool(bypass),
+        )
+        self._sync_runtime_state('recv_atten')
 
     def get_rx_amp_bypass(self):
         """Get RX amplifier bypass state."""
-        return self._get_amp_bypass('recv_atten')
+        self._require_bypass_amps()
+        return self._mixerless_module.get_amp_bypass_state(
+            self._channel, 'recv_atten',
+        )
 
-    # -- transfer functions --
+    # -- transfer functions / gain / 1 dB compression --
 
     def get_transfer(self):
-        """Return (tx_transfer, rx_transfer) dataclasses for the current state."""
-        mod = self._hw_module or self._mimic_module
-        return mod.get_transfer(self._channel)
+        """Return (tx_transfer, rx_transfer) for the current state.
 
-    def get_tx_input_1db_comp(self):
-        """Return the TX path input 1 dB compression point (dBm) at the current settings."""
-        mod = self._hw_module or self._mimic_module
-        atten_amp = mod._get_atten_amp(self._channel, 'transmit_atten')
-        return atten_amp.atten_amp_level.input_1dB_comp
-
-    def get_rx_input_1db_comp(self):
-        """Return the RX path input 1 dB compression point (dBm) at the current settings."""
-        mod = self._hw_module or self._mimic_module
-        atten_amp = mod._get_atten_amp(self._channel, 'recv_atten')
-        return atten_amp.atten_amp_level.input_1dB_comp
+        ``None`` for backends that don't model a full transfer function (RUDAT).
+        """
+        if self._mixerless_module is not None:
+            return self._mixerless_module.get_transfer(self._channel)
+        return None
 
     def get_tx_total_gain(self):
-        """Return the TX path total gain/insertion-loss (dB) at the current settings."""
-        mod = self._hw_module or self._mimic_module
-        atten_amp = mod._get_atten_amp(self._channel, 'transmit_atten')
-        return atten_amp.atten_amp_level.total_gain_il
+        """TX path total gain/insertion-loss (dB) at the current settings."""
+        if self._attenuator_backend == 'fixed':
+            gain = -abs(self.get_tx_attenuation())
+            if self.supports_bypass_amps:
+                gain += self._get_amp_s21('transmit_atten')
+            return gain
+        if self._mixerless_module is not None:
+            atten_amp = self._mixerless_module._get_atten_amp(
+                self._channel, 'transmit_atten',
+            )
+            return atten_amp.atten_amp_level.total_gain_il
+        return -abs(self.get_tx_attenuation())
 
     def get_rx_total_gain(self):
-        """Return the RX path total gain/insertion-loss (dB) at the current settings."""
-        mod = self._hw_module or self._mimic_module
-        atten_amp = mod._get_atten_amp(self._channel, 'recv_atten')
-        return atten_amp.atten_amp_level.total_gain_il
+        """RX path total gain/insertion-loss (dB) at the current settings."""
+        if self._attenuator_backend == 'fixed':
+            gain = -abs(self.get_rx_attenuation())
+            if self.supports_bypass_amps:
+                gain += self._get_amp_s21('recv_atten')
+            return gain
+        if self._mixerless_module is not None:
+            atten_amp = self._mixerless_module._get_atten_amp(
+                self._channel, 'recv_atten',
+            )
+            return atten_amp.atten_amp_level.total_gain_il
+        return -abs(self.get_rx_attenuation())
+
+    def get_tx_input_1db_comp(self):
+        """TX path input 1 dB compression point (dBm) at the current settings."""
+        if self._mixerless_module is not None:
+            atten_amp = self._mixerless_module._get_atten_amp(
+                self._channel, 'transmit_atten',
+            )
+            return atten_amp.atten_amp_level.input_1dB_comp
+        return None
+
+    def get_rx_input_1db_comp(self):
+        """RX path input 1 dB compression point (dBm) at the current settings."""
+        if self._mixerless_module is not None:
+            atten_amp = self._mixerless_module._get_atten_amp(
+                self._channel, 'recv_atten',
+            )
+            return atten_amp.atten_amp_level.input_1dB_comp
+        return None
 
     # -- status --
-
-    @property
-    def attenuator_backend(self):
-        """Name of the active attenuator backend."""
-        if isinstance(self._hw_module, RudatAdapter):
-            return 'rudat'
-        elif self._hw_module is not None:
-            return 'i2c'
-        elif self._mimic_module is not None:
-            return 'mimic'
-        return 'none'
 
     def get_status(self):
         """Return a dict summarising the current peripheral state."""
         if not self.enabled:
             return {'enabled': False}
+        has_readable_attenuation = (
+            self.is_hardware or self._attenuator_backend == 'fixed'
+        )
         status = {
             'enabled': True,
             'hardware': self.is_hardware,
+            'controllable': self.is_controllable,
             'attenuator_backend': self.attenuator_backend,
-            # channel: I2C MUX channel for the mixerless module hardware.
-            # For RUDAT backends this defaults to pipeline_id and is
-            # informational only (RUDAT devices are addressed by serial number).
-            'channel': self._channel,
-            'tx_attenuation_db': self.get_tx_attenuation(),
-            'rx_attenuation_db': self.get_rx_attenuation(),
-            'tx_amp_bypass': self.get_tx_amp_bypass(),
-            'rx_amp_bypass': self.get_rx_amp_bypass(),
-            'tx_total_gain_db': self.get_tx_total_gain(),
-            'rx_total_gain_db': self.get_rx_total_gain(),
-            'tx_input_1db_comp_dbm': self.get_tx_input_1db_comp(),
-            'rx_input_1db_comp_dbm': self.get_rx_input_1db_comp(),
+            'rf_channel': self._channel,
+            'tx_attenuation_db': (
+                self.get_tx_attenuation() if has_readable_attenuation else None
+            ),
+            'rx_attenuation_db': (
+                self.get_rx_attenuation() if has_readable_attenuation else None
+            ),
+            'tx_total_gain_db': (
+                self.get_tx_total_gain() if has_readable_attenuation else None
+            ),
+            'rx_total_gain_db': (
+                self.get_rx_total_gain() if has_readable_attenuation else None
+            ),
+            'tx_input_1db_comp_dbm': self.get_tx_input_1db_comp() if self.is_hardware else None,
+            'rx_input_1db_comp_dbm': self.get_rx_input_1db_comp() if self.is_hardware else None,
         }
-        if self.attenuator_backend == 'rudat':
-            rf_cfg = self.config.get('rf_frontend', {})
-            status['rudat_tx_serial'] = rf_cfg.get('rudat_tx_serial')
-            status['rudat_rx_serial'] = rf_cfg.get('rudat_rx_serial')
+        if self.supports_bypass_amps:
+            status['tx_amp_bypass'] = self.get_tx_amp_bypass()
+            status['rx_amp_bypass'] = self.get_rx_amp_bypass()
+            status['tx_bypass_amp_s21_db'] = self._get_amp_s21('transmit_atten')
+            status['rx_bypass_amp_s21_db'] = self._get_amp_s21('recv_atten')
+        if self._attenuator_backend == 'rudat':
+            attn_cfg = self.config.get('rf_frontend', {}).get('attenuator', {})
+            status['rudat_tx_serial'] = attn_cfg.get('rudat_tx_serial')
+            status['rudat_rx_serial'] = attn_cfg.get('rudat_rx_serial')
         return status
 
     # -- config application --
@@ -378,112 +446,157 @@ class RFPeripheralController:
 
         Counterpart to ``firmware_lib.apply_config`` — that function handles
         FPGA/firmware parameters, this one handles RF peripheral hardware
-        (variable attenuators and amplifier bypass via I2C).
+        (variable attenuators and amplifier bypass).
 
-        Reads ``tx_attenuator_value_db``, ``rx_attenuator_value_db`` from
-        rf_frontend and ``bypass_amps.tx_amp_bypass`` / ``rx_amp_bypass``
-        and programs the hardware to match.
-        Derived config values (``tx_bypass_amp_s21_db`` etc.) are updated after
-        each set operation via the normal _sync_config path.
+        Reads ``attenuator.tx_value_db`` / ``attenuator.rx_value_db`` and
+        ``bypass_amps.tx_amp_bypass`` / ``bypass_amps.rx_amp_bypass`` and
+        programs the hardware to match.
         """
         if not self.enabled:
             return
 
         cfg = config_dict if config_dict is not None else self.config
-        rf_cfg = cfg.get('rf_frontend', {})
-        bypass_cfg = rf_cfg.get('bypass_amps', {})
+        rf_cfg     = cfg.get('rf_frontend', {})
+        attn_cfg   = rf_cfg.get('attenuator', {}) or {}
+        bypass_cfg = rf_cfg.get('bypass_amps', {}) or {}
 
-        # Set hardware attenuators to match config
-        tx_atten = rf_cfg.get('tx_attenuator_value_db')
-        if tx_atten is not None:
-            try:
-                self.set_tx_attenuation(float(tx_atten))
-            except (ValueError, RuntimeError) as e:
-                logger.warning('Could not apply TX attenuation from config: %s', e)
+        if self._attenuator_backend == 'fixed':
+            for key in ('tx_value_db', 'rx_value_db'):
+                if key in attn_cfg:
+                    self.runtime_state['attenuator'][key] = attn_cfg[key]
+        else:
+            tx_atten = attn_cfg.get('tx_value_db')
+            if tx_atten is not None:
+                try:
+                    self.set_tx_attenuation(float(tx_atten))
+                except (ValueError, RuntimeError) as e:
+                    logger.warning('Could not apply TX attenuation from config: %s', e)
 
-        rx_atten = rf_cfg.get('rx_attenuator_value_db')
-        if rx_atten is not None:
-            try:
-                self.set_rx_attenuation(float(rx_atten))
-            except (ValueError, RuntimeError) as e:
-                logger.warning('Could not apply RX attenuation from config: %s', e)
+            rx_atten = attn_cfg.get('rx_value_db')
+            if rx_atten is not None:
+                try:
+                    self.set_rx_attenuation(float(rx_atten))
+                except (ValueError, RuntimeError) as e:
+                    logger.warning('Could not apply RX attenuation from config: %s', e)
 
-        # Set amplifier bypass state to match config (if bypass_amps enabled)
         if bypass_cfg.get('enabled', False):
-            tx_bypass = bypass_cfg.get('tx_amp_bypass')
-            if tx_bypass is not None:
-                try:
-                    self.set_tx_amp_bypass(bool(tx_bypass))
-                except (ValueError, RuntimeError) as e:
-                    logger.warning('Could not apply TX amp bypass from config: %s', e)
+            if not self.supports_bypass_amps:
+                logger.warning(
+                    'bypass_amps.enabled: true but no SOUK mixerless module '
+                    'is connected — ignoring bypass-amp settings.'
+                )
+            else:
+                tx_bypass = bypass_cfg.get('tx_amp_bypass')
+                if tx_bypass is not None:
+                    try:
+                        self.set_tx_amp_bypass(bool(tx_bypass))
+                    except (ValueError, RuntimeError) as e:
+                        logger.warning('Could not apply TX amp bypass from config: %s', e)
 
-            rx_bypass = bypass_cfg.get('rx_amp_bypass')
-            if rx_bypass is not None:
-                try:
-                    self.set_rx_amp_bypass(bool(rx_bypass))
-                except (ValueError, RuntimeError) as e:
-                    logger.warning('Could not apply RX amp bypass from config: %s', e)
+                rx_bypass = bypass_cfg.get('rx_amp_bypass')
+                if rx_bypass is not None:
+                    try:
+                        self.set_rx_amp_bypass(bool(rx_bypass))
+                    except (ValueError, RuntimeError) as e:
+                        logger.warning('Could not apply RX amp bypass from config: %s', e)
 
     # -- internal helpers --
 
-    def _module(self):
-        mod = self._hw_module or self._mimic_module
-        if mod is None:
-            raise RuntimeError('RF mixerless module not initialised')
-        return mod
+    def _require_attenuator(self):
+        if self._attenuator is None:
+            if self._attenuator_backend == 'fixed':
+                raise RuntimeError(
+                    'Fixed attenuator backend is not controllable.'
+                )
+            raise RuntimeError(
+                'Attenuator not initialised — check server logs for hardware errors.'
+            )
+        return self._attenuator
+
+    def _require_bypass_amps(self):
+        if self._mixerless_module is None:
+            raise RuntimeError(
+                'Bypass amps not available: the SOUK mixerless module is not '
+                'connected or did not initialise.'
+            )
 
     def _set_attenuation(self, dev_name, attenuation_db):
-        self._module().set_attenuation(self._channel, dev_name, attenuation_db)
-        self._sync_config(dev_name)
+        self._require_attenuator().set_attenuation(self._channel, dev_name, attenuation_db)
+        self._sync_runtime_state(dev_name)
 
     def _get_attenuation(self, dev_name):
-        return self._module().get_attenuation_value(self._channel, dev_name)
+        if self._attenuator_backend == 'fixed':
+            key = 'tx_value_db' if dev_name == 'transmit_atten' else 'rx_value_db'
+            value = self.runtime_state.get('attenuator', {}).get(key)
+            if value is None:
+                value = (
+                    self.config.get('rf_frontend', {})
+                    .get('attenuator', {})
+                    .get(key)
+                )
+            return 0.0 if value is None else float(value)
+        return self._require_attenuator().get_attenuation_value(self._channel, dev_name)
 
-    def _set_amp_bypass(self, dev_name, bypass):
-        self._module().set_amp_bypass_state(self._channel, dev_name, bool(bypass))
-        self._sync_config(dev_name)
+    def _sync_runtime_state(self, dev_name):
+        """Update runtime_state to reflect the current peripheral state."""
+        attn_state = self.runtime_state.setdefault('attenuator', {})
+        bypass_state = self.runtime_state.setdefault('bypass_amps', {})
 
-    def _get_amp_bypass(self, dev_name):
-        return self._module().get_amp_bypass_state(self._channel, dev_name)
-
-    def _sync_config(self, dev_name):
-        """Update the in-memory config to reflect the current peripheral state."""
-        rf_cfg = self.config.setdefault('rf_frontend', {})
-        bypass_cfg = rf_cfg.setdefault('bypass_amps', {})
+        if self._attenuator_backend == 'fixed':
+            attn_cfg = self.config.get('rf_frontend', {}).get('attenuator', {})
+            key = 'tx_value_db' if dev_name == 'transmit_atten' else 'rx_value_db'
+            if key in attn_cfg:
+                attn_state[key] = attn_cfg[key]
 
         if dev_name == 'transmit_atten':
-            rf_cfg['tx_attenuator_value_db'] = self.get_tx_attenuation()
-            rf_cfg['tx_bypass_amp_s21_db'] = self._get_amp_s21('transmit_atten')
-            bypass_cfg['tx_amp_bypass'] = self.get_tx_amp_bypass()
+            if self.is_hardware:
+                attn_state['tx_value_db'] = self.get_tx_attenuation()
+            if self.supports_bypass_amps:
+                bypass_state['tx_s21_db'] = self._get_amp_s21('transmit_atten')
+                bypass_state['tx_amp_bypass'] = self.get_tx_amp_bypass()
         elif dev_name == 'recv_atten':
-            rf_cfg['rx_attenuator_value_db'] = self.get_rx_attenuation()
-            rf_cfg['rx_bypass_amp_s21_db'] = self._get_amp_s21('recv_atten')
-            bypass_cfg['rx_amp_bypass'] = self.get_rx_amp_bypass()
+            if self.is_hardware:
+                attn_state['rx_value_db'] = self.get_rx_attenuation()
+            if self.supports_bypass_amps:
+                bypass_state['rx_s21_db'] = self._get_amp_s21('recv_atten')
+                bypass_state['rx_amp_bypass'] = self.get_rx_amp_bypass()
 
-    def _sync_config_from_hardware(self):
-        """Read all hardware state and update config on first init."""
-        self._sync_config('transmit_atten')
-        self._sync_config('recv_atten')
+    def _sync_runtime_state_from_hardware(self):
+        """Read all hardware state and update runtime_state on first init."""
+        self._sync_runtime_state('transmit_atten')
+        self._sync_runtime_state('recv_atten')
 
     def _get_amp_s21(self, dev_name):
-        """Return the current amplifier S21 contribution (gain or bypass IL)."""
-        mod = self._module()
-        atten_amp = mod._get_atten_amp(self._channel, dev_name)
+        """Return the current bypass-amp S21 contribution (gain or bypass IL)."""
+        atten_amp = self._mixerless_module._get_atten_amp(self._channel, dev_name)
         return atten_amp.atten_amp_level.amp.total_gain_il
+
+    def get_runtime_state(self):
+        """Return a copy of mutable RF frontend state."""
+        self._sync_runtime_state_from_hardware()
+        return {
+            'attenuator': dict(self.runtime_state.get('attenuator', {})),
+            'bypass_amps': dict(self.runtime_state.get('bypass_amps', {})),
+        }
 
 
 # ---------------------------------------------------------------------
 # Generic attenuator discovery
 # ---------------------------------------------------------------------
 
-def find_attenuators():
-    """Discover all connected programmable attenuators and print their details.
+def find_attenuators(include_state=False):
+    """Discover all connected programmable attenuators.
 
     Searches for:
     - Mini-Circuits RUDAT USB attenuators (via pyusb)
-    - I2C attenuators on the SOUK RF Mixerless Module (via smbus2)
+    - I2C attenuators on the SOUK mixerless module (via smbus2) — both
+      TX and RX paths on each of the module's two channels.
 
-    Returns a list of dicts with keys: backend, serial, bus, address, model.
+    If ``include_state=True``, each entry also reports the current
+    attenuation level in dB (key: ``attenuation_db``).
+
+    Returns a list of dicts. Common keys: backend, model, bus, address.
+    Mixerless-module entries also include channel and path ('TX'/'RX').
     """
     results = []
 
@@ -494,70 +607,175 @@ def find_attenuators():
             for serial, info in rudats.items():
                 from souk_readout_tools.server.rudat import Attenuator as _Att
                 att = _Att(info['bus'], info['address'])
-                model = att.get_model()
-                results.append({
+                entry = {
                     'backend': 'rudat',
                     'serial': serial,
                     'bus': info['bus'],
                     'address': info['address'],
-                    'model': model,
-                })
+                    'model': att.get_model(),
+                }
+                if include_state:
+                    try:
+                        entry['attenuation_db'] = float(att.att)
+                    except Exception:
+                        entry['attenuation_db'] = None
+                results.append(entry)
         except Exception as e:
             print(f'RUDAT discovery error: {e}')
     else:
         print('RUDAT support not available (pyusb not installed)')
 
-    # -- I2C attenuators (souk-peripherals-control) --
+    # -- I2C attenuators (SOUK mixerless module on SMBus(0)) --
     if _HW_AVAILABLE:
-        for bus_num in range(4):
-            try:
-                bus = SMBus(bus_num)
-                cfg_list = [
-                    SOUKRFMixerlessModuleChnHWConfig.default_config(),
-                    SOUKRFMixerlessModuleChnHWConfig.default_config(),
-                ]
-                mod = SOUKRFMixerlessModule(bus, cfg_list)
-                for ch in range(2):
+        try:
+            bus = SMBus(0)
+            mod = SOUKRFMixerlessModule(bus, _mixerless_module_hw_config_list())
+            # Each channel has two independent MAX7329-driven attenuators —
+            # one on the TX path and one on the RX path. Probe both.
+            for ch in range(2):
+                for path, label in (('transmit_atten', 'TX'),
+                                    ('recv_atten', 'RX')):
                     try:
-                        atten_amp = mod._get_atten_amp(ch, 'transmit_atten')
-                        results.append({
+                        atten_amp = mod._get_atten_amp(ch, path)
+                        entry = {
                             'backend': 'i2c',
                             'serial': None,
-                            'bus': bus_num,
-                            'address': None,
-                            'model': f'SOUK RF Mixerless Module ch{ch}',
-                        })
+                            'bus': 0,
+                            'address': hex(atten_amp.atten_amp.addr),
+                            'channel': ch,
+                            'path': label,
+                            'model': f'SOUK RF Mixerless Module ch{ch} {label}',
+                        }
+                        if include_state:
+                            try:
+                                entry['attenuation_db'] = mod.get_attenuation_value(ch, path)
+                            except Exception:
+                                entry['attenuation_db'] = None
+                        results.append(entry)
                     except Exception:
                         pass
-                bus.close()
-            except Exception:
-                pass
+            bus.close()
+        except Exception as e:
+            print(f'I2C mixerless-module discovery error: {e}')
     else:
         print('I2C support not available (smbus2 not installed)')
 
     return results
 
 
+def find_bypass_amps(include_state=False):
+    """Discover bypassable amplifiers.
+
+    Currently only the SOUK mixerless module has bypass amps — one per
+    TX/RX path per channel, sharing the MAX7329 GPIO with the attenuator.
+
+    If ``include_state=True``, each entry reports the current bypass
+    state (key: ``bypassed`` — True means the amp is bypassed).
+
+    Returns a list of dicts. Keys: backend, model, bus, address, channel, path.
+    """
+    results = []
+
+    if _HW_AVAILABLE:
+        try:
+            bus = SMBus(0)
+            mod = SOUKRFMixerlessModule(bus, _mixerless_module_hw_config_list())
+            for ch in range(2):
+                for path, label in (('transmit_atten', 'TX'),
+                                    ('recv_atten', 'RX')):
+                    try:
+                        atten_amp = mod._get_atten_amp(ch, path)
+                        entry = {
+                            'backend': 'i2c',
+                            'bus': 0,
+                            'address': hex(atten_amp.atten_amp.addr),
+                            'channel': ch,
+                            'path': label,
+                            'model': f'SOUK RF Mixerless Module ch{ch} {label} bypass amp',
+                        }
+                        if include_state:
+                            try:
+                                entry['bypassed'] = mod.get_amp_bypass_state(ch, path)
+                            except Exception:
+                                entry['bypassed'] = None
+                        results.append(entry)
+                    except Exception:
+                        pass
+            bus.close()
+        except Exception as e:
+            print(f'Bypass-amp discovery error: {e}')
+    else:
+        print('I2C support not available (smbus2 not installed)')
+
+    return results
+
+
+def _format_value(val):
+    if val is None:
+        return 'unknown'
+    if isinstance(val, bool):
+        return str(val)
+    if isinstance(val, float):
+        return f'{val:.3f}'
+    return str(val)
+
+
+def _print_results(results, kind):
+    """Pretty-print a list of discovery dicts."""
+    if not results:
+        print(f'No {kind}s found.')
+        return
+    print(f'Found {len(results)} {kind}(s):\n')
+    state_keys = (
+        'attenuation_db', 'bypassed',
+        'remote_voltage_v', 'local_voltage_v', 'bias_current_a',
+    )
+    for r in results:
+        print(f'  Backend: {r["backend"]}')
+        if r.get('serial'):
+            print(f'  Serial:  {r["serial"]}')
+        if r.get('model'):
+            print(f'  Model:   {r["model"]}')
+        if r.get('refdes'):
+            print(f'  Refdes:  {r["refdes"]}')
+        if r.get('channel') is not None:
+            extra = f' ({r["path"]})' if r.get('path') else ''
+            print(f'  Channel: {r["channel"]}{extra}')
+        bus = r.get('bus')
+        addr = r.get('address')
+        if bus is not None:
+            line = f'  Bus:     {bus}'
+            if addr is not None:
+                line += f', Address: {addr}'
+            print(line)
+        for key in state_keys:
+            if key in r:
+                print(f'  {key}: {_format_value(r[key])}')
+        print()
+
+
 def _cli_main():
     """CLI entry point for souk-find-attenuators."""
+    import argparse
+    parser = argparse.ArgumentParser(description='Discover programmable attenuators.')
+    parser.add_argument('--status', action='store_true',
+                        help='Also report the current attenuation level on each.')
+    args = parser.parse_args()
+
     print('\nSearching for programmable attenuators...\n')
-    results = find_attenuators()
-    if not results:
-        print('No programmable attenuators found.')
-    else:
-        print(f'Found {len(results)} attenuator(s):\n')
-        for r in results:
-            print(f'  Backend: {r["backend"]}')
-            if r['serial'] is not None:
-                print(f'  Serial:  {r["serial"]}')
-            if r['model'] is not None:
-                print(f'  Model:   {r["model"]}')
-            print(f'  Bus:     {r["bus"]}', end='')
-            if r['address'] is not None:
-                print(f', Address: {r["address"]}')
-            else:
-                print()
-            print()
+    _print_results(find_attenuators(include_state=args.status), 'attenuator')
+
+
+def _cli_main_bypass_amps():
+    """CLI entry point for souk-find-bypass-amps."""
+    import argparse
+    parser = argparse.ArgumentParser(description='Discover bypass amplifiers.')
+    parser.add_argument('--status', action='store_true',
+                        help='Also report the current bypass state on each.')
+    args = parser.parse_args()
+
+    print('\nSearching for bypass amplifiers...\n')
+    _print_results(find_bypass_amps(include_state=args.status), 'bypass amp')
 
 
 if __name__ == '__main__':

@@ -46,37 +46,46 @@ souk_readout_tools/server/
 
 `rf_peripherals.py` is the wrapper that the readout server uses.  It adds the
 submodule directory to `sys.path`, imports the submodule classes, and provides a
-unified `RFPeripheralController` interface that supports three backends:
+unified `RFPeripheralController` interface that supports three attenuator
+backends:
 
-- **i2c** (default) — real SOUK I2C hardware via `smbus2`
+- **i2c** — real SOUK I2C hardware via `smbus2`
 - **rudat** — Mini-Circuits RUDAT-6000-30 USB attenuators via `pyusb`
-- **software mimic** — automatic fallback when no hardware libraries are
-  available; useful for offline transfer-function modelling
+- **fixed** — explicit, non-controllable attenuation values from config
 
 ## Configuration
 
 RF peripherals are configured in the `rf_frontend` section of the readout
 config YAML. The `RFPeripheralController` is active when `connected: true`
-and `attenuator_backend` is set to `i2c` or `rudat`. If `attenuator_backend`
-is blank, attenuator values are treated as manual (fixed) entries.
+and `attenuator.backend` is set to `i2c`, `rudat`, or `fixed`. Use `fixed`
+for manual attenuators whose values should contribute to calibration but
+must not be changed by software.
 
 ```yaml
 rf_frontend:
   connected: true
   hardware_id: "souk-mixerless-module"
-  attenuator_backend: "i2c"         # 'i2c', 'rudat', or blank for manual
-  tx_attenuator_value_db: 10.0
-  rx_attenuator_value_db: 15.0
-  # rudat_tx_serial: "12345"        # required if attenuator_backend: rudat
-  # rudat_rx_serial: "67890"
+  mixerless_module:
+    connected: true                 # true for the SOUK mixerless module
+    rf_channel: 0                   # 0 or 1
+  attenuator:
+    backend: "i2c"                  # 'i2c', 'rudat', or 'fixed'
+    tx_value_db: 10.0
+    rx_value_db: 15.0
+    # rudat_tx_serial: "12345"      # required if backend: rudat
+    # rudat_rx_serial: "67890"
   bypass_amps:
     enabled: true                   # true for souk-mixerless-module
     tx_amp_bypass: false
     rx_amp_bypass: false
-  mixerless_module:
-    i2c_bus: 0
-    channel: 0
 ```
+
+The attenuator keys in the config are desired startup/apply values. Runtime
+attenuator and bypass-amp values are kept separately by the server and are
+reported by `get_rf_peripheral_status()` / `get_info(['rf_frontend'])`.
+`pull_config()` returns the active config file only. Use
+`sync_config_from_system()` or `sync_config_to_local()` when you explicitly
+want to capture the current hardware state into a local config.
 
 ## Standalone usage
 
@@ -96,17 +105,28 @@ from souk_rf_mixerless_module import (
 )
 
 bus = SMBus(0)  # /dev/i2c-0
-hw_config = [SOUKRFMixerlessModuleChnHWConfig.default_config()]
+hw_config = [
+    SOUKRFMixerlessModuleChnHWConfig(
+        r8_r13="R8", r9_r14="R9", r12_r17="R17",
+        r18_r21="R21", r19_r22="R19", r20_r23="R23",
+        u4_type="MAX7329", u8_type="MAX7329",
+    ),
+    SOUKRFMixerlessModuleChnHWConfig(
+        r8_r13="R8", r9_r14="R14", r12_r17="R17",
+        r18_r21="R21", r19_r22="R22", r20_r23="R23",
+        u4_type="MAX7329", u8_type="MAX7329",
+    ),
+]
 module = SOUKRFMixerlessModule(bus, hw_config)
 
 # Set TX attenuator to 12.0 dB
-module.set_atten(channel=0, tx_rx='tx', atten_dB=12.0)
+module.set_attenuation(0, 'transmit_atten', 12.0)
 
 # Read back
-print(module.get_atten(channel=0, tx_rx='tx'))
+print(module.get_attenuation_value(0, 'transmit_atten'))
 
 # Bypass the RX amplifier
-module.set_amp_bypass(channel=0, tx_rx='rx', bypass=True)
+module.set_amp_bypass_state(0, 'recv_atten', True)
 ```
 
 ### Transfer function modelling (no hardware needed)
@@ -124,9 +144,11 @@ tx_model = SOUKRFMixerlessTransmitAttenAmpLevel()
 rx_model = SOUKRFMixerlessRecvAttenAmpLevel()
 
 # Get TX transfer function with amp enabled, 10 dB attenuation
-tx_transfer = tx_model.get_transfer(atten_dB=10.0, bypass=False)
-print(f"TX total gain: {tx_transfer.total_gain_dB:.1f} dB")
-print(f"TX input 1dB comp: {tx_transfer.input_1dB_comp:.1f} dBm")
+tx_model.atten = 10.0
+tx_model.bypass_state = False
+tx_transfer = tx_model.get_transfer()
+print(f"TX total gain: {tx_transfer.total_gain_il:.1f} dB")
+print(f"TX input 1dB comp: {tx_model.input_1dB_comp:.1f} dBm")
 ```
 
 ### RUDAT USB attenuator
@@ -172,6 +194,19 @@ You can also probe all connected RUDATs from the command line:
 ```bash
 python -m souk_readout_tools.server.rudat
 ```
+
+The installed server package also provides discovery/status entry points:
+
+```bash
+souk-find-attenuators --status
+souk-find-bypass-amps --status
+souk-rf-peripherals-status
+```
+
+`souk-find-attenuators` reports both RUDAT devices and the two TX/RX
+attenuator paths on each SOUK mixerless-module channel. `souk-find-bypass-amps`
+reports the corresponding bypass amplifiers. The combined status command runs
+the attenuator, bypass-amplifier, and LNA discovery passes in one report.
 
 ### LNA bias monitoring and control
 
@@ -282,9 +317,10 @@ where in the chain the power is reported:
 | `'detector'` | Power at detector (default, full TX chain) |
 
 When `detailed_output=True` it returns a breakdown of every gain/loss stage.
-The current peripheral settings are included in this calculation — it reads
-`tx_attenuator_value_db` and `tx_bypass_amp_s21_db` from the live config, which
-the `RFPeripheralController` keeps in sync with the hardware.
+The current peripheral settings are included in this calculation.  With
+hardware RF peripherals available, the server reads attenuator and bypass-amp
+state directly from the `RFPeripheralController`; otherwise it falls back to
+the desired/fixed values in the config.
 
 ```python
 # Per-tone power at detector plane (default)

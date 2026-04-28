@@ -89,6 +89,9 @@ if install_server:
         'souk-disable-daemon=souk_readout_tools.server.server_scripts.souk_disable_daemon:main',
         'souk-restart-daemon=souk_readout_tools.server.server_scripts.souk_restart_daemon:main',
         'souk-find-attenuators=souk_readout_tools.server.rf_peripherals:_cli_main',
+        'souk-find-bypass-amps=souk_readout_tools.server.rf_peripherals:_cli_main_bypass_amps',
+        'souk-find-lnas=souk_readout_tools.server.lna_controller:_cli_main',
+        'souk-rf-peripherals-status=souk_readout_tools.server.server_scripts.souk_rf_peripherals_status:main',
     ])
 
 setup(

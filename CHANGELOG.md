@@ -1,20 +1,106 @@
 # Changelog & Feature List
 
-## v1.2.0 (Current)
+## v1.1.1 (Current)
+
+**Removed Deprecated APIs**
+- `get_system_information()` (client/server/`firmware_lib`) and
+  `get_server_status()` (client/server) have been removed. Use
+  `get_info(sections=...)` for structured system state and
+  `health_check()` for compact polling.
+- Sweep, snapshot, stream, and parsed-data payloads now carry the
+  structured info under the `info` key (replacing the legacy flat
+  `system_information` key). Plotting and parsing helpers read from
+  `data['info']` accordingly.
+
+**LNA Bias Setting Failure Reporting**
+- `set_lna_bias_voltage()` and `set_lna_bias_voltage_all()` now propagate
+  hardware-side rejections from the upstream `souk-peripherals-control`
+  algorithm as proper `status: 'error'` responses (with the original
+  diagnostic message and full result still attached) rather than burying
+  the failure inside a `status: 'success'` payload.
+- Each per-channel result now carries a `success: bool` flag so callers
+  can branch on it directly.
+- LNA bias config now includes an explicit backend plus `bias_voltage_v`
+  (default 1.5 V), `method`, and `blind`; config application sets the
+  configured LNA channel when the `i2c` backend is enabled.
+- Added explicit `fixed` backends for LNA bias and RF attenuators so
+  non-controllable values are represented deliberately instead of by
+  blank backend leaves.
+- Added `soft_off_lna_bias()` / `soft_off_lna_bias_all()` and the
+  `souk-find-lnas --status` discovery CLI.
+
+**RF Peripheral Configuration & Discovery**
+- RF frontend config now separates `mixerless_module`, `attenuator`, and
+  `bypass_amps` settings. Attenuator values live at
+  `rf_frontend.attenuator.tx_value_db` / `rx_value_db`; bypass amp S21 lives
+  at `rf_frontend.bypass_amps.tx_s21_db` / `rx_s21_db`.
+- The controller no longer uses a software mimic after hardware init
+  failures. Failed hardware remains unavailable and subsequent set/get calls
+  raise clear errors instead of returning fake-success state.
+- Added `souk-find-bypass-amps` and `souk-rf-peripherals-status`, and
+  extended `souk-find-attenuators` with `--status`.
+- Power-management helpers now distinguish controllable attenuators from
+  bypass-amplifier support, so RUDAT/fixed attenuator setups are not asked to
+  toggle mixerless-module amps.
+
+**Config / Runtime State Split**
+- `pull_config()` (and the `config` section of `get_info()`) now return the
+  active config file only. Runtime hardware changes are reported through the
+  live status/info APIs instead of being patched into config.
+- `sync_config_from_system()` explicitly captures the live state into
+  `client.config` and returns the updated config dict. Use
+  `sync_config_to_local(save_as=...)` as a clearer alias when creating a new
+  local config from the running system.
+
+**Sweep Plotter Speed-up**
+- `plot_sweep()` `show_errors` now defaults to `None`, which auto-disables
+  error fills for wideband sweeps where `fill_between` over hundreds of
+  thousands of points dominates render time.  Per-tone sweeps are
+  unchanged.  Pass `show_errors=True`/`False` to override.
+
+**Sweep & Tone Update Robustness**
+- Frequency-only tone updates now preserve existing tone amplitudes and phases
+  when the tone count is unchanged.
+- Fast sweep setup can carry amplitudes/phases through every sweep point, and
+  protects the VACC from shared-bin amplitude overflow by scaling sweep
+  amplitudes and temporarily compensating `psb_scale` when possible.
+- Fast sweep/retune paths use the fast tone-frequency writer and direct
+  channel-map updates for lower overhead.
+
+**Peak Finder Edge Trim**
+- `PeakFinderParams` accepts new `f_low` / `f_high` (Hz) fields to drop
+  peaks outside a chosen band.  Useful for excluding band edges where
+  filtering artefacts can produce spurious peaks.  Filtering happens
+  after `find_peaks` so prominence/width context still uses the full
+  band.
+
+**Other Fixes & Improvements**
+- Wideband sweep with `tone_powers=None` no longer reapplies tone powers
+  (preserves whatever the pipeline currently has set).
+- Fix late-import bug in `firmware_lib`.
+- `perform_sweep()` and `perform_retune()` can refresh the ADC calibration
+  before sweeping for improved S21 stability.
+- Group-delay estimation and removal: improved cable-delay fit;
+  `remove_group_delay()` honours frequency-dependent calibrations.
+- Fixed `generate_newman_phases` to return phases in the original frequency 
+  order, not the sorted order. 
 
 **Structured Info System**
-- `get_info(sections)` replaces the monolithic `get_system_information()` with 15 named sections: `server`, `versions`, `clock`, `fpga`, `rfdc`, `pipeline`, `tones`, `rf_frontend`, `lna`, `rfsoc_sensors`, `diagnostics`, `config`, `calibrations`, `resonators`, `registers`.
+- `get_info(sections)` provides structured system state in 15 named sections: `server`, `versions`, `clock`, `fpga`, `rfdc`, `pipeline`, `tones`, `rf_frontend`, `lna`, `rfsoc_sensors`, `diagnostics`, `config`, `calibrations`, `resonators`, `registers`.
 - `rfsoc_sensors` section reports on-chip PS/PL SYSMON readings via IIO sysfs: die temperatures (C) and supply voltages (V), keyed by the raw sensor names so PS/PL rails with duplicate short names (e.g. `vccams`, `vccint`) stay distinct.
 - Each section includes a `ready` flag indicating whether its data could be read from hardware.
 - Default call excludes expensive sections (`diagnostics`, `config`, `calibrations`, `resonators`, `registers`); use `'all'` for everything.
 - `health_check()` for compact intermittent polling — returns pass/fail bools for clock lock, ADC/DAC saturation, DSP overflow, RTS events, plus key state indicators.
 - `rf_frontend` section now includes full signal chain description: hardware identity, attenuator backend details (I2C bus/channel or RUDAT serial numbers), live attenuator/amp state, derived gain/compression, and updownconverter characterisation (LO frequency, sideband, mixer/combiner losses, IF/RF S21).
 - `lna` section includes controller status and bias readings (voltage, current) for all 14 channels.
-- `config` section returns raw YAML config text with comments preserved, plus `config_matches_applied` (in-memory config vs last applied to firmware).
+- `config` section returns the active config file as YAML text; mutable hardware
+  state is reported by the relevant live info sections instead of being patched
+  into the config.  Use `sync_config_from_system()` / `sync_config_to_local()`
+  to explicitly capture live settings into a new local config.
 - `calibrations` section returns resolved per-tone calibration values (after frequency-dependent interpolation).
 - `resonators` section placeholder for future resonator detuning tracking module.
 - `registers` section placeholder for future full firmware register dump.
-- `tone_indices` renamed to `firmware_indices` in new info output (backward-compatible key retained in legacy `get_system_information()`).
+- `tone_indices` renamed to `firmware_indices` in `info['tones']`.
 - Server activity flags (`streaming`, `triggered_streaming`, `sweeping`) now exposed in `server` section.
 - `firmware_interface_ready` / `firmware_fast_interface_ready` checks added (verifies blocks are present, not just that the object exists).
 
@@ -82,7 +168,7 @@
 **Clock Source Control**
 - `get_clock_source()` / `set_clock_source()` for reading and setting the PL reference clock (internal 12.8 MHz or external 10 MHz).
 - `get_clock_status()` for querying PLL lock status of all clock chips (LMK04208 + LMX2594s).
-- Clock source and lock status included in `get_system_information()`.
+- Clock source and lock status included in `get_info()` (under the `clock` section).
 - `apply_config()` enforces `firmware.clock_source` on every config push.
 - See [clock_source.md](doc/clock_source.md) for full details and manual procedures.
 
@@ -102,7 +188,7 @@
 - `estimate_papr_db()` in `firmware_lib` for computing the peak-to-average power ratio (dB) of a multitone waveform. Simulates the time-domain composite signal to verify phase/amplitude choices before applying to hardware.
 
 **System Information**
-- `get_system_information()` reports software versions, git info, and RFDC RTS events.
+- `get_info()` reports software versions, git info, and RFDC RTS events.
 - `check_rfdc_rts_events()` for DAC/ADC overvoltage sticky flag checking.
 
 **Sweep Progress**

@@ -62,6 +62,11 @@ class PeakFinderParams:
     peak_direction: int = -1  # -1 for dips (resonances), +1 for peaks
     max_num_peaks: int = 10000
 
+    # Frequency-range trim — exclude band edges where filtering artefacts
+    # often produce spurious peaks.  None disables the trim on that side.
+    f_low: Optional[float] = None   # Hz; drop peaks below this frequency
+    f_high: Optional[float] = None  # Hz; drop peaks above this frequency
+
 
 @dataclass
 class ResonanceResult:
@@ -231,12 +236,25 @@ def find_resonances(
     search_data = data * params.peak_direction
     
     peaks, properties = find_peaks(search_data, **kwargs)
-    
+
+    # Drop peaks outside [f_low, f_high].  Done AFTER find_peaks so the
+    # filter / prominence / width logic still sees full-band context — only
+    # the returned peak list is trimmed.
+    if params.f_low is not None or params.f_high is not None:
+        peak_freqs = frequencies[peaks]
+        mask = np.ones(len(peaks), dtype=bool)
+        if params.f_low is not None:
+            mask &= peak_freqs >= params.f_low
+        if params.f_high is not None:
+            mask &= peak_freqs <= params.f_high
+        peaks = peaks[mask]
+        properties = {k: v[mask] for k, v in properties.items()}
+
     # Limit number of peaks
     if len(peaks) > params.max_num_peaks:
         peaks = peaks[:params.max_num_peaks]
         properties = {k: v[:params.max_num_peaks] for k, v in properties.items()}
-    
+
     return peaks, properties
 
 

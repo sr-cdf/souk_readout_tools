@@ -55,15 +55,15 @@ Uses an external mixer to up/down-convert between IF and RF frequencies.
 ```
 TX: DAC0 ──► IF chain ──► Atten ──► Mixer ──► RF chain ──► Cryostat ──► Detector
                  |           |          |           |            |
-             tx_if_s21  tx_attenuator  tx_mixer  tx_rf_s21   input_s21
-               _db       _value_db    _conv_       _db         _db
-                                      loss_db
+             tx_if_s21   attenuator  tx_mixer   tx_rf_s21    input_s21
+               _db       .tx_value   _conv_       _db          _db
+                            _db    loss_db
 
 RX: ADC ◄── IF chain ◄── Atten ◄── Mixer ◄── RF chain ◄── Cryostat ◄── Detector
                 |           |          |           |            |
-            rx_if_s21  rx_attenuator  rx_mixer  rx_rf_s21   output_s21
-              _db       _value_db    _conv_       _db         _db
-                                     loss_db
+            rx_if_s21   attenuator  rx_mixer   rx_rf_s21    output_s21
+              _db       .rx_value   _conv_       _db          _db
+                           _db    loss_db
 ```
 
 The IF and RF chains include any fixed (non-bypassable) amplifiers, filters, and cables between the DAC/ADC and mixer and the mixer and cryostat. Measure the end-to-end S21 of these paths and enter them as `tx_if_s21_db` / `rx_if_s21_db` / `tx_rf_s21_db` / `rx_rf_s21_db` .
@@ -77,18 +77,20 @@ rf_frontend:
   connected: true
   tx_combiner_loss_db: 0        # dual-DAC not supported, set to 0
   rx_combiner_loss_db: 0
-  tx_attenuator_value_db: 10.0  # manual attenuator — enter the fixed setting
-  rx_attenuator_value_db: 10.0
+  attenuator:
+    backend: "fixed"            # manual fixed attenuator
+    tx_value_db: 10.0           # enter the fixed setting
+    rx_value_db: 10.0
   tx_if_s21_db: -1.0            # measure IF path S21 (cables, filters)
   rx_if_s21_db: -1.0
   tx_mixer_conversion_loss_db: 7.0   # measure mixer conversion loss at LO freq
   rx_mixer_conversion_loss_db: 7.0
   tx_rf_s21_db: -2.0            # measure RF path S21 (cables, filters, amps)
   rx_rf_s21_db: -2.0
-  tx_bypass_amp_s21_db: 0       # no bypass amp in breadboard
-  rx_bypass_amp_s21_db: 0
   bypass_amps:
-    enabled: false
+    enabled: false              # no bypass amp in breadboard
+    tx_s21_db: 0
+    rx_s21_db: 0
 ```
 
 ### Direct RF Model (no mixer)
@@ -118,18 +120,20 @@ rf_frontend:
   connected: true
   tx_combiner_loss_db: 0        # dual-DAC not supported, set to 0
   rx_combiner_loss_db: 0
-  tx_attenuator_value_db: 0     # no attenuator
-  rx_attenuator_value_db: 0
+  attenuator:
+    backend: "fixed"            # no programmable attenuator
+    tx_value_db: 0
+    rx_value_db: 0
   tx_if_s21_db: 0               # no IF chain
   rx_if_s21_db: 0
   tx_mixer_conversion_loss_db: 0     # no mixer
   rx_mixer_conversion_loss_db: 0
   tx_rf_s21_db: -1.5            # measure end-to-end RF chain S21 (filters, amps, cables)
   rx_rf_s21_db: -1.5
-  tx_bypass_amp_s21_db: 0       # no bypass amp
-  rx_bypass_amp_s21_db: 0
   bypass_amps:
-    enabled: false
+    enabled: false              # no bypass amp
+    tx_s21_db: 0
+    rx_s21_db: 0
 ```
 
 ### RF Mixerless Module
@@ -139,13 +143,13 @@ The SOUK RF Mixerless Module adds a variable attenuator (0-31.5 dB in 0.5 dB ste
 ```
 TX: DAC0 ──► RF chain (filters, amps, cables) ──► Var. Atten ──► Bypass Amp ──► Cryostat ──► Detector
                     |                                  |               |             |
-                tx_rf_s21                         tx_attenuator   tx_bypass_amp    input_s21
-                  _db                              _value_db        _s21_db          _db
+                tx_rf_s21                         attenuator      bypass_amps    input_s21
+                  _db                             .tx_value_db    .tx_s21_db       _db
 
 RX: ADC ◄──  RF chain (filters, amps, cables) ◄── Var. Atten ◄── Bypass Amp ◄── Cryostat ◄── Detector
                     |                                  |               |             |
-                rx_rf_s21                         rx_attenuator   rx_bypass_amp    output_s21
-                  _db                              _value_db        _s21_db          _db
+                rx_rf_s21                         attenuator      bypass_amps    output_s21
+                  _db                             .rx_value_db    .rx_s21_db       _db
 
          NyqZ 1: low-pass filter    NyqZ 2: band-pass filter
 ```
@@ -157,27 +161,34 @@ rf_frontend:
   connected: true
   tx_combiner_loss_db: 0        # dual-DAC not supported, set to 0
   rx_combiner_loss_db: 0
-  tx_attenuator_value_db: 10.0  # set by RFPeripheralController
-  rx_attenuator_value_db: 10.0
+  mixerless_module:
+    connected: true
+    rf_channel: 0
+  attenuator:
+    backend: "i2c"
+    tx_value_db: 10.0           # applied on config push/startup
+    rx_value_db: 10.0
   tx_if_s21_db: 0               # no IF chain
   rx_if_s21_db: 0
   tx_mixer_conversion_loss_db: 0     # no mixer
   rx_mixer_conversion_loss_db: 0
   tx_rf_s21_db: -1.5            # measure filter + cable S21
   rx_rf_s21_db: -1.5
-  tx_bypass_amp_s21_db: 15.0    # auto-updated by RFPeripheralController
-  rx_bypass_amp_s21_db: 15.0
-  attenuator_backend: "i2c"
   bypass_amps:
     enabled: true
     tx_amp_bypass: false
     rx_amp_bypass: false
-  mixerless_module:
-    i2c_bus: 0
-    channel: 0
+    tx_s21_db: 15.0             # desired/captured value; live value read from hardware
+    rx_s21_db: 15.0
 ```
 
-When `rf_frontend.connected: true`, `tx_attenuator_value_db`, `rx_attenuator_value_db`, `tx_bypass_amp_s21_db`, and `rx_bypass_amp_s21_db` are automatically managed by the `RFPeripheralController`. See [RF Peripheral Control](#rf-peripheral-control) for full details and alternative attenuator backends.
+When `rf_frontend.connected: true`, `attenuator.tx_value_db`,
+`attenuator.rx_value_db`, `bypass_amps.tx_s21_db`, and
+`bypass_amps.rx_s21_db` are desired/captured config values. The
+`RFPeripheralController` keeps live attenuator and bypass-amp state separately
+and power calibration uses that live state at runtime. `pull_config()` returns
+the active config file only; call `sync_config_from_system()` if you want to
+capture the running state into a local config. See [RF Peripheral Control](#rf-peripheral-control) for full details and alternative attenuator backends.
 
 ---
 
@@ -270,17 +281,17 @@ When `rf_frontend.connected: true`, the following parameters contribute to the c
 | Config key | Description | Sign convention | Used by |
 |-----------|-------------|----------------|---------|
 | `tx_combiner_loss_db` | Combiner insertion loss (TX) | Negative (loss) | None (dual-DAC not supported) |
-| `tx_attenuator_value_db` | Attenuator setting (TX) | Positive = attenuation | Breadboard (fixed), Mixerless (programmable) |
+| `attenuator.tx_value_db` | Attenuator setting (TX) | Positive = attenuation | Breadboard (fixed), Mixerless (programmable) |
 | `tx_if_s21_db` | IF chain S21 (TX) | Gain +, loss - | Breadboard |
 | `tx_mixer_conversion_loss_db` | Mixer conversion loss (TX) | Positive = loss | Breadboard |
 | `tx_rf_s21_db` | RF chain S21 (TX) | Gain +, loss - | All |
-| `tx_bypass_amp_s21_db` | Bypass amplifier S21 (TX, auto-updated) | Gain + | Mixerless module |
+| `bypass_amps.tx_s21_db` | Bypass amplifier S21 (TX, desired/captured; live value read from hardware) | Gain + | Mixerless module |
 | `rx_combiner_loss_db` | Combiner insertion loss (RX) | Negative (loss) | None (dual-DAC not supported) |
-| `rx_attenuator_value_db` | Attenuator setting (RX) | Positive = attenuation | Breadboard (fixed), Mixerless (programmable) |
+| `attenuator.rx_value_db` | Attenuator setting (RX) | Positive = attenuation | Breadboard (fixed), Mixerless (programmable) |
 | `rx_if_s21_db` | IF chain S21 (RX) | Gain +, loss - | Breadboard |
 | `rx_mixer_conversion_loss_db` | Mixer conversion loss (RX) | Positive = loss | Breadboard |
 | `rx_rf_s21_db` | RF chain S21 (RX) | Gain +, loss - | All |
-| `rx_bypass_amp_s21_db` | Bypass amplifier S21 (RX, auto-updated) | Gain + | Mixerless module |
+| `bypass_amps.rx_s21_db` | Bypass amplifier S21 (RX, desired/captured; live value read from hardware) | Gain + | Mixerless module |
 
 Each of these can be specified as a scalar, inline pairs, or a file path (same options as DAC calibration).
 
@@ -290,41 +301,45 @@ Measure these values with a VNA or signal source + spectrum analyser. For mixers
 
 ## RF Peripheral Control
 
-The `RFPeripheralController` manages programmable attenuators (and optionally a bypassable amplifier) on the TX and RX paths. It is initialised by the server on startup when `rf_frontend.connected: true`. Two attenuator backends are supported.
+The `RFPeripheralController` manages programmable attenuators (and optionally a bypassable amplifier) on the TX and RX paths. It is initialised by the server on startup when `rf_frontend.connected: true`. Three attenuator backends are supported.
 
 ### Attenuator backends
 
-The `attenuator_backend` config key (under `rf_frontend`) selects the hardware driver. If omitted, defaults to `i2c`.
+The `attenuator.backend` config key (under `rf_frontend`) selects the attenuator backend. Use `fixed` for manual attenuators whose values should be included in calibration but not changed by software.
 
-#### `i2c` — SOUK RF Mixerless Module (default)
+#### `i2c` — SOUK RF Mixerless Module
 
 The I2C-controlled mixerless module provides a variable attenuator (0-31.5 dB, 0.5 dB steps) and a bypassable amplifier on each path.
 
 ```yaml
 rf_frontend:
   connected: true
-  attenuator_backend: "i2c"
+  mixerless_module:
+    connected: true
+    rf_channel: 0          # pipeline index
+  attenuator:
+    backend: "i2c"
+    tx_value_db: 10.0
+    rx_value_db: 10.0
   bypass_amps:
     enabled: true
     tx_amp_bypass: false   # true = amplifier bypassed
     rx_amp_bypass: false
-  mixerless_module:
-    i2c_bus: 0
-    channel: 0             # pipeline index
 ```
 
 Requires `smbus2` and the `souk-peripherals-control` submodule on the server.
 
 #### `rudat` — Mini-Circuits RUDAT USB attenuators
 
-Uses two standalone RUDAT USB attenuators (one TX, one RX) for bench testing without the mixerless module. Attenuator-only — no bypass amplifier (amp bypass methods are no-ops, `tx_bypass_amp_s21_db` / `rx_bypass_amp_s21_db` are always 0).
+Uses two standalone RUDAT USB attenuators (one TX, one RX) for bench testing without the mixerless module. Attenuator-only — no bypass amplifier (amp bypass methods are no-ops, `bypass_amps.tx_s21_db` / `bypass_amps.rx_s21_db` are always 0).
 
 ```yaml
 rf_frontend:
   connected: true
-  attenuator_backend: "rudat"
-  rudat_tx_serial: "12345"   # serial number from find_rudats()
-  rudat_rx_serial: "67890"
+  attenuator:
+    backend: "rudat"
+    rudat_tx_serial: "12345"   # serial number from find_rudats()
+    rudat_rx_serial: "67890"
 ```
 
 Requires `pyusb` and the `rudat` module on the server's `PYTHONPATH`. To discover connected RUDATs and their serial numbers:
@@ -342,15 +357,36 @@ A udev rule is recommended so the server does not need root for USB access:
 SUBSYSTEMS=="usb", ATTRS{idVendor}=="20ce", ATTRS{idProduct}=="0023", MODE="0666", GROUP="plugdev"
 ```
 
+#### `fixed` — explicit non-controllable attenuator values
+
+Use this for manual attenuators or fixed bench components. The configured
+values are reported by status/info calls and included in the power calibration
+chain, but software optimisation will not try to change them.
+
+```yaml
+rf_frontend:
+  connected: true
+  attenuator:
+    backend: "fixed"
+    tx_value_db: 10.0
+    rx_value_db: 10.0
+  bypass_amps:
+    enabled: false
+```
+
 ### Behaviour common to all backends
 
-When the peripheral controller is enabled (regardless of backend):
+When the peripheral controller is enabled:
 
-- `tx_attenuator_value_db` and `rx_attenuator_value_db` are programmed to the hardware attenuator on config push or `apply_config()`.
-- The in-memory config is updated after every hardware change via `_sync_config()`, so subsequent `get_tone_powers()` / `set_tone_powers()` calls see the correct values.
-- `set_tone_powers(optimise_dynamic_range=True)` adjusts the attenuator (and amp bypass if available) automatically.
+- For controllable backends, `attenuator.tx_value_db` and `attenuator.rx_value_db` are programmed to the hardware attenuator on config push or `apply_config()`.
+- For the `fixed` backend, those values are treated as explicit read-only calibration inputs.
+- Runtime hardware state is kept outside the config. `get_tone_powers()` /
+  `set_tone_powers()` read live attenuator and bypass-amp values from the
+  controller when hardware is available, and `pull_config()` returns the active
+  config file unchanged by runtime operations.
+- `set_tone_powers(optimise_dynamic_range=True)` adjusts the attenuator (and amp bypass if available) automatically only when the backend is controllable.
 - `get_info(['rf_frontend'])` reports the full RF frontend state including attenuators, bypass, gain, compression points, and updownconverter characterisation.
-- `get_rf_peripheral_status()` returns attenuator values, bypass state, total path gain, and 1 dB compression points.
+- `get_rf_peripheral_status()` returns attenuator values, controllability, bypass state, total path gain, and 1 dB compression points.
 
 ### Client API
 
@@ -368,11 +404,13 @@ All peripheral operations are available from the client via the server's TCP int
 | `set_rx_amp_bypass(bypass)` | Set RX amp bypass (I2C only; no-op on RUDAT) |
 | `get_rx_amp_bypass()` | Read RX amp bypass state |
 
-After changing attenuator or bypass settings from the client, call `sync_config_from_system()` to update the client's in-memory config, then `save_config()` if you want to persist the new state.
+After changing attenuator or bypass settings from the client, call
+`pull_config()` (or `sync_config_from_system()`) to update the client's
+in-memory config, then `save_config()` if you want to persist the new state.
 
-### Disabling peripheral control
+### Fixed-value peripheral control
 
-For systems without programmable attenuators, leave `attenuator_backend` empty and enter the attenuator values directly in the config as fixed scalars. Keep `rf_frontend.connected: true` so that the RF frontend calibration chain is still applied — setting `connected: false` excludes the entire RF frontend from calibration.
+For systems without programmable attenuators, set `attenuator.backend: "fixed"` and enter the attenuator values directly in `attenuator.tx_value_db` / `attenuator.rx_value_db` as fixed scalars. Keep `rf_frontend.connected: true` so that the RF frontend calibration chain is still applied; setting `connected: false` excludes the entire RF frontend from calibration.
 
 ---
 
@@ -388,7 +426,7 @@ A typical first-time calibration workflow:
 
 1. **DAC calibration**: Measure DAC0 output power at a few frequencies with the conditions above. Create `calibrations/dac0.txt`.
 
-2. **RF frontend calibration**: Measure S21 of each stage (IF path, mixer, RF path, combiner). Enter values in the config file.
+2. **RF frontend calibration**: Measure S21 of each stage (DAC combiner, IF path, mixer, RF path). Enter values in the config file.
 
 3. **Start the server** and verify with `get_tone_powers(detailed_output=True)` that the power breakdown makes sense.
 
