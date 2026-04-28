@@ -322,6 +322,14 @@ hardware RF peripherals available, the server reads attenuator and bypass-amp
 state directly from the `RFPeripheralController`; otherwise it falls back to
 the desired/fixed values in the config.
 
+The `tx_total_gain_db` / `rx_total_gain_db` values reported by
+`get_info(['rf_frontend'])` are model summaries from the peripheral
+controller.  Tone-power estimates do not use those summary values directly;
+they use the staged calibration chain (`attenuator.*_value_db`,
+`*_if_s21_db`, `*_mixer_conversion_loss_db`, `*_rf_s21_db`,
+`bypass_amps.*_s21_db`, and cryostat S21).  If the S21 fields are left unset,
+detector-plane powers are only as good as the remaining defaults.
+
 ```python
 # Per-tone power at detector plane (default)
 powers = client.get_tone_powers()
@@ -374,4 +382,15 @@ result = client.set_tone_powers(
 )
 print(result['warnings'])        # any limitations encountered
 print(result['power_error_db'])  # per-tone error vs target
+```
+
+`maximise_tx_power()` can optionally include frontend compression headroom:
+
+```python
+result = client.maximise_tx_power(
+    headroom_db=2.0,
+    reference_plane='detector',
+    compression_headroom_db=10.0,
+)
+print(result['result']['tx_compression'])
 ```

@@ -973,7 +973,8 @@ class ReadoutClient:
     # TODO: Add option to save the resulting parameters to the config file after
     #       maximise/optimise/fix operations (requires save_config, see push_config TODO).
     def maximise_tx_power(self, headroom_db=2.0, reference_plane='dac',
-                          power_limit_dbm=None, rx_policy='protect'):
+                          power_limit_dbm=None, compression_headroom_db=None,
+                          rx_policy='protect'):
         """Maximise TX output power at the chosen reference plane.
 
         Parameters
@@ -984,6 +985,10 @@ class ReadoutClient:
             'dac' (default), 'rf_output', or 'detector'.
         power_limit_dbm : float or None
             Maximum allowed tone power in dBm at the reference plane.
+        compression_headroom_db : float or None
+            Optional margin below the RF frontend TX input 1 dB compression
+            point.  For example, pass 10.0 to keep total TX input power
+            at least 10 dB below the modelled P1dB.  Disabled by default.
         rx_policy : str
             How to manage the RX path when TX power increases risk
             saturating the ADC.  One of:
@@ -999,6 +1004,8 @@ class ReadoutClient:
                'reference_plane': reference_plane, 'rx_policy': rx_policy}
         if power_limit_dbm is not None:
             msg['power_limit_dbm'] = power_limit_dbm
+        if compression_headroom_db is not None:
+            msg['compression_headroom_db'] = compression_headroom_db
         return self.send_request(msg)
 
     def maximise_rx_power(self, headroom_db=1.0):

@@ -1535,12 +1535,17 @@ class ReadoutServer:
                     headroom_db = message.get('headroom_db', 2.0)
                     reference_plane = message.get('reference_plane', 'dac')
                     power_limit_dbm = message.get('power_limit_dbm', None)
+                    compression_headroom_db = message.get('compression_headroom_db', None)
                     rx_policy = message.get('rx_policy', 'protect')
                     amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.maximise_tx_power(
                         self.r, self.r_fast, self.config, headroom_db=headroom_db,
                         reference_plane=reference_plane, rf_peripherals=self.rf_peripherals,
-                        power_limit_dbm=power_limit_dbm, rx_policy=rx_policy)
+                        power_limit_dbm=power_limit_dbm,
+                        compression_headroom_db=compression_headroom_db,
+                        rx_policy=rx_policy)
                     result = {'amps': amps.tolist(), 'psb_fft_shift': psb_fft_shift, 'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
+                    if isinstance(dac, dict) and 'tx_compression' in dac:
+                        result['tx_compression'] = dac['tx_compression']
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'maximise_rx_power':

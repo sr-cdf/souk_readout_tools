@@ -386,7 +386,8 @@ class RFPeripheralController:
             atten_amp = self._mixerless_module._get_atten_amp(
                 self._channel, 'transmit_atten',
             )
-            return atten_amp.atten_amp_level.input_1dB_comp
+            return self._corrected_tx_input_1db_comp(
+                atten_amp.atten_amp_level)
         return None
 
     def get_rx_input_1db_comp(self):
@@ -395,7 +396,8 @@ class RFPeripheralController:
             atten_amp = self._mixerless_module._get_atten_amp(
                 self._channel, 'recv_atten',
             )
-            return atten_amp.atten_amp_level.input_1dB_comp
+            return self._corrected_rx_input_1db_comp(
+                atten_amp.atten_amp_level)
         return None
 
     # -- status --
@@ -570,6 +572,52 @@ class RFPeripheralController:
         """Return the current bypass-amp S21 contribution (gain or bypass IL)."""
         atten_amp = self._mixerless_module._get_atten_amp(self._channel, dev_name)
         return atten_amp.atten_amp_level.amp.total_gain_il
+
+    @staticmethod
+    def _amp_input_1db_comp(amp):
+        """Input P1dB for the amplifier without relying on submodule math."""
+        if amp.bypass_state:
+            return amp._bypass_1dB_comp
+        return amp._gain_1dB_comp
+
+    @classmethod
+    def _corrected_tx_input_1db_comp(cls, level):
+        """Input-referred TX P1dB using wrapper-side component arithmetic."""
+        amp_comp = cls._amp_input_1db_comp(level.amp)
+        return min(
+            level.variable_atten.input_1dB_comp,
+            level.filter.input_1dB_comp
+            - level.variable_atten.total_gain_il,
+            level.equalizer.input_1dB_comp
+            - level.variable_atten.total_gain_il
+            - level.filter.total_gain_il,
+            amp_comp
+            - level.equalizer.total_gain_il
+            - level.filter.total_gain_il
+            - level.variable_atten.total_gain_il,
+            level.fixed_atten.input_1dB_comp
+            - level.amp.total_gain_il
+            - level.equalizer.total_gain_il
+            - level.filter.total_gain_il
+            - level.variable_atten.total_gain_il,
+        )
+
+    @classmethod
+    def _corrected_rx_input_1db_comp(cls, level):
+        """Input-referred RX P1dB using wrapper-side component arithmetic."""
+        amp_comp = cls._amp_input_1db_comp(level.amp)
+        preamp_comp = cls._amp_input_1db_comp(level.preamp)
+        return min(
+            amp_comp
+            - level.fixed_atten.total_gain_il
+            - level.variable_atten.total_gain_il
+            - level.preamp.total_gain_il
+            - level.filter.total_gain_il
+            - level.equalizer.total_gain_il,
+            preamp_comp
+            - level.equalizer.total_gain_il
+            - level.filter.total_gain_il,
+        )
 
     def get_runtime_state(self):
         """Return a copy of mutable RF frontend state."""

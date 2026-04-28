@@ -46,7 +46,7 @@ Three digital parameters control the signal level through the polyphase synthesi
 
 The `maximise_tx_power()` function optimises all three in order: amplitudes first (scale up to ~1.0), then FFT shift (sweep from safest to highest power, stop at first DSP overflow), then PSB scale (exponential ramp-up then binary search, stop before DSP overflow or DAC saturation).
 
-Both `maximise_tx_power()` and `maximise_rx_power()` accept a `headroom_db` parameter (default 2.0 dB) that sets the safety margin below the overflow/saturation point. If pre-existing DAC saturation is detected, `maximise_tx_power()` automatically calls `fix_dac_saturation()` before proceeding.
+Both `maximise_tx_power()` and `maximise_rx_power()` accept a `headroom_db` parameter (default 2.0 dB) that sets the safety margin below the overflow/saturation point. If pre-existing DAC saturation is detected, `maximise_tx_power()` automatically calls `fix_dac_saturation()` before proceeding. `maximise_tx_power()` also accepts `compression_headroom_db`; when set, it keeps the total multitone power into the TX frontend below the input-referred 1 dB compression point by that margin.
 
 **Per-bin coherent addition**: When multiple tones map to the same FFT bin, the vector accumulator (VACC) sums their amplitudes coherently. If the sum exceeds 1.0, the VACC overflows. The power management functions (`maximise_tx_power`, `optimise_tx_snr`, `set_tone_powers`) automatically detect shared bins and scale **all** amplitudes down by the worst-case bin overlap factor to preserve relative powers.
 
@@ -126,7 +126,7 @@ The optimisation proceeds in steps:
 2. **PSB FFT shift** is swept from most attenuated (safe) to least, stopping at the first overflow. Per-bin scaling is applied to account for coherent addition in shared bins.
 3. **PSB scale** is binary-searched using exponential ramp-up from the current value, stopping just before overflow or DAC saturation.
 4. **Analog adjustment** (if RF peripherals are available): the required attenuation is **computed** from the calibration chain gains (DAC output power + known analog gains/losses) rather than trial-and-error. The TX amplifier is enabled first for maximum power, then the minimum required attenuation is set. If the programmable attenuator range (0-31.5 dB) is insufficient, the amplifier is bypassed. As a last resort, the RFDC DAC DSA (up to 12 dB) is used.
-5. **Compression check**: the total power into the RF frontend is compared against the 1 dB compression point.
+5. **Compression check**: use `maximise_tx_power(compression_headroom_db=10.0)` when you want the total power into the RF frontend kept 10 dB below the modelled 1 dB compression point.
 6. **Final amplitudes** are calculated with the now-fixed analog settings.
 7. **Verification** confirms achieved powers against targets using `get_tone_powers(reference_plane=...)`.
 

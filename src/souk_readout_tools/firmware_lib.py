@@ -4875,6 +4875,139 @@ def _rf_has_readable_attenuator(rf_peripherals):
     )
 
 
+def _sum_tone_powers_dbm(powers_dbm):
+    """Sum independent per-tone powers in dBm and return total power in dBm."""
+    powers = np.asarray(powers_dbm, dtype=float)
+    powers = powers[np.isfinite(powers)]
+    if powers.size == 0:
+        return float('-inf')
+    return float(10 * np.log10(np.sum(np.power(10.0, powers / 10.0))))
+
+
+def _get_tx_input_1db_comp_dbm(rf_peripherals):
+    """Return the TX chain input 1 dB compression point, if available."""
+    if rf_peripherals is None or not getattr(rf_peripherals, 'enabled', False):
+        return None
+    getter = getattr(rf_peripherals, 'get_tx_input_1db_comp', None)
+    if getter is None:
+        return None
+    try:
+        value = getter()
+    except Exception as exc:
+        print(f'  WARNING: could not read TX input 1 dB compression point: {exc}')
+        return None
+    if value is None:
+        return None
+    value = float(value)
+    if not np.isfinite(value):
+        return None
+    return value
+
+
+def _calculate_current_tx_chain(r, config_dict, rf_peripherals=None):
+    """Return current TX-chain parameters, detector powers, and stage details."""
+    p = _gather_tx_chain_params(r, config_dict, rf_peripherals=rf_peripherals)
+    tx_powers, tx_details = calibration.calc_tone_powers(
+        p['amps'], p['psb_fftshift'], p['psb_scale'],
+        p['mixer_scale_is_1p0'], p['mixer_qmc_gain'], p['vop_current'],
+        p['vop_current_fs'], p['dac_dbfs_to_dbm'],
+        p['tx_combiner_loss_db'], p['tx_attenuator_value_db'],
+        p['tx_if_s21_db'], p['tx_mixer_conversion_loss_db'],
+        p['tx_rf_s21_db'], p['tx_bypass_amp_s21_db'],
+        p['cryostat_input_s21_db'], p['dac_fs_bits'],
+        detailed_output=True)
+    return p, tx_powers, tx_details
+
+
+def _get_tx_compression_state(r, config_dict, rf_peripherals,
+                              compression_headroom_db=None):
+    """Estimate margin between composite TX input power and P1dB.
+
+    The RF peripheral model reports input P1dB referred to the start of the
+    controllable TX chain.  The matching power plane in calc_tone_powers is
+    ``combiner_dbm``: after DAC/combiner loss and before TX attenuation.
+    """
+    requested_headroom = (
+        None if compression_headroom_db is None
+        else float(compression_headroom_db)
+    )
+    state = {
+        'available': False,
+        'compression_headroom_db': requested_headroom,
+    }
+    comp_dbm = _get_tx_input_1db_comp_dbm(rf_peripherals)
+    if comp_dbm is None or config_dict is None:
+        state['reason'] = 'TX input 1 dB compression point unavailable'
+        return state
+
+    _, _, details = _calculate_current_tx_chain(
+        r, config_dict, rf_peripherals=rf_peripherals)
+    tx_input_per_tone = np.asarray(details['combiner_dbm'], dtype=float)
+    tx_input_total_dbm = _sum_tone_powers_dbm(tx_input_per_tone)
+    finite = tx_input_per_tone[np.isfinite(tx_input_per_tone)]
+    peak_tone_dbm = float(np.max(finite)) if finite.size else float('-inf')
+    margin_db = comp_dbm - tx_input_total_dbm
+
+    state.update({
+        'available': True,
+        'tx_input_1db_comp_dbm': float(comp_dbm),
+        'tx_input_total_dbm': float(tx_input_total_dbm),
+        'tx_input_peak_tone_dbm': peak_tone_dbm,
+        'compression_margin_db': float(margin_db),
+    })
+    if requested_headroom is not None:
+        limit_dbm = comp_dbm - requested_headroom
+        excess_db = tx_input_total_dbm - limit_dbm
+        state.update({
+            'compression_limit_dbm': float(limit_dbm),
+            'compression_excess_db': float(excess_db),
+            'safe': bool(excess_db <= 0),
+        })
+    return state
+
+
+def _enforce_tx_compression_margin(r, config_dict, rf_peripherals,
+                                   compression_headroom_db,
+                                   scalemin, scalemax):
+    """Reduce psb_scale so total TX input power stays below P1dB margin."""
+    if compression_headroom_db is None:
+        return r.psbscale.get_scale(), None
+    compression_headroom_db = float(compression_headroom_db)
+    if compression_headroom_db < 0:
+        raise ValueError('compression_headroom_db must be non-negative')
+
+    state = _get_tx_compression_state(
+        r, config_dict, rf_peripherals, compression_headroom_db)
+    if not state.get('available'):
+        print('  compression guard: skipped '
+              f'({state.get("reason", "not available")})')
+        return r.psbscale.get_scale(), state
+
+    print(f'  compression guard: TX input {state["tx_input_total_dbm"]:.1f} dBm, '
+          f'P1dB {state["tx_input_1db_comp_dbm"]:.1f} dBm, '
+          f'margin {state["compression_margin_db"]:.1f} dB '
+          f'(target {compression_headroom_db:.1f} dB)')
+    excess_db = state.get('compression_excess_db', 0.0)
+    if excess_db > 0.1:
+        scale_before = r.psbscale.get_scale()
+        scale_after = scale_before * 10**(-excess_db / 20)
+        scale_after = float(np.clip(scale_after, scalemin, scalemax))
+        r.psbscale.set_scale(scale_after)
+        time.sleep(0.01)
+        state = _get_tx_compression_state(
+            r, config_dict, rf_peripherals, compression_headroom_db)
+        state['psb_scale_before_compression_limit'] = float(scale_before)
+        state['psb_scale_after_compression_limit'] = float(scale_after)
+        if state.get('compression_excess_db', 0.0) > 0.1:
+            state['limited_by_min_psb_scale'] = bool(scale_after <= scalemin)
+            print('    WARNING: compression margin still exceeded by '
+                  f'{state["compression_excess_db"]:.1f} dB')
+        else:
+            print(f'    psb_scale: {scale_before:.4f} -> {scale_after:.4f} '
+                  'to satisfy compression margin')
+    return r.psbscale.get_scale(), state
+
+
 def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                      tx_power_change_db=None):
     """Check and optionally protect the RX path after a TX power change.
@@ -5101,7 +5234,8 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
 
 def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
                       reference_plane='dac', rf_peripherals=None,
-                      power_limit_dbm=None, rx_policy='protect'):
+                      power_limit_dbm=None, compression_headroom_db=None,
+                      rx_policy='protect'):
     """Maximise the TX output power at the chosen reference plane.
 
     Scales tone amplitudes to near-max, finds the highest PSB FFT shift
@@ -5129,6 +5263,11 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
         TX attenuation is increased (or psb_scale reduced) to bring it
         down.  Requires config_dict for power computation.  If None
         (default), no limit is applied.
+    compression_headroom_db : float or None
+        Optional margin below the RF frontend TX input 1 dB compression
+        point.  When set, the composite power into the TX frontend is kept
+        at least this many dB below the modelled P1dB by reducing psb_scale.
+        If None (default), no compression guard is applied.
     rx_policy : str
         How to manage the RX path when TX power changes risk saturating
         the ADC.  Checked after each incremental TX power step (psb_scale
@@ -5148,6 +5287,10 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
     if rx_policy not in RX_POLICIES:
         raise ValueError(
             f"rx_policy must be one of {RX_POLICIES}, got {rx_policy!r}")
+    if compression_headroom_db is not None:
+        compression_headroom_db = float(compression_headroom_db)
+        if compression_headroom_db < 0:
+            raise ValueError('compression_headroom_db must be non-negative')
     print(f'maximise_tx_power: starting (reference_plane={reference_plane})')
     if reference_plane not in ('dac', 'rf_output', 'detector'):
         raise ValueError(f"reference_plane must be 'dac', 'rf_output', or 'detector', "
@@ -5248,6 +5391,12 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
     r.psbscale.set_scale(psb_scale)
     time.sleep(0.01)
     print(f'  psb_scale: {psb_scale:.4f} ({headroom_db} dB headroom)')
+
+    # Optional RF compression guard.  This compares total multitone power
+    # at the TX frontend input with the modelled input-referred P1dB.
+    psb_scale, tx_compression_state = _enforce_tx_compression_margin(
+        r, config_dict, rf_peripherals, compression_headroom_db,
+        scalemin, scalemax)
 
     # Estimate total TX power change at the DAC from the combined effect
     # of amplitude scaling, fftshift change, and psb_scale change.
@@ -5360,8 +5509,14 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
                 time.sleep(0.01)
                 print(f'    psb_scale reduced to {psb_scale:.4f} (no RF peripherals)')
 
+    if compression_headroom_db is not None:
+        tx_compression_state = _get_tx_compression_state(
+            r, config_dict, rf_peripherals, compression_headroom_db)
+
     _, dsp_overflow_details = check_dsp_overflow(r, 0.1, verbose=False)
     _, dac_saturation_details = check_output_saturation(r_fast, iterations=250, verbose=False)
+    if tx_compression_state is not None:
+        dac_saturation_details['tx_compression'] = tx_compression_state
     print(f'maximise_tx_power: done')
 
     return amps, best_fftshift, psb_scale, dsp_overflow_details, dac_saturation_details
