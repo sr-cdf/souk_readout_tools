@@ -50,6 +50,40 @@ Both `maximise_tx_power()` and `maximise_rx_power()` accept a `headroom_db` para
 
 **Per-bin coherent addition**: When multiple tones map to the same FFT bin, the vector accumulator (VACC) sums their amplitudes coherently. If the sum exceeds 1.0, the VACC overflows. The power management functions (`maximise_tx_power`, `optimise_tx_snr`, `set_tone_powers`) automatically detect shared bins and scale **all** amplitudes down by the worst-case bin overlap factor to preserve relative powers.
 
+### Blind tones and power limits
+
+Blind tones are ordinary firmware tones used for off-resonance gain/phase
+monitoring. They count in every digital and analog power constraint:
+
+- VACC shared-bin limits include blind tones and regular tones together.
+- PAPR and DAC saturation depend on the combined waveform.
+- `set_tone_powers()`, `maximise_tx_power()`, and
+  `optimise_dynamic_range=True` treat blind tones as active tones.
+- Total TX frontend power and compression checks include blind-tone power.
+
+Because they share the same waveform, generate phase offsets over the full
+active tone list after adding blind tones:
+
+```python
+freqs = client.get_tone_frequencies()
+phases = client.generate_newman_phases(freqs)
+client.set_tone_phases(phases)
+```
+
+For interactive setup, `set_blind_tones(..., powers_dbm=...)` snapshots the
+current regular tones, appends/replaces the blind tones, preserves the
+existing regular tone powers, and sets the requested blind-tone powers in the
+same calibrated power operation. If you later call `set_tone_powers()` directly,
+pass targets for all active tones, or split the arrays with
+`get_tone_metadata()` / `get_blind_tone_indices()`.
+
+Avoid placing blind tones on an exactly regular grid. Regular grids make many
+intermodulation products land on the same frequencies, so the products can add
+coherently into larger spurs. `client.suggest_blind_frequencies()` starts from
+approximately even coverage across the band but jitters the target positions by
+default while still enforcing minimum spacing from resonances and other blind
+tones.
+
 ### DAC output
 
 The DAC has 14 physical bits but is addressed with a 16-bit word. The full-scale output power depends on the VOP current setting and the DUC mixer scaling mode. DAC saturation is detected by `check_output_saturation()`, which captures DAC snapshots and checks whether the waveform approaches full-scale — this is independent of DSP overflow (checked by `check_dsp_overflow()`).
@@ -57,7 +91,6 @@ The DAC has 14 physical bits but is addressed with a 16-bit word. The full-scale
 Key constraints:
 - **VOP current**: Default and maximum rated value is 20000 uA for gen3 devices with 2.5V DAC VTT. Values above 20000 uA (up to the hardware max of 40500 uA) add nonlinearity and are not recommended.
 - **DUC mixer scale**: Use `0P7` (not `1P0`) to avoid overflow at the mixer output. The `1P0` mode provides ~3 dB more power but risks clipping.
-- **DAC DSA**: The RFDC DAC digital step attenuator (up to 12 dB) can be used as a last resort by `set_tone_powers(optimise_dynamic_range=True)` when the programmable attenuator and amplifier bypass are insufficient.
 
 ### Multitone power sharing
 
@@ -95,7 +128,7 @@ The calibrated power interface accounts for the full signal chain:
 
 ```python
 # Simple mode — adjusts tone amplitudes only, keeps current PSB/analog settings
-client.set_tone_powers([-20, -25], reference_plane='detector')
+client.set_tone_powers([-90, -95], reference_plane='detector')
 ```
 
 The `reference_plane` parameter controls where the target power is specified:
@@ -115,7 +148,7 @@ For best SNR, use the dynamic range optimisation mode. This maximises DAC bit ut
 ```python
 # Optimised mode — maximises DAC dynamic range, adjusts attenuator/amp
 result = client.set_tone_powers(
-    [-20, -25],
+    [-90, -95],
     reference_plane='detector',
     optimise_dynamic_range=True
 )
@@ -127,8 +160,14 @@ print(result['power_error_db']) # per-tone error vs target
 The optimisation proceeds in steps:
 1. **Amplitude ratios** are computed from the target powers so per-tone variation is preserved.
 2. **PSB FFT shift** is swept from most attenuated (safe) to least, stopping at the first overflow. Per-bin scaling is applied to account for coherent addition in shared bins.
-3. **PSB scale** is binary-searched using exponential ramp-up from the current value, stopping just before overflow or DAC saturation.
-4. **Analog adjustment** (if RF peripherals are available): the required attenuation is **computed** from the calibration chain gains (DAC output power + known analog gains/losses) rather than trial-and-error. The TX amplifier is enabled first for maximum power, then the minimum required attenuation is set. If the programmable attenuator range (0-31.5 dB) is insufficient, the amplifier is bypassed. As a last resort, the RFDC DAC DSA (up to 12 dB) is used.
+3. **PSB scale** is ramped-up from a safe starting value, stopping just before overflow or DAC saturation.
+4. **TX level adjustment**: the required level change is **computed** from the
+   calibration chain gains (DAC output power + known analog gains/losses). If
+   RF peripherals are available, the optimiser uses the TX programmable
+   attenuator and, where supported, the TX amplifier bypass. If those controls
+   cannot absorb enough excess power, the remaining reduction is applied by
+   lowering `psb_scale`. RFDC DSA handling in the software is for the ADC/RX
+   path, not TX optimisation.
 5. **Compression check**: use `maximise_tx_power(compression_headroom_db=10.0)` when you want the total power into the RF frontend kept 10 dB below the modelled 1 dB compression point.
 6. **Final amplitudes** are calculated with the now-fixed analog settings.
 7. **Verification** confirms achieved powers against targets using `get_tone_powers(reference_plane=...)`.
@@ -148,17 +187,38 @@ print(details)  # per-stage power contributions
 
 ### RX tone powers
 
-Received tone powers can be estimated from accumulated IQ data using `get_tone_powers()` with an RX reference plane:
+RX reference planes in `get_tone_powers()` are modelled from the current TX
+tone settings and calibration. The function follows the configured TX chain to
+the end of the enabled path (the API calls this the `detector` plane), then
+runs a forward RX-chain model through the cryostat, RF frontend, ADC, PFB, and
+accumulator.
+
+This forward estimate is useful when the RX input can be inferred from the
+preceding stages, for example with FPGA internal loopback or an external
+through/loopback path represented by the config S21 terms. Configure unused
+sections as disconnected or set their S21 terms to 0, and put any measured
+loopback loss in the appropriate stage calibration. If a detector or resonator
+is present, the returned RX powers also need the device transmission at the
+tone frequency. In dB terms, apply the per-tone `S21(f_tone)` magnitude before
+continuing down the RX chain.
+
+`get_tone_powers()` does not acquire or invert measured accumulated IQ samples.
+For measured data, read accumulator snapshots or stream frames and use
+`calibration.calc_adc_input_power()` to walk the RX chain backwards. With only
+digital/ADC parameters it returns ADC-input power; with RX frontend and
+cryostat S21 terms it can refer the measured level back toward the cryostat
+output. The `details` output is useful when you want to stop at an intermediate
+stage such as `adc_dbm`, `rx_rf_dbm`, or `cryostat_output_dbm`.
 
 ```python
-# Estimated power at ADC input
+# Modelled power at ADC input
 rx_powers = client.get_tone_powers(reference_plane='adc_input')
 
-# Estimated power at cryostat output (before RX frontend)
+# Modelled power at cryostat output (before RX frontend)
 cryo_powers = client.get_tone_powers(reference_plane='cryostat_output')
 
-# Raw accumulated IQ magnitude (no calibration)
-raw_powers = client.get_tone_powers(reference_plane='accumulator')
+# Modelled accumulated IQ magnitude (no calibration)
+accumulator_levels = client.get_tone_powers(reference_plane='accumulator')
 ```
 
 See the [Calibration Guide - Reference Planes](calibration.md#reference-planes) for the full list of TX and RX reference planes.

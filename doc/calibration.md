@@ -89,8 +89,6 @@ rf_frontend:
   rx_rf_s21_db: -2.0
   bypass_amps:
     enabled: false              # no bypass amp in breadboard
-    tx_s21_db: 0
-    rx_s21_db: 0
 ```
 
 ### Direct RF Model (no mixer)
@@ -132,8 +130,6 @@ rf_frontend:
   rx_rf_s21_db: -1.5
   bypass_amps:
     enabled: false              # no bypass amp
-    tx_s21_db: 0
-    rx_s21_db: 0
 ```
 
 ### RF Mixerless Module
@@ -143,13 +139,13 @@ The SOUK RF Mixerless Module adds a variable attenuator (0-31.5 dB in 0.5 dB ste
 ```
 TX: DAC0 ──► RF chain (filters, amps, cables) ──► Var. Atten ──► Bypass Amp ──► Cryostat ──► Detector
                     |                                  |               |             |
-                tx_rf_s21                         attenuator      bypass_amps    input_s21
-                  _db                             .tx_value_db    .tx_s21_db       _db
+                tx_rf_s21                         attenuator    mixerless_module  input_s21
+                  _db                             .tx_value_db   amp_*_s21_db       _db
 
 RX: ADC ◄──  RF chain (filters, amps, cables) ◄── Var. Atten ◄── Bypass Amp ◄── Cryostat ◄── Detector
                     |                                  |               |             |
-                rx_rf_s21                         attenuator      bypass_amps    output_s21
-                  _db                             .rx_value_db    .rx_s21_db       _db
+                rx_rf_s21                         attenuator    mixerless_module output_s21
+                  _db                             .rx_value_db   amp_*_s21_db      _db
 
          NyqZ 1: low-pass filter    NyqZ 2: band-pass filter
 ```
@@ -341,7 +337,7 @@ Requires `smbus2` and the `souk-peripherals-control` submodule on the server.
 
 #### `rudat` — Mini-Circuits RUDAT USB attenuators
 
-Uses two standalone RUDAT USB attenuators (one TX, one RX) for bench testing without the mixerless module. Attenuator-only — no bypass amplifier (amp bypass methods are no-ops, `bypass_amps.tx_s21_db` / `bypass_amps.rx_s21_db` are always 0).
+Uses two standalone RUDAT USB attenuators (one TX, one RX) for bench testing without the mixerless module. Attenuator-only — no bypass amplifier.
 
 ```yaml
 rf_frontend:
@@ -454,6 +450,11 @@ print(details)  # shows per-stage power breakdown
 
 Power can be queried at any point in the signal chain using the `reference_plane` parameter on `get_tone_powers()`.
 
+Blind tones are included in the same calibrated power arrays as regular tones.
+Use `get_tone_metadata()`, `get_blind_tone_indices()`, or
+`get_regular_tone_indices()` when you need to separate the returned powers by
+tone role.
+
 ### TX reference planes
 
 | `reference_plane` | Description |
@@ -464,13 +465,27 @@ Power can be queried at any point in the signal chain using the `reference_plane
 
 ### RX reference planes
 
-Estimates received tone powers from accumulated IQ data using `calibration.calc_adc_input_power()`.
+RX reference planes are forward-modelled from the current TX endpoint power and
+RX calibration using `calibration.calc_accumulated_iq_level()`. This is
+appropriate when the RX input follows from the preceding configured stages, for
+example FPGA internal loopback or an external through/loopback path whose loss
+is represented by the config S21 terms. If a detector or resonator is present,
+include its per-tone transmission, `S21(f_tone)`, before continuing through the
+RX chain.
+
+These queries do not read or invert measured accumulator data. For measured-IQ
+conversions, use the accumulator snapshot/stream APIs together with
+`calibration.calc_adc_input_power()` and follow the chain in reverse. With only
+digital/ADC parameters the reverse calculation reports ADC-input power; with
+RX frontend and cryostat S21 terms it can refer the measured level back toward
+the cryostat output. Use `detailed_output=True` when you need intermediate
+planes such as `adc_dbm`, `rx_rf_dbm`, or `cryostat_output_dbm`.
 
 | `reference_plane` | Description |
 |---|---|
 | `'cryostat_output'` | Power at cryostat output (before RF frontend RX chain) |
 | `'adc_input'` | Power at ADC input in dBm |
-| `'accumulator'` | Raw accumulated IQ magnitude in dB (no calibration applied) |
+| `'accumulator'` | Modelled accumulated IQ magnitude in dB (no calibration applied) |
 
 ```python
 # Power at DAC output
@@ -479,17 +494,26 @@ dac_powers = client.get_tone_powers(reference_plane='dac')
 # Power at detector (default)
 det_powers = client.get_tone_powers(reference_plane='detector')
 
-# Estimated power at ADC input
+# Modelled power at ADC input
 rx_powers = client.get_tone_powers(reference_plane='adc_input')
 
-# Estimated power at cryostat output
+# Modelled power at cryostat output
 cryo_powers = client.get_tone_powers(reference_plane='cryostat_output')
 
 # Full breakdown of every stage in both TX and RX chains
 powers, details = client.get_tone_powers(detailed_output=True)
 ```
 
-This enables ADC calibration via loopback: compare `get_tone_powers(reference_plane='rf_output')` (known TX power) with `get_tone_powers(reference_plane='adc_input')` (estimated RX power) to derive the ADC calibration correction.
+For ADC calibration via loopback, compare the known TX/loopback power with
+measured accumulator or snapshot data, then use `calibration.calc_adc_input_power()`
+or the plotting conversion helpers to solve the ADC calibration correction.
+`get_tone_powers(reference_plane='adc_input')` is the model prediction for the
+current settings, not a measurement.
+
+Loopback flags are topology/state hints. The power calculation is determined by
+the connected flags and S21 values in the active config, so represent a
+loopback path by excluding stages that are not in the path and by entering the
+loopback transmission loss in the nearest appropriate S21 term.
 
 ---
 

@@ -587,9 +587,10 @@ def initialise_pipeline_resources(r,r_fast,config_dict):
     psb_scale = defaults.get('psb_scale',None)
     psb_fftshift = defaults.get('psb_fftshift',None)
     pfb_fftshift = defaults.get('pfb_fftshift',None)
-    frequencies = defaults.get('frequencies',[])
-    amplitudes = defaults.get('amplitudes',[])
-    phases = defaults.get('phases',[])
+    tone_plan = get_configured_tone_plan(config_dict)
+    frequencies = tone_plan['frequencies']
+    amplitudes = tone_plan['amplitudes']
+    phases = tone_plan['phases']
 
     #initialise and setup blocks
     r.initialize_pipeline_blocks()
@@ -637,16 +638,20 @@ def initialise_pipeline_resources(r,r_fast,config_dict):
         r.psb.set_fftshift(psb_fftshift)
     if pfb_fftshift is not None:
         r.pfb.set_fftshift(pfb_fftshift)
-    if frequencies:
+    if len(frequencies) > 0:
         try:
             r_fast.mixer.host.transport.axil_mm
             r_fast.mixer.host.transport._get_device_address
-            set_tone_frequencies_fast(r, r_fast, config_dict, frequencies)
+            set_tone_frequencies_fast(
+                r, r_fast, config_dict, frequencies,
+                tone_amplitudes=amplitudes, tone_phases=phases)
         except AttributeError:
-            set_tone_frequencies(r, config_dict, frequencies)
-    if amplitudes:
+            set_tone_frequencies(
+                r, config_dict, frequencies,
+                tone_amplitudes=amplitudes, tone_phases=phases)
+    if amplitudes is not None and len(amplitudes) > 0:
         set_tone_amplitudes(r, config_dict, amplitudes)
-    if phases:
+    if phases is not None and len(phases) > 0:
         set_tone_phases(r,config_dict, phases)
 
     # #check signal levels -- does not work anymore during init because r_fast has no blocks yet
@@ -810,6 +815,161 @@ def info_pipeline(r):
     }
 
 
+def _is_present_config_value(value):
+    if value is None:
+        return False
+    if isinstance(value, (list, tuple, np.ndarray)) and len(value) == 0:
+        return False
+    return True
+
+
+def _as_1d_float_array(value, name):
+    if not _is_present_config_value(value):
+        return np.array([], dtype=float)
+    try:
+        return np.atleast_1d(value).astype(float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{name} must be numeric') from exc
+
+
+def _normalise_config_tone_values(values, n_values, name, allow_scalar=True):
+    arr = _as_1d_float_array(values, name)
+    if arr.size == 0:
+        return arr
+    if arr.size == n_values:
+        return arr
+    if allow_scalar and arr.size == 1 and n_values > 1:
+        return np.full(n_values, float(arr[0]), dtype=float)
+    raise ValueError(
+        f'Number of {name} values ({arr.size}) must match number of tones '
+        f'({n_values})')
+
+
+def _normalise_split_tone_values(values, blind_values, n_regular, n_blind,
+                                 name, default_missing):
+    """Combine regular/blind per-tone config values.
+
+    ``values`` normally describes regular tones and ``blind_values`` describes
+    blind tones.  For convenience, ``values`` may also already contain the full
+    combined list when ``blind_values`` is absent.
+    """
+    total = n_regular + n_blind
+    values_present = _is_present_config_value(values)
+    blind_present = _is_present_config_value(blind_values)
+    if total == 0 or not values_present and not blind_present:
+        return None
+
+    primary = _as_1d_float_array(values, name)
+    if values_present and n_blind and not blind_present and primary.size == total:
+        return primary
+
+    if values_present:
+        primary = _normalise_config_tone_values(primary, n_regular, name)
+    elif n_regular:
+        primary = np.full(n_regular, default_missing, dtype=float)
+    else:
+        primary = np.array([], dtype=float)
+
+    if blind_present:
+        blind = _normalise_config_tone_values(
+            blind_values, n_blind, f'blind_{name}')
+    elif n_blind:
+        blind = np.full(n_blind, default_missing, dtype=float)
+    else:
+        blind = np.array([], dtype=float)
+
+    return np.concatenate([primary, blind])
+
+
+def get_configured_tone_plan(config_dict):
+    """Return the config tone plan, including configured blind tones.
+
+    The firmware still receives a single combined tone list.  The returned
+    metadata records which user-facing indices are regular tones and which are
+    blind tones so higher-level control loops can treat them differently.
+    """
+    defaults = (
+        config_dict.get('firmware', {}).get('defaults', {}) or {}
+    )
+    regular_frequencies = _as_1d_float_array(
+        defaults.get('frequencies', []), 'frequencies')
+    blind_frequencies = _as_1d_float_array(
+        defaults.get('blind_frequencies', []), 'blind_frequencies')
+
+    n_regular = len(regular_frequencies)
+    n_blind = len(blind_frequencies)
+    frequencies = np.concatenate([regular_frequencies, blind_frequencies])
+
+    amplitudes = _normalise_split_tone_values(
+        defaults.get('amplitudes', []),
+        defaults.get('blind_amplitudes', []),
+        n_regular, n_blind, 'amplitudes', 1.0)
+    phases = _normalise_split_tone_values(
+        defaults.get('phases', []),
+        defaults.get('blind_phases', []),
+        n_regular, n_blind, 'phases', 0.0)
+
+    blind_spans = _normalise_config_tone_values(
+        defaults.get('blind_spans', []), n_blind, 'blind_spans')
+
+    regular_indices = list(range(n_regular))
+    blind_indices = list(range(n_regular, n_regular + n_blind))
+    tone_types = ['regular'] * n_regular + ['blind'] * n_blind
+    is_blind = [False] * n_regular + [True] * n_blind
+
+    return {
+        'frequencies': frequencies,
+        'regular_frequencies': regular_frequencies,
+        'blind_frequencies': blind_frequencies,
+        'amplitudes': amplitudes,
+        'phases': phases,
+        'blind_spans': blind_spans,
+        'tone_types': tone_types,
+        'is_blind': is_blind,
+        'regular_indices': regular_indices,
+        'blind_indices': blind_indices,
+        'num_regular_tones': n_regular,
+        'num_blind_tones': n_blind,
+        'num_tones': n_regular + n_blind,
+    }
+
+
+def get_configured_tone_metadata(config_dict, active_count=None):
+    """Return user-facing tone metadata for the active tone list.
+
+    If the live tone count no longer matches the configured regular+blind tone
+    plan, the metadata falls back to treating all active tones as regular
+    tones.  This avoids incorrectly freezing arbitrary user-set tones.
+    """
+    plan = get_configured_tone_plan(config_dict)
+    configured_count = plan['num_tones']
+    if active_count is None:
+        active_count = configured_count
+    active_count = int(active_count)
+
+    if configured_count == active_count:
+        tone_types = plan['tone_types']
+        is_blind = plan['is_blind']
+        regular_indices = plan['regular_indices']
+        blind_indices = plan['blind_indices']
+    else:
+        tone_types = ['regular'] * active_count
+        is_blind = [False] * active_count
+        regular_indices = list(range(active_count))
+        blind_indices = []
+
+    return {
+        'tone_types': tone_types,
+        'is_blind': is_blind,
+        'regular_indices': regular_indices,
+        'blind_indices': blind_indices,
+        'num_regular_tones': len(regular_indices),
+        'num_blind_tones': len(blind_indices),
+        'metadata_matches_config': configured_count == active_count,
+        'configured_num_tones': configured_count,
+    }
+
+
 def info_tones(r, config_dict):
     """Tone frequencies, amplitudes, phases, powers, and firmware indices."""
     pipeline_ready = (r is not None and hasattr(r, 'accumulators')
@@ -830,6 +990,12 @@ def info_tones(r, config_dict):
         powers = get_tone_powers(r, config_dict)
     except Exception:
         powers = np.array([])
+    metadata = get_configured_tone_metadata(config_dict, active_count=len(freqs))
+    tone_plan = get_configured_tone_plan(config_dict)
+    blind_spans = (
+        tone_plan['blind_spans'].tolist()
+        if metadata['metadata_matches_config'] else []
+    )
     return {
         'ready': True,
         'count': len(freqs),
@@ -838,6 +1004,8 @@ def info_tones(r, config_dict):
         'phases_rad': phases.tolist(),
         'powers_dbm': powers.tolist() if len(powers) > 0 else None,
         'firmware_indices': details['rx']['tone_indices'],
+        'blind_spans': blind_spans,
+        **metadata,
         'detailed_frequency_info': details,
     }
 
@@ -1156,26 +1324,38 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
             print(f'apply_config: setting pfb_fftshift = {pfb_fftshift}')
             r.pfb.set_fftshift(pfb_fftshift)
 
-    if changed('frequencies'):
-        frequencies = defaults.get('frequencies', [])
-        if frequencies:
-            print(f'apply_config: setting frequencies ({len(frequencies)} tones)')
+    tone_plan = get_configured_tone_plan(new_config_dict)
+    tone_frequencies_changed = changed_any('frequencies', 'blind_frequencies')
+    tone_amplitudes_changed = changed_any('amplitudes', 'blind_amplitudes')
+    tone_phases_changed = changed_any('phases', 'blind_phases')
+
+    if tone_frequencies_changed:
+        frequencies = tone_plan['frequencies']
+        if len(frequencies) > 0:
+            print(f'apply_config: setting frequencies ({len(frequencies)} tones, '
+                  f'{tone_plan["num_blind_tones"]} blind)')
             try:
                 r_fast.mixer.host.transport.axil_mm
                 r_fast.mixer.host.transport._get_device_address
-                set_tone_frequencies_fast(r, r_fast, new_config_dict, frequencies)
+                set_tone_frequencies_fast(
+                    r, r_fast, new_config_dict, frequencies,
+                    tone_amplitudes=tone_plan['amplitudes'],
+                    tone_phases=tone_plan['phases'])
             except AttributeError:
-                set_tone_frequencies(r, new_config_dict, frequencies)
+                set_tone_frequencies(
+                    r, new_config_dict, frequencies,
+                    tone_amplitudes=tone_plan['amplitudes'],
+                    tone_phases=tone_plan['phases'])
 
-    if changed('amplitudes'):
-        amplitudes = defaults.get('amplitudes', [])
-        if amplitudes:
+    if tone_amplitudes_changed and not tone_frequencies_changed:
+        amplitudes = tone_plan['amplitudes']
+        if amplitudes is not None and len(amplitudes) > 0:
             print(f'apply_config: setting amplitudes ({len(amplitudes)} values)')
             set_tone_amplitudes(r, new_config_dict, amplitudes)
 
-    if changed('phases'):
-        phases = defaults.get('phases', [])
-        if phases:
+    if tone_phases_changed and not tone_frequencies_changed:
+        phases = tone_plan['phases']
+        if phases is not None and len(phases) > 0:
             print(f'apply_config: setting phases ({len(phases)} values)')
             set_tone_phases(r, new_config_dict, phases)
 
@@ -2046,6 +2226,8 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
         details['rx']['digital_baseband_freq'] = dbb_freqs_rx.tolist()
         details['rx']['analog_input_freq'] = adc_in_freqs.tolist()
         details['rx']['rf_input_freq'] = udc_freqs_rx.tolist()
+        details.update(get_configured_tone_metadata(
+            config_dict, active_count=len(output_freqs)))
         return output_freqs,details
     else:
         return output_freqs
@@ -4647,19 +4829,8 @@ def _gather_bypass_amp_s21_for_state(config_dict, rf_peripherals, path,
         if not bypassed and bypass_state is not None:
             return bypass_state - delta
 
-    bypass_cfg = config_dict.get('rf_frontend', {}).get('bypass_amps', {}) or {}
-    state_key = (
-        f'{path}_amp_bypassed_s21_db'
-        if bypassed else f'{path}_amp_enabled_s21_db'
-    )
-    measured = _resolve_optional_cal_value(bypass_cfg.get(state_key), freq_axis)
-    if measured is not None:
-        return measured
-
     if not _rf_supports_bypass_amps(rf_peripherals):
-        measured = _resolve_optional_cal_value(
-            bypass_cfg.get(f'{path}_s21_db'), freq_axis)
-        return 0 if measured is None else measured
+        return 0
 
     dev_name = 'transmit_atten' if path == 'tx' else 'recv_atten'
     get_bypass = (
@@ -4682,23 +4853,6 @@ def _gather_bypass_amp_s21_for_state(config_dict, rf_peripherals, path,
             time.sleep(0.1)
 
 
-def _mixerless_amp_s21_state_configured(mixerless_cfg, path, bypassed):
-    """True when mixerless config can determine S21 for the requested state."""
-    direct_key = (
-        f'{path}_amp_bypassed_s21_db'
-        if bypassed else f'{path}_amp_enabled_s21_db'
-    )
-    if mixerless_cfg.get(direct_key) is not None:
-        return True
-    if mixerless_cfg.get(f'{path}_amp_bypass_delta_s21_db') is None:
-        return False
-    counterpart_key = (
-        f'{path}_amp_enabled_s21_db'
-        if bypassed else f'{path}_amp_bypassed_s21_db'
-    )
-    return mixerless_cfg.get(counterpart_key) is not None
-
-
 def _gather_bypass_amp_s21(config_dict, rf_peripherals, path, freq_axis):
     """Return the bypass-amp S21 for TX/RX, preferring measured config.
 
@@ -4706,10 +4860,6 @@ def _gather_bypass_amp_s21(config_dict, rf_peripherals, path, freq_axis):
     bypassed S21 values.  Measured values are better for absolute power
     calibration, so optional per-state config keys take priority:
     ``tx_amp_enabled_s21_db`` / ``tx_amp_bypassed_s21_db`` and RX equivalents.
-
-    If ``bypass_amps.use_config_s21`` is true, the legacy ``tx_s21_db`` /
-    ``rx_s21_db`` key is also treated as the measured value for the current
-    state.  Otherwise the model is used as a fallback.
     """
     if path not in ('tx', 'rx'):
         raise ValueError("path must be 'tx' or 'rx'")
@@ -4722,32 +4872,14 @@ def _gather_bypass_amp_s21(config_dict, rf_peripherals, path, freq_axis):
         bypassed = bool(get_bypass())
         state_value = _gather_bypass_amp_s21_for_state(
             config_dict, rf_peripherals, path, freq_axis, bypassed)
-        state_key = (
-            f'{path}_amp_bypassed_s21_db'
-            if bypassed else f'{path}_amp_enabled_s21_db'
-        )
-        mixerless_cfg = (
-            config_dict.get('rf_frontend', {}).get('mixerless_module', {}) or {}
-        )
-        bypass_cfg = (
-            config_dict.get('rf_frontend', {}).get('bypass_amps', {}) or {}
-        )
-        if (_mixerless_amp_s21_state_configured(mixerless_cfg, path, bypassed)
-                or bypass_cfg.get(state_key) is not None):
-            return state_value
-
-        if bypass_cfg.get('use_config_s21', False):
-            measured = _resolve_optional_cal_value(
-                bypass_cfg.get(f'{path}_s21_db'), freq_axis)
-            if measured is not None:
-                return measured
-
         return state_value
 
-    bypass_cfg = config_dict.get('rf_frontend', {}).get('bypass_amps', {}) or {}
-    measured = _resolve_optional_cal_value(
-        bypass_cfg.get(f'{path}_s21_db'), freq_axis)
-    return 0 if measured is None else measured
+    bypass_cfg = (
+        config_dict.get('rf_frontend', {}).get('bypass_amps', {}) or {}
+    )
+    bypassed = bool(bypass_cfg.get(f'{path}_amp_bypass', True))
+    return _gather_bypass_amp_s21_for_state(
+        config_dict, rf_peripherals, path, freq_axis, bypassed)
 
 
 def _gather_tx_chain_params(r, config_dict, rf_peripherals=None):
@@ -7123,9 +7255,13 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
     """
     Get current tone powers at the specified reference plane.
 
-    Covers the full signal chain from DAC through to the accumulator.
-    When detailed_output is True, returns power at every intermediate stage
-    in both the TX and RX chains.
+    Covers the full signal chain from DAC through to the accumulator. TX
+    planes are computed from current tone settings. RX planes are modelled
+    forward from the configured TX endpoint through the RX chain, which is most
+    useful for loopback or known-through paths. Detector/resonator S21 must be
+    included in the configured model or applied separately. This function does
+    not read accumulator samples. When detailed_output is True, returns power
+    at every intermediate stage in both the TX and RX chains.
 
     Parameters
     ----------
@@ -7134,10 +7270,10 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
             'dac'              - DAC output (after VOP, before analog frontend)
             'rf_output'        - RF frontend output (after amp, before cryostat)
             'detector'         - cryogenic focal plane (default)
-        RX chain (detector -> accumulator):
+        RX chain, modelled forward from the configured TX endpoint:
             'cryostat_output'  - cryostat output (before RX frontend)
             'adc_input'        - ADC input (after RX frontend)
-            'accumulator'      - raw accumulated IQ magnitude in dB
+            'accumulator'      - modelled accumulated IQ magnitude in dB
     detailed_output : bool
         If True, return (powers, details) where details is a dict of
         per-stage values across the full TX and RX chain.
@@ -7170,7 +7306,7 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
         detailed_output=True)
     details.update(tx_details)
 
-    # ---- RX chain (forward computation from detector power) ----
+    # ---- RX chain (forward computation from the configured TX endpoint) ----
     if need_rx:
         adc_tile = int(config_dict['firmware']['adc_tile'])
         adc_block = int(config_dict['firmware']['adc_block'])
@@ -7216,11 +7352,11 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
         if not p['cryo_connected']:
             cryostat_output_s21_db = 0
 
-        # Forward computation: use detector power from TX chain as input
-        detector_power_dbm = tx_powers
+        # Forward computation: use the TX endpoint power as RX-chain input.
+        tx_endpoint_power_dbm = tx_powers
 
         rx_iq, rx_details = calibration.calc_accumulated_iq_level(
-            detector_power_dbm, adc_dbm_to_dbfs, adc_mixer_qmc_gain, adc_mixer_scale_is_1p0,
+            tx_endpoint_power_dbm, adc_dbm_to_dbfs, adc_mixer_qmc_gain, adc_mixer_scale_is_1p0,
             adc_bits, pfb_fftshift, rx_mix_scale, acc_len,
             rx_combiner_loss_db=rx_combiner_loss_db,
             rx_attenuator_value_db=rx_attenuator_value_db,

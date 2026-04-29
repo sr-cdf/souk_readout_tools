@@ -99,8 +99,6 @@ CAL_FILE_KEYS = [
     ('rf_frontend', 'mixerless_module', 'rx_amp_bypass_delta_s21_db'),
     ('rf_frontend', 'mixerless_module', 'tx_group_delay_ns'),
     ('rf_frontend', 'mixerless_module', 'rx_group_delay_ns'),
-    ('rf_frontend', 'bypass_amps', 'tx_s21_db'),
-    ('rf_frontend', 'bypass_amps', 'rx_s21_db'),
     ('rf_frontend', 'path_group_delay_ns'),
     ('cryostat', 'input_s21_db'),
     ('cryostat', 'output_s21_db'),
@@ -611,7 +609,7 @@ class ReadoutClient:
         Update the in-memory config with live hardware state from the server.
 
         Fetches system information and writes the current firmware settings
-        back into config['firmware']['defaults'], current tone
+        back into config['firmware']['defaults'], current regular/blind tone
         frequencies/amplitudes/phases into the defaults section, and the
         current RF peripheral state (attenuator dB values, amp bypass
         state) into config['rf_frontend'].  This captures the running
@@ -685,13 +683,40 @@ class ReadoutClient:
             if 'PhaseCorrectionFactor' in adc_qmc:
                 defaults['adc_qmc_phase'] = adc_qmc['PhaseCorrectionFactor']
 
-        # Tone state
-        if tones.get('frequencies_hz') is not None:
-            defaults['frequencies'] = tones['frequencies_hz']
-        if tones.get('amplitudes') is not None:
-            defaults['amplitudes'] = tones['amplitudes']
-        if tones.get('phases_rad') is not None:
-            defaults['phases'] = tones['phases_rad']
+        # Tone state.  Preserve the configured regular/blind split when the
+        # live tone count still matches the config metadata.
+        blind_indices = tones.get('blind_indices') or []
+        regular_indices = tones.get('regular_indices') or []
+        split_blind = bool(blind_indices) and tones.get('metadata_matches_config', False)
+
+        def _take(values, indices):
+            if values is None:
+                return None
+            return [values[i] for i in indices]
+
+        if split_blind:
+            if tones.get('frequencies_hz') is not None:
+                defaults['frequencies'] = _take(tones['frequencies_hz'], regular_indices)
+                defaults['blind_frequencies'] = _take(tones['frequencies_hz'], blind_indices)
+            if tones.get('amplitudes') is not None:
+                defaults['amplitudes'] = _take(tones['amplitudes'], regular_indices)
+                defaults['blind_amplitudes'] = _take(tones['amplitudes'], blind_indices)
+            if tones.get('phases_rad') is not None:
+                defaults['phases'] = _take(tones['phases_rad'], regular_indices)
+                defaults['blind_phases'] = _take(tones['phases_rad'], blind_indices)
+            if tones.get('blind_spans') is not None:
+                defaults['blind_spans'] = tones['blind_spans']
+        else:
+            if tones.get('frequencies_hz') is not None:
+                defaults['frequencies'] = tones['frequencies_hz']
+            if tones.get('amplitudes') is not None:
+                defaults['amplitudes'] = tones['amplitudes']
+            if tones.get('phases_rad') is not None:
+                defaults['phases'] = tones['phases_rad']
+            defaults['blind_frequencies'] = []
+            defaults['blind_amplitudes'] = []
+            defaults['blind_phases'] = []
+            defaults['blind_spans'] = []
 
         # RF frontend peripheral state (attenuator, amp bypass)
         rf_response = self.get_rf_peripheral_status()
@@ -711,22 +736,14 @@ class ReadoutClient:
                 bypass['tx_amp_bypass'] = rf_status['tx_amp_bypass']
             if 'rx_amp_bypass' in rf_status:
                 bypass['rx_amp_bypass'] = rf_status['rx_amp_bypass']
-            if 'tx_bypass_amp_s21_db' in rf_status:
-                bypass['tx_s21_db'] = rf_status['tx_bypass_amp_s21_db']
-            if 'rx_bypass_amp_s21_db' in rf_status:
-                bypass['rx_s21_db'] = rf_status['rx_bypass_amp_s21_db']
             if not rf_status.get('supports_bypass_amps', False):
                 bypass['tx_amp_bypass'] = None
                 bypass['rx_amp_bypass'] = None
-                bypass['tx_s21_db'] = None
-                bypass['rx_s21_db'] = None
         else:
             atten['tx_value_db'] = None
             atten['rx_value_db'] = None
             bypass['tx_amp_bypass'] = None
             bypass['rx_amp_bypass'] = None
-            bypass['tx_s21_db'] = None
-            bypass['rx_s21_db'] = None
 
         lna_response = self.get_lna_controller_status()
         lna_status = lna_response.get('result', {}) if isinstance(lna_response, dict) else {}
@@ -744,12 +761,15 @@ class ReadoutClient:
                     lna_cfg[dst] = lna_status[src]
 
         n_changed = sum(1 for _, _, k in DIRECT_MAPS if k in defaults)
-        n_tones = len(defaults.get("frequencies", []))
+        n_regular_tones = len(defaults.get("frequencies", []))
+        n_blind_tones = len(defaults.get("blind_frequencies", []))
+        n_tones = n_regular_tones + n_blind_tones
         # The raw text from pull_config() is now stale because this method
         # intentionally creates a new captured config.
         self.config_raw_text = None
         print(f'Config captured from live system state '
-              f'({n_changed} parameters, {n_tones} tones)')
+              f'({n_changed} parameters, {n_tones} tones, '
+              f'{n_blind_tones} blind)')
         if save_as is not None:
             self.save_config(save_as)
         print('Use save_config() to write to disk, or push_config() to persist on the server.')
@@ -796,6 +816,80 @@ class ReadoutClient:
             return self.get_parameter('tone_frequencies_detailed')
         else:
             return np.atleast_1d(self.get_parameter('tone_frequencies'))
+
+    def get_tone_metadata(self):
+        """Return tone role metadata, including regular/blind indices."""
+        return self.get_parameter('tone_metadata')
+
+    def get_blind_tone_indices(self):
+        metadata = self.get_tone_metadata()
+        return np.asarray(metadata.get('blind_indices', []), dtype=int)
+
+    def get_regular_tone_indices(self):
+        metadata = self.get_tone_metadata()
+        return np.asarray(metadata.get('regular_indices', []), dtype=int)
+
+    def _update_tone_defaults_from_blind_result(self, result):
+        defaults_update = result.get('config_defaults') if isinstance(result, dict) else None
+        if defaults_update is None or self.config is None:
+            return
+        defaults = self.config.setdefault('firmware', {}).setdefault('defaults', {})
+        for key, value in defaults_update.items():
+            defaults[key] = value
+        self.config_raw_text = None
+
+    def get_blind_tones(self, reference_plane='detector'):
+        """Return current blind-tone state and user-facing indices."""
+        response = self.send_request({
+            'request': 'get_blind_tones',
+            'reference_plane': reference_plane,
+        })
+        if response.get('status') != 'success':
+            print(f"Error getting blind tones: {response.get('message')}")
+            return response
+        return response['result']
+
+    def set_blind_tones(self, frequencies, amplitudes=None, phases=None,
+                        spans=None, powers_dbm=None,
+                        reference_plane='detector',
+                        optimise_dynamic_range=False,
+                        rx_policy='protect'):
+        """Create or replace blind tones interactively.
+
+        The server snapshots the currently active regular tones, appends the
+        supplied blind tones, updates its in-memory tone
+        metadata, and immediately applies to firmware.
+        """
+        message = {
+            'request': 'set_blind_tones',
+            'frequencies': np.atleast_1d(frequencies).tolist(),
+            'reference_plane': reference_plane,
+            'optimise_dynamic_range': optimise_dynamic_range,
+            'rx_policy': rx_policy,
+        }
+        if amplitudes is not None:
+            message['amplitudes'] = np.atleast_1d(amplitudes).tolist()
+        if phases is not None:
+            message['phases'] = np.atleast_1d(phases).tolist()
+        if spans is not None:
+            message['spans'] = np.atleast_1d(spans).tolist()
+        if powers_dbm is not None:
+            message['powers_dbm'] = np.atleast_1d(powers_dbm).tolist()
+        response = self.send_request(message)
+        if response.get('status') != 'success':
+            print(f"Error setting blind tones: {response.get('message')}")
+            return response
+        self._update_tone_defaults_from_blind_result(response['result'])
+        return response
+
+    def remove_blind_tones(self):
+        """Remove blind tones and leave the current regular tones active."""
+        response = self.send_request({'request': 'remove_blind_tones'})
+        if response.get('status') != 'success':
+            print(f"Error removing blind tones: {response.get('message')}")
+            return response
+        self._update_tone_defaults_from_blind_result(response['result'])
+        return response
 
     def set_tone_amplitudes(self, tone_amplitudes):
         tone_amplitudes = np.atleast_1d(tone_amplitudes).tolist()
@@ -896,9 +990,10 @@ class ReadoutClient:
             Where the target power is specified: 'dac', 'rf_output', or
             'detector' (default).
         optimise_dynamic_range : bool
-            If True (default), maximise DAC bit utilisation and adjust
-            the analog chain (attenuator, amp bypass, DSA) to hit the
-            target power.  Set to False to skip optimisation for speed.
+            If True (default), maximise DAC bit utilisation, adjust available
+            TX RF controls (programmable attenuator and amp bypass), and
+            reduce PSB scale if those controls cannot absorb enough excess
+            power.  Set to False to skip optimisation for speed.
         rx_policy : str
             How to manage the RX path when the TX power change risks
             saturating the ADC.  One of:
@@ -949,10 +1044,16 @@ class ReadoutClient:
                 'dac'              - DAC output (after VOP, before analog frontend)
                 'rf_output'        - RF frontend output (after amp, before cryostat)
                 'detector'         - cryogenic focal plane (default)
-            RX chain (detector -> accumulator):
+            RX chain, modelled forward from the configured TX endpoint:
                 'cryostat_output'  - cryostat output (before RX frontend)
                 'adc_input'        - ADC input (after RX frontend)
-                'accumulator'      - raw accumulated IQ magnitude in dB
+                'accumulator'      - modelled accumulated IQ magnitude in dB
+
+            RX reference planes are predictions from current TX settings and
+            calibration, useful for configured loopback or known-through paths.
+            If a detector/resonator is present, include its per-tone S21 in the
+            configured model or apply it separately. This method does not
+            acquire accumulator samples.
 
         Returns
         -------
@@ -2738,6 +2839,112 @@ class ReadoutClient:
         return phases_sorted[inv_sort_idx]
 
     @staticmethod
+    def suggest_blind_frequencies(resonance_frequencies, count, band_hz,
+                                  min_distance_hz, edge_margin_hz=0.0,
+                                  candidate_spacing_hz=None,
+                                  random_offset_fraction=0.35,
+                                  rng=None):
+        """Suggest blind-tone centers away from known resonances.
+
+        Parameters
+        ----------
+        resonance_frequencies : array-like
+            Frequencies to avoid, usually the current resonator centers.
+        count : int
+            Number of blind tones to suggest.
+        band_hz : tuple
+            ``(f_min, f_max)`` search band in Hz.
+        min_distance_hz : float
+            Minimum allowed distance from any resonance and from other blind
+            tones.
+        edge_margin_hz : float
+            Margin excluded at each band edge.
+        candidate_spacing_hz : float, optional
+            Grid spacing for candidate centers. Defaults to
+            the larger of ``min_distance_hz / 5`` and one part in 5000 of
+            the usable band.
+        random_offset_fraction : float
+            Fraction of the nominal blind-tone spacing used to randomly jitter
+            the ideal target positions. This avoids placing blind tones on a
+            perfectly regular comb, which can align intermodulation products.
+            Set to 0 for deterministic evenly-spaced targets.
+        rng : numpy random generator, optional
+            Random generator used for jitter. Defaults to ``np.random``.
+        """
+        if resonance_frequencies is None:
+            avoid = np.array([], dtype=float)
+        else:
+            avoid = np.atleast_1d(resonance_frequencies).astype(float)
+        count = int(count)
+        if count < 0:
+            raise ValueError('count must be non-negative')
+        if count == 0:
+            return np.array([], dtype=float)
+        f_min, f_max = map(float, band_hz)
+        edge_margin_hz = float(edge_margin_hz)
+        min_distance_hz = float(min_distance_hz)
+        lo = f_min + edge_margin_hz
+        hi = f_max - edge_margin_hz
+        if hi <= lo:
+            raise ValueError('band_hz is empty after applying edge_margin_hz')
+        if candidate_spacing_hz is None:
+            candidate_spacing_hz = max(min_distance_hz / 5.0, (hi - lo) / 5000.0)
+        candidate_spacing_hz = float(candidate_spacing_hz)
+        if candidate_spacing_hz <= 0:
+            raise ValueError('candidate_spacing_hz must be positive')
+        random_offset_fraction = float(random_offset_fraction)
+        if random_offset_fraction < 0:
+            raise ValueError('random_offset_fraction must be non-negative')
+
+        # Build a fine grid of possible parking spaces.  This grid is only used
+        # for the search; final choices are picked from it after applying
+        # resonance-avoidance and blind-to-blind spacing constraints.
+        candidates = np.arange(lo, hi + candidate_spacing_hz / 2, candidate_spacing_hz)
+        if candidates.size == 0:
+            raise ValueError('No blind-tone candidates in requested band')
+
+        def min_distance_to(values, points):
+            if len(points) == 0:
+                return np.full(len(values), np.inf)
+            return np.min(np.abs(values[:, None] - points[None, :]), axis=1)
+
+        resonance_distance = min_distance_to(candidates, avoid)
+        allowed = resonance_distance >= min_distance_hz
+        if not np.any(allowed):
+            raise ValueError('No blind-tone candidates satisfy min_distance_hz')
+
+        selected = []
+        # Start from evenly-spaced ideal target locations so the blind tones
+        # monitor the whole band rather than clustering in one clean gap.
+        targets = np.linspace(lo, hi, count + 2)[1:-1]
+        # Regularly-spaced tones can produce aligned intermodulation products.
+        # Jitter the targets by less than half their nominal spacing, then use
+        # the nearest safe candidate to each jittered target.
+        if random_offset_fraction > 0 and count > 1:
+            if rng is None:
+                rng = np.random
+            nominal_spacing = (hi - lo) / (count + 1)
+            max_offset = min(
+                random_offset_fraction * nominal_spacing,
+                0.45 * nominal_spacing)
+            offsets = rng.uniform(-max_offset, max_offset, count)
+            targets = np.clip(targets + offsets, lo, hi)
+
+        for target in targets:
+            selected_arr = np.asarray(selected, dtype=float)
+            selected_distance = min_distance_to(candidates, selected_arr)
+            available = allowed & (selected_distance >= min_distance_hz)
+            if not np.any(available):
+                raise ValueError(
+                    f'Could only place {len(selected)} blind tones with '
+                    f'min_distance_hz={min_distance_hz}')
+            available_idx = np.nonzero(available)[0]
+            nearest_idx = available_idx[np.argmin(np.abs(candidates[available_idx] - target))]
+            selected.append(candidates[nearest_idx])
+
+        return np.asarray(selected, dtype=float)
+
+    @staticmethod
     def calculate_frequency_and_dissipation_noise(sweep_frequencies,sweep_complex_data,timestream_tone_frequency,timestream_complex_data,smooth_window_hz=1000):
         """
         Calculate the fractional frequency and dissipation noise timestreams from a sweep and complex timestream data.
@@ -3221,10 +3428,11 @@ class ReadoutClient:
         if freqs is None or len(freqs) == 0:
             raise ValueError("Frequencies must be provided and cannot be empty.")
         freqs = np.atleast_1d(freqs)
-        if phases is None:
-            phases = self.generate_newman_phases(freqs)
 
         self.set_tone_frequencies(freqs)
+        active_freqs = self.get_tone_frequencies()
+        if phases is None:
+            phases = self.generate_newman_phases(active_freqs)
 
         # Check for multiple tones per FFT bin
         detailed = self.get_tone_frequencies(detailed_output=True)
@@ -3237,7 +3445,7 @@ class ReadoutClient:
             lines = []
             for fft_bin, count in zip(unique_bins[shared_mask], counts[shared_mask]):
                 idxs = np.nonzero(tx_bins == fft_bin)[0]
-                tone_freqs = freqs[idxs]
+                tone_freqs = active_freqs[idxs]
                 freq_strs = ', '.join(f'{f/1e6:.4f} MHz' for f in tone_freqs)
                 lines.append(f'  FFT bin {fft_bin}: {count} tones (tones {idxs.tolist()}, freqs [{freq_strs}])')
             detail_str = '\n'.join(lines)
@@ -3257,8 +3465,16 @@ class ReadoutClient:
             self.set_tone_powers(powers_dbm)
         else:
             if amps is None:
-                amps = np.ones_like(freqs)
+                amps = np.ones_like(active_freqs)
             amps = np.atleast_1d(amps).copy()
+            if len(amps) == len(freqs) and len(active_freqs) > len(freqs):
+                try:
+                    current_amps = self.get_tone_amplitudes()
+                    amps = np.concatenate([amps, current_amps[len(freqs):]])
+                except Exception:
+                    amps = np.concatenate([
+                        amps,
+                        np.ones(len(active_freqs) - len(freqs), dtype=float)])
             if np.any(shared_mask):
                 # Find the worst-case bin (highest amplitude sum) and scale
                 # ALL tones uniformly so that bin stays <= 1.0.  This keeps

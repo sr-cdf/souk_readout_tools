@@ -229,11 +229,11 @@ DONE: optimise_tx_snr now records initial powers and verifies preservation after
 
 DONE: set_tone_powers now returns result dict with achieved_powers_dbm, power_error_db, and warnings; client surfaces warnings
 
-DONE: set_tone_powers with optimise_dynamic_range now follows order: maximise amps → fftshift → psbscale → compute required analog attenuation from calibration chain → RFDC DSA as last resort
+DONE: set_tone_powers with optimise_dynamic_range now follows order: maximise amplitudes → fftshift → psbscale → compute required TX level change from calibration chain → TX attenuator / TX amp bypass if available → reduce psbscale for remaining excess power
 
 DONE: get_tone_powers now accepts reference_plane parameter ('dac', 'rf_output', 'detector')
 
-DONE: get_tone_powers now covers the full signal chain with RX reference planes 'accumulator', 'adc_input', 'cryostat_output' in addition to TX planes; uses calc_adc_input_power from calibration.py
+DONE: get_tone_powers now covers the full signal chain with RX reference planes 'accumulator', 'adc_input', 'cryostat_output' in addition to TX planes; RX planes are forward-modelled with calc_accumulated_iq_level from calibration.py
 
 
 ### 1.3  Config sync from system
@@ -357,7 +357,7 @@ sweep = c.wideband_sweep(tone_powers_dbm=-60.0, verbose=True)
 ### 1.10c  RX tone powers (new in v1.1.0)
 
 ```python
-# Estimate received power from accumulated IQ
+# Predict received power from current TX settings and RX calibration
 rx_powers = c.get_tone_powers(reference_plane='adc_input')
 print(f"RX powers at ADC: {rx_powers} dBm")
 
@@ -367,7 +367,7 @@ print(f"RX powers at cryostat output: {rx_powers_cryo} dBm")
 - [x] Returns power array matching number of active tones
 - [x] `reference_plane='adc_input'` returns sensible ADC-level powers
 - [x] `reference_plane='cryostat_output'` includes RX frontend corrections (when connected)
-- [x] `reference_plane='accumulator'` returns raw dB levels (no calibration)
+- [x] `reference_plane='accumulator'` returns modelled accumulator dB levels (no calibration)
 
 ### 1.11  Wideband sweep CLI
 
@@ -529,7 +529,7 @@ print(f"DAC: {powers_dac[0]:.1f}, RF: {powers_rf[0]:.1f}, Det: {powers_det[0]:.1
 result = c.set_tone_powers([-40.0], reference_plane='detector', optimise_dynamic_range=True)
 ```
 - [ ] Analog adjustment computes exact attenuation from calibration chain (no trial-and-error)
-- [ ] RFDC DAC DSA used as last resort when attenuator+amp bypass insufficient
+- [ ] `psb_scale` is reduced as the last resort when TX attenuator+amp bypass cannot absorb enough excess power
 - [ ] `set_tone_powers` returns result dict with `warnings` list
 - [ ] Client prints any warnings from the result
 

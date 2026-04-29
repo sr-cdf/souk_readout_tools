@@ -32,8 +32,8 @@
 **RF Peripheral Configuration & Discovery**
 - RF frontend config now separates `mixerless_module`, `attenuator`, and
   `bypass_amps` settings. Attenuator values live at
-  `rf_frontend.attenuator.tx_value_db` / `rx_value_db`; bypass amp S21 lives
-  at `rf_frontend.bypass_amps.tx_s21_db` / `rx_s21_db`.
+  `rf_frontend.attenuator.tx_value_db` / `rx_value_db`; measured bypass-amp
+  S21 values live under `rf_frontend.mixerless_module`.
 - The controller no longer uses a software mimic after hardware init
   failures. Failed hardware remains unavailable and subsequent set/get calls
   raise clear errors instead of returning fake-success state.
@@ -51,6 +51,9 @@
   `client.config` and returns the updated config dict. Use
   `sync_config_to_local(save_as=...)` as a clearer alias when creating a new
   local config from the running system.
+- When blind tone metadata is active, `sync_config_from_system()` preserves the
+  regular/blind split and writes `blind_frequencies`, `blind_amplitudes`,
+  `blind_phases`, and `blind_spans` into `firmware.defaults`.
 
 **Sweep Plotter Speed-up**
 - `plot_sweep()` `show_errors` now defaults to `None`, which auto-disables
@@ -66,6 +69,24 @@
   amplitudes and temporarily compensating `psb_scale` when possible.
 - Fast sweep/retune paths use the fast tone-frequency writer and direct
   channel-map updates for lower overhead.
+
+**Blind Tone Management**
+- Added blind tone support for fixed gain/phase monitor tones.
+  Configs can now set `firmware.defaults.blind_frequencies`,
+  `blind_amplitudes`, `blind_phases`, and `blind_spans` alongside the
+  regular tone list.
+- The firmware is programmed with one combined tone list, so blind tones are
+  included in Newman phase generation, VACC/shared-bin protection, calibrated
+  power setting, dynamic-range optimisation, timestreams, and sweeps.
+- Retune and tracking paths keep blind tones fixed at their configured centers
+  while only updating regular tones.
+- Added interactive client/server helpers:
+  `suggest_blind_frequencies()`, `set_blind_tones()`, `get_blind_tones()`,
+  `remove_blind_tones()`, `get_tone_metadata()`,
+  `get_blind_tone_indices()`, and `get_regular_tone_indices()`.
+- `suggest_blind_frequencies()` now jitters the initially even target positions
+  by default, reducing regular-grid intermodulation spur alignment while still
+  respecting resonance/blind-tone spacing constraints.
 
 **Peak Finder Edge Trim**
 - `PeakFinderParams` accepts new `f_low` / `f_high` (Hz) fields to drop

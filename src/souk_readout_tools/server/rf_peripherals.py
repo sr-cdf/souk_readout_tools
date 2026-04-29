@@ -560,13 +560,11 @@ class RFPeripheralController:
             if self.is_hardware:
                 attn_state['tx_value_db'] = self.get_tx_attenuation()
             if self.supports_bypass_amps:
-                bypass_state['tx_s21_db'] = self._get_amp_s21('transmit_atten')
                 bypass_state['tx_amp_bypass'] = self.get_tx_amp_bypass()
         elif dev_name == 'recv_atten':
             if self.is_hardware:
                 attn_state['rx_value_db'] = self.get_rx_attenuation()
             if self.supports_bypass_amps:
-                bypass_state['rx_s21_db'] = self._get_amp_s21('recv_atten')
                 bypass_state['rx_amp_bypass'] = self.get_rx_amp_bypass()
 
     def _sync_runtime_state_from_hardware(self):

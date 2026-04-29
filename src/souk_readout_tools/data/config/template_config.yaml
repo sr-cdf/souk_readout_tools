@@ -75,9 +75,19 @@ firmware:
     adc_qmc_gain: 1                  # WARNING UNTESTED. Gain correction factor. Range: 0 to 2.0 (Exclusive)
     adc_qmc_offset: 0               # WARNING UNTESTED. Offset correction factor (fixed LSB value added to signal)
     adc_qmc_phase: 0                # WARNING UNTESTED. Phase correction factor. Range: +/- 26.5 degrees (Exclusive)
+    # Regular tone defaults. Blind monitor tones are configured separately
+    # below and are appended after these entries in the active firmware tone
+    # list.
     frequencies: []
     amplitudes: []
     phases: []
+    # Blind tones are ordinary firmware tones used for off-resonance gain/phase
+    # monitoring. Power/VACC/PAPR calculations include them, sweeps include
+    # them, and retune/tracking logic keeps them fixed at these centers.
+    blind_frequencies: []
+    blind_amplitudes: []
+    blind_phases: []
+    blind_spans: []                  # Optional sweep spans for blind tones; defaults to the requested regular-tone sweep span.
   # GPIO pin assignments
   gpio_0: 'trigger_input'
   gpio_1: 'misc_input'
@@ -151,10 +161,6 @@ rf_frontend:
     enabled: true
     tx_amp_bypass: true
     rx_amp_bypass: true
-    # Legacy/current-state bypass-amp S21 values. For mixerless modules,
-    # prefer the measured per-state keys in mixerless_module above.
-    tx_s21_db: 0
-    rx_s21_db: 0
 
   # --- RF path characterisation ---
   # These values describe the gain/loss of each component in the signal chain.

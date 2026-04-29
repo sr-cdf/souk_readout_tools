@@ -304,7 +304,8 @@ client.pull_config()  # updates in memory only, nothing written to disk
 Fields updated by `sync_config_from_system()`:
 
 - `firmware.defaults` — accumulator length, sync delay, RFDC parameters (VOP, Nyquist zone, mixer scales, QMC settings, DSA, DUC/DDC mixer frequencies)
-- `firmware.defaults.frequencies/amplitudes/phases` — current tone state
+- `firmware.defaults.frequencies/amplitudes/phases` — current regular tone state
+- `firmware.defaults.blind_frequencies/blind_amplitudes/blind_phases/blind_spans` — current blind tone state when the active tone metadata still matches the config
 - `rf_frontend.attenuator.tx_value_db` / `rx_value_db` — current attenuator settings
 - `rf_frontend.bypass_amps.tx_amp_bypass` / `rx_amp_bypass` — current amp bypass states. Measured mixerless-module S21 and P1dB calibration values live under `rf_frontend.mixerless_module`.
 - `cryostat.lna_bias` — current LNA bias setting for this pipeline when the controller is enabled
@@ -439,6 +440,96 @@ client.get_tone_frequencies()
 client.get_tone_frequencies(detailed_output=True)
 ```
 
+### Blind Tones
+
+Blind tones are fixed monitor tones placed away from resonances. Configure them
+alongside the regular tone list:
+
+```yaml
+firmware:
+  defaults:
+    frequencies: [0.800e9, 1.500e9]
+    blind_frequencies: [0.900e9, 1.200e9]
+    blind_amplitudes: [0.2, 0.2]
+    blind_phases: [0.0, 1.57]
+    blind_spans: [20000, 20000]
+```
+
+Here `frequencies`, `amplitudes`, and `phases` are the regular tones.
+The `blind_*` entries are appended after them. The firmware sees one combined
+tone list, so `get_tone_frequencies()`,
+`get_tone_amplitudes()`, `get_tone_phases()`, and power helpers return all
+tones in user order. Use the metadata helpers to split them:
+
+```python
+metadata = client.get_tone_metadata()
+metadata['regular_indices']
+metadata['blind_indices']
+
+blind = client.get_blind_tones()
+blind['frequencies_hz']
+blind['indices']
+```
+
+Sweeps include blind tones and use `blind_spans` when supplied. Retune keeps
+blind tones fixed at `blind_frequencies` and only updates regular tone indices.
+To generate candidate blind centers, use the helper:
+
+```python
+blind = client.suggest_blind_frequencies(
+    resonance_frequencies=client.get_tone_frequencies(),
+    count=8,
+    band_hz=(0.75e9, 1.75e9),
+    min_distance_hz=1e6,
+)
+```
+
+The helper first finds grid candidates that are far enough from resonances, then
+chooses tones near approximately even target positions. Those targets are
+jittered by default so the blind tones are not on a perfectly regular grid,
+which helps avoid intermodulation products lining up into coherent spurs. Pass
+`rng=np.random.default_rng(seed)` for repeatable suggestions, or
+`random_offset_fraction=0` for a deterministic regular target pattern.
+
+During interactive setup you do not need to edit a config file first. Set the
+current regular tones, then attach blind tones to the live tone state:
+
+```python
+res_freqs = np.array([...])              # from VNA or wideband sweep analysis
+client.set_tone_frequencies(res_freqs)
+
+blind_freqs = client.suggest_blind_frequencies(
+    resonance_frequencies=res_freqs,
+    count=8,
+    band_hz=(fmin, fmax),
+    min_distance_hz=1e6,
+)
+
+client.set_blind_tones(
+    blind_freqs,
+    powers_dbm=-65,
+    spans=20e3,
+    reference_plane='detector',
+)
+
+freqs = client.get_tone_frequencies()
+client.set_tone_phases(client.generate_newman_phases(freqs))
+client.get_blind_tones()
+```
+
+`set_blind_tones()` snapshots the current regular tones,
+adds/replaces the blind tones, updates the server's in-memory tone metadata,
+and immediately applies the combined tone list. If `powers_dbm` is supplied,
+the server preserves the current regular tone powers and sets the blind-tone
+powers in the same calibrated power call. `remove_blind_tones()` drops the
+blind tones and leaves the current regular tones active.
+
+After blind tones are attached, calls that operate on all active tones should
+use the combined arrays returned by `get_tone_frequencies()`,
+`get_tone_amplitudes()`, or `get_tone_phases()`. Calls that should operate on
+regular tones only can use `get_regular_tone_indices()` or
+`get_blind_tone_indices()` to split the returned data.
+
 ### Powers
 
 The final output power of each tone depends on several factors in the signal chain:
@@ -466,7 +557,7 @@ client.set_tone_powers([-20, -25], reference_plane='detector')
 client.get_tone_powers(detailed_output=True)
 ```
 
-By default, `set_tone_powers` automatically optimises the dynamic range — it maximises DAC bit utilisation and adjusts the analog chain (attenuator, amp bypass, DSA) to hit the target power. To skip optimisation for faster execution (e.g. during sweeps where the analog chain is already configured), pass `optimise_dynamic_range=False`.
+By default, `set_tone_powers` automatically optimises the dynamic range — it maximises DAC bit utilisation, adjusts available TX RF controls (programmable attenuator and amp bypass), and lowers `psb_scale` if those controls cannot absorb enough excess power. To skip optimisation for faster execution (e.g. during sweeps where the analog chain is already configured), pass `optimise_dynamic_range=False`.
 
 The tone powers can be set to the maximum level that avoids saturation of the RF chain by calling ```client.maximise_tx_power()```
 
@@ -856,7 +947,7 @@ client.get_tone_powers()                              # at detector (default)
 client.get_tone_powers(reference_plane='dac')          # at DAC output
 client.get_tone_powers(reference_plane='rf_output')    # at RF frontend output
 
-# RX power estimation based on the accumulated IQ data values
+# RX power prediction from current TX settings and RX calibration
 client.get_tone_powers(reference_plane='adc_input')             # at ADC input
 client.get_tone_powers(reference_plane='cryostat_output')       # at cryostat output
 ```

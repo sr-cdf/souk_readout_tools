@@ -356,18 +356,25 @@ powers, details = client.get_tone_powers(detailed_output=True)
 
 ### RX tone power estimation
 
-`get_tone_powers()` also covers the RX chain, estimating received tone powers
-from accumulated IQ data using the RX calibration chain to convert back to
-physical power.
+`get_tone_powers()` also covers the RX chain by forward-modelling the expected
+received levels from the current TX endpoint power and RX calibration. It does
+not read accumulated IQ data; use accumulator snapshots/streams plus
+`calibration.calc_adc_input_power()` when you need to convert measured IQ back
+to physical power.
+
+The forward estimate is most meaningful for a configured loopback or known
+through path, where the RX input follows from the preceding TX stages and the
+configured S21 terms. If a detector or resonator is in the path, include the
+per-tone device transmission, `S21(f_tone)`, before applying the RX chain.
 
 | `reference_plane` | Description |
 |---|---|
 | `'cryostat_output'` | Power at cryostat output (before RX frontend) |
 | `'adc_input'` | Power at ADC input in dBm |
-| `'accumulator'` | Raw accumulated IQ magnitude in dB |
+| `'accumulator'` | Modelled accumulated IQ magnitude in dB |
 
 ```python
-# Estimated power at ADC input
+# Modelled power at ADC input
 rx_powers = client.get_tone_powers(reference_plane='adc_input')
 ```
 
@@ -377,11 +384,13 @@ When `optimise_dynamic_range=True`, `set_tone_powers()` maximises DAC bit
 utilisation then computes the exact analog attenuation needed from the
 calibration chain gains, rather than trial-and-error hardware probing.
 
-The analog adjustment order is:
-1. Enable TX amplifier (maximum analog gain)
-2. Set minimum required programmable attenuation (0-31.5 dB)
-3. If insufficient, bypass TX amplifier
-4. As a last resort, use RFDC DAC DSA (up to 12 dB)
+The TX level adjustment order is:
+1. Use the programmable TX attenuator to move toward the target level
+2. Use the TX amplifier bypass when supported and additional reduction is needed
+3. Reduce `psb_scale` for any remaining excess power
+
+RFDC DSA operations in the software apply to the ADC/RX path, not this TX
+optimisation path.
 
 The result dict includes `achieved_powers_dbm`, `power_error_db`, and
 `warnings`, which are surfaced to the client automatically.

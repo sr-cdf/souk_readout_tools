@@ -735,6 +735,26 @@ class ReadoutServer:
 
 
 
+    def _resolve_request_config_file(self, config_file):
+        """Resolve the config file for an init/reset request, with fallback.
+
+        If the caller supplied an explicit path, it is returned (or rejected
+        upstream if missing). If the caller supplied None, fall back to
+        ``self.config_file`` if it still exists on disk, otherwise to
+        ``default_config.lnk``. This handles the case where the active config
+        file was deleted out from under the server.
+        """
+        if config_file is not None:
+            return config_file
+        if self.config_file and os.path.exists(self.config_file):
+            return self.config_file
+        if self.default_config and os.path.exists(self.default_config):
+            if self.config_file:
+                print(bcolors.WARNING + f'Active config {self.config_file} no longer '
+                      f'exists, falling back to {self.default_config}' + bcolors.ENDC)
+            return self.default_config
+        return self.config_file
+
     def load_config(self, config_file):
         """
         Load a new configuration file.
@@ -1253,50 +1273,40 @@ class ReadoutServer:
 
                 if request == 'ensure_ready':
                     level = message.get('level', 'pipeline')
-                    config_file = message.get('config_filename', None)
-                    if config_file is None:
-                        config_file = self.config_file
-                    if not os.path.exists(config_file):
+                    config_file = self._resolve_request_config_file(message.get('config_filename', None))
+                    if not config_file or not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
                         self.ensure_ready(config_file=config_file, level=level)
                         await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'hard_reset':
-                    config_file = message.get('config_filename', None)
-                    if config_file is None:
-                        config_file = self.config_file
-                    if not os.path.exists(config_file):
+                    config_file = self._resolve_request_config_file(message.get('config_filename', None))
+                    if not config_file or not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
                         self.init_server(config_file,ensure_ready=False, force_ready=True)
                         await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'initialise_server':
-                    config_file = message.get('config_filename')
-                    if config_file is None:
-                        config_file = self.config_file
-                    if not os.path.exists(config_file):
+                    config_file = self._resolve_request_config_file(message.get('config_filename'))
+                    if not config_file or not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
                         self.init_server(config_file,ensure_ready=False, force_ready=False)
                         await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'initialise_firmware':
-                    config_file = message.get('config_filename')
-                    if config_file is None:
-                        config_file = self.config_file
-                    if not os.path.exists(config_file):
+                    config_file = self._resolve_request_config_file(message.get('config_filename'))
+                    if not config_file or not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
                         await self.send_response(writer, {'status': 'success'})
-                        self.init_firmware(config_file) 
-                
+                        self.init_firmware(config_file)
+
                 elif request == 'initialise_pipeline':
-                    config_file = message.get('config_filename')
-                    if config_file is None:
-                        config_file = self.config_file
-                    if not os.path.exists(config_file):
+                    config_file = self._resolve_request_config_file(message.get('config_filename'))
+                    if not config_file or not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
                         self.init_pipeline(config_file)
@@ -1343,6 +1353,44 @@ class ReadoutServer:
                     result = self.health_check()
                     await self.send_response(writer, {'status': 'success', 'data': result})
 
+                elif request == 'get_blind_tones':
+                    ref_plane = message.get('reference_plane', 'detector')
+                    result = self.get_blind_tones(reference_plane=ref_plane)
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'set_blind_tones':
+                    self.stream_flags[FLAG_SET_FREQS].set()
+                    self.stream_flags[FLAG_SET_AMPS].set()
+                    self.stream_flags[FLAG_SET_PHASES].set()
+                    await asyncio.sleep(0)
+                    try:
+                        result = self.set_blind_tones(
+                            message.get('frequencies', []),
+                            amplitudes=message.get('amplitudes', None),
+                            phases=message.get('phases', None),
+                            spans=message.get('spans', None),
+                            powers_dbm=message.get('powers_dbm', None),
+                            reference_plane=message.get('reference_plane', 'detector'),
+                            optimise_dynamic_range=message.get(
+                                'optimise_dynamic_range', False),
+                            rx_policy=message.get('rx_policy', 'protect'))
+                    finally:
+                        self.stream_flags[FLAG_SET_PHASES].clear()
+                        self.stream_flags[FLAG_SET_AMPS].clear()
+                        self.stream_flags[FLAG_SET_FREQS].clear()
+                    await asyncio.sleep(0)
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'remove_blind_tones':
+                    self.stream_flags[FLAG_SET_FREQS].set()
+                    await asyncio.sleep(0)
+                    try:
+                        result = self.remove_blind_tones()
+                    finally:
+                        self.stream_flags[FLAG_SET_FREQS].clear()
+                    await asyncio.sleep(0)
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
                 elif request == 'get':
                     param_name = message.get('param')
                     response = {'status': 'error', 'message': f'Invalid parameter name {param_name}'}
@@ -1354,6 +1402,11 @@ class ReadoutServer:
                         response = {'status': 'success', 'value': value.tolist()}
                     elif param_name == 'tone_frequencies_detailed':
                         value = firmware_lib.get_tone_frequencies(self.r,self.config,detailed_output=True)[1]
+                        response = {'status': 'success', 'value': value}
+                    elif param_name == 'tone_metadata':
+                        active_count = len(firmware_lib.get_tone_frequencies(self.r, self.config))
+                        value = firmware_lib.get_configured_tone_metadata(
+                            self.config, active_count=active_count)
                         response = {'status': 'success', 'value': value}
                     elif param_name == 'tone_amplitudes':
                         value = firmware_lib.get_tone_amplitudes(self.r,self.config)
@@ -1421,6 +1474,7 @@ class ReadoutServer:
                     elif param_name == 'tone_frequencies':
                         self.stream_flags[FLAG_SET_FREQS].set()
                         await asyncio.sleep(0)
+                        param_value = self._expand_frequencies_for_blind(param_value)
                         firmware_lib.set_tone_frequencies_fast(self.r, self.r_fast, self.config, param_value)
                         self.update_active_tone_indices()
                         self.stream_flags[FLAG_SET_FREQS].clear()
@@ -1430,6 +1484,9 @@ class ReadoutServer:
                     elif param_name == 'tone_amplitudes':
                         self.stream_flags[FLAG_SET_AMPS].set()
                         await asyncio.sleep(0)
+                        param_value = self._expand_values_for_blind(
+                            param_value, firmware_lib.get_tone_amplitudes,
+                            plan_values_key='amplitudes', default_value=1.0)
                         firmware_lib.set_tone_amplitudes(self.r, self.config, param_value)
                         self.stream_flags[FLAG_SET_AMPS].clear()
                         await asyncio.sleep(0)
@@ -1438,6 +1495,9 @@ class ReadoutServer:
                     elif param_name == 'tone_phases':
                         self.stream_flags[FLAG_SET_PHASES].set()
                         await asyncio.sleep(0)
+                        param_value = self._expand_values_for_blind(
+                            param_value, firmware_lib.get_tone_phases,
+                            plan_values_key='phases', default_value=0.0)
                         firmware_lib.set_tone_phases(self.r, self.config, param_value)
                         self.stream_flags[FLAG_SET_PHASES].clear()
                         await asyncio.sleep(0)
@@ -1449,6 +1509,11 @@ class ReadoutServer:
                         ref_plane = message.get('reference_plane', 'detector')
                         opt_dr = message.get('optimise_dynamic_range', False)
                         rx_pol = message.get('rx_policy', 'protect')
+                        param_value = self._expand_values_for_blind(
+                            param_value, firmware_lib.get_tone_powers,
+                            getter_kwargs={'reference_plane': ref_plane,
+                                           'rf_peripherals': self.rf_peripherals},
+                            plan_values_key=None, default_value=None)
                         result = firmware_lib.set_tone_powers(
                             self.r, self.r_fast, self.config, param_value,
                             reference_plane=ref_plane,
@@ -1996,6 +2061,301 @@ class ReadoutServer:
             print(f"Error sending response: {response} \n {e}")
             print(traceback.format_exc())
     
+    def _tone_plan(self):
+        return firmware_lib.get_configured_tone_plan(self.config)
+
+    def _tone_defaults(self):
+        return self.config.setdefault('firmware', {}).setdefault('defaults', {})
+
+    @staticmethod
+    def _normalise_interactive_values(values, n_values, name,
+                                      default_values=None,
+                                      default_value=None):
+        if n_values == 0:
+            return np.array([], dtype=float)
+        if values is None:
+            if default_values is not None and len(default_values) == n_values:
+                return np.asarray(default_values, dtype=float)
+            if default_value is None:
+                return None
+            return np.full(n_values, default_value, dtype=float)
+        values = np.atleast_1d(values).astype(float)
+        if len(values) == n_values:
+            return values
+        if len(values) == 1 and n_values > 1:
+            return np.full(n_values, float(values[0]), dtype=float)
+        raise ValueError(
+            f'Number of {name} values ({len(values)}) must match number of '
+            f'blind tones ({n_values})')
+
+    def _live_tone_state(self):
+        freqs = np.asarray(
+            firmware_lib.get_tone_frequencies(self.r, self.config),
+            dtype=float)
+        amps = np.asarray(
+            firmware_lib.get_tone_amplitudes(self.r, self.config),
+            dtype=float)
+        phases = np.asarray(
+            firmware_lib.get_tone_phases(self.r, self.config),
+            dtype=float)
+        metadata = firmware_lib.get_configured_tone_metadata(
+            self.config, active_count=len(freqs))
+        return freqs, amps, phases, metadata
+
+    def _tone_config_snapshot(self):
+        defaults = self._tone_defaults()
+        keys = (
+            'frequencies', 'amplitudes', 'phases',
+            'blind_frequencies', 'blind_amplitudes', 'blind_phases',
+            'blind_spans',
+        )
+        return {key: copy.deepcopy(defaults.get(key, [])) for key in keys}
+
+    def _set_tone_defaults_from_split(self, regular_freqs, regular_amps,
+                                      regular_phases, blind_freqs,
+                                      blind_amps=None, blind_phases=None,
+                                      blind_spans=None):
+        defaults = self._tone_defaults()
+        defaults['frequencies'] = np.asarray(regular_freqs, dtype=float).tolist()
+        defaults['amplitudes'] = np.asarray(regular_amps, dtype=float).tolist()
+        defaults['phases'] = np.asarray(regular_phases, dtype=float).tolist()
+        defaults['blind_frequencies'] = np.asarray(blind_freqs, dtype=float).tolist()
+        defaults['blind_amplitudes'] = (
+            [] if blind_amps is None else np.asarray(blind_amps, dtype=float).tolist()
+        )
+        defaults['blind_phases'] = (
+            [] if blind_phases is None else np.asarray(blind_phases, dtype=float).tolist()
+        )
+        defaults['blind_spans'] = (
+            [] if blind_spans is None else np.asarray(blind_spans, dtype=float).tolist()
+        )
+
+    def get_blind_tones(self, reference_plane='detector'):
+        freqs, amps, phases, metadata = self._live_tone_state()
+        blind_indices = metadata['blind_indices']
+        powers = None
+        if blind_indices:
+            try:
+                powers_all = firmware_lib.get_tone_powers(
+                    self.r, self.config, reference_plane=reference_plane,
+                    rf_peripherals=self.rf_peripherals)
+                powers = np.asarray(powers_all, dtype=float)[blind_indices].tolist()
+            except Exception as e:
+                print(f'Warning: could not read blind tone powers: {e}')
+
+        plan = self._tone_plan()
+        spans = plan['blind_spans']
+        if len(spans) != len(blind_indices):
+            spans = np.array([], dtype=float)
+        blind_freqs = freqs[blind_indices].tolist() if blind_indices else []
+        blind_phases = phases[blind_indices].tolist() if blind_indices else []
+
+        return {
+            'indices': blind_indices,
+            'frequencies': blind_freqs,
+            'frequencies_hz': blind_freqs,
+            'amplitudes': amps[blind_indices].tolist() if blind_indices else [],
+            'phases': blind_phases,
+            'phases_rad': blind_phases,
+            'spans': spans.tolist(),
+            'powers_dbm': powers,
+            'powers_reference_plane': reference_plane,
+            'regular_indices': metadata['regular_indices'],
+            'tone_types': metadata['tone_types'],
+            'all_frequencies': freqs.tolist(),
+            'metadata': metadata,
+            'config_defaults': self._tone_config_snapshot(),
+        }
+
+    def set_blind_tones(self, frequencies, amplitudes=None, phases=None,
+                        spans=None, powers_dbm=None,
+                        reference_plane='detector',
+                        optimise_dynamic_range=False,
+                        rx_policy='protect'):
+        blind_freqs = np.atleast_1d(frequencies).astype(float)
+        if len(blind_freqs) == 0:
+            return self.remove_blind_tones()
+
+        freqs, amps, current_phases, metadata = self._live_tone_state()
+        regular_indices = metadata['regular_indices']
+        regular_freqs = freqs[regular_indices]
+        regular_amps = amps[regular_indices]
+        regular_phases = current_phases[regular_indices]
+
+        old_plan = self._tone_plan()
+        old_blind_amps = old_plan['amplitudes']
+        old_blind_phases = old_plan['phases']
+        if (old_blind_amps is not None
+                and len(old_blind_amps) == old_plan['num_tones']
+                and old_plan['num_blind_tones'] == len(blind_freqs)):
+            old_blind_amps = np.asarray(old_blind_amps)[old_plan['blind_indices']]
+        else:
+            old_blind_amps = None
+        if (old_blind_phases is not None
+                and len(old_blind_phases) == old_plan['num_tones']
+                and old_plan['num_blind_tones'] == len(blind_freqs)):
+            old_blind_phases = np.asarray(old_blind_phases)[old_plan['blind_indices']]
+        else:
+            old_blind_phases = None
+
+        blind_amps = self._normalise_interactive_values(
+            amplitudes, len(blind_freqs), 'amplitudes',
+            default_values=old_blind_amps, default_value=1.0)
+        blind_phases = self._normalise_interactive_values(
+            phases, len(blind_freqs), 'phases',
+            default_values=old_blind_phases, default_value=0.0)
+        blind_spans = self._normalise_interactive_values(
+            spans, len(blind_freqs), 'spans', default_value=None)
+        if blind_spans is None:
+            blind_spans = np.array([], dtype=float)
+
+        current_regular_powers = None
+        if powers_dbm is not None:
+            current_powers = firmware_lib.get_tone_powers(
+                self.r, self.config, reference_plane=reference_plane,
+                rf_peripherals=self.rf_peripherals)
+            current_powers = np.asarray(current_powers, dtype=float)
+            current_regular_powers = current_powers[regular_indices]
+
+        self._set_tone_defaults_from_split(
+            regular_freqs, regular_amps, regular_phases,
+            blind_freqs, blind_amps=blind_amps, blind_phases=blind_phases,
+            blind_spans=blind_spans)
+
+        combined_freqs = np.concatenate([regular_freqs, blind_freqs])
+        combined_amps = np.concatenate([regular_amps, blind_amps])
+        combined_phases = np.concatenate([regular_phases, blind_phases])
+        firmware_lib.set_tone_frequencies_fast(
+            self.r, self.r_fast, self.config, combined_freqs,
+            tone_amplitudes=combined_amps, tone_phases=combined_phases)
+        self.update_active_tone_indices()
+
+        if powers_dbm is not None:
+            blind_powers = self._normalise_interactive_values(
+                powers_dbm, len(blind_freqs), 'powers_dbm')
+            target_powers = np.concatenate([
+                current_regular_powers, blind_powers])
+            firmware_lib.set_tone_powers(
+                self.r, self.r_fast, self.config, target_powers,
+                reference_plane=reference_plane,
+                optimise_dynamic_range=optimise_dynamic_range,
+                rf_peripherals=self.rf_peripherals,
+                rx_policy=rx_policy)
+            # Capture the amplitude result after calibrated power setting.
+            final_amps = firmware_lib.get_tone_amplitudes(self.r, self.config)
+            defaults = self._tone_defaults()
+            defaults['amplitudes'] = np.asarray(
+                final_amps[:len(regular_freqs)], dtype=float).tolist()
+            defaults['blind_amplitudes'] = np.asarray(
+                final_amps[len(regular_freqs):], dtype=float).tolist()
+
+        return self.get_blind_tones(reference_plane=reference_plane)
+
+    def remove_blind_tones(self):
+        freqs, amps, phases, metadata = self._live_tone_state()
+        regular_indices = metadata['regular_indices']
+        regular_freqs = freqs[regular_indices]
+        regular_amps = amps[regular_indices]
+        regular_phases = phases[regular_indices]
+        self._set_tone_defaults_from_split(
+            regular_freqs, regular_amps, regular_phases,
+            [], blind_amps=[], blind_phases=[], blind_spans=[])
+        if len(regular_freqs) > 0:
+            firmware_lib.set_tone_frequencies_fast(
+                self.r, self.r_fast, self.config, regular_freqs,
+                tone_amplitudes=regular_amps,
+                tone_phases=regular_phases)
+        else:
+            firmware_lib.set_tone_frequencies_fast(
+                self.r, self.r_fast, self.config, [])
+        self.update_active_tone_indices()
+        return self.get_blind_tones()
+
+    def _expand_frequencies_for_blind(self, frequencies):
+        """Append configured blind centers when a user supplies regular tones."""
+        freqs = np.atleast_1d(frequencies).astype(float)
+        plan = self._tone_plan()
+        n_regular = plan['num_regular_tones']
+        n_blind = plan['num_blind_tones']
+        if n_blind == 0:
+            return freqs.tolist()
+        if len(freqs) == n_regular:
+            return np.concatenate([freqs, plan['blind_frequencies']]).tolist()
+        if len(freqs) == n_regular + n_blind:
+            freqs = freqs.copy()
+            freqs[plan['blind_indices']] = plan['blind_frequencies']
+            return freqs.tolist()
+        return freqs.tolist()
+
+    def _expand_values_for_blind(self, values, getter, getter_kwargs=None,
+                                 plan_values_key=None, default_value=None):
+        """Append blind per-tone values when only regular values are supplied."""
+        vals = np.atleast_1d(values).astype(float)
+        plan = self._tone_plan()
+        n_regular = plan['num_regular_tones']
+        n_blind = plan['num_blind_tones']
+        total = n_regular + n_blind
+        if n_blind == 0 or len(vals) != n_regular or len(vals) == total:
+            return vals.tolist()
+
+        getter_kwargs = getter_kwargs or {}
+        blind_values = None
+        try:
+            current = np.atleast_1d(getter(self.r, self.config, **getter_kwargs))
+            if len(current) == total:
+                blind_values = current[plan['blind_indices']]
+        except Exception as e:
+            print(f'Warning: could not read current blind tone values: {e}')
+
+        if blind_values is None and plan_values_key is not None:
+            plan_values = plan.get(plan_values_key)
+            if plan_values is not None and len(plan_values) == total:
+                blind_values = np.asarray(plan_values)[plan['blind_indices']]
+
+        if blind_values is None:
+            if default_value is None:
+                return vals.tolist()
+            blind_values = np.full(n_blind, default_value, dtype=float)
+
+        return np.concatenate([vals, blind_values]).tolist()
+
+    def _expand_sweep_request_for_blind(self, centers, spans):
+        """Append configured blind sweep centers/spans to regular tone sweeps."""
+        centers = np.atleast_1d(centers).astype(float)
+        spans = np.atleast_1d(spans).astype(float)
+        plan = self._tone_plan()
+        n_regular = plan['num_regular_tones']
+        n_blind = plan['num_blind_tones']
+        total = n_regular + n_blind
+
+        if n_blind == 0:
+            if len(spans) == 1:
+                spans = np.full(len(centers), spans[0])
+            return centers, spans
+
+        if len(centers) not in (n_regular, total):
+            if len(spans) == 1:
+                spans = np.full(len(centers), spans[0])
+            return centers, spans
+
+        if len(spans) == 1:
+            spans = np.full(len(centers), spans[0])
+
+        if len(centers) == n_regular:
+            blind_spans = plan['blind_spans']
+            if len(blind_spans) != n_blind:
+                fallback_span = float(np.median(spans)) if len(spans) else 0.0
+                blind_spans = np.full(n_blind, fallback_span, dtype=float)
+            centers = np.concatenate([centers, plan['blind_frequencies']])
+            spans = np.concatenate([spans, blind_spans])
+        else:
+            centers = centers.copy()
+            centers[plan['blind_indices']] = plan['blind_frequencies']
+            if len(spans) != total:
+                spans = np.full(total, float(np.median(spans)), dtype=float)
+
+        return centers, spans
+
     def update_active_tone_indices(self):
         """
         Refresh active_tone_indices from the firmware.
@@ -2235,10 +2595,7 @@ class ReadoutServer:
             self.latest_sweep_data_valid = False
             self.sweep_progress = 0.0
 
-            centers = np.atleast_1d(centers)
-            spans = np.atleast_1d(spans)
-            if len(spans)==1:
-                spans = np.full(len(centers),spans[0])
+            centers, spans = self._expand_sweep_request_for_blind(centers, spans)
             assert len(centers) == len(spans)
             num_points=int(points)
             samples_per_point=int(samples_per_point)
@@ -2253,6 +2610,11 @@ class ReadoutServer:
             for i in range(len(centers)):
                 if initial_freqs[i]<centers[i]-spans[i]/2. or initial_freqs[i]>centers[i]+spans[i]/2.:
                     initial_freqs[i] = centers[i]
+            metadata = firmware_lib.get_configured_tone_metadata(
+                self.config, active_count=len(centers))
+            if metadata['blind_indices']:
+                plan = self._tone_plan()
+                initial_freqs[metadata['blind_indices']] = plan['blind_frequencies']
 
             print('Setting initial tone frequencies')
             firmware_lib.set_tone_frequencies_fast(self.r,self.r_fast,self.config,centers,autosync=True)
@@ -2477,10 +2839,7 @@ class ReadoutServer:
                 Default 2.0.
         """
 
-        center = np.atleast_1d(center)
-        span = np.atleast_1d(span)
-        if len(span)==1:
-            span = np.full(len(center),span[0])
+        center, span = self._expand_sweep_request_for_blind(center, span)
         assert len(center) == len(span)
         num_points=int(points)
         samples_per_point=int(samples_per_point)
@@ -2493,7 +2852,14 @@ class ReadoutServer:
         elif np.isscalar(freq_offsets):
             freq_offsets = np.full_like(center, freq_offsets)
         else:
-            freq_offsets = np.atleast_1d(freq_offsets)
+            freq_offsets = np.atleast_1d(freq_offsets).astype(float)
+            plan = self._tone_plan()
+            if (plan['num_blind_tones'] > 0
+                    and len(freq_offsets) == plan['num_regular_tones']
+                    and len(center) == plan['num_tones']):
+                freq_offsets = np.concatenate([
+                    freq_offsets,
+                    np.zeros(plan['num_blind_tones'], dtype=float)])
         if freq_offsets.shape != center.shape:
             raise ValueError("freq_offsets must be None, a scalar, or have the same shape as centers")
         if np.any(np.abs(freq_offsets) > span/2):
@@ -2513,20 +2879,28 @@ class ReadoutServer:
             sweep_z = self.latest_sweep_results['sweep_responses']
             sweep_e = self.latest_sweep_results['sweep_sems']
 
-            retune_freqs = np.zeros_like(sweep_f[0])
+            metadata = firmware_lib.get_configured_tone_metadata(
+                self.config, active_count=len(center))
+            regular_indices = metadata['regular_indices']
+            blind_indices = metadata['blind_indices']
+            plan = self._tone_plan()
+            retune_freqs = np.array(center, dtype=float)
 
             if method == 'max_gradient':
-                for t in range(len(center)):
+                for t in regular_indices:
                     freqs = sweep_f[:,t]
                     grads = np.abs(np.gradient(sweep_z[:,t]))
                     max_grad = np.argmax(grads)
                     retune_freqs[t] = freqs[max_grad] + freq_offsets[t]
             elif method == 'min_mag':
-                for t in range(len(center)):
+                for t in regular_indices:
                     freqs = sweep_f[:,t]
                     mags = np.abs(sweep_z[:,t])
                     min_mag = np.argmin(mags)
                     retune_freqs[t] = freqs[min_mag] + freq_offsets[t]
+
+            if blind_indices:
+                retune_freqs[blind_indices] = plan['blind_frequencies']
 
             print('Retune freqs = found freqs + freq offsets = ',retune_freqs)
 

@@ -126,9 +126,16 @@ def _rx_chain_gain_db(frequencies, info, config):
     if rf_connected:
         rx_rf_s21 = _cal_or_zero(rf.get('rx_rf_s21_db'), frequencies)
         rx_if_s21 = _cal_or_zero(rf.get('rx_if_s21_db'), frequencies)
-        rx_bypass_amp_s21 = _cal_or_zero(
-            rf.get('bypass_amps', {}).get('rx_s21_db'), frequencies,
-        )
+        rx_amp_bypass = (rf.get('bypass_amps', {}) or {}).get('rx_amp_bypass')
+        if rx_amp_bypass is not None:
+            rx_amp_key = (
+                'rx_amp_bypassed_s21_db'
+                if rx_amp_bypass else 'rx_amp_enabled_s21_db'
+            )
+            rx_bypass_amp_s21 = _cal_or_zero(
+                (rf.get('mixerless_module', {}) or {}).get(rx_amp_key),
+                frequencies,
+            )
         rx_mixer_conv = _cal_or_zero(rf.get('rx_mixer_conversion_loss_db'), frequencies)
         rx_combiner = _cal_or_zero(rf.get('rx_combiner_loss_db'), frequencies)
         rx_atten_raw = rf.get('attenuator', {}).get('rx_value_db')

@@ -556,7 +556,7 @@ running alongside `stream_data`) we might expect the server to
 - use the **second accumulator** (or suitably averaged/filtered views of the
     same fast data) to monitor slow, high‑S/N variations in each
     resonator’s transmission and phase, and
-- adjust the resonator tones from inside the daemon using the same
+- adjust the tones from inside the daemon using the same
     `set_tone_frequencies` / `prepare_tone_frequencies_fast` /
     `apply_tone_frequencies_fast` machinery that is already used for
     sweeps and retunes, without requiring any external RPCs while the
@@ -596,5 +596,4 @@ We are looking at adding a prepare_slow_frame method that:
 This would be called from within a tracking_task coroutine which runs alongside stream_data.
 
 We may want to perform some profiling to optimise the speed of the slow accumulator read and tone update path.
-
 
