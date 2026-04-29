@@ -107,6 +107,26 @@ rf_frontend:
     connected: true
     rf_channel: 0                    # which channel (0 or 1) of the module
                                      # this pipeline drives
+    # Optional measured mixerless-module calibration overrides.
+    # S21 values use the standard calibration formats:
+    #   scalar, [[freq_hz, dB], ...], or "filename.csv".
+    # These override the built-in component model when set. The *_delta_s21_db
+    # keys are bypassed-minus-enabled S21, useful when only the bypass change
+    # is measured. Prefer absolute enabled/bypassed S21 values when available.
+    tx_amp_enabled_s21_db:
+    tx_amp_bypassed_s21_db:
+    tx_amp_bypass_delta_s21_db:
+    rx_amp_enabled_s21_db:
+    rx_amp_bypassed_s21_db:
+    rx_amp_bypass_delta_s21_db:
+    # Input-referred 1 dB compression points for the mixerless-module path.
+    # If unset, the wrapper uses the component model as a fallback.
+    tx_input_1db_comp_dbm:
+    rx_input_1db_comp_dbm:
+    # Optional module-only group delay. Full path deembedding still uses
+    # rf_frontend.path_group_delay_ns.
+    tx_group_delay_ns:
+    rx_group_delay_ns:
 
   # --- Attenuator control ---
   # backend: i2c   uses the SOUK mixerless module's on-board attenuators
@@ -131,9 +151,8 @@ rf_frontend:
     enabled: true
     tx_amp_bypass: true
     rx_amp_bypass: true
-    # Bypass-amp S21 values used as desired/captured config values.
-    # Live hardware values are used at runtime and can be captured with
-    # sync_config_from_system().
+    # Legacy/current-state bypass-amp S21 values. For mixerless modules,
+    # prefer the measured per-state keys in mixerless_module above.
     tx_s21_db: 0
     rx_s21_db: 0
 

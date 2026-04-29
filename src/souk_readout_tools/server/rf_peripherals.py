@@ -382,6 +382,9 @@ class RFPeripheralController:
 
     def get_tx_input_1db_comp(self):
         """TX path input 1 dB compression point (dBm) at the current settings."""
+        override = self._mixerless_module_cal_value('tx_input_1db_comp_dbm')
+        if override is not None:
+            return float(override)
         if self._mixerless_module is not None:
             atten_amp = self._mixerless_module._get_atten_amp(
                 self._channel, 'transmit_atten',
@@ -392,6 +395,9 @@ class RFPeripheralController:
 
     def get_rx_input_1db_comp(self):
         """RX path input 1 dB compression point (dBm) at the current settings."""
+        override = self._mixerless_module_cal_value('rx_input_1db_comp_dbm')
+        if override is not None:
+            return float(override)
         if self._mixerless_module is not None:
             atten_amp = self._mixerless_module._get_atten_amp(
                 self._channel, 'recv_atten',
@@ -572,6 +578,15 @@ class RFPeripheralController:
         """Return the current bypass-amp S21 contribution (gain or bypass IL)."""
         atten_amp = self._mixerless_module._get_atten_amp(self._channel, dev_name)
         return atten_amp.atten_amp_level.amp.total_gain_il
+
+    def _mixerless_module_cal_value(self, key):
+        """Return a scalar mixerless-module calibration override if set."""
+        value = (
+            self.config.get('rf_frontend', {})
+            .get('mixerless_module', {})
+            .get(key)
+        )
+        return None if value is None else value
 
     @staticmethod
     def _amp_input_1db_comp(amp):

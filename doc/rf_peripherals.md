@@ -68,6 +68,12 @@ rf_frontend:
   mixerless_module:
     connected: true                 # true for the SOUK mixerless module
     rf_channel: 0                   # 0 or 1
+    tx_amp_enabled_s21_db: 20.0     # measured; scalar/table/file
+    tx_amp_bypassed_s21_db: -2.0
+    rx_amp_enabled_s21_db: 20.0
+    rx_amp_bypassed_s21_db: -2.0
+    tx_input_1db_comp_dbm: 24.0     # optional measured override
+    rx_input_1db_comp_dbm: -24.0
   attenuator:
     backend: "i2c"                  # 'i2c', 'rudat', or 'fixed'
     tx_value_db: 10.0
@@ -327,8 +333,15 @@ The `tx_total_gain_db` / `rx_total_gain_db` values reported by
 controller.  Tone-power estimates do not use those summary values directly;
 they use the staged calibration chain (`attenuator.*_value_db`,
 `*_if_s21_db`, `*_mixer_conversion_loss_db`, `*_rf_s21_db`,
-`bypass_amps.*_s21_db`, and cryostat S21).  If the S21 fields are left unset,
-detector-plane powers are only as good as the remaining defaults.
+measured `mixerless_module.*_s21_db`, and cryostat S21).  If the S21 fields
+are left unset, detector-plane powers fall back to the component model where
+available and are only as good as the remaining defaults.
+
+For mixerless modules, measured S21 keys under `rf_frontend.mixerless_module`
+accept the same calibration formats as the other S21 fields: a scalar, inline
+`[[freq_hz, dB], ...]` pairs, or a filename.  If both enabled and bypassed
+states are not measured, `*_amp_bypass_delta_s21_db` can be supplied as the
+bypassed-minus-enabled delta together with one absolute state.
 
 ```python
 # Per-tone power at detector plane (default)

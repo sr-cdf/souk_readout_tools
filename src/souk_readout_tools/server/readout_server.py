@@ -1120,6 +1120,15 @@ class ReadoutServer:
                      'loopback'):
             info[key] = rf_cfg.get(key)
 
+        # Mixerless-module measured calibration overrides.
+        for key in ('tx_amp_enabled_s21_db', 'tx_amp_bypassed_s21_db',
+                     'tx_amp_bypass_delta_s21_db',
+                     'rx_amp_enabled_s21_db', 'rx_amp_bypassed_s21_db',
+                     'rx_amp_bypass_delta_s21_db',
+                     'tx_input_1db_comp_dbm', 'rx_input_1db_comp_dbm',
+                     'tx_group_delay_ns', 'rx_group_delay_ns'):
+            info[key] = mixerless_cfg.get(key)
+
         return info
 
     def _info_lna(self):

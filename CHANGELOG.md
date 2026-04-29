@@ -79,6 +79,10 @@
   total TX frontend input power below the RF frontend input-referred 1 dB
   compression point. The RF peripheral wrapper also corrects the mixerless
   module amplifier P1dB arithmetic without modifying the upstream submodule.
+- Mixerless-module measured calibration overrides can now be supplied under
+  `rf_frontend.mixerless_module`: per-state TX/RX amp S21, bypass delta S21,
+  input-referred P1dB, and module group-delay metadata. S21/group-delay keys
+  accept scalars, inline frequency tables, or calibration filenames.
 - Wideband sweep with `tone_powers=None` no longer reapplies tone powers
   (preserves whatever the pipeline currently has set).
 - Fix late-import bug in `firmware_lib`.

@@ -103,7 +103,10 @@ The `reference_plane` parameter controls where the target power is specified:
 - `'rf_output'` — at the RF frontend output, before the cryostat
 - `'detector'` — at the cryogenic detector (default, full TX chain)
 
-This requires calibration values in the config file. See the [calibration guide](calibration.md) for details.
+This requires calibration values in the config file. For mixerless modules,
+put measured amp-enabled / bypassed S21 values under
+`rf_frontend.mixerless_module`; these can be scalars, frequency tables, or
+calibration filenames. See the [calibration guide](calibration.md) for details.
 
 ### Dynamic range optimisation
 

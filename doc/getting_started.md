@@ -306,7 +306,7 @@ Fields updated by `sync_config_from_system()`:
 - `firmware.defaults` — accumulator length, sync delay, RFDC parameters (VOP, Nyquist zone, mixer scales, QMC settings, DSA, DUC/DDC mixer frequencies)
 - `firmware.defaults.frequencies/amplitudes/phases` — current tone state
 - `rf_frontend.attenuator.tx_value_db` / `rx_value_db` — current attenuator settings
-- `rf_frontend.bypass_amps.tx_amp_bypass` / `rx_amp_bypass` and `tx_s21_db` / `rx_s21_db` — current amp bypass states and live S21 values (when the peripherals controller is available)
+- `rf_frontend.bypass_amps.tx_amp_bypass` / `rx_amp_bypass` — current amp bypass states. Measured mixerless-module S21 and P1dB calibration values live under `rf_frontend.mixerless_module`.
 - `cryostat.lna_bias` — current LNA bias setting for this pipeline when the controller is enabled
 
 ```python

@@ -952,6 +952,30 @@ def info_calibrations(r, config_dict):
     info['cryostat_input_s21_db'] = cryo.get('input_s21_db')
     info['cryostat_output_s21_db'] = cryo.get('output_s21_db')
 
+    mixerless = rf.get('mixerless_module', {}) or {}
+    for key in (
+        'tx_amp_enabled_s21_db', 'tx_amp_bypassed_s21_db',
+        'tx_amp_bypass_delta_s21_db',
+        'rx_amp_enabled_s21_db', 'rx_amp_bypassed_s21_db',
+        'rx_amp_bypass_delta_s21_db',
+        'tx_group_delay_ns', 'rx_group_delay_ns',
+    ):
+        raw = mixerless.get(key)
+        if freq_axis is not None and raw is not None:
+            try:
+                resolved = _resolve_cal_value(raw, freq_axis)
+                info[f'mixerless_module.{key}'] = (
+                    resolved.tolist() if hasattr(resolved, 'tolist') else resolved
+                )
+            except Exception:
+                info[f'mixerless_module.{key}'] = raw
+        else:
+            info[f'mixerless_module.{key}'] = raw
+    info['mixerless_module.tx_input_1db_comp_dbm'] = mixerless.get(
+        'tx_input_1db_comp_dbm')
+    info['mixerless_module.rx_input_1db_comp_dbm'] = mixerless.get(
+        'rx_input_1db_comp_dbm')
+
     return info
 
 
@@ -4582,6 +4606,150 @@ def _resolve_cal_value(value, freq_axis):
     return value
 
 
+def _resolve_optional_cal_value(value, freq_axis):
+    """Resolve a calibration parameter, preserving None as unavailable."""
+    if value is None:
+        return None
+    return _resolve_cal_value(value, freq_axis)
+
+
+def _mean_cal_value_db(value):
+    """Return a scalar dB value for control decisions."""
+    arr = np.asarray(value, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return float('nan')
+    return float(np.mean(finite))
+
+
+def _gather_bypass_amp_s21_for_state(config_dict, rf_peripherals, path,
+                                     freq_axis, bypassed):
+    """Return bypass-amp S21 for an explicit bypass state."""
+    rf_cfg = config_dict.get('rf_frontend', {}) or {}
+    mixerless_cfg = rf_cfg.get('mixerless_module', {}) or {}
+    direct_key = (
+        f'{path}_amp_bypassed_s21_db'
+        if bypassed else f'{path}_amp_enabled_s21_db'
+    )
+    direct = _resolve_optional_cal_value(mixerless_cfg.get(direct_key), freq_axis)
+    if direct is not None:
+        return direct
+
+    delta = _resolve_optional_cal_value(
+        mixerless_cfg.get(f'{path}_amp_bypass_delta_s21_db'), freq_axis)
+    if delta is not None:
+        enabled = _resolve_optional_cal_value(
+            mixerless_cfg.get(f'{path}_amp_enabled_s21_db'), freq_axis)
+        bypass_state = _resolve_optional_cal_value(
+            mixerless_cfg.get(f'{path}_amp_bypassed_s21_db'), freq_axis)
+        if bypassed and enabled is not None:
+            return enabled + delta
+        if not bypassed and bypass_state is not None:
+            return bypass_state - delta
+
+    bypass_cfg = config_dict.get('rf_frontend', {}).get('bypass_amps', {}) or {}
+    state_key = (
+        f'{path}_amp_bypassed_s21_db'
+        if bypassed else f'{path}_amp_enabled_s21_db'
+    )
+    measured = _resolve_optional_cal_value(bypass_cfg.get(state_key), freq_axis)
+    if measured is not None:
+        return measured
+
+    if not _rf_supports_bypass_amps(rf_peripherals):
+        measured = _resolve_optional_cal_value(
+            bypass_cfg.get(f'{path}_s21_db'), freq_axis)
+        return 0 if measured is None else measured
+
+    dev_name = 'transmit_atten' if path == 'tx' else 'recv_atten'
+    get_bypass = (
+        rf_peripherals.get_tx_amp_bypass if path == 'tx'
+        else rf_peripherals.get_rx_amp_bypass
+    )
+    set_bypass = (
+        rf_peripherals.set_tx_amp_bypass if path == 'tx'
+        else rf_peripherals.set_rx_amp_bypass
+    )
+    original_state = bool(get_bypass())
+    if original_state != bypassed:
+        set_bypass(bypassed)
+        time.sleep(0.1)
+    try:
+        return rf_peripherals._get_amp_s21(dev_name)
+    finally:
+        if bool(get_bypass()) != original_state:
+            set_bypass(original_state)
+            time.sleep(0.1)
+
+
+def _mixerless_amp_s21_state_configured(mixerless_cfg, path, bypassed):
+    """True when mixerless config can determine S21 for the requested state."""
+    direct_key = (
+        f'{path}_amp_bypassed_s21_db'
+        if bypassed else f'{path}_amp_enabled_s21_db'
+    )
+    if mixerless_cfg.get(direct_key) is not None:
+        return True
+    if mixerless_cfg.get(f'{path}_amp_bypass_delta_s21_db') is None:
+        return False
+    counterpart_key = (
+        f'{path}_amp_enabled_s21_db'
+        if bypassed else f'{path}_amp_bypassed_s21_db'
+    )
+    return mixerless_cfg.get(counterpart_key) is not None
+
+
+def _gather_bypass_amp_s21(config_dict, rf_peripherals, path, freq_axis):
+    """Return the bypass-amp S21 for TX/RX, preferring measured config.
+
+    For mixerless hardware, the submodule can model the amp-enabled and
+    bypassed S21 values.  Measured values are better for absolute power
+    calibration, so optional per-state config keys take priority:
+    ``tx_amp_enabled_s21_db`` / ``tx_amp_bypassed_s21_db`` and RX equivalents.
+
+    If ``bypass_amps.use_config_s21`` is true, the legacy ``tx_s21_db`` /
+    ``rx_s21_db`` key is also treated as the measured value for the current
+    state.  Otherwise the model is used as a fallback.
+    """
+    if path not in ('tx', 'rx'):
+        raise ValueError("path must be 'tx' or 'rx'")
+
+    if _rf_supports_bypass_amps(rf_peripherals):
+        get_bypass = (
+            rf_peripherals.get_tx_amp_bypass if path == 'tx'
+            else rf_peripherals.get_rx_amp_bypass
+        )
+        bypassed = bool(get_bypass())
+        state_value = _gather_bypass_amp_s21_for_state(
+            config_dict, rf_peripherals, path, freq_axis, bypassed)
+        state_key = (
+            f'{path}_amp_bypassed_s21_db'
+            if bypassed else f'{path}_amp_enabled_s21_db'
+        )
+        mixerless_cfg = (
+            config_dict.get('rf_frontend', {}).get('mixerless_module', {}) or {}
+        )
+        bypass_cfg = (
+            config_dict.get('rf_frontend', {}).get('bypass_amps', {}) or {}
+        )
+        if (_mixerless_amp_s21_state_configured(mixerless_cfg, path, bypassed)
+                or bypass_cfg.get(state_key) is not None):
+            return state_value
+
+        if bypass_cfg.get('use_config_s21', False):
+            measured = _resolve_optional_cal_value(
+                bypass_cfg.get(f'{path}_s21_db'), freq_axis)
+            if measured is not None:
+                return measured
+
+        return state_value
+
+    bypass_cfg = config_dict.get('rf_frontend', {}).get('bypass_amps', {}) or {}
+    measured = _resolve_optional_cal_value(
+        bypass_cfg.get(f'{path}_s21_db'), freq_axis)
+    return 0 if measured is None else measured
+
+
 def _gather_tx_chain_params(r, config_dict, rf_peripherals=None):
     """Read firmware state and resolve all TX chain calibration parameters.
 
@@ -4632,14 +4800,8 @@ def _gather_tx_chain_params(r, config_dict, rf_peripherals=None):
     tx_mixer_conversion_loss_db = _resolve_cal_value(config_dict['rf_frontend']['tx_mixer_conversion_loss_db'], analog_freq)
     tx_rf_s21_db = _resolve_cal_value(config_dict['rf_frontend']['tx_rf_s21_db'], rf_freq)
 
-    # TX bypass-amp S21: read live hardware state when available, else config.
-    if _rf_supports_bypass_amps(rf_peripherals):
-        tx_bypass_amp_s21_db = rf_peripherals._get_amp_s21('transmit_atten')
-    else:
-        tx_bypass_amp_s21_db = _resolve_cal_value(
-            config_dict['rf_frontend'].get('bypass_amps', {}).get('tx_s21_db', 0),
-            rf_freq,
-        )
+    tx_bypass_amp_s21_db = _gather_bypass_amp_s21(
+        config_dict, rf_peripherals, 'tx', rf_freq)
 
     cryostat_input_s21_db = _resolve_cal_value(config_dict['cryostat']['input_s21_db'], rf_freq)
 
@@ -7040,10 +7202,8 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
         rx_if_s21_db = config_dict['rf_frontend'].get('rx_if_s21_db', 0) or 0
         rx_mixer_conversion_loss_db = config_dict['rf_frontend'].get('rx_mixer_conversion_loss_db', 0) or 0
         rx_rf_s21_db = config_dict['rf_frontend'].get('rx_rf_s21_db', 0) or 0
-        if _rf_supports_bypass_amps(rf_peripherals):
-            rx_bypass_amp_s21_db = rf_peripherals._get_amp_s21('recv_atten')
-        else:
-            rx_bypass_amp_s21_db = config_dict['rf_frontend'].get('bypass_amps', {}).get('rx_s21_db', 0) or 0
+        rx_bypass_amp_s21_db = _gather_bypass_amp_s21(
+            config_dict, rf_peripherals, 'rx', freq_details['rx']['rf_input_freq'])
         cryostat_output_s21_db = config_dict['cryostat'].get('output_s21_db', 0) or 0
 
         if not p['rf_connected']:
@@ -7176,16 +7336,12 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
     s21_bypassed = 0.0
     if has_bypass_amps:
         current_bypass = rf_peripherals.get_tx_amp_bypass()
-        if current_bypass:
-            s21_bypassed = float(rf_peripherals._get_amp_s21('transmit_atten'))
-            rf_peripherals.set_tx_amp_bypass(False)
-            s21_enabled = float(rf_peripherals._get_amp_s21('transmit_atten'))
-            rf_peripherals.set_tx_amp_bypass(True)  # restore
-        else:
-            s21_enabled = float(rf_peripherals._get_amp_s21('transmit_atten'))
-            rf_peripherals.set_tx_amp_bypass(True)
-            s21_bypassed = float(rf_peripherals._get_amp_s21('transmit_atten'))
-            rf_peripherals.set_tx_amp_bypass(False)  # restore
+        s21_enabled = _mean_cal_value_db(_gather_bypass_amp_s21_for_state(
+            config_dict, rf_peripherals, 'tx',
+            p['freq_details']['tx']['rf_output_freq'], False))
+        s21_bypassed = _mean_cal_value_db(_gather_bypass_amp_s21_for_state(
+            config_dict, rf_peripherals, 'tx',
+            p['freq_details']['tx']['rf_output_freq'], True))
 
     if not optimise_dynamic_range:
         # Simple mode: just compute amplitudes with current settings

@@ -164,6 +164,12 @@ rf_frontend:
   mixerless_module:
     connected: true
     rf_channel: 0
+    tx_amp_enabled_s21_db: 20.0      # measured amp path, scalar/table/file
+    tx_amp_bypassed_s21_db: -2.0     # measured bypass path, scalar/table/file
+    rx_amp_enabled_s21_db: 20.0
+    rx_amp_bypassed_s21_db: -2.0
+    tx_input_1db_comp_dbm: 24.0      # measured/input-referred, if available
+    rx_input_1db_comp_dbm: -24.0
   attenuator:
     backend: "i2c"
     tx_value_db: 10.0           # applied on config push/startup
@@ -178,16 +184,16 @@ rf_frontend:
     enabled: true
     tx_amp_bypass: false
     rx_amp_bypass: false
-    tx_s21_db: 15.0             # desired/captured value; live value read from hardware
-    rx_s21_db: 15.0
 ```
 
 When `rf_frontend.connected: true`, `attenuator.tx_value_db`,
-`attenuator.rx_value_db`, `bypass_amps.tx_s21_db`, and
-`bypass_amps.rx_s21_db` are desired/captured config values. The
+`attenuator.rx_value_db`, and `bypass_amps.tx_amp_bypass` /
+`bypass_amps.rx_amp_bypass` are desired/captured config values. The
 `RFPeripheralController` keeps live attenuator and bypass-amp state separately
-and power calibration uses that live state at runtime. `pull_config()` returns
-the active config file only; call `sync_config_from_system()` if you want to
+and power calibration uses that live state at runtime. Absolute power
+calibration should use measured mixerless-module S21 values under
+`rf_frontend.mixerless_module`; unset values fall back to the component model.
+`pull_config()` returns the active config file only; call `sync_config_from_system()` if you want to
 capture the running state into a local config. See [RF Peripheral Control](#rf-peripheral-control) for full details and alternative attenuator backends.
 
 ---
@@ -285,13 +291,17 @@ When `rf_frontend.connected: true`, the following parameters contribute to the c
 | `tx_if_s21_db` | IF chain S21 (TX) | Gain +, loss - | Breadboard |
 | `tx_mixer_conversion_loss_db` | Mixer conversion loss (TX) | Positive = loss | Breadboard |
 | `tx_rf_s21_db` | RF chain S21 (TX) | Gain +, loss - | All |
-| `bypass_amps.tx_s21_db` | Bypass amplifier S21 (TX, desired/captured; live value read from hardware) | Gain + | Mixerless module |
+| `mixerless_module.tx_amp_enabled_s21_db` / `tx_amp_bypassed_s21_db` | Measured TX mixerless amp/bypass S21 contribution | Gain +, loss - | Mixerless module |
+| `mixerless_module.tx_amp_bypass_delta_s21_db` | Optional TX bypassed-minus-enabled S21 delta | dB delta | Mixerless module |
+| `mixerless_module.tx_input_1db_comp_dbm` | Optional measured input-referred TX 1 dB compression point | dBm | Mixerless module |
 | `rx_combiner_loss_db` | Combiner insertion loss (RX) | Negative (loss) | None (dual-DAC not supported) |
 | `attenuator.rx_value_db` | Attenuator setting (RX) | Positive = attenuation | Breadboard (fixed), Mixerless (programmable) |
 | `rx_if_s21_db` | IF chain S21 (RX) | Gain +, loss - | Breadboard |
 | `rx_mixer_conversion_loss_db` | Mixer conversion loss (RX) | Positive = loss | Breadboard |
 | `rx_rf_s21_db` | RF chain S21 (RX) | Gain +, loss - | All |
-| `bypass_amps.rx_s21_db` | Bypass amplifier S21 (RX, desired/captured; live value read from hardware) | Gain + | Mixerless module |
+| `mixerless_module.rx_amp_enabled_s21_db` / `rx_amp_bypassed_s21_db` | Measured RX mixerless amp/bypass S21 contribution | Gain +, loss - | Mixerless module |
+| `mixerless_module.rx_amp_bypass_delta_s21_db` | Optional RX bypassed-minus-enabled S21 delta | dB delta | Mixerless module |
+| `mixerless_module.rx_input_1db_comp_dbm` | Optional measured input-referred RX 1 dB compression point | dBm | Mixerless module |
 
 Each of these can be specified as a scalar, inline pairs, or a file path (same options as DAC calibration).
 
