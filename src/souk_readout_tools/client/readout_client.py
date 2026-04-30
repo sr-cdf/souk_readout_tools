@@ -23,7 +23,7 @@ Example general usage:
     In [3]: client.get_info(['server'])
     Out[3]:
     {'server':
-        {'process_name': 'readout_daemon',
+        {'process_name': 'readout_srv_0',
          'ip_addresses': '10.11.11.11 192.168.2.224',
          'pwd': '/home/casper/readout_server',
          ....}

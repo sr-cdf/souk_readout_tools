@@ -270,6 +270,7 @@ def extract_pipeline_id_from_config(config_file):
 USER_CONFIG_DIR = os.path.join(HOME, '.souk_readout_tools', 'pipeline_0', 'config')
 USER_CALIBRATIONS_DIR = os.path.join(HOME, '.souk_readout_tools', 'pipeline_0', 'calibrations')
 DEFAULT_CONFIG = os.path.join(USER_CONFIG_DIR, 'default_config.lnk')
+PROCESS_NAME_COMM_LIMIT = 15
 
 def check_if_running_on_rfsoc_arm():
     """
@@ -281,14 +282,38 @@ def check_if_running_on_rfsoc_arm():
         print('This script should only be run on the RFSoC ARM processor')
         raise RuntimeError('This script should only be run on the RFSoC ARM processor')
     
-def set_process_name():
+def set_process_name(pipeline_id=None):
     """
     Set the process name for the current process.
     Useful for identifying the process in the output of 'top' or 'ps caux'.
+
+    Linux task names shown by top/ps comm are limited to 15 visible bytes, so
+    keep the default short enough that the pipeline suffix is not truncated.
     """
     import os
     import ctypes
-    process_name = os.getenv('READOUT_SERVER_NAME', 'readout_server')
+    default_process_name = (
+        f'readout_srv_{pipeline_id}' if pipeline_id is not None else 'readout_server'
+    )
+    requested_process_name = os.getenv('READOUT_SERVER_NAME', default_process_name)
+    legacy_process_names = set()
+    if pipeline_id is not None:
+        legacy_process_names.update({
+            f'readout_daemon_{pipeline_id}',
+            f'readout_server_{pipeline_id}',
+        })
+    if requested_process_name in legacy_process_names:
+        requested_process_name = default_process_name
+    process_name = requested_process_name
+    if len(process_name.encode('utf-8')) > PROCESS_NAME_COMM_LIMIT:
+        process_name = (
+            process_name.encode('utf-8')[:PROCESS_NAME_COMM_LIMIT]
+            .decode('utf-8', errors='ignore')
+        )
+        print(
+            f"Warning: READOUT_SERVER_NAME '{requested_process_name}' exceeds "
+            f"{PROCESS_NAME_COMM_LIMIT} bytes; using '{process_name}' for top/ps."
+        )
     libc = ctypes.CDLL('libc.so.6')
     libc.prctl(15, ctypes.c_char_p(process_name.encode('utf-8')), 0, 0, 0)
     return process_name
@@ -342,7 +367,6 @@ class ReadoutServer:
         print('pipeline_id (hint):',pipeline_id)
         print('************************************************')
         check_if_running_on_rfsoc_arm()
-        self.process_name = set_process_name()
         self.ip_addresses = get_host_ips()
         self.server_start_unix_s = time.time()
         
@@ -379,6 +403,7 @@ class ReadoutServer:
         
         # Step 3: Extract pipeline_id FROM THE CONFIG (this is authoritative)
         self.pipeline_id = config.get('firmware', {}).get('pipeline_id', 0)
+        self.process_name = set_process_name(self.pipeline_id)
         
         # Warn if explicit pipeline_id was provided and differs from config
         if pipeline_id is not None and pipeline_id != self.pipeline_id:
