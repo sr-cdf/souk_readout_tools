@@ -21,6 +21,7 @@ SOUK Readout Tools is a Python package with tools for operating the MKID (Microw
 - [Retuning](#retuning)
 - [Power Calibration & Optimisation](#power-calibration--optimisation)
 - [Clock Source](#clock-source)
+- [Timing Status](#timing-status)
 - [Pre-Accumulator Snapshots](#pre-accumulator-snapshots)
 - [Plotting](#plotting)
 - [Resonator Analysis](#resonator-analysis)
@@ -76,6 +77,7 @@ Default ports: pipeline 0 uses 10000/20000, pipeline 1 uses 10001/20001.
 |--------|-------------|
 | `readout_client.py` | Client interface for remote control and data acquisition |
 | `readout_server.py` | Async TCP server running on the RFSoC ARM processor |
+| `timing.py` | Client helpers for the local RFSoC timing monitor |
 | `firmware_lib.py` | FPGA firmware interface: register access, tone management, sweeps |
 | `calibration.py` | RF power/amplitude calibration chain (DAC to detector) |
 | `peak_finder.py` | MKID resonance detection algorithms |
@@ -108,6 +110,14 @@ Verify the server is running:
 ```bash
 ssh casper@10.11.11.11
 sudo systemctl status readout_server_0
+```
+
+If timing services are installed on the RFSoC, they run separately from the
+readout server:
+
+```bash
+systemctl status ptp4l chrony timing-monitor
+souk-test-timing-monitor status
 ```
 
 ### Client
@@ -340,7 +350,8 @@ config only by an explicit sync/capture call.
 The `get_info()` method returns structured system information organised into named sections:
 
 ```python
-# Default sections (fast — server, versions, clock, fpga, rfdc, pipeline, tones, rf_frontend, lna)
+# Default sections (fast — server, versions, clock, timing, fpga, rfdc,
+# pipeline, tones, rf_frontend, lna)
 info = client.get_info()
 
 # Specific sections only; list input returns a list in the same order
@@ -363,9 +374,10 @@ For quick periodic monitoring, use `health_check()`:
 ```python
 health = client.health_check()
 # Returns compact pass/fail bools:
-#   initialisation_level, clock_locked, streaming, sweeping,
-#   adc_saturated, dac_saturated, dsp_overflow, rts_events,
-#   tone_count, client_count, rf_frontend_available, lna_available
+#   initialisation_level, clock_locked, timing_state, timing_ready,
+#   streaming, sweeping, adc_saturated, dac_saturated, dsp_overflow,
+#   rts_events, tone_count, client_count, rf_frontend_available,
+#   lna_available
 ```
 
 ---
@@ -662,7 +674,7 @@ To check whether the RFSoC is locked to the PTP grandmaster:
 ```python
 timing = client.get_info("timing")
 print(timing["summary"]["state"], timing["summary"]["ready_for_firmware_sync"])
-print(timing["ptp"]["healthy"], timing["chrony"]["source_type"])
+print(timing["ptp"].get("healthy"), timing["chrony"].get("source_type"))
 ```
 
 See [Timing and PTP](timing.md) for the RFSoC `ptp4l`, chrony, and timing-monitor setup.
@@ -1027,6 +1039,51 @@ Since this is a shared resource, both pipeline configs should specify the same `
 
 ---
 
+## Timing Status
+
+RFSoC wall-clock and firmware timestamp health are monitored by `ptp4l`,
+chrony, and `souk-timing-monitor`. The readout server exposes the monitor
+through the normal client API:
+
+```python
+timing = client.get_info("timing")
+summary = timing["summary"]
+
+print(summary["state"])
+print(summary["active_source_type"])
+print(summary["ready_for_firmware_sync"])
+```
+
+For compact periodic checks, `health_check()` includes the timing state:
+
+```python
+health = client.health_check()
+print(health["timing_state"], health["timing_ready"])
+```
+
+For lower-level debugging, request the raw monitor status:
+
+```python
+raw = client.get_timing_status()
+print(raw.get("ptp_port_state"), raw.get("chrony_source_type"))
+```
+
+Common states include `locked_to_gm`, `ptp_holdover`, `phc_free_run`,
+`ntp_synced`, `ntp_holdover`, `free_run`, `initializing`, and `unavailable`.
+`ready_for_firmware_sync` is true only when PTP is fresh, locked, and stable.
+
+On the RFSoC, local timing checks are available with:
+
+```bash
+souk-test-timing-monitor status
+souk-test-timing-monitor stream 10
+```
+
+See [timing.md](timing.md) for the `ptp4l`, chrony, timing-monitor, standalone
+monitoring, and firmware sync setup.
+
+---
+
 ## Pre-Accumulator Snapshots
 
 For high time-resolution data on a single tone, acquire snapshots from the pre-accumulator stage. Each snapshot contains 1024 complex samples at the FFT output rate (before accumulation), which is `acc_len` times faster than the normal sample rate:
@@ -1324,3 +1381,7 @@ Server-side commands (installed on the RFSoC):
 | `souk-readout-server` | Start the readout server (`-p` flag for pipeline ID) |
 | `souk-enable-daemon` | Enable the server as a systemd daemon |
 | `souk-disable-daemon` | Disable the server daemon |
+| `souk-restart-daemon` | Restart the server daemon |
+| `souk-enable-timing` | Install and restart the packaged `ptp4l`, chrony PHC, and timing-monitor setup |
+| `souk-timing-monitor` | Run the local PTP/NTP timing monitor |
+| `souk-test-timing-monitor` | Query or stream status from `/run/timing-monitor.sock` |

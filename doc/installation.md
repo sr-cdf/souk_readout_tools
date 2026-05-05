@@ -11,6 +11,7 @@ Detailed installation instructions for SOUK Readout Tools.
 - [Prerequisites](#prerequisites)
 - [Server Software Installation & Setup](#server-software-installation--setup)
   - [Writing the SD Card Image](#0-writing-the-sd-card-image)
+  - [Enable Timing Services](#7-enable-timing-services-recommended)
 - [Client Installation](#client-installation)
 - [Configuration Reference](#configuration-reference)
 - [Troubleshooting](#troubleshooting)
@@ -183,6 +184,9 @@ INSTALL_SERVER=true INSTALL_CLIENT=true pip install .
 Verify:
 ```bash
 souk-readout-server --help
+souk-enable-timing --help
+souk-timing-monitor --help
+souk-test-timing-monitor --help
 ```
 
 ### 4. Create Configuration Files
@@ -340,6 +344,55 @@ souk-disable-daemon -p 0                       # pipeline 0 only
 souk-disable-daemon -p 1                       # pipeline 1 only
 ```
 
+### 7. Enable Timing Services (Recommended)
+
+The readout server reports timing health through `get_info("timing")`, but the
+PTP/NTP timing stack runs as separate local services on the RFSoC:
+
+- `ptp4l` disciplines the `end0` PTP Hardware Clock from the grandmaster.
+- chrony disciplines Linux time from the PHC or NTP fallback.
+- `souk-timing-monitor` polls `ptp4l` and chrony and exposes status on
+  `/run/timing-monitor.sock`.
+
+Install the OS packages:
+
+```bash
+sudo apt install linuxptp chrony
+```
+
+Install the packaged SOUK timing config and restart the services:
+
+```bash
+souk-enable-timing
+```
+
+For the current lab software grandmaster only, use the PHC offset workaround:
+
+```bash
+souk-enable-timing --offset=-37
+```
+
+Do not use `--offset=-37` with a production grandmaster that serves UTC
+correctly.
+
+Check the timing services:
+
+```bash
+systemctl status ptp4l chrony timing-monitor
+souk-test-timing-monitor status
+souk-test-timing-monitor stream 10
+```
+
+For firmware timestamp sync, the `end0` TSU/PHC PPS strobe must also be
+enabled. At present this is provided by the `souk-firmware` helper:
+
+```bash
+sudo python3 ~/souk-firmware/software/rfsoc_scripts/ptp/run_strobe.py
+```
+
+See [timing.md](timing.md) for the full timing setup, standalone laptop
+monitoring, site checks, lab UTC offset notes, and firmware sync caveats.
+
 ---
 
 ## Client Installation
@@ -485,6 +538,7 @@ client = ReadoutClient(config_file='my_config.yaml')
 info = client.get_info()
 print(info['server']['initialisation_level'])  # should be 'pipeline'
 print(info['fpga'])                            # FPGA status and clock
+print(info['timing']['summary']['state'])      # PTP/PHC/NTP timing state
 print(info['tones']['count'])                  # number of active tones
 
 # Quick health check
