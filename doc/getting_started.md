@@ -343,8 +343,11 @@ The `get_info()` method returns structured system information organised into nam
 # Default sections (fast — server, versions, clock, fpga, rfdc, pipeline, tones, rf_frontend, lna)
 info = client.get_info()
 
-# Specific sections only
-info = client.get_info(['tones', 'rfdc'])
+# Specific sections only; list input returns a list in the same order
+tones, rfdc = client.get_info(['tones', 'rfdc'])
+
+# A single section name returns that section directly
+pipeline = client.get_info('pipeline')
 
 # Everything including diagnostics, config, calibrations
 info = client.get_info('all')
@@ -418,7 +421,7 @@ client.set_internal_loopback(True)
 These are also available in the `pipeline` section of `get_info()`:
 
 ```python
-pipeline = client.get_info(['pipeline'])['pipeline']
+pipeline = client.get_info('pipeline')
 print(pipeline['acc_len'], pipeline['psb_scale'], pipeline['internal_loopback'])
 ```
 
@@ -648,12 +651,22 @@ client.set_sample_rate(1000)
 
 ### Telescope Time (PTP Timestamp)
 
-The firmware reads PTP network time and attaches it to each accumulation. This 64-bit timestamp is included in every sample frame, sweep point, and stream packet. To read it on demand:
+The firmware attaches a 64-bit telescope timestamp to each accumulation. This timestamp is included in every sample frame, sweep point, and stream packet. To read it on demand:
 
 ```python
 tt = client.get_telescope_time()
 
 ```
+To check whether the RFSoC is locked to the PTP grandmaster:
+
+```python
+timing = client.get_info("timing")
+print(timing["summary"]["state"], timing["summary"]["ready_for_firmware_sync"])
+print(timing["ptp"]["healthy"], timing["chrony"]["source_type"])
+```
+
+See [Timing and PTP](timing.md) for the RFSoC `ptp4l`, chrony, and timing-monitor setup.
+
 The plotting tools can read the telescope time from the data:
 
 ```
@@ -1002,10 +1015,10 @@ firmware:
   clock_source: "external"
 ```
 
-Clock source and PLL lock status are available via `get_info(['clock'])`:
+Clock source and PLL lock status are available via `get_info('clock')`:
 
 ```python
-clock = client.get_info(['clock'])['clock']
+clock = client.get_info('clock')
 print(clock['source'])      # 'internal' or 'external'
 print(clock['all_locked'])  # True if all PLLs are locked
 ```

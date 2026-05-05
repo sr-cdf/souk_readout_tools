@@ -54,7 +54,7 @@ print(status)
 Clock source and lock status are also available via `get_info()`:
 
 ```python
-clock = client.get_info(['clock'])['clock']
+clock = client.get_info('clock')
 print(clock['source'])       # 'internal' or 'external'
 print(clock['all_locked'])   # True if all PLLs are locked
 print(clock['chips'])        # per-chip lock status

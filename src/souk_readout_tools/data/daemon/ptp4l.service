@@ -1,0 +1,16 @@
+[Unit]
+Description=Precision Time Protocol daemon for RFSoC PHC
+Documentation=man:ptp4l(8)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ptp4l -f /etc/linuxptp/ptp4l.conf -i end0 -s -m
+Restart=on-failure
+RestartSec=5
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+
+[Install]
+WantedBy=multi-user.target

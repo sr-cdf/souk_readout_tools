@@ -25,11 +25,11 @@ def main():
         else:
             print(bcolors.FAIL + 'Provide --config_file or --address (with --port).' + bcolors.ENDC)
             return
-        result = client.get_info(['server'])
+        result = client.get_info('server')
 
-        if isinstance(result, dict) and 'server' in result:
+        if isinstance(result, dict) and 'ip_addresses' in result:
             print(bcolors.OKGREEN+'Success'+bcolors.ENDC)
-            print(f"SOUK Readout Server running on {result['server']['ip_addresses']}")
+            print(f"SOUK Readout Server running on {result['ip_addresses']}")
         else:
             msg = result.get('message', 'Unknown error') if isinstance(result, dict) else result
             print(bcolors.FAIL + f'Failed: {msg}' + bcolors.ENDC)
@@ -43,5 +43,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

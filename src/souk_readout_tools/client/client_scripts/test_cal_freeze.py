@@ -25,7 +25,7 @@ process = start_stream_receiver()
 time.sleep(1.0)
 
 #enable streaming in the server if it is not already enabled
-if client.get_info(['server'])['server']['streaming']:
+if client.get_info('server')['streaming']:
     remember_to_disable_stream = False
 else:
     print("Enabling streaming")
@@ -119,4 +119,3 @@ plt.show()
 title =  f'Stream data and change tone frequency with cal freeze on and off'
 title += f'\nSample rate={client.get_sample_rate()} f0 = 1GHz f1 = 2GHz'
 plt.suptitle(title)
-

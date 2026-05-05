@@ -20,13 +20,12 @@ Example general usage:
 
     In [2]: client = readout_client.ReadoutClient()
 
-    In [3]: client.get_info(['server'])
+    In [3]: client.get_info('server')
     Out[3]:
-    {'server':
-        {'process_name': 'readout_srv_0',
-         'ip_addresses': '10.11.11.11 192.168.2.224',
-         'pwd': '/home/casper/readout_server',
-         ....}
+    {'process_name': 'readout_srv_0',
+     'ip_addresses': '10.11.11.11 192.168.2.224',
+     'pwd': '/home/casper/readout_server',
+     ....}
     }
 
     In [4]: client.get_sample_rate()
@@ -54,7 +53,7 @@ Example general usage:
 
 Author: Sam Rowe
 Date: July 2024
-Version: 1.1.0
+Version: 1.2.0
 
 """
 
@@ -274,14 +273,20 @@ class ReadoutClient:
             try:
                 s.connect((self.request_server_address, self.request_server_port))
             except socket.gaierror as e:
-                print(f"Error connecting to request server {(self.request_server_address,self.request_server_port)}: {e}")
-                return {'status': 'error', 'message': f"Error connecting to request server {(self.request_server_address,self.request_server_port)}: {e}"}
+                raise ConnectionError(
+                    f"Error connecting to request server "
+                    f"{(self.request_server_address, self.request_server_port)}: {e}"
+                ) from e
             except ConnectionRefusedError as e:
-                print(f"Connection refused, is the server running? {(self.request_server_address,self.request_server_port)}: {e}")
-                return {'status': 'error', 'message': f"Connection refused connecting to request server {(self.request_server_address,self.request_server_port)}: {e}"}
-            except:
-                print(f"Unhandled exception connecting to request server {(self.request_server_address,self.request_server_port)}: {sys.exc_info()[0]}")
-                return {'status': 'error', 'message': f"Error connecting to request server {(self.request_server_address,self.request_server_port)}: {sys.exc_info()[0]}"}
+                raise ConnectionError(
+                    f"Connection refused connecting to request server "
+                    f"{(self.request_server_address, self.request_server_port)}: {e}"
+                ) from e
+            except OSError as e:
+                raise ConnectionError(
+                    f"Error connecting to request server "
+                    f"{(self.request_server_address, self.request_server_port)}: {e}"
+                ) from e
             
             # Send message length + data
             message_data = json.dumps(message).encode()
@@ -563,18 +568,20 @@ class ReadoutClient:
 
         Parameters
         ----------
-        sections : list of str or ``'all'``, optional
+        sections : str, list of str, or ``'all'``, optional
             Which sections to include.  ``None`` returns the default set
-            (server, versions, clock, fpga, rfdc, pipeline, tones,
+            (server, versions, clock, timing, fpga, rfdc, pipeline, tones,
             rf_frontend, lna, rfsoc_sensors).  ``'all'`` includes
             diagnostics, config, calibrations, resonators, and registers
-            as well.
+            as well. A string returns that section directly. A list returns
+            a list of section dictionaries in the same order.
 
         Returns
         -------
-        dict
-            ``{section_name: section_dict, ...}`` where each section dict
-            contains a ``'ready'`` bool and section-specific keys.
+        dict or list
+            With ``None`` or ``'all'``, returns ``{section_name: section_dict}``.
+            With a single section string, returns that section dict. With a
+            list, returns a list of section dicts in the requested order.
         """
         message = {'request': 'get_info'}
         if sections is not None:
@@ -586,6 +593,15 @@ class ReadoutClient:
             print(f"Error getting info: {response.get('message', 'unknown error')}")
             return response
 
+    def get_timing_status(self):
+        """Return PTP/chrony timing status reported by the RFSoC monitor."""
+        response = self.send_request({'request': 'get_timing_status'})
+        if response['status'] == 'success':
+            return response['data']
+        else:
+            print(f"Error getting timing status: {response.get('message', 'unknown error')}")
+            return response
+
     def health_check(self):
         """Quick system health summary for intermittent polling.
 
@@ -593,8 +609,9 @@ class ReadoutClient:
         -------
         dict
             Compact health indicators including initialisation_level,
-            clock_locked, streaming/sweeping state, saturation/overflow
-            bools, tone_count, client_count, and resonator tracking status.
+            clock_locked, timing_state, timing_ready, streaming/sweeping
+            state, saturation/overflow bools, tone_count, client_count,
+            and resonator tracking status.
         """
         message = {'request': 'health_check'}
         response = self.send_request(message)
@@ -623,8 +640,12 @@ class ReadoutClient:
         if self.config is None:
             raise RuntimeError('No config loaded. Use pull_config() or load a config file first.')
 
-        info = self.get_info(['server', 'pipeline', 'rfdc', 'tones'])
-        if not isinstance(info, dict) or 'server' not in info:
+        sections = ['server', 'pipeline', 'rfdc', 'tones']
+        info_list = self.get_info(sections)
+        if not isinstance(info_list, list) or len(info_list) != len(sections):
+            raise RuntimeError(f'Failed to get info: {info_list}')
+        info = dict(zip(sections, info_list))
+        if 'server' not in info:
             raise RuntimeError(f'Failed to get info: {info}')
 
         pipeline = info.get('pipeline', {})
@@ -1655,7 +1676,7 @@ class ReadoutClient:
             print(f"Received {num_snapshots} snapshots in {t1-t0:.3f}s "
                   f"({num_snapshots/(t1-t0):.1f} snapshots/s)")
 
-        acc_len = self.get_info(['pipeline'])['pipeline']['acc_len']
+        acc_len = self.get_info('pipeline')['acc_len']
         accumulated_rate = self.get_sample_rate()
         snapshot_rate = accumulated_rate * acc_len
 
@@ -1716,7 +1737,7 @@ class ReadoutClient:
                     raise ValueError(
                         f"Tone index {idx} out of range (0 to {n_tones - 1})")
 
-        acc_len = self.get_info(['pipeline'])['pipeline']['acc_len']
+        acc_len = self.get_info('pipeline')['acc_len']
         accumulated_rate = self.get_sample_rate()
         snapshot_rate = accumulated_rate * acc_len
 
@@ -3166,7 +3187,11 @@ class ReadoutClient:
         if p != 0.0 and p != 1.0:
             raise RuntimeError(f'Sweep already in progress ({p*100:.3f}%), wait for it to finish.')
         
-        info = self.get_info(['fpga', 'rfdc'])
+        sections = ['fpga', 'rfdc']
+        info_list = self.get_info(sections)
+        if not isinstance(info_list, list) or len(info_list) != len(sections):
+            raise RuntimeError(f'Failed to get info: {info_list}')
+        info = dict(zip(sections, info_list))
 
         # Get RF frontend mixer configuration
         # TODO: if we have a frontend connected it might not have a mixer - needs updating.

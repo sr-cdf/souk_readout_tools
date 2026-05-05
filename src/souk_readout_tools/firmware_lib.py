@@ -34,6 +34,11 @@ class bcolors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
+
+def _firmware_log(message, source='general'):
+    print(f'firmware:{source}: {message}', flush=True)
+
+
 USER_DIR = os.path.expanduser('~/.souk_readout_tools/')
 FPGA_PROGRAM_LOCK = os.path.join(USER_DIR, '.fpga_program.lock')
 SHARED_INIT_LOCK = os.path.join(USER_DIR, '.shared_init.lock')
@@ -266,13 +271,11 @@ def create_fast_readout_interface(fw_config_file,pipeline_id=0):
         raise RuntimeError('souk_mkid_readout module not imported, cannot create readout interface')
     return r_fast
 
-def needs_programming(r,config_dict):
+def needs_programming(r,config_dict, verbose=False):
 
     if r is None:
-        print('************************************************')
-        print('needs_programming?')
-        print('yes, readout interface is None')
-        print('************************************************')
+        if verbose:
+            _firmware_log('programming required: readout interface is missing', source='ready')
         return True
 
     currentfpg = r.fpgfile
@@ -291,18 +294,17 @@ def needs_programming(r,config_dict):
     newfpg = os.path.basename(newfpg)
     currentfpg = os.path.basename(currentfpg)
 
-    print('************************************************')
-    print('needs_programming?')
-    print('current fpg:',currentfpg)
-    print('new fpg:',newfpg)
-    print('************************************************')
+    if verbose:
+        _firmware_log(f'programming check: current={currentfpg}, requested={newfpg}', source='ready')
 
     if not r.fpga.is_programmed():
-        print('yes, FPGA is not programmed')
+        if verbose:
+            _firmware_log('programming required: FPGA is not programmed', source='ready')
         return True
 
     if newfpg != currentfpg:
-        print('yes, current fpg is not the requested one')
+        if verbose:
+            _firmware_log('programming required: current FPG does not match config', source='ready')
         return True
 
     #if not hasattr(r, 'accumulators'):
@@ -310,65 +312,62 @@ def needs_programming(r,config_dict):
     #    print('yes, accumulators not found')
     #    return True
 
-    print('no')
+    if verbose:
+        _firmware_log('programming check: ready', source='ready')
     return False
 
-def needs_shared_resource_initialising(r, config_dict):
+def needs_shared_resource_initialising(r, config_dict, verbose=False):
     """
     True if shared resources need initialising.
 
     checks autocorr acc_len
       - r.autocorr.get_acc_len() == 0 => not initialised
     """
-    print('************************************************')
-    print('needs_shared_resource_initialising?')
-    print('************************************************')
-
     if r is None or not hasattr(r, "autocorr"):
-        print('yes, autocorr block missing (or interface is None)')
+        if verbose:
+            _firmware_log('shared resources require initialisation: autocorr block missing', source='ready')
         return True
 
     autocorr_acc_len = r.autocorr.get_acc_len()
     if autocorr_acc_len==0:
-        print('yes, autocorr acc_len is zero')
+        if verbose:
+            _firmware_log('shared resources require initialisation: autocorr acc_len is zero', source='ready')
         return True
 
-    print('no')
+    if verbose:
+        _firmware_log('shared resources check: ready', source='ready')
     return False
 
-def needs_pipeline_initialising(r, config_dict):
+def needs_pipeline_initialising(r, config_dict, verbose=False):
     """
     True if pipeline resources need initialising.
 
     checks pipeline accumulator acc_len
       - r.accumulators[0].get_acc_len() == 0 => not initialised
     """
-    print('************************************************')
-    print('needs_pipeline_initialising?')
-    print('************************************************')
-
     if r is None or not hasattr(r, "accumulators") or len(r.accumulators) == 0:
-        print('yes, accumulators missing (or interface is None)')
+        if verbose:
+            _firmware_log('pipeline resources require initialisation: accumulators missing', source='ready')
         return True
 
     acc_len = r.accumulators[0].get_acc_len()
     if acc_len == 0:
-        print('yes, pipeline acc_len is zero')
+        if verbose:
+            _firmware_log('pipeline resources require initialisation: accumulator acc_len is zero', source='ready')
         return True
 
-    print('no')
+    if verbose:
+        _firmware_log('pipeline resources check: ready', source='ready')
     return False
 
-def needs_initialising(r,config_dict):
+def needs_initialising(r,config_dict, verbose=False):
     """
     Deprecated function, use needs_shared_resource_initialising and needs_pipeline_initialising instead.
     """
-    print('************************************************')
-    print('needs_initialising?')
-    print(bcolors.FAIL+'This function is deprecated, use needs_shared_resource_initialising and needs_pipeline_initialising instead'+bcolors.ENDC)
-    print('************************************************')
-    needs_initialising_shared = needs_shared_resource_initialising(r, config_dict)
-    needs_initialising_pipeline = needs_pipeline_initialising(r, config_dict)
+    if verbose:
+        _firmware_log('needs_initialising is deprecated; use shared/pipeline checks instead', source='ready')
+    needs_initialising_shared = needs_shared_resource_initialising(r, config_dict, verbose=verbose)
+    needs_initialising_pipeline = needs_pipeline_initialising(r, config_dict, verbose=verbose)
     return needs_initialising_shared or needs_initialising_pipeline
 
 
@@ -399,7 +398,7 @@ def ensure_clocks_locked(config_dict, max_retries=1):
     """
     status = get_clock_status()
     if status.get('all_locked', False):
-        print(bcolors.OKGREEN + 'Clocks locked.' + bcolors.ENDC)
+        _firmware_log('clocks locked', source='clock')
         return status
 
     # Clocks not locked — attempt to re-apply clock source from config
@@ -410,15 +409,18 @@ def ensure_clocks_locked(config_dict, max_retries=1):
     current_clock = get_clock_source()
 
     for attempt in range(max_retries):
-        print(bcolors.WARNING + f'Clocks not locked (attempt {attempt + 1}/{max_retries}). '
-              f'Re-applying clock source: {desired_clock or current_clock}' + bcolors.ENDC)
+        _firmware_log(
+            f'clocks not locked (attempt {attempt + 1}/{max_retries}); '
+            f're-applying clock source: {desired_clock or current_clock}',
+            source='clock',
+        )
         try:
             status = set_clock_source(desired_clock or current_clock)
         except (ValueError, FileNotFoundError) as exc:
-            print(bcolors.FAIL + f'Failed to set clock source: {exc}' + bcolors.ENDC)
+            _firmware_log(f'failed to set clock source: {exc}', source='clock')
             continue
         if status.get('all_locked', False):
-            print(bcolors.OKGREEN + 'Clocks locked after re-init.' + bcolors.ENDC)
+            _firmware_log('clocks locked after re-init', source='clock')
             return status
 
     # Still not locked
@@ -443,7 +445,7 @@ def reload_firmware(config_dict):
 
     IMPORTANT: This and any second pipeline will need initialising. Do not initialise shared or pipeline resources here.
     """
-    print(bcolors.WARNING+'Reloading firmware: all shared/pipeline resources will need re-initialising'+bcolors.ENDC)
+    _firmware_log('reloading firmware; shared and pipeline resources will need reinitialising', source='program')
 
     # Ensure clocks are locked before programming the FPGA
     ensure_clocks_locked(config_dict)
@@ -456,16 +458,16 @@ def reload_firmware(config_dict):
     os.makedirs(os.path.dirname(FPGA_PROGRAM_LOCK), exist_ok=True)
     lock_fd = open(FPGA_PROGRAM_LOCK, 'w')
     try:
-        print(f'Acquiring FPGA programming lock ({FPGA_PROGRAM_LOCK}) ...')
+        _firmware_log(f'waiting for FPGA programming lock: {FPGA_PROGRAM_LOCK}', source='program')
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        print('FPGA programming lock acquired.')
+        _firmware_log('FPGA programming lock acquired', source='program')
 
         r = create_standard_readout_interface(fw_config_file,pipeline_id=pipeline_id)
         r_fast = create_fast_readout_interface(fw_config_file,pipeline_id=pipeline_id)
-        print("Deprogram")
+        _firmware_log('deprogramming FPGA', source='program')
         r.fpga.host.deprogram()
         time.sleep(1)
-        print("Program")
+        _firmware_log('programming FPGA', source='program')
         r.program()
         time.sleep(1)
         fw_type = r.fpga.get_firmware_type()
@@ -478,7 +480,7 @@ def reload_firmware(config_dict):
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()
-        print('FPGA programming lock released.')
+        _firmware_log('FPGA programming lock released', source='program')
 
     return r, r_fast
 
@@ -499,26 +501,27 @@ def initialise_shared_resources(r,config_dict):
     os.makedirs(os.path.dirname(SHARED_INIT_LOCK), exist_ok=True)
     lock_fd = open(SHARED_INIT_LOCK, 'w')
     try:
-        print(f'Acquiring shared resource init lock ({SHARED_INIT_LOCK}) ...')
+        _firmware_log(f'waiting for shared resource init lock: {SHARED_INIT_LOCK}', source='shared')
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        print('Shared resource init lock acquired.')
+        _firmware_log('shared resource init lock acquired', source='shared')
 
         # Re-check inside the lock: another pipeline may have already initialised.
         if not needs_shared_resource_initialising(r, config_dict):
-            print('Shared resources already initialised by another pipeline, skipping.')
+            _firmware_log('shared resources already initialised by another pipeline; skipping', source='shared')
             return
 
         #read from config
         ## no common block configurations in use right now
 
         #initialise and setup blocks
+        _firmware_log('initialising shared resources', source='shared')
         r.initialize_shared_blocks()
 
         #nothing to setup right now
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()
-        print('Shared resource init lock released.')
+        _firmware_log('shared resource init lock released', source='shared')
 
     return
 
@@ -593,6 +596,7 @@ def initialise_pipeline_resources(r,r_fast,config_dict):
     phases = tone_plan['phases']
 
     #initialise and setup blocks
+    _firmware_log(f'initialising pipeline resources for pipeline {pipeline_id}', source='pipeline')
     r.initialize_pipeline_blocks()
 
     r.output.use_psb()
@@ -7088,7 +7092,6 @@ def get_cal_freeze(r,config_dict):
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
     freeze = r.rfdc.core.get_cal_freeze(adc_tile,adc_block)
-    print('freeze',freeze)
     return bool(int(freeze['CalFrozen']))
 
 def refresh_adc_cal(r, config_dict, adc_cal_settle_time=2.0):

@@ -207,7 +207,7 @@ DONE - git info simplified to commit hash only from fixed paths (/home/casper/so
 
 1. With no signal applied (or loopback off), read RTS events:
    ```python
-   info = c.get_info(['rfdc'])
+   info = c.get_info('rfdc')
    print(info['rfdc']['rts_events'])
    ```
 2. [ x] All `rts_over_*` flags should be `False` in quiescent state
@@ -269,7 +269,7 @@ c2.pull_config(save_as='pulled_config.yaml')
 - [x] Creating a new client from the pulled config connects successfully:
   ```python
   c3 = ReadoutClient(config_file='pulled_config.yaml')
-  c3.get_info(['server'])
+  c3.get_info('server')
   ```
 
 DONE: souk-enable-daemon / souk-disable-daemon docs updated to not use sudo (they call sudo internally)

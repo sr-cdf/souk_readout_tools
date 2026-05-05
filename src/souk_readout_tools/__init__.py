@@ -11,6 +11,7 @@ _SUBMODULES = [
     "resonator",
     "fitting",
     "measurement",
+    "timing",
     "plotting",
 ]
 

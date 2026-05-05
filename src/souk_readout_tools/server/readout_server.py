@@ -18,7 +18,7 @@ Example usage:
     
 Author: Sam Rowe
 Date: July 2024
-Version: 1.1.0
+Version: 1.2.0
 
 """
 
@@ -42,6 +42,7 @@ import base64
 
 from importlib.resources import files as importlib_files
 from souk_readout_tools.config_utils import copy_template_config
+from souk_readout_tools.timing import get_timing_summary, get_timing_status
 import argparse
 
 import time
@@ -57,6 +58,30 @@ class bcolors:
     ENDC = '\033[0m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
+
+
+def _format_log_value(value):
+    if value is None:
+        return 'none'
+    if isinstance(value, bool):
+        return 'yes' if value else 'no'
+    return str(value)
+
+
+def _server_log(message, source='general'):
+    print(f'server:{source}: {message}', flush=True)
+
+
+def _server_log_fields(title, fields, source='general'):
+    _server_log(title, source=source)
+    for label, value in fields:
+        _server_log(f'  {label}: {_format_log_value(value)}', source=source)
+
+
+def _format_socket_name(sockname):
+    if isinstance(sockname, tuple) and len(sockname) >= 2:
+        return f'{sockname[0]}:{sockname[1]}'
+    return str(sockname)
 
 
 #STREAM FLAGS 
@@ -195,12 +220,29 @@ def _ensure_daemon_files(dirs, pipeline_id):
     Copy daemon files from package data into the user directory structure.
 
     - The pipeline-specific service file goes into the pipeline directory.
-    - The control scripts (install/remove) go into a top-level daemon/ directory.
+    - The control scripts and board-level service files go into a top-level
+      daemon/ directory.
+    - Timing config templates go into a top-level timing/ directory.
     """
     import shutil
 
     try:
         pkg_daemon_dir = importlib_files('souk_readout_tools').joinpath('data', 'daemon')
+
+        def copy_package_file(src, dst, mode):
+            src = str(src)
+            needs_copy = True
+            if os.path.exists(dst):
+                try:
+                    with open(src, 'rb') as src_fh, open(dst, 'rb') as dst_fh:
+                        needs_copy = src_fh.read() != dst_fh.read()
+                except OSError:
+                    needs_copy = True
+            if needs_copy:
+                shutil.copy2(src, dst)
+            os.chmod(dst, mode)
+            if SUDO:
+                os.chown(dst, TARGET_UID, TARGET_GID)
 
         # Copy the service file into the pipeline directory
         # Both pipelines use the same base filename within their own directory
@@ -223,13 +265,23 @@ def _ensure_daemon_files(dirs, pipeline_id):
             os.chown(daemon_dir, TARGET_UID, TARGET_GID)
 
         for script in ('install_systemd_service.sh', 'remove_systemd_service.sh',
-                       'restart_systemd_service.sh'):
+                       'restart_systemd_service.sh', 'install_timing_services.sh'):
             dst_script = os.path.join(daemon_dir, script)
-            if not os.path.exists(dst_script):
-                shutil.copy2(str(pkg_daemon_dir.joinpath(script)), dst_script)
-                os.chmod(dst_script, 0o775)
-                if SUDO:
-                    os.chown(dst_script, TARGET_UID, TARGET_GID)
+            copy_package_file(pkg_daemon_dir.joinpath(script), dst_script, 0o775)
+
+        for service in ('ptp4l.service', 'timing-monitor.service'):
+            dst_service = os.path.join(daemon_dir, service)
+            copy_package_file(pkg_daemon_dir.joinpath(service), dst_service, 0o664)
+
+        pkg_timing_dir = importlib_files('souk_readout_tools').joinpath('data', 'timing')
+        timing_dir = os.path.join(HOME, '.souk_readout_tools', 'timing')
+        os.makedirs(timing_dir, exist_ok=True)
+        if SUDO and os.path.exists(timing_dir):
+            os.chown(timing_dir, TARGET_UID, TARGET_GID)
+
+        for config_file in ('ptp4l.conf', 'ptp-phc.conf'):
+            dst_config = os.path.join(timing_dir, config_file)
+            copy_package_file(pkg_timing_dir.joinpath(config_file), dst_config, 0o664)
 
     except Exception as e:
         print(f"{bcolors.WARNING}Warning: Could not copy daemon files: {e}{bcolors.ENDC}")
@@ -361,11 +413,10 @@ class ReadoutServer:
                          (config file's pipeline_id takes precedence).
         """
         
-        print('************************************************')
-        print('__init__')
-        print('config_file:',config_file)
-        print('pipeline_id (hint):',pipeline_id)
-        print('************************************************')
+        _server_log_fields('starting readout server', [
+            ('config file', config_file or 'default'),
+            ('pipeline hint', pipeline_id if pipeline_id is not None else 'default'),
+        ], source='init')
         check_if_running_on_rfsoc_arm()
         self.ip_addresses = get_host_ips()
         self.server_start_unix_s = time.time()
@@ -377,7 +428,7 @@ class ReadoutServer:
             # Use the hint pipeline_id to find the default config
             hint_dirs = ensure_pipeline_dirs(initial_pipeline_id)
             config_file = hint_dirs['default_config']
-            print(f'Loading default config file from {config_file}')
+            _server_log(f'default config link: {config_file}', source='init')
         
         # Step 2: Load and parse config to get the authoritative pipeline_id
         # (We need to do this before setting up directories)
@@ -407,13 +458,21 @@ class ReadoutServer:
         
         # Warn if explicit pipeline_id was provided and differs from config
         if pipeline_id is not None and pipeline_id != self.pipeline_id:
-            print(f'{bcolors.FAIL}ERROR: Explicit pipeline_id ({pipeline_id}) differs from '
-                  f'config file pipeline_id ({self.pipeline_id}).{bcolors.ENDC}')
-            print(f'{bcolors.WARNING}Using config file pipeline_id={self.pipeline_id} '
-                  f'(this is what the firmware interfaces will use).{bcolors.ENDC}')
+            _server_log(
+                f'ERROR: explicit pipeline_id {pipeline_id} differs from '
+                f'config pipeline_id {self.pipeline_id}',
+                source='init',
+            )
+            _server_log(
+                f'using config pipeline_id={self.pipeline_id}; this is what '
+                f'the firmware interfaces use',
+                source='init',
+            )
         
-        print(f'Config file loaded: {resolved_config_file}')
-        print(f'Pipeline ID from config: {self.pipeline_id}')
+        _server_log_fields('config selected', [
+            ('config file', resolved_config_file),
+            ('pipeline', self.pipeline_id),
+        ], source='init')
         
         # Step 4: Now set up directories based on CONFIG's pipeline_id
         self.pipeline_dirs = ensure_pipeline_dirs(self.pipeline_id)
@@ -421,9 +480,10 @@ class ReadoutServer:
         self.user_calibrations_dir = self.pipeline_dirs['calibrations']
         self.default_config = self.pipeline_dirs['default_config']
 
-        print(f'Using pipeline {self.pipeline_id} directories:')
-        print(f'  config: {self.user_config_dir}')
-        print(f'  calibrations: {self.user_calibrations_dir}')
+        _server_log_fields(f'pipeline {self.pipeline_id} directories', [
+            ('config', self.user_config_dir),
+            ('calibrations', self.user_calibrations_dir),
+        ], source='init')
 
         #server attributes
         self.config = None
@@ -455,7 +515,7 @@ class ReadoutServer:
         self.init_server(resolved_config_file, ensure_ready=True, force_ready=False)
     
     
-    def ensure_ready(self, config_file=None, level="pipeline"):
+    def ensure_ready(self, config_file=None, level="pipeline", log_source='ready'):
         """
         Ensure the firmware is ready up to the requested init level.
 
@@ -471,7 +531,7 @@ class ReadoutServer:
         if level not in ("server", "firmware", "pipeline"):
             raise ValueError(f"Invalid ready level: {level}")
 
-        self.load_config(config_file)
+        self.load_config(config_file, log_source=log_source)
 
         #re-establish firmware interfaces in case they were initially created before programming
         fw_config_file = self.config['firmware']['fw_config_file']
@@ -592,12 +652,11 @@ class ReadoutServer:
 
         """
 
-        print('************************************************')
-        print('init_server')
-        print('config_file:',config_file)
-        print('ensure_ready:',ensure_ready)
-        print('force_ready:',force_ready)
-        print('************************************************')
+        _server_log_fields('initialising runtime', [
+            ('config file', config_file),
+            ('ensure ready', ensure_ready),
+            ('force ready', force_ready),
+        ], source='init')
 
         #server attributes
         self.config = None
@@ -622,7 +681,7 @@ class ReadoutServer:
         self.sweep_progress = 0.0
 
         #load config
-        self.load_config(config_file)
+        self.load_config(config_file, log_source='init')
         self.server_address = '0.0.0.0'
         self.request_server_port = self.config['rfsoc_host']['request_port']
         self.stream_server_port = self.config['rfsoc_host']['stream_port']
@@ -645,11 +704,14 @@ class ReadoutServer:
 
         if ensure_ready:
             try:
-                self.ensure_ready(level="pipeline")
+                self.ensure_ready(level="pipeline", log_source='init')
             except Exception as e:
-                print(bcolors.FAIL + f'ensure_ready failed: {e}' + bcolors.ENDC)
-                print(bcolors.WARNING + 'Server will remain at server init level. '
-                      'Use a client to diagnose and retry (ensure_ready / hard_reset).' + bcolors.ENDC)
+                _server_log(f'ensure_ready failed: {e}', source='init')
+                _server_log(
+                    'server remains at server init level; use a client to diagnose '
+                    'and retry (ensure_ready / hard_reset)',
+                    source='init',
+                )
 
         if force_ready:
             self.force_ready(level='pipeline')
@@ -660,53 +722,71 @@ class ReadoutServer:
             self.get_info()
             self.update_active_tone_indices()
         except Exception as e:
-            print(bcolors.WARNING+'Warning: could not get system information from firmware:',e,bcolors.ENDC)
-            print('Try hard reset')
+            _server_log(f'warning: could not get system information from firmware: {e}', source='init')
+            _server_log('try hard reset', source='init')
 
-        if firmware_lib.needs_programming(self.r,self.config):
-            print(bcolors.WARNING+'Warning: firmware needs programming'+bcolors.ENDC)
-        if firmware_lib.needs_shared_resource_initialising(self.r,self.config):
-            print(bcolors.WARNING+'Warning: shared resources need initialising'+bcolors.ENDC)
-        if firmware_lib.needs_pipeline_initialising(self.r,self.config):
-            print(bcolors.WARNING+'Warning: pipeline resources need initialising'+bcolors.ENDC)
+        firmware_needs_programming = firmware_lib.needs_programming(
+            self.r, self.config, verbose=True
+        )
+        shared_needs_initialising = firmware_lib.needs_shared_resource_initialising(
+            self.r, self.config, verbose=True
+        )
+        pipeline_needs_initialising = firmware_lib.needs_pipeline_initialising(
+            self.r, self.config, verbose=True
+        )
+
+        if firmware_needs_programming:
+            _server_log('warning: firmware needs programming', source='init')
+        if shared_needs_initialising:
+            _server_log('warning: shared resources need initialising', source='init')
+        if pipeline_needs_initialising:
+            _server_log('warning: pipeline resources need initialising', source='init')
 
         # initialise rf peripheral controller (attenuators, amp bypass)
         try:
             self.rf_peripherals = RFPeripheralController(self.config, self.pipeline_id)
         except Exception as e:
-            print(bcolors.WARNING+f'Warning: RF peripheral init failed: {e}'+bcolors.ENDC)
+            _server_log(f'warning: init failed: {e}', source='rf')
             self.rf_peripherals = None
 
         if self.rf_peripherals is not None and self.rf_peripherals.enabled:
-            colour = bcolors.OKGREEN if self.rf_peripherals.is_hardware else bcolors.WARNING
-            print(f'{colour}RF frontend initialised '
-                  f'({self.rf_peripherals.attenuator_backend}, '
-                  f'hardware_available={self.rf_peripherals.is_hardware}){bcolors.ENDC}')
+            _server_log(
+                f'frontend initialised: {self.rf_peripherals.attenuator_backend}, '
+                f'hardware={_format_log_value(self.rf_peripherals.is_hardware)}',
+                source='rf',
+            )
             if (self.rf_peripherals.is_hardware
                     or self.rf_peripherals.attenuator_backend == 'fixed'):
                 status = self.rf_peripherals.get_status()
-                tx_bypass = status.get('tx_amp_bypass', '—')
-                rx_bypass = status.get('rx_amp_bypass', '—')
-                print(f'  TX atten: {status["tx_attenuation_db"]:.1f} dB, '
-                      f'amp bypass: {tx_bypass}, '
-                      f'total gain: {status["tx_total_gain_db"]:.1f} dB')
-                print(f'  RX atten: {status["rx_attenuation_db"]:.1f} dB, '
-                      f'amp bypass: {rx_bypass}, '
-                      f'total gain: {status["rx_total_gain_db"]:.1f} dB')
+                tx_bypass = _format_log_value(status.get('tx_amp_bypass', 'unknown'))
+                rx_bypass = _format_log_value(status.get('rx_amp_bypass', 'unknown'))
+                _server_log(
+                    f'  TX: atten={status["tx_attenuation_db"]:.1f} dB, '
+                    f'amp_bypass={tx_bypass}, '
+                    f'total_gain={status["tx_total_gain_db"]:.1f} dB',
+                    source='rf',
+                )
+                _server_log(
+                    f'  RX: atten={status["rx_attenuation_db"]:.1f} dB, '
+                    f'amp_bypass={rx_bypass}, '
+                    f'total_gain={status["rx_total_gain_db"]:.1f} dB',
+                    source='rf',
+                )
 
         # initialise LNA bias controller
         try:
             self.lna_controller = LNABiasController(self.config, self.pipeline_id)
         except Exception as e:
-            print(bcolors.WARNING+f'Warning: LNA bias init failed: {e}'+bcolors.ENDC)
+            _server_log(f'warning: bias init failed: {e}', source='lna')
             self.lna_controller = None
 
         if self.lna_controller is not None and self.lna_controller.enabled:
-            colour = bcolors.OKGREEN if self.lna_controller.is_hardware else bcolors.WARNING
-            print(f'{colour}LNA bias controller initialised '
-                  f'({self.lna_controller.backend}, '
-                  f'channel {self.lna_controller.lna_channel}, '
-                  f'hardware_available={self.lna_controller.is_hardware}){bcolors.ENDC}')
+            _server_log(
+                f'bias controller initialised: {self.lna_controller.backend}, '
+                f'channel={self.lna_controller.lna_channel}, '
+                f'hardware={_format_log_value(self.lna_controller.is_hardware)}',
+                source='lna',
+            )
 
         return
    
@@ -716,13 +796,12 @@ class ReadoutServer:
         Reprogram firmware (optionally using config_file), then init shared fw resources.
         Does NOT implicitly also init pipeline unless you request ensure_ready("pipeline").
         """
-        print('************************************************')
-        print('init_firmware')
-        print('config_file:',config_file)
-        print('************************************************')
+        _server_log_fields('initialising firmware', [
+            ('config file', config_file),
+        ], source='firmware')
         
         if config_file is not None:
-            self.load_config(config_file)
+            self.load_config(config_file, log_source='firmware')
        
         self.force_ready(level="firmware")
 
@@ -735,13 +814,12 @@ class ReadoutServer:
         Does not force a reprogram unless needs_programming() says so.
         Does not force shared resource initialisation unless needs_shared_resource_initialising() says so.
         """
-        print('************************************************')
-        print('init_pipeline')
-        print('config_file:',config_file)
-        print('************************************************')
+        _server_log_fields('initialising pipeline', [
+            ('config file', config_file),
+        ], source='pipeline')
 
         if config_file is not None:
-            self.load_config(config_file)
+            self.load_config(config_file, log_source='pipeline')
             # rebuild interfaces in case pipeline_id / fw_config_file changed
             fw_config_file = self.config['firmware']['fw_config_file']
             pipeline_id = self.config['firmware']['pipeline_id']
@@ -750,7 +828,7 @@ class ReadoutServer:
 
         
         #ensure pipeline is ready
-        self.ensure_ready(level="pipeline")
+        self.ensure_ready(level="pipeline", log_source='pipeline')
     
         #force pipeline init
         firmware_lib.initialise_pipeline_resources(self.r, self.r_fast, self.config)
@@ -775,21 +853,21 @@ class ReadoutServer:
             return self.config_file
         if self.default_config and os.path.exists(self.default_config):
             if self.config_file:
-                print(bcolors.WARNING + f'Active config {self.config_file} no longer '
-                      f'exists, falling back to {self.default_config}' + bcolors.ENDC)
+                _server_log(
+                    f'active config {self.config_file} no longer exists; '
+                    f'falling back to {self.default_config}',
+                    source='config',
+                )
             return self.default_config
         return self.config_file
 
-    def load_config(self, config_file):
+    def load_config(self, config_file, log_source='config'):
         """
         Load a new configuration file.
         Does not reload or initialise the firmware.
         Uses pipeline-specific directories.
         """
-        print('************************************************')
-        print('load_config')
-        print('config_file:',config_file)
-        print('************************************************')
+        requested_config_file = config_file
         if config_file is None:
             config_file = self.default_config
         if not os.path.exists(config_file):
@@ -806,7 +884,13 @@ class ReadoutServer:
             #file is a link, try again using the link contents as the config file path
             with open(config_file,'r') as file:
                 config = yaml.safe_load(file)
-        print(f'Found config file: {config_file}')
+        if requested_config_file != config_file:
+            _server_log(
+                f'config loaded: {config_file} (requested {requested_config_file or "default"})',
+                source=log_source,
+            )
+        else:
+            _server_log(f'config loaded: {config_file}', source=log_source)
         self.config = config
         self.config_file = config_file
         with open(config_file, 'r') as file:
@@ -837,10 +921,9 @@ class ReadoutServer:
 
         Now also applies any modified config parameters in hardware.
         """
-        print('************************************************')
-        print('set_config')
-        print('config_filename:',config_filename)
-        print('************************************************')
+        _server_log_fields('applying config', [
+            ('config filename', config_filename),
+        ], source='config')
 
         filename = os.path.join(self.user_config_dir, os.path.basename(config_filename))
         with open( filename, 'w') as file:
@@ -850,19 +933,14 @@ class ReadoutServer:
         if SUDO:
             os.chown(filename,int(TARGET_UID),int(TARGET_GID))
 
-        print(f'Saved config to {filename}')
-        
-        print('************************************************')
-        print('set_config')
-        print('filename:',filename)
-        print('************************************************')
+        _server_log(f'saved config: {filename}', source='config')
 
 
         firmware_lib.apply_config(config_contents, self.r, self.r_fast, self.applied_config)
         self.applied_config = copy.deepcopy(config_contents)
         self.update_active_tone_indices()
 
-        self.ensure_ready(config_file=filename, level="pipeline")
+        self.ensure_ready(config_file=filename, level="pipeline", log_source='config')
 
         # Rebind/rebuild RF peripheral control after ensure_ready() reloads
         # self.config, then apply the requested RF settings to that live dict.
@@ -871,7 +949,7 @@ class ReadoutServer:
             if self.rf_peripherals.enabled:
                 self.rf_peripherals.apply_config(config_contents)
         except Exception as e:
-            print(bcolors.WARNING+f'Warning: RF peripheral re-init failed: {e}'+bcolors.ENDC)
+            _server_log(f'warning: re-init failed: {e}', source='rf')
             self.rf_peripherals = None
 
         try:
@@ -879,7 +957,7 @@ class ReadoutServer:
             if self.lna_controller.enabled:
                 self.lna_controller.apply_config(config_contents)
         except Exception as e:
-            print(bcolors.WARNING+f'Warning: LNA bias re-init failed: {e}'+bcolors.ENDC)
+            _server_log(f'warning: bias re-init failed: {e}', source='lna')
             self.lna_controller = None
 
         if default:
@@ -909,7 +987,7 @@ class ReadoutServer:
     # ------------------------------------------------------------------
 
     DEFAULT_INFO_SECTIONS = [
-        'server', 'versions', 'clock', 'fpga', 'rfdc',
+        'server', 'versions', 'clock', 'timing', 'fpga', 'rfdc',
         'pipeline', 'tones', 'rf_frontend', 'lna', 'rfsoc_sensors',
     ]
     ALL_INFO_SECTIONS = DEFAULT_INFO_SECTIONS + [
@@ -921,16 +999,19 @@ class ReadoutServer:
 
         Parameters
         ----------
-        sections : list of str or ``'all'``, optional
+        sections : str, list of str, or ``'all'``, optional
             Which sections to include.  ``None`` returns
             ``DEFAULT_INFO_SECTIONS`` (fast path — excludes diagnostics,
             config, calibrations, resonators, and registers).
             ``'all'`` returns every section including expensive ones.
+            A single section name returns that section dictionary directly.
+            A list returns a list of section dictionaries in the same order.
         """
         dispatchers = {
             'server':       self._info_server,
             'versions':     self._info_versions,
             'clock':        self._info_clock,
+            'timing':       self._info_timing,
             'fpga':         self._info_fpga,
             'rfdc':         self._info_rfdc,
             'pipeline':     self._info_pipeline,
@@ -945,10 +1026,22 @@ class ReadoutServer:
             'registers':    self._info_registers,
         }
         if sections is None:
-            sections = self.DEFAULT_INFO_SECTIONS
-        elif sections == 'all':
-            sections = self.ALL_INFO_SECTIONS
-        return {s: dispatchers[s]() for s in sections if s in dispatchers}
+            return {
+                s: dispatchers[s]()
+                for s in self.DEFAULT_INFO_SECTIONS
+                if s in dispatchers
+            }
+        if sections == 'all':
+            return {
+                s: dispatchers[s]()
+                for s in self.ALL_INFO_SECTIONS
+                if s in dispatchers
+            }
+        if isinstance(sections, str):
+            if sections not in dispatchers:
+                return {}
+            return dispatchers[sections]()
+        return [dispatchers[s]() for s in sections if s in dispatchers]
 
     def health_check(self):
         """Compact health summary for intermittent polling."""
@@ -968,6 +1061,7 @@ class ReadoutServer:
             init_level = 'not_programmed'
 
         clock = firmware_lib.get_clock_status()
+        timing = get_timing_status(timeout_s=0.2)
 
         # Diagnostics — only run if pipeline is ready
         adc_sat = dac_sat = dsp_ovf = False
@@ -1006,6 +1100,8 @@ class ReadoutServer:
         return {
             'initialisation_level': init_level,
             'clock_locked': clock.get('all_locked', False),
+            'timing_ready': timing.get('ready_for_firmware_sync', False),
+            'timing_state': timing.get('state'),
             'streaming': self.e_stream_enabled.is_set() and self.stream_task is not None and not self.stream_task.done(),
             'triggered_streaming': self.e_triggered_stream_enabled.is_set() and self.triggered_stream_task is not None and not self.triggered_stream_task.done(),
             'sweeping': self.sweep_task is not None and not self.sweep_task.done(),
@@ -1093,6 +1189,9 @@ class ReadoutServer:
 
     def _info_clock(self):
         return firmware_lib.info_clock()
+
+    def _info_timing(self):
+        return get_timing_summary(timeout_s=0.2)
 
     def _info_fpga(self):
         return firmware_lib.info_fpga(self.r)
@@ -1376,6 +1475,10 @@ class ReadoutServer:
 
                 elif request == 'health_check':
                     result = self.health_check()
+                    await self.send_response(writer, {'status': 'success', 'data': result})
+
+                elif request == 'get_timing_status':
+                    result = get_timing_status()
                     await self.send_response(writer, {'status': 'success', 'data': result})
 
                 elif request == 'get_blind_tones':
@@ -2962,8 +3065,16 @@ class ReadoutServer:
         request_server = await asyncio.start_server(self.handle_request_client, self.server_address, self.request_server_port)
         stream_server = await asyncio.start_server(self.handle_stream_client, self.server_address, self.stream_server_port)
         
-        print('Request server serving on', request_server.sockets[0].getsockname())
-        print('Stream server serving on', stream_server.sockets[0].getsockname())
+        _server_log(
+            f'request server listening on '
+            f'{_format_socket_name(request_server.sockets[0].getsockname())}',
+            source='network',
+        )
+        _server_log(
+            f'stream server listening on '
+            f'{_format_socket_name(stream_server.sockets[0].getsockname())}',
+            source='network',
+        )
         
         self.stream_task = asyncio.create_task(self.stream_data())
         self.triggered_stream_task = asyncio.create_task(self.triggered_stream())

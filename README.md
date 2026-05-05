@@ -54,6 +54,7 @@ Each `ReadoutServer` uses two TCP ports - a **request port** for JSON command/re
 - **Power management** - automatic TX/RX level optimisation with saturation detection, dynamic range management, and calibrated power control in dBm at any reference plane in the signal chain
 - **ADC calibration freeze** - freeze the RFSoC's internal ADC calibration during observations to eliminate drift noise, with periodic defrost for recalibration
 - **Clock source control** - select internal (12.8 MHz) or external (10 MHz) PL reference clock with PLL lock status monitoring
+- **PTP/NTP timing status** - packaged `ptp4l`, chrony, and timing-monitor service templates, plus `get_info("timing")` for checking GM lock, PHC/NTP source health, and firmware sync readiness
 - **Dual-pipeline support** - two independent pipelines per board with three-level initialisation (program FPGA → shared resources → per-pipeline resources) to prevent cross-pipeline disruption
 - **VACC multitone** (v7.9+) - multiple tones per FFT bin with automatic LO index management and sparse tone index handling
 - **Configuration sync** - YAML-based config with `push_config()`/`pull_config()` for client-server synchronisation, including automatic calibration file transfer
@@ -115,7 +116,7 @@ from souk_readout_tools.plotting import plot_timestream
 plot_timestream(data)
 ```
 
-For full installation details (including server setup, SD card imaging, and daemon configuration), see the [Installation Guide](doc/installation.md).
+For full installation details (including server setup, SD card imaging, and daemon configuration), see the [Installation Guide](doc/installation.md). For RFSoC timing setup, see [Timing and PTP](doc/timing.md).
 
 ## CLI Tools
 

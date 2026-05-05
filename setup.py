@@ -85,9 +85,12 @@ if install_client:
 if install_server:
     entry_points['console_scripts'].extend([
         'souk-readout-server=souk_readout_tools.server.readout_server:main',
+        'souk-timing-monitor=souk_readout_tools.server.timing_monitor:main',
+        'souk-test-timing-monitor=souk_readout_tools.server.server_scripts.souk_test_timing_monitor:main',
         'souk-enable-daemon=souk_readout_tools.server.server_scripts.souk_enable_daemon:main',
         'souk-disable-daemon=souk_readout_tools.server.server_scripts.souk_disable_daemon:main',
         'souk-restart-daemon=souk_readout_tools.server.server_scripts.souk_restart_daemon:main',
+        'souk-enable-timing=souk_readout_tools.server.server_scripts.souk_enable_timing:main',
         'souk-find-attenuators=souk_readout_tools.server.rf_peripherals:_cli_main',
         'souk-find-bypass-amps=souk_readout_tools.server.rf_peripherals:_cli_main_bypass_amps',
         'souk-find-lnas=souk_readout_tools.server.lna_controller:_cli_main',
@@ -96,7 +99,7 @@ if install_server:
 
 setup(
     name='souk_readout_tools',
-    version='1.1.1',
+    version='1.2.0',
     description='Tools for the SOUK readout',
     author='Sam Rowe',
     author_email='sam.rowe@astro.cf.ac.uk',
@@ -107,6 +110,11 @@ setup(
     package_data={'souk_readout_tools': [
         'mkid_finder_app.png',
         'mkid_finder_app.ico',
+        'data/readme',
+        'data/config/*',
+        'data/calibrations/*',
+        'data/daemon/*',
+        'data/timing/*',
         'server/souk-peripherals-control/*.py',
     ]},
     install_requires=install_requires,

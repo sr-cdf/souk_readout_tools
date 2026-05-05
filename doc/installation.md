@@ -137,6 +137,7 @@ The CASPER image includes the `souk_mkid_readout` firmware interface library fro
 The FPGA (programmable logic) does not require any manual setup. Three things happen automatically on the board:
 
 - **Clock configuration:** The PL clocks (LMK/LMX chips) are configured on boot by the `krc-utils` service. The default source is the on-board 12.8 MHz oscillator. To use an external 10 MHz reference, set `firmware.clock_source: "external"` in the config and push it, or use `client.set_clock_source('external')`. The server also verifies that clocks are locked before programming the FPGA. See [clock_source.md](clock_source.md) for details.
+- **PTP/NTP timing:** RFSoC wall-clock and telescope timestamp health are monitored separately by `ptp4l`, chrony, and `souk-timing-monitor`. See [timing.md](timing.md) for service installation, lab UTC offset caveats, and site checks.
 - **Device tree overlay:** The Xilinx device tree overlay is applied by Linux at boot to expose the PL peripherals to the PS operating system.
 - **Bitfile programming:** The FPGA bitfile is programmed automatically by the readout server when a client calls `ensure_ready()`. You should not need to program the FPGA manually.
 
@@ -492,7 +493,7 @@ print(client.health_check())
 # If RF peripherals are enabled in the config, verify hardware control:
 print(info['rf_frontend'])
 client.set_tx_attenuation(10.0)
-print(client.get_info(['rf_frontend'])['rf_frontend']['tx_attenuation_db'])  # should be 10.0
+print(client.get_info('rf_frontend')['tx_attenuation_db'])  # should be 10.0
 ```
 
 If `get_info()` returns successfully, the client-server link is working and the firmware is accessible.

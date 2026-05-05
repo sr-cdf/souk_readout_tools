@@ -88,7 +88,7 @@ rf_frontend:
 
 The attenuator keys in the config are desired startup/apply values. Runtime
 attenuator and bypass-amp values are kept separately by the server and are
-reported by `get_rf_peripheral_status()` / `get_info(['rf_frontend'])`.
+reported by `get_rf_peripheral_status()` / `get_info('rf_frontend')`.
 `pull_config()` returns the active config file only. Use
 `sync_config_from_system()` or `sync_config_to_local()` when you explicitly
 want to capture the current hardware state into a local config.
@@ -329,7 +329,7 @@ state directly from the `RFPeripheralController`; otherwise it falls back to
 the desired/fixed values in the config.
 
 The `tx_total_gain_db` / `rx_total_gain_db` values reported by
-`get_info(['rf_frontend'])` are model summaries from the peripheral
+`get_info('rf_frontend')` are model summaries from the peripheral
 controller.  Tone-power estimates do not use those summary values directly;
 they use the staged calibration chain (`attenuator.*_value_db`,
 `*_if_s21_db`, `*_mixer_conversion_loss_db`, `*_rf_s21_db`,

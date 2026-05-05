@@ -1,0 +1,17 @@
+[Unit]
+Description=SOUK Timing Status Monitor (PTP/NTP)
+Documentation=man:ptp4l(8) man:chronyd(8)
+After=ptp4l.service chrony.service network-online.target
+Wants=ptp4l.service chrony.service network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/casper/py3.12-venv/bin/souk-timing-monitor
+Restart=on-failure
+RestartSec=5
+User=root
+SyslogIdentifier=souk-timing-monitor
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

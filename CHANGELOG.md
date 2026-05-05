@@ -1,6 +1,70 @@
 # Changelog & Feature List
 
-## v1.1.1 (Current)
+## v1.2.0 (Current)
+
+**Get Info API**
+- `get_info()` now accepts a single section name, such as
+  `get_info("timing")`, and returns that section dictionary directly rather
+  than requiring callers to pass a one-item list. List requests still work and
+  `get_info(["section_a", "section_b"])` returns a list in the requested order.
+
+
+**RFSoC Timing and PTP**
+- Added a packaged `souk-timing-monitor` daemon that polls `ptp4l` via `pmc`
+  and chrony via `chronyc`, tracks timing state, and exposes JSON status on
+  `/run/timing-monitor.sock`.
+- Added packaged timing templates for `ptp4l.service`, `timing-monitor.service`,
+  `ptp4l.conf`, and the chrony PHC refclock drop-in.
+- Added `souk-enable-timing` to install and start the RFSoC timing services
+  from the packaged templates.
+- Added `souk-test-timing-monitor` as a small lab client for `status`, `ping`,
+  and streaming checks against the live timing-monitor socket.
+- Added `client.get_timing_status()` and a `timing` section in `get_info()`.
+  `health_check()` now includes `timing_state` and `timing_ready`.
+- `get_info("timing")` now presents a compact grouped user-facing view with
+  `summary`, `monitor`, `ptp`, `phc`, `ntp`, and `chrony` sections. The
+  summary is intended for regular health logs, while the detailed sections keep
+  concise parsed values plus raw `pmc`/`chronyc` command output for debugging.
+- Timing summaries now expose `ready_for_firmware_sync` as the gate for
+  firmware timestamp syncs.
+- Timing summaries now include the current and last-seen PTP grandmaster
+  identities, compact NTP source error values, and a rough
+  PTP-holdover-vs-NTP comparison for extended holdover decisions. The summary
+  and monitor sections also expose the holdover drift-rate and policy constants
+  used by that estimate.
+- `summary.system_synced` now means actively synchronised to a current external
+  source. It is false during PTP holdover; `chrony.synced` still reports
+  chrony's local `Leap status == Normal` view.
+- NTP source entries now include both the configured source name and the
+  resolved address where chrony exposes both, plus adjusted/measured offsets
+  and the measurement error bound.
+- Timing status now includes `ptp_data_fresh`, `ptp_ingress_time_ns`,
+  `ptp_seconds_since_ingress`, and `ptp_seconds_since_ingress_update`; stale
+  `gmPresent` and `master_offset` values are masked when
+  `TIME_STATUS_NP.ingress_time` shows no recent PTP ingress.
+- Timing status now stores raw `pmc` outputs and raw `chronyc tracking` /
+  `chronyc sources -v` outputs, while keeping parsed values only where the
+  monitor or summary needs them.
+- PTP holdover policy is configurable via `souk-timing-monitor` CLI options and
+  is reported in status as `ptp_holdover_window_s` and
+  `ptp_holdover_error_rate_ppm`. When this monitor has observed PTP lock and
+  chrony remains selected on `PHC0`, the monitor stays in `ptp_holdover` beyond
+  the nominal window and reports `ptp_holdover_expired`.
+- Revised monitor startup and stale-ingress handling: starting with no GM but
+  chrony selected on `PHC0` is now reported as `phc_free_run` until this monitor
+  has observed a PTP lock, and a non-zero `ingress_time` must keep advancing to
+  remain fresh.
+- If the monitor starts and neither PTP, PHC, nor NTP is selected yet, it now
+  reports `initializing` during a configurable startup grace period before
+  falling back to `free_run`.
+- The packaged chrony PHC refclock uses `prefer` but not `trust`, so NTP can
+  reject a free-running PHC if the board starts without a grandmaster and the
+  PHC epoch is wrong.
+- Added timing documentation and a site commissioning checklist. The packaged
+  chrony PHC refclock now defaults to `offset 0`; the lab-only `offset -37`
+  workaround can be installed with `souk-enable-timing --offset=-37`.
+
+## v1.1.1
 
 **Removed Deprecated APIs**
 - `get_system_information()` (client/server/`firmware_lib`) and

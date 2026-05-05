@@ -391,7 +391,7 @@ When the peripheral controller is enabled:
   controller when hardware is available, and `pull_config()` returns the active
   config file unchanged by runtime operations.
 - `set_tone_powers(optimise_dynamic_range=True)` adjusts the attenuator (and amp bypass if available) automatically only when the backend is controllable.
-- `get_info(['rf_frontend'])` reports the full RF frontend state including attenuators, bypass, gain, compression points, and updownconverter characterisation.
+- `get_info('rf_frontend')` reports the full RF frontend state including attenuators, bypass, gain, compression points, and updownconverter characterisation.
 - `get_rf_peripheral_status()` returns attenuator values, controllability, bypass state, total path gain, and 1 dB compression points.
 
 ### Client API
