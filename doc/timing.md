@@ -631,6 +631,40 @@ The SOUK firmware `telescope_time` counter must be explicitly synced to the
 timebase. The current v1.2 timing monitor provides the readiness gate; the
 multi-board coordinator that carries out the sync is still to be implemented.
 
+### PPS Source and Firmware Reset Release
+
+In this document, `PPS` means the one-pulse-per-second strobe generated from
+the Ethernet TSU/PHC associated with `end0`; it is not a separate external PPS
+input. The `end0` TSU counter is disciplined by `ptp4l` through the PHC. A TSU
+compare/strobe output is programmed so that when the TSU reaches an integer
+second boundary, the TSU emits a short pulse.
+
+That pulse is wired into the FPGA firmware. The firmware samples/latches it on
+the next FPGA fabric clock and stretches it internally for a short period so
+the sync logic can use it reliably.
+
+When software calls `r.sync.arm_sync()`, either locally or as one step in the
+future global sync coordinator, the firmware arms the sync/reset release logic.
+The firmware then waits for the TSU/PHC PPS strobe before releasing the system
+reset and allowing the DSP pipeline to run from the aligned edge.
+
+`r.sync.sw_sync()` can be used to inject a pulse to mimic the PPS strobe and
+release the reset when no PPS strobe is being produced. It is useful
+for local bring-up and non-PTP testing, but it is not a substitute for a
+PTP/PPS-aligned firmware sync.
+
+The TSU/PHC PPS strobe must be enabled before relying on `r.sync.arm_sync()`.
+At the time of writing this is done by a helper in `souk-firmware`:
+
+```bash
+sudo python3 ~/souk-firmware/software/rfsoc_scripts/ptp/run_strobe.py
+```
+
+The helper programs the GEM TSU compare registers and keeps updating the
+comparison second so a pulse is emitted at each new second boundary. This
+should eventually become a packaged service or be folded into the timing
+setup.
+
 The intended coordinator procedure is:
 
 1. Poll every participating board and pipeline with `client.get_info("timing")`.
@@ -642,17 +676,25 @@ The intended coordinator procedure is:
    `unavailable`.
 4. Choose a target PTP integer second far enough in the future for all control
    messages to arrive before the edge.
-5. Arm each SOUK firmware sync block.
+5. Ensure the TSU/PHC PPS strobe from `end0` is enabled and being received by
+   firmware on every participant.
 6. Load the target PTP integer second into each firmware sync interface.
-7. Wait for the target PPS edge so the firmware counter latches the requested
-   time.
-8. Read back firmware sync status and `telescope_time`.
-9. Log the target second, readback, and `summary` block from every participant.
+7. Call `r.sync.arm_sync()` on each participant so the firmware waits for the
+   TSU/PHC PPS strobe before releasing reset.
+8. Wait for the target integer-second PPS edge.
+9. Read back firmware sync status and `telescope_time`.
+10. Log the target second, readback, and `summary` block from every
+    participant.
 
-This is distinct from the existing local/software sync helpers such as
-`r.sync.arm_sync()` and `r.sync.sw_sync()`, which are useful for local firmware
-state changes but do not by themselves provide a global PTP/PPS-aligned sync
-across RFSoCs.
+There may be practical issues fitting all coordinator control messages into a
+single one-second interval. The target second must be far enough in the future
+that every board has loaded the requested time and armed `r.sync.arm_sync()`
+before the same PPS edge arrives. Operating system scheduling, Python runtime
+latency, TCP/network latency, or a slow participant could otherwise leave some
+boards armed for the intended PPS edge while others miss it and release on the
+following edge. The coordinator may therefore need further development to allow
+a minimum wait longer than one second, and to verify that all boards have armed
+successfully before committing to a shared target edge.
 
 ## Configuration Reference
 
