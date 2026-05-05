@@ -111,7 +111,9 @@ Install the OS tools first:
 sudo apt install linuxptp chrony ethtool netcat-openbsd
 ```
 
-Check the laptop interface name and whether it has a PTP Hardware Clock:
+Check the laptop interface name and whether it has a PTP Hardware Clock. The
+interface might be called `eth0`, `enp1s0`, `enx...`, or similar; on the RFSoC
+timing interface it is usually `end0`.
 
 ```bash
 ip link
@@ -119,10 +121,11 @@ sudo ethtool -T <iface>
 ```
 
 `ethtool -T` should list hardware transmit timestamps, hardware receive
-timestamps, and a hardware raw clock if PTP/PHC monitoring is expected to work.
-Many laptop Ethernet or USB Ethernet adapters do not provide a PHC. In that
-case the monitor is still useful for chrony/NTP state, but PTP fields will stay
-stale or unavailable.
+timestamps, and a hardware raw clock if the laptop is expected to follow the
+same PHC timing path as the RFSoC. Many laptop Ethernet or USB Ethernet
+adapters do not provide a PHC. In that case the laptop cannot track PTP time
+with the RFSoC's hardware-timestamp precision, but `ptp4l` can still be useful
+in software timestamp mode as a grandmaster visibility check.
 
 Start chrony:
 
@@ -130,11 +133,16 @@ Start chrony:
 sudo systemctl enable --now chrony
 ```
 
-If the machine has a PHC and should follow the SOUK PTP profile, install or
-adapt the packaged timing config from a source checkout:
+Install or adapt the packaged PTP config from a source checkout:
 
 ```bash
 sudo install -D -m 0644 src/souk_readout_tools/data/timing/ptp4l.conf /etc/linuxptp/ptp4l.conf
+```
+
+If the machine has a PHC and chrony should use it as `PHC0`, also install the
+chrony PHC drop-in:
+
+```bash
 sudo install -D -m 0644 src/souk_readout_tools/data/timing/ptp-phc.conf /etc/chrony/conf.d/ptp-phc.conf
 sudo systemctl restart chrony
 ```
@@ -146,11 +154,24 @@ normal UTC grandmaster keep `offset 0`, and only use `offset -37` for the
 specific lab software GM described above. If the laptop has no PHC, leave the
 PHC drop-in out and let chrony use normal NTP sources.
 
-Run `ptp4l` in the foreground on the chosen interface:
+With a PHC-capable interface, run `ptp4l` in the foreground on the chosen
+interface:
 
 ```bash
 sudo ptp4l -f /etc/linuxptp/ptp4l.conf -i <iface> -s -m
 ```
+
+Without a PHC, use software timestamps and keep `ptp4l` free-running so it can
+listen for/select a GM without trying to steer the system clock:
+
+```bash
+sudo ptp4l -f /etc/linuxptp/ptp4l.conf -i <iface> -s -m --time_stamping software --free_running 1
+```
+
+This no-PHC mode can show that a grandmaster is present and that the PTP domain,
+transport, delay mechanism, VLANs, and multicast path are plausible. It is not
+equivalent to the RFSoC hardware-timestamped PHC path, and it should not be
+used as evidence that firmware timestamp sync would be safe.
 
 In another terminal, run the monitor directly from the checkout:
 
