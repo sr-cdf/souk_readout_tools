@@ -138,6 +138,9 @@ For full installation details (including server setup, SD card imaging, and daem
 | `souk-enable-daemon` | Enable the server as a systemd service (`-p 0 1` for both pipelines) |
 | `souk-disable-daemon` | Disable the server systemd service(s) |
 | `souk-restart-daemon` | Restart the server systemd service(s) without reinstalling them |
+| `souk-enable-timing` | Install and restart the packaged `ptp4l`, chrony PHC, and timing-monitor setup |
+| `souk-timing-monitor` | Run the PTP/NTP timing monitor daemon |
+| `souk-test-timing-monitor` | Query or stream status from `/run/timing-monitor.sock` |
 | `souk-find-attenuators` | Discover RUDAT and SOUK mixerless-module attenuators (`--status` for live values) |
 | `souk-find-bypass-amps` | Discover SOUK mixerless-module bypass amplifiers (`--status` for bypass state) |
 | `souk-find-lnas` | Discover populated LNA bias monitors (`--status` for voltage/current readings) |
@@ -155,6 +158,8 @@ For full installation details (including server setup, SD card imaging, and daem
 | [LNA Bias](doc/lna_bias.md) | Cryostat LNA bias control, soft-off, and status monitoring |
 | [Dual Pipeline](doc/dual_pipeline.md) | Dual-pipeline setup, initialisation model, and multi-server operation |
 | [Clock Source](doc/clock_source.md) | PL reference clock selection (internal/external) and PLL status |
+| [Timing and PTP](doc/timing.md) | `ptp4l`, chrony, timing-monitor setup, standalone monitoring, and firmware-sync readiness |
+| [Timing Site Checklist](doc/timing_site_checklist.md) | Site commissioning checks for PTP GM, chrony, monitor state, and holdover behaviour |
 | [v7.9 Multitone Notes](doc/v79-multitone-notes.md) | VACC multitone design notes and constraints |
 | [Changelog](CHANGELOG.md) | Version history, feature list, and roadmap |
 
