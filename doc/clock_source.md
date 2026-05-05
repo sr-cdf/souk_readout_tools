@@ -30,6 +30,8 @@ Both configurations produce a 122.88 MHz output from the LMK, which feeds the th
 
 The clock source is set by pointing a symlink at one of the two LMK config files and running `krc-utils init` to apply it. The readout tools can do this automatically via the client API or the config file.
 
+> **Important:** Manual changes to the clock symlinks are not authoritative. Any later client call to `set_clock_source()` or config push that applies `firmware.clock_source` will overwrite the symlink selection with the requested `internal` or `external` clock source.
+
 ---
 
 ## Checking Clock Status
@@ -129,6 +131,8 @@ The clock source is applied unconditionally on every config push. Since this is 
 ### Manually on the RFSoC
 
 If you need to set the clock source without the readout tools (e.g. during initial board setup):
+
+> **Warning:** This manual symlink selection is temporary if the readout tools are used afterwards. Client calls to `set_clock_source()` and config pushes that apply `firmware.clock_source` will rewrite the symlink and replace any manual setting.
 
 **Select external 10 MHz reference:**
 
