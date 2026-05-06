@@ -277,6 +277,7 @@ class ReadoutClient:
 
     @staticmethod
     def _write_csv_info_metadata(writer, info):
+        """Write nested info metadata as comment rows in exported CSV files."""
         for section, section_data in info.items():
             if isinstance(section_data, dict):
                 for key, value in section_data.items():
@@ -284,7 +285,73 @@ class ReadoutClient:
             else:
                 writer.writerow([f'# {section}', ReadoutClient._csv_metadata_value(section_data)])
 
+    @staticmethod
+    def _sweep_csv_indices(field_names, prefix):
+        """Return and validate the numeric suffixes for one sweep CSV column family."""
+        column_prefix = f'{prefix}_'
+        indices = []
+        for name in field_names:
+            if name.startswith(column_prefix):
+                suffix = name[len(column_prefix):]
+                if suffix.isdigit():
+                    indices.append(int(suffix))
+
+        indices = sorted(indices)
+        if not indices:
+            raise ValueError(f"No {prefix}_NNNN columns found in sweep CSV.")
+        if indices != list(range(len(indices))):
+            raise ValueError(
+                f"Sweep CSV {prefix}_NNNN columns must be contiguous from 0000.")
+        return indices
+
+    @staticmethod
+    def _infer_sweep_csv_layout(sweep_dict, field_count, row_count):
+        """Infer whether a sweep CSV uses corrected tone columns or legacy point columns."""
+        marked_layout = sweep_dict.get('csv_layout')
+        if marked_layout is not None:
+            marked_layout = str(marked_layout).lower()
+            if marked_layout in ('tone_columns', 'point_columns'):
+                return marked_layout
+            raise ValueError(f"Invalid sweep CSV layout marker {marked_layout!r}.")
+
+        num_tones = int(sweep_dict['num_tones'])
+        num_points = int(sweep_dict['num_points'])
+        tone_columns_match = (field_count == num_tones and row_count == num_points)
+        point_columns_match = (field_count == num_points and row_count == num_tones)
+
+        if tone_columns_match and not point_columns_match:
+            return 'tone_columns'
+        if point_columns_match and not tone_columns_match:
+            return 'point_columns'
+        if tone_columns_match and point_columns_match:
+            # Unmarked square CSVs are ambiguous. Older exports had no marker,
+            # so preserve backward compatibility by treating them as legacy.
+            return 'point_columns'
+
+        # Old wideband CSVs were single-trace exports whose metadata still
+        # recorded the original multi-tone sweep dimensions.
+        if field_count == 1:
+            return 'point_columns'
+
+        raise ValueError(
+            "Sweep CSV dimensions do not match num_tones/num_points metadata.")
+
+    @staticmethod
+    def _read_sweep_csv_columns(data, sweep_indices, prefix, csv_layout,
+                                wideband_sweep=False):
+        """Load one sweep CSV column family into the internal sweep array shape."""
+        columns = np.array([
+            np.atleast_1d(data[f'{prefix}_{i:04d}'])
+            for i in sweep_indices
+        ])
+        if csv_layout == 'tone_columns':
+            columns = columns.T
+            if wideband_sweep and columns.shape[1] == 1:
+                columns = columns.T
+        return columns
+
     def send_request(self, message):
+        """Send a length-prefixed JSON request to the server and return its response."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.connect((self.request_server_address, self.request_server_port))
@@ -333,6 +400,7 @@ class ReadoutClient:
             return json.loads(response_data.decode())
 
     def _initialise_server(self,config_file=None):
+        """Ask the server process to initialise itself from a config file."""
         message = {'request': 'initialise_server','config_filename': config_file}
         response = self.send_request(message)
         if response['status'] == 'success':
@@ -341,6 +409,7 @@ class ReadoutClient:
         return response
 
     def _initialise_firmware(self,config_file=None):
+        """Program and initialise firmware resources for all pipelines."""
         print(bcolors.WARNING + 'Warning: initialize_firmware will reset all pipelines, other clients will be affected.' + bcolors.ENDC)
         message = {'request': 'initialise_firmware', 'config_filename': config_file}
         response = self.send_request(message)
@@ -349,6 +418,7 @@ class ReadoutClient:
         return response
     
     def _initialise_pipeline(self,config_file=None):
+        """Initialise only this client's configured readout pipeline."""
         message = {'request': 'initialise_pipeline', 'config_filename': config_file}
         response = self.send_request(message)
         if response['status'] == 'success':
@@ -356,6 +426,7 @@ class ReadoutClient:
         return response
 
     def ensure_ready(self, config_file=None, level="pipeline"):
+        """Ensure the server, firmware, or pipeline is ready before use."""
         message = {'request': 'ensure_ready', 'config_filename': config_file, 'level': level}
         response = self.send_request(message)
         if response['status'] == 'success':
@@ -544,6 +615,7 @@ class ReadoutClient:
 
 
     def push_calibration(self, calibration_file):
+        """Upload one local calibration file to the RFSoC server."""
         with open(calibration_file,'r') as file:
             cal = file.read()
         cal_filename=os.path.basename(calibration_file)
@@ -557,6 +629,7 @@ class ReadoutClient:
             return response
 
     def pull_calibration(self, remote_file, destination_file=None):
+        """Download one calibration file from the RFSoC server."""
         if destination_file is None:
             destination_file = os.path.join(self.config_dir, os.path.basename(remote_file))
         message = {'request':'pull_calibration',
@@ -571,11 +644,13 @@ class ReadoutClient:
             return response
 
     def hard_reset(self):
+        """Request a full firmware reset that affects all pipelines."""
         print(bcolors.WARNING + 'Warning: hard_reset will reset all pipelines, other clients will be affected.' + bcolors.ENDC)
         message = {'request':'hard_reset'}
         return self.send_request(message)
 
     def cancel_all_tasks(self):
+        """Cancel all currently running asynchronous server tasks."""
         message = {'request': 'cancel'}
         return self.send_request(message)
 
@@ -727,6 +802,7 @@ class ReadoutClient:
         split_blind = bool(blind_indices) and tones.get('metadata_matches_config', False)
 
         def _take(values, indices):
+            """Select indexed values while preserving None for unavailable state."""
             if values is None:
                 return None
             return [values[i] for i in indices]
@@ -817,6 +893,7 @@ class ReadoutClient:
         return self.sync_config_from_system(save_as=save_as)
 
     def set_parameter(self, param_name, param_value):
+        """Set a named server/firmware parameter."""
         message = {'request': 'set', 'param': param_name, 'value': param_value}
         response = self.send_request(message)
         if response['status'] == 'success':
@@ -826,6 +903,7 @@ class ReadoutClient:
             return response
 
     def get_parameter(self, param_name, **kwargs):
+        """Get a named server/firmware parameter, with optional request metadata."""
         message = {'request': 'get', 'param': param_name}
         message.update(kwargs)
         response = self.send_request(message)
@@ -836,19 +914,24 @@ class ReadoutClient:
             return response
 
     def set_sample_rate(self, sample_rate_hz):
+        """Set the accumulator sample rate in Hz."""
         return self.set_parameter('sample_rate_hz',sample_rate_hz)
 
     def get_sample_rate(self):
+        """Return the accumulator sample rate in Hz."""
         return self.get_parameter('sample_rate_hz')
 
     def get_telescope_time(self):
+        """Return the latest telescope timestamp reported by the server."""
         return self.get_parameter('telescope_time')
 
     def set_tone_frequencies(self, tone_frequencies):
+        """Set active tone frequencies in Hz."""
         tone_frequencies = np.atleast_1d(tone_frequencies).tolist()
         return self.set_parameter('tone_frequencies',tone_frequencies)
 
     def get_tone_frequencies(self,detailed_output=False):
+        """Return active tone frequencies, optionally with detailed metadata."""
         if detailed_output:
             return self.get_parameter('tone_frequencies_detailed')
         else:
@@ -859,14 +942,17 @@ class ReadoutClient:
         return self.get_parameter('tone_metadata')
 
     def get_blind_tone_indices(self):
+        """Return integer indices of tones marked as blind monitors."""
         metadata = self.get_tone_metadata()
         return np.asarray(metadata.get('blind_indices', []), dtype=int)
 
     def get_regular_tone_indices(self):
+        """Return integer indices of tones marked as regular readout tones."""
         metadata = self.get_tone_metadata()
         return np.asarray(metadata.get('regular_indices', []), dtype=int)
 
     def _update_tone_defaults_from_blind_result(self, result):
+        """Patch local config defaults from a blind-tone server operation result."""
         defaults_update = result.get('config_defaults') if isinstance(result, dict) else None
         if defaults_update is None or self.config is None:
             return
@@ -929,17 +1015,21 @@ class ReadoutClient:
         return response
 
     def set_tone_amplitudes(self, tone_amplitudes):
+        """Set per-tone amplitude scale factors."""
         tone_amplitudes = np.atleast_1d(tone_amplitudes).tolist()
         return self.set_parameter('tone_amplitudes',tone_amplitudes)
 
     def get_tone_amplitudes(self):
+        """Return per-tone amplitude scale factors."""
         return np.atleast_1d(self.get_parameter('tone_amplitudes'))
 
     def set_tone_phases(self, tone_phases):
+        """Set per-tone phase offsets in radians."""
         tone_phases = np.atleast_1d(tone_phases).tolist()
         return self.set_parameter('tone_phases',tone_phases)
 
     def get_tone_phases(self):
+        """Return per-tone phase offsets in radians."""
         return np.atleast_1d(self.get_parameter('tone_phases'))
 
     def _warn_zero_phases(self):
@@ -1105,14 +1195,17 @@ class ReadoutClient:
             return np.atleast_1d(self.get_parameter('tone_powers', reference_plane=reference_plane))
 
     def check_input_saturation(self,iterations=250):
+        """Check whether the ADC/input path is saturating."""
         message = {'request': 'check_input_saturation','iterations':iterations}
         return self.send_request(message)
 
     def check_output_saturation(self,iterations=250):
+        """Check whether the DAC/output path is saturating."""
         message = {'request': 'check_output_saturation','iterations':iterations}
         return self.send_request(message)
 
     def check_dsp_overflow(self,duration_s=0.2):
+        """Check whether DSP overflow flags occur during a short interval."""
         message = {'request': 'check_dsp_overflow','duration_s':duration_s}
         return self.send_request(message)
     
@@ -1155,23 +1248,29 @@ class ReadoutClient:
         return self.send_request(msg)
 
     def maximise_rx_power(self, headroom_db=1.0):
+        """Maximise RX chain power while retaining the requested headroom."""
         return self.send_request({'request': 'maximise_rx_power', 'headroom_db': headroom_db})
 
     def optimise_tx_snr(self, reference_plane='detector', headroom_db=2.0):
+        """Optimise TX settings for SNR at the requested reference plane."""
         return self.send_request({'request': 'optimise_tx_snr',
                                   'reference_plane': reference_plane,
                                   'headroom_db': headroom_db})
 
     def optimise_rx_snr(self):
+        """Optimise RX settings for SNR."""
         return self.send_request({'request': 'optimise_rx_snr'})
 
     def fix_dac_saturation(self):
+        """Ask the server to reduce or reconfigure output drive to clear DAC saturation."""
         return self.send_request({'request': 'fix_dac_saturation'})
     
     def fix_adc_saturation(self):
+        """Ask the server to reduce or reconfigure input gain to clear ADC saturation."""
         return self.send_request({'request': 'fix_adc_saturation'})
 
     def fix_dsp_overflow(self, duration_s=0.5, max_iterations=10):
+        """Ask the server to adjust DSP settings until overflow clears."""
         return self.send_request({'request': 'fix_dsp_overflow',
                                   'duration_s': duration_s,
                                   'max_iterations': max_iterations})
@@ -1179,30 +1278,39 @@ class ReadoutClient:
     # -- RF peripheral (attenuator / amp bypass) control --
 
     def get_rf_peripheral_status(self):
+        """Return status for configured RF attenuator and amplifier-bypass hardware."""
         return self.send_request({'request': 'get_rf_peripheral_status'})
 
     def set_tx_attenuation(self, value_db):
+        """Set TX attenuation in dB."""
         return self.send_request({'request': 'set_tx_attenuation', 'value': float(value_db)})
 
     def get_tx_attenuation(self):
+        """Return current TX attenuation in dB."""
         return self.send_request({'request': 'get_tx_attenuation'})
 
     def set_rx_attenuation(self, value_db):
+        """Set RX attenuation in dB."""
         return self.send_request({'request': 'set_rx_attenuation', 'value': float(value_db)})
 
     def get_rx_attenuation(self):
+        """Return current RX attenuation in dB."""
         return self.send_request({'request': 'get_rx_attenuation'})
 
     def set_tx_amp_bypass(self, bypass=True):
+        """Enable or disable the TX amplifier bypass path."""
         return self.send_request({'request': 'set_tx_amp_bypass', 'bypass': bool(bypass)})
 
     def get_tx_amp_bypass(self):
+        """Return whether the TX amplifier bypass path is enabled."""
         return self.send_request({'request': 'get_tx_amp_bypass'})
 
     def set_rx_amp_bypass(self, bypass=True):
+        """Enable or disable the RX amplifier bypass path."""
         return self.send_request({'request': 'set_rx_amp_bypass', 'bypass': bool(bypass)})
 
     def get_rx_amp_bypass(self):
+        """Return whether the RX amplifier bypass path is enabled."""
         return self.send_request({'request': 'get_rx_amp_bypass'})
 
     # --- LNA bias control ---
@@ -1314,31 +1422,38 @@ class ReadoutClient:
         return self.send_request({'request': 'soft_off_lna_bias_all'})
 
     def enable_stream(self):
+        """Enable continuous sample streaming on the server."""
         self._warn_zero_phases()
         message = {'request': 'enable_stream'}
         return self.send_request(message)
 
     def disable_stream(self):
+        """Disable continuous sample streaming on the server."""
         message = {'request': 'disable_stream'}
         return self.send_request(message)
 
     def enable_triggered_stream(self):
+        """Enable triggered sample streaming on the server."""
         self._warn_zero_phases()
         message = {'request': 'enable_triggered_stream'}
         return self.send_request(message)
 
     def disable_triggered_stream(self):
+        """Disable triggered sample streaming on the server."""
         message = {'request': 'disable_triggered_stream'}
         return self.send_request(message)
 
     def send_fake_trigger(self):
+        """Send a software trigger for testing triggered streaming."""
         message = {'request': 'send_fake_trigger'}
         return self.send_request(message)
 
     def get_cal_freeze(self):
+        """Return whether ADC calibration is currently frozen."""
         return self.get_parameter('cal_freeze')
 
     def set_cal_freeze(self,freeze):
+        """Freeze or unfreeze ADC calibration."""
         return self.set_parameter('cal_freeze',freeze)
 
     def refresh_adc_cal(self, adc_cal_settle_time=2.0):
@@ -1503,6 +1618,7 @@ class ReadoutClient:
 
     @staticmethod
     def export_samples(filename, sample_data, num_tones_to_save=None,file_format=None):
+        """Export raw or parsed sample captures to npy, json, or CSV."""
         filepath, file_format = ReadoutClient._resolve_export_path(
             filename, file_format, ('npy', 'json', 'csv'))
 
@@ -1570,6 +1686,7 @@ class ReadoutClient:
 
     @staticmethod
     def import_samples(filename):
+        """Import sample captures previously written by ``export_samples``."""
         data_dict={}
         if filename.endswith('.npy'):
             data_dict = np.load(filename,allow_pickle=True).item()
@@ -2148,6 +2265,7 @@ class ReadoutClient:
         return self.send_request(message)
 
     def get_sweep_progress(self):
+        """Return current sweep progress as a float from 0.0 to 1.0."""
         message = {'request': 'get_sweep_progress'}
         response = self.send_request(message)
         if response['status'] == 'success':
@@ -2188,6 +2306,7 @@ class ReadoutClient:
             time.sleep(poll_interval)
 
     def get_sweep_data(self):
+        """Fetch the latest averaged sweep data from the server."""
         message = {'request': 'get_sweep_data'}
         response = self.send_request(message)
         if response['status'] == 'success':
@@ -2198,6 +2317,7 @@ class ReadoutClient:
             return response
 
     def get_sweep_raw_samples(self):
+        """Fetch unaveraged per-sample sweep data as a complex array."""
         message = {'request': 'get_sweep_raw_samples'}
         response = self.send_request(message)
         if response['status'] == 'success':
@@ -2214,6 +2334,7 @@ class ReadoutClient:
             return response
 
     def get_sweep_txt(self):
+        """Fetch the server's plain-text representation of the latest sweep."""
         message = {'request': 'get_sweep_txt'}
         response = self.send_request(message)
         if response['status'] == 'success':
@@ -2321,6 +2442,13 @@ class ReadoutClient:
 
     @staticmethod
     def export_sweep(filename, sweep_data, file_format=None):
+        """Export parsed or raw sweep data to npy, json, or CSV.
+
+        CSV exports use tone-numbered column groups: ``sweep_f_0000`` is
+        tone/trace zero, and each data row is one sweep point.  Wideband sweeps
+        are stored as a single trace so importing them preserves the
+        ``(1, N_total_points)`` shape used by plotting and analysis helpers.
+        """
         filepath, file_format = ReadoutClient._resolve_export_path(
             filename, file_format, ('npy', 'json', 'csv', 'dirfile', 'hdf5'), default='npy')
 
@@ -2354,28 +2482,52 @@ class ReadoutClient:
                 json.dump(json_data_dict, file, indent=4)
 
         elif file_format == 'csv':
+            sweep_f = np.atleast_2d(np.asarray(sweep_dict['sweep_f']))
+            sweep_i = np.atleast_2d(np.asarray(sweep_dict['sweep_i']))
+            sweep_q = np.atleast_2d(np.asarray(sweep_dict['sweep_q']))
+            sweep_ei = np.atleast_2d(np.asarray(sweep_dict['sweep_ei']))
+            sweep_eq = np.atleast_2d(np.asarray(sweep_dict['sweep_eq']))
+            if not (sweep_f.shape == sweep_i.shape == sweep_q.shape
+                    == sweep_ei.shape == sweep_eq.shape):
+                raise ValueError("Sweep arrays must all have the same shape.")
+
             with open(filepath, mode='w', newline='') as file:
                 writer = csv.writer(file)
                 writer.writerow(['# date', sweep_dict['date']])
                 writer.writerow(['# num_tones', sweep_dict['num_tones']])
                 writer.writerow(['# num_points', sweep_dict['num_points']])
                 writer.writerow(['# samples_per_point', sweep_dict['samples_per_point']])
+                writer.writerow(['# csv_layout', 'tone_columns'])
+                if 'wideband_sweep' in sweep_dict:
+                    writer.writerow(['# wideband_sweep', sweep_dict['wideband_sweep']])
                 ReadoutClient._write_csv_info_metadata(writer, sweep_dict['info'])
                 if 'telescope_time' in sweep_dict:
                     writer.writerow(['# telescope_time_per_point'] + [int(t) for t in sweep_dict['telescope_time']])
+
+                if sweep_dict.get('wideband_sweep', False) and sweep_f.shape[0] == 1:
+                    sweep_f = sweep_f.T
+                    sweep_i = sweep_i.T
+                    sweep_q = sweep_q.T
+                    sweep_ei = sweep_ei.T
+                    sweep_eq = sweep_eq.T
+
+                num_csv_points, num_csv_tones = sweep_f.shape
+
                 header = []
-                for k in range(len(sweep_dict['sweep_f'])):
-                    header.extend([f'sweep_f_{k:04d}', f'sweep_i_{k:04d}', f'sweep_q_{k:04d}', f'err_i_{k:04d}', f'err_q_{k:04d}'])
+                for tone in range(num_csv_tones):
+                    header.extend([f'sweep_f_{tone:04d}', f'sweep_i_{tone:04d}',
+                                   f'sweep_q_{tone:04d}', f'err_i_{tone:04d}',
+                                   f'err_q_{tone:04d}'])
                 writer.writerow(header)
-                for j in range(len(sweep_dict['sweep_f'][0])):
+                for point in range(num_csv_points):
                     row = []
-                    for i in range(len(sweep_dict['sweep_f'])):
+                    for tone in range(num_csv_tones):
                         row.extend([
-                            f'{sweep_dict["sweep_f"][i][j]}',
-                            f'{sweep_dict["sweep_i"][i][j]}',
-                            f'{sweep_dict["sweep_q"][i][j]}',
-                            f'{sweep_dict["sweep_ei"][i][j]}',
-                            f'{sweep_dict["sweep_eq"][i][j]}'
+                            f'{sweep_f[point][tone]}',
+                            f'{sweep_i[point][tone]}',
+                            f'{sweep_q[point][tone]}',
+                            f'{sweep_ei[point][tone]}',
+                            f'{sweep_eq[point][tone]}'
                         ])
                     writer.writerow(row)
 
@@ -2388,6 +2540,13 @@ class ReadoutClient:
 
     @staticmethod
     def import_sweep(filename):
+        """Import sweep data from npy, json, or CSV.
+
+        CSV imports accept both the corrected tone-column layout and the legacy
+        point-column layout.  New CSVs include a ``csv_layout`` marker; older
+        files are inferred from the number of data rows and numbered column
+        groups in the header.
+        """
         sweep_dict={}
         if filename.endswith('.npy'):
             sweep_dict = np.load(filename,allow_pickle=True).item()
@@ -2429,24 +2588,39 @@ class ReadoutClient:
                         sweep_dict[key] = value
 
             data = np.genfromtxt(filename, delimiter=',',names=True,skip_header=header_lines)
-            num_tones = sweep_dict['num_tones']
-            num_points = sweep_dict['num_points']
+            field_names = data.dtype.names
+            sweep_indices = ReadoutClient._sweep_csv_indices(field_names, 'sweep_f')
+            for prefix in ('sweep_i', 'sweep_q', 'err_i', 'err_q'):
+                if ReadoutClient._sweep_csv_indices(field_names, prefix) != sweep_indices:
+                    raise ValueError(
+                        f"Sweep CSV {prefix}_NNNN columns do not match sweep_f_NNNN.")
+
+            first_column = np.atleast_1d(data[f'sweep_f_{sweep_indices[0]:04d}'])
+            csv_layout = ReadoutClient._infer_sweep_csv_layout(
+                sweep_dict, len(sweep_indices), len(first_column))
             #samples_per_point = sweep_dict['samples_per_point']
-            
-            sweep_f = np.array([data[f'sweep_f_{i:04d}'] for i in range(num_tones)])
-            sweep_i = np.array([data[f'sweep_i_{i:04d}'] for i in range(num_tones)])
-            sweep_q = np.array([data[f'sweep_q_{i:04d}'] for i in range(num_tones)])
-            err_i = np.array([data[f'err_i_{i:04d}'] for i in range(num_tones)])
-            err_q = np.array([data[f'err_q_{i:04d}'] for i in range(num_tones)])
+
+            wideband_sweep = sweep_dict.get('wideband_sweep', False)
+            sweep_f = ReadoutClient._read_sweep_csv_columns(
+                data, sweep_indices, 'sweep_f', csv_layout, wideband_sweep)
+            sweep_i = ReadoutClient._read_sweep_csv_columns(
+                data, sweep_indices, 'sweep_i', csv_layout, wideband_sweep)
+            sweep_q = ReadoutClient._read_sweep_csv_columns(
+                data, sweep_indices, 'sweep_q', csv_layout, wideband_sweep)
+            err_i = ReadoutClient._read_sweep_csv_columns(
+                data, sweep_indices, 'err_i', csv_layout, wideband_sweep)
+            err_q = ReadoutClient._read_sweep_csv_columns(
+                data, sweep_indices, 'err_q', csv_layout, wideband_sweep)
             sweep_dict['sweep_f'] = sweep_f
             sweep_dict['sweep_i'] = sweep_i
             sweep_dict['sweep_q'] = sweep_q
             sweep_dict['sweep_ei'] = err_i
             sweep_dict['sweep_eq'] = err_q
+            sweep_dict['csv_layout'] = csv_layout
 
         elif filename.endswith('.hdf5'):
             raise NotImplementedError("hdf5 format not yet implemented.")
-        elif os.path.endswith('.dirfile'):
+        elif filename.endswith('.dirfile'):
             raise NotImplementedError("dirfile format not yet implemented.")
         else:
             raise ValueError(f"Invalid file format {filename.split('.')[-1]}")
@@ -2455,6 +2629,7 @@ class ReadoutClient:
 
 
     def receive_stream(self, num_tones=None, filename=None, print_data=False):
+        """Receive continuous stream frames from the stream socket and write them to disk."""
         iq_data=None
         if filename is None:
             filename = os.path.join(os.getcwd(), 'tmp_stream')
@@ -2551,6 +2726,7 @@ class ReadoutClient:
 
 
     def receive_triggered_stream(self, num_tones=None, filename=None, print_data=False):
+        """Receive triggered stream frames from the stream socket and write them to disk."""
         if filename is None:
             filename = os.path.join(os.getcwd(), 'tmp_triggered_stream')
             print(f"No filename specified, writing to {filename}")
@@ -2698,6 +2874,7 @@ class ReadoutClient:
 
     @staticmethod
     def export_stream_data(filename,data_dict,file_format=None):
+        """Export parsed stream data to npy, json, or CSV."""
         filepath, file_format = ReadoutClient._resolve_export_path(
             filename, file_format, ('npy', 'json', 'csv'), default='npy')
 
@@ -2771,6 +2948,7 @@ class ReadoutClient:
 
     @staticmethod
     def import_stream_data(filename):
+        """Import stream data previously written by ``export_stream_data``."""
         data_dict={}
         if filename.endswith('.npy'):
             data_dict = np.load(filename,allow_pickle=True).item()
@@ -2926,6 +3104,7 @@ class ReadoutClient:
             raise ValueError('No blind-tone candidates in requested band')
 
         def min_distance_to(values, points):
+            """Return each candidate's distance to the nearest excluded point."""
             if len(points) == 0:
                 return np.full(len(values), np.inf)
             return np.min(np.abs(values[:, None] - points[None, :]), axis=1)
