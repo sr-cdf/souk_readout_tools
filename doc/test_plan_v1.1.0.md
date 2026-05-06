@@ -45,9 +45,13 @@ git submodule init && git submodule update
 ```bash
 souk-readout-server --help
 souk-enable-daemon --help
+souk-enable-daemons --help
 souk-disable-daemon --help
+souk-disable-daemons --help
+souk-restart-daemon --help
+souk-restart-daemons --help
 ```
-- [x] All three commands are registered and print help text
+- [x] Server commands are registered and print help text
 
 ### 0.4  Client entry points (on client machine)
 
@@ -134,13 +138,17 @@ ls -la ~/.souk_readout_tools/
 ### 0.8  Systemd daemon setup
 
 ```bash
-souk-enable-daemon
+souk-enable-daemons
 systemctl cat readout_server_0
+systemctl cat readout_server_1
 ```
-- [x] Service installs without errors
+- [x] Services install without errors
 - [x] `ExecStart` path is `/home/casper/py3.12-venv/bin/souk-readout-server -p 0`
+- [x] Pipeline 1 service uses `/home/casper/py3.12-venv/bin/souk-readout-server -p 1`
 - [x] `sudo systemctl start readout_server_0` starts the server
+- [x] `sudo systemctl start readout_server_1` starts the pipeline 1 server
 - [x] `sudo journalctl -xu readout_server_0` shows server log output
+- [x] `sudo journalctl -xu readout_server_1` shows pipeline 1 server log output
 
 ### 0.9  RUDAT USB attenuator discovery (if devices connected)
 
@@ -272,7 +280,7 @@ c2.pull_config(save_as='pulled_config.yaml')
   c3.get_info('server')
   ```
 
-DONE: souk-enable-daemon / souk-disable-daemon docs updated to not use sudo (they call sudo internally)
+DONE: souk-enable-daemon(s) / souk-disable-daemon(s) docs updated to not use sudo (they call sudo internally)
 
 
 ### 1.6  Single pre-accumulator snapshot

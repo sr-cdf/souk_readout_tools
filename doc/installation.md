@@ -128,7 +128,7 @@ picocom -b 115200 /dev/ttyUSB1
 
 The default Python environment on the board is `/home/casper/py3.12-venv/` and the bash shell should activate this virtual environment automatically on login, as indicated by the `(py3.12-venv) casper@host:~$` prompt. All server-side `python` and `pip install` commands should use this environment.
 
-Note that the server requires root access for `/dev/mem` (FPGA register access). However, `sudo` does not inherit the virtual environment, so `sudo souk-readout-server ...` will fail with a "command not found" error. Use full paths to virtualenv binary instead: `sudo /home/casper/py3.12-venv/bin/souk-readout-server ...`. The systemd daemon handles this automatically (see [Enable the Daemon](#6-enable-the-daemon-recommended)).
+Note that the server requires root access for `/dev/mem` (FPGA register access). However, `sudo` does not inherit the virtual environment, so `sudo souk-readout-server ...` will fail with a "command not found" error. Use full paths to virtualenv binary instead: `sudo /home/casper/py3.12-venv/bin/souk-readout-server ...`. The systemd daemons handle this automatically (see [Enable the Daemons](#6-enable-the-daemons-recommended)).
 
 The CASPER image includes the `souk_mkid_readout` firmware interface library from the `souk-firmware` repository. If you need to update it (e.g. after a firmware upgrade), follow the instructions at https://github.com/realtimeradio/souk-firmware.
 
@@ -224,7 +224,9 @@ This creates `~/.souk_readout_tools/` with the correct directory structure, temp
 ~/.souk_readout_tools/
 ├── daemon/
 │   ├── install_systemd_service.sh
-│   └── remove_systemd_service.sh
+│   ├── remove_systemd_service.sh
+│   ├── restart_systemd_service.sh
+│   └── install_timing_services.sh
 ├── pipeline_0/
 │   ├── config/
 │   │   ├── template_config.yaml
@@ -316,14 +318,14 @@ The FPGA will be programmed automatically when a client calls `ensure_ready()`. 
 To run the servers as systemd services that start on boot and auto-restart on crash:
 
 ```bash
-souk-enable-daemon -p 0 1
+souk-enable-daemons
 ```
 
 This enables both pipelines. To enable a single pipeline, use `souk-enable-daemon -p 0` or `souk-enable-daemon -p 1`.
 
 These commands call `sudo` internally and will prompt for a password if needed.
 
-If these commands arent recognised, ensure the python environment is activated and the package is installed correctly. The `souk-enable-daemon` script should be available in the virtual environment's `bin` directory.
+If these commands arent recognised, ensure the python environment is activated and the package is installed correctly. The `souk-enable-daemons` and `souk-enable-daemon` scripts should be available in the virtual environment's `bin` directory.
 
 Check status:
 ```bash
@@ -338,9 +340,16 @@ sudo journalctl -f -xu readout_server_1                      # pipeline 1 only
 sudo journalctl -f -xu readout_server_0 -u readout_server_1  # both pipelines
 ```
 
+Restart:
+```bash
+souk-restart-daemons                          # both pipelines
+souk-restart-daemon -p 0                      # pipeline 0 only
+souk-restart-daemon -p 1                      # pipeline 1 only
+```
+
 Disable:
 ```bash
-souk-disable-daemon -p 0 1                     # both pipelines
+souk-disable-daemons                           # both pipelines
 souk-disable-daemon -p 0                       # pipeline 0 only
 souk-disable-daemon -p 1                       # pipeline 1 only
 ```
@@ -626,7 +635,7 @@ The same format and specification options apply to `dac1_dbfs_to_dbm` and `adc_d
 ConnectionRefusedError: [Errno 111] Connection refused
 ```
 
-- Check that the server is running on the RFSoC (`ps aux | grep readout` or `sudo systemctl status readout_server`)
+- Check that the server is running on the RFSoC (`ps aux | grep readout` or `sudo systemctl status readout_server_0 readout_server_1`)
 - Verify the IP address and port in your config file match the server
 - Check firewall settings on both machines
 - Try `souk-connection-test -C path/to/config.yaml` for a quick diagnostic
@@ -706,7 +715,7 @@ ModuleNotFoundError: No module named 'souk_mkid_readout'
 
 #### Server crashes on startup
 
-- Check the journal for error messages: `sudo journalctl -xu readout_server`
+- Check the journal for error messages: `sudo journalctl -xu readout_server_0 -u readout_server_1`
 - Verify that no other server instance is using the same ports
 - Ensure the config YAML is valid (no syntax errors)
 
@@ -745,7 +754,7 @@ cd /home/casper/souk_readout_tools
 git pull
 git submodule update
 sudo /home/casper/py3.12-venv/bin/pip install .
-sudo systemctl restart readout_server  # if running as daemon
+souk-restart-daemons  # if running as daemons
 ```
 
 ---
@@ -761,6 +770,6 @@ pip uninstall souk_readout_tools
 ### Server
 
 ```bash
-souk-disable-daemon  # if running as daemon
+souk-disable-daemons  # if running as daemons
 sudo /home/casper/py3.12-venv/bin/pip uninstall souk_readout_tools
 ```

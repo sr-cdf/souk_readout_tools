@@ -301,8 +301,7 @@ When you push/apply a config to one server instance:
 ## TBD / future improvements
 
 - Provide helper scripts to:
-  - start/stop/restart both servers together,
   - check both server statuses,
   - run `ensure_ready()` on both pipelines in a single command ?
 
-Note: systemd dual-pipeline support is now implemented. Use `souk-enable-daemon -p 0 1` to enable both pipelines as separate services (`readout_server_0` and `readout_server_1`).
+Note: systemd dual-pipeline support is now implemented. Use `souk-enable-daemons`, `souk-disable-daemons`, and `souk-restart-daemons` to manage both pipelines as separate services (`readout_server_0` and `readout_server_1`).

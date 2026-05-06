@@ -1383,9 +1383,12 @@ Server-side commands (installed on the RFSoC):
 | Command | Description |
 |---------|-------------|
 | `souk-readout-server` | Start the readout server (`-p` flag for pipeline ID) |
-| `souk-enable-daemon` | Enable the server as a systemd daemon |
-| `souk-disable-daemon` | Disable the server daemon |
-| `souk-restart-daemon` | Restart the server daemon |
+| `souk-enable-daemon` | Enable selected pipeline systemd daemon(s), default pipeline 0 |
+| `souk-enable-daemons` | Enable both pipeline systemd daemons |
+| `souk-disable-daemon` | Disable selected pipeline systemd daemon(s), default both |
+| `souk-disable-daemons` | Disable both pipeline systemd daemons |
+| `souk-restart-daemon` | Restart selected pipeline systemd daemon(s), default pipeline 0 |
+| `souk-restart-daemons` | Restart both pipeline systemd daemons |
 | `souk-enable-timing` | Install and restart the packaged `ptp4l`, chrony PHC, and timing-monitor setup |
 | `souk-timing-monitor` | Run the local PTP/NTP timing monitor |
 | `souk-test-timing-monitor` | Query or stream status from `/run/timing-monitor.sock` |

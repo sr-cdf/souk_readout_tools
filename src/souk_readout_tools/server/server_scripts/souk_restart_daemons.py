@@ -5,9 +5,9 @@ def main():
     daemon_main(
         "restart_systemd_service.sh",
         "restart",
-        default_pipelines=(0,),
-        default_label="0",
-        help_suffix="Use -p 0 1, or souk-restart-daemons, for both pipelines.",
+        default_pipelines=(0, 1),
+        default_label="both",
+        help_suffix="Use -p 0 or -p 1 for a single pipeline.",
     )
 
 

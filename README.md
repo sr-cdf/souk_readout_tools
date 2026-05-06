@@ -136,8 +136,11 @@ For full installation details (including server setup, SD card imaging, and daem
 |---------|-------------|
 | `souk-readout-server` | Start the readout server (optional config path, `-p` for pipeline) |
 | `souk-enable-daemon` | Enable the server as a systemd service (`-p 0 1` for both pipelines) |
+| `souk-enable-daemons` | Enable both pipeline systemd services |
 | `souk-disable-daemon` | Disable the server systemd service(s) |
+| `souk-disable-daemons` | Disable both pipeline systemd services |
 | `souk-restart-daemon` | Restart the server systemd service(s) without reinstalling them |
+| `souk-restart-daemons` | Restart both pipeline systemd services without reinstalling them |
 | `souk-enable-timing` | Install and restart the packaged `ptp4l`, chrony PHC, and timing-monitor setup |
 | `souk-timing-monitor` | Run the PTP/NTP timing monitor daemon |
 | `souk-test-timing-monitor` | Query or stream status from `/run/timing-monitor.sock` |

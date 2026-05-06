@@ -7,7 +7,7 @@ def main():
         "disable",
         default_pipelines=(0, 1),
         default_label="both",
-        help_suffix="Use -p 0 for pipeline 0 only.",
+        help_suffix="Use -p 0 or -p 1 for a single pipeline.",
     )
 
 
