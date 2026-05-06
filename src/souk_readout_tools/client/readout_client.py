@@ -268,6 +268,22 @@ class ReadoutClient:
                 )
         return filepath, file_format
 
+    @staticmethod
+    def _csv_metadata_value(value):
+        """Escape embedded newlines so each metadata item stays on one CSV row."""
+        if isinstance(value, str):
+            return value.replace('\r\n', '\n').replace('\r', '\n').replace('\n', r'\n')
+        return value
+
+    @staticmethod
+    def _write_csv_info_metadata(writer, info):
+        for section, section_data in info.items():
+            if isinstance(section_data, dict):
+                for key, value in section_data.items():
+                    writer.writerow([f'# {section}.{key}', ReadoutClient._csv_metadata_value(value)])
+            else:
+                writer.writerow([f'# {section}', ReadoutClient._csv_metadata_value(section_data)])
+
     def send_request(self, message):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
@@ -1523,12 +1539,7 @@ class ReadoutClient:
                 writer.writerow(['# num_tones', data_dict['num_tones']])
                 writer.writerow(['# num_samples', data_dict['num_samples']])
                 writer.writerow(['# sample_rate', data_dict['sample_rate']])
-                for section, section_data in data_dict['info'].items():
-                    if isinstance(section_data, dict):
-                        for key, value in section_data.items():
-                            writer.writerow([f'# {section}.{key}', value])
-                    else:
-                        writer.writerow([f'# {section}', section_data])
+                ReadoutClient._write_csv_info_metadata(writer, data_dict['info'])
                 # Write the header for i_data, q_data, packet_counter, packet_error, and stream_flags
                 header = []
                 for i in range(data_dict['num_tones']):
@@ -2349,12 +2360,7 @@ class ReadoutClient:
                 writer.writerow(['# num_tones', sweep_dict['num_tones']])
                 writer.writerow(['# num_points', sweep_dict['num_points']])
                 writer.writerow(['# samples_per_point', sweep_dict['samples_per_point']])
-                for section, section_data in sweep_dict['info'].items():
-                    if isinstance(section_data, dict):
-                        for key, value in section_data.items():
-                            writer.writerow([f'# {section}.{key}', value])
-                    else:
-                        writer.writerow([f'# {section}', section_data])
+                ReadoutClient._write_csv_info_metadata(writer, sweep_dict['info'])
                 if 'telescope_time' in sweep_dict:
                     writer.writerow(['# telescope_time_per_point'] + [int(t) for t in sweep_dict['telescope_time']])
                 header = []
@@ -2733,12 +2739,7 @@ class ReadoutClient:
                 writer.writerow(['# num_tones', num_tones])
                 writer.writerow(['# num_samples', num_samples])
                 writer.writerow(['# sample_rate',sample_rate])
-                for section, section_data in info.items():
-                    if isinstance(section_data, dict):
-                        for key, value in section_data.items():
-                            writer.writerow([f'# {section}.{key}', value])
-                    else:
-                        writer.writerow([f'# {section}', section_data])
+                ReadoutClient._write_csv_info_metadata(writer, info)
 
                 num_flags = len(data_dict['stream_flags'])
                 header = []
