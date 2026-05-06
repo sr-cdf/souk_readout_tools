@@ -47,6 +47,8 @@ def copy_template_config(destination, pipeline_id=0, nyquist_zone=1,
         pipeline_id: Pipeline ID (0 or 1) to set in the template.
             This also sets the default SOUK mixerless-module
             ``rf_frontend.mixerless_module.rf_channel`` to the same value.
+            It does not change ``cryostat.lna_bias.i2c.bus``; the LNA bias
+            board is always on SMBus(0).
         nyquist_zone: Nyquist zone (1 or 2). Sets the ``nyquist_zone`` key
             in the config, which controls the DAC/ADC mix-mode setting and 
             mixer frequencies: zone 1 uses fs/4 (~1228.8 MHz), zone 2 uses 

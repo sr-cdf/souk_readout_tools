@@ -264,6 +264,7 @@ nano ~/.souk_readout_tools/pipeline_1/config/p1_config.yaml
 | `firmware.dac0_tile` / `block` | `0` / `0` (auto) | `1` / `0` (auto) | Auto-set |
 | `firmware.adc_tile` / `block` | `2` / `0` (auto) | `3` / `0` (auto) | Auto-set |
 | `rf_frontend.mixerless_module.rf_channel` | `0` (auto) | `1` (auto) | Auto-set from `pipeline_id`; selects mixerless-module attenuator/bypass channel |
+| `cryostat.lna_bias.i2c.bus` | `0` | `0` | Linux SMBus for the LNA bias board; not pipeline-specific |
 
 Parameters marked (auto) are set by `copy_template_config` — verify they match your firmware and RF frontend wiring. The RFDC tile/block mapping above is for v7.9+ dual-pipeline firmware. See [dual_pipeline.md](dual_pipeline.md) for full details. The remaining config sections (`cryostat`, `detector`, and RF frontend calibration values) are client-side concerns and can be configured later — see [Client Config Setup](#5-config-setup).
 

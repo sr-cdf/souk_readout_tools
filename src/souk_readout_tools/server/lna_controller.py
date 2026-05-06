@@ -17,6 +17,10 @@ import logging
 import math
 import os
 import sys
+import tempfile
+from contextlib import contextmanager
+
+import fcntl
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +66,28 @@ if _HW_AVAILABLE:
 
 
 NUM_LNA_CHANNELS = 14
+LNA_I2C_BUS_NUM = 0
+
+
+@contextmanager
+def _i2c_bus_lock(bus_num, purpose='LNA bias'):
+    """Serialize access to a shared Linux I2C bus across server processes."""
+    lock_path = os.path.join(
+        tempfile.gettempdir(),
+        f'souk_readout_tools_i2c_bus_{int(bus_num)}.lock',
+    )
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+        os.chmod(lock_path, 0o666)
+    except OSError:
+        pass
+    with os.fdopen(fd, 'r+') as lock_fd:
+        logger.debug('Waiting for %s I2C bus %d lock', purpose, bus_num)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
 # Substrings in the upstream message that mean "the requested voltage was
@@ -288,7 +314,24 @@ class LNABiasController:
             )
 
         self._lna_channel = lna_cfg.get('lna_channel', 1)
-        self._i2c_bus_num = (lna_cfg.get('i2c', {}) or {}).get('bus', 0)
+        configured_bus = (lna_cfg.get('i2c', {}) or {}).get(
+            'bus', LNA_I2C_BUS_NUM,
+        )
+        try:
+            configured_bus = int(configured_bus)
+        except (TypeError, ValueError):
+            logger.warning(
+                'Invalid cryostat.lna_bias.i2c.bus value %r; using SMBus(%d).',
+                configured_bus, LNA_I2C_BUS_NUM,
+            )
+            configured_bus = LNA_I2C_BUS_NUM
+        if configured_bus != LNA_I2C_BUS_NUM:
+            logger.warning(
+                'Ignoring cryostat.lna_bias.i2c.bus=%d for pipeline %d; '
+                'the LNA bias board is always on SMBus(%d).',
+                configured_bus, self.pipeline_id, LNA_I2C_BUS_NUM,
+            )
+        self._i2c_bus_num = LNA_I2C_BUS_NUM
 
         if self._backend == 'fixed':
             if lna_cfg.get('soft_off', self.DEFAULT_SOFT_OFF):
@@ -313,18 +356,19 @@ class LNABiasController:
             return
 
         try:
-            bus = SMBus(self._i2c_bus_num)
-            per_channel_cfg = _default_lna_monitor_hw_config()
-            detected = _detect_lna_channels(bus, per_channel_cfg)
-            if not detected:
-                logger.error(
-                    'No LNA channels responded on i2c bus %d — '
-                    'subsequent LNA calls will fail.',
-                    self._i2c_bus_num,
-                )
-                return
-            hw_config = _build_lna_hw_config(detected, per_channel_cfg)
-            self._monitor = SOUKLNABiasControlMonitor(bus, hw_config)
+            with _i2c_bus_lock(self._i2c_bus_num, 'LNA bias init'):
+                bus = SMBus(self._i2c_bus_num)
+                per_channel_cfg = _default_lna_monitor_hw_config()
+                detected = _detect_lna_channels(bus, per_channel_cfg)
+                if not detected:
+                    logger.error(
+                        'No LNA channels responded on i2c bus %d — '
+                        'subsequent LNA calls will fail.',
+                        self._i2c_bus_num,
+                    )
+                    return
+                hw_config = _build_lna_hw_config(detected, per_channel_cfg)
+                self._monitor = SOUKLNABiasControlMonitor(bus, hw_config)
             self._detected_refdes = detected
             logger.info(
                 'LNA bias controller initialised on backend %s, bus %d: '
@@ -467,30 +511,35 @@ class LNABiasController:
         if method not in ('remote', 'local'):
             raise ValueError("method must be 'remote' or 'local'")
 
-        if method == 'local':
-            vmin, vmax = self._monitor.lna_local_voltage_ranges.get(
-                chn, (float('nan'), float('nan'))
-            )
-            if (math.isfinite(vmin) and math.isfinite(vmax)
-                    and not (vmin - 1e-6 <= voltage_v <= vmax + 1e-6)):
-                return _out_of_local_range_result(chn, voltage_v, 'local', vmin, vmax)
-            result = self._monitor.set_lna_bias_local(chn=[chn], v_local=voltage_v)
-            out = _local_lna_result(chn, result[chn])
-        else:
-            result = self._monitor.set_lna_bias_remote(
-                chn=[chn], v_local=voltage_v, blind=blind,
-            )
-            message = result[chn][1]
-            success = _lna_set_succeeded(message)
-            if not success and 'Cannot set remote voltage' in message:
-                message = self._augment_with_open_circuit_hint(chn, message)
-            out = {
-                'channel': chn,
-                'voltage_v': result[chn][0],
-                'method': 'remote',
-                'message': message,
-                'success': success,
-            }
+        with _i2c_bus_lock(self._i2c_bus_num, 'LNA bias set'):
+            if method == 'local':
+                vmin, vmax = self._monitor.lna_local_voltage_ranges.get(
+                    chn, (float('nan'), float('nan'))
+                )
+                if (math.isfinite(vmin) and math.isfinite(vmax)
+                        and not (vmin - 1e-6 <= voltage_v <= vmax + 1e-6)):
+                    return _out_of_local_range_result(
+                        chn, voltage_v, 'local', vmin, vmax,
+                    )
+                result = self._monitor.set_lna_bias_local(
+                    chn=[chn], v_local=voltage_v,
+                )
+                out = _local_lna_result(chn, result[chn])
+            else:
+                result = self._monitor.set_lna_bias_remote(
+                    chn=[chn], v_local=voltage_v, blind=blind,
+                )
+                message = result[chn][1]
+                success = _lna_set_succeeded(message)
+                if not success and 'Cannot set remote voltage' in message:
+                    message = self._augment_with_open_circuit_hint(chn, message)
+                out = {
+                    'channel': chn,
+                    'voltage_v': result[chn][0],
+                    'method': 'remote',
+                    'message': message,
+                    'success': success,
+                }
         if out.get('success', True):
             self._sync_runtime_state_from_result(out, blind=blind)
         return out
@@ -506,12 +555,13 @@ class LNABiasController:
         chn = channel if channel is not None else self._lna_channel
         self._validate_channel(chn)
 
-        vmin = self._minimum_local_voltage(chn)
-        if not _finite_voltage(vmin):
-            return _soft_off_unavailable_result(chn)
+        with _i2c_bus_lock(self._i2c_bus_num, 'LNA bias soft-off'):
+            vmin = self._minimum_local_voltage(chn)
+            if not _finite_voltage(vmin):
+                return _soft_off_unavailable_result(chn)
 
-        result = self._monitor.set_lna_bias_local(chn=[chn], v_local=vmin)
-        out = _local_lna_result(chn, result[chn])
+            result = self._monitor.set_lna_bias_local(chn=[chn], v_local=vmin)
+            out = _local_lna_result(chn, result[chn])
         out['soft_off'] = out.get('success', True)
         if out.get('success', True):
             out['message'] = _soft_off_message(chn, out['voltage_v'])
@@ -541,55 +591,56 @@ class LNABiasController:
             raise ValueError("method must be 'remote' or 'local'")
         channels = list(range(1, NUM_LNA_CHANNELS + 1))
 
-        if method == 'local':
-            ranges = self._monitor.lna_local_voltage_ranges
-            out = {}
-            in_range = []
-            for chn in channels:
-                vmin, vmax = ranges.get(chn, (float('nan'), float('nan')))
-                if (math.isfinite(vmin) and math.isfinite(vmax)
-                        and not (vmin - 1e-6 <= voltage_v <= vmax + 1e-6)):
-                    out[chn] = _out_of_local_range_result(
-                        chn, voltage_v, 'local', vmin, vmax,
+        with _i2c_bus_lock(self._i2c_bus_num, 'LNA bias set-all'):
+            if method == 'local':
+                ranges = self._monitor.lna_local_voltage_ranges
+                out = {}
+                in_range = []
+                for chn in channels:
+                    vmin, vmax = ranges.get(chn, (float('nan'), float('nan')))
+                    if (math.isfinite(vmin) and math.isfinite(vmax)
+                            and not (vmin - 1e-6 <= voltage_v <= vmax + 1e-6)):
+                        out[chn] = _out_of_local_range_result(
+                            chn, voltage_v, 'local', vmin, vmax,
+                        )
+                    else:
+                        in_range.append(chn)
+                if in_range:
+                    result = self._monitor.set_lna_bias_local(
+                        chn=in_range, v_local=voltage_v,
                     )
-                else:
-                    in_range.append(chn)
-            if in_range:
-                result = self._monitor.set_lna_bias_local(
-                    chn=in_range, v_local=voltage_v,
+                    for chn in in_range:
+                        out[chn] = _local_lna_result(chn, result[chn])
+                ordered = {chn: out[chn] for chn in channels}
+                default_result = ordered.get(self._lna_channel)
+                if default_result and default_result.get('success', True):
+                    self._sync_runtime_state_from_result(
+                        default_result, blind=blind, soft_off=False,
+                    )
+                return ordered
+            else:
+                result = self._monitor.set_lna_bias_remote(
+                    chn=channels, v_local=voltage_v, blind=blind,
                 )
-                for chn in in_range:
-                    out[chn] = _local_lna_result(chn, result[chn])
-            ordered = {chn: out[chn] for chn in channels}
-            default_result = ordered.get(self._lna_channel)
-            if default_result and default_result.get('success', True):
-                self._sync_runtime_state_from_result(
-                    default_result, blind=blind, soft_off=False,
-                )
-            return ordered
-        else:
-            result = self._monitor.set_lna_bias_remote(
-                chn=channels, v_local=voltage_v, blind=blind,
-            )
-            out = {}
-            for chn in channels:
-                message = result[chn][1]
-                success = _lna_set_succeeded(message)
-                if not success and 'Cannot set remote voltage' in message:
-                    message = self._augment_with_open_circuit_hint(chn, message)
-                out[chn] = {
-                    'channel': chn,
-                    'voltage_v': result[chn][0],
-                    'method': 'remote',
-                    'message': message,
-                    'success': success,
-                }
-            default_result = out.get(self._lna_channel)
-            if default_result and default_result.get('success', True):
-                self._sync_runtime_state_from_result(
-                    default_result, blind=blind, soft_off=False,
-                )
-            return out
+                out = {}
+                for chn in channels:
+                    message = result[chn][1]
+                    success = _lna_set_succeeded(message)
+                    if not success and 'Cannot set remote voltage' in message:
+                        message = self._augment_with_open_circuit_hint(chn, message)
+                    out[chn] = {
+                        'channel': chn,
+                        'voltage_v': result[chn][0],
+                        'method': 'remote',
+                        'message': message,
+                        'success': success,
+                    }
+                default_result = out.get(self._lna_channel)
+                if default_result and default_result.get('success', True):
+                    self._sync_runtime_state_from_result(
+                        default_result, blind=blind, soft_off=False,
+                    )
+                return out
 
     def soft_off_lna_bias_all(self):
         """Drive all LNA channels to their minimum local voltage.
@@ -627,7 +678,8 @@ class LNABiasController:
 
         self._require_hardware()
 
-        status = self._monitor.read_lna_status(chn=[chn])
+        with _i2c_bus_lock(self._i2c_bus_num, 'LNA bias status'):
+            status = self._monitor.read_lna_status(chn=[chn])
         s = status[chn]
         message = self._check_status_health(
             chn, s['remote voltage'], s['bias current'],
@@ -655,7 +707,8 @@ class LNABiasController:
             return {chn: self._fixed_lna_status(chn) for chn in channels}
 
         self._require_hardware()
-        status = self._monitor.read_lna_status(chn=channels)
+        with _i2c_bus_lock(self._i2c_bus_num, 'LNA bias status-all'):
+            status = self._monitor.read_lna_status(chn=channels)
         return {
             chn: {
                 'channel': chn,
@@ -853,47 +906,48 @@ def find_lnas(include_state=False):
         print('I2C support not available (smbus2 not installed)')
         return []
 
-    try:
-        bus = SMBus(0)
-    except Exception as e:
-        print(f'LNA discovery error opening SMBus(0): {e}')
-        return []
-
-    per_channel_cfg = _default_lna_monitor_hw_config()
-    detected = _detect_lna_channels(bus, per_channel_cfg)
-    if not detected:
-        return []
-
-    monitor = None
-    if include_state:
+    with _i2c_bus_lock(LNA_I2C_BUS_NUM, 'LNA discovery'):
         try:
-            hw_config = _build_lna_hw_config(detected, per_channel_cfg)
-            monitor = SOUKLNABiasControlMonitor(bus, hw_config)
+            bus = SMBus(LNA_I2C_BUS_NUM)
         except Exception as e:
-            print(f'LNA status read setup failed: {e}')
-            monitor = None
+            print(f'LNA discovery error opening SMBus({LNA_I2C_BUS_NUM}): {e}')
+            return []
 
-    results = []
-    for refdes in detected:
-        chn = _refdes_to_channel(refdes)
-        entry = {
-            'backend': 'i2c',
-            'bus': 0,
-            'refdes': refdes,
-            'channel': chn,
-            'model': f'SOUK LNA bias monitor {refdes}',
-        }
-        if include_state and monitor is not None and chn is not None:
+        per_channel_cfg = _default_lna_monitor_hw_config()
+        detected = _detect_lna_channels(bus, per_channel_cfg)
+        if not detected:
+            return []
+
+        monitor = None
+        if include_state:
             try:
-                status = monitor.read_lna_status(chn=[chn])[chn]
-                entry['remote_voltage_v'] = float(status['remote voltage'])
-                entry['local_voltage_v'] = float(status['local voltage'])
-                entry['bias_current_a'] = float(status['bias current'])
-            except Exception:
-                entry['remote_voltage_v'] = None
-                entry['local_voltage_v'] = None
-                entry['bias_current_a'] = None
-        results.append(entry)
+                hw_config = _build_lna_hw_config(detected, per_channel_cfg)
+                monitor = SOUKLNABiasControlMonitor(bus, hw_config)
+            except Exception as e:
+                print(f'LNA status read setup failed: {e}')
+                monitor = None
+
+        results = []
+        for refdes in detected:
+            chn = _refdes_to_channel(refdes)
+            entry = {
+                'backend': 'i2c',
+                'bus': LNA_I2C_BUS_NUM,
+                'refdes': refdes,
+                'channel': chn,
+                'model': f'SOUK LNA bias monitor {refdes}',
+            }
+            if include_state and monitor is not None and chn is not None:
+                try:
+                    status = monitor.read_lna_status(chn=[chn])[chn]
+                    entry['remote_voltage_v'] = float(status['remote voltage'])
+                    entry['local_voltage_v'] = float(status['local voltage'])
+                    entry['bias_current_a'] = float(status['bias current'])
+                except Exception:
+                    entry['remote_voltage_v'] = None
+                    entry['local_voltage_v'] = None
+                    entry['bias_current_a'] = None
+            results.append(entry)
     return results
 
 

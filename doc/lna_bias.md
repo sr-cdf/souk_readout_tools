@@ -56,7 +56,7 @@ cryostat:
     method: "remote"          # 'remote' feedback or 'local' DAC set
     blind: false              # remote method only
     i2c:
-      bus: 0                  # I2C bus number on the RFSoC
+      bus: 0                  # LNA bias board SMBus; always 0 for both pipelines
 ```
 
 `cryostat.connected` only controls whether cryostat S21 terms are included in
@@ -67,6 +67,11 @@ the RF calibration chain. LNA bias control is independent: set
 Setting `lna_bias.enabled: false` (the default) disables all LNA hardware
 access for this pipeline. If `bias_voltage_v` is missing or `null`, config
 application defaults to 1.5 V.
+
+The Linux SMBus number is not pipeline-specific: both pipeline daemons use
+`SMBus(0)`. Pipeline-specific wiring is selected with `lna_channel`, not
+`i2c.bus`. LNA I2C operations are serialized across pipeline daemons so the
+shared switch tree is not driven concurrently.
 
 Set `lna_bias.soft_off: true` to make config application drive the configured
 channel to the minimum local voltage (about 1.15 V on the present board),

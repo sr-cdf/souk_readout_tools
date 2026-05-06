@@ -221,7 +221,7 @@ cryostat:
     method: "local"                 # 'remote' feedback or 'local' DAC set
     blind: false                     # remote method only; skip LNA-voltage sanity check
     i2c:
-      bus: 0
+      bus: 0                         # LNA bias board is always on SMBus(0), independent of pipeline_id
 
   thermometry_log_file:
   optical_setup:

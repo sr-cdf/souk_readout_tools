@@ -98,6 +98,10 @@ For generated configs, `copy_template_config(..., pipeline_id=N)` sets
 uses mixerless-module channel 0 and pipeline 1 uses channel 1 unless you edit
 the config to match different wiring.
 
+This RF channel is separate from the Linux SMBus number. The SOUK RF frontend
+and LNA bias hardware are still accessed through `SMBus(0)`; only the
+module-side RF path/channel changes with the pipeline.
+
 ## Standalone usage
 
 The submodule can be used independently of the readout server.  This is useful
