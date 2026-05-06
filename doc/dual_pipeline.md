@@ -123,9 +123,14 @@ On the client side, keep your config files wherever you like — there is no hid
 
 ```python
 from souk_readout_tools.config_utils import copy_template_config
-copy_template_config(config_file='config_pipeline_0.yaml', pipeline_id=0)
-copy_template_config(config_file='config_pipeline_1.yaml', pipeline_id=1)
+copy_template_config(destination='config_pipeline_0.yaml', pipeline_id=0)
+copy_template_config(destination='config_pipeline_1.yaml', pipeline_id=1)
 ```
+
+`copy_template_config()` uses `pipeline_id` to set the generated config's
+firmware pipeline ID, TCP ports, RFDC tile/block mapping, and the default
+`rf_frontend.mixerless_module.rf_channel`. With the standard mixerless-module
+wiring, pipeline 0 controls RF channel 0 and pipeline 1 controls RF channel 1.
 
 ---
 

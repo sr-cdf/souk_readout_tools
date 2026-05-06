@@ -1363,16 +1363,6 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
             print(f'apply_config: setting phases ({len(phases)} values)')
             set_tone_phases(r, new_config_dict, phases)
 
-    #check signal levels
-    dac_saturation = check_output_saturation(r_fast,iterations=25,saturation_bits=dac_saturation_bits)
-    adc_saturation = check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation_bits)
-    dsp_overflow = check_dsp_overflow(r)
-    print(f'DAC levels: {dac_saturation}')
-    print(f'ADC levels: {adc_saturation}')
-    print(f'DSP overflow: {dsp_overflow}')
-
-
-
 
 def read_parameter(r, param_name):
     if hasattr(r, param_name):

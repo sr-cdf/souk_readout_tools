@@ -203,6 +203,10 @@ from souk_readout_tools.config_utils import copy_template_config
 copy_template_config(destination='my_config.yaml', pipeline_id=0)
 ```
 
+The `pipeline_id` argument sets the generated config's pipeline-specific
+defaults, including `firmware.pipeline_id`, TCP ports, RFDC tile/block mapping,
+and `rf_frontend.mixerless_module.rf_channel`.
+
 To create a config for **Nyquist zone 2** operation, pass `nyquist_zone=2`:
 
 ```python
@@ -1329,7 +1333,7 @@ The system supports two independent readout pipelines on a single RFSoC board, a
 
 ### Quick Summary
 
-1. Create two config files with different `pipeline_id` (0 and 1), different tcp ports, and correct RFDC tile/block mappings. Use `copy_template_config()` with `pipeline_id=0` and `pipeline_id=1`.
+1. Create two config files with different `pipeline_id` (0 and 1), different tcp ports, correct RFDC tile/block mappings, and matching default mixerless-module RF channels. Use `copy_template_config()` with `pipeline_id=0` and `pipeline_id=1`.
 
 2. Start two server instances on the RFSoC:
    ```bash

@@ -67,7 +67,7 @@ rf_frontend:
   hardware_id: "souk-mixerless-module"
   mixerless_module:
     connected: true                 # true for the SOUK mixerless module
-    rf_channel: 0                   # 0 or 1
+    rf_channel: 0                   # 0 or 1; copy_template_config() defaults this to pipeline_id
     tx_amp_enabled_s21_db: 20.0     # measured; scalar/table/file
     tx_amp_bypassed_s21_db: -2.0
     rx_amp_enabled_s21_db: 20.0
@@ -92,6 +92,11 @@ reported by `get_rf_peripheral_status()` / `get_info('rf_frontend')`.
 `pull_config()` returns the active config file only. Use
 `sync_config_from_system()` or `sync_config_to_local()` when you explicitly
 want to capture the current hardware state into a local config.
+
+For generated configs, `copy_template_config(..., pipeline_id=N)` sets
+`rf_frontend.mixerless_module.rf_channel` to `N` by default, so pipeline 0
+uses mixerless-module channel 0 and pipeline 1 uses channel 1 unless you edit
+the config to match different wiring.
 
 ## Standalone usage
 

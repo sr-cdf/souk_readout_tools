@@ -170,7 +170,7 @@ def ensure_pipeline_dirs(pipeline_id):
 def _copy_template_configs(dirs, pipeline_id):
     """
     Copy template configuration files from package data to the user's pipeline config directory.
-    Updates pipeline_id in template_config.yaml to match the target pipeline.
+    Updates pipeline-specific defaults in template_config.yaml to match the target pipeline.
     Copies as raw text to preserve comments.
     """
     print(f"First run for pipeline {pipeline_id}: copying template config files to {dirs['config']}")
@@ -1223,7 +1223,7 @@ class ReadoutServer:
             'controllable': rf.is_controllable,
             'supports_bypass_amps': rf.supports_bypass_amps,
             'attenuator_backend': rf.attenuator_backend,
-            'rf_channel': mixerless_cfg.get('rf_channel'),
+            'rf_channel': status.get('rf_channel', mixerless_cfg.get('rf_channel')),
         }
 
         # Backend-specific identity

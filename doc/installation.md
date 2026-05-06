@@ -248,7 +248,7 @@ nano ~/.souk_readout_tools/pipeline_0/config/p0_config.yaml
 nano ~/.souk_readout_tools/pipeline_1/config/p1_config.yaml
 ```
 
-`copy_template_config` automatically sets the pipeline-specific fields (`pipeline_id`, ports, RFDC tile/block mapping) based on the `pipeline_id` argument. For server setup, the parameters that matter are the address, ports, and firmware config path — the remaining settings are used by clients and can be left as defaults for now:
+`copy_template_config` automatically sets the pipeline-specific fields (`pipeline_id`, ports, RFDC tile/block mapping, and the SOUK mixerless-module RF channel default) based on the `pipeline_id` argument. For server setup, the parameters that matter are the address, ports, firmware config path, and any enabled RF peripheral defaults you want applied at startup:
 
 | Parameter | Pipeline 0 | Pipeline 1 | Notes |
 |-----------|-----------|-----------|-------|
@@ -261,8 +261,9 @@ nano ~/.souk_readout_tools/pipeline_1/config/p1_config.yaml
 | `firmware.pipeline_id` | `0` (auto) | `1` (auto) | Auto-set |
 | `firmware.dac0_tile` / `block` | `0` / `0` (auto) | `1` / `0` (auto) | Auto-set |
 | `firmware.adc_tile` / `block` | `2` / `0` (auto) | `3` / `0` (auto) | Auto-set |
+| `rf_frontend.mixerless_module.rf_channel` | `0` (auto) | `1` (auto) | Auto-set from `pipeline_id`; selects mixerless-module attenuator/bypass channel |
 
-Parameters marked (auto) are set by `copy_template_config` — verify they match your firmware. The RFDC tile/block mapping above is for v7.9+ dual-pipeline firmware. See [dual_pipeline.md](dual_pipeline.md) for full details. The remaining config sections (`rf_frontend`, `cryostat`, `detector`) are client-side concerns and can be configured later — see [Client Config Setup](#5-config-setup).
+Parameters marked (auto) are set by `copy_template_config` — verify they match your firmware and RF frontend wiring. The RFDC tile/block mapping above is for v7.9+ dual-pipeline firmware. See [dual_pipeline.md](dual_pipeline.md) for full details. The remaining config sections (`cryostat`, `detector`, and RF frontend calibration values) are client-side concerns and can be configured later — see [Client Config Setup](#5-config-setup).
 
 Point the default config link to your new file for each pipeline:
 
@@ -673,7 +674,7 @@ client.pull_config(save_as='my_config.yaml')
 
 # Or create a config from the template:
 from souk_readout_tools.config_utils import copy_template_config
-copy_template_config(config_file='my_config.yaml', pipeline_id=0,
+copy_template_config(destination='my_config.yaml', pipeline_id=0,
                      config_id="A new config", created_by="You")
 ```
 

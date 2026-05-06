@@ -159,7 +159,7 @@ rf_frontend:
   rx_combiner_loss_db: 0
   mixerless_module:
     connected: true
-    rf_channel: 0
+    rf_channel: 0                   # defaults to pipeline_id when generated
     tx_amp_enabled_s21_db: 20.0      # measured amp path, scalar/table/file
     tx_amp_bypassed_s21_db: -2.0     # measured bypass path, scalar/table/file
     rx_amp_enabled_s21_db: 20.0
@@ -322,7 +322,7 @@ rf_frontend:
   connected: true
   mixerless_module:
     connected: true
-    rf_channel: 0          # pipeline index
+    rf_channel: 0          # defaults to pipeline_id when generated
   attenuator:
     backend: "i2c"
     tx_value_db: 10.0
