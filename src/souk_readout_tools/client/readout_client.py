@@ -1220,8 +1220,8 @@ class ReadoutClient:
                    fr['num_samples'] = size_of_this_frame # per frame
                    fr['frame_num'] = frame_count # JL Numbering from 0
                    fr['session_id'] = int(start) # Unix start time in whole seconds 
-                   fr['sostream_id'] = 'ukkid_1' # JL This ultimately comes from the OCS agent that starts up the taks
-                   fr['sostream_version'] = 2    # JL Again, should probably mean something different in our case.
+                   fr['sostream_id'] = kid_stream_id
+                   fr['sostream_version'] = SOSTREAM_VERSION
                    fr['time'] = core.G3Time(time.time() * core.G3Units.s) # JL Presumably meant to be the time when frame is written out, not the timestamp of the first element of the frame??
                    writer(fr)
                    frame_count+=1
