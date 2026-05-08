@@ -74,7 +74,7 @@ import so3g
 import spt3g.core
 from scipy import signal
 
-from souk_readout_tools.config_utils import get_template_config_path, copy_template_config
+from souk_readout_tools.config_utils import copy_template_config
 
 
 # Config keys whose string values are calibration file paths.
@@ -144,8 +144,9 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 class ReadoutClient:
-    
-    def __init__(self, config_file=None, address=None, request_port=None, stream_port=None):
+
+    def __init__(self, config_file=None, address=None, request_port=None,
+                 stream_port=None, mock=False):
         """
         Initialize the ReadoutClient.
 
@@ -165,7 +166,18 @@ class ReadoutClient:
                           Pipeline 0 uses 10000, pipeline 1 uses 10001.
             stream_port: TCP stream port. If None, derived as request_port + 10000.
                           Pipeline 0 uses 20000, pipeline 1 uses 20001.
+            mock: If True, emulate the readout server locally instead of opening
+                  request/stream sockets.  This is intended for OCS/controller
+                  testing without RFSoC hardware attached.
         """
+        self.mock = bool(mock)
+        connect_message = None
+        connect_hint = None
+        if self.mock and config_file is None and address is None:
+            address = '127.0.0.1'
+            if request_port is None:
+                request_port = 10000
+
         if config_file is not None:
             # Load config from file
             if not os.path.exists(config_file):
@@ -197,17 +209,17 @@ class ReadoutClient:
 
             # Connect without a config file - user will pull_config from the server
             self.config = None
+            self.pipeline_id = None
             self.config_file = None
             self.config_dir = os.getcwd()
-            self.pipeline_id = None
 
             self.request_server_address = address
             self.request_server_port = request_port
             self.stream_server_address = address
             self.stream_server_port = stream_port
 
-            print(f'Connecting to {address}:{request_port} (stream port {stream_port}, no local config)')
-            print(f'Use client.pull_config(save_as="my_config.yaml") to fetch and save the running config.')
+            connect_message = f'Connecting to {address}:{request_port} (stream port {stream_port}, no local config)'
+            connect_hint = 'Use client.pull_config(save_as="my_config.yaml") to fetch and save the running config.'
 
         else:
             # No config file, no address - help the user get started
@@ -225,6 +237,20 @@ class ReadoutClient:
 
         self.parameters = {}
         self.calibration_files = {}  # basename -> contents, populated by pull_config
+        self._mock_server = None
+        if self.mock:
+            from souk_readout_tools.client.mock_readout import MockReadoutServer
+            if self.config is None:
+                self.config = MockReadoutServer.default_config(
+                    self.request_server_address,
+                    self.request_server_port,
+                    self.stream_server_port)
+                self.pipeline_id = self.config.get('firmware', {}).get('pipeline_id', 0)
+            self._mock_server = MockReadoutServer(self)
+            print(f'Using mock readout client (pipeline {self.pipeline_id})')
+        elif connect_message is not None:
+            print(connect_message)
+            print(connect_hint)
 
     @property
     def cal_dir(self):
@@ -355,6 +381,9 @@ class ReadoutClient:
 
     def send_request(self, message):
         """Send a length-prefixed JSON request to the server and return its response."""
+        if self.mock:
+            return self._mock_server.send_request(message)
+
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.connect((self.request_server_address, self.request_server_port))
@@ -1510,6 +1539,9 @@ class ReadoutClient:
         size depends on the number of active tones. The per-frame byte
         count is stored in sample_data['frame_bytes'] for parse_samples.
         """
+        if self.mock:
+            return self._mock_server.get_samples(num_samples, incl_system_info, burst)
+
         self._warn_zero_phases()
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((self.request_server_address, self.request_server_port))
@@ -2633,6 +2665,9 @@ class ReadoutClient:
 
     def receive_stream(self, num_tones=None, filename=None, print_data=False):
         """Receive continuous stream frames from the stream socket and write them to disk."""
+        if self.mock:
+            return self._mock_server.receive_stream(num_tones, filename, print_data)
+
         iq_data=None
         if filename is None:
             filename = os.path.join(os.getcwd(), 'tmp_stream')
@@ -2731,6 +2766,11 @@ class ReadoutClient:
     def receive_stream_g3(self, num_tones=None, filename=None, print_data=False,
                           kid_stream_id='UNSET', duration=30):
         '''JL: Receives a data stream and writes it to a G3 file.'''
+        if self.mock:
+            return self._mock_server.receive_stream_g3(
+                num_tones=num_tones, filename=filename, print_data=print_data,
+                kid_stream_id=kid_stream_id, duration=duration)
+
         # JL: Presumably this gets updated if something radically changes in this code
         SOSTREAM_VERSION = 1
         # JL: Level 1 data shows this is typically around 400
@@ -3055,6 +3095,9 @@ class ReadoutClient:
 
     def receive_triggered_stream(self, num_tones=None, filename=None, print_data=False):
         """Receive triggered stream frames from the stream socket and write them to disk."""
+        if self.mock:
+            return self._mock_server.receive_stream(num_tones, filename, print_data)
+
         if filename is None:
             filename = os.path.join(os.getcwd(), 'tmp_triggered_stream')
             print(f"No filename specified, writing to {filename}")

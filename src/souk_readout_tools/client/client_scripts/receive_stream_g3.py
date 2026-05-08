@@ -40,12 +40,23 @@ def main():
     parser.add_argument('-p', '--print_data', action='store_true', help='Prints out the data to the console')
     parser.add_argument('-i', '--kid_stream_id', type=str, default='UNSET', help='KID stream ID e.g. ufm_kid1 etc.')
     parser.add_argument('-t', '--time_to_stream', type=int, default=30, help='Time (in integer seconds) to run the streaming process for')
+    parser.add_argument('-m', '--mock', action='store_true', help='Run without RFSoC hardware using the built-in mock client mode.')
 
     args  = parser.parse_args()
 
     print("receiving stream with args: ", args)
 
-    if args.config_file is not None:
+    if args.mock:
+        if args.config_file is not None:
+            client = readout_client.ReadoutClient(config_file=args.config_file,
+                                                 mock=True)
+        elif args.address is not None and args.request_port is not None:
+            client = readout_client.ReadoutClient(address=args.address,
+                                                 request_port=args.request_port,
+                                                 mock=True)
+        else:
+            client = readout_client.ReadoutClient(mock=True)
+    elif args.config_file is not None:
         if args.address is not None or args.request_port is not None:
             parser.error('--config_file cannot be used with --address or --request_port')
         client = readout_client.ReadoutClient(config_file=args.config_file)
