@@ -68,6 +68,7 @@ import time
 import os
 import traceback
 import csv
+import ast
 import base64
 import logging
 import so3g
@@ -1750,15 +1751,12 @@ class ReadoutClient:
                         header_lines+=1
                         key = line.split(',')[0].lstrip('# ')
                         value = line[line.find(',')+1:].strip()
-                        if key=='date':
-                            value = value
-                        elif value.startswith('"') and value.endswith('"'):
-                            value = eval(value[1:-1])
-                        else:
-                            try:
-                                value = eval(value)
-                            except NameError:
-                                value = value
+                        if value.startswith('"') and value.endswith('"'):
+                            value = value[1:-1]
+                        try:
+                            value = ast.literal_eval(value)
+                        except (ValueError, SyntaxError):
+                            pass
                         data_dict[key] = value
 
             data = np.genfromtxt(filename, delimiter=',',names=True,skip_header=header_lines)
@@ -2611,15 +2609,11 @@ class ReadoutClient:
                         key = line.split(',')[0].lstrip('# ')
                         value = line[line.find(',')+1:].strip()
                         if value.startswith('"') and value.endswith('"'):
-                            try:
-                                value = eval(value[1:-1])
-                            except:
-                                value=value
-                        else:
-                            try:
-                                value = eval(value)
-                            except:
-                                value = value
+                            value = value[1:-1]
+                        try:
+                            value = ast.literal_eval(value)
+                        except (ValueError, SyntaxError):
+                            pass
                         sweep_dict[key] = value
 
             data = np.genfromtxt(filename, delimiter=',',names=True,skip_header=header_lines)
@@ -3346,15 +3340,12 @@ class ReadoutClient:
                         header_lines+=1
                         key = line.split(',')[0].lstrip('# ')
                         value = line[line.find(',')+1:].strip()
-                        if key=='date':
-                            value = value
-                        elif value.startswith('"') and value.endswith('"'):
-                            value = eval(value[1:-1])
-                        else:
-                            try:
-                                value = eval(value)
-                            except NameError:
-                                value = value
+                        if value.startswith('"') and value.endswith('"'):
+                            value = value[1:-1]
+                        try:
+                            value = ast.literal_eval(value)
+                        except (ValueError, SyntaxError):
+                            pass
                         data_dict[key] = value
 
             data = np.genfromtxt(filename, delimiter=',',names=True,skip_header=header_lines)
