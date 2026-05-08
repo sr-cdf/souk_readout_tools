@@ -68,10 +68,14 @@ import time
 import os
 import traceback
 import csv
+import ast
 import base64
+import logging
+import so3g
+import spt3g.core
 from scipy import signal
 
-from souk_readout_tools.config_utils import get_template_config_path, copy_template_config
+from souk_readout_tools.config_utils import copy_template_config
 
 
 # Config keys whose string values are calibration file paths.
@@ -141,8 +145,9 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 class ReadoutClient:
-    
-    def __init__(self, config_file=None, address=None, request_port=None, stream_port=None):
+
+    def __init__(self, config_file=None, address=None, request_port=None,
+                 stream_port=None, mock=False):
         """
         Initialize the ReadoutClient.
 
@@ -162,7 +167,18 @@ class ReadoutClient:
                           Pipeline 0 uses 10000, pipeline 1 uses 10001.
             stream_port: TCP stream port. If None, derived as request_port + 10000.
                           Pipeline 0 uses 20000, pipeline 1 uses 20001.
+            mock: If True, emulate the readout server locally instead of opening
+                  request/stream sockets.  This is intended for OCS/controller
+                  testing without RFSoC hardware attached.
         """
+        self.mock = bool(mock)
+        connect_message = None
+        connect_hint = None
+        if self.mock and config_file is None and address is None:
+            address = '127.0.0.1'
+            if request_port is None:
+                request_port = 10000
+
         if config_file is not None:
             # Load config from file
             if not os.path.exists(config_file):
@@ -194,17 +210,17 @@ class ReadoutClient:
 
             # Connect without a config file - user will pull_config from the server
             self.config = None
+            self.pipeline_id = None
             self.config_file = None
             self.config_dir = os.getcwd()
-            self.pipeline_id = None
 
             self.request_server_address = address
             self.request_server_port = request_port
             self.stream_server_address = address
             self.stream_server_port = stream_port
 
-            print(f'Connecting to {address}:{request_port} (stream port {stream_port}, no local config)')
-            print(f'Use client.pull_config(save_as="my_config.yaml") to fetch and save the running config.')
+            connect_message = f'Connecting to {address}:{request_port} (stream port {stream_port}, no local config)'
+            connect_hint = 'Use client.pull_config(save_as="my_config.yaml") to fetch and save the running config.'
 
         else:
             # No config file, no address - help the user get started
@@ -222,6 +238,20 @@ class ReadoutClient:
 
         self.parameters = {}
         self.calibration_files = {}  # basename -> contents, populated by pull_config
+        self._mock_server = None
+        if self.mock:
+            from souk_readout_tools.client.mock_readout import MockReadoutServer
+            if self.config is None:
+                self.config = MockReadoutServer.default_config(
+                    self.request_server_address,
+                    self.request_server_port,
+                    self.stream_server_port)
+                self.pipeline_id = self.config.get('firmware', {}).get('pipeline_id', 0)
+            self._mock_server = MockReadoutServer(self)
+            print(f'Using mock readout client (pipeline {self.pipeline_id})')
+        elif connect_message is not None:
+            print(connect_message)
+            print(connect_hint)
 
     @property
     def cal_dir(self):
@@ -352,6 +382,9 @@ class ReadoutClient:
 
     def send_request(self, message):
         """Send a length-prefixed JSON request to the server and return its response."""
+        if self.mock:
+            return self._mock_server.send_request(message)
+
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.connect((self.request_server_address, self.request_server_port))
@@ -1507,6 +1540,9 @@ class ReadoutClient:
         size depends on the number of active tones. The per-frame byte
         count is stored in sample_data['frame_bytes'] for parse_samples.
         """
+        if self.mock:
+            return self._mock_server.get_samples(num_samples, incl_system_info, burst)
+
         self._warn_zero_phases()
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((self.request_server_address, self.request_server_port))
@@ -1715,15 +1751,12 @@ class ReadoutClient:
                         header_lines+=1
                         key = line.split(',')[0].lstrip('# ')
                         value = line[line.find(',')+1:].strip()
-                        if key=='date':
-                            value = value
-                        elif value.startswith('"') and value.endswith('"'):
-                            value = eval(value[1:-1])
-                        else:
-                            try:
-                                value = eval(value)
-                            except NameError:
-                                value = value
+                        if value.startswith('"') and value.endswith('"'):
+                            value = value[1:-1]
+                        try:
+                            value = ast.literal_eval(value)
+                        except (ValueError, SyntaxError):
+                            pass
                         data_dict[key] = value
 
             data = np.genfromtxt(filename, delimiter=',',names=True,skip_header=header_lines)
@@ -2576,15 +2609,11 @@ class ReadoutClient:
                         key = line.split(',')[0].lstrip('# ')
                         value = line[line.find(',')+1:].strip()
                         if value.startswith('"') and value.endswith('"'):
-                            try:
-                                value = eval(value[1:-1])
-                            except:
-                                value=value
-                        else:
-                            try:
-                                value = eval(value)
-                            except:
-                                value = value
+                            value = value[1:-1]
+                        try:
+                            value = ast.literal_eval(value)
+                        except (ValueError, SyntaxError):
+                            pass
                         sweep_dict[key] = value
 
             data = np.genfromtxt(filename, delimiter=',',names=True,skip_header=header_lines)
@@ -2630,6 +2659,9 @@ class ReadoutClient:
 
     def receive_stream(self, num_tones=None, filename=None, print_data=False):
         """Receive continuous stream frames from the stream socket and write them to disk."""
+        if self.mock:
+            return self._mock_server.receive_stream(num_tones, filename, print_data)
+
         iq_data=None
         if filename is None:
             filename = os.path.join(os.getcwd(), 'tmp_stream')
@@ -2725,8 +2757,341 @@ class ReadoutClient:
         return iq_data
 
 
+    def receive_stream_g3(self, num_tones=None, filename=None, print_data=False,
+                          kid_stream_id='UNSET', duration=30):
+        '''JL: Receives a data stream and writes it to a G3 file.'''
+        if self.mock:
+            return self._mock_server.receive_stream_g3(
+                num_tones=num_tones, filename=filename, print_data=print_data,
+                kid_stream_id=kid_stream_id, duration=duration)
+
+        # JL: Presumably this gets updated if something radically changes in this code
+        SOSTREAM_VERSION = 1
+        # JL: Level 1 data shows this is typically around 400
+        num_sample_rows_per_frame = 400
+        num_headers = 10
+
+        data = bytearray(2048*2*4 + num_headers*4)
+        view = memoryview(data)
+        iq_data = None
+        if filename is None:
+            filename = os.path.join(os.getcwd(), 'tmp_stream.g3')
+            print(f"No filename specified, writing to {filename}")
+        if not filename.endswith('.g3'):
+            filename += '.g3'
+        if not os.path.exists(os.path.dirname(os.path.abspath(filename))):
+            os.makedirs(os.path.dirname(os.path.abspath(filename)))
+
+        # Set up logging
+        pid = os.getpid()
+        # Assumes input filename ends in '.g3'
+        log_filename = filename[:-3] + '_log_' + str(pid) + '.log'
+        logging.basicConfig(filename=log_filename, level=logging.INFO,
+                            format='%(asctime)s : %(levelname)s : %(message)s')
+        logger = logging.getLogger(__name__)
+
+        info = self.get_info('all')
+
+        tone_indices = info.get('tones', {}).get('firmware_indices')
+        if num_tones is None:
+            num_tones = len(tone_indices) if tone_indices is not None else 2048
+
+        metadata = {}
+        metadata['date'] = time.strftime('%Y-%m-%d %H:%M:%S UTC%z')
+        metadata['num_tones'] = num_tones
+        metadata['sample_rate'] = self.get_sample_rate()
+        metadata['format'] = '<i4'
+        metadata['index_err'] = 2*num_tones-1+10
+        metadata['index_cnt'] = 2*num_tones-1+9
+        metadata['index_tt_lsb'] = 2*num_tones-1+8
+        metadata['index_tt_msb'] = 2*num_tones-1+7
+        metadata['index_flag_5'] = 2*num_tones-1+6
+        metadata['index_flag_4'] = 2*num_tones-1+5
+        metadata['index_flag_3'] = 2*num_tones-1+4
+        metadata['index_flag_2'] = 2*num_tones-1+3
+        metadata['index_flag_1'] = 2*num_tones-1+2
+        metadata['index_flag_0'] = 2*num_tones-1+1
+        metadata['ordering'] = 'I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, Q_tone1_sample0,..flags, tt_msb, tt_lsb, cnt, err .'
+        metadata['info'] = info
+
+        # JL setting similar to Smurf at the the moment - some of our primary names won't exist.
+        primary_names = [
+            'UnixTime', 'FluxRampIncrement', 'FluxRampOffset', 'Counter0',
+            'Counter1', 'Counter2', 'AveragingResetBits', 'FrameCounter',
+            'TESRelaySetting']
+        primary_idxs = {name: idx for idx, name in enumerate(primary_names)}
+
+        # JL Indexing below strips the assumed .g3 extension from the supplied filename and replaces it with .json
+        # pdb.set_trace()
+        with open(filename[:-3]+'.json', 'w') as file:
+            json.dump(metadata, file, indent=4)
+
+        logger.info('Wrote JSON header to '+filename[:-3]+'.json')
+        logger.info('Preparing to receive TCP/IP data from : '+ self.stream_server_address +':'+ str(self.stream_server_port))
+        logger.info(f'Will stream for duration {duration}')
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((self.stream_server_address, self.stream_server_port))
+
+            with spt3g.core.G3Writer(filename=filename) as writer:
+                logger.info(f"Writing data to {filename}")
+                print(f"Writing data to {filename}")
+                t0 = time.time()
+                frame_count = 0 # Counter for total number of frames (each of  length num_sample_rows_per_frame) written/
+                count = 0    # counter for total number of packets (data rows) received.
+                row_frame_count = 0 # Counter for number of packets received within the frame so far.
+                ppid = os.getppid()
+
+                key_interupt = False
+                general_exception = False
+
+                # First write out an observation frame
+                # JL: TO DO
+                # increment frame count
+                fr = spt3g.core.G3Frame(spt3g.core.G3FrameType.Observation)
+                t0 = time.time()
+                session_id = int(t0) # Unix start time in whole seconds
+                fr['frame_num'] = frame_count
+                fr['session_id'] = session_id
+                fr['sostream_id'] = kid_stream_id
+                fr['sostream_version'] = SOSTREAM_VERSION
+                fr['stream_placement'] = 'start'
+                fr['time'] = spt3g.core.G3Time(t0 * spt3g.core.G3Units.s)
+                writer(fr)
+                frame_count += 1
+                #################################################
+                # Then write out a  write out a Wiring Frame
+                fr = spt3g.core.G3Frame(spt3g.core.G3FrameType.Wiring)
+                t0 = time.time()
+                fr['frame_num'] = frame_count
+                fr['session_id'] = session_id
+                fr['sostream_id'] = kid_stream_id
+                fr['sostream_version'] = SOSTREAM_VERSION
+                fr['time'] = spt3g.core.G3Time(t0 * spt3g.core.G3Units.s)
+                fr['dump'] = True
+                # Persistent bug here with the yaml string being truncated.
+                '''
+                yaml_dump_string =  yaml.dump(metadata)
+                logger.info('###################################')
+                logger.info(str(type(metadata)))
+                logger.info('###################################')
+                logger.info(yaml_dump_string)
+                logger.info('###################################')
+                logger.info(str(metadata))
+                logger.info('###################################')
+                logger.info(json.dumps(metadata).encode())
+                logger.info('###################################')
+                logger.info('###################################')
+                logger.info(len(yaml_dump_string))
+                logger.info('###################################')
+                logger.info(len(str(metadata)))
+                logger.info('###################################')
+                logger.info(len(json.dumps(metadata).encode()))
+                logger.info('###################################')
+                logger.info('###################################')
+                logger.info(yaml_dump_string[-50:])
+                logger.info('###################################')
+                logger.info(str(metadata)[-50:])
+                logger.info('###################################')
+                logger.info(json.dumps(metadata).encode()[-50:])
+                fr['status'] = yaml_dump_string
+                '''
+                # Thus write the json string instead, which does not have this problem.
+                fr['status'] = json.dumps(metadata).encode()
+                writer(fr)
+                frame_count += 1
+                #################################################
+                start = time.time() # JL will be ultimately derived from the PTP data in the packets
+                time_now = time.time()
+
+                while (time_now-t0) < duration:
+                    while True:
+                        try:
+                            #quit if parent has changed, prevents zombie processes
+                            if os.getppid() != ppid:
+                                size_of_this_frame = row_frame_count
+                                break
+
+                            # Read data length
+                            raw_datalen = s.recv(4)
+                            if not raw_datalen:
+                                continue
+                            datalen = struct.unpack('>I', raw_datalen)[0]
+                            if datalen == 0:
+                                continue
+                            if datalen > len(data):
+                                data = bytearray(datalen)
+                                view = memoryview(data)
+                            received_len = 0
+                            while received_len < datalen:
+                                packet_len = s.recv_into(view[received_len:], datalen - received_len)
+                                if packet_len == 0:
+                                    break
+                                received_len += packet_len
+                            if received_len < datalen:
+                                logger.error(f"Expected {datalen} bytes, but only received {received_len} bytes.")
+                                print(f"Expected {datalen} bytes, but only received {received_len} bytes.")
+                                size_of_this_frame = row_frame_count
+                                break
+
+                            #############################################
+                            # JL Pickout out data from the bufferm contruct a 1-D "row" transfomar into a column vector
+                            # then hstack to build up the 2-D data_frame_buffer
+                            # Example row structure in the original PR:
+                            # i_data_0000,q_data_0000,i_data_0001,q_data_0001,i_data_0002,q_data_0002,i_data_0003,q_data_0003,i_data_0004,q_data_0004,i_data_0005,q_data_0005,i_data_0006
+                            # ,q_data_0006,packet_counter,packet_error,flag0,flag1,flag2,flag3,flag4,flag5,flag6,flag7
+                            # Number of columns in a row =
+                            # iq_data = num_tones * 2
+                            # cnt = 1
+                            # err = 1
+                            # flags = 8
+                            # = num_tones*2 + 10
+                            #############################################
+                            # SR: Modern stream frames are active tones in user order, then:
+                            # flag0..flag5, tt_msb, tt_lsb, cnt, err.
+                            frame_words = datalen // 4
+                            frame_tones = (frame_words - num_headers) // 2
+                            if datalen % 4 != 0 or frame_tones < num_tones:
+                                raise ValueError(
+                                    f"Stream frame length {datalen} bytes cannot contain "
+                                    f"{num_tones} tones plus {num_headers} header words.")
+
+                            all_data = np.frombuffer(data[:datalen], dtype='<i4')
+                            iq_words = all_data[:2*num_tones].astype(np.int64)
+                            tail = all_data[-num_headers:].astype(np.int64)
+                            flags = tail[:6]
+                            tt_msb = int(tail[6]) & 0xFFFFFFFF
+                            tt_lsb = int(tail[7]) & 0xFFFFFFFF
+                            tt = (tt_msb << 32) + tt_lsb
+                            cnt = int(tail[8])
+                            err = int(tail[9])
+                            full_row = np.concatenate(
+                                (iq_words, flags, np.array([tt, cnt, err], dtype=np.int64)),
+                                axis=0)
+                            full_row = full_row.reshape(-1,1) # make into column vector
+                            if row_frame_count == 0:
+                                data_frame_buffer = full_row
+                            else:
+                                data_frame_buffer = np.hstack((data_frame_buffer, full_row))
+                            #print('##############################')
+                            #print(f"Frame is {data_frame_buffer}")
+                            #print("Shape is ", np.shape(data_frame_buffer))
+                            #print(f"Frame is {data_frame_buffer}\r", end='', flush=True)
+
+                            count += 1
+                            row_frame_count += 1
+
+                            if (row_frame_count == num_sample_rows_per_frame):
+                                size_of_this_frame = row_frame_count
+                                # Frame is full, reset counter and exit the loop
+                                row_frame_count = 0
+                                break
+
+                            if print_data:
+                                i = iq_words[::2]
+                                q = iq_words[1::2]
+                                iq_data = i+1j*q
+                                print(f"datalen {datalen} row frame count {row_frame_count} Received IQ data: err={err} cnt={cnt} tt={tt} {iq_data.tolist()} \r",end='',flush=True)
+
+                        except KeyboardInterrupt:
+                            size_of_this_frame = row_frame_count
+                            key_interupt = True
+                            break
+
+                        except Exception as e:
+                            size_of_this_frame = row_frame_count
+                            general_exception = True
+                            logger.error(f"Error receiving stream data: {e}")
+                            logger.error(traceback.format_exc())
+                            print(f"Error receiving stream data: {e}")
+                            print(traceback.format_exc())
+                            break
+
+                    # End "while true" data frame buffer contruction loop
+                    # We arrive here if a frame has become completely filled or a keyboard interrupt or exception has happened.
+                    # in either case size_of_this_frame contains the numer of rows in the frame
+                    logger.info(f'About to write frame {frame_count}')
+                    # If we arrive here after an exception leave the loop entirely.
+                    if key_interupt or general_exception:
+                        logger.info(f"Key Interrupt: {key_interupt} General exception: {general_exception} ")
+                        break
+                    if size_of_this_frame == 0:
+                        break
+
+                    #### Write the scan frame out
+                    fr = spt3g.core.G3Frame(spt3g.core.G3FrameType.Scan)
+                    sample_rate = metadata['sample_rate']
+                    #Setup the 1-D time array for the data part of the frame
+                    times = np.linspace(start,start+(size_of_this_frame)/sample_rate, size_of_this_frame) # JL Utimately will be from PTP within packets
+
+                    #SR: once telescope time from ptp is confirmed working, this should be replaced with the following to get the correct timestamp for each sample:
+                    if False:
+                        times = tt
+
+                    g3times = spt3g.core.G3VectorTime(times * spt3g.core.G3Units.s)
+
+                    chans = np.arange(num_tones)
+                    # Set up the row descriptive names for the data part of the frame
+                    # v1.2.0 uses 6 flags and combines tt_msb/tt_lsb into telescope_time.
+                    names = ['_']*(2*num_tones+6+1+1+1) # 6 flags, 1 telescope time, 1 cnt, 1 err
+                    names[0:2*len(chans):2] = [f'i{ch:0>4}' for ch in chans] # i followed by zero padded 4 digit channel (tone) number
+                    names[1:2*len(chans):2] = [f'q{ch:0>4}' for ch in chans] # q followed by zero padded 4 digit channel (tone) number
+                    names[num_tones*2:num_tones*2+6] = [f'flag{flag}' for flag in list(range(6))]
+                    names[num_tones*2+6] = 'telescope_time'
+                    names[num_tones*2+7] = 'cnt'
+                    names[num_tones*2+8] = 'err'
+
+                    # Write the data frame - row names (len = 2*num_tones + 9), times (len = size_of_this_frame), 2-D data_frame_buffer  = len(row_names) * len(times).
+                    fr['data'] = so3g.G3SuperTimestream(names, g3times, data_frame_buffer)
+                    #pdb.set_trace()
+                    # This is purely a counter of how much data is in the frame - look at cnt to see if packets have been dropped.
+                    frame_counter = np.arange(0,size_of_this_frame, dtype=int)
+                    primary_data = np.zeros((len(primary_names), size_of_this_frame), dtype=np.int64)
+                    primary_data[primary_idxs['UnixTime'], :] = (times * 1e9).astype(int)
+                    primary_data[primary_idxs['FrameCounter'], :] = frame_counter
+                    fr['primary'] = so3g.G3SuperTimestream(primary_names, g3times, primary_data)
+
+                    fr['timing_paradigm'] = 'High Precision'
+                    #SR: client.get_info('timing') tells us the current status, eg ptp_locked, or ptp_holdover, or ntp or free-running.
+                    # we should match up our available status values to the available timing paradigms in the G3 frame metadata
+
+                    fr['num_samples'] = size_of_this_frame # per frame
+                    fr['frame_num'] = frame_count # JL Numbering from 0
+                    fr['session_id'] = session_id
+                    fr['sostream_id'] = kid_stream_id
+                    fr['sostream_version'] = SOSTREAM_VERSION
+                    fr['time'] = spt3g.core.G3Time(time.time() * spt3g.core.G3Units.s) # JL Presumably meant to be the time when frame is written out, not the timestamp of the first element of the frame??
+                    writer(fr)
+                    frame_count += 1
+                    time_now = time.time()
+                #end while (time_now-t0) < duration:
+
+                logger.info(f'Streaming duration {duration} expired.')
+                logger.info(f"Writing final observation frame..")
+                t1 = time.time()
+
+                # At the end of the observation write out an observation frame.
+                fr = spt3g.core.G3Frame(spt3g.core.G3FrameType.Observation)
+                fr['frame_num'] = frame_count
+                fr['session_id'] = session_id
+                fr['sostream_id'] = kid_stream_id
+                fr['sostream_version'] = SOSTREAM_VERSION
+                fr['stream_placement'] = 'end'
+                fr['time'] = spt3g.core.G3Time(t1 * spt3g.core.G3Units.s)
+                writer(fr)
+            # End of "with core..."
+        # end of "with socket..."
+        print()
+        print(f"Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
+        logger.info(f"Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
+        return iq_data
+
+
     def receive_triggered_stream(self, num_tones=None, filename=None, print_data=False):
         """Receive triggered stream frames from the stream socket and write them to disk."""
+        if self.mock:
+            return self._mock_server.receive_stream(num_tones, filename, print_data)
+
         if filename is None:
             filename = os.path.join(os.getcwd(), 'tmp_triggered_stream')
             print(f"No filename specified, writing to {filename}")
@@ -2975,15 +3340,12 @@ class ReadoutClient:
                         header_lines+=1
                         key = line.split(',')[0].lstrip('# ')
                         value = line[line.find(',')+1:].strip()
-                        if key=='date':
-                            value = value
-                        elif value.startswith('"') and value.endswith('"'):
-                            value = eval(value[1:-1])
-                        else:
-                            try:
-                                value = eval(value)
-                            except NameError:
-                                value = value
+                        if value.startswith('"') and value.endswith('"'):
+                            value = value[1:-1]
+                        try:
+                            value = ast.literal_eval(value)
+                        except (ValueError, SyntaxError):
+                            pass
                         data_dict[key] = value
 
             data = np.genfromtxt(filename, delimiter=',',names=True,skip_header=header_lines)
