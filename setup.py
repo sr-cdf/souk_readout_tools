@@ -41,6 +41,11 @@ gui_dependencies = [
     'pyqt5',
 ]
 
+# Define client-specific dependencies
+client_dependencies = [
+    'so3g',
+]
+
 # Define server-specific dependencies
 server_dependencies = [
     "souk_mkid_readout",
@@ -49,6 +54,7 @@ server_dependencies = [
 
 # Conditionally add client or server dependencies
 if install_client:
+    install_requires.extend(client_dependencies)
     if not is_xilinx_platform():
         install_requires.extend(gui_dependencies)
 
