@@ -48,6 +48,8 @@ Each `ReadoutServer` uses two TCP ports - a **request port** for JSON command/re
 - **Tone control** - set frequencies, amplitudes, and phases for up to 2048 readout tones per pipeline with full TX/RX power calibration through the entire signal chain (DSP → DAC → RF frontend → cryostat → detector). Tone updates happen on millisecond timescales, enabling fast resonator tracking.
 - **Blind tone management** - add fixed off-resonance monitor tones for gain/phase tracking, with config-based and interactive helpers, sweep inclusion, calibrated power support, and retune-safe tone metadata.
 - **Data acquisition** - discrete samples, continuous streaming, triggered streaming, and single tone snapshots (1024 sample bursts at the pre-accumulator rate). All data includes PTP telescope timestamps from the firmware for precise time synchronisation.
+- **G3 stream output** - record continuous streams to so3g/spt3g `.g3` files (Observation, Wiring, Scan frames with `G3SuperTimestream` payloads) for downstream OCS / SO data pipelines.
+- **Mock server mode** - `ReadoutClient(mock=True)` emulates the readout server in-process (synthetic resonator catalogue, sweeps, snapshots, streams) for OCS / controller integration testing without RFSoC hardware.
 - **Frequency sweeping** - wideband survey sweeps across the full RF band and targeted sweeps around individual resonances
 - **Resonance finding** - automated peak detection across multiple data formats (magnitude, phase, group delay, |dS21/df|, etc), plus an interactive PyQt5 GUI
 - **Retuning** - sweep-and-retune workflows to track drifting resonances using max-derivative or min-magnitude methods
