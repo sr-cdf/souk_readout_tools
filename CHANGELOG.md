@@ -1,6 +1,47 @@
 # Changelog & Feature List
 
-## v1.2.0 (Current)
+## v1.3.0 (Current)
+
+Forward-ported the `jl_ocs_devel` branch (PR #10) plus follow-on hardening.
+
+**G3 Streaming Output (so3g)**
+- Added `client.receive_stream_g3()` to record a continuous data stream as
+  an so3g/spt3g G3 file. The output contains an `Observation` frame, a
+  `Wiring` frame describing tone metadata, and `Scan` frames carrying
+  `G3SuperTimestream` payloads for I/Q data, packet counters, and PTP
+  telescope timestamps. Mock mode is also supported.
+- Added the `receive_stream_g3.py` client script for command-line G3
+  capture (connect via config file or address/port). The script is shipped
+  as a module rather than an entry point, matching the existing
+  `receive_stream.py` convention.
+- Client install now requires `so3g` (which pulls in `spt3g`).
+
+**Mock Server Mode**
+- Added `ReadoutClient(..., mock=True)` for local emulation of the readout
+  server without RFSoC hardware, intended for OCS / controller integration
+  testing. Mock mode swaps socket traffic for an in-process
+  `MockReadoutServer` (`souk_readout_tools.client.mock_readout`) and
+  defaults connection details to `127.0.0.1:10000` when no config or
+  address is supplied.
+- The mock server generates a synthetic resonator catalogue and emulates
+  sweeps, snapshots, streams, the full `get_info()` surface, and the new
+  G3 stream writer.
+
+**OCS Resonator Helpers**
+- Forward-ported `souk_readout_tools.client.res_fns` for `UKKIDController`
+  compatibility. Provides simple resonator-fitting helpers (`s21_model`,
+  etc.). Slated for removal once the built-in fitting tools in
+  `souk_readout_tools` are fully validated in `UKKIDController`.
+
+**CSV Import Hardening**
+- `import_sweep` and the equivalent stream/snapshot CSV importers now use
+  `ast.literal_eval` instead of `eval` for metadata parsing. This removes
+  an arbitrary-code-execution sink and fixes a latent crash on values that
+  are valid strings but not valid Python expressions (e.g. `fpg_file`
+  paths, ISO-8601 date strings, free-form text). All three importers now
+  share an identical metadata-parse loop.
+
+## v1.2.0
 
 **Get Info API**
 - `get_info()` now accepts a single section name, such as

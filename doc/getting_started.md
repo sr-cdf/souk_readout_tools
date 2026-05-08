@@ -27,6 +27,7 @@ SOUK Readout Tools is a Python package with tools for operating the MKID (Microw
 - [Resonator Analysis](#resonator-analysis)
 - [Parameter Space Measurements](#parameter-space-measurements)
 - [Dual-Pipeline Operation](#dual-pipeline-operation)
+- [Mock Server Mode](#mock-server-mode)
 - [CLI Tools](#cli-tools)
 - [Changelog & Feature List](#changelog--feature-list)
 - [Future Developments](#future-developments)
@@ -735,6 +736,40 @@ or use the plotting tool:
 plot_timestream(data,x_axis='telescope_time')
 ```
 
+### G3 Stream Output (so3g)
+
+For OCS / Simons Observatory data pipelines, streams can be recorded directly
+into so3g/spt3g `.g3` files instead of the default binary format:
+
+```python
+client.receive_stream_g3(
+    num_tones=None,             # default: all active tones from the firmware
+    filename='my_stream.g3',
+    duration=30,                # seconds
+    kid_stream_id='UNSET',      # tag carried in Wiring frame metadata
+)
+```
+
+The output file contains:
+
+- one `Observation` frame at the start (timestamp, run metadata),
+- one `Wiring` frame describing tone metadata (frequencies, indices, ID),
+- a sequence of `Scan` frames carrying `G3SuperTimestream` payloads with
+  I/Q data, packet counters/errors, and PTP telescope timestamps,
+- one closing `Observation` frame at the end.
+
+A standalone receiver script is provided as
+`receive_stream_g3.py` (under `client/client_scripts/`); it is currently
+shipped as a module rather than an installed entry point, matching the
+existing `receive_stream.py` convention. It accepts either a config file
+(`-C`) or an address/port pair, plus `--duration` and `--filename`.
+
+> **Note:** PTP telescope time is currently embedded in the
+> `G3SuperTimestream`, but the mapping between this package's
+> `timing_monitor` state and the spt3g timing paradigms (G3 time vs.
+> session time) is still being finalised. Treat G3 timestamps as
+> firmware-PTP for now.
+
 ### Triggered Streaming
 
 The server can also stream samples on external trigger pulses:
@@ -1362,6 +1397,45 @@ DAC0 is the primary DAC used in normal operation. DAC1 is only used in dual-DAC 
 
 - `ensure_ready()` on one pipeline will not disrupt the other unless a firmware reprogram is actually required.
 - `hard_reset()` on either pipeline wipes both, so run `ensure_ready()` on both afterwards.
+
+---
+
+## Mock Server Mode
+
+For OCS / controller integration testing without RFSoC hardware,
+`ReadoutClient` can run against an in-process mock server:
+
+```python
+from souk_readout_tools.client.readout_client import ReadoutClient
+
+client = ReadoutClient(mock=True)        # no config / address required
+client.ensure_ready()
+client.set_tone_frequencies([0.8e9, 1.5e9])
+raw = client.get_samples(500)
+data = client.parse_samples(raw, num_tones=2)
+```
+
+What is emulated:
+
+- Connection setup (defaults to `127.0.0.1:10000` if no config/address is
+  given), `push_config()` / `pull_config()`, and the full `get_info()`
+  surface.
+- A synthetic resonator catalogue with realistic `S21` responses, used to
+  back wideband sweeps, targeted sweeps, snapshots, streams, and the new
+  G3 stream output.
+- Timing, RFDC, tone, and LNA `info` sections so OCS health-checks behave
+  the same as against real hardware.
+
+What is **not** emulated:
+
+- Actual firmware programming, real RF behaviour, or hardware-specific
+  failure modes. Mock mode is for client-side / pipeline-integration
+  testing, not RF validation.
+
+The mock implementation lives in
+`souk_readout_tools.client.mock_readout` (`MockReadoutServer`); mock mode
+swaps socket traffic for this in-process state object rather than
+providing a separate mock client class.
 
 ---
 
