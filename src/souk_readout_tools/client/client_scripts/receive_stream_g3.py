@@ -9,7 +9,10 @@ import os
 import argparse
 import signal
 
-from souk_readout_tools.client import readout_client
+souk_readout_tools_path = '/home/leechj/souk_readout_tools/client_venv/lib/python3.10/site-packages'
+sys.path.append(souk_readout_tools_path)
+
+from souk_readout_tools.client.readout_client import ReadoutClient
 
 def handle_signal(signum, frame):
     """Handles incoming signals and exits gracefully."""
@@ -48,22 +51,22 @@ def main():
 
     if args.mock:
         if args.config_file is not None:
-            client = readout_client.ReadoutClient(config_file=args.config_file,
+            client = ReadoutClient(config_file=args.config_file,
                                                  mock=True)
         elif args.address is not None and args.request_port is not None:
-            client = readout_client.ReadoutClient(address=args.address,
+            client = ReadoutClient(address=args.address,
                                                  request_port=args.request_port,
                                                  mock=True)
         else:
-            client = readout_client.ReadoutClient(mock=True)
+            client = ReadoutClient(mock=True)
     elif args.config_file is not None:
         if args.address is not None or args.request_port is not None:
             parser.error('--config_file cannot be used with --address or --request_port')
-        client = readout_client.ReadoutClient(config_file=args.config_file)
+        client = ReadoutClient(config_file=args.config_file)
     elif args.address is not None and args.request_port is not None:
         # The client uses the request socket to pull the running config, then
         # reads the stream port from that remote config.
-        client = readout_client.ReadoutClient(address=args.address,
+        client = ReadoutClient(address=args.address,
                                              request_port=args.request_port)
         client.pull_config()
         client.stream_server_port = client.config['rfsoc_host']['stream_port']
