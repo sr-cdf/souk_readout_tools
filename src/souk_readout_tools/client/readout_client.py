@@ -70,6 +70,7 @@ import traceback
 import csv
 import ast
 import base64
+import io
 import logging
 import so3g
 import spt3g.core
@@ -645,6 +646,78 @@ class ReadoutClient:
         if os.path.isfile(cal_path):
             return os.path.abspath(cal_path)
         return None
+
+    @staticmethod
+    def _parse_group_delay_calibration_text(cal_text, source='<memory>'):
+        """Parse a path-group-delay CSV into the resonator helper dict format."""
+        data = np.genfromtxt(io.StringIO(cal_text), delimiter=',', names=True,
+                             autostrip=True)
+
+        if getattr(data, 'dtype', None) is not None and data.dtype.names:
+            column_map = {name.lower(): name for name in data.dtype.names}
+            freq_key = column_map.get('freq_hz') or column_map.get('frequency_hz')
+            tau_key = column_map.get('tau_ns') or column_map.get('group_delay_ns')
+            if freq_key is not None and tau_key is not None:
+                return {
+                    'frequencies': np.asarray(data[freq_key], dtype=float).ravel(),
+                    'tau_ns': np.asarray(data[tau_key], dtype=float).ravel(),
+                }
+
+        raw = np.loadtxt(io.StringIO(cal_text), delimiter=',', ndmin=2)
+        if raw.shape[1] < 2:
+            raise ValueError(
+                f"Group delay calibration '{source}' must have at least two columns.")
+        return {
+            'frequencies': np.asarray(raw[:, 0], dtype=float).ravel(),
+            'tau_ns': np.asarray(raw[:, 1], dtype=float).ravel(),
+        }
+
+    def load_path_group_delay_calibration(self, value=None, pull_if_missing=True):
+        """Load ``rf_frontend.path_group_delay_ns`` into an in-memory calibration dict."""
+        if value is None:
+            if self.config is None:
+                raise RuntimeError(
+                    'No config loaded; pass a calibration entry or load a config first.')
+            value = _cal_path_get(self.config, ('rf_frontend', 'path_group_delay_ns'))
+
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, str):
+            arr = np.asarray(value, dtype=float)
+            if arr.ndim == 0:
+                return float(arr)
+            return {
+                'frequencies': arr[:, 0].ravel(),
+                'tau_ns': arr[:, 1].ravel(),
+            }
+
+        basename = os.path.basename(value)
+        if basename in self.calibration_files:
+            return self._parse_group_delay_calibration_text(
+                self.calibration_files[basename], source=basename)
+
+        local_path = self._resolve_local_cal_path(value)
+        if local_path is not None:
+            with open(local_path, 'r') as file:
+                return self._parse_group_delay_calibration_text(
+                    file.read(), source=local_path)
+
+        if pull_if_missing:
+            response = self.send_request({
+                'request': 'pull_calibration',
+                'cal_filename': basename,
+            })
+            if response.get('status') == 'success':
+                cal_text = response['cal_contents']
+                self.calibration_files[basename] = cal_text
+                return self._parse_group_delay_calibration_text(
+                    cal_text, source=basename)
+
+        raise FileNotFoundError(
+            'Could not resolve path-group-delay calibration entry '
+            f"'{value}'. Save the config locally or pull calibration files first.")
 
 
     def push_calibration(self, calibration_file):
@@ -4413,25 +4486,27 @@ class ReadoutClient:
 
         return save_to_csv
 
-    def find_resonances(self, sweep_data=None, mode='wideband',
+
+    def find_resonances(self, sweep_data=None, mode='auto',
                         data_format='log_magnitude',
                         filter_params=None, finder_params=None, **kwargs):
         """
         Find MKID resonances in sweep data using the peak_finder module.
 
-        Supports two modes:
-        - 'wideband': searches the full concatenated sweep trace for all
-          resonances (default, for wideband_sweep data).
-        - 'targeted': searches within each tone's individual sweep for
-          resonances. Returns per-tone results and flags tones with
-          multiple resonances (doubles/triples).
+                Supports three modes:
+                        - 'auto': infers the sweep type from parsed sweep metadata/shape.
+                        - 'wideband': searches the full concatenated sweep trace for all
+                            resonances (default, for wideband_sweep data).
+                        - 'targeted': searches within each tone's individual sweep for
+                            resonances. Returns per-tone results and flags tones with
+                            multiple resonances (doubles/triples).
 
         Args:
             sweep_data (dict, optional): Sweep data dictionary with keys
                 'sweep_f', 'sweep_i', 'sweep_q'. If None, performs a new
-                wideband_sweep (for mode='wideband') or raises an error
-                (for mode='targeted').
-            mode (str): 'wideband' or 'targeted'.
+                wideband_sweep (for mode='wideband' or mode='auto') or raises
+                an error (for mode='targeted').
+            mode (str): 'auto', 'wideband', or 'targeted'.
             data_format (str): Analysis format for peak finding. One of:
                 'lin_magnitude', 'log_magnitude', 'phase', 'unwrapped_phase',
                 'group_delay', 'complex_gradient'. Default is 'log_magnitude'.
@@ -4460,6 +4535,18 @@ class ReadoutClient:
             filter_params = FilterParams(**filter_params)
         if isinstance(finder_params, dict):
             finder_params = PeakFinderParams(**finder_params)
+
+        if mode == 'auto':
+            if sweep_data is None:
+                return 'wideband'
+
+            if sweep_data.get('wideband_sweep', False):
+                return 'wideband'
+
+            sweep_f = np.atleast_2d(sweep_data['sweep_f'])
+            mode = 'wideband' if sweep_f.shape[0] == 1 else 'targeted'
+
+            
 
         if mode == 'wideband':
             if sweep_data is None:
@@ -4524,7 +4611,8 @@ class ReadoutClient:
             }
 
         else:
-            raise ValueError(f"Unknown mode '{mode}'. Use 'wideband' or 'targeted'.")
+            raise ValueError(
+                f"Unknown mode '{mode}'. Use 'auto', 'wideband', or 'targeted'.")
 
     def find_resonance_frequencies(self, sweep_data=None, **kwargs):
         """
@@ -4535,9 +4623,15 @@ class ReadoutClient:
             **kwargs: Passed to find_resonances.
         
         Returns:
-            np.ndarray: Array of resonance frequencies in Hz
+            np.ndarray: Array of resonance frequencies in Hz.
+                For targeted sweeps this is the flattened
+                ``all_resonances`` frequency list.
         """
         resonances = self.find_resonances(sweep_data, **kwargs)
+
+        if isinstance(resonances, dict):
+            resonances = resonances['all_resonances']
+
         return np.array([r.frequency for r in resonances])
 
 
