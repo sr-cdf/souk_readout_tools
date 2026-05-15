@@ -4343,6 +4343,76 @@ class ReadoutClient:
 
         return result
 
+    def save_path_group_delay_calibration(self, group_delay, frequencies=None,
+                                          filename='path_group_delay.csv',
+                                          update_config=True, verbose=True):
+        """Write a path-group-delay calibration CSV into ``self.cal_dir``.
+
+        Args:
+            group_delay: Either a result dict from ``measure_path_group_delay()``
+                or a 1-D array of ``tau_ns`` values.
+            frequencies: 1-D array of frequencies in Hz when ``group_delay`` is
+                not a result dict.
+            filename: Output CSV filename or path. Relative paths are written
+                inside ``self.cal_dir``.
+            update_config: If True (default), update
+                ``rf_frontend.path_group_delay_ns`` in the in-memory config and
+                cache the file contents for ``save_config()`` / ``push_config()``.
+            verbose: Print status messages.
+
+        Returns:
+            Absolute path to the written calibration CSV.
+        """
+        import csv
+        import os
+
+        if isinstance(group_delay, dict):
+            if frequencies is None:
+                frequencies = group_delay.get('frequencies')
+            tau_ns = group_delay.get('tau_ns')
+        else:
+            tau_ns = group_delay
+
+        if frequencies is None:
+            raise ValueError('frequencies must be provided when group_delay is not a result dict')
+
+        frequencies = np.asarray(frequencies, dtype=float).ravel()
+        tau_ns = np.asarray(tau_ns, dtype=float).ravel()
+        if frequencies.shape != tau_ns.shape:
+            raise ValueError('frequencies and group delay arrays must have the same shape')
+
+        if os.path.isabs(filename):
+            save_to_csv = filename
+        else:
+            os.makedirs(self.cal_dir, exist_ok=True)
+            save_to_csv = os.path.join(self.cal_dir, filename)
+        save_to_csv = os.path.abspath(save_to_csv)
+        os.makedirs(os.path.dirname(save_to_csv), exist_ok=True)
+
+        with open(save_to_csv, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['freq_hz', 'tau_ns'])
+            for freq_hz, tau_val in zip(frequencies, tau_ns):
+                writer.writerow([f'{freq_hz:.3f}', f'{tau_val:.6f}'])
+
+        basename = os.path.basename(save_to_csv)
+        with open(save_to_csv) as f:
+            self.calibration_files[basename] = f.read()
+
+        if update_config:
+            if self.config is None:
+                raise RuntimeError('No config loaded; cannot update rf_frontend.path_group_delay_ns')
+            self.config.setdefault('rf_frontend', {})['path_group_delay_ns'] = save_to_csv
+            self.config_raw_text = None
+            if verbose:
+                print(f'Config rf_frontend.path_group_delay_ns set to "{save_to_csv}"')
+
+        if verbose:
+            print(f'Saved path group delay calibration to {save_to_csv}')
+            print('Use push_config() to persist this calibration on the RFSoC.')
+
+        return save_to_csv
+
     def find_resonances(self, sweep_data=None, mode='wideband',
                         data_format='log_magnitude',
                         filter_params=None, finder_params=None, **kwargs):
