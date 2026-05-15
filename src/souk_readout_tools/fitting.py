@@ -67,8 +67,11 @@ Uncertainties and weights
 -------------------------
 
 ``z_err`` is the measurement uncertainty used for covariance, parameter
-uncertainties, weighted RMS, and reduced chi-square. The optimizer itself is
-unweighted by default. Pass ``optimizer_z_err=z_err`` or
+uncertainties, weighted RMS, and reduced chi-square. Parsed server sweep
+data stores ``sweep_ei``/``sweep_eq`` as the standard error of the averaged
+point already, so fitting helpers consume those values as-is; do not scale
+them again by ``samples_per_point``. The optimizer itself is unweighted by
+default. Pass ``optimizer_z_err=z_err`` or
 ``use_error_weights=True`` only when the measurement uncertainty is also a
 good numerical weight for the least-squares objective. ``error_weight_power``
 can soften those optimizer weights, for example ``0.5``.
@@ -401,7 +404,12 @@ def _select_names(values, names):
 
 
 def _prepare_z_error(z_err, shape):
-    """Return positive sigma_I and sigma_Q arrays in readout-server convention."""
+    """Return positive sigma_I and sigma_Q arrays in readout-server convention.
+
+    When ``z_err`` comes from parsed server sweep data, ``sweep_ei`` and
+    ``sweep_eq`` are already the standard error of the averaged sweep point,
+    matching the uncertainty of ``sweep_i``/``sweep_q`` used by the fit.
+    """
     if z_err is None or z_err is False:
         return None
     if isinstance(z_err, dict):

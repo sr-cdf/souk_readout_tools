@@ -7,7 +7,8 @@ optional deembedding and/or phase centering. All functions return
 matplotlib Figure objects.
 
 Sweep plots:
-    plot_sweep, plot_sweep_iq, plot_sweep_magphase, plot_sweep_iq_vs_f
+    plot_sweep, plot_sweep_iq, plot_sweep_magphase, plot_sweep_iq_vs_f,
+    plot_fits, plot_fit_params
 
 Timestream plots:
     plot_timestream, plot_timestream_psd, plot_timestream_on_resonance
@@ -24,6 +25,8 @@ from .sweep import (
     plot_sweep_iq,
     plot_sweep_magphase,
     plot_sweep_iq_vs_f,
+    plot_fits,
+    plot_fit_params,
 )
 from .timestream import (
     plot_timestream,
