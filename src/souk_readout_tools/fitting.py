@@ -44,8 +44,10 @@ probe automatically when the measured dip has a clear cliff/shoulder shape and
 the first nonlinear refinement appears to be in the wrong basin.
 
 ``fit_sweep_stack`` fits an already-windowed stack of sweeps, one row/column
-per resonator or power. ``batch_fit`` first finds/windows resonances in a
-full sweep-data dictionary, then fits each window. Both support process-based
+per resonator or power. ``batch_fit`` fits each trace in a targeted sweep-data
+dictionary by default, can fit user-supplied resonance windows, and can
+optionally auto-find/window resonances in a concatenated full sweep. Both
+support process-based
 parallelism via ``n_jobs``: ``1`` is serial, ``-1`` uses all visible CPUs, and
 ``-2`` uses all but one. ``verbose=True`` prints compact progress and
 throughput; ``verbose=2`` prints one line per completed fit. Returned lists are
@@ -125,11 +127,12 @@ Fit the same KID over many powers in parallel:
     )
     params = extract_parameters(fits)
 
-Find and fit resonances in a full sweep dictionary:
+Auto-find and fit resonances in a full sweep dictionary:
 
     fits = batch_fit(
         sweep_data, nonlinear=True, n_jobs=-1, verbose=True,
         window_fwhm=10.0, use_error_weights=True, subsample=True,
+        find_resonances=True,
     )
 """
 
@@ -1550,8 +1553,14 @@ def _stack_rows(f_stack, z_stack, z_err_stack=None):
         else:
             raise ValueError("one axis of z_stack must match the 1D frequency array")
     elif f.shape == z.shape:
-        for i in range(z.shape[0]):
-            rows.append((f[i], z[i], None if e is None else e[i]))
+        if z.ndim != 2:
+            rows.append((f.ravel(), z.ravel(), None if e is None else e.ravel()))
+        elif z.shape[0] <= z.shape[1]:
+            for i in range(z.shape[0]):
+                rows.append((f[i], z[i], None if e is None else e[i]))
+        else:
+            for i in range(z.shape[1]):
+                rows.append((f[:, i], z[:, i], None if e is None else e[:, i]))
     else:
         raise ValueError("f_stack and z_stack must have compatible shapes")
     return rows
@@ -1582,21 +1591,35 @@ def fit_sweep_stack(f_stack, z_stack, z_err_stack=None, nonlinear=False,
     )
 
 
-def _flatten_sweep(sweep_data, zerr=None):
-    """Flatten a sweep-data dict into sorted frequency, complex S21, and errors."""
-    sf = np.atleast_2d(np.asarray(sweep_data["sweep_f"], float))
-    si = np.atleast_2d(np.asarray(sweep_data["sweep_i"], float))
-    sq = np.atleast_2d(np.asarray(sweep_data["sweep_q"], float))
+def _prepare_sweep_stack(sweep_data, zerr=None):
+    """Load a sweep-data dict as frequency/complex/error arrays without flattening."""
+    sf = np.asarray(sweep_data["sweep_f"], float)
+    si = np.asarray(sweep_data["sweep_i"], float)
+    sq = np.asarray(sweep_data["sweep_q"], float)
     z = si + 1j * sq
     if zerr is None and ("sweep_ei" in sweep_data or "sweep_eq" in sweep_data):
-        ei = np.atleast_2d(np.asarray(sweep_data.get("sweep_ei", np.zeros_like(si)), float))
-        eq = np.atleast_2d(np.asarray(sweep_data.get("sweep_eq", np.zeros_like(sq)), float))
+        ei = np.asarray(sweep_data.get("sweep_ei", np.zeros_like(si)), float)
+        eq = np.asarray(sweep_data.get("sweep_eq", np.zeros_like(sq)), float)
         zerr = ei + 1j * eq
     elif zerr is not None:
         ei, eq = _prepare_z_error(zerr, z.shape)
         zerr = ei + 1j * eq
-    f_all, z_all = sf.ravel(), z.ravel()
-    e_all = None if zerr is None else np.broadcast_to(zerr, z.shape).ravel()
+    return sf, z, zerr
+
+
+def _is_targeted_sweep_data(sweep_data):
+    """Return True when sweep_data already contains one targeted trace per tone."""
+    sf = np.asarray(sweep_data["sweep_f"], float)
+    if sf.ndim == 1:
+        return True
+    return not sweep_data.get("wideband_sweep", False) and np.atleast_2d(sf).shape[0] != 1
+
+
+def _flatten_sweep(sweep_data, zerr=None):
+    """Flatten a sweep-data dict into sorted frequency, complex S21, and errors."""
+    sf, z, zerr = _prepare_sweep_stack(sweep_data, zerr)
+    f_all, z_all = np.atleast_2d(sf).ravel(), np.atleast_2d(z).ravel()
+    e_all = None if zerr is None else np.broadcast_to(np.atleast_2d(zerr), np.atleast_2d(z).shape).ravel()
     order = np.argsort(f_all)
     return f_all[order], z_all[order], None if e_all is None else e_all[order]
 
@@ -1605,18 +1628,22 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
               filter_params=None, finder_params=None, window_fwhm=10.0,
               nonlinear=False, sweep_direction="up", verbose=True,
               z_err=None, optimizer_z_err=None, use_error_weights=None,
-              max_points=None, n_jobs=1, **fit_kwargs):
-    """Find/window resonances in a sweep-data dict and fit each one.
+              max_points=None, n_jobs=1, find_resonances=False,
+              **fit_kwargs):
+    """Fit one or more resonances from a sweep-data dict.
 
     ``n_jobs`` follows the joblib convention: ``1`` is serial, ``-1`` uses all
     visible CPUs, and ``-2`` uses all but one. Parallel fitting uses separate
     processes. Single-fit options, including ``initial_guess``,
     ``param_bounds`` and ``param_fixed``, are forwarded through
-    ``**fit_kwargs``.
+    ``**fit_kwargs``. When ``resonances`` is omitted, targeted per-tone sweeps
+    fit one trace per tone by default. Pass ``find_resonances=True`` to
+    auto-detect resonance windows from a concatenated sweep instead.
     """
     from .peak_finder import find_mkid_resonances
 
     n_jobs = _pop_njobs_alias(fit_kwargs, n_jobs)
+    sf, z_stack, e_stack = _prepare_sweep_stack(sweep_data, z_err)
     f_all, z_all, e_all = _flatten_sweep(sweep_data, z_err)
     if use_error_weights is not None:
         optimizer_z_err = True if use_error_weights else None
@@ -1626,11 +1653,41 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
     )
     none_opt = optimizer_z_err is None or optimizer_z_err is False
     opt_all = e_all if optimizer_z_err is True or same_opt else None
+    opt_stack = e_stack if optimizer_z_err is True or same_opt else None
     if not (none_opt or optimizer_z_err is True or same_opt):
+        _, _, opt_stack = _prepare_sweep_stack(sweep_data, optimizer_z_err)
         _, _, opt_all = _flatten_sweep(sweep_data, optimizer_z_err)
     base_guess = _normalise_param_dict(fit_kwargs.pop("initial_guess", None))
 
     if resonances is None:
+        if _is_targeted_sweep_data(sweep_data) and not find_resonances:
+            rows = _stack_rows(sf, z_stack, e_stack)
+            if opt_stack is None:
+                opt_rows = [None] * len(rows)
+            else:
+                opt_rows = [row for _, row, _ in _stack_rows(sf, opt_stack)]
+
+            tasks = []
+            total = len(rows)
+            for i, ((f_row, z_row, e_row), opt_row) in enumerate(zip(rows, opt_rows)):
+                kwargs = dict(fit_kwargs)
+                if base_guess is not None:
+                    kwargs["initial_guess"] = dict(base_guess)
+                kwargs["optimizer_z_err"] = opt_row
+                tasks.append((f_row, z_row, e_row, nonlinear, sweep_direction, kwargs))
+
+            return _parallel_map(
+                _fit_sweep_stack_one, tasks, n_jobs, verbose=verbose,
+                label="tones",
+                progress_formatter=lambda index, completed, total, fit:
+                    _format_fit_progress("Tone", index, completed, total, fit),
+            )
+
+        if not find_resonances:
+            raise ValueError(
+                "batch_fit() requires explicit resonances for concatenated sweeps; "
+                "pass find_resonances=True to auto-detect them from sweep_data."
+            )
         resonances = find_mkid_resonances(
             f_all, z_all, data_format=data_format,
             filter_params=filter_params, finder_params=finder_params,
