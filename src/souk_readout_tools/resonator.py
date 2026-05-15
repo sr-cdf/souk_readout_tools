@@ -143,16 +143,22 @@ def _resolve_group_delay_cal(group_delay_cal, frequencies):
     config:
 
     - scalar (float) — constant delay in nanoseconds.
-    - ``[[freq_hz, tau_ns], ...]`` — frequency-dependent pairs; linearly
-      interpolated to *frequencies*.
-    - result dict from ``measure_path_group_delay()`` — uses the
-      ``'frequencies'`` and ``'tau_ns'`` keys.
+        - ``[[freq_hz, tau_ns], ...]`` — frequency-dependent pairs; linearly
+            interpolated to *frequencies*.
+        - result dict from ``measure_path_group_delay()`` — uses the
+            ``'frequencies'`` and ``'tau_ns'`` keys.
 
     Returns:
         tau_s: 1-D array of delay values in **seconds**, same length as
         *frequencies*.
     """
     frequencies = np.asarray(frequencies, dtype=float)
+
+    if isinstance(group_delay_cal, str):
+        raise TypeError(
+            'group_delay_cal does not accept config path strings directly; '
+            'load the calibration first with '
+            'ReadoutClient.load_path_group_delay_calibration().')
 
     if isinstance(group_delay_cal, dict):
         cal_f = np.asarray(group_delay_cal['frequencies'], dtype=float).ravel()
