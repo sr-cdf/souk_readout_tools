@@ -10,20 +10,97 @@ sits at (1, 0) and the on-resonance point lies near zero on the
 positive real axis (overcoupled case).
 
 **Phase centering** (``phase_center``) — translates the resonance
-circle so its algebraic center sits at the origin and rotates it so
-that the resonance point lies on the negative real axis (zero phase
-off-resonance).  Phase centering can be applied to raw *or*
-deembedded data.
+circle so its algebraic center sits at the origin, then rotates the
+centered circle so that the off-resonance point lies on the negative
+real axis and the resonance point lies near zero phase.  Phase centering
+can be applied to raw *or* deembedded data.
 
 Also provides a ``ResonatorCalibration`` class for vectorized
 IQ - frequency/dissipation conversion that relies on the
 phase-centered representation.
+
+Uncertainty propagation:
+- Public transform functions accept optional ``s21_err`` arrays.
+- A complex error array means real=sigma_I and imag=sigma_Q, matching
+  the readout-server sweep_ei/sweep_eq convention.
+- Complex multiplications, including cable-delay rotation, baseline
+  division, and phase rotation, propagate independent I/Q uncertainties.
+- Translation by a circle center does not change per-point uncertainty.
+- Uncertainty in fitted transform parameters themselves is not included.
 """
 
 import numpy as np
 
 
-def remove_cable_delay(frequencies, s21, tau=None):
+def _coerce_s21_error(s21_err, shape=None):
+    """Return I/Q standard uncertainties with the requested shape.
+
+    Error arrays in this package follow the readout-server convention:
+    a complex error means ``real == sigma_I`` and ``imag == sigma_Q``.
+    A real error is interpreted as the same standard uncertainty for both
+    quadratures, and a ``(sigma_I, sigma_Q)`` tuple is also accepted.
+    This helper only normalises shape and sign; it deliberately does not
+    decide whether the input represents a standard deviation or standard
+    error of the mean.
+    """
+    if s21_err is None:
+        return None
+
+    if isinstance(s21_err, (tuple, list)) and len(s21_err) == 2:
+        err_i, err_q = s21_err
+    else:
+        err = np.asarray(s21_err)
+        if np.iscomplexobj(err):
+            err_i = err.real
+            err_q = err.imag
+        else:
+            err_i = err
+            err_q = err
+
+    if shape is None:
+        err_i = np.abs(err_i).astype(float, copy=True)
+        err_q = np.abs(err_q).astype(float, copy=True)
+        return err_i, err_q
+
+    err_i = np.broadcast_to(np.abs(err_i), shape).astype(float, copy=True)
+    err_q = np.broadcast_to(np.abs(err_q), shape).astype(float, copy=True)
+    return err_i, err_q
+
+
+def transform_s21_error(s21_err, multiplier):
+    """Propagate I/Q uncertainties through ``z_out = multiplier * z``.
+
+    The calculation assumes independent I and Q errors and does not include
+    uncertainty in the transform parameters themselves (for example the
+    fitted baseline, delay, circle center, or rotation angle).  Translation
+    does not change per-point uncertainty; complex multiplication rotates
+    and scales it.  This matters when sigma_I != sigma_Q because a pure
+    90-degree rotation swaps the quadrature uncertainties:
+
+        I' = Re(c) I - Im(c) Q
+        Q' = Im(c) I + Re(c) Q
+
+    Args:
+        s21_err: Real, complex, or ``(sigma_I, sigma_Q)`` error array.
+        multiplier: Complex scalar or array multiplying the S21 data.
+
+    Returns:
+        Complex error array with real=sigma_I and imag=sigma_Q.
+    """
+    multiplier = np.asarray(multiplier, dtype=complex)
+    err_i, err_q = _coerce_s21_error(s21_err)
+    shape = np.broadcast_shapes(multiplier.shape, err_i.shape, err_q.shape)
+    multiplier = np.broadcast_to(multiplier, shape)
+    err_i = np.broadcast_to(err_i, shape)
+    err_q = np.broadcast_to(err_q, shape)
+    c_re = multiplier.real
+    c_im = multiplier.imag
+    out_i = np.sqrt((c_re * err_i) ** 2 + (c_im * err_q) ** 2)
+    out_q = np.sqrt((c_im * err_i) ** 2 + (c_re * err_q) ** 2)
+    return out_i + 1j * out_q
+
+
+def remove_cable_delay(frequencies, s21, tau=None, s21_err=None):
     """
     Remove electrical delay (cable delay) from S21 data.
 
@@ -35,10 +112,12 @@ def remove_cable_delay(frequencies, s21, tau=None):
         s21: 1D complex array of S21 values.
         tau: Cable delay in seconds. If None, estimated from the
              median gradient of the unwrapped phase.
+        s21_err: Optional S21 uncertainty. A complex array is interpreted
+            as real=sigma_I and imag=sigma_Q.
 
     Returns:
-        s21_corrected: Complex array with cable delay removed.
-        tau: The delay that was removed (seconds).
+        If ``s21_err`` is None: ``(s21_corrected, tau)``.
+        Otherwise: ``(s21_corrected, s21_err_corrected, tau)``.
     """
     frequencies = np.asarray(frequencies, dtype=float)
     s21 = np.asarray(s21, dtype=complex)
@@ -49,8 +128,12 @@ def remove_cable_delay(frequencies, s21, tau=None):
         dphase_df = np.gradient(phase, frequencies)
         tau = -np.median(dphase_df) / (2 * np.pi)
 
-    s21_corrected = s21 * np.exp(1j * 2 * np.pi * frequencies * tau)
-    return s21_corrected, tau
+    multiplier = np.exp(1j * 2 * np.pi * frequencies * tau)
+    s21_corrected = s21 * multiplier
+    if s21_err is None:
+        return s21_corrected, tau
+    s21_err_corrected = transform_s21_error(s21_err, multiplier)
+    return s21_corrected, s21_err_corrected, tau
 
 
 def _resolve_group_delay_cal(group_delay_cal, frequencies):
@@ -89,9 +172,8 @@ def _integrate_group_delay(group_delay_cal, frequencies):
     """Integrate a group delay calibration to recover cumulative phase.
 
     Group delay is the derivative of phase: τ(f) = -1/(2π) dφ/df.
-    Recovering the phase requires integration, not multiplication by f.
-    For a constant delay the integral reduces to 2πfτ, but for
-    frequency-dependent delay the pointwise product 2πf·τ(f) is wrong.
+    Recovering the phase requires integration.
+    For a constant delay the integral reduces to 2πfτ..
 
     Args:
         group_delay_cal: Group delay calibration (same formats as
@@ -149,7 +231,7 @@ def _integrate_group_delay(group_delay_cal, frequencies):
     return phase.reshape(frequencies.shape)
 
 
-def remove_group_delay(frequencies, s21, group_delay_cal):
+def remove_group_delay(frequencies, s21, group_delay_cal, s21_err=None):
     """
     Remove frequency-dependent group delay from S21 data.
 
@@ -169,17 +251,23 @@ def remove_group_delay(frequencies, s21, group_delay_cal):
             - ``[[freq_hz, tau_ns], ...]`` — frequency-dependent pairs.
             - result dict from ``measure_path_group_delay()`` with keys
               ``'frequencies'`` and ``'tau_ns'``.
+        s21_err: Optional S21 uncertainty. A complex array is interpreted
+            as real=sigma_I and imag=sigma_Q.
 
     Returns:
-        s21_corrected: Complex array with group delay removed.
-        tau_s: 1-D array of delay values removed (seconds).
+        If ``s21_err`` is None: ``(s21_corrected, tau_s)``.
+        Otherwise: ``(s21_corrected, s21_err_corrected, tau_s)``.
     """
     frequencies = np.asarray(frequencies, dtype=float)
     s21 = np.asarray(s21, dtype=complex)
     tau_s = _resolve_group_delay_cal(group_delay_cal, frequencies)
     phase = _integrate_group_delay(group_delay_cal, frequencies)
-    s21_corrected = s21 * np.exp(1j * phase)
-    return s21_corrected, tau_s
+    multiplier = np.exp(1j * phase)
+    s21_corrected = s21 * multiplier
+    if s21_err is None:
+        return s21_corrected, tau_s
+    s21_err_corrected = transform_s21_error(s21_err, multiplier)
+    return s21_corrected, s21_err_corrected, tau_s
 
 
 def center_circle(s21):
@@ -243,19 +331,20 @@ def center_circle(s21):
     return s21_centered, center, radius
 
 
-def rotate_to_real_axis(s21, s21_at_resonance=None):
+def rotate_to_real_axis(s21, s21_off_resonance=None, n_edge=5):
     """
-    Rotate S21 so the resonance point lies on the negative real axis.
+    Rotate centered S21 so off resonance lies on the negative real axis.
 
     This is the second step of *phase centering* (after ``center_circle``).
-    The result places the off-resonance point near 0 rad and the
-    on-resonance point near ±π rad.
+    The result places the off-resonance point near ±π rad and the
+    on-resonance point near 0 rad.
 
     Args:
         s21: 1D complex array (should already be centered).
-        s21_at_resonance: Complex value at resonance. If None, uses
-                          the point with minimum distance from the origin
-                          (deepest dip on the centered circle).
+        s21_off_resonance: Centered complex value off resonance. If None,
+            uses the average of the centered sweep edge points.
+        n_edge: Number of points from each edge to average when estimating
+            the off-resonance point.
 
     Returns:
         s21_rotated: Complex array.
@@ -263,13 +352,11 @@ def rotate_to_real_axis(s21, s21_at_resonance=None):
     """
     s21 = np.asarray(s21, dtype=complex)
 
-    if s21_at_resonance is None:
-        # Minimum magnitude point on centered circle = resonance
-        idx = np.argmin(np.abs(s21))
-        s21_at_resonance = s21[idx]
+    if s21_off_resonance is None:
+        s21_off_resonance = _estimate_baseline(s21, n_edge=n_edge)
 
-    # Rotate so this point is on the negative real axis
-    angle = np.pi - np.angle(s21_at_resonance)
+    # Rotate so the off-resonance point is on the negative real axis.
+    angle = np.pi - np.angle(s21_off_resonance)
     s21_rotated = s21 * np.exp(1j * angle)
     return s21_rotated, angle
 
@@ -288,7 +375,7 @@ def _estimate_baseline(s21, n_edge=5):
 
 # -- True RF deembedding ----------------------------------------------------
 
-def deembed(frequencies, s21, tau=None, group_delay_cal=None):
+def deembed(frequencies, s21, tau=None, group_delay_cal=None, s21_err=None):
     """
     True RF deembedding for a notch resonator.
 
@@ -305,31 +392,50 @@ def deembed(frequencies, s21, tau=None, group_delay_cal=None):
             (from ``measure_path_group_delay()``).  When provided, used
             instead of a scalar ``tau``.  Accepted formats: scalar (ns),
             ``[[freq_hz, tau_ns], ...]``, or result dict.
+        s21_err: Optional S21 uncertainty. A complex array is interpreted
+            as real=sigma_I and imag=sigma_Q.
 
     Returns:
-        s21_deembedded: Complex array in the standard notch resonator
-            representation.
-        params: dict with keys:
-            'tau': cable delay removed (seconds; scalar or array)
-            'baseline': complex off-resonance baseline value
-            'group_delay_cal': the calibration used, or None
+        If ``s21_err`` is None: ``(s21_deembedded, params)``.
+        Otherwise: ``(s21_deembedded, s21_err_deembedded, params)``.
+
+        The propagated errors include the pointwise delay rotation and
+        baseline division, but not uncertainty in the estimated tau or
+        baseline themselves. ``params`` has keys:
+        'tau', 'baseline', and 'group_delay_cal'.
     """
     if group_delay_cal is not None:
-        s21_no_delay, tau = remove_group_delay(frequencies, s21, group_delay_cal)
+        if s21_err is None:
+            s21_no_delay, tau = remove_group_delay(
+                frequencies, s21, group_delay_cal)
+            err_no_delay = None
+        else:
+            s21_no_delay, err_no_delay, tau = remove_group_delay(
+                frequencies, s21, group_delay_cal, s21_err=s21_err)
     else:
-        s21_no_delay, tau = remove_cable_delay(frequencies, s21, tau=tau)
+        if s21_err is None:
+            s21_no_delay, tau = remove_cable_delay(
+                frequencies, s21, tau=tau)
+            err_no_delay = None
+        else:
+            s21_no_delay, err_no_delay, tau = remove_cable_delay(
+                frequencies, s21, tau=tau, s21_err=s21_err)
     baseline = _estimate_baseline(s21_no_delay)
     s21_deembedded = s21_no_delay / baseline
+    if err_no_delay is not None:
+        s21_err_deembedded = transform_s21_error(err_no_delay, 1.0 / baseline)
 
     params = {
         'tau': tau,
         'baseline': baseline,
         'group_delay_cal': group_delay_cal,
     }
+    if s21_err is not None:
+        return s21_deembedded, s21_err_deembedded, params
     return s21_deembedded, params
 
 
-def apply_deembed_params(s21, params, frequency=None):
+def apply_deembed_params(s21, params, frequency=None, s21_err=None):
     """
     Apply deembed parameters to new data (e.g. timestream).
 
@@ -342,56 +448,73 @@ def apply_deembed_params(s21, params, frequency=None):
         frequency: Tone frequency in Hz.  When provided, cable delay is
             removed at this frequency before baseline normalisation.
             When None, only baseline normalisation is applied.
+        s21_err: Optional S21 uncertainty. A complex array is interpreted
+            as real=sigma_I and imag=sigma_Q.
 
     Returns:
-        s21_deembedded: Deembedded complex array.
+        If ``s21_err`` is None: deembedded complex array.
+        Otherwise: ``(s21_deembedded, s21_err_deembedded)``.
     """
     s21 = np.asarray(s21, dtype=complex)
+    multiplier = 1.0 / params['baseline']
     if frequency is not None:
         group_delay_cal = params.get('group_delay_cal')
         if group_delay_cal is not None:
             phase = _integrate_group_delay(group_delay_cal, np.atleast_1d(frequency))
-            s21 = s21 * np.exp(1j * phase)
+            multiplier = np.exp(1j * phase) / params['baseline']
         elif params.get('tau') is not None:
-            s21 = s21 * np.exp(
+            multiplier = (np.exp(
                 1j * 2 * np.pi * np.asarray(frequency, dtype=float) * params['tau'])
-    return s21 / params['baseline']
+                / params['baseline'])
+    s21_deembedded = s21 * multiplier
+    if s21_err is None:
+        return s21_deembedded
+    s21_err_deembedded = transform_s21_error(s21_err, multiplier)
+    return s21_deembedded, s21_err_deembedded
 
 
 # -- Phase centering --------------------------------------------------------
 
-def phase_center(s21):
+def phase_center(s21, s21_err=None, n_edge=5):
     """
     Phase-center S21 data: circle centering followed by rotation.
 
     Translates the resonance circle so its algebraic center is at the
-    origin and rotates so that the resonance point lies on the negative
-    real axis (off-resonance near 0 rad, on-resonance near ±π rad).
+    origin and rotates so that the off-resonance point lies on the
+    negative real axis (off-resonance near ±π rad, on-resonance near 0 rad).
 
     Can be applied to raw, cable-delay-corrected, or deembedded data.
 
     Args:
         s21: 1D complex array.
+        s21_err: Optional S21 uncertainty. A complex array is interpreted
+            as real=sigma_I and imag=sigma_Q.
+        n_edge: Number of points from each sweep edge to average when
+            estimating the off-resonance point for rotation.
 
     Returns:
-        s21_centered: Phase-centered complex array.
-        params: dict with keys:
-            'center': complex circle center
-            'radius': float circle radius
-            'rotation_angle': float rotation applied (radians)
+        If ``s21_err`` is None: ``(s21_centered, params)``.
+        Otherwise: ``(s21_centered, s21_err_centered, params)``.
+        Translation by the fitted center does not change per-point
+        uncertainty; rotation propagates I/Q uncertainties with
+        ``transform_s21_error``.
     """
     s21_centered, center, radius = center_circle(s21)
-    s21_rotated, angle = rotate_to_real_axis(s21_centered)
+    s21_rotated, angle = rotate_to_real_axis(s21_centered, n_edge=n_edge)
+    if s21_err is not None:
+        s21_err_rotated = transform_s21_error(s21_err, np.exp(1j * angle))
 
     params = {
         'center': center,
         'radius': radius,
         'rotation_angle': angle,
     }
+    if s21_err is not None:
+        return s21_rotated, s21_err_rotated, params
     return s21_rotated, params
 
 
-def apply_phase_center_params(s21, params):
+def apply_phase_center_params(s21, params, s21_err=None):
     """
     Apply phase-centering parameters to new data.
 
@@ -402,27 +525,35 @@ def apply_phase_center_params(s21, params):
         s21: Complex array (or single complex value) to transform.
         params: dict from ``phase_center()`` with keys 'center',
                 'rotation_angle'.
+        s21_err: Optional S21 uncertainty. A complex array is interpreted
+            as real=sigma_I and imag=sigma_Q.
 
     Returns:
-        s21_centered: Phase-centered complex array.
+        If ``s21_err`` is None: phase-centered complex array.
+        Otherwise: ``(s21_centered, s21_err_centered)``.
     """
     s21 = np.asarray(s21, dtype=complex)
     s21_centered = s21 - params['center']
-    return s21_centered * np.exp(1j * params['rotation_angle'])
+    multiplier = np.exp(1j * params['rotation_angle'])
+    s21_rotated = s21_centered * multiplier
+    if s21_err is None:
+        return s21_rotated
+    s21_err_rotated = transform_s21_error(s21_err, multiplier)
+    return s21_rotated, s21_err_rotated
 
 
 class ResonatorCalibration:
     """
     Cached calibration for vectorized IQ - frequency/dissipation conversion.
 
-    Stores the phase-centering parameters (cable delay, circle center,
-    rotation) along with the resonator model parameters (fr, Ql) needed
-    to convert between raw IQ and physical quantities.
+    Stores the phase-centering parameters (cable delay, gain phase, circle
+    center, rotation) along with the resonator model parameters (fr, Ql)
+    needed to convert between raw IQ and physical quantities.
 
     On the phase-centered circle (centered at origin, resonance on
-    negative real axis), the exact Möbius inversion gives:
+    positive real axis), the exact Möbius inversion gives:
 
-        x = (f - fr) / fr = Re[-j * (z + r) / (2 * Ql * (r - z))]
+        x = (f - fr) / fr = Re[-j * (r - z) / (2 * Ql * (r + z))]
 
     This is valid for arbitrary detuning, not just small perturbations.
 
@@ -439,16 +570,21 @@ class ResonatorCalibration:
         df, dd = convert(z)     # z is raw IQ, scalar or array
     """
 
-    __slots__ = ('fr', 'Ql', 'tau', 'center', 'radius',
-                 'rotation_angle', '_rotation_phasor')
+    __slots__ = ('fr', 'Ql', 'tau', 'center', 'radius', 'gain_amplitude',
+                 'gain_phase', 'rotation_angle', '_deembed_scale',
+                 '_rotation_phasor')
 
-    def __init__(self, fr, Ql, tau, center, radius, rotation_angle):
+    def __init__(self, fr, Ql, tau, center, radius, rotation_angle,
+                 gain_amplitude=1.0, gain_phase=0.0):
         self.fr = float(fr)
         self.Ql = float(Ql)
         self.tau = float(tau)
         self.center = complex(center)
         self.radius = float(radius)
+        self.gain_amplitude = float(gain_amplitude)
+        self.gain_phase = float(gain_phase)
         self.rotation_angle = float(rotation_angle)
+        self._deembed_scale = np.exp(-1j * self.gain_phase) / self.gain_amplitude
         self._rotation_phasor = np.exp(1j * rotation_angle)
 
     @classmethod
@@ -464,12 +600,22 @@ class ResonatorCalibration:
         fr = fit_result.fr
         Ql = fit_result.Ql
         tau = fit_result.tau
-        center = fit_result.iq_center
-        radius = fit_result.iq_radius
-        # Rotation angle: put the resonance point on the negative real axis.
-        # In the centered frame, the resonance point is at angle (pi + alpha + phi).
-        rotation_angle = -(fit_result.alpha + fit_result.phi)
-        return cls(fr, Ql, tau, center, radius, rotation_angle)
+        # The public fit_result.iq_center/iq_radius describe the raw IQ plot.
+        # Calibration removes fitted gain and delay before centering, so use
+        # the exact deembedded circle geometry from the model.
+        center = fit_result.iq_center_deembed
+        radius = fit_result.iq_radius_deembed
+        # Rotation angle: put the off-resonance point on the negative real
+        # axis, leaving the resonance point on the positive real axis.
+        # FitResult.alpha is already in the public absolute-frequency phase
+        # convention used with exp(-j*2*pi*f*tau), and is removed by
+        # _deembed_scale before this rotation is applied.
+        # With Qe = Qc*(1 + j*tan(phi)), the coupling term has phase -phi,
+        # so after removing alpha the resonance point is at angle pi - phi.
+        rotation_angle = getattr(
+            fit_result, 'phase_center_rotation_angle', fit_result.phi - np.pi)
+        return cls(fr, Ql, tau, center, radius, rotation_angle,
+                   gain_amplitude=fit_result.a, gain_phase=fit_result.alpha)
 
     @classmethod
     def from_sweep(cls, frequencies, s21, fr=None, Ql=None, group_delay_cal=None):
@@ -517,27 +663,38 @@ class ResonatorCalibration:
         return {
             'center': self.center,
             'radius': self.radius,
+            'gain_amplitude': self.gain_amplitude,
+            'gain_phase': self.gain_phase,
             'rotation_angle': self.rotation_angle,
         }
 
     # -- Phase centering -----------------------------------------------------
 
-    def deembed_sweep(self, frequencies, s21):
+    def deembed_sweep(self, frequencies, s21, s21_err=None):
         """
         Phase-center sweep data (cable delay removal + centering + rotation).
 
         Args:
             frequencies: 1D frequency array (Hz).
             s21: Complex S21 array.
+            s21_err: Optional S21 uncertainty. A complex array is interpreted
+                as real=sigma_I and imag=sigma_Q.
 
         Returns:
-            Complex array, phase-centered.
+            If ``s21_err`` is None: complex array, phase-centered.
+            Otherwise: ``(z_centered, z_err_centered)``.
         """
         s21 = np.asarray(s21, dtype=complex)
-        z = s21 * np.exp(1j * 2 * np.pi * np.asarray(frequencies) * self.tau)
-        return (z - self.center) * self._rotation_phasor
+        deembed_scale = (
+            np.exp(1j * 2 * np.pi * np.asarray(frequencies) * self.tau)
+            * self._deembed_scale)
+        multiplier = deembed_scale * self._rotation_phasor
+        z = (s21 * deembed_scale - self.center) * self._rotation_phasor
+        if s21_err is None:
+            return z
+        return z, transform_s21_error(s21_err, multiplier)
 
-    def deembed_timestream(self, s21):
+    def deembed_timestream(self, s21, s21_err=None):
         """
         Phase-center timestream data (centering + rotation, no cable delay).
 
@@ -547,12 +704,19 @@ class ResonatorCalibration:
 
         Args:
             s21: Complex array of timestream IQ samples.
+            s21_err: Optional S21 uncertainty. A complex array is interpreted
+                as real=sigma_I and imag=sigma_Q.
 
         Returns:
-            Complex array, phase-centered (centered and rotated).
+            If ``s21_err`` is None: complex array, phase-centered.
+            Otherwise: ``(z_centered, z_err_centered)``.
         """
         s21 = np.asarray(s21, dtype=complex)
-        return (s21 - self.center) * self._rotation_phasor
+        z = (s21 * self._deembed_scale - self.center) * self._rotation_phasor
+        if s21_err is None:
+            return z
+        return z, transform_s21_error(
+            s21_err, self._deembed_scale * self._rotation_phasor)
 
     # -- Conversions ---------------------------------------------------------
 
@@ -566,7 +730,7 @@ class ResonatorCalibration:
 
         Returns:
             phase: Angle on the resonance circle (rad). Zero at the
-                   off-resonance point (+real axis), ±pi at resonance.
+                   resonance point (+real axis), ±pi off resonance.
             amplitude: |z| / radius. Unity on the model circle;
                        deviations indicate dissipation changes.
         """
@@ -582,10 +746,10 @@ class ResonatorCalibration:
         for arbitrary detuning (not just small perturbations).
 
         On the phase-centered circle the model is:
-            z = r * (-1 + 2j*Ql*x) / (1 + 2j*Ql*x),  x = (f-fr)/fr
+            z = r * (1 - 2j*Ql*x) / (1 + 2j*Ql*x),  x = (f-fr)/fr
 
         Inverting:
-            x = Re[-j * (z + r) / (2*Ql * (r - z))]
+            x = Re[-j * (r - z) / (2*Ql * (r + z))]
 
         Args:
             z_centered: Complex array on the phase-centered circle.
@@ -597,7 +761,7 @@ class ResonatorCalibration:
         """
         r = self.radius
         z = np.asarray(z_centered, dtype=complex)
-        x = np.real(-1j * (z + r) / (2.0 * self.Ql * (r - z)))
+        x = np.real(-1j * (r - z) / (2.0 * self.Ql * (r + z)))
         df = x * self.fr
         dd = np.abs(z) / r - 1.0
         return df, dd
@@ -628,7 +792,7 @@ class ToneConverter:
     Pre-combines cable delay removal and phase centering into a single
     complex multiply and add, so each call is:
         z_d = z * _multiply - _offset      (1 complex mul + 1 complex sub)
-        x   = Re[-j*(z_d + r) / (2*Ql*(r - z_d))]  (Möbius inversion)
+        x   = Re[-j*(r - z_d) / (2*Ql*(r + z_d))]  (Möbius inversion)
         df  = x * fr
 
     Construct via ResonatorCalibration.tone_converter(f_tone).
@@ -637,8 +801,9 @@ class ToneConverter:
     __slots__ = ('_multiply', '_offset', '_fr', '_Ql', '_radius')
 
     def __init__(self, cal, f_tone):
-        # Combine cable delay and rotation into a single phasor
-        self._multiply = np.exp(1j * 2 * np.pi * f_tone * cal.tau) * cal._rotation_phasor
+        # Combine cable delay, gain removal, and rotation into one phasor.
+        self._multiply = (np.exp(1j * 2 * np.pi * f_tone * cal.tau)
+                          * cal._deembed_scale * cal._rotation_phasor)
         self._offset = cal.center * cal._rotation_phasor
         self._fr = cal.fr
         self._Ql = cal.Ql
@@ -657,7 +822,7 @@ class ToneConverter:
         """
         z_d = z * self._multiply - self._offset
         r = self._radius
-        x = np.real(-1j * (z_d + r) / (2.0 * self._Ql * (r - z_d)))
+        x = np.real(-1j * (r - z_d) / (2.0 * self._Ql * (r + z_d)))
         df = x * self._fr
         dd = np.abs(z_d) / r - 1.0
         return df, dd

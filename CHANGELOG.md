@@ -27,11 +27,32 @@ Forward-ported the `jl_ocs_devel` branch (PR #10) plus follow-on hardening.
   sweeps, snapshots, streams, the full `get_info()` surface, and the new
   G3 stream writer.
 
-**OCS Resonator Helpers**
+**OCS Compatibility Fitting Helpers (`client/res_fns.py`)**
 - Forward-ported `souk_readout_tools.client.res_fns` for `UKKIDController`
   compatibility. Provides simple resonator-fitting helpers (`s21_model`,
-  etc.). Slated for removal once the built-in fitting tools in
+  etc.). Slated for removal once the core fitting tools in
   `souk_readout_tools` are fully validated in `UKKIDController`.
+
+**Core Resonator Fitting (`fitting.py`)**
+- Reworked the linear and nonlinear resonator fitters around a clearer
+  parameter convention (`fr, Qi, Qc, phi, A, alpha, tau[, anl]`). `Qc` is the
+  fitted real coupling parameter; `Qe` and `Qc_abs` are derived reporting
+  fields. Fit setup now uses explicit `initial_guess`, `param_bounds`, and
+  `param_fixed` dictionaries.
+- Improved nonlinear/Duffing fitting for highly driven resonances. The new
+  seed strategy, high-drive handling, optional subsampling, and fit diagnostics
+  give much better and faster convergence on distorted resonance shapes.
+- Added process-based parallel fitting for `fit_sweep_stack()` and
+  `batch_fit()` via `n_jobs`, with compact verbose progress showing throughput,
+  fit timing, and cumulative function evaluations.
+
+**Resonator Transforms and Plotting**
+- Deembedding, phase-centering, and sweep plotting now propagate optional S21
+  uncertainties (`real=sigma_I`, `imag=sigma_Q`) through the same transforms
+  applied to the data.
+- Updated the phase-centering convention and calibration construction so
+  fitted resonator geometry is handled consistently across fitting, plotting,
+  and frequency/dissipation conversion.
 
 **CSV Import Hardening**
 - `import_sweep` and the equivalent stream/snapshot CSV importers now use
@@ -277,19 +298,27 @@ Forward-ported the `jl_ocs_devel` branch (PR #10) plus follow-on hardening.
 - `deembed()` — true RF deembedding: cable delay + baseline normalisation (off-resonance → (1, 0)).
 - `apply_deembed_params()` — apply deembed to timestream data.
 - `center_circle()` — Kasa algebraic circle fit.
-- `rotate_to_real_axis()` — rotate resonance to negative real axis.
+- `rotate_to_real_axis()` — rotate the off-resonance point to the negative real axis.
 - `phase_center()` — circle centering + rotation (may act on raw or deembedded data).
 - `apply_phase_center_params()` — apply phase centering to timestream data.
+- Transform helpers accept optional S21 errors and propagate independent I/Q
+  uncertainties through delay removal, baseline division, and rotations.
 
 **Resonance Finding Enhancements**
 - `find_resonances(mode='targeted')` — per-tone resonance search with double/triple flagging.
 - `flagged_tones` output for tones containing multiple resonances.
 
 **Resonator Fitting (`souk_readout_tools.fitting`)**
-- Khalil notch-type resonator model: `S21 = a*exp(jα)*exp(-2πjfτ)*(1 - Ql/|Qc|*exp(jφ)/(1+2jQlΔf/fr))`.
-- `fit_resonance()` — single resonance nonlinear least-squares fit.
-- `batch_fit()` — automatic detection and fitting of all resonances.
-- `extract_parameters()` — extract fitted parameters into arrays.
+- Notch/Duffing resonator model with fitted parameters
+  `fr, Qi, Qc, phi, a, alpha, tau[, anl]`; `Qe` and `Qc_abs` are derived.
+- `fit_resonance()` / `fit_resonance_nonlinear()` — single-resonance
+  least-squares fit with named `initial_guess`, `param_bounds`, and
+  `param_fixed` controls.
+- `fit_sweep_stack()` — process-parallel fitting of already-windowed sweep
+  stacks.
+- `batch_fit()` — automatic detection/windowing and process-parallel fitting
+  of all resonances.
+- `extract_parameters()` — extract fitted and diagnostic parameters into arrays.
 - CLI tool: `souk-find-resonances` (with `--fit` option).
 
 **Parameter Space Measurements (`souk_readout_tools.measurement`)**
