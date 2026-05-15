@@ -1,14 +1,33 @@
-# Hardware Validation Plan — v1.1.0
+# Hardware Validation Test Plan
 
-This plan covers all v1.1.0 changes that touch hardware and software. Tests
-are grouped into stages by what equipment is needed. Work through them in
-order — each stage builds confidence for the next.
+This is the living hardware/software validation plan. It started as the v1.1.0
+hardware validation plan, and later releases add or update individual tests
+rather than creating a new filename each time. Tests are grouped into stages by
+what equipment is needed. Work through them in order — each stage builds
+confidence for the next.
 
-Note: this is a historical v1.1.0 validation plan. The current v1.1.1 config
-uses nested `rf_frontend.attenuator`, `rf_frontend.mixerless_module`,
-`rf_frontend.bypass_amps`, and `cryostat.lna_bias` backend fields; use
-`template_config.yaml`, `doc/rf_peripherals.md`, and `doc/lna_bias.md` for
-current config key names.
+Checklist state is historical unless a new run date is recorded. Old unchecked
+items still represent validation debt from the release where they were added.
+
+## Release Focus — v1.3.0
+
+New or changed areas that should be rerun for v1.3.0:
+
+- Resonator fitting: sections 4.5, 4.5b, 4.6, and 4.7. Cover the `Qc` / `Qe`
+  convention, `param_bounds` / `param_fixed`, function-evaluation counters,
+  compact verbose progress, process-parallel `batch_fit()`, and nonlinear
+  convergence on highly driven resonances.
+- Resonator transforms and plotting: sections 3.2, 4.5c, 4.8, and 4.10. Cover
+  deembedding versus phase-centering semantics, phase-centred calibration
+  output, and transformed error propagation where error data are available.
+
+## Version Notes
+
+| Version | Test-plan meaning |
+| --- | --- |
+| v1.1.0 | Original hardware validation plan. Existing statuses mostly come from this baseline. |
+| v1.1.1 | Config naming changed to nested `rf_frontend.attenuator`, `rf_frontend.mixerless_module`, `rf_frontend.bypass_amps`, and `cryostat.lna_bias` backend fields. Use `template_config.yaml`, `doc/rf_peripherals.md`, and `doc/lna_bias.md` for current config key names. |
+| v1.3.0 | Resonator fitting, deembedding, phase-centering, and fitting CLI checks were updated. Rerun the release-focus sections above. |
 
 Stage 0 validates the fresh OS image install before any hardware interaction.
 
@@ -340,13 +359,13 @@ With internal loopback enabled:
 ```python
 sweep = c.wideband_sweep(step_size_hz=50000, verbose=True)
 ```
-- [x] Progress display updates during sweep (new in v1.1.0)
+- [x] Progress display updates during sweep (introduced in v1.1.0)
 - [x] `sweep['sweep_f'].shape[1]` matches expected number of points
 - [x] Magnitude is flat-ish across band (loopback, no resonances)
 - [x] Phase is smooth (phase slope removal working)
 - [x] `sweep['info']` dict is populated
 
-### 1.10b  Wideband sweep with auto power (new in v1.1.0)
+### 1.10b  Wideband sweep with auto power (introduced in v1.1.0)
 
 ```python
 sweep = c.wideband_sweep(tone_powers_dbm='auto', verbose=True)
@@ -362,7 +381,7 @@ sweep = c.wideband_sweep(tone_powers_dbm=-60.0, verbose=True)
 - [x] Tones are set to -60 dBm via `set_tone_powers()`
 - [x] Sweep completes with consistent power levels
 
-### 1.10c  RX tone powers (new in v1.1.0)
+### 1.10c  RX tone powers (introduced in v1.1.0)
 
 ```python
 # Predict received power from current TX settings and RX calibration
@@ -641,20 +660,20 @@ fig = plot_sweep(sweep, format='iq_vs_f'); plt.show()
 - [ ] IQ vs freq: smooth I and Q traces
 - [ ] All three formats render without errors
 
-### 3.2  Sweep with deembedding
+### 3.2  Sweep with deembedding (updated in v1.3.0)
 
 ```python
 fig = plot_sweep(sweep, format='iq', deembed=True)
 plt.show()
 ```
 - [ ] Cable delay removed: IQ trace is a tighter cluster (no large loop)
-- [ ] Circle centering brings the data near the origin
+- [ ] Off-resonance is normalised near (1, 0)
 - [ ] No crash or NaN in deembedded data
 
 ### 3.3  Resonator module — cable delay estimation
 
 ```python
-from souk_readout_tools.resonator import remove_cable_delay, deembed
+from souk_readout_tools.resonator import remove_cable_delay
 import numpy as np
 
 f = np.ravel(sweep['sweep_f'])
@@ -744,7 +763,7 @@ plt.show()
 ```
 - [ ] Sweep trace (line) and timestream points (scatter) appear on same IQ axes
 - [ ] Timestream points cluster on or near the sweep trace
-- [ ] With `deembed=True`: circle is centred, resonance on negative real axis
+- [ ] With `phase_center=True`: circle is centred, off-resonance lies on the negative real axis, and resonance is near zero phase
 
 ---
 
@@ -803,7 +822,7 @@ souk-find-resonances -C config.yaml --prominence 2.0 -P
 - [ ] Plot shows sweep with green markers at resonance locations
 - [ ] Marker positions match the resonance frequencies in the table
 
-### 4.5  Resonance fitting
+### 4.5  Resonance fitting (updated in v1.3.0)
 
 ```python
 from souk_readout_tools.fitting import batch_fit, extract_parameters
@@ -814,34 +833,41 @@ params = extract_parameters(fit_results)
 print(f"Fitted {len(fit_results)} resonances")
 for r in fit_results[:5]:
     print(f"  fr={r.fr/1e6:.4f} MHz, Ql={r.Ql:.0f}, "
-          f"Qi={r.Qi:.0f}, Qc={r.Qc_abs:.0f}, "
-          f"rms={r.residual_rms:.2e}, success={r.success}")
+          f"Qi={r.Qi:.0f}, Qc={r.Qc:.0f}, "
+          f"nfev={r.nfev}, rms={r.residual_rms:.2e}, success={r.success}")
 ```
 - [ ] Most fits converge (`success=True`)
 - [ ] `Ql` values are physically reasonable (typically 1e3-1e6 for MKIDs)
 - [ ] `Qi > Ql` (internal Q should exceed loaded Q)
+- [ ] Fitted `Qc` is the real coupling parameter; `Qe` and `Qc_abs=abs(Qe)` are derived reporting fields
+- [ ] `nfev`, `linear_nfev`, and fit timing fields are populated
 - [ ] `residual_rms` is small relative to the dip depth
 - [ ] Fitted `fr` values agree with peak-finder frequencies to within a linewidth
 - [ ] `FitResult.iq_center` and `FitResult.iq_radius` are populated
 - [ ] `FitResult.anl` is 0.0 for linear fits
 
-### 4.5b  Nonlinear resonance fitting (new in v1.1.0)
+### 4.5b  Nonlinear resonance fitting (introduced in v1.1.0, updated in v1.3.0)
 
 ```python
 from souk_readout_tools.fitting import batch_fit
 
 # Nonlinear (Duffing) model — useful at high drive power
-nl_results = batch_fit(sweep, nonlinear=True, sweep_direction='up', verbose=True)
+nl_results = batch_fit(
+    sweep, nonlinear=True, sweep_direction='up', verbose=True,
+    n_jobs=-1, subsample=True,
+)
 for r in nl_results[:5]:
     print(f"  fr={r.fr/1e6:.4f} MHz, Ql={r.Ql:.0f}, Qi={r.Qi:.0f}, "
-          f"anl={r.anl:.2e}, rms={r.residual_rms:.2e}")
+          f"anl={r.anl:.2e}, nfev={r.nfev}, rms={r.residual_rms:.2e}")
 ```
 - [ ] Nonlinear fits converge
 - [ ] `anl` values are small and positive (typically < 0.1 for low-power)
 - [ ] Fit quality is comparable to or better than linear fits
+- [ ] `nonlinear_nfev` includes all attempted nonlinear seeds when `try_harder` / `try_even_harder` is used
+- [ ] `verbose=True` prints compact progress with throughput and cumulative `nfev`
 - [ ] `sweep_direction='down'` produces different `anl` values at high power
 
-### 4.5c  ResonatorCalibration and ToneConverter (new in v1.1.0)
+### 4.5c  ResonatorCalibration and ToneConverter (introduced in v1.1.0, updated in v1.3.0)
 
 ```python
 from souk_readout_tools.resonator import ResonatorCalibration
@@ -870,18 +896,18 @@ df_ts, dd_ts = convert(z_raw)
 - [ ] `deembed_sweep()` produces a centered, rotated resonance circle
 - [ ] `to_frequency_dissipation()` returns sensible df, dd values
 - [ ] `ToneConverter` produces same results as full deembed + convert pipeline
-- [ ] `deembed_params` property is compatible with `apply_deembed_params()`
+- [ ] `phase_center_params` property is compatible with `apply_phase_center_params()`
 
-### 4.6  Fit quality inspection
+### 4.6  Fit quality inspection (updated in v1.3.0)
 
 ```python
 # Plot a single fit
 import matplotlib.pyplot as plt
-from souk_readout_tools.fitting import _s21_notch
+from souk_readout_tools.fitting import evaluate_fit
 
 r = fit_results[0]
 f_fine = np.linspace(r.f_data[0], r.f_data[-1], 1000)
-z_model = _s21_notch(f_fine, r.fr, r.Ql, r.Qc_abs, r.phi, r.a, r.alpha, r.tau)
+z_model = evaluate_fit(f_fine, r)
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 ax1.plot(r.f_data/1e6, 20*np.log10(np.abs(r.z_data)), '.', ms=2, label='Data')
@@ -900,7 +926,7 @@ plt.tight_layout(); plt.show()
 - [ ] Resonance circle in IQ is well-described by the model
 - [ ] No systematic residual pattern (would indicate model mismatch)
 
-### 4.7  Resonance fitting CLI
+### 4.7  Resonance fitting CLI (updated in v1.3.0)
 
 ```bash
 souk-find-resonances -C config.yaml --fit -f resonances.txt -P
@@ -910,25 +936,28 @@ souk-find-resonances -C config.yaml --fit -f resonances.txt -P
 - [ ] File is tab-separated and machine-parseable
 - [ ] Plot shows sweep with fitted resonance markers
 
-### 4.8  Deembedding on real resonance data
+### 4.8  Deembedding and phase centering on real resonance data (updated in v1.3.0)
 
 ```python
-from souk_readout_tools.resonator import deembed
+from souk_readout_tools.resonator import deembed, phase_center
 
 f = np.ravel(sweep['sweep_f'])
 z = np.ravel(sweep['sweep_i']) + 1j * np.ravel(sweep['sweep_q'])
 
 z_de, params = deembed(f, z)
+z_pc, pc_params = phase_center(z_de)
 print(f"Cable delay: {params['tau']*1e9:.2f} ns")
-print(f"Circle center: {params['center']}")
-print(f"Rotation angle: {params['rotation_angle']:.3f} rad")
+print(f"Deembed baseline: {params['baseline']}")
+print(f"Circle center: {pc_params['center']}")
+print(f"Rotation angle: {pc_params['rotation_angle']:.3f} rad")
 
-fig = plot_sweep(sweep, format='iq', deembed=True)
+fig = plot_sweep(sweep, format='iq', deembed=True, phase_center=True)
 plt.show()
 ```
 - [ ] Cable delay is consistent with known cable length
-- [ ] Deembedded IQ plot shows resonance circles centred near origin
-- [ ] Resonance dips point toward negative real axis after rotation
+- [ ] Deembedded IQ plot has off-resonance near (1, 0)
+- [ ] Phase-centred IQ plot shows resonance circles centred near origin
+- [ ] Off-resonance points lie toward the negative real axis after phase centering; resonance is near zero phase
 
 ### 4.9  Frequency and dissipation noise measurement
 
@@ -956,7 +985,7 @@ plt.show()
 - [ ] PSD shows expected 1/f + white noise shape
 - [ ] No NaN or inf values in the output
 
-### 4.10  Timestream on resonance — real resonator
+### 4.10  Timestream on resonance — real resonator (updated in v1.3.0)
 
 ```python
 fig = plot_timestream_on_resonance(parsed, sweep_1t, tone_index=0, deembed=True)
@@ -964,7 +993,7 @@ plt.show()
 ```
 - [ ] Sweep trace shows the resonance circle
 - [ ] Timestream points cluster on the circle at the tone frequency
-- [ ] Deembedded view: circle is centred, points are on expected arc position
+- [ ] Deembedded view: off-resonance is normalised and timestream points are on the expected arc position
 
 ### 4.11  Multi-tone operation with real resonators
 

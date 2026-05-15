@@ -138,7 +138,7 @@ def main():
         fwhm = (fr / r.Ql * 1e-3) if fit_results else (r.fwhm or 0) * 1e-3
         Ql = r.Ql if fit_results else (r.q_factor or 0)
         Qi = r.Qi if fit_results else (r.qi or 0)
-        Qc = r.Qc_abs if fit_results else (r.qc or 0)
+        Qc = r.Qc if fit_results else (r.qc or 0)
         dip = (r.residual_rms if fit_results else r.dip_depth) or 0
         if fit_results:
             dip = r.residual_rms
@@ -162,7 +162,7 @@ def main():
                 fwhm = (fr / r.Ql) if fit_results else (r.fwhm or 0)
                 Ql = r.Ql if fit_results else (r.q_factor or 0)
                 Qi = r.Qi if fit_results else (r.qi or 0)
-                Qc = r.Qc_abs if fit_results else (r.qc or 0)
+                Qc = r.Qc if fit_results else (r.qc or 0)
                 dip = r.dip_depth if not fit_results else 0
                 fout.write(f"{fr:>16.6f}\t{fwhm:>12.3f}\t"
                            f"{Ql:>10.1f}\t{Qi:>10.1f}\t{Qc:>10.1f}\t{dip:>10.3f}\n")

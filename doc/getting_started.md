@@ -1178,7 +1178,7 @@ fig = plot_sweep(sweep_data, format='iq')
 # With true RF deembedding (off-resonance → (1, 0))
 fig = plot_sweep(sweep_data, format='iq', deembed=True)
 
-# With phase centering (circle centred at origin, resonance on −real axis)
+# With phase centering (circle centred at origin, off-resonance on negative real axis)
 fig = plot_sweep(sweep_data, format='iq', phase_center=True)
 
 # Both: deembed first, then phase-center the result
@@ -1247,7 +1247,8 @@ z_deembedded, deembed_params = deembed(frequencies, s21_complex)
 # deembed_params contains: tau, baseline
 
 # Phase centering: circle centering + rotation
-# Result: circle centred at origin, resonance on negative real axis
+# Result: circle centred at origin, off-resonance on negative real axis,
+# resonance near zero phase
 z_centered, pc_params = phase_center(s21_complex)
 # pc_params contains: center, radius, rotation_angle
 
@@ -1255,28 +1256,66 @@ z_centered, pc_params = phase_center(s21_complex)
 z_ts_deembedded = apply_deembed_params(z_ts, deembed_params, frequency=tone_freq)
 z_ts_centered = apply_phase_center_params(z_ts, pc_params)
 
+# Propagate independent I/Q errors through the same transforms
+s21_err = sigma_i + 1j * sigma_q
+z_deembedded, err_deembedded, deembed_params = deembed(
+    frequencies, s21_complex, s21_err=s21_err)
+
 # Cable delay removal only
 z_nodelay, tau = remove_cable_delay(frequencies, s21_complex)
 ```
 
 ### Resonance Fitting
 
-The `souk_readout_tools.fitting` module fits resonances to a notch-type (Khalil) model:
+The `souk_readout_tools.fitting` module fits complex S21 sweeps to a
+notch/Duffing resonator model. The fitted Q convention is:
 
 ```python
-from souk_readout_tools.fitting import fit_resonance, batch_fit, extract_parameters
+Qe = Qc * (1 + 1j * np.tan(phi))
+1 / Ql = 1 / Qi + np.real(1 / Qe)
+```
 
-# Fit a single resonance
-result = fit_resonance(f_tone, z_tone)
-print(f"fr={result.fr/1e6:.4f} MHz, Ql={result.Ql:.0f}, Qi={result.Qi:.0f}")
+Use `Qc` in `initial_guess`, `param_bounds`, and `param_fixed`.
+`Qc_abs = abs(Qe)` is returned for reporting, but is not a fitted parameter.
 
-# Batch fit all resonances in a sweep (auto-detects resonances)
-fits = batch_fit(sweep_data, verbose=True)
+```python
+from souk_readout_tools.fitting import (
+    fit_resonance, fit_sweep_stack, batch_fit, extract_parameters,
+)
+
+# Fit a single resonance. z_err follows the server convention:
+# real=sigma_I, imag=sigma_Q.
+z_tone = i_tone + 1j * q_tone
+z_err = ei_tone + 1j * eq_tone
+result = fit_resonance(
+    f_tone, z_tone, z_err=z_err, nonlinear=True,
+    use_error_weights=True, error_weight_power=0.5,
+    subsample=True,
+    param_bounds={"Qi": (1e3, 1e8), "phi": (-0.5, 0.5)},
+)
+print(
+    f"fr={result.fr/1e6:.4f} MHz, Ql={result.Ql:.0f}, "
+    f"Qi={result.Qi:.0f}, Qc={result.Qc:.0f}, nfev={result.nfev}")
+
+# Fit an already-windowed stack, e.g. the same KID over several powers
+fits_by_power = fit_sweep_stack(
+    f_stack, z_stack, z_err_stack=e_stack, nonlinear=True,
+    n_jobs=-1, verbose=True, subsample=True,
+)
+
+# Batch fit all resonances in a full sweep (auto-detects resonances)
+fits = batch_fit(
+    sweep_data, nonlinear=True, n_jobs=-1, verbose=True,
+    use_error_weights=True, error_weight_power=0.5, subsample=True,
+)
 
 # Extract to arrays
 params = extract_parameters(fits)
 print(f"Mean Qi: {np.mean(params['Qi']):.0f}")
 ```
+
+`verbose=True` prints compact progress with throughput and cumulative
+function evaluations. Use `verbose=2` to print one line per completed fit.
 
 CLI: `souk-find-resonances -C config.yaml --fit -f resonances.txt -P`
 

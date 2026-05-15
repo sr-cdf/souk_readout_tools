@@ -53,24 +53,55 @@ def _apply_transforms(f, z, deembed, phase_center, ei=None, eq=None,
     d_params = None
     pc_params = None
     if deembed:
-        z, d_params = _apply_deembed(f, z, deembed,
-                                     group_delay_cal=group_delay_cal)
-        # Deembedding divides by a complex baseline — scale errors by
-        # the same factor so they remain consistent with the signal.
-        if d_params is not None and ei is not None:
-            baseline_mag = np.abs(d_params['baseline'])
-            ei = ei / baseline_mag
-            eq = eq / baseline_mag
+        if ei is None or eq is None:
+            z, d_params = _apply_deembed(f, z, deembed,
+                                         group_delay_cal=group_delay_cal)
+        else:
+            from .. import resonator
+            z_err = ei + 1j * eq
+            if deembed is True:
+                z, z_err, d_params = resonator.deembed(
+                    f, z, group_delay_cal=group_delay_cal, s21_err=z_err)
+            elif isinstance(deembed, dict):
+                z, z_err = resonator.apply_deembed_params(
+                    z, deembed, s21_err=z_err)
+                d_params = deembed
+            else:
+                z, d_params = _apply_deembed(f, z, deembed,
+                                             group_delay_cal=group_delay_cal)
+            if d_params is not None:
+                ei = z_err.real
+                eq = z_err.imag
     elif group_delay_cal is not None:
         # Remove group delay without full deembedding (no baseline
         # normalisation).  This corrects the linear phase slope so that
         # phase-vs-frequency plots show the resonator response only.
         from ..resonator import remove_group_delay
-        z, _ = remove_group_delay(f, z, group_delay_cal)
+        if ei is None or eq is None:
+            z, _ = remove_group_delay(f, z, group_delay_cal)
+        else:
+            z, z_err, _ = remove_group_delay(
+                f, z, group_delay_cal, s21_err=ei + 1j * eq)
+            ei = z_err.real
+            eq = z_err.imag
     if phase_center:
-        z, pc_params = _apply_phase_center(z, phase_center)
-        # Phase centering is a translation + rotation — neither changes
-        # the magnitude of the error, so ei/eq are unchanged.
+        if ei is None or eq is None:
+            z, pc_params = _apply_phase_center(z, phase_center)
+        else:
+            from .. import resonator
+            z_err = ei + 1j * eq
+            if phase_center is True:
+                z, z_err, pc_params = resonator.phase_center(
+                    z, s21_err=z_err)
+            elif isinstance(phase_center, dict):
+                z, z_err = resonator.apply_phase_center_params(
+                    z, phase_center, s21_err=z_err)
+                pc_params = phase_center
+            else:
+                z, pc_params = _apply_phase_center(z, phase_center)
+            if pc_params is not None:
+                ei = z_err.real
+                eq = z_err.imag
     return z, ei, eq, d_params, pc_params
 
 
