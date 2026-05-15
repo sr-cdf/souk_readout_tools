@@ -4070,7 +4070,8 @@ class ReadoutClient:
                                  sweep_data=None,
                                  kid_frequencies=None,
                                  kid_q_factors=None,
-                                 mask_hwhm_factor=10.0,
+                                 auto_mask_resonances=True,
+                                 mask_hwhm_factor=50.0,
                                  median_filter_mhz=10.0,
                                  savgol_mhz=10.0,
                                  savgol_poly_order=3,
@@ -4090,9 +4091,11 @@ class ReadoutClient:
         1. **Phase derivative** — group delay is computed from
            ``np.gradient(unwrap(phase), freqs)``.
 
-        2. **Resonance masking** — if ``kid_frequencies`` and ``kid_q_factors``
-           are supplied, frequency channels within ``mask_hwhm_factor`` × HWHM
-           of each resonance are excluded from subsequent filtering.
+          2. **Resonance masking** — if ``kid_frequencies`` and ``kid_q_factors``
+              are supplied, or if ``auto_mask_resonances`` is True and no
+              explicit resonance list is supplied, frequency channels within
+              ``mask_hwhm_factor`` × HWHM of each resonance are excluded from
+              subsequent filtering.
 
         3. **Median filter** — a sliding median of width ``median_filter_mhz``
            is applied to the unmasked group-delay points.  This removes
@@ -4114,6 +4117,9 @@ class ReadoutClient:
                 each resonance in ``kid_frequencies``.  If scalar, the same
                 value is used for all resonances.  Required if
                 ``kid_frequencies`` is provided; defaults to 10 000 if omitted.
+            auto_mask_resonances (bool): If True (default), automatically find
+                MKID resonances in the supplied wideband sweep and mask them
+                when ``kid_frequencies`` is not provided.
             mask_hwhm_factor (float): Half-width of the exclusion zone around
                 each resonance, expressed as a multiple of the HWHM
                 (= fr / (2 * Ql)).  Default 10 — catches the main Lorentzian
@@ -4145,10 +4151,12 @@ class ReadoutClient:
                 ``'sweep_data'``: the sweep dict used (new or supplied).
         """
         import numpy as np
+        import warnings
         try:
-            from scipy.signal import medfilt, savgol_filter
+            from scipy.ndimage import median_filter as nd_median_filter
+            from scipy.signal import savgol_filter
         except ImportError:
-            medfilt = None
+            nd_median_filter = None
             savgol_filter = None
 
         # --- acquire sweep data -------------------------------------------------
@@ -4175,6 +4183,27 @@ class ReadoutClient:
 
         # --- resonance mask -----------------------------------------------------
         mask = np.ones(n_pts, dtype=bool)  # True = include
+
+        if kid_frequencies is None and auto_mask_resonances:
+            try:
+                from ..peak_finder import find_mkid_resonances
+
+                auto_resonances = find_mkid_resonances(freqs, s21)
+                if auto_resonances:
+                    kid_frequencies = np.array(
+                        [res.frequency for res in auto_resonances], dtype=float)
+                    kid_q_factors = np.array([
+                        1e4 if res.q_factor is None or not np.isfinite(res.q_factor)
+                        else max(float(res.q_factor), 1.0)
+                        for res in auto_resonances
+                    ], dtype=float)
+                    if verbose:
+                        print(f'  Auto resonance masking: found {len(kid_frequencies)} resonances')
+                elif verbose:
+                    print('  Auto resonance masking: found no resonances; leaving sweep unmasked')
+            except Exception as exc:
+                warnings.warn(
+                    f'Automatic resonance masking failed; proceeding without masking: {exc}')
 
         if kid_frequencies is not None:
             kid_frequencies = np.atleast_1d(np.asarray(kid_frequencies, dtype=float))
@@ -4204,9 +4233,8 @@ class ReadoutClient:
                 f'Too few unmasked points ({len(included_idx)}) for smoothing. '
                 f'Reduce mask_hwhm_factor.')
 
-        # Compute filter kernels and edge-padding width (in points) up front.
-        # Padding replicates the edge values so that the median and savgol
-        # filters see a flat continuation instead of running into a boundary.
+        # Compute filter kernels in points. Boundary handling below avoids
+        # flat endpoint padding, which biases the filtered delay at both ends.
         freq_span_mhz = (freqs[-1] - freqs[0]) / 1e6 if n_pts > 1 else 0.0
         pts_per_mhz = n_pts / freq_span_mhz if freq_span_mhz > 0 else 0.0
         med_kernel = 0
@@ -4226,29 +4254,20 @@ class ReadoutClient:
             savgol_window = min(savgol_window,
                                 n_pts if n_pts % 2 == 1 else n_pts - 1)
 
-        pad_n = 2 * max(med_kernel, savgol_window)
-
         if n_pts > 1 and med_kernel >= 3 and len(included_idx) > med_kernel:
-            # Pad with edge values, filter, then trim
             vals = tau_ns_work[included_idx]
-            padded = np.concatenate([
-                np.full(pad_n, vals[0]),
-                vals,
-                np.full(pad_n, vals[-1]),
-            ])
-            if medfilt is not None:
-                ks = min(med_kernel, len(padded) if len(padded) % 2 == 1
-                         else len(padded) - 1)
-                padded = medfilt(padded, kernel_size=ks)
+            if nd_median_filter is not None:
+                filtered_vals = nd_median_filter(
+                    vals, size=med_kernel, mode='reflect')
             else:
                 half = med_kernel // 2
-                filtered = padded.copy()
-                for i in range(len(padded)):
-                    lo = max(0, i - half)
-                    hi = min(len(padded), i + half + 1)
-                    filtered[i] = np.median(padded[lo:hi])
-                padded = filtered
-            tau_ns_work[included_idx] = padded[pad_n:pad_n + len(included_idx)]
+                padded = np.pad(vals, (half, half), mode='reflect')
+                half = med_kernel // 2
+                filtered_vals = np.empty_like(vals)
+                for i in range(len(vals)):
+                    window = padded[i:i + 2 * half + 1]
+                    filtered_vals[i] = np.median(window)
+            tau_ns_work[included_idx] = filtered_vals
             if verbose:
                 print(f'  Median filter: kernel {med_kernel} points '
                       f'({med_kernel/pts_per_mhz:.1f} MHz)')
@@ -4264,17 +4283,11 @@ class ReadoutClient:
 
         # --- Savitzky-Golay filter ---------------------------------------------
         if savgol_window >= savgol_poly_order + 2:
-            # Pad with edge values, filter, then trim
-            padded = np.concatenate([
-                np.full(pad_n, tau_for_savgol[0]),
+            tau_ns_smooth = savgol_filter(
                 tau_for_savgol,
-                np.full(pad_n, tau_for_savgol[-1]),
-            ])
-            sw_padded = min(savgol_window,
-                            len(padded) if len(padded) % 2 == 1
-                            else len(padded) - 1)
-            tau_ns_smooth = savgol_filter(padded, sw_padded, savgol_poly_order)
-            tau_ns_smooth = tau_ns_smooth[pad_n:pad_n + n_pts]
+                savgol_window,
+                savgol_poly_order,
+                mode='interp')
 
             if verbose:
                 print(f'  Savitzky-Golay filter: window {savgol_window} points '
