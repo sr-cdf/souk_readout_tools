@@ -1,5 +1,6 @@
 import sys
 import os
+import tempfile
 import traceback
 import logging
 import signal
@@ -828,12 +829,31 @@ class ResonanceFinderApp(QMainWindow):
         self.settings.beginGroup("Analysis")
         filename = self.settings.value("filename", defaultValue=None)
         self.settings.endGroup()
+        if self._is_transient_temp_filename(filename) and not os.path.exists(filename):
+            _log.debug(f'Skipping stale temporary filename: {filename}')
+            filename = None
         self.filename = filename
+
+    def _is_transient_temp_filename(self, filename):
+        if not filename:
+            return False
+        try:
+            filename = os.path.abspath(os.fspath(filename))
+        except TypeError:
+            return False
+
+        temp_dir = os.path.abspath(tempfile.gettempdir())
+        if os.path.dirname(filename) != temp_dir:
+            return False
+        return os.path.basename(filename).startswith('tmp')
         
     def saveSettingsFilename(self):
         _log.debug('saveSettingsFilename')
         self.settings.beginGroup("Analysis")
-        self.settings.setValue("filename", self.filename if self.filename is not None else '')
+        filename = self.filename if self.filename is not None else ''
+        if self._is_transient_temp_filename(filename):
+            filename = ''
+        self.settings.setValue("filename", filename)
         self.settings.endGroup()
 
     def loadSettingsActiveFormat(self):
