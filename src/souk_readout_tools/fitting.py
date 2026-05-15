@@ -1686,13 +1686,20 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
 
 
 def extract_parameters(fit_results):
-    """Extract common fitted parameters from FitResult objects into arrays."""
+    """Extract common fitted parameters from one or more FitResult objects."""
     keys = ("fr", "Ql", "Qi", "Qc", "Qc_abs", "phi", "a", "A", "alpha",
             "tau", "anl", "nonlinear_detuning_hz", "residual_rms",
             "weighted_rms", "reduced_chi2", "success", "nfev",
             "linear_nfev", "nonlinear_nfev", "fit_duration_s",
             "linear_fit_duration_s", "nonlinear_fit_duration_s",
             "optimizer_cost", "linear_cost", "nonlinear_cost")
+    if fit_results is None:
+        fit_results = ()
+    elif isinstance(fit_results, FitResult):
+        fit_results = (fit_results,)
+    else:
+        fit_results = tuple(fit_results)
+
     if not fit_results:
         out = {k: np.array([]) for k in keys}
         out["Qe"] = np.array([])
