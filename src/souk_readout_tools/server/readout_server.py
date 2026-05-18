@@ -1680,7 +1680,10 @@ class ReadoutServer:
                         self.r.accumulators[0].set_acc_len(int(param_value))
                         response = {'status': 'success'}
                     elif param_name == 'internal_loopback':
-                        self.r.input.enable_loopback(bool(param_value))
+                        if param_value:
+                            self.r.input.enable_loopback()
+                        else:
+                            self.r.input.disable_loopback()
                         response = {'status': 'success'}
                     elif param_name == 'psb_scale':
                         self.r.psbscale.set_scale(int(param_value))
