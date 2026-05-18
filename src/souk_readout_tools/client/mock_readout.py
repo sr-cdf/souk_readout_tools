@@ -717,6 +717,9 @@ class MockReadoutServer:
             self.cal_freeze = bool(param_value)
         elif param_name == 'clock_source':
             self.clock_source = str(param_value)
+        elif param_name == 'internal_loopback':
+            defaults = self.config.setdefault('firmware', {}).setdefault('defaults', {})
+            defaults['internal_loopback'] = bool(param_value)
         return {'status': 'success'}
 
     def stream_frame(self, num_tones=None):
