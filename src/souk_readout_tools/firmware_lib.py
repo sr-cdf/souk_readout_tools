@@ -5130,7 +5130,7 @@ def _apply_per_bin_scaling(r, config_dict, amps):
 # Used by maximise_tx_power and set_tone_powers to manage the RX path
 # when TX power changes risk saturating the ADC.
 
-RX_POLICIES = ('protect', 'compensate', 'raise', 'none')
+RX_POLICIES = ('protect', 'compensate', 'maximise', 'raise', 'none')
 
 
 def _rf_supports_bypass_amps(rf_peripherals):
@@ -5330,6 +5330,11 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
             ranges are exhausted, falls back to ``'protect'`` behaviour
             (i.e. best-effort compensation, then reactive protection).
 
+        ``'maximise'``
+            Run :func:`maximise_rx_power` after the TX change.  This actively
+            optimises the RX path for ADC dynamic range by adjusting RX
+            attenuation, ADC DSA, RX amp bypass state, and PFB FFT shift.
+
         ``'raise'``
             Check for ADC saturation after the TX change.  If detected,
             raise ``RuntimeError`` immediately.  The caller is
@@ -5374,6 +5379,42 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
 
     if rx_policy == 'none':
         return None
+
+    if rx_policy == 'maximise':
+        dsa, pfb_fftshift, dsp, adc, rx_atten = maximise_rx_power(
+            r, r_fast, config_dict, rf_peripherals=rf_peripherals)
+        if isinstance(adc, dict):
+            threshold = float(adc.get('threshold', 0.45))
+            peak = max(
+                abs(float(adc.get('imax_fs', 0.0))),
+                abs(float(adc.get('imin_fs', 0.0))),
+                abs(float(adc.get('qmax_fs', 0.0))),
+                abs(float(adc.get('qmin_fs', 0.0))),
+            )
+            saturated = bool(
+                peak >= threshold
+                or adc.get('rts_over_range', False)
+                or adc.get('rts_over_voltage', False)
+            )
+        else:
+            saturated = None
+        action = (
+            f'maximise: DSA={dsa} dB, '
+            f'PFB fftshift={format(int(pfb_fftshift), "#016b")}'
+        )
+        if rx_atten is not None:
+            action += f', RX atten={float(rx_atten):.1f} dB'
+        print(f'    rx_policy: {action}')
+        return {
+            'policy': 'maximise',
+            'saturated': saturated,
+            'action': action,
+            'rx_attenuation_db': None if rx_atten is None else float(rx_atten),
+            'dsa_db': int(dsa),
+            'pfb_fftshift': int(pfb_fftshift),
+            'dsp_overflow': dsp,
+            'adc_levels': adc,
+        }
 
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
@@ -5567,6 +5608,9 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
           path (prefer RX attenuator, fall back to DSA) to keep
           round-trip power constant.  Falls back to ``'protect'`` if
           range is exhausted.
+        - ``'maximise'`` — run ``maximise_rx_power()`` after each TX
+          power change to optimise the RX attenuator, DSA, RX amp, and
+          PFB FFT shift.
         - ``'raise'`` — raise ``RuntimeError`` if ADC saturates.
         - ``'none'`` — do not check or touch the RX path.
 
@@ -7421,6 +7465,9 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
           enough to clear it and warn.
         - ``'compensate'`` — mirror the TX power change onto the RX
           path to keep round-trip power constant.
+        - ``'maximise'`` — run ``maximise_rx_power()`` after the TX
+          change to optimise the RX attenuator, DSA, RX amp, and PFB
+          FFT shift.
         - ``'raise'`` — raise ``RuntimeError`` if ADC saturates.
         - ``'none'`` — do not check or touch the RX path.
 
