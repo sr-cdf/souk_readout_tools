@@ -1212,7 +1212,8 @@ class ReadoutClient:
         return self.get_parameter('pfb_fftshift')
 
     def set_tone_powers(self, tone_powers_dbm, reference_plane='detector',
-                        optimise_dynamic_range=True, rx_policy='protect'):
+                        optimise_dynamic_range=True, rx_policy='protect',
+                        verbose=True):
         """Set tone powers to specified levels in dBm.
 
         Parameters
@@ -1235,8 +1236,14 @@ class ReadoutClient:
               attenuation or DSA to clear it and warn.
             - ``'compensate'`` — mirror TX power changes onto the RX
               path to keep round-trip power constant.
+            - ``'maximise'`` — run ``maximise_rx_power()`` after the TX
+              change to optimise RX attenuation, DSA, RX amp, and PFB
+              FFT shift.
             - ``'raise'`` — raise error if ADC saturates.
             - ``'none'`` — don't touch the RX path.
+        verbose : bool
+            If False, suppress client-side informational summaries.  Warnings
+            and errors are still printed.
         """
         tone_powers_dbm = np.atleast_1d(tone_powers_dbm).tolist()
         message = {'request': 'set', 'param': 'tone_powers',
@@ -1259,7 +1266,7 @@ class ReadoutClient:
                     if np.max(valid) > 16:
                         print(f'  WARNING: DAC overdriven ({np.max(valid):.1f} effective bits, '
                               f'max is 16)')
-                    else:
+                    elif verbose:
                         print(f'  Effective DAC bits per tone: '
                               f'{np.min(valid):.1f} — {np.max(valid):.1f} (of 16)')
         return response
@@ -1342,6 +1349,9 @@ class ReadoutClient:
               attenuation or DSA to clear it and warn.
             - ``'compensate'`` — mirror TX power changes onto the RX
               path to keep round-trip power constant.
+            - ``'maximise'`` — run ``maximise_rx_power()`` after each TX
+              power change to optimise RX attenuation, DSA, RX amp, and
+              PFB FFT shift.
             - ``'raise'`` — raise error if ADC saturates.
             - ``'none'`` — don't touch the RX path.
         """
@@ -3908,7 +3918,8 @@ class ReadoutClient:
                       f'(optimise_dynamic_range={optimise_tx_dynamic_range})')
             stp_response = self.set_tone_powers(powers,
                                 reference_plane=reference_plane,
-                                optimise_dynamic_range=optimise_tx_dynamic_range)
+                                optimise_dynamic_range=optimise_tx_dynamic_range,
+                                verbose=verbose)
             if stp_response.get('status') != 'success':
                 raise RuntimeError(
                     f"Failed to set tone powers: {stp_response.get('message', 'unknown error')}")
@@ -4512,41 +4523,37 @@ class ReadoutClient:
                 'group_delay', 'complex_gradient'. Default is 'log_magnitude'.
             filter_params: FilterParams instance or dict.
             finder_params: PeakFinderParams instance or dict.
+                In wideband mode, omitted values use conservative MKID defaults:
+                inner 10-90% of the frequency span, dip finding, 1-100 dB
+                prominence, 1 kHz-10 MHz width, 100 kHz minimum spacing,
+                lowpass 0.5 and highpass 0. Dicts override individual defaults.
             **kwargs: Passed to wideband_sweep if sweep_data is None.
 
         Returns:
-            For mode='wideband':
-                list of ResonanceResult objects sorted by frequency.
-
-            For mode='targeted':
-                dict with keys:
-                    'per_tone': list of lists, per_tone[i] is the list of
-                        ResonanceResult objects found in tone i's sweep.
-                    'all_resonances': flat list of all ResonanceResult objects.
-                    'flagged_tones': list of tone indices with >1 resonance
-                        (doubles, triples, etc.).
-                    'num_tones': total number of tones.
+            ResonanceSearchResult for all modes. It is list-like over all
+            ResonanceResult objects, so existing wideband-style usage such as
+            ``len(result)``, ``for r in result``, and ``result[:5]`` still
+            works. It also supports dict-style access to:
+                'mode': resolved search mode, 'wideband' or 'targeted'.
+                'per_tone': list of lists. In wideband mode this has one
+                    entry containing the single concatenated-trace result.
+                'all_resonances': flat list of all ResonanceResult objects.
+                'flagged_tones': tone indices with >1 resonance.
+                'num_tones': total number of tones in the sweep metadata.
         """
         from ..peak_finder import (
-            find_mkid_resonances, FilterParams, PeakFinderParams
+            find_mkid_resonances, FilterParams, PeakFinderParams,
+            ResonanceSearchResult, wideband_resonance_search_params,
         )
-
-        if isinstance(filter_params, dict):
-            filter_params = FilterParams(**filter_params)
-        if isinstance(finder_params, dict):
-            finder_params = PeakFinderParams(**finder_params)
 
         if mode == 'auto':
             if sweep_data is None:
-                return 'wideband'
-
-            if sweep_data.get('wideband_sweep', False):
-                return 'wideband'
-
-            sweep_f = np.atleast_2d(sweep_data['sweep_f'])
-            mode = 'wideband' if sweep_f.shape[0] == 1 else 'targeted'
-
-            
+                mode = 'wideband'
+            elif sweep_data.get('wideband_sweep', False):
+                mode = 'wideband'
+            else:
+                sweep_f = np.atleast_2d(sweep_data['sweep_f'])
+                mode = 'wideband' if sweep_f.shape[0] == 1 else 'targeted'
 
         if mode == 'wideband':
             if sweep_data is None:
@@ -4555,16 +4562,34 @@ class ReadoutClient:
             frequencies = np.ravel(sweep_data['sweep_f'])
             s21_complex = (np.ravel(sweep_data['sweep_i'])
                            + 1j * np.ravel(sweep_data['sweep_q']))
+            filter_params, finder_params = wideband_resonance_search_params(
+                frequencies, filter_params=filter_params,
+                finder_params=finder_params)
 
-            return find_mkid_resonances(
+            results = find_mkid_resonances(
                 frequencies=frequencies,
                 s21_complex=s21_complex,
                 data_format=data_format,
                 filter_params=filter_params,
                 finder_params=finder_params,
             )
+            num_tones = int(sweep_data.get(
+                'num_tones_used', sweep_data.get('num_tones', 1)))
+
+            return ResonanceSearchResult(
+                mode='wideband',
+                all_resonances=results,
+                per_tone=[results],
+                flagged_tones=[],
+                num_tones=num_tones,
+            )
 
         elif mode == 'targeted':
+            if isinstance(filter_params, dict):
+                filter_params = FilterParams(**filter_params)
+            if isinstance(finder_params, dict):
+                finder_params = PeakFinderParams(**finder_params)
+
             if sweep_data is None:
                 raise ValueError(
                     "sweep_data must be provided for mode='targeted'. "
@@ -4579,7 +4604,7 @@ class ReadoutClient:
                     "Targeted mode requires per-tone sweep data "
                     "(shape N_points x N_tones), not wideband.")
 
-            n_points, n_tones = sf.shape
+            _, n_tones = sf.shape
             per_tone = []
             all_resonances = []
             flagged_tones = []
@@ -4603,12 +4628,13 @@ class ReadoutClient:
 
             all_resonances.sort(key=lambda r: r.frequency)
 
-            return {
-                'per_tone': per_tone,
-                'all_resonances': all_resonances,
-                'flagged_tones': flagged_tones,
-                'num_tones': n_tones,
-            }
+            return ResonanceSearchResult(
+                mode='targeted',
+                all_resonances=all_resonances,
+                per_tone=per_tone,
+                flagged_tones=flagged_tones,
+                num_tones=n_tones,
+            )
 
         else:
             raise ValueError(
@@ -4629,7 +4655,9 @@ class ReadoutClient:
         """
         resonances = self.find_resonances(sweep_data, **kwargs)
 
-        if isinstance(resonances, dict):
+        if hasattr(resonances, 'all_resonances'):
+            resonances = resonances.all_resonances
+        elif isinstance(resonances, dict):
             resonances = resonances['all_resonances']
 
         return np.array([r.frequency for r in resonances])
