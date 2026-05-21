@@ -11,7 +11,9 @@ import numpy as np
 from ._common import (_get_pyplot, _compute_mag_phase,
                        _apply_deembed, _apply_phase_center,
                        _resolve_label,
-                       _normalise_iq, _compute_mag_phase_units, UNITS)
+                       _normalise_iq, _compute_mag_phase_units, UNITS,
+                       _is_calibrated_magnitude_unit,
+                       _canonical_units, _validate_reference_plane)
 from ._psd import compute_psd
 
 # PTP clock rate: telescope_time counts per second
@@ -138,7 +140,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     deembed=False, phase_center=False,
                     sweep_data=None, fig=None, label=None,
                     units='raw', config=None, reference_plane='adc_input',
-                    x_axis='time', **kwargs):
+                    x_axis='time', unwrap_phase=True, **kwargs):
     """
     Plot timestream data in various formats.
 
@@ -160,25 +162,36 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         fig: Existing figure. If None, create new.
         label: Legend label. If None, uses an auto-incrementing index.
         units: Unit for I/Q normalisation.  One of:
-            'raw' (default) - accumulator codes, no normalisation.
+            'raw' (default) - accumulator units, no normalisation.
             'peak' - normalise to the peak magnitude of the data.
+            'adc_units' / 'adc' - linear ADC units.  The firmware
+                accumulator path is undone and, for non-ADC reference planes,
+                the RX-chain calibration is removed.
             'adc_fs' - fraction of ADC full-scale.
-            'dbfs' - dB relative to ADC full-scale.
+            'dbfs' - dB relative to ADC full-scale, optionally referred to
+                ``reference_plane`` for magnitude plots.
             'dbm' - estimated power in dBm at ``reference_plane``.
             All options except 'raw' and 'peak' require
             'info' in ts_data.
-        config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
-        reference_plane: Reference plane used when ``units='dbm'``.  One of
-            'adc_input' (default), 'cryostat_output', or 'detector'.
+        config: Config dict (needed when the timestream metadata does not
+            include the run config, or for non-default rx_mix_scale in older
+            data).
+        reference_plane: Reference plane for calibrated magnitude plotting.
+            Use 'adc_input' (default), 'cryostat_output', or 'detector'.
             'cryostat_output'/'detector' deembed the RX analog chain using
-            the calibration entries in ``config['rf_frontend']`` and
-            ``config['cryostat']`` at each tone's frequency; falls back to
-            'adc_input' with a warning if that cal is not available.
+            calibration entries in ``config`` or ``ts_data['info']`` at each
+            tone's frequency; falls back to 'adc_input' with a warning if
+            that cal is not available.  ``units='raw'`` is accumulator units
+            only; use ``units='adc_units'`` for a linear ADC-unit view
+            referred to a detector/cryostat plane.
         x_axis: X-axis for time-domain formats.  One of:
             'time' (default) - seconds from sample rate.
             'sample' - sample index (0, 1, 2, ...).
             'acc_count' - accumulation counter (packet_counter).
             'telescope_time' - PTP telescope time in seconds.
+        unwrap_phase: bool, optional.  Unwrap the phase in
+            ``format='magphase'``.  Default ``True`` preserves the previous
+            behaviour; pass ``False`` to show wrapped phase.
         **kwargs: Passed to matplotlib plot calls.
 
     Returns:
@@ -190,6 +203,15 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
     sample_rate = ts_data['sample_rate']
     x_values, x_label = _build_x_axis(ts_data, x_axis)
     info = ts_data.get('info')
+    units = _canonical_units(units)
+    _validate_reference_plane(reference_plane)
+    if units == 'raw' and reference_plane != 'adc_input':
+        raise ValueError(
+            "units='raw' always means accumulator units and does not have a "
+            "detector/cryostat reference plane. Use units='adc_units' to "
+            "undo the firmware accumulator path and refer linear ADC units "
+            f"to reference_plane={reference_plane!r}.")
+    calibration_cache = {}
 
     # Look up each selected tone's RF frequency for cal resolution.
     tone_freqs = None
@@ -216,12 +238,13 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             ni, nq, _, _, iq_label, mag_label = _normalise_iq(
                 i_arr, q_arr, units, info, config=config,
                 reference_plane=reference_plane,
-                frequencies=tone_f)
+                frequencies=tone_f,
+                calibration_cache=calibration_cache)
             normalised.append((key, ni, nq))
         selected = normalised
     else:
         iq_label = ''
-        mag_label = '|S21| (dB)'
+        mag_label = '|RX| (dB)'
 
     if format == 'freq_diss' and sweep_data is None:
         raise ValueError("sweep_data is required for format='freq_diss'")
@@ -268,8 +291,12 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             ax2.set_ylabel(f'Q {iq_label}'.strip())
 
         elif format == 'magphase':
+            tone_f = _tone_frequency(key)
             z, _, _ = _apply_transforms(z, deembed, phase_center)
-            mag_db, phase = _compute_mag_phase_units(z, units, info=info, config=config)
+            mag_db, phase = _compute_mag_phase_units(
+                z, units, info=info, config=config,
+                reference_plane=reference_plane, frequencies=tone_f,
+                unwrap=unwrap_phase, calibration_cache=calibration_cache)
             ax1.plot(x_values, mag_db, linewidth=0.5, label=trace_label, **kwargs)
             ax2.plot(x_values, phase, linewidth=0.5, label=trace_label, **kwargs)
             ax1.set_ylabel(mag_label)
@@ -451,11 +478,12 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
         sw_i, sw_q = si[:, tone_index].copy(), sq[:, tone_index].copy()
 
     # Normalise both sweep and timestream with the same units
-    if units in ('dbfs', 'dbm'):
+    if _is_calibrated_magnitude_unit(units):
         raise ValueError(
             f"units='{units}' is not supported for I vs Q plots — "
             "use 'raw', 'peak', or 'adc_fs'.")
     info = ts_data.get('info') or sweep_data.get('info')
+    calibration_cache = {}
     iq_label = ''
     if units != 'raw':
         tone_f = np.mean(sweep_f) if sweep_f is not None else None
@@ -463,10 +491,10 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
             raise ValueError("data must contain 'info' for non-raw units.")
         i_arr, q_arr, _, _, iq_label, _ = _normalise_iq(
             i_arr, q_arr, units, info, config=config,
-            frequencies=tone_f)
+            frequencies=tone_f, calibration_cache=calibration_cache)
         sw_i, sw_q, _, _, _, _ = _normalise_iq(
             sw_i, sw_q, units, info, config=config,
-            frequencies=sweep_f)
+            frequencies=sweep_f, calibration_cache=calibration_cache)
 
     z_ts = i_arr + 1j * q_arr
     z_sweep = sw_i + 1j * sw_q
@@ -484,6 +512,7 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     # Compute phase for the frequency-domain panel
     _, phase_sweep = _compute_mag_phase(z_sweep, unwrap=unwrap)
     _, phase_ts = _compute_mag_phase(z_ts, unwrap=unwrap)
+
     ts_info = ts_data.get('info') or {}
     ts_tone_freqs = ts_info.get('tones', {}).get('frequencies_hz')
     if ts_tone_freqs is not None:

@@ -8,6 +8,7 @@ _SUBMODULES = [
     "firmware_lib",
     "tone_list_tools",
     "peak_finder",
+    "power_sweep",
     "resonator",
     "fitting",
     "measurement",

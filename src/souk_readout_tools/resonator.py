@@ -29,7 +29,128 @@ Uncertainty propagation:
 - Uncertainty in fitted transform parameters themselves is not included.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
+
+
+@dataclass
+class EmpiricalResonanceEstimate:
+    """Measured dip estimates that do not depend on an optimizer."""
+    fr: float = np.nan
+    linewidth_hz: float = np.nan
+    left_width_hz: float = np.nan
+    right_width_hz: float = np.nan
+    skew: float = np.nan
+    Ql: float = np.nan
+    Qc: float = np.nan
+    Qi: float = np.nan
+    dip_depth_db: float = np.nan
+    peak_index: int = -1
+    marker_log_mag_db: float = np.nan
+    baseline_log_mag_db: float = np.nan
+
+
+def estimate_resonance_empirical(frequencies, s21, peak_index=None):
+    """Estimate quick-look resonance values directly from complex S21 data."""
+    f = np.asarray(frequencies, dtype=float).ravel()
+    z = np.asarray(s21, dtype=complex).ravel()
+    if f.size != z.size:
+        raise ValueError("frequencies and s21 must have the same length.")
+    if f.size == 0:
+        return EmpiricalResonanceEstimate()
+
+    # Work in log magnitude; the resonance marker is the supplied point or the
+    # deepest finite dip in the trace.
+    mag_db = 20.0 * np.log10(np.abs(z) + 1e-300)
+    good = np.isfinite(f) & np.isfinite(mag_db)
+    if not np.any(good):
+        return EmpiricalResonanceEstimate()
+    if peak_index is None or not (0 <= int(peak_index) < f.size) or not good[int(peak_index)]:
+        peak_index = int(np.nanargmin(np.where(good, mag_db, np.nan)))
+    else:
+        peak_index = int(peak_index)
+
+    fr = float(f[peak_index])
+    step = float(np.nanmedian(np.abs(np.diff(f[good])))) if np.count_nonzero(good) > 1 else 1.0
+    step = step if np.isfinite(step) and step > 0.0 else 1.0
+    dip_db = float(mag_db[peak_index])
+
+    # Estimate the local off-resonance level from a line between small edge
+    # medians.  For centered sweeps this is close to averaging the endpoints,
+    # while a sloped through-line is not counted as dip depth.
+    good_indices = np.flatnonzero(good)
+    n_edge = max(1, min(5, good_indices.size // 4))
+    left_edge = good_indices[:n_edge]
+    right_edge = good_indices[-n_edge:]
+    left_baseline_db = float(np.nanmedian(mag_db[left_edge]))
+    right_baseline_db = float(np.nanmedian(mag_db[right_edge]))
+    f_left_edge = float(np.nanmedian(f[left_edge]))
+    f_right_edge = float(np.nanmedian(f[right_edge]))
+    if (
+        np.isfinite(f_left_edge)
+        and np.isfinite(f_right_edge)
+        and f_left_edge != f_right_edge
+    ):
+        t = (fr - f_left_edge) / (f_right_edge - f_left_edge)
+        baseline_db = left_baseline_db + t * (right_baseline_db - left_baseline_db)
+    else:
+        baseline_db = 0.5 * (left_baseline_db + right_baseline_db)
+    shoulder_db = float(
+        min(
+            np.nanmax(mag_db[: peak_index + 1]),
+            np.nanmax(mag_db[peak_index:]),
+        )
+    )
+
+    # Keep the half-depth linewidth threshold bounded by the weaker shoulder,
+    # so one high edge of a sloped sweep cannot stretch the width estimate.
+    depth_db = max(0.0, baseline_db - dip_db)
+    width_depth_db = max(0.0, min(shoulder_db, baseline_db) - dip_db)
+    half_db = dip_db + 0.5 * width_depth_db
+
+    f_left = f_right = np.nan
+    for j in range(peak_index - 1, -1, -1):
+        if mag_db[j] >= half_db and np.isfinite(mag_db[j + 1]):
+            denom = mag_db[j + 1] - mag_db[j]
+            frac = 0.0 if denom == 0.0 else (half_db - mag_db[j]) / denom
+            f_left = float(f[j] + frac * (f[j + 1] - f[j]))
+            break
+    for j in range(peak_index + 1, f.size):
+        if mag_db[j] >= half_db and np.isfinite(mag_db[j - 1]):
+            denom = mag_db[j] - mag_db[j - 1]
+            frac = 0.0 if denom == 0.0 else (half_db - mag_db[j - 1]) / denom
+            f_right = float(f[j - 1] + frac * (f[j] - f[j - 1]))
+            break
+
+    left_width = max(fr - f_left, 0.0) if np.isfinite(f_left) else np.nan
+    right_width = max(f_right - fr, 0.0) if np.isfinite(f_right) else np.nan
+    linewidth = left_width + right_width if np.isfinite(left_width + right_width) else step
+    linewidth = linewidth if linewidth > 0.0 else step
+    skew = (
+        (right_width - left_width) / linewidth
+        if np.isfinite(left_width + right_width)
+        else np.nan
+    )
+    Ql = abs(fr / linewidth) if linewidth > 0.0 else np.inf
+    Qc = Ql / (1.0 - 10.0 ** (-depth_db / 20.0)) if depth_db > 0.0 and np.isfinite(Ql) else np.inf
+    denom = 1.0 / Ql - 1.0 / Qc if Ql != 0.0 and Qc != 0.0 else 0.0
+    Qi = 1.0 / denom if denom != 0.0 else np.inf
+
+    return EmpiricalResonanceEstimate(
+        fr=fr,
+        linewidth_hz=float(linewidth),
+        left_width_hz=float(left_width),
+        right_width_hz=float(right_width),
+        skew=float(skew),
+        Ql=float(Ql),
+        Qc=float(Qc),
+        Qi=float(Qi),
+        dip_depth_db=float(depth_db),
+        peak_index=peak_index,
+        marker_log_mag_db=dip_db,
+        baseline_log_mag_db=float(baseline_db),
+    )
 
 
 def _coerce_s21_error(s21_err, shape=None):

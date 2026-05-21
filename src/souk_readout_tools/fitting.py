@@ -43,15 +43,25 @@ return the lowest-cost candidate. ``autodetect_high_anl=True`` runs the small
 probe automatically when the measured dip has a clear cliff/shoulder shape and
 the first nonlinear refinement appears to be in the wrong basin.
 
-``fit_sweep_stack`` fits an already-windowed stack of sweeps, one row/column
-per resonator or power. ``batch_fit`` fits each trace in a targeted sweep-data
-dictionary by default, can fit user-supplied resonance windows, and can
-optionally auto-find/window resonances in a concatenated full sweep. Both
-support process-based
-parallelism via ``n_jobs``: ``1`` is serial, ``-1`` uses all visible CPUs, and
-``-2`` uses all but one. ``verbose=True`` prints compact progress and
-throughput; ``verbose=2`` prints one line per completed fit. Returned lists are
-kept in input order even though parallel progress is completion-order.
+``batch_fit`` is the server-sweep adapter. It accepts a sweep-data dictionary
+from the readout server, fits each targeted trace by default, skips tones
+marked as blind monitors unless requested otherwise, and records each returned
+fit's original ``tone_index``. It can also fit user-supplied resonance windows
+or auto-find/window resonances in a concatenated full sweep.
+
+``fit_sweep_stack`` is the array-stack adapter. It accepts already-windowed
+frequency/S21/error arrays, treats each row or column as one independent fit,
+and returns a list of ``FitResult`` objects in stack order. Stack rows are fit
+independently today: the helper does not carry one row's result into the next
+row as an ``initial_guess``. For ordered repeat measurements of the same
+resonator, you can call ``fit_resonance`` / ``fit_resonance_nonlinear`` in a
+loop and pass the previous ``FitResult`` as ``initial_guess``.
+
+Both collection helpers support process-based parallelism via ``n_jobs``:
+``1`` is serial, ``-1`` uses all visible CPUs, and ``-2`` uses all but one.
+``verbose=True`` prints compact progress and throughput; ``verbose=2`` prints
+one line per completed fit. Returned lists are kept in input order even though
+parallel progress is completion-order.
 
 Sub-sampling
 ------------
@@ -84,7 +94,12 @@ diagnostic arrays, optimizer results, and timing/count fields. For nonlinear
 fits with fallback probes, ``nonlinear_nfev`` and
 ``nonlinear_fit_duration_s`` include all nonlinear attempts, not just the
 winning candidate. ``nfev`` is the total of the linear seed and all nonlinear
-refinements.
+refinements. The ``empirical_*`` fields are measured dip estimates computed
+before optimisation; they are useful sanity checks and fallback diagnostics,
+not least-squares fit parameters. If ``min_dip_depth_db`` is set and the
+empirical dip depth falls below it, the fitters return ``success=False`` with
+``noise_only=True`` and leave ``nfev=0`` so batch/power-sweep tools can exclude
+the row cleanly.
 
 Examples
 --------
@@ -103,7 +118,7 @@ Fit one targeted sweep:
     )
     z_model = evaluate_fit(f, fit)
 
-Fit the same KID over many powers in parallel:
+Fit already-windowed traces for the same KID over many powers, independently:
 
     from souk_readout_tools.fitting import fit_sweep_stack, extract_parameters
 
@@ -159,11 +174,40 @@ for _cpu_pool_env_var in (
 import numpy as np
 from scipy.optimize import OptimizeResult, least_squares
 
+from .resonator import estimate_resonance_empirical
+
 
 LINEAR_NAMES = ("fr", "Qi", "Qc", "phi", "a", "alpha", "tau")
 NONLINEAR_NAMES = LINEAR_NAMES + ("anl",)
-PARAM_ALIASES = {"A": "a"}
 DERIVED_PARAMETER_NAMES = {"Qc_abs"}
+FIT_SUMMARY_KEYS = (
+    "fr",
+    "Ql",
+    "Qi",
+    "Qc",
+    "Qc_abs",
+    "phi",
+    "a",
+    "alpha",
+    "tau",
+    "anl",
+    "nonlinear_detuning_hz",
+    "empirical_fr",
+    "empirical_linewidth_hz",
+    "empirical_Ql",
+    "empirical_Qc",
+    "empirical_Qi",
+    "empirical_dip_depth_db",
+    "empirical_skew",
+    "noise_only",
+    "residual_rms",
+    "weighted_rms",
+    "reduced_chi2",
+    "success",
+    "nfev",
+    "fit_duration_s",
+)
+FIT_UNCERTAINTY_KEYS = ("fr", "Ql", "Qi", "Qc", "phi", "a", "alpha", "tau", "anl")
 SCALE_FLOORS = np.array([1.0, 1e3, 1e3, 1.0, 1e-3, 1.0, 1e-8])
 DIFF_STEPS = np.array([1e-7, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4])
 
@@ -190,10 +234,11 @@ _HIGH_ANL_EXHAUSTIVE_ANL_SEEDS = (0.5, 2.0, 5.0, 10.0, 20.0)
 _HIGH_ANL_EXHAUSTIVE_QI_SEEDS = (1e5, 5e5, 1e6, 5e6)
 _HIGH_ANL_EXHAUSTIVE_FR_PERTURB_KHZ = (-1.0, 0.0, 1.0)
 
-
 @dataclass
 class FitResult:
     """Container for one fitted resonance and the arrays used to make it."""
+    tone_index: int = -1
+    is_blind: bool = False
     fr: float = np.nan
     Ql: float = np.nan
     Qi: float = np.nan
@@ -204,6 +249,15 @@ class FitResult:
     tau: float = np.nan
     Qe: complex = complex(np.nan, np.nan)
     Qc_abs: float = np.nan
+    empirical_fr: float = np.nan
+    empirical_linewidth_hz: float = np.nan
+    empirical_Ql: float = np.nan
+    empirical_Qc: float = np.nan
+    empirical_Qi: float = np.nan
+    empirical_dip_depth_db: float = np.nan
+    empirical_skew: float = np.nan
+    noise_only: bool = False
+    noise_reason: str = ""
     iq_center: complex = complex(np.nan, np.nan)
     iq_radius: float = np.nan
     iq_center_deembed: complex = complex(np.nan, np.nan)
@@ -253,51 +307,6 @@ class FitResult:
     z_fit_deembed_phase_centered: object = field(default=None, repr=False)
     deembed_rotation_angle: float = np.nan
     phase_center_rotation_angle: float = np.nan
-
-    @property
-    def A(self):
-        """Alias for the positive amplitude gain."""
-        return self.a
-
-    @property
-    def covariance(self):
-        """Alias for parameter_covariance."""
-        return self.parameter_covariance
-
-    @property
-    def uncertainty(self):
-        """Alias for parameter_uncertainties."""
-        return self.parameter_uncertainties
-
-    @property
-    def center(self):
-        """Alias for the deembedded resonance-circle center."""
-        return self.iq_center_deembed
-
-    @property
-    def radius(self):
-        """Alias for the deembedded resonance-circle radius."""
-        return self.iq_radius_deembed
-
-    @property
-    def rotation_angle(self):
-        """Alias for the phase-centering rotation angle."""
-        return self.phase_center_rotation_angle
-
-    @property
-    def z_deembed(self):
-        """Alias for deembedded data."""
-        return self.z_data_deembed
-
-    @property
-    def z_phase_centered(self):
-        """Alias for deembedded, centered, rotated data."""
-        return self.z_data_deembed_phase_centered
-
-    @property
-    def z_fit_phase_centered(self):
-        """Alias for deembedded, centered, rotated model data."""
-        return self.z_fit_deembed_phase_centered
 
 
 def wrap_phase(x):
@@ -381,8 +390,8 @@ def s21_model_centered_delay(f, fr, Qi, Qc, phi, a, alpha0, tau,
     return env * res
 
 
-def _normalise_param_dict(values):
-    """Map public aliases like A onto fitted parameter names."""
+def _parameter_dict(values):
+    """Return a parameter dictionary keyed by fitted parameter name."""
     if values is None:
         return None
     if isinstance(values, FitResult):
@@ -394,12 +403,12 @@ def _normalise_param_dict(values):
         raise ValueError(
             "Qc_abs is derived from Qc and phi; use Qc in parameter dictionaries."
         )
-    return {PARAM_ALIASES.get(k, k): v for k, v in values.items()}
+    return dict(values)
 
 
 def _select_names(values, names):
     """Keep only entries relevant to a particular linear/nonlinear fit."""
-    values = _normalise_param_dict(values)
+    values = _parameter_dict(values)
     return None if values is None else {k: v for k, v in values.items() if k in names}
 
 
@@ -504,11 +513,29 @@ def _prepare_arrays(f, z, z_err=None, optimizer_z_err=None):
     return f, z, z_error, opt_error
 
 
-def _guess_params(f, z):
+def _finite_positive(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return False
+    return np.isfinite(value) and value > 0.0
+
+
+def _clean_q_guess(value, fallback):
+    if _finite_positive(value):
+        return float(np.clip(value, 10.0, 1e8))
+    return fallback
+
+
+def _guess_params(f, z, empirical=None):
     """Estimate a compact, robust starting point from a targeted sweep."""
     phase = np.unwrap(np.angle(z))
     tau = -np.median(np.gradient(phase, f)) / (2.0 * np.pi)
-    f0 = f[np.argmin(np.abs(z))]
+    f0 = (
+        float(empirical.fr)
+        if empirical is not None and np.isfinite(empirical.fr)
+        else float(f[np.argmin(np.abs(z))])
+    )
     zn = z * np.exp(2j * np.pi * (f - f0) * tau)
     nedge = max(3, len(f) // 10)
     base = np.r_[zn[:nedge], zn[-nedge:]].mean()
@@ -524,12 +551,16 @@ def _guess_params(f, z):
     Qc = Ql / max(1e-6, 1.0 - mag[i] / max(np.max(mag), 1e-30))
     Qi_inv = 1.0 / Ql - 1.0 / Qc
     Qi = 1.0 / Qi_inv if Qi_inv > 0.0 else 2.0 * Ql
-    return np.array([f[i], Qi, Qc, 1e-3, a, alpha0, tau], float)
+    if empirical is not None:
+        Ql = _clean_q_guess(empirical.Ql, Ql)
+        Qc = _clean_q_guess(empirical.Qc, Qc)
+        Qi = _clean_q_guess(empirical.Qi, Qi)
+    return np.array([f0, Qi, Qc, 1e-3, a, alpha0, tau], float)
 
 
 def _apply_initial_guess(p, names, initial_guess, f0):
-    """Override starting values from a public-parameter dictionary."""
-    initial_guess = _normalise_param_dict(initial_guess)
+    """Override starting values from a parameter dictionary."""
+    initial_guess = _parameter_dict(initial_guess)
     if initial_guess is None:
         return p
     unknown = set(initial_guess) - set(names)
@@ -546,8 +577,8 @@ def _apply_initial_guess(p, names, initial_guess, f0):
 
 
 def _apply_bounds(lower, upper, names, param_bounds, f0, tau0):
-    """Apply public named box bounds, translating alpha to centred alpha0."""
-    param_bounds = _normalise_param_dict(param_bounds)
+    """Apply named box bounds, translating alpha to centred alpha0."""
+    param_bounds = _parameter_dict(param_bounds)
     if param_bounds is None:
         return np.array(lower, float), np.array(upper, float)
     unknown = set(param_bounds) - set(names)
@@ -797,7 +828,7 @@ def _run_optimizer(f, z, z_error, optimizer_z_error, p0, nonlinear,
     returned covariance are all reported in linear ``anl`` units.
     """
     names = NONLINEAR_NAMES if nonlinear else LINEAR_NAMES
-    param_fixed = _normalise_param_dict(param_fixed) or {}
+    param_fixed = _parameter_dict(param_fixed) or {}
     unknown = set(param_fixed) - set(names)
     if unknown:
         raise ValueError(f"unknown param_fixed parameter(s): {sorted(unknown)}")
@@ -813,7 +844,7 @@ def _run_optimizer(f, z, z_error, optimizer_z_error, p0, nonlinear,
     span = max(float(f[-1] - f[0]), float(np.median(np.diff(f))), 1.0)
     eps, a0 = 1e-6, max(abs(float(p0[4])), 1e-12)
 
-    # Broad physical defaults; param_bounds are still public-parameter bounds.
+    # Broad physical defaults; param_bounds are still named parameter bounds.
     lower = [f[0] - span, 10.0, 10.0, -np.pi / 2.0 + eps,
              a0 * 0.01, -np.pi, p0[6] - 1e-6]
     upper = [f[-1] + span, 1e8, 1e8, np.pi / 2.0 - eps,
@@ -938,7 +969,8 @@ def _run_optimizer(f, z, z_error, optimizer_z_error, p0, nonlinear,
     opt.stat_residual = stat_residual
 
     if not return_uncertainties:
-        opt.covariance, opt.uncertainty = None, None
+        opt.parameter_covariance = None
+        opt.parameter_uncertainties = None
         return opt
 
     try:
@@ -973,13 +1005,60 @@ def _run_optimizer(f, z, z_error, optimizer_z_error, p0, nonlinear,
     grad[names.index("phi")] = Ql**2 * np.sin(2.0 * phi) / Qc
     vql = grad @ covariance @ grad
     uncertainty["Ql"] = float(np.sqrt(vql)) if np.isfinite(vql) and vql >= 0.0 else np.nan
-    opt.covariance, opt.uncertainty = covariance, uncertainty
+    opt.parameter_covariance = covariance
+    opt.parameter_uncertainties = uncertainty
     return opt
 
 
+def _make_noise_result(f, z, z_error, optimizer_z_error, sweep_direction, f0,
+                       fit_start, empirical, min_dip_depth_db,
+                       nonlinear=False):
+    """Build a failed FitResult for a trace classified as unresolved noise."""
+    if empirical is None:
+        empirical = estimate_resonance_empirical(f, s21=z)
+    raw_center, raw_radius = _circle_fit(z)
+    reason = (
+        f"empirical dip depth {empirical.dip_depth_db:.3g} dB < "
+        f"{float(min_dip_depth_db):.3g} dB"
+    )
+    parameter_names = NONLINEAR_NAMES if nonlinear else LINEAR_NAMES
+    return FitResult(
+        fr=float(empirical.fr),
+        Ql=float(empirical.Ql),
+        Qi=float(empirical.Qi),
+        Qc=float(empirical.Qc),
+        empirical_fr=float(empirical.fr),
+        empirical_linewidth_hz=float(empirical.linewidth_hz),
+        empirical_Ql=float(empirical.Ql),
+        empirical_Qc=float(empirical.Qc),
+        empirical_Qi=float(empirical.Qi),
+        empirical_dip_depth_db=float(empirical.dip_depth_db),
+        empirical_skew=float(empirical.skew),
+        iq_center=raw_center,
+        iq_radius=raw_radius,
+        success=False,
+        message=f"noise-only sweep: {reason}",
+        noise_only=True,
+        noise_reason=reason,
+        anl=np.nan,
+        sweep_direction=sweep_direction,
+        fit_duration_s=float(time.time() - fit_start),
+        f_reference=float(f0),
+        parameter_names=parameter_names,
+        f_data=f,
+        z_data=z,
+        z_err_data=_pack_z_error(z_error),
+        optimizer_z_err_data=_pack_z_error(optimizer_z_error),
+        z_fit=None,
+    )
+
+
 def _make_result(f, z, z_error, optimizer_z_error, opt, sweep_direction, f0,
-                 fit_start, linear_fit=None, opt_linear=None, opt_nonlinear=None):
-    """Build a FitResult plus all compatibility aliases from optimiser output."""
+                 fit_start, empirical=None, linear_fit=None, opt_linear=None,
+                 opt_nonlinear=None):
+    """Build a FitResult from optimiser output."""
+    if empirical is None:
+        empirical = estimate_resonance_empirical(f, s21=z)
     p = opt.x_public.copy()
     names = tuple(opt.parameter_names)
     fr, Qi, Qc, phi, a, alpha, tau = p[:7]
@@ -1027,7 +1106,15 @@ def _make_result(f, z, z_error, optimizer_z_error, opt, sweep_direction, f0,
     return FitResult(
         fr=float(fr), Ql=Ql, Qi=float(Qi), Qc=float(Qc), phi=float(phi),
         a=float(a), alpha=float(alpha), tau=float(tau), Qe=Qe,
-        Qc_abs=float(abs(Qe)), iq_center=raw_center, iq_radius=raw_radius,
+        Qc_abs=float(abs(Qe)),
+        empirical_fr=float(empirical.fr),
+        empirical_linewidth_hz=float(empirical.linewidth_hz),
+        empirical_Ql=float(empirical.Ql),
+        empirical_Qc=float(empirical.Qc),
+        empirical_Qi=float(empirical.Qi),
+        empirical_dip_depth_db=float(empirical.dip_depth_db),
+        empirical_skew=float(empirical.skew),
+        iq_center=raw_center, iq_radius=raw_radius,
         iq_center_deembed=center, iq_radius_deembed=radius,
         residual_rms=float(np.sqrt(np.mean(np.abs(diff) ** 2))),
         weighted_rms=_weighted_rms(diff, z_error),
@@ -1057,8 +1144,8 @@ def _make_result(f, z, z_error, optimizer_z_error, opt, sweep_direction, f0,
             if opt_nonlinear is not None else np.nan
         ),
         f_reference=float(f0), parameter_names=names,
-        parameter_covariance=getattr(opt, "covariance", None),
-        parameter_uncertainties=getattr(opt, "uncertainty", None),
+        parameter_covariance=getattr(opt, "parameter_covariance", None),
+        parameter_uncertainties=getattr(opt, "parameter_uncertainties", None),
         p=p, initial_guess=getattr(opt, "initial_guess_public", None),
         opt=opt, opt_linear=opt_linear, opt_nonlinear=opt_nonlinear,
         optimizer_result=opt, optimizer_result_linear=opt_linear,
@@ -1081,7 +1168,8 @@ def fit_resonance(f, z, z_err=None, nonlinear=False, sweep_direction="up",
                   optimizer_z_err=None, use_error_weights=None,
                   error_weight_power=1.0, fit_tolerance=None,
                   try_harder=False, try_even_harder=False,
-                  subsample=False, autodetect_high_anl=True):
+                  subsample=False, autodetect_high_anl=True,
+                  min_dip_depth_db=0.5):
     """Fit one complex S21 sweep.
 
     ``subsample=True`` keeps every point near the dip and decimates the tails,
@@ -1097,6 +1185,10 @@ def fit_resonance(f, z, z_err=None, nonlinear=False, sweep_direction="up",
     Most optional arguments are historically positional; new code should pass
     them by keyword. ``try_harder``, ``try_even_harder`` and
     ``autodetect_high_anl`` only affect nonlinear fits.
+
+    If ``min_dip_depth_db`` is not ``None``, sweeps whose empirical dip depth
+    is below the threshold return ``success=False`` and ``noise_only=True``
+    instead of fitting a random fluctuation.
     """
     if nonlinear:
         return fit_resonance_nonlinear(
@@ -1109,13 +1201,25 @@ def fit_resonance(f, z, z_err=None, nonlinear=False, sweep_direction="up",
             fit_tolerance=fit_tolerance,
             try_harder=try_harder, try_even_harder=try_even_harder,
             subsample=subsample, autodetect_high_anl=autodetect_high_anl,
+            min_dip_depth_db=min_dip_depth_db,
         )
     fit_start = time.time()
     tol = fit_tolerance if fit_tolerance is not None else tol
-    guess = {} if initial_guess is None else dict(_normalise_param_dict(initial_guess))
+    guess = {} if initial_guess is None else dict(_parameter_dict(initial_guess))
     if use_error_weights is not None:
         optimizer_z_err = True if use_error_weights else None
     f, z, z_error, opt_error = _prepare_arrays(f, z, z_err, optimizer_z_err)
+    empirical = estimate_resonance_empirical(f, s21=z)
+    f0_full = float(np.mean(f))
+    if (
+        min_dip_depth_db is not None
+        and np.isfinite(empirical.dip_depth_db)
+        and empirical.dip_depth_db < float(min_dip_depth_db)
+    ):
+        return _make_noise_result(
+            f, z, z_error, opt_error, sweep_direction, f0_full, fit_start,
+            empirical, min_dip_depth_db, nonlinear=False,
+        )
     f_full, z_full, z_error_full, opt_error_full = f, z, z_error, opt_error
     if subsample:
         keep = _dip_weighted_subsample(f, z)
@@ -1123,7 +1227,7 @@ def fit_resonance(f, z, z_err=None, nonlinear=False, sweep_direction="up",
         z_error = None if z_error is None else tuple(a[keep] for a in z_error)
         opt_error = None if opt_error is None else tuple(a[keep] for a in opt_error)
     f0 = float(np.mean(f))
-    p0 = _apply_initial_guess(_guess_params(f, z), LINEAR_NAMES, guess, f0)
+    p0 = _apply_initial_guess(_guess_params(f, z, empirical), LINEAR_NAMES, guess, f0)
     opt = _run_optimizer(
         f, z, z_error, opt_error, p0, False, sweep_direction, f0, max_nfev, tol,
         param_bounds=_select_names(param_bounds, LINEAR_NAMES),
@@ -1132,7 +1236,8 @@ def fit_resonance(f, z, z_err=None, nonlinear=False, sweep_direction="up",
         error_weight_power=error_weight_power,
     )
     return _make_result(f_full, z_full, z_error_full, opt_error_full,
-                        opt, sweep_direction, f0, fit_start)
+                        opt, sweep_direction, f0, fit_start,
+                        empirical=empirical)
 
 
 def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
@@ -1143,7 +1248,8 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
                             use_error_weights=None, error_weight_power=1.0,
                             fit_tolerance=None, try_harder=False,
                             try_even_harder=False,
-                            subsample=False, autodetect_high_anl=True):
+                            subsample=False, autodetect_high_anl=True,
+                            min_dip_depth_db=0.5):
     """Fit one complex S21 sweep with a linear seed then one Duffing refinement.
 
     For heavily bistable resonators whose deepest basin has a narrow
@@ -1174,14 +1280,26 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
 
     For repeat measurements pass the previous ``FitResult`` as
     ``initial_guess`` instead; that path is faster and lands in the same
-    basin as the original fit.
+    basin as the original fit. The same ``min_dip_depth_db`` pre-check used by
+    ``fit_resonance`` runs before the linear seed.
     """
     fit_start = time.time()
     tol = fit_tolerance if fit_tolerance is not None else tol
-    guess = {} if initial_guess is None else dict(_normalise_param_dict(initial_guess))
+    guess = {} if initial_guess is None else dict(_parameter_dict(initial_guess))
     if use_error_weights is not None:
         optimizer_z_err = True if use_error_weights else None
     f, z, z_error, opt_error = _prepare_arrays(f, z, z_err, optimizer_z_err)
+    empirical = estimate_resonance_empirical(f, s21=z)
+    f0 = float(np.mean(f))
+    if (
+        min_dip_depth_db is not None
+        and np.isfinite(empirical.dip_depth_db)
+        and empirical.dip_depth_db < float(min_dip_depth_db)
+    ):
+        return _make_noise_result(
+            f, z, z_error, opt_error, sweep_direction, f0, fit_start,
+            empirical, min_dip_depth_db, nonlinear=True,
+        )
     f_full, z_full, z_error_full, opt_error_full = f, z, z_error, opt_error
     # Run seeder, _guess_params, and the linear pre-fit on the FULL data --
     # they're cheap and changing their inputs perturbs the seed enough to
@@ -1189,8 +1307,7 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
     # Duffing refine and try_harder/try_even_harder grids below.
     seed_obs = _asymmetry_observables(f, z)
     seed = None if seed_obs is None else (seed_obs["fr_seed"], seed_obs["anl_seed"])
-    f0 = float(np.mean(f))
-    p0_linear = _apply_initial_guess(_guess_params(f, z), LINEAR_NAMES,
+    p0_linear = _apply_initial_guess(_guess_params(f, z, empirical), LINEAR_NAMES,
                                      _select_names(guess, LINEAR_NAMES), f0)
     opt_linear = _run_optimizer(
         f, z, z_error, opt_error, p0_linear, False, sweep_direction, f0, max_nfev, tol,
@@ -1199,7 +1316,10 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
         return_uncertainties=return_uncertainties,
         error_weight_power=error_weight_power,
     )
-    linear_fit = _make_result(f, z, z_error, opt_error, opt_linear, sweep_direction, f0, fit_start)
+    linear_fit = _make_result(
+        f, z, z_error, opt_error, opt_linear, sweep_direction, f0, fit_start,
+        empirical=empirical,
+    )
 
     if subsample:
         keep = _dip_weighted_subsample(f, z)
@@ -1284,6 +1404,7 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
 
     return _make_result(f_full, z_full, z_error_full, opt_error_full,
                         opt, sweep_direction, f0, fit_start,
+                        empirical=empirical,
                         linear_fit=linear_fit, opt_linear=opt_linear,
                         opt_nonlinear=opt)
 
@@ -1325,15 +1446,6 @@ def _resolve_n_jobs(n_jobs, task_count):
     else:
         workers = n_jobs
     return max(1, min(workers, int(task_count)))
-
-
-def _pop_njobs_alias(fit_kwargs, n_jobs):
-    """Accept the common njobs spelling without passing it to single-fit APIs."""
-    if "njobs" not in fit_kwargs:
-        return n_jobs
-    if n_jobs not in (None, 1):
-        raise ValueError("pass only one of n_jobs or njobs")
-    return fit_kwargs.pop("njobs")
 
 
 def _verbose_level(verbose):
@@ -1516,12 +1628,16 @@ def _parallel_map(func, tasks, n_jobs, verbose=False, label="fits",
 
 def _fit_sweep_stack_one(task):
     """Worker for one already-windowed sweep stack row."""
-    f, z, e, nonlinear, sweep_direction, fit_kwargs = task
+    f, z, e, nonlinear, sweep_direction, fit_kwargs, tone_index, is_blind = task
     if nonlinear:
-        return fit_resonance_nonlinear(
+        fit = fit_resonance_nonlinear(
             f, z, z_err=e, sweep_direction=sweep_direction, **fit_kwargs)
-    return fit_resonance(
-        f, z, z_err=e, sweep_direction=sweep_direction, **fit_kwargs)
+    else:
+        fit = fit_resonance(
+            f, z, z_err=e, sweep_direction=sweep_direction, **fit_kwargs)
+    fit.tone_index = int(tone_index)
+    fit.is_blind = bool(is_blind)
+    return fit
 
 
 def _batch_fit_one(task):
@@ -1574,22 +1690,76 @@ def _stack_rows(f_stack, z_stack, z_err_stack=None):
     return rows
 
 
+def _targeted_sweep_tone_indices(sweep_data, n_tones, skip_blind=True):
+    """Return original tone indices to fit for targeted sweep data."""
+    def metadata_sequence(*values):
+        for value in values:
+            if value is None:
+                continue
+            try:
+                if len(value) == 0:
+                    continue
+            except TypeError:
+                pass
+            return value
+        return []
+
+    indices = list(range(n_tones))
+    if not skip_blind:
+        return indices, set()
+
+    info = sweep_data.get("info", {}) or {}
+    tones = info.get("tones", {}) if isinstance(info, dict) else {}
+    metadata = sweep_data.get("tone_metadata", {}) or {}
+    blind_indices = metadata_sequence(
+        metadata.get("blind_indices"),
+        tones.get("blind_indices"),
+    )
+    try:
+        blind = {int(i) for i in blind_indices if 0 <= int(i) < n_tones}
+    except TypeError:
+        blind = set()
+    regular_indices = metadata_sequence(
+        metadata.get("regular_indices"),
+        tones.get("regular_indices"),
+    )
+    try:
+        has_regular = len(regular_indices) > 0
+    except TypeError:
+        has_regular = bool(regular_indices)
+    if has_regular:
+        try:
+            regular = [int(i) for i in regular_indices if 0 <= int(i) < n_tones]
+        except TypeError:
+            regular = []
+        if regular:
+            return regular, blind
+    return [i for i in indices if i not in blind], blind
+
+
 def fit_sweep_stack(f_stack, z_stack, z_err_stack=None, nonlinear=False,
                     sweep_direction="up", n_jobs=1, verbose=False,
                     **fit_kwargs):
     """Fit each row/column in a stack of already-windowed resonance sweeps.
 
+    This is a low-level array helper. It does not understand server sweep
+    metadata, blind-tone flags, or original tone indices; each returned
+    ``FitResult.tone_index`` is the row/column number assigned by the stack
+    adapter. Rows are independent fits, so even if the stack represents the
+    same resonator over several powers, this function does not use the
+    previous row's result as the next row's starting point.
+
     ``n_jobs`` follows the joblib convention: ``1`` is serial, ``-1`` uses all
     visible CPUs, and ``-2`` uses all but one. Parallel fitting uses separate
     processes. Pass ``verbose=True`` to print completion progress.
     Single-fit options, including ``initial_guess``, ``param_bounds`` and
-    ``param_fixed``, are forwarded through ``**fit_kwargs``.
+    ``param_fixed`` and ``min_dip_depth_db``, are forwarded through
+    ``**fit_kwargs``.
     """
     rows = _stack_rows(f_stack, z_stack, z_err_stack)
-    n_jobs = _pop_njobs_alias(fit_kwargs, n_jobs)
     tasks = [
-        (f, z, e, nonlinear, sweep_direction, dict(fit_kwargs))
-        for f, z, e in rows
+        (f, z, e, nonlinear, sweep_direction, dict(fit_kwargs), i, False)
+        for i, (f, z, e) in enumerate(rows)
     ]
     return _parallel_map(
         _fit_sweep_stack_one, tasks, n_jobs, verbose=verbose,
@@ -1632,25 +1802,46 @@ def _flatten_sweep(sweep_data, zerr=None):
     return f_all[order], z_all[order], None if e_all is None else e_all[order]
 
 
+def _batch_fit_finder_defaults(frequencies, filter_params=None,
+                               finder_params=None):
+    """Return conservative resonance-search defaults for fitting windows."""
+    from .peak_finder import wideband_resonance_search_params
+
+    return wideband_resonance_search_params(
+        frequencies, filter_params=filter_params, finder_params=finder_params)
+
+
 def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
               filter_params=None, finder_params=None, window_fwhm=10.0,
               nonlinear=False, sweep_direction="up", verbose=True,
               z_err=None, optimizer_z_err=None, use_error_weights=None,
               max_points=None, n_jobs=1, find_resonances=False,
+              skip_blind=True,
               **fit_kwargs):
     """Fit one or more resonances from a sweep-data dict.
+
+    This is the high-level adapter for sweep-data dictionaries returned by the
+    readout server. For targeted sweeps, it fits each regular tone trace in
+    that one sweep independently and preserves the original server tone index
+    on each ``FitResult``. Use ``fit_sweep_stack`` instead when you already
+    have raw frequency/S21 arrays rather than a sweep-data dictionary.
 
     ``n_jobs`` follows the joblib convention: ``1`` is serial, ``-1`` uses all
     visible CPUs, and ``-2`` uses all but one. Parallel fitting uses separate
     processes. Single-fit options, including ``initial_guess``,
-    ``param_bounds`` and ``param_fixed``, are forwarded through
+    ``param_bounds``, ``param_fixed`` and ``min_dip_depth_db``, are forwarded through
     ``**fit_kwargs``. When ``resonances`` is omitted, targeted per-tone sweeps
     fit one trace per tone by default. Pass ``find_resonances=True`` to
-    auto-detect resonance windows from a concatenated sweep instead.
+    auto-detect resonance windows from a concatenated sweep instead. That
+    auto-detection uses fitter-oriented defaults when no ``filter_params`` or
+    ``finder_params`` are supplied: inner 10-90% of the frequency span,
+    prominence 1-100 dB, width 1 kHz-10 MHz, minimum spacing 100 kHz,
+    lowpass 0.5, highpass 0, and dip finding. By default, targeted sweeps skip
+    tones marked as blind in ``sweep_data['info']['tones']`` or
+    ``sweep_data['tone_metadata']``.
     """
     from .peak_finder import find_mkid_resonances
 
-    n_jobs = _pop_njobs_alias(fit_kwargs, n_jobs)
     sf, z_stack, e_stack = _prepare_sweep_stack(sweep_data, z_err)
     f_all, z_all, e_all = _flatten_sweep(sweep_data, z_err)
     if use_error_weights is not None:
@@ -1665,30 +1856,42 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
     if not (none_opt or optimizer_z_err is True or same_opt):
         _, _, opt_stack = _prepare_sweep_stack(sweep_data, optimizer_z_err)
         _, _, opt_all = _flatten_sweep(sweep_data, optimizer_z_err)
-    base_guess = _normalise_param_dict(fit_kwargs.pop("initial_guess", None))
+    base_guess = _parameter_dict(fit_kwargs.pop("initial_guess", None))
 
     if resonances is None:
         if _is_targeted_sweep_data(sweep_data) and not find_resonances:
             rows = _stack_rows(sf, z_stack, e_stack)
+            tone_indices, blind_indices = _targeted_sweep_tone_indices(
+                sweep_data, len(rows), skip_blind=skip_blind)
             if opt_stack is None:
                 opt_rows = [None] * len(rows)
             else:
                 opt_rows = [row for _, row, _ in _stack_rows(sf, opt_stack)]
 
             tasks = []
-            total = len(rows)
-            for i, ((f_row, z_row, e_row), opt_row) in enumerate(zip(rows, opt_rows)):
+            for tone_index in tone_indices:
+                f_row, z_row, e_row = rows[tone_index]
+                opt_row = opt_rows[tone_index]
                 kwargs = dict(fit_kwargs)
                 if base_guess is not None:
                     kwargs["initial_guess"] = dict(base_guess)
                 kwargs["optimizer_z_err"] = opt_row
-                tasks.append((f_row, z_row, e_row, nonlinear, sweep_direction, kwargs))
+                tasks.append((
+                    f_row, z_row, e_row, nonlinear, sweep_direction, kwargs,
+                    tone_index, tone_index in blind_indices,
+                ))
+
+            def targeted_progress(index, completed, total, fit):
+                tone_index = tasks[index][6]
+                return _format_fit_progress(
+                    "Tone", tone_index, completed, total, fit,
+                    item_label="index",
+                )
 
             return _parallel_map(
                 _fit_sweep_stack_one, tasks, n_jobs, verbose=verbose,
                 label="tones",
-                progress_formatter=lambda index, completed, total, fit:
-                    _format_fit_progress("Tone", index, completed, total, fit),
+                progress_formatter=targeted_progress,
             )
 
         if not find_resonances:
@@ -1696,9 +1899,12 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
                 "batch_fit() requires explicit resonances for concatenated sweeps; "
                 "pass find_resonances=True to auto-detect them from sweep_data."
             )
+        filter_params, finder_params = _batch_fit_finder_defaults(
+            f_all, filter_params=filter_params, finder_params=finder_params)
         resonances = find_mkid_resonances(
             f_all, z_all, data_format=data_format,
             filter_params=filter_params, finder_params=finder_params,
+            verbose=verbose,
         )
     if resonances and isinstance(resonances[0], (int, float, np.integer, np.floating)):
         resonances = [type("R", (), {"frequency": float(fr), "fwhm": None})()
@@ -1752,12 +1958,15 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
 
 def extract_parameters(fit_results):
     """Extract common fitted parameters from one or more FitResult objects."""
-    keys = ("fr", "Ql", "Qi", "Qc", "Qc_abs", "phi", "a", "A", "alpha",
+    keys = ("fr", "Ql", "Qi", "Qc", "Qc_abs", "phi", "a", "alpha",
             "tau", "anl", "nonlinear_detuning_hz", "residual_rms",
             "weighted_rms", "reduced_chi2", "success", "nfev",
             "linear_nfev", "nonlinear_nfev", "fit_duration_s",
             "linear_fit_duration_s", "nonlinear_fit_duration_s",
-            "optimizer_cost", "linear_cost", "nonlinear_cost")
+            "optimizer_cost", "linear_cost", "nonlinear_cost",
+            "empirical_fr", "empirical_linewidth_hz", "empirical_Ql",
+            "empirical_Qc", "empirical_Qi", "empirical_dip_depth_db",
+            "empirical_skew", "noise_only")
     if fit_results is None:
         fit_results = ()
     elif isinstance(fit_results, FitResult):
@@ -1770,7 +1979,45 @@ def extract_parameters(fit_results):
         out["Qe"] = np.array([])
         return out
     out = {}
+    defaults = {"noise_only": False}
     for key in keys:
-        out[key] = np.array([getattr(r, key) for r in fit_results])
-    out["Qe"] = np.array([r.Qe for r in fit_results])
+        out[key] = np.array([
+            getattr(r, key, defaults.get(key, np.nan))
+            for r in fit_results
+        ])
+    noise_only = np.asarray(out["noise_only"], dtype=bool)
+    if np.any(noise_only):
+        out["anl"] = np.asarray(out["anl"], dtype=float)
+        out["anl"][noise_only] = np.nan
+    out["Qe"] = np.array([getattr(r, "Qe", complex(np.nan, np.nan)) for r in fit_results])
     return out
+
+
+def fit_result_summary_row(
+    fit,
+    keys=FIT_SUMMARY_KEYS,
+    uncertainty_keys=FIT_UNCERTAINTY_KEYS,
+    include_message=True,
+):
+    """Return CSV-friendly scalar fields for one ``FitResult``.
+
+    Power-sweep tooling adds sweep/tone/power columns around this generic
+    fitter-level row, so the list of exported fit fields lives with the fitter
+    instead of being duplicated by each workflow.
+    """
+    row = {}
+    uncertainty_keys = set(uncertainty_keys or ())
+    uncertainties = getattr(fit, "parameter_uncertainties", None) or {}
+    for key in tuple(keys):
+        if key == "noise_only":
+            value = bool(getattr(fit, key, False))
+        else:
+            value = getattr(fit, key, np.nan)
+        if isinstance(value, np.generic):
+            value = value.item()
+        row[key] = value
+        if key in uncertainty_keys:
+            row[f"{key}_err"] = float(uncertainties.get(key, np.nan))
+    if include_message:
+        row["message"] = getattr(fit, "message", "")
+    return row

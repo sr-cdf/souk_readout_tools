@@ -787,7 +787,8 @@ plt.show()
 ### 4.2  Resonance finding — wideband mode
 
 ```python
-resonances = c.find_resonances(sweep_data=sweep, mode='wideband')
+wideband = c.find_resonances(sweep_data=sweep, mode='wideband')
+resonances = wideband['all_resonances']
 print(f"Found {len(resonances)} resonances")
 for r in resonances[:5]:
     print(f"  {r.frequency/1e6:.3f} MHz, depth={r.dip_depth:.1f} dB, "

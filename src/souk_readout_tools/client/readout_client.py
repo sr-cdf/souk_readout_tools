@@ -1326,7 +1326,7 @@ class ReadoutClient:
     #       maximise/optimise/fix operations (requires save_config, see push_config TODO).
     def maximise_tx_power(self, headroom_db=2.0, reference_plane='dac',
                           power_limit_dbm=None, compression_headroom_db=None,
-                          rx_policy='protect'):
+                          rx_policy='protect', digital_only=False, rf_only=False):
         """Maximise TX output power at the chosen reference plane.
 
         Parameters
@@ -1354,28 +1354,41 @@ class ReadoutClient:
               PFB FFT shift.
             - ``'raise'`` — raise error if ADC saturates.
             - ``'none'`` — don't touch the RX path.
+        digital_only : bool
+            If True, only firmware/RFDC parameters are adjusted.
+        rf_only : bool
+            If True, only RF frontend attenuators and bypass amps are adjusted.
         """
         msg = {'request': 'maximise_tx_power', 'headroom_db': headroom_db,
-               'reference_plane': reference_plane, 'rx_policy': rx_policy}
+               'reference_plane': reference_plane, 'rx_policy': rx_policy,
+               'digital_only': digital_only, 'rf_only': rf_only}
         if power_limit_dbm is not None:
             msg['power_limit_dbm'] = power_limit_dbm
         if compression_headroom_db is not None:
             msg['compression_headroom_db'] = compression_headroom_db
         return self.send_request(msg)
 
-    def maximise_rx_power(self, headroom_db=1.0):
+    def maximise_rx_power(self, headroom_db=1.0, digital_only=False, rf_only=False):
         """Maximise RX chain power while retaining the requested headroom."""
-        return self.send_request({'request': 'maximise_rx_power', 'headroom_db': headroom_db})
+        return self.send_request({'request': 'maximise_rx_power',
+                                  'headroom_db': headroom_db,
+                                  'digital_only': digital_only,
+                                  'rf_only': rf_only})
 
-    def optimise_tx_snr(self, reference_plane='detector', headroom_db=2.0):
+    def optimise_tx_snr(self, reference_plane='detector', headroom_db=2.0,
+                        digital_only=False, rf_only=False):
         """Optimise TX settings for SNR at the requested reference plane."""
         return self.send_request({'request': 'optimise_tx_snr',
                                   'reference_plane': reference_plane,
-                                  'headroom_db': headroom_db})
+                                  'headroom_db': headroom_db,
+                                  'digital_only': digital_only,
+                                  'rf_only': rf_only})
 
-    def optimise_rx_snr(self):
+    def optimise_rx_snr(self, digital_only=False, rf_only=False):
         """Optimise RX settings for SNR."""
-        return self.send_request({'request': 'optimise_rx_snr'})
+        return self.send_request({'request': 'optimise_rx_snr',
+                                  'digital_only': digital_only,
+                                  'rf_only': rf_only})
 
     def fix_dac_saturation(self):
         """Ask the server to reduce or reconfigure output drive to clear DAC saturation."""
@@ -1862,7 +1875,7 @@ class ReadoutClient:
             raise ValueError(f"Invalid file format {filename.split('.')[-1]}")
         return data_dict
 
-    def get_accumulator_snapshots(self, tone_index, num_snapshots):
+    def get_accumulator_snapshots(self, tone_index, num_snapshots, fast=False):
         """
         Acquire num_snapshots pre-accumulation snapshots for a single tone.
 
@@ -1872,6 +1885,8 @@ class ReadoutClient:
         Args:
             tone_index (int): Tone index to snapshot.
             num_snapshots (int): Number of snapshots to acquire.
+            fast (bool): If True, use the server's manual devmem path.
+                         Default False uses the standard CASPER snapshot API.
 
         Returns:
             dict with keys:
@@ -1884,7 +1899,8 @@ class ReadoutClient:
             s.connect((self.request_server_address, self.request_server_port))
             message = {'request': 'get_accumulator_snapshots',
                        'tone_index': tone_index,
-                       'num_snapshots': num_snapshots}
+                       'num_snapshots': num_snapshots,
+                       'fast': bool(fast)}
             message_data = json.dumps(message).encode()
             message_len = struct.pack('>I', len(message_data))
             s.sendall(message_len + message_data)
@@ -1928,7 +1944,114 @@ class ReadoutClient:
                 'tone_index': tone_index,
                 'sample_rate': snapshot_rate,
                 'num_snapshots': num_snapshots,
-                'len_snapshot': result.shape[1] if result is not None else 0}
+                'len_snapshot': result.shape[1] if result is not None else 0,
+                'fast': bool(fast)}
+
+    @staticmethod
+    def analyse_accumulator_snapshots(snapshot_data, threshold=1.5):
+        """
+        Summarise per-frame changes in pre-accumulator snapshots.
+
+        This is intended for spotting whole-snapshot excursions such as
+        apparent gain jumps, I/Q rotations, or mean/noise changes.
+
+        Args:
+            snapshot_data: Dict returned by get_accumulator_snapshots(), or a
+                           2D complex array with shape (frames, samples).
+            threshold: Ratio threshold used to flag suspect frames.
+
+        Returns:
+            Dict of per-frame arrays and ``suspect_indices``.
+        """
+        if isinstance(snapshot_data, dict):
+            snapshots = snapshot_data.get('snapshots')
+        else:
+            snapshots = snapshot_data
+
+        snapshots = np.asarray(snapshots)
+        if snapshots.ndim != 2:
+            raise ValueError('snapshots must be a 2D array of shape '
+                             '(num_snapshots, len_snapshot)')
+        if snapshots.shape[0] == 0:
+            raise ValueError('snapshots array is empty')
+
+        eps = np.finfo(float).tiny
+        threshold = float(threshold)
+        if threshold <= 1.0:
+            raise ValueError('threshold must be greater than 1.0')
+
+        frame_mean = np.mean(snapshots, axis=1)
+        centered = snapshots - frame_mean[:, None]
+        noise_rms = np.sqrt(np.mean(np.abs(centered) ** 2, axis=1))
+        i_std = np.std(snapshots.real, axis=1)
+        q_std = np.std(snapshots.imag, axis=1)
+
+        reference_mean = (np.median(frame_mean.real)
+                          + 1j * np.median(frame_mean.imag))
+        reference_abs_mean = max(float(np.median(np.abs(frame_mean))), eps)
+        reference_noise_rms = max(float(np.median(noise_rms)), eps)
+        reference_i_std = max(float(np.median(i_std)), eps)
+        reference_q_std = max(float(np.median(q_std)), eps)
+        reference_i_mean = float(np.median(frame_mean.real))
+        reference_q_mean = float(np.median(frame_mean.imag))
+
+        if abs(reference_mean) > eps:
+            complex_mean_ratio = frame_mean / reference_mean
+            phase_offset_rad = np.angle(complex_mean_ratio)
+        else:
+            complex_mean_ratio = np.full(frame_mean.shape, np.nan + 1j*np.nan)
+            phase_offset_rad = np.full(frame_mean.shape, np.nan)
+
+        if abs(reference_i_mean) > eps:
+            i_mean_ratio = frame_mean.real / reference_i_mean
+            i_mean_suspect = ((np.abs(i_mean_ratio) < 1.0 / threshold) |
+                              (np.abs(i_mean_ratio) > threshold))
+        else:
+            i_mean_ratio = np.full(frame_mean.shape, np.nan)
+            i_mean_suspect = np.zeros(frame_mean.shape, dtype=bool)
+
+        if abs(reference_q_mean) > eps:
+            q_mean_ratio = frame_mean.imag / reference_q_mean
+            q_mean_suspect = ((np.abs(q_mean_ratio) < 1.0 / threshold) |
+                              (np.abs(q_mean_ratio) > threshold))
+        else:
+            q_mean_ratio = np.full(frame_mean.shape, np.nan)
+            q_mean_suspect = np.zeros(frame_mean.shape, dtype=bool)
+
+        abs_mean_ratio = np.abs(frame_mean) / reference_abs_mean
+        noise_rms_ratio = noise_rms / reference_noise_rms
+        i_std_ratio = i_std / reference_i_std
+        q_std_ratio = q_std / reference_q_std
+
+        lower = 1.0 / threshold
+        suspect_mask = (
+            (abs_mean_ratio < lower) | (abs_mean_ratio > threshold) |
+            (noise_rms_ratio < lower) | (noise_rms_ratio > threshold) |
+            (i_std_ratio < lower) | (i_std_ratio > threshold) |
+            (q_std_ratio < lower) | (q_std_ratio > threshold) |
+            i_mean_suspect | q_mean_suspect
+        )
+
+        return {
+            'frame_mean': frame_mean,
+            'complex_mean_ratio': complex_mean_ratio,
+            'abs_mean_ratio': abs_mean_ratio,
+            'i_mean_ratio': i_mean_ratio,
+            'q_mean_ratio': q_mean_ratio,
+            'phase_offset_rad': phase_offset_rad,
+            'noise_rms': noise_rms,
+            'noise_rms_ratio': noise_rms_ratio,
+            'i_std': i_std,
+            'q_std': q_std,
+            'i_std_ratio': i_std_ratio,
+            'q_std_ratio': q_std_ratio,
+            'reference_mean': reference_mean,
+            'reference_abs_mean': reference_abs_mean,
+            'reference_i_mean': reference_i_mean,
+            'reference_q_mean': reference_q_mean,
+            'reference_noise_rms': reference_noise_rms,
+            'suspect_indices': np.flatnonzero(suspect_mask),
+        }
 
     def batch_snapshots(self, tone_indices=None, num_snapshots=10,
                         export_file=None, plot=False, verbose=True):
@@ -2269,7 +2392,7 @@ class ReadoutClient:
         else:
             raise ValueError(f"Unsupported file_format '{file_format}'. Use 'npy' or 'json'.")
 
-    def perform_sweep(self, centers, spans, points, samples_per_point,direction='up', phases=None, refresh_adc_cal=True, adc_cal_settle_time=2.0):
+    def perform_sweep(self, centers, spans, points, samples_per_point,direction='up', phases=None, refresh_adc_cal=True, adc_cal_settle_time=2.0, wait=False):
         """
         Perform a frequency sweep.
 
@@ -2289,6 +2412,8 @@ class ReadoutClient:
                 the refresh but still ensure the calibration is frozen.
             adc_cal_settle_time (float): Seconds to wait for ADC calibration
                 to settle. Default 2.0.
+            wait (bool): If True, block until the sweep completes by calling
+                wait_for_sweep() after dispatching the request. Default False.
         """
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(centers)
@@ -2313,9 +2438,12 @@ class ReadoutClient:
             'refresh_adc_cal': refresh_adc_cal,
             'adc_cal_settle_time': adc_cal_settle_time
         }
-        return self.send_request(message)
+        response = self.send_request(message)
+        if wait and response.get('status') == 'success':
+            self.wait_for_sweep()
+        return response
 
-    def perform_retune(self, centers, spans, points, samples_per_point, direction='up', method='max_gradient', freq_offsets=None, phases=None, refresh_adc_cal=True, adc_cal_settle_time=2.0):
+    def perform_retune(self, centers, spans, points, samples_per_point, direction='up', method='max_gradient', freq_offsets=None, phases=None, refresh_adc_cal=True, adc_cal_settle_time=2.0, wait=False):
         """
         Perform a retune sweep to find optimal tone frequencies.
 
@@ -2335,6 +2463,8 @@ class ReadoutClient:
                 before sweeping. If False, skip refresh but still ensure frozen.
             adc_cal_settle_time (float): Seconds to wait for ADC calibration
                 to settle. Default 2.0.
+            wait (bool): If True, block until the retune completes by calling
+                wait_for_sweep() after dispatching the request. Default False.
         """
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(centers)
@@ -2378,7 +2508,10 @@ class ReadoutClient:
             'refresh_adc_cal': refresh_adc_cal,
             'adc_cal_settle_time': adc_cal_settle_time
         }
-        return self.send_request(message)
+        response = self.send_request(message)
+        if wait and response.get('status') == 'success':
+            self.wait_for_sweep()
+        return response
 
     def get_sweep_progress(self):
         """Return current sweep progress as a float from 0.0 to 1.0."""
@@ -4623,6 +4756,10 @@ class ReadoutClient:
                 per_tone.append(results)
                 all_resonances.extend(results)
 
+                if len(results) == 0:
+                    print(f'Warning: no resonances found in tone {t} sweep.')
+
+
                 if len(results) > 1:
                     flagged_tones.append(t)
 
@@ -4640,12 +4777,15 @@ class ReadoutClient:
             raise ValueError(
                 f"Unknown mode '{mode}'. Use 'auto', 'wideband', or 'targeted'.")
 
-    def find_resonance_frequencies(self, sweep_data=None, **kwargs):
+    def find_resonance_frequencies(self, sweep_data, only_first=True,**kwargs):
         """
         Convenience method to get just the resonance frequencies.
         
         Args:
             sweep_data: Optional sweep data dict. If None, performs a sweep.
+            only_first: If True (default), return only the first found resonance per tone but 
+                        if no resonance found for a tone, return the frequency from the sweep info dict.
+                        If False, return all found resonances in a flat list.
             **kwargs: Passed to find_resonances.
         
         Returns:
@@ -4655,12 +4795,28 @@ class ReadoutClient:
         """
         resonances = self.find_resonances(sweep_data, **kwargs)
 
-        if hasattr(resonances, 'all_resonances'):
-            resonances = resonances.all_resonances
-        elif isinstance(resonances, dict):
-            resonances = resonances['all_resonances']
+        if only_first:
+            if hasattr(resonances, 'per_tone'):
+                resonances = resonances.per_tone
+            elif isinstance(resonances, dict):
+                resonances = resonances['per_tone']
 
-        return np.array([r.frequency for r in resonances])
+            freqs= []
+
+            for i,p in enumerate(resonances):
+                if len(p) == 0:
+                    freqs.append(sweep_data['info']['tones']['frequencies_hz'][i])
+                else:
+                    freqs.append(p[0].frequency)
+            return np.array(freqs)
+        
+        else:
+            if hasattr(resonances, 'all_resonances'):
+                resonances = resonances.all_resonances
+            elif isinstance(resonances, dict):
+                resonances = resonances['all_resonances']
+
+            return np.array([r.frequency for r in resonances])
 
 
     def open_kid_finder_app(self, sweep_data=None, sweep_file=None, prompt_save=False):

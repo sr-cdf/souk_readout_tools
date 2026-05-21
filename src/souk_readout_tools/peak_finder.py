@@ -14,7 +14,7 @@ Date: January 2026
 """
 
 import numpy as np
-from scipy.signal import butter, filtfilt, find_peaks, peak_widths
+from scipy.signal import butter, filtfilt, find_peaks
 from scipy.ndimage import median_filter
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict, Any, Union
@@ -68,6 +68,69 @@ class PeakFinderParams:
     f_high: Optional[float] = None  # Hz; drop peaks above this frequency
 
 
+def _inner_frequency_trim(frequencies, low_fraction=0.10, high_fraction=0.90):
+    """Return inner-band frequency bounds for wideband auto-detection."""
+    f = np.asarray(frequencies, dtype=float).ravel()
+    good = np.isfinite(f)
+    if np.count_nonzero(good) < 2:
+        return None, None
+    f_min = float(np.nanmin(f[good]))
+    f_max = float(np.nanmax(f[good]))
+    bandwidth = f_max - f_min
+    if not np.isfinite(bandwidth) or bandwidth <= 0.0:
+        return None, None
+    return (
+        f_min + low_fraction * bandwidth,
+        f_min + high_fraction * bandwidth,
+    )
+
+
+def _with_default_param_overrides(defaults, overrides, cls):
+    """Build params from defaults plus caller-supplied dict overrides."""
+    if overrides is None:
+        return defaults
+    if isinstance(overrides, dict):
+        values = dict(vars(defaults))
+        values.update(overrides)
+        return cls(**values)
+    return overrides
+
+
+def wideband_resonance_search_params(frequencies, filter_params=None,
+                                     finder_params=None):
+    """Return conservative wideband resonance-search parameters.
+
+    These defaults are intended for automatic wideband MKID resonance searches:
+    ignore the noisy filter edges, look for dips, and require enough
+    prominence/width/spacing to avoid fitting every small noise fluctuation.
+    Caller-supplied dicts override individual defaults; fully constructed
+    parameter objects are used unchanged.
+    """
+    f_low, f_high = _inner_frequency_trim(frequencies)
+    default_filter = FilterParams(
+        highpass_edge=0.0,
+        lowpass_edge=0.5,
+        median_kernel_size=1,
+    )
+    default_finder = PeakFinderParams(
+        prominence_enabled=True,
+        prominence_min=1.0,
+        prominence_max=100.0,
+        width_enabled=True,
+        width_min=1_000.0,
+        width_max=10_000_000.0,
+        distance_enabled=True,
+        distance_value=100_000.0,
+        peak_direction=-1,
+        f_low=f_low,
+        f_high=f_high,
+    )
+    return (
+        _with_default_param_overrides(default_filter, filter_params, FilterParams),
+        _with_default_param_overrides(default_finder, finder_params, PeakFinderParams),
+    )
+
+
 @dataclass
 class ResonanceResult:
     """Result for a single detected resonance."""
@@ -78,8 +141,70 @@ class ResonanceResult:
     qc: Optional[float] = None
     qi: Optional[float] = None
     dip_depth: Optional[float] = None
+    skew: Optional[float] = None
     marker_mag: Optional[float] = None
     marker_filt: Optional[float] = None
+
+
+@dataclass
+class ResonanceSearchResult:
+    """Container returned by client-level resonance searches.
+
+    It is list-like over ``all_resonances`` for compatibility with the old
+    wideband return value, and mapping-like for metadata shared by wideband and
+    targeted searches.
+    """
+    mode: str
+    all_resonances: List[ResonanceResult] = field(default_factory=list)
+    per_tone: List[List[ResonanceResult]] = field(default_factory=list)
+    flagged_tones: List[int] = field(default_factory=list)
+    num_tones: int = 0
+
+    _mapping_keys = (
+        'mode',
+        'all_resonances',
+        'per_tone',
+        'flagged_tones',
+        'num_tones',
+    )
+
+    def __iter__(self):
+        return iter(self.all_resonances)
+
+    def __len__(self):
+        return len(self.all_resonances)
+
+    def __bool__(self):
+        return bool(self.all_resonances)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            if key not in self._mapping_keys:
+                raise KeyError(key)
+            return getattr(self, key)
+        return self.all_resonances[key]
+
+    def __contains__(self, item):
+        if isinstance(item, str) and item in self._mapping_keys:
+            return True
+        return item in self.all_resonances
+
+    def keys(self):
+        return self._mapping_keys
+
+    def values(self):
+        return tuple(getattr(self, key) for key in self._mapping_keys)
+
+    def items(self):
+        return tuple((key, getattr(self, key)) for key in self._mapping_keys)
+
+    def get(self, key, default=None):
+        if key in self._mapping_keys:
+            return getattr(self, key)
+        return default
+
+    def as_dict(self):
+        return dict(self.items())
 
 
 class DataProcessor:
@@ -261,9 +386,9 @@ def find_resonances(
 def analyze_resonance(
     peak_idx: int,
     frequencies: np.ndarray,
+    s21_complex: np.ndarray,
     log_magnitude: np.ndarray,
     filtered_data: np.ndarray,
-    peak_direction: int = -1,
 ) -> ResonanceResult:
     """
     Analyze a single resonance to extract Q-factor, FWHM, etc.
@@ -271,64 +396,71 @@ def analyze_resonance(
     Args:
         peak_idx: Index of the peak in the data arrays
         frequencies: Frequency array in Hz
+        s21_complex: Complex S21 data
         log_magnitude: Log magnitude data in dB
         filtered_data: Filtered data used for peak finding
-        peak_direction: -1 for dips, +1 for peaks
         
     Returns:
         ResonanceResult with analysis data
     """
-    n = len(frequencies)
-    i_p1 = min(n - 1, peak_idx + 1)
-    i_n1 = max(0, peak_idx - 1)
-    
-    frequency = frequencies[peak_idx]
-    frequency_step = (frequencies[i_p1] - frequencies[i_n1]) / max(1, i_p1 - i_n1)
-    
-    # Adjust data for peak direction
-    adjusted_data = peak_direction * filtered_data
-    
-    try:
-        results_half = peak_widths(adjusted_data, [peak_idx], rel_height=0.5)
-        width_samples = results_half[0][0]
-        width_hz = width_samples * frequency_step
-        fwhm = width_hz if width_hz > 0 else frequency_step
-        q_factor = frequency / fwhm
-        
-        # Calculate dip depth in region around resonance
-        mask = (frequencies < frequency + 5 * fwhm) & (frequencies > frequency - 5 * fwhm)
-        if np.any(mask):
-            dip_depth = float(np.max(log_magnitude[mask]) - np.min(log_magnitude[mask]))
-        else:
-            dip_depth = 0.0
-            
-    except Exception:
-        fwhm = frequency_step
-        q_factor = frequency / fwhm
-        dip_depth = 0.0
-    
-    # Calculate Qc and Qi
-    if dip_depth > 0:
-        qc = q_factor / (1 - 10 ** (-dip_depth / 20))
-    else:
-        qc = float('inf')
-    
-    if q_factor != 0 and qc != 0:
-        qi = 1.0 / (1.0 / q_factor - 1.0 / qc) if (1.0 / q_factor - 1.0 / qc) != 0 else float('inf')
-    else:
-        qi = float('inf')
+    from .resonator import estimate_resonance_empirical
+
+    estimate = estimate_resonance_empirical(
+        frequencies,
+        s21_complex,
+        peak_index=peak_idx,
+    )
     
     return ResonanceResult(
         peak_idx=peak_idx,
-        frequency=frequency,
-        fwhm=fwhm,
-        q_factor=q_factor,
-        qc=qc,
-        qi=qi,
-        dip_depth=dip_depth,
+        frequency=estimate.fr,
+        fwhm=estimate.linewidth_hz,
+        q_factor=estimate.Ql,
+        qc=estimate.Qc,
+        qi=estimate.Qi,
+        dip_depth=estimate.dip_depth_db,
+        skew=estimate.skew,
         marker_mag=float(log_magnitude[peak_idx]),
         marker_filt=float(filtered_data[peak_idx]),
     )
+
+
+def _verbose_level(verbose):
+    if isinstance(verbose, bool):
+        return 1 if verbose else 0
+    try:
+        return int(verbose)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _candidate_analysis_slice(peak_idx, candidate_index, properties, n_points,
+                              pad_widths=10.0, min_points=101):
+    """Return a local data window wide enough to estimate one candidate."""
+    start = int(peak_idx)
+    stop = int(peak_idx) + 1
+
+    left_ips = properties.get('left_ips')
+    right_ips = properties.get('right_ips')
+    if left_ips is not None and right_ips is not None:
+        left = float(left_ips[candidate_index])
+        right = float(right_ips[candidate_index])
+        if np.isfinite(left) and np.isfinite(right) and right > left:
+            width = right - left
+            margin = pad_widths * width
+            start = int(np.floor(left - margin))
+            stop = int(np.ceil(right + margin)) + 1
+
+    if stop - start < min_points:
+        extra = int(np.ceil((min_points - (stop - start)) / 2.0))
+        start -= extra
+        stop += extra
+
+    start = max(0, start)
+    stop = min(n_points, stop)
+    if stop <= start:
+        stop = min(n_points, start + 1)
+    return slice(start, stop)
 
 
 def find_mkid_resonances(
@@ -337,6 +469,7 @@ def find_mkid_resonances(
     data_format: str = 'log_magnitude',
     filter_params: Optional[FilterParams] = None,
     finder_params: Optional[PeakFinderParams] = None,
+    verbose: Union[bool, int] = False,
 ) -> List[ResonanceResult]:
     """
     Main entry point: find MKID resonances in sweep data.
@@ -353,6 +486,8 @@ def find_mkid_resonances(
         data_format: One of DataProcessor.FORMATS
         filter_params: Optional FilterParams (defaults used if None)
         finder_params: Optional PeakFinderParams (defaults used if None)
+        verbose: Print resonance-search progress. ``True`` prints stage
+            summaries; ``2`` also prints each analyzed candidate.
         
     Returns:
         List of ResonanceResult objects sorted by frequency
@@ -381,32 +516,75 @@ def find_mkid_resonances(
         filter_params = FilterParams()
     if finder_params is None:
         finder_params = PeakFinderParams()
+    verbose = _verbose_level(verbose)
+    frequencies = np.asarray(frequencies, dtype=float).ravel()
+    s21_complex = np.asarray(s21_complex, dtype=complex).ravel()
+    if frequencies.shape != s21_complex.shape:
+        raise ValueError("frequencies and s21_complex must have the same shape.")
     
     # Process data
+    if verbose:
+        print(
+            f"Finding resonances in {frequencies.size} sweep points "
+            f"using {data_format}...",
+            flush=True,
+        )
     processor = DataProcessor(frequencies, s21_complex)
     raw_data = processor.get_data(data_format)
     log_mag = processor.get_data('log_magnitude')
     
     # Apply filtering
+    if verbose:
+        print("  Filtering resonance-search data...", flush=True)
     filtered_data = apply_filter(raw_data, filter_params)
     
     # Find peaks
-    peak_indices, _ = find_resonances(filtered_data, frequencies, finder_params)
+    if verbose:
+        print("  Running peak finder...", flush=True)
+    peak_indices, properties = find_resonances(
+        filtered_data, frequencies, finder_params)
+    total = len(peak_indices)
+    if verbose:
+        print(f"  Found {total} candidate resonances.", flush=True)
+        if total >= finder_params.max_num_peaks:
+            print(
+                f"  Candidate list reached max_num_peaks="
+                f"{finder_params.max_num_peaks}; peak finding may be noise-limited.",
+                flush=True,
+            )
     
     # Analyze each resonance
     results = []
-    for idx in peak_indices:
+    report_every = max(1, int(np.ceil(total / 10.0))) if total else 1
+    for candidate_index, idx in enumerate(peak_indices):
+        window = _candidate_analysis_slice(
+            idx, candidate_index, properties, frequencies.size)
+        local_idx = int(idx - window.start)
         result = analyze_resonance(
-            peak_idx=idx,
-            frequencies=frequencies,
-            log_magnitude=log_mag,
-            filtered_data=filtered_data,
-            peak_direction=finder_params.peak_direction,
+            peak_idx=local_idx,
+            frequencies=frequencies[window],
+            s21_complex=s21_complex[window],
+            log_magnitude=log_mag[window],
+            filtered_data=filtered_data[window],
         )
+        result.peak_idx = int(idx)
+        result.marker_mag = float(log_mag[idx])
+        result.marker_filt = float(filtered_data[idx])
         results.append(result)
+        completed = candidate_index + 1
+        if verbose >= 2 or (verbose == 1 and (
+            completed == 1 or completed == total or completed % report_every == 0
+        )):
+            print(
+                f"  Analyzed {completed}/{total} candidates "
+                f"({100.0 * completed / max(total, 1):.0f}%).",
+                flush=True,
+            )
     
     # Sort by frequency
     results.sort(key=lambda r: r.frequency)
+    if verbose:
+        print(f"  Resonance analysis complete: {len(results)} candidates.", flush=True)
     
     return results
 

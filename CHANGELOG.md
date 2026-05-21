@@ -45,6 +45,11 @@ Forward-ported the `jl_ocs_devel` branch (PR #10) plus follow-on hardening.
 - Added process-based parallel fitting for `fit_sweep_stack()` and
   `batch_fit()` via `n_jobs`, with compact verbose progress showing throughput,
   fit timing, and cumulative function evaluations.
+- Added conservative wideband peak-finder defaults for
+  `client.find_resonances(mode='wideband')` and
+  `batch_fit(find_resonances=True)`: inner 10-90% frequency trim, dip finding,
+  1-100 dB prominence, 1 kHz-10 MHz width, 100 kHz minimum spacing, and
+  lowpass 0.5.
 
 **Resonator Transforms and Plotting**
 - Deembedding, phase-centering, and sweep plotting now propagate optional S21
@@ -61,6 +66,25 @@ Forward-ported the `jl_ocs_devel` branch (PR #10) plus follow-on hardening.
   are valid strings but not valid Python expressions (e.g. `fpg_file`
   paths, ISO-8601 date strings, free-form text). All three importers now
   share an identical metadata-parse loop.
+
+**Client API**
+- `ReadoutClient.perform_sweep()` and `perform_retune()` now accept a
+  `wait=False` keyword. Setting `wait=True` blocks until the sweep
+  finishes by calling `wait_for_sweep()` internally after a successful
+  dispatch.
+
+**Power Sweep Workflow Polish**
+- `power_sweep.run_power_sweep()` now defaults `follow_min_depth_db=0.5`
+  (matching `fit_power_sweep()`'s `min_dip_depth_db` default), so
+  `follow_dips=True` no longer chases shallow noise minima between power
+  steps. Pass `follow_min_depth_db=None` to restore the previous accept-
+  any-depth behaviour.
+- Added `power_sweep.best_power_arrays()`, `write_best_power()`, and
+  `load_best_power()` for extracting the chosen power, `p_bif`, and
+  `p_bif_sub_3db` per tone as 1-D NumPy arrays, and round-tripping the
+  full `find_best_power()` result to `best_power.json`.
+- `plot_fits()` now disables the shared axis offset annotation
+  (`+1.5e9`-style text) on every magnitude/phase/IQ panel it draws.
 
 ## v1.2.0
 
@@ -306,6 +330,11 @@ Forward-ported the `jl_ocs_devel` branch (PR #10) plus follow-on hardening.
 
 **Resonance Finding Enhancements**
 - `find_resonances(mode='targeted')` — per-tone resonance search with double/triple flagging.
+- `find_resonances()` now returns one `ResonanceSearchResult` shape for both
+  wideband and targeted inputs, with `all_resonances`, `per_tone`,
+  `flagged_tones`, and `mode` available in all cases.
+- Fixed `find_resonances(mode='auto', sweep_data=None)` so it performs the
+  default wideband sweep instead of returning the string `"wideband"`.
 - `flagged_tones` output for tones containing multiple resonances.
 
 **Resonator Fitting (`souk_readout_tools.fitting`)**

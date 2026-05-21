@@ -577,7 +577,7 @@ client.set_tone_powers([-20, -25], reference_plane='detector')
 client.get_tone_powers(detailed_output=True)
 ```
 
-By default, `set_tone_powers` automatically optimises the dynamic range — it maximises DAC bit utilisation, adjusts available TX RF controls (programmable attenuator and amp bypass), and lowers `psb_scale` if those controls cannot absorb enough excess power. To skip optimisation for faster execution (e.g. during sweeps where the analog chain is already configured), pass `optimise_dynamic_range=False`.
+By default, `set_tone_powers` automatically optimises the dynamic range — it maximises DAC bit utilisation, adjusts available TX RF controls (programmable attenuator and amp bypass), and lowers `psb_scale` if those controls cannot absorb enough excess power. RX handling is controlled with `rx_policy`: use `protect` to avoid ADC saturation, `compensate` to keep ADC power approximately constant when TX power changes, or `maximise` to run `maximise_rx_power()` after the TX change. To skip optimisation for faster execution (e.g. during sweeps where the analog chain is already configured), pass `optimise_dynamic_range=False`.
 
 The tone powers can be set to the maximum level that avoids saturation of the RF chain by calling ```client.maximise_tx_power()```
 
@@ -798,13 +798,13 @@ spans = [0.2e6, 0.2e6]        # span per tone in Hz
 num_points = 101
 samples_per_point = 3          # keep low for fast sweeps
 
-client.perform_sweep(centers, spans, num_points, samples_per_point, direction='up')
+client.perform_sweep(centers, spans, num_points, samples_per_point, direction='up', wait=True)
 
-# Check progress
-client.get_sweep_progress()  # 0.0 to 1.0
-
-# Wait for completion and retrieve data
-client.wait_for_sweep()
+# `wait=True` blocks until the sweep completes. To dispatch without blocking,
+# omit `wait` (or pass `wait=False`) and poll/await manually:
+#   client.perform_sweep(centers, spans, num_points, samples_per_point, direction='up')
+#   client.get_sweep_progress()  # 0.0 to 1.0
+#   client.wait_for_sweep()
 
 raw_sweep = client.get_sweep_data()
 data = client.parse_sweep_data(raw_sweep)
@@ -885,10 +885,12 @@ Use the built-in resonance finder to locate MKID dips in sweep data:
 
 ```python
 # Find resonances from existing sweep data
-resonances = client.find_resonances(sweep_data, data_format='log_magnitude')
+result = client.find_resonances(sweep_data, data_format='log_magnitude')
+resonances = result['all_resonances']
 
 # Or let find_resonances perform a wideband sweep automatically
-resonances = client.find_resonances()  # calls wideband_sweep() internally
+result = client.find_resonances()  # calls wideband_sweep() internally
+resonances = result['all_resonances']
 
 # Each resonance has: frequency, fwhm, q_factor, qc, qi, dip_depth
 for r in resonances:
@@ -897,6 +899,12 @@ for r in resonances:
 # Get just the frequency list
 freqs = client.find_resonance_frequencies(sweep_data)
 ```
+
+`find_resonances()` returns the same result object for wideband and targeted
+sweeps. Use `result['all_resonances']` for the flat list, `result['per_tone']`
+for per-tone/per-trace grouping, and `result['flagged_tones']` for targeted
+sweeps with multiple resonances in one tone. The result is also list-like over
+`all_resonances`, so existing `for r in result` style code still works.
 
 If `sweep_data=None` (the default), `find_resonances` will call `wideband_sweep()` internally to acquire the data. Any extra keyword arguments are forwarded to `wideband_sweep()`.
 
@@ -923,7 +931,8 @@ from souk_readout_tools.peak_finder import FilterParams, PeakFinderParams
 filt = FilterParams(highpass_edge=0.001, lowpass_edge=0.5, median_kernel_size=51)
 peaks = PeakFinderParams(prominence=3.0, min_width=3e3, max_num_peaks=500)
 
-resonances = client.find_resonances(sweep_data, filter_params=filt, finder_params=peaks)
+result = client.find_resonances(sweep_data, filter_params=filt, finder_params=peaks)
+resonances = result['all_resonances']
 ```
 
 ### Interactive GUI
@@ -949,11 +958,9 @@ client.perform_retune(
     points=101,
     samples_per_point=100,
     direction='up',
-    method='max_gradient'  # or 'min_mag'
+    method='max_gradient',  # or 'min_mag'
+    wait=True,              # block until the retune completes
 )
-
-# Wait for completion
-client.wait_for_sweep()
 
 # Tones are now placed at the detected resonance frequencies
 new_freqs = client.get_tone_frequencies()
@@ -1297,13 +1304,15 @@ print(
     f"fr={result.fr/1e6:.4f} MHz, Ql={result.Ql:.0f}, "
     f"Qi={result.Qi:.0f}, Qc={result.Qc:.0f}, nfev={result.nfev}")
 
-# Fit an already-windowed stack, e.g. the same KID over several powers
+# Fit an already-windowed array stack. Rows are independent fits; if this is
+# the same KID over several powers, no previous-row result is used as a seed.
 fits_by_power = fit_sweep_stack(
     f_stack, z_stack, z_err_stack=e_stack, nonlinear=True,
     n_jobs=-1, verbose=True, subsample=True,
 )
 
-# Batch fit all resonances in a full sweep (auto-detects resonances)
+# Batch fit a server sweep dictionary. Targeted sweeps preserve tone metadata
+# and skip blind tones by default; full/wide sweeps can auto-detect windows.
 fits = batch_fit(
     sweep_data, nonlinear=True, n_jobs=-1, verbose=True,
     use_error_weights=True, error_weight_power=0.5, subsample=True,
@@ -1316,6 +1325,13 @@ print(f"Mean Qi: {np.mean(params['Qi']):.0f}")
 
 `verbose=True` prints compact progress with throughput and cumulative
 function evaluations. Use `verbose=2` to print one line per completed fit.
+Set `min_dip_depth_db` to reject noise-only traces before optimisation. The
+check uses the existing empirical dip depth; rejected rows return
+`success=False`, `noise_only=True`, and `nfev=0`. Use
+`min_dip_depth_db=None` to force a fit.
+For ordered repeat measurements where each trace is the same resonator, call
+`fit_resonance()` or `fit_resonance_nonlinear()` in a loop and pass the
+previous `FitResult` as `initial_guess` if you want chained starting values.
 
 CLI: `souk-find-resonances -C config.yaml --fit -f resonances.txt -P`
 
