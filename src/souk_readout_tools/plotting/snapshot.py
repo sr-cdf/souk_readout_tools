@@ -19,7 +19,8 @@ from ._psd import compute_psd, compute_psd_averaged, compute_psd_concatenated
 def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
                    deembed=False, phase_center=False,
                    fig=None, label=None,
-                   units='raw', config=None, system_info=None, **kwargs):
+                   units='raw', config=None, system_info=None,
+                   unwrap_phase=True, **kwargs):
     """
     Plot snapshot data for a single tone.
 
@@ -48,6 +49,9 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
         config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
         system_info: structured info dict.  Looked up from
             snapshot_data['info'] if not provided.
+        unwrap_phase: bool, optional.  Unwrap the phase in
+            ``format='magphase'``.  Default ``True`` preserves the previous
+            behaviour; pass ``False`` to show wrapped phase.
         **kwargs: Passed to plot calls.
 
     Returns:
@@ -59,6 +63,7 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
     tone_index = snapshot_data['tone_index']
     n_snap, n_samples = snapshots.shape
     info = system_info or snapshot_data.get('info')
+    calibration_cache = {}
 
     # Normalise I/Q label setup
     if units != 'raw':
@@ -68,10 +73,10 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
         # Probe labels from a dummy call
         _, _, _, _, iq_label, mag_label = _normalise_iq(
             np.zeros(1), np.zeros(1), units, info, config=config,
-            pre_accumulation=True)
+            pre_accumulation=True, calibration_cache=calibration_cache)
     else:
         iq_label = ''
-        mag_label = '|S21| (dB)'
+        mag_label = '|RX| (dB)'
 
     # Prepare data based on repetitions mode
     if repetitions == 'concatenate':
@@ -99,7 +104,7 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
         for z in z_list:
             ni, nq, _, _, _, _ = _normalise_iq(
                 z.real.copy(), z.imag.copy(), units, info, config=config,
-                pre_accumulation=True)
+                pre_accumulation=True, calibration_cache=calibration_cache)
             normalised.append(ni + 1j * nq)
         z_list = normalised
 
@@ -139,7 +144,9 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             ax2.set_xlabel('Time (µs)')
 
         elif format == 'magphase':
-            mag_db, phase = _compute_mag_phase_units(z, units, info=info, config=config)
+            mag_db, phase = _compute_mag_phase_units(
+                z, units, info=info, config=config, unwrap=unwrap_phase,
+                calibration_cache=calibration_cache)
             ax1.plot(t, mag_db, linewidth=0.5, label=trace_label, **kwargs)
             ax2.plot(t, phase, linewidth=0.5, label=trace_label, **kwargs)
             ax1.set_ylabel(mag_label)
@@ -349,7 +356,7 @@ def plot_batch_snapshots(batch_data, format='iq_vs_t', repetitions='concatenate'
                     mag_db, phase = _compute_mag_phase(z)
                     ax1.plot(t, mag_db, linewidth=0.5, label=trace_label, **kwargs)
                     ax2.plot(t, phase, linewidth=0.5, label=trace_label, **kwargs)
-                ax1.set_ylabel('|S21| (dB)')
+                ax1.set_ylabel('|RX| (dB)')
                 ax2.set_ylabel('Phase (rad)')
 
             # Row label + legends

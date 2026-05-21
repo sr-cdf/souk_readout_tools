@@ -1742,12 +1742,15 @@ class ReadoutServer:
                     power_limit_dbm = message.get('power_limit_dbm', None)
                     compression_headroom_db = message.get('compression_headroom_db', None)
                     rx_policy = message.get('rx_policy', 'protect')
+                    digital_only = message.get('digital_only', False)
+                    rf_only = message.get('rf_only', False)
                     amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.maximise_tx_power(
                         self.r, self.r_fast, self.config, headroom_db=headroom_db,
                         reference_plane=reference_plane, rf_peripherals=self.rf_peripherals,
                         power_limit_dbm=power_limit_dbm,
                         compression_headroom_db=compression_headroom_db,
-                        rx_policy=rx_policy)
+                        rx_policy=rx_policy, digital_only=digital_only,
+                        rf_only=rf_only)
                     result = {'amps': amps.tolist(), 'psb_fft_shift': psb_fft_shift, 'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
                     if isinstance(dac, dict) and 'tx_compression' in dac:
                         result['tx_compression'] = dac['tx_compression']
@@ -1757,6 +1760,10 @@ class ReadoutServer:
                     kwargs = {'rf_peripherals': self.rf_peripherals}
                     if 'headroom_db' in message:
                         kwargs['headroom_db'] = message['headroom_db']
+                    if 'digital_only' in message:
+                        kwargs['digital_only'] = message['digital_only']
+                    if 'rf_only' in message:
+                        kwargs['rf_only'] = message['rf_only']
                     dsa, pfb_fft_shift, dsp, adc, rx_atten = firmware_lib.maximise_rx_power(self.r, self.r_fast, self.config, **kwargs)
                     # Get RX amp bypass state if available
                     has_bypass_amps = hasattr(self.rf_peripherals, 'get_rx_amp_bypass')
@@ -1777,12 +1784,23 @@ class ReadoutServer:
                         kwargs['reference_plane'] = message['reference_plane']
                     if 'headroom_db' in message:
                         kwargs['headroom_db'] = message['headroom_db']
+                    if 'digital_only' in message:
+                        kwargs['digital_only'] = message['digital_only']
+                    if 'rf_only' in message:
+                        kwargs['rf_only'] = message['rf_only']
                     amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.optimise_tx_snr(self.r,self.r_fast,self.config, **kwargs)
                     result = {'amps': amps.tolist(), 'psb_fft_shift': psb_fft_shift, 'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
                     await self.send_response(writer, {'status': 'success', 'result': result})
                 
                 elif request == 'optimise_rx_snr':
-                    pfb_fft_shift,dsp,adc = firmware_lib.optimise_rx_snr(self.r,self.r_fast,self.config, rf_peripherals=self.rf_peripherals)
+                    kwargs = {'rf_peripherals': self.rf_peripherals}
+                    if 'headroom_db' in message:
+                        kwargs['headroom_db'] = message['headroom_db']
+                    if 'digital_only' in message:
+                        kwargs['digital_only'] = message['digital_only']
+                    if 'rf_only' in message:
+                        kwargs['rf_only'] = message['rf_only']
+                    pfb_fft_shift,dsp,adc = firmware_lib.optimise_rx_snr(self.r,self.r_fast,self.config, **kwargs)
                     result = {'pfb_fft_shift': pfb_fft_shift, 'dsp_ovf': dsp, 'adc_levels': adc}
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
@@ -1950,7 +1968,10 @@ class ReadoutServer:
                 elif request == 'get_accumulator_snapshots':
                     tone_index = message.get('tone_index')
                     num_snapshots = message.get('num_snapshots')
-                    task = asyncio.create_task(self.batch_accumulator_snapshots(writer, [tone_index], num_snapshots))
+                    if message.get('fast', False):
+                        task = asyncio.create_task(self.batch_accumulator_snapshots(writer, [tone_index], num_snapshots))
+                    else:
+                        task = asyncio.create_task(self.get_accumulator_snapshots(writer, tone_index, num_snapshots))
                     self.tasks.append(task)
 
                 elif request == 'batch_accumulator_snapshots':
@@ -1987,6 +2008,8 @@ class ReadoutServer:
                         direction = message.get('direction')
                         refresh_adc_cal = message.get('refresh_adc_cal', True)
                         adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
+                        self.latest_sweep_data_valid = False
+                        self.sweep_progress = 0.0
                         #print('asyncio create task, sweep task')
                         self.sweep_task = asyncio.create_task(
                             self.sweep(centers, spans, points, samples_per_point, direction, refresh_adc_cal=refresh_adc_cal, adc_cal_settle_time=adc_cal_settle_time)
@@ -1998,7 +2021,10 @@ class ReadoutServer:
                         await self.send_response(writer, {'status': 'error', 'message': 'Sweep already in progress'})
                 
                 elif request == 'get_sweep_progress':
-                        await self.send_response(writer, {'status': 'success', 'progress': self.sweep_progress})
+                    progress = self.sweep_progress
+                    if self.sweep_task is not None and not self.sweep_task.done():
+                        progress = min(progress, 0.999999)
+                    await self.send_response(writer, {'status': 'success', 'progress': progress})
                     
                 elif request == 'get_sweep_data':
                     if self.latest_sweep_data_valid:
@@ -2090,6 +2116,8 @@ class ReadoutServer:
                         freq_offsets = message.get('freq_offsets', None)
                         refresh_adc_cal = message.get('refresh_adc_cal', True)
                         adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
+                        self.latest_sweep_data_valid = False
+                        self.sweep_progress = 0.0
                         self.sweep_task = asyncio.create_task(
                             self.retune(centers, spans, points, samples_per_point, direction, method, freq_offsets, refresh_adc_cal=refresh_adc_cal, adc_cal_settle_time=adc_cal_settle_time)
                         )
@@ -2581,6 +2609,42 @@ class ReadoutServer:
             writer.close()
             await writer.wait_closed()
 
+    async def get_accumulator_snapshots(self, writer, tone_index, num_snapshots):
+        """
+        Acquire num_snapshots pre-accumulation snapshots for a single tone
+        using the standard CASPER snapshot API and stream them to the client.
+
+        This is slower than the manual devmem path but keeps the snapshot
+        control/read sequence inside the firmware library implementation.
+        """
+        try:
+            details = firmware_lib.get_tone_frequencies(
+                self.r, self.config, detailed_output=True)[1]
+            firmware_indices = details['rx']['tone_indices']
+            if tone_index >= len(firmware_indices):
+                raise ValueError(f'Tone index {tone_index} out of range '
+                                 f'(only {len(firmware_indices)} tones active)')
+
+            fw_chan = firmware_indices[tone_index]
+            acc = self.r.accumulators[0]
+            acc.set_snapshot_chan(fw_chan)
+
+            for _ in range(num_snapshots):
+                data = np.asarray(acc.get_new_snapshot(), dtype=np.complex128)
+                data_bytes = data.tobytes()
+                data_len = struct.pack('>I', len(data_bytes))
+                writer.write(data_len + data_bytes)
+                await writer.drain()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Error getting accumulator snapshots: {e}")
+            print(traceback.format_exc())
+        finally:
+            self.tasks.remove(asyncio.current_task())
+            writer.close()
+            await writer.wait_closed()
+
     async def batch_accumulator_snapshots(self, writer, tone_indices, num_snapshots):
         """
         Acquire num_snapshots pre-accumulation snapshots for multiple tones
@@ -2896,6 +2960,7 @@ class ReadoutServer:
                 autosync=True,
                 tone_amplitudes=sweep_tone_amplitudes,
                 tone_phases=sweep_tone_phases)
+            self.update_active_tone_indices()
 
             if init_psb_scale is not None:
                 self.r.psbscale.set_scale(init_psb_scale)
@@ -2932,6 +2997,7 @@ class ReadoutServer:
                 autosync=True,
                 tone_amplitudes=sweep_tone_amplitudes,
                 tone_phases=sweep_tone_phases)
+            self.update_active_tone_indices()
             if init_psb_scale is not None:
                 self.r.psbscale.set_scale(init_psb_scale)
                 init_psb_scale = None
@@ -3037,6 +3103,7 @@ class ReadoutServer:
 
             firmware_lib.set_tone_frequencies_fast(self.r,self.r_fast,self.config,retune_freqs)
             self.update_active_tone_indices()
+            self.sweep_progress = 1.0
             # print('New frequencies:',firmware_lib.get_tone_frequencies(self.r,self.config))
 
             # results = firmware_lib.perform_retune(self.r,self.r_fast, self.config, center, span, points, samples_per_point, direction, method)

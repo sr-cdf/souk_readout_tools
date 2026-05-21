@@ -52,7 +52,7 @@ Each `ReadoutServer` uses two TCP ports - a **request port** for JSON command/re
 - **Mock server mode** - `ReadoutClient(mock=True)` emulates the readout server in-process (synthetic resonator catalogue, sweeps, snapshots, streams) for OCS / controller integration testing without RFSoC hardware.
 - **Frequency sweeping** - wideband survey sweeps across the full RF band and targeted sweeps around individual resonances
 - **Resonance finding** - automated peak detection across multiple data formats (magnitude, phase, group delay, |dS21/df|, etc), plus an interactive PyQt5 GUI
-- **Resonance fitting** - linear and Duffing-capable complex S21 fitting (`fit_resonance`, `fit_sweep_stack`, `batch_fit`) with extracted physical parameters (`fr`, `Qi`, `Qc`, `phi`, etc.), optional uncertainty weighting, and process-parallel fitting support
+- **Resonance fitting** - linear and Duffing-capable complex S21 fitting (`fit_resonance`, `batch_fit`, `fit_sweep_stack`) with extracted physical parameters (`fr`, `Qi`, `Qc`, `phi`, etc.), optional uncertainty weighting, and process-parallel fitting support. `batch_fit` consumes server sweep dictionaries and preserves tone metadata; `fit_sweep_stack` consumes already-windowed arrays and fits rows independently.
 - **Retuning** - sweep-and-retune workflows to track drifting resonances using max-derivative or min-magnitude methods
 - **Power management** - automatic TX/RX level optimisation with saturation detection, dynamic range management, and calibrated power control in dBm at any reference plane in the signal chain
 - **ADC calibration freeze** - freeze the RFSoC's internal ADC calibration during observations to eliminate drift noise, with periodic defrost for recalibration

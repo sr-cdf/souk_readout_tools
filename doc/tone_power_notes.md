@@ -174,6 +174,19 @@ The optimisation proceeds in steps:
 
 The result dict returned by `set_tone_powers` includes `achieved_powers_dbm`, `power_error_db`, and `warnings` — these are surfaced to the client automatically.
 
+RX handling during TX power changes is controlled with `rx_policy`:
+
+- `protect` keeps the ADC from saturating, adding RX attenuation or DSA only
+  when needed.
+- `compensate` mirrors TX power changes onto the RX path to keep ADC power
+  approximately constant.
+- `maximise` runs `maximise_rx_power()` after the TX change, optimising RX
+  attenuation, ADC DSA, RX amp bypass state, and PFB FFT shift.
+- `raise` errors on ADC saturation, and `none` leaves the RX path untouched.
+
+The same policy string can be passed through `run_power_sweep(...,
+rx_policy="maximise")`.
+
 The function also checks RFDC RTS (Real-Time Status) sticky overvoltage flags during overflow detection, if available in the installed `souk_mkid_readout` version.
 
 ### Power breakdown
@@ -263,15 +276,83 @@ client.set_tone_frequencies(freqs)
 for power_dbm in [-30, -25, -20, -15, -10]:
     client.set_tone_powers([power_dbm] * len(freqs))
     spans = [0.5e6] * len(freqs)
-    client.perform_sweep(freqs, spans, 201, 10)
-    # ... wait and collect data ...
+    client.perform_sweep(freqs, spans, 201, 10, wait=True)
+    # ... collect data ...
 ```
 
-### Fitting to dip depth
+### Fitting power sweeps
 
-*Not yet implemented in the codebase.* A planned approach is to fit the resonance dip depth or the nonlinearity parameter as a function of drive power, and automatically select the optimal drive level.
+The `souk_readout_tools.power_sweep` helper keeps acquisition, fitting, and
+plotting as explicit steps for this workflow:
 
-The general procedure would be:
+```python
+from souk_readout_tools import power_sweep as ps
+
+run = ps.run_power_sweep(
+    client,
+    centers=freqs,
+    spans=0.5e6,
+    powers_dbm=[-95, -90, -85, -80],
+    output_dir="kid_power_sweep",
+    follow_dips=True,
+)
+
+data = ps.load_power_sweep("kid_power_sweep")
+fits = ps.fit_power_sweep(data, nonlinear=True, n_jobs=-1)
+ps.write_fit_summary(fits, "kid_power_sweep/fit_summary.csv")
+ps.write_fit_results(fits, "kid_power_sweep")
+ps.plot_power_sweep(data, fits, deembed=True)
+```
+
+On later notebook sessions you can skip the fit step and reload the stored
+`FitResult` objects directly:
+
+```python
+data = ps.load_power_sweep("kid_power_sweep")
+fits = ps.load_fit_results("kid_power_sweep", run=data)
+ps.plot_power_sweep(
+    data,
+    fits,
+    deembed=True,
+    tone_indices=range(0, data["tone_count"], 10),  # quick-look subset
+    save_overlay=False,  # skip the crowded combined overlay for large arrays
+    dpi=90,
+    fit_figsize=(7.0, 4.2),
+    parameter_figsize=(5.8, 6.9),
+    parameters=("fr", "empirical_dip_depth_db", "Qi", "Qc", "phi", "anl"),
+)
+```
+
+Use `tone_indices` to control which per-tone PNGs are written. It accepts a
+single tone index, an explicit list such as `[0, 12, 37]`, a `range(...)`, or a
+NumPy index array. Leave it as `None` only when you really want diagnostics for
+every resonator in the sweep. Both `plot_power_sweep()` and
+`plot_best_power()` print compact progress by default while writing plots; pass
+`verbose=False` to silence that output.
+
+The parameter plots keep 1-sigma error bars by default, but use a compact
+layout and one vectorised error-bar artist per parameter subplot. Reduce
+`dpi`/`parameter_figsize` further for quick-look production, or set
+`parameter_show_errors=False` only for very rough browse plots.
+
+`fit_power_sweep()` has two fitting shapes. With `tone_index=None`, it calls
+`batch_fit()` once per saved server sweep and returns `fits_by_power`, so the
+output is organised as power step -> tone. This path preserves server tone
+indices and skips blind tones by default. With `tone_index=<i>`, it extracts
+that one tone from every power step and returns a single `fits` list ordered by
+power. That single-tone path uses `fit_sweep_stack()` as an array adapter; rows
+are currently fit independently, so the previous power's result is not used as
+the next initial guess.
+
+For quick notebook inspection, use `fit_parameter_series()` to pull one tone's
+parameters onto the power axis without walking the nested fit lists:
+
+```python
+series = ps.fit_parameter_series(fits, tone_index=0)
+plt.plot(series["power_dbm"], series["Qc"] / series["Qi"], marker="o")
+```
+
+The general procedure is:
 
 1. Sweep each resonance at a range of drive powers.
 2. Fit the S21 dip at each power level to extract Q_i, Q_c, and the resonance frequency.
@@ -279,10 +360,137 @@ The general procedure would be:
 4. Identify the onset of nonlinearity as the point where Q_i or frequency begins to change rapidly with power.
 5. Set the drive power just below this onset.
 
+Fit summaries also include `empirical_*` columns (`empirical_linewidth_hz`,
+`empirical_dip_depth_db`, empirical Q estimates, and `empirical_skew`). These
+are measured before optimisation, so they are useful when a least-squares fit
+fails or lands in an unrealistic basin. If `empirical_dip_depth_db` is below
+`min_dip_depth_db`, the fitter marks that row as `success=False` and
+`noise_only=True`; power selection ignores those rows by default.
+Tones marked as blind monitors are saved for raw inspection, but are skipped by
+the batch fitting, fit-summary, and fitted power-sweep plotting helpers.
+
+With `follow_dips=True`, each targeted sweep recentres the next power step on
+the empirical local dip near the current tone. This is useful when resonances
+move with drive power. The update is conservative: blind tones are left fixed,
+the search is limited to the tone's current span, candidate dips shallower than
+`follow_min_depth_db` (default `0.5` dB, matching `fit_power_sweep()`'s
+`min_dip_depth_db` default) keep their previous centre, and proposed moves that
+would make neighbouring tone centres cross or bunch together are rejected. Set
+`follow_min_depth_db=None` to accept any depth.
+
 
 ### Nonlinearity parameter
 
-*Coming soon.* A quantitative nonlinearity metric based on the Duffing model could be used to automate drive power selection.
+For nonlinear fits, the Duffing `anl` parameter can be used to automate the
+readout-power choice. Work with the in-memory fit result first:
+
+```python
+fits = ps.fit_power_sweep(data, nonlinear=True, n_jobs=-1)
+
+best = ps.find_best_power(fits, target_anl=0.01)
+plots = ps.plot_best_power(fits, best, dpi=90, figsize=(6.2, 3.8))
+```
+
+`find_best_power()` fits an unweighted straight line to `log(anl)` vs tone
+power for each resonator, applies one pass of MAD outlier rejection, and
+returns the precise power that reaches the target ANL. Rows are excluded
+before the fit when the solver reports failure, when any fitted parameter
+falls at or beyond an entry in `param_valid_ranges` (defaults mirror the
+fitter's physical bounds, so rows pinned at a clamp are dropped), or when
+`Qi` / `Qc` / `phi` deviates from the per-tone median by more than
+`param_outliers_mad_clip` MAD-equivalent sigmas (default `5.0`).
+Low-clamped `anl` rows are excluded from the ANL-vs-power fit, but still
+count for the measured fallback that picks the highest power with
+`anl < target_anl`.
+
+If the target lies outside the measured range, `find_best_power()` simply
+returns the extrapolated value from the log-linear fit. The `range_position`
+field on the pick (`within_measured_range` / `above_measured_range` /
+`below_measured_range`) flags this for diagnostics. If the ANL fit is
+unreliable (too few retained points, or slope below `anl_fit_min_slope`), the
+selection falls back to the highest-power row whose measured `anl` is below
+the target, and finally to the lowest measured power.
+
+`plot_best_power()` writes per-tone diagnostic plots showing the measured ANL
+values, rejected rows, the log-linear ANL fit, the target ANL, and the selected
+power. The same helpers also accept rows from `fit_summary_rows()` or a
+`fit_summary.csv` path for offline checks. For large arrays, pass
+`tone_indices=...` to either plotting helper when you only need a subset of
+diagnostics.
+
+### End-to-end best-power workflow
+
+Putting the pieces together, a typical iteration looks like this. The first
+sweep brackets each tone with a wide power schedule, the chosen powers are
+saved to disk, and the next sweep narrows around them:
+
+```python
+import numpy as np
+from souk_readout_tools import power_sweep as ps
+
+OUT = "kid_power_sweep_round1"
+p = np.arange(-100, -70, 3)[:, np.newaxis]  # (n_steps, 1), broadcasts to tones
+
+run = ps.run_power_sweep(
+    client,
+    centers=centers,
+    spans=spans,
+    points=301,
+    samples_per_point=3,
+    powers_dbm=p,
+    output_dir=OUT,
+    follow_dips=True,            # uses follow_min_depth_db=0.5 by default,
+                                 # so shallow noise dips are not chased
+    optimise_dynamic_range=True,
+    rx_policy="maximise",
+)
+
+data = ps.load_power_sweep(OUT)
+fits = ps.fit_power_sweep(data, nonlinear=True, n_jobs=-1,
+                          try_harder=True, tol=1e-8, min_dip_depth_db=1)
+ps.write_fit_results(fits, OUT)
+ps.write_fit_summary(fits, f"{OUT}/fit_summary.csv")
+
+best = ps.find_best_power(fits, target_anl=0.05)
+ps.write_best_power(best, OUT)            # writes OUT/best_power.json
+ps.plot_best_power(fits, best)
+ps.plot_power_sweep(
+    data, fits,
+    parameters=("empirical_fr", "empirical_dip_depth_db", "fr",
+                "Qi", "Qc", "phi", "anl"),
+    show_overlay=True,
+)
+```
+
+For the next iteration, reload the previous picks and centre a denser
+schedule on them:
+
+```python
+arrays = ps.best_power_arrays(OUT)        # accepts a dir, file, or list
+b0 = arrays["chosen_power_dbm"]
+p_bif = arrays["p_bif"]                   # 1-D arrays, length == n_tones
+
+p = b0 + np.arange(-9, 10, 3)[:, np.newaxis]
+run = ps.run_power_sweep(
+    client,
+    centers=centers,
+    spans=spans,
+    powers_dbm=p,
+    output_dir="kid_power_sweep_round2",
+    follow_dips=True,
+    optimise_dynamic_range=True,
+    rx_policy="maximise",
+)
+```
+
+`best_power_arrays()` returns
+`{"tone_index", "chosen_power_dbm", "p_bif", "p_bif_sub_3db"}` as 1-D arrays
+of length `n_tones`, with `NaN` wherever a tone was missing from
+`find_best_power()`'s result. `write_best_power()` / `load_best_power()`
+round-trip the full per-tone dicts (including criteria, diagnostics, and
+exclusion reasons) via `OUT/best_power.json`, so any later session can
+recover the chosen powers and the bifurcation estimates without rerunning
+`find_best_power()`.
 
 ---
 
