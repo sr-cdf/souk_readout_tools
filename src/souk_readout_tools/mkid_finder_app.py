@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import tempfile
 import traceback
 import logging
@@ -182,7 +183,7 @@ class DataLoader():
             f,z=self.load_from_fits(filename)
         elif ext == '.npy':
             f,z=self.load_from_npy(filename)
-        elif ext == '.txt':
+        elif ext == '.txt' or ext == '.csv':
             f,z=self.load_from_txt(filename)
         else:
             QMessageBox.warning(None, "Error", f"File type not supported: {ext}")
@@ -245,13 +246,18 @@ class DataLoader():
             raise ValueError('format of data in npy file not understood')
 
     def load_from_txt(self, filename):
+        # Handles comma-delimited .txt/.csv with columns f,i,q,...  Skips '#'
+        # comment lines and any non-numeric header row (e.g. the
+        # 'sweep_f_0000,sweep_i_0000,...' header in wideband sweep CSV output).
         try:
-            data = np.loadtxt(filename, delimiter=',')
+            data = np.genfromtxt(filename, delimiter=',', comments='#')
+            data = np.atleast_2d(data)
+            data = data[~np.isnan(data[:, :3]).any(axis=1)]
             frequencies = data[:, 0]
             s21_complex = data[:, 1] + 1j * data[:, 2]
         except Exception as e:
-            _log.error(f'not a txt file with columns = f,i,q: {e}')  
-            QMessageBox.warning(None, "Error", f'not a txt file with columns = f,i,q: {e}')
+            _log.error(f'not a txt/csv file with columns = f,i,q: {e}')
+            QMessageBox.warning(None, "Error", f'not a txt/csv file with columns = f,i,q: {e}')
             raise(e)
         return frequencies, s21_complex
     
@@ -3682,12 +3688,12 @@ class ResonanceFinderApp(QMainWindow):
             default_ext = '.txt'
             default_filename = os.path.splitext(self.label_filename.text())[0] + default_ext
             filename, _ = QFileDialog.getSaveFileName(self, "Save Resonances", default_filename,
-                                                    "KIDLAB Toneslist Files (*.txt);;Resonance Files (*.resonances);;All Files (*)", options=options)
+                                                    "KIDLAB Toneslist Files (*.txt);;Resonance Files (*.resonances);;JSON Resonance Files (*.json);;All Files (*)", options=options)
         else:
             default_ext = ".resonances"
             default_filename = os.path.splitext(self.label_filename.text())[0] + default_ext
             filename, _ = QFileDialog.getSaveFileName(self, "Save Resonances", default_filename,
-                                                    "Resonance Files (*.resonances);;KIDLAB Toneslist Files (*.txt);;All Files (*)", options=options)
+                                                    "Resonance Files (*.resonances);;KIDLAB Toneslist Files (*.txt);;JSON Resonance Files (*.json);;All Files (*)", options=options)
         if filename:
             try:
                 if filename.endswith('.resonances'):
@@ -3704,6 +3710,24 @@ class ResonanceFinderApp(QMainWindow):
                         for resonance in self.resonances:
                             if resonance.save and resonance.id is not None:
                                 f.write('K%03d\t%f\t%f\t%d\t%d\n'%(resonance.id,resonance.frequency,0,1,0))
+
+                elif filename.endswith('.json'):
+                    # Same info as the .resonances format, formatted as parallel
+                    # lists. The 'f_guess_list' key holds the resonance
+                    # frequencies (Hz) as consumed by the OCS-based fitting.
+                    saved = [r for r in self.resonances if r.save and r.id is not None]
+                    resonances_json = {
+                        "f_guess_list": [r.frequency for r in saved],
+                        "id": [r.id for r in saved],
+                        "name": [r.name for r in saved],
+                        "linewidth": [r.fwhm for r in saved],
+                        "q_factor": [r.q_factor for r in saved],
+                        "q_coupling": [r.qc for r in saved],
+                        "q_internal": [r.qi for r in saved],
+                        "dip_depth": [r.dip_depth for r in saved],
+                    }
+                    with open(filename, 'w') as f:
+                        json.dump(resonances_json, f, indent=4)
 
                 else:
                     with open(filename, 'w') as f:
@@ -3852,7 +3876,7 @@ def main():
         "interactive session using the souk_readout_tools library directly; "
         "this GUI provides a convenient interactive interface.")
     parser.add_argument('sweep_file', nargs='?', default=None,
-                        help='Sweep data file to load (.fits, .npy, or .txt)')
+                        help='Sweep data file to load (.fits, .npy, .txt, or .csv)')
     parser.add_argument('-f', '--format', default=None,
                         choices=['lin_mag', 'log_mag', 'phase', 'unwrapped_phase',
                                  'group_delay', 'complex_gradient', 'sin_iq'],
