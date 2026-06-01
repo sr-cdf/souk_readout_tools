@@ -671,6 +671,17 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         phase_center: bool or dict, apply the circle-centering step after
             deembedding.
         phase_rotate: bool or dict, apply the post-centering rotation step.
+        mag_centered: bool or None, per-panel override for whether the
+            magnitude panel uses the centered frame.  None (default) follows
+            phase_center/deembed for that panel.
+        phase_centered: bool or None, per-panel override for whether the phase
+            panel uses the centered frame.  None (default) follows
+            phase_center.
+        mag_rotated: bool or None, per-panel override for whether the
+            magnitude panel applies the rotation step.  None follows
+            phase_rotate.
+        phase_rotated: bool or None, per-panel override for whether the phase
+            panel applies the rotation step.  None follows phase_rotate.
         show_errors: True/False/None.  None (default) draws error fills for
             per-tone sweeps but skips them for wideband sweeps, where the
             concatenated trace can be hundreds of thousands of points and
@@ -1767,6 +1778,12 @@ def plot_fits(fit_results, format='magphase', deembed=False,
             one complex frame.
         phase_center: Apply the circle-centering step before plotting.
         phase_rotate: Apply the rotation step after centering.
+        mag_centered, phase_centered: Per-panel overrides for whether the
+            magnitude/phase panel uses the centered frame (None follows
+            phase_center).
+        mag_rotated, phase_rotated: Per-panel overrides for whether the
+            magnitude/phase panel applies the rotation step (None follows
+            phase_rotate).
         show_errors: True/False/None. ``None`` draws error bands when any fit
             result carries ``z_err_data``.
         multi_tone: 'overlay' (shared axes) or 'grid' (one subplot per fit).
@@ -2187,20 +2204,36 @@ def plot_fit_params(fit_results, x='fr', y='Ql', color=None, fig=None,
 # Convenience wrappers
 
 def plot_sweep_iq(sweep_data, **kwargs):
-    """Plot sweep as I vs Q in the complex plane. See plot_sweep() for args."""
+    """Plot ``sweep_data`` as I vs Q in the complex plane.
+
+    Thin wrapper over :func:`plot_sweep` with ``format='iq'``; ``**kwargs`` are
+    forwarded there (see it for the accepted keywords).
+    """
     return plot_sweep(sweep_data, format='iq', **kwargs)
 
 
 def plot_sweep_magphase(sweep_data, **kwargs):
-    """Plot sweep as magnitude/phase vs frequency. See plot_sweep() for args."""
+    """Plot ``sweep_data`` as magnitude/phase vs frequency.
+
+    Thin wrapper over :func:`plot_sweep` with ``format='magphase'``; ``**kwargs``
+    are forwarded there.
+    """
     return plot_sweep(sweep_data, format='magphase', **kwargs)
 
 
 def plot_sweep_magphase_iq(sweep_data, **kwargs):
-    """Plot sweep as magnitude/phase plus IQ. See plot_sweep() for args."""
+    """Plot ``sweep_data`` as magnitude/phase plus IQ.
+
+    Thin wrapper over :func:`plot_sweep` with ``format='mag+phase+iq'``;
+    ``**kwargs`` are forwarded there.
+    """
     return plot_sweep(sweep_data, format='mag+phase+iq', **kwargs)
 
 
 def plot_sweep_iq_vs_f(sweep_data, **kwargs):
-    """Plot sweep as I and Q vs frequency. See plot_sweep() for args."""
+    """Plot ``sweep_data`` as I and Q vs frequency.
+
+    Thin wrapper over :func:`plot_sweep` with ``format='iq_vs_f'``; ``**kwargs``
+    are forwarded there.
+    """
     return plot_sweep(sweep_data, format='iq_vs_f', **kwargs)

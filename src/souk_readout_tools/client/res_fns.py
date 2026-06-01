@@ -23,18 +23,29 @@ import pdb
 from scipy.optimize import curve_fit
 
 def s21_model(f,f0,Qr,Qc_real,Qc_imag=0.0):
+ """Symmetric resonator S21 model.
+
+ ``f`` is the frequency array (Hz), ``f0`` the resonance frequency (Hz),
+ ``Qr`` the loaded Q, and ``Qc_real``/``Qc_imag`` the real/imaginary parts
+ of the complex coupling Q.
+ """
  degs = 0.0
  amp = 1.0
  prefactor = amp*np.exp(1.0j*(degs/180)*np.pi)    
  return prefactor*(1.0-(Qr/(Qc_real +1.0j*Qc_imag)) / (1.0+2.0j*Qr* ((f-f0)/f0) )) 
 
 def abs_s21(f,f0,Qr, Qc_real,Qc_imag=0.0):
+  """Magnitude (dB) of :func:`s21_model` at frequencies ``f`` with resonance
+  ``f0``, loaded Q ``Qr`` and complex coupling ``Qc_real``/``Qc_imag``."""
   return 20.0*np.log10(np.abs(s21_model(f,f0,Qr,Qc_real,Qc_imag)))
 
 def arg_s21(f,f0,Qr,Qc_real,Qc_imag=0.0):
+  """Phase (radians) of :func:`s21_model` at frequencies ``f`` with resonance
+  ``f0``, loaded Q ``Qr`` and complex coupling ``Qc_real``/``Qc_imag``."""
   return np.angle(s21_model(f,f0,Qr,Qc_real,Qc_imag))
- 
+
 def clip(x,q,i,lo,hi):
+    """Restrict the ``x``/``q``/``i`` arrays to samples with ``lo <= x <= hi``."""
     indices = np.where(np.logical_and(x>=lo, x<=hi))
     x= x[indices]
     q = q[indices]
@@ -43,11 +54,13 @@ def clip(x,q,i,lo,hi):
 
 def find_single_resonance(x,q,i,f_tone_approx):
     '''
-    Returns the frequency at which the power is minimum (the the nearest f sample). 
+    Returns the frequency at which the power is minimum (the the nearest f sample).
     Inputs:
     x: frequency array
     q: q array
     i: i array
+    f_tone_approx: approximate tone frequency (unused; kept for call-site
+        compatibility with the resonance-search helpers).
     (Assumes input array has one distinct resonance in it).
     returns frequency at which power is minimum within this range.
     '''
@@ -75,6 +88,31 @@ def find_all_resonances(x,q,i,tone_guesses,window_size):
 
 
 def fit_resonance_symmetric(x,i,q,tone,Qr_guess,Qc_guess,window_size,do_plot,verbose,save_prefix):
+    """Fit one resonance with the symmetric (real-Qc) S21 magnitude model.
+
+    Parameters
+    ----------
+    x, i, q : array-like
+        Full-band frequency (Hz) and I/Q arrays.
+    tone : float
+        Approximate resonance frequency (Hz); used as the ``f0`` guess and the
+        fit-window centre.
+    Qr_guess, Qc_guess : float
+        Initial guesses for the loaded and coupling Q.
+    window_size : float
+        Width (Hz) of the fit window centred on ``tone``.
+    do_plot : bool
+        Save and show power/phase fit plots.
+    verbose : bool
+        Print guessed and fitted values.
+    save_prefix : str
+        Filename prefix for the saved plot PNGs.
+
+    Returns
+    -------
+    popt : ndarray
+        Best-fit ``[f0, Qr, Qc]``.
+    """
     guess_arr = [tone,Qr_guess,Qc_guess]
     (x_w,q_w,i_w) = clip(x,q,i,tone - window_size /2.0 , tone + window_size /2.0)
     power = 10*np.log10(i_w**2+q_w**2)
@@ -106,6 +144,18 @@ def fit_resonance_symmetric(x,i,q,tone,Qr_guess,Qc_guess,window_size,do_plot,ver
     return popt
    
 def fit_resonance_asymmetric(x,i,q,tone,Qr_guess,Qc_real_guess,Qc_imag_guess,window_size,do_plot,verbose,save_prefix):
+    """Fit one resonance with the asymmetric (complex-Qc) S21 magnitude model.
+
+    Same as :func:`fit_resonance_symmetric` but with separate
+    ``Qc_real_guess`` and ``Qc_imag_guess`` initial guesses for the complex
+    coupling Q.  ``x``/``i``/``q``, ``tone``, ``Qr_guess``, ``window_size``,
+    ``do_plot``, ``verbose`` and ``save_prefix`` mean the same as there.
+
+    Returns
+    -------
+    popt : ndarray
+        Best-fit ``[f0, Qr, Qc_real, Qc_imag]``.
+    """
     guess_arr = [tone,Qr_guess,Qc_real_guess,Qc_imag_guess]
     (x_w,q_w,i_w) = clip(x,q,i,tone - window_size /2.0 , tone + window_size /2.0)
     power = 10*np.log10(i_w**2+q_w**2)

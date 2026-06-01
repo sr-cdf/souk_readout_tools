@@ -55,6 +55,8 @@ class _I2CRetryWarningFilter(logging.Filter):
     _SUPPRESS_PATTERNS = ('trying again after delay', 'No such device or address')
 
     def filter(self, record):
+        """Logging filter: drop ``record`` if it matches the suppressed
+        retry/noise patterns, else keep it."""
         msg = record.getMessage()
         return not all(p in msg for p in self._SUPPRESS_PATTERNS)
 
@@ -415,6 +417,9 @@ class LNABiasController:
         configured LNA channel to the minimum achievable local voltage.
         Otherwise reads ``bias_voltage_v`` and sets the channel to that
         voltage. Missing/None voltage defaults to 1.5 V.
+
+        ``config_dict`` is the config to apply; ``None`` (default) uses this
+        controller's stored ``self.config``.
         """
         if not self.enabled:
             return None

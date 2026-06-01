@@ -107,7 +107,7 @@ from souk_readout_tools.peak_finder import PeakFinder
 from souk_readout_tools.plotting import plot_sweep_magphase
 from souk_readout_tools.resonator import remove_cable_delay
 from souk_readout_tools.fitting import batch_fit
-from souk_readout_tools.measurement import ParameterSweep, TimedMeasurement
+from souk_readout_tools.measurement import MeasurementRun, MeasurementStore, save_system_info
 print('All client imports OK')
 "
 ```
@@ -124,7 +124,7 @@ from souk_readout_tools.peak_finder import *
 from souk_readout_tools.plotting import plot_sweep_magphase
 from souk_readout_tools.resonator import remove_cable_delay
 from souk_readout_tools.fitting import batch_fit
-from souk_readout_tools.measurement import ParameterSweep, TimedMeasurement
+from souk_readout_tools.measurement import MeasurementRun, MeasurementStore, save_system_info
 print('All client imports OK')
 "
 ```
@@ -1018,83 +1018,88 @@ print(f"Flagged: {targeted['flagged_tones']}")
 - [ ] Targeted find correctly identifies one resonance per tone
 - [ ] Any flagged tones are genuinely problematic (collisions, weak resonances)
 
-### 4.12  Parameter sweep — attenuation vs Q
+### 4.12  Measurement run-directory round-trip
 
 ```python
-from souk_readout_tools.measurement import ParameterSweep
-from souk_readout_tools.fitting import batch_fit
-
-def set_atten(val):
-    c.set_tx_attenuation(val)
-
-def measure(client):
-    sweep = client.wideband_sweep(verbose=False)
-    fits = batch_fit(sweep, verbose=False)
-    return {'sweep': sweep, 'fits': fits}
-
-ps = ParameterSweep(c, 'tx_attenuation_dB', set_parameter=set_atten)
-results = ps.sweep(values=[0, 5, 10, 15, 20], measure_func=measure)
-
-# Check Q vs power
-for pt in results:
-    fits = pt.data['fits']
-    if fits:
-        print(f"Atten={pt.parameter_value} dB: "
-              f"Ql={fits[0].Ql:.0f}, Qi={fits[0].Qi:.0f}")
-```
-- [ ] ParameterSweep runs without errors
-- [ ] Attenuation is set correctly at each step (verify with `get_rf_peripheral_status()`)
-- [ ] Q factors change with power as expected (Qi should increase at lower power for MKIDs)
-- [ ] All measurement points contain valid sweep and fit data
-
-### 4.13  Timed measurement — stability monitoring
-
-```python
-from souk_readout_tools.measurement import TimedMeasurement
-
-def measure_tone(client):
-    ts = client.get_samples(num_samples=1000)
-    parsed = client.parse_samples(ts)
-    key = sorted(parsed['i_data'].keys())[0]
-    return {
-        'i_mean': np.mean(parsed['i_data'][key]),
-        'q_mean': np.mean(parsed['q_data'][key]),
-    }
-
-tm = TimedMeasurement(c, interval_s=10)
-results = tm.run(measure_func=measure_tone, n_points=6)
-
-# Plot drift
-i_vals = [r.data['i_mean'] for r in results]
-times = [r.timestamp - results[0].timestamp for r in results]
-plt.plot(times, i_vals, 'o-')
-plt.xlabel('Time (s)'); plt.ylabel('I mean'); plt.show()
-```
-- [ ] Measurements are taken at the requested interval
-- [ ] Results show realistic drift/stability for the system
-- [ ] `save_measurement(results, 'stability.npz')` saves and reloads correctly
-
-### 4.14  Conditional measurement
-
-```python
-from souk_readout_tools.measurement import ConditionalMeasurement
-
-# Example: measure whenever temperature crosses a threshold
-# (replace get_temperature with your actual thermometry function)
-def get_temperature():
-    # Read from your cryostat monitoring system
-    return read_thermometer_mK()
-
-cm = ConditionalMeasurement(
-    c, 'temperature_mK', get_temperature,
-    condition=lambda t: True,  # or a real condition
-    poll_interval_s=5.0
+from pathlib import Path
+import numpy as np
+from souk_readout_tools.measurement import (
+    ArtifactKind, MeasurementRun, MeasurementStep, MeasurementStore,
 )
-results = cm.run(measure_func=measure_tone, n_points=3, timeout_s=60)
+
+root = Path('/tmp/souk_measurement_test')
+store = MeasurementStore(root)
+store.ensure_layout()
+
+run = MeasurementRun(kind='test_measurement', root=root,
+                     parameters={'axis': [1, 2]})
+for value in (1, 2):
+    step = run.add_step(MeasurementStep(
+        index=value - 1, axis={'axis': value}))
+    step.readback['axis_readback'] = value
+    store.save_step_npz_artifact(
+        run, step,
+        name=f'step_{value}_sweep',
+        kind=ArtifactKind.SWEEP,
+        relative_path=f'data/step_{value}_sweep.npz',
+        data={'sweep_f': np.arange(3), 'axis': value})
+run.write_manifest()
+
+loaded = MeasurementRun.load(root)
+data = loaded.store().load_artifact_data(
+    loaded.steps[0].artifact(ArtifactKind.SWEEP))
 ```
-- [ ] Polling works at the specified interval
-- [ ] Condition triggers correctly
-- [ ] Timeout terminates the run if condition is never met
+- [ ] `measurement.json` is written and reloads successfully
+- [ ] Artifact files are stored under `data/`
+- [ ] Array data and metadata round-trip through the artifact store
+- [ ] Reloaded steps preserve their requested `axis` and `readback` values
+
+### 4.13  Tone-power sweep smoke test
+
+```python
+from souk_readout_tools import power_sweep as ps
+
+run = ps.run_power_sweep(
+    c,
+    centers=[1.0e9],
+    spans=1.0e6,
+    powers_dbm=[-90.0],
+    output_dir='test_power_campaign',
+    points=21,
+    samples_per_point=1,
+    settle_time=0,
+    refresh_adc_cal=False,
+)
+loaded = ps.load_power_sweep('test_power_campaign')
+fits = ps.fit_power_sweep(loaded, min_dip_depth_db=None, verbose=False)
+analysis = ps.analyse_power_sweep(
+    loaded,
+    nonlinear=True,
+    n_jobs=1,
+    target_anl=0.01,
+    fit_kwargs={'min_dip_depth_db': None},
+    plot=False,
+    verbose=False,
+)
+```
+- [ ] Run directory contains `measurement.json`
+- [ ] Run directory contains `system_info_start.json`
+- [ ] Each step contains a `sweep` artifact
+- [ ] Loaded run can be passed to `fit_power_sweep`
+- [ ] `analyse_power_sweep` can run the one-call fit/summary/best-power path
+
+### 4.14  Accumulator snapshot artifact semantics
+
+Accumulator snapshots are pre-accumulation, high-rate captures from one tone at
+a time.  They should be stored with `kind='accumulator_snapshot'` and metadata
+marking `stage='pre_accumulation'`, `simultaneous_tones=False`, and
+`correlatable=False`.
+
+- [ ] Single-tone accumulator snapshots store `sample_rate_hz`, `tone_index`,
+      `num_snapshots`, and `len_snapshot`
+- [ ] Batch accumulator snapshots store one array per tone
+- [ ] Accumulator snapshot PSD analysis is allowed
+- [ ] Tone-tone correlation analysis rejects accumulator snapshot artifacts
 
 ---
 
@@ -1174,9 +1179,9 @@ sweep1 = c1.wideband_sweep()
 | Resonance fitting (linear) | 4.5, 4.6, 4.7 |
 | Resonance fitting (nonlinear) | 4.5b |
 | Freq/diss noise | 4.9 |
-| ParameterSweep | 4.12 |
-| TimedMeasurement | 4.13 |
-| ConditionalMeasurement | 4.14 |
+| Simple measurement runner | 4.12 |
+| Tone-power sweep smoke test | 4.13 |
+| Accumulator snapshot artifacts | 4.14 |
 | Dual pipeline | 5.1-5.3 |
 | CLI: `souk-batch-snapshots` | 1.9 |
 | CLI: `souk-find-resonances` | 4.4, 4.7 |

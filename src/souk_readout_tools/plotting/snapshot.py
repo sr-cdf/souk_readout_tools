@@ -16,18 +16,98 @@ from ._common import (_get_pyplot, _compute_mag_phase, ERRORBAR_STYLE, _resolve_
 from ._psd import compute_psd, compute_psd_averaged, compute_psd_concatenated
 
 
+def _snapshot_acc_len(snapshot_data, sweep_data):
+    """Resolve acc_len for matching pre-accumulation snapshots to sweep I/Q."""
+    info = (sweep_data.get('info') if isinstance(sweep_data, dict) else None) \
+           or snapshot_data.get('info')
+    if isinstance(info, dict):
+        acc_len = info.get('pipeline', {}).get('acc_len')
+        if acc_len is not None:
+            return acc_len
+    raise ValueError(
+        "Cannot determine acc_len for freq_diss scaling. "
+        "Provide sweep_data with 'info.pipeline.acc_len' set.")
+
+
+def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
+                               n_snap, *, repetitions, sweep_data,
+                               reference_tone_frequency, smooth_window_hz,
+                               deembed, phase_center, units, fig, label,
+                               **kwargs):
+    """Time-domain fractional frequency/dissipation panel for snapshots."""
+    plt = _get_pyplot()
+    if sweep_data is None:
+        raise ValueError("sweep_data is required for format='freq_diss'")
+    if units != 'raw':
+        raise ValueError(
+            "format='freq_diss' produces dimensionless quantities; "
+            "use units='raw'.")
+    if deembed or phase_center:
+        raise ValueError(
+            "deembed/phase_center are not applicable to format='freq_diss'.")
+
+    from .timestream import _compute_freq_diss
+    acc_len = _snapshot_acc_len(snapshot_data, sweep_data)
+    ts_like = {'info': snapshot_data.get('info')}
+
+    def _ff_fd(z):
+        """Fractional frequency/dissipation for a complex snapshot trace ``z``."""
+        return _compute_freq_diss(
+            ts_like, tone_index, z.real, z.imag, sweep_data,
+            reference_tone_frequency=reference_tone_frequency,
+            smooth_window_hz=smooth_window_hz)
+
+    # Snapshots are pre-accumulation; scale to match summed sweep I/Q.
+    if repetitions == 'concatenate':
+        z = snapshots.ravel() * acc_len
+        traces = [(_ff_fd(z), None)]
+    elif repetitions == 'overlay':
+        traces = []
+        for i in range(n_snap):
+            z = snapshots[i] * acc_len
+            traces.append((_ff_fd(z), f'Rep {i}'))
+    elif repetitions == 'mean':
+        z = np.mean(snapshots, axis=0) * acc_len
+        traces = [(_ff_fd(z), None)]
+    else:
+        raise ValueError(
+            f"Unknown repetitions mode '{repetitions}'. "
+            "Use 'concatenate', 'overlay', or 'mean'.")
+
+    if fig is None:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    else:
+        ax1, ax2 = fig.axes[:2]
+
+    for (ff, fd), rep_label in traces:
+        t = np.arange(len(ff)) / sample_rate * 1e6
+        trace_label = _resolve_label(ax1, label, suffix=rep_label)
+        ax1.plot(t, ff, linewidth=0.5, label=trace_label, **kwargs)
+        ax2.plot(t, fd, linewidth=0.5, label=trace_label, **kwargs)
+
+    ax1.set_ylabel('Fractional frequency shift')
+    ax2.set_ylabel('Fractional dissipation shift')
+    ax2.set_xlabel('Time (µs)')
+    ax1.legend(fontsize='small')
+    ax2.legend(fontsize='small')
+    fig.suptitle(f'Tone {tone_index} — {n_snap} snapshots ({repetitions})')
+    plt.tight_layout()
+    return fig
+
+
 def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
                    deembed=False, phase_center=False,
+                   sweep_data=None, reference_tone_frequency=None,
                    fig=None, label=None,
                    units='raw', config=None, system_info=None,
-                   unwrap_phase=True, **kwargs):
+                   unwrap_phase=True, smooth_window_hz=1000, **kwargs):
     """
     Plot snapshot data for a single tone.
 
     Args:
         snapshot_data: dict from get_accumulator_snapshots() with keys
             'snapshots' (N_snap, 1024), 'sample_rate', 'tone_index'.
-        format: 'iq' | 'iq_vs_t' | 'magphase'
+        format: 'iq' | 'iq_vs_t' | 'magphase' | 'freq_diss'
         repetitions: How to handle multiple snapshots:
             'concatenate': join all end-to-end
             'overlay': plot each snapshot as a separate trace
@@ -37,6 +117,16 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
         phase_center: bool or phase-centering params dict.  Applies
             circle centering and rotation.  Applied after deembedding
             when both are set.
+        sweep_data: Sweep data dict. Required for ``format='freq_diss'``.
+        reference_tone_frequency: Tone frequency for the freq/diss
+            calculation (``format='freq_diss'``).  ``None`` (default) uses
+            ``snapshot_data['info']['tones']['frequencies_hz'][tone_index]``.
+            Pass a scalar to override.
+        smooth_window_hz: Smoothing window passed to
+            ``ReadoutClient.calculate_frequency_and_dissipation_noise`` for
+            ``format='freq_diss'``.  The default, ``1000``, preserves the
+            client default.  Pass ``None`` or ``0`` to disable sweep
+            smoothing.
         fig: Existing figure.
         label: Legend label. If None, uses an auto-incrementing index.
         units: Unit for I/Q normalisation.  One of:
@@ -46,6 +136,7 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             'dbfs' - dB relative to ADC full-scale.
             'dbm' - estimated ADC input power in dBm.
             All options except 'raw' and 'peak' require system_info.
+            Ignored for ``format='freq_diss'`` (must be 'raw').
         config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
         system_info: structured info dict.  Looked up from
             snapshot_data['info'] if not provided.
@@ -64,6 +155,15 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
     n_snap, n_samples = snapshots.shape
     info = system_info or snapshot_data.get('info')
     calibration_cache = {}
+
+    if format == 'freq_diss':
+        return _plot_snapshots_freq_diss(
+            snapshot_data, snapshots, sample_rate, tone_index, n_snap,
+            repetitions=repetitions, sweep_data=sweep_data,
+            reference_tone_frequency=reference_tone_frequency,
+            smooth_window_hz=smooth_window_hz,
+            deembed=deembed, phase_center=phase_center,
+            units=units, fig=fig, label=label, **kwargs)
 
     # Normalise I/Q label setup
     if units != 'raw':
@@ -164,15 +264,31 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
     return fig
 
 
-def plot_snapshots_psd(snapshot_data, method='averaged', psd_kwargs=None,
-                       show_errors=True, fig=None, label=None, **kwargs):
+def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
+                       sweep_data=None, reference_tone_frequency=None,
+                       psd_kwargs=None,
+                       show_errors=True, fig=None, label=None,
+                       smooth_window_hz=1000, **kwargs):
     """
     Plot PSD of snapshot data.
 
     Args:
         snapshot_data: dict from get_accumulator_snapshots().
+        format: 'iq' | 'magphase' | 'freq_diss'
+            Selects which quantity to compute PSD of.  Two panels:
+            I/Q, magnitude/phase, or fractional frequency/dissipation.
         method: 'averaged' (per-rep PSD then mean, with error bars from
                 std dev) or 'concatenated' (concat reps, single PSD).
+        sweep_data: Required for 'freq_diss' format.
+        reference_tone_frequency: Tone frequency for the freq/diss
+            calculation (``format='freq_diss'``).  ``None`` (default) uses
+            ``snapshot_data['info']['tones']['frequencies_hz'][tone_index]``.
+            Pass a scalar to override.
+        smooth_window_hz: Smoothing window passed to
+            ``ReadoutClient.calculate_frequency_and_dissipation_noise`` for
+            ``format='freq_diss'``.  The default, ``1000``, preserves the
+            client default.  Pass ``None`` or ``0`` to disable sweep
+            smoothing.
         psd_kwargs: dict passed to compute_psd().
         show_errors: bool. For 'averaged', show std-dev error bars.
         fig: Existing figure.
@@ -187,42 +303,86 @@ def plot_snapshots_psd(snapshot_data, method='averaged', psd_kwargs=None,
     sample_rate = snapshot_data['sample_rate']
     tone_index = snapshot_data['tone_index']
     psd_kw = psd_kwargs or {}
+    n_snap = snapshots.shape[0]
 
-    if fig is None:
-        fig, ax = plt.subplots(1, 1, figsize=(10, 5))
-    else:
-        ax = fig.gca()
+    if format == 'freq_diss' and sweep_data is None:
+        raise ValueError("sweep_data is required for format='freq_diss'")
 
-    if method == 'averaged':
-        f, psd_mean, psd_std = compute_psd_averaged(
-            snapshots, sample_rate, **psd_kw)
-        psd_db = 10 * np.log10(psd_mean)
-        trace_label = _resolve_label(ax, label)
-        if show_errors and psd_std is not None:
-            # Error in dB: propagate from linear
-            e_db = 10 / (psd_mean * np.log(10)) * psd_std
-            ax.errorbar(f, psd_db, yerr=e_db, linewidth=0.5, label=trace_label,
-                        **{**ERRORBAR_STYLE, **kwargs})
-        else:
-            ax.plot(f, psd_db, linewidth=0.5, label=trace_label, **kwargs)
-        ax.set_title(f'Tone {tone_index} — Averaged PSD '
-                     f'({snapshots.shape[0]} reps)')
+    if format == 'iq':
+        data_top = snapshots.real
+        data_bot = snapshots.imag
+        y_top, y_bot = 'I PSD', 'Q PSD'
+    elif format == 'magphase':
+        data_top = np.abs(snapshots)
+        data_bot = np.unwrap(np.angle(snapshots), axis=-1)
+        y_top, y_bot = 'Magnitude PSD', 'Phase PSD'
+    elif format == 'freq_diss':
+        from .timestream import _compute_freq_diss
+        # Snapshots are pre-accumulation; sweep I/Q are sums over acc_len
+        # samples. Scale up so both are in the same units.
+        acc_len = _snapshot_acc_len(snapshot_data, sweep_data)
+        scaled = snapshots * acc_len
 
-    elif method == 'concatenated':
-        f, psd = compute_psd_concatenated(snapshots, sample_rate, **psd_kw)
-        psd_db = 10 * np.log10(psd)
-        trace_label = _resolve_label(ax, label)
-        ax.plot(f, psd_db, linewidth=0.5, label=trace_label, **kwargs)
-        ax.set_title(f'Tone {tone_index} — Concatenated PSD')
-
+        ts_like = {'info': snapshot_data.get('info')}
+        frac_f_list, frac_d_list = [], []
+        for i in range(n_snap):
+            ff, fd = _compute_freq_diss(
+                ts_like, tone_index,
+                scaled[i].real, scaled[i].imag, sweep_data,
+                reference_tone_frequency=reference_tone_frequency,
+                smooth_window_hz=smooth_window_hz)
+            frac_f_list.append(ff)
+            frac_d_list.append(fd)
+        data_top = np.array(frac_f_list)
+        data_bot = np.array(frac_d_list)
+        y_top = 'Frequency noise PSD'
+        y_bot = 'Dissipation noise PSD'
     else:
         raise ValueError(
-            f"Unknown method '{method}'. Use 'averaged' or 'concatenated'.")
+            f"Unknown format '{format}'. "
+            "Use 'iq', 'magphase', or 'freq_diss'.")
 
-    ax.set_xlabel('Frequency (Hz)')
-    ax.set_ylabel('PSD (dB/Hz)')
-    ax.set_xscale('log')
-    ax.legend(fontsize='small')
+    if fig is None:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    else:
+        ax1, ax2 = fig.axes[:2]
+
+    trace_label = _resolve_label(ax1, label)
+
+    def _plot_panel(ax, data2d):
+        """Draw one PSD panel from a (snapshots x samples) array on ``ax``."""
+        if method == 'averaged':
+            f, p_mean, p_std = compute_psd_averaged(
+                data2d, sample_rate, **psd_kw)
+            if show_errors and p_std is not None:
+                ax.errorbar(f, p_mean, yerr=p_std, linewidth=0.5,
+                            label=trace_label,
+                            **{**ERRORBAR_STYLE, **kwargs})
+            else:
+                ax.plot(f, p_mean, linewidth=0.5,
+                        label=trace_label, **kwargs)
+        elif method == 'concatenated':
+            f, p = compute_psd_concatenated(
+                data2d, sample_rate, **psd_kw)
+            ax.plot(f, p, linewidth=0.5, label=trace_label, **kwargs)
+        else:
+            raise ValueError(
+                f"Unknown method '{method}'. "
+                "Use 'averaged' or 'concatenated'.")
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+
+    _plot_panel(ax1, data_top)
+    _plot_panel(ax2, data_bot)
+
+    ax1.set_ylabel(y_top)
+    ax2.set_ylabel(y_bot)
+    ax2.set_xlabel('Frequency (Hz)')
+    ax1.legend(fontsize='small')
+    ax2.legend(fontsize='small')
+    title_method = 'Averaged' if method == 'averaged' else 'Concatenated'
+    fig.suptitle(
+        f'Tone {tone_index} — {title_method} PSD ({n_snap} reps)')
     plt.tight_layout()
     return fig
 
@@ -243,6 +403,7 @@ def plot_batch_snapshots(batch_data, format='iq_vs_t', repetitions='concatenate'
         psd_method: 'averaged' or 'concatenated'.
         psd_kwargs: dict passed to compute_psd().
         fig: Existing figure.
+        label: Optional legend label for the plotted traces (auto if None).
         **kwargs: Passed to plot calls.
 
     Returns:

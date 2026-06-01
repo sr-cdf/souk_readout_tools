@@ -37,7 +37,11 @@ class MockReadoutServer:
     @staticmethod
     def default_config(address='127.0.0.1', request_port=10000,
                        stream_port=20000):
-        """Load the bundled template config and patch mock connection fields."""
+        """Load the bundled template config and patch mock connection fields.
+
+        ``address``, ``request_port`` and ``stream_port`` are written into the
+        returned config as the mock server's connection details.
+        """
         with open(get_template_config_path(), 'r') as file:
             config = yaml.safe_load(file)
 
@@ -282,7 +286,11 @@ class MockReadoutServer:
         return details
 
     def info(self, sections=None):
-        """Return structured system information by section."""
+        """Return structured system information by section.
+
+        ``sections`` selects which section(s) to build: ``None``/``'all'`` for
+        everything, or a section name (or list of names) such as ``'tones'``.
+        """
         dispatchers = {
             'server': self._info_server,
             'versions': self._info_versions,
@@ -505,6 +513,7 @@ class MockReadoutServer:
             'amplitudes': list(self.tone_amplitudes),
             'phases_rad': list(self.tone_phases),
             'powers_dbm': list(self.tone_powers_dbm),
+            'powers_reference_plane': 'detector',
             'firmware_indices': details['rx']['tone_indices'],
             'blind_spans': blind_spans,
             **metadata,
@@ -514,6 +523,63 @@ class MockReadoutServer:
     def _info_rf_frontend(self):
         rf_cfg = self.config.get('rf_frontend', {}) or {}
         mixerless_cfg = rf_cfg.get('mixerless_module', {}) or {}
+        bypass_cfg = rf_cfg.get('bypass_amps', {}) or {}
+
+        def cal_mean(value):
+            """Mean S21 (dB) from a calibration entry, taking column 1 of an
+            (freq, value) table; ``None`` for missing/empty/non-numeric data."""
+            if value is None:
+                return None
+            if isinstance(value, str):
+                try:
+                    return float(value)
+                except ValueError:
+                    return None
+            try:
+                arr = np.asarray(value, dtype=float)
+            except (TypeError, ValueError):
+                return None
+            if arr.size == 0:
+                return None
+            if arr.ndim == 0:
+                values = np.asarray([float(arr)])
+            elif arr.ndim >= 2 and arr.shape[-1] >= 2:
+                values = arr[..., 1]
+            else:
+                values = arr
+            finite = values[np.isfinite(values)]
+            return None if finite.size == 0 else float(np.mean(finite))
+
+        def amp_cal(path, bypassed):
+            """Modelled amp S21 (dB) for a TX/RX path in the given bypass state,
+            using the direct cal if present or the enabled/bypass delta otherwise."""
+            direct_key = (
+                f'{path}_amp_bypassed_s21_db'
+                if bypassed else f'{path}_amp_enabled_s21_db'
+            )
+            direct = cal_mean(mixerless_cfg.get(direct_key))
+            if direct is not None:
+                return direct
+            delta = cal_mean(mixerless_cfg.get(f'{path}_amp_bypass_delta_s21_db'))
+            if delta is None:
+                return None
+            enabled = cal_mean(mixerless_cfg.get(f'{path}_amp_enabled_s21_db'))
+            bypass_state = cal_mean(
+                mixerless_cfg.get(f'{path}_amp_bypassed_s21_db'))
+            if bypassed and enabled is not None:
+                return enabled + delta
+            if not bypassed and bypass_state is not None:
+                return bypass_state - delta
+            return None
+
+        tx_amp_bypass = bool(bypass_cfg.get('tx_amp_bypass', False))
+        rx_amp_bypass = bool(bypass_cfg.get('rx_amp_bypass', False))
+        tx_amp_cal = amp_cal('tx', tx_amp_bypass)
+        rx_amp_cal = amp_cal('rx', rx_amp_bypass)
+        tx_total_model = 0.0
+        rx_total_model = 0.0
+        tx_total_cal = tx_amp_cal if tx_amp_cal is not None else None
+        rx_total_cal = rx_amp_cal if rx_amp_cal is not None else None
         info = {
             'ready': True,
             'connected': rf_cfg.get('connected', False),
@@ -525,17 +591,47 @@ class MockReadoutServer:
             'rf_channel': mixerless_cfg.get('rf_channel'),
             'tx_attenuation_db': 0.0,
             'rx_attenuation_db': 0.0,
-            'tx_total_gain_db': 0.0,
-            'rx_total_gain_db': 0.0,
+            'tx_total_gain_db': (
+                tx_total_cal if tx_total_cal is not None else tx_total_model
+            ),
+            'rx_total_gain_db': (
+                rx_total_cal if rx_total_cal is not None else rx_total_model
+            ),
+            'tx_total_gain_source': (
+                'calibrated_config'
+                if tx_total_cal is not None else 'peripheral_model'
+            ),
+            'rx_total_gain_source': (
+                'calibrated_config'
+                if rx_total_cal is not None else 'peripheral_model'
+            ),
+            'tx_total_gain_model_db': tx_total_model,
+            'rx_total_gain_model_db': rx_total_model,
+            'tx_total_gain_calibrated_estimate_db': tx_total_cal,
+            'rx_total_gain_calibrated_estimate_db': rx_total_cal,
             'tx_input_1db_comp_dbm': mixerless_cfg.get('tx_input_1db_comp_dbm'),
             'rx_input_1db_comp_dbm': mixerless_cfg.get('rx_input_1db_comp_dbm'),
         }
         if info['supports_bypass_amps']:
+            tx_amp_effective = tx_amp_cal if tx_amp_cal is not None else 0.0
+            rx_amp_effective = rx_amp_cal if rx_amp_cal is not None else 0.0
             info.update({
-                'tx_amp_bypass': False,
-                'rx_amp_bypass': False,
-                'tx_bypass_amp_s21_db': mixerless_cfg.get('tx_amp_bypassed_s21_db'),
-                'rx_bypass_amp_s21_db': mixerless_cfg.get('rx_amp_bypassed_s21_db'),
+                'tx_amp_bypass': tx_amp_bypass,
+                'rx_amp_bypass': rx_amp_bypass,
+                'tx_bypass_amp_s21_db': tx_amp_effective,
+                'rx_bypass_amp_s21_db': rx_amp_effective,
+                'tx_bypass_amp_s21_source': (
+                    'calibrated_config'
+                    if tx_amp_cal is not None else 'peripheral_model'
+                ),
+                'rx_bypass_amp_s21_source': (
+                    'calibrated_config'
+                    if rx_amp_cal is not None else 'peripheral_model'
+                ),
+                'tx_bypass_amp_s21_model_db': 0.0,
+                'rx_bypass_amp_s21_model_db': 0.0,
+                'tx_bypass_amp_s21_calibrated_estimate_db': tx_amp_cal,
+                'rx_bypass_amp_s21_calibrated_estimate_db': rx_amp_cal,
             })
         for key in ('tx_mixer_lo_frequency_hz', 'rx_mixer_lo_frequency_hz',
                     'tx_mixer_sideband', 'rx_mixer_sideband',
@@ -663,7 +759,13 @@ class MockReadoutServer:
         }
 
     def get_parameter(self, param_name, message=None):
-        """Return a mock value for a parameter-server style ``get`` request."""
+        """Return a mock value for a parameter-server style ``get`` request.
+
+        ``param_name`` is one of the server-registered names handled below
+        (the same names as :py:meth:`ReadoutClient.get_parameter`);
+        ``message`` is the optional full request dict (request metadata such
+        as ``reference_plane`` is read from it where relevant).
+        """
         if param_name == 'sample_rate_hz':
             return self.sample_rate
         if param_name == 'tone_frequencies':
@@ -698,7 +800,11 @@ class MockReadoutServer:
         return None
 
     def set_parameter(self, param_name, param_value):
-        """Update mock state for a parameter-server style ``set`` request."""
+        """Update mock state for a parameter-server style ``set`` request.
+
+        ``param_name`` / ``param_value`` follow
+        :py:meth:`ReadoutClient.set_parameter` (the names handled below).
+        """
         if param_name == 'sample_rate_hz':
             self.sample_rate = float(param_value)
         elif param_name == 'tone_frequencies':
@@ -723,7 +829,11 @@ class MockReadoutServer:
         return {'status': 'success'}
 
     def stream_frame(self, num_tones=None):
-        """Build one modern stream packet: IQ words plus six flags, TT, cnt, err."""
+        """Build one modern stream packet: IQ words plus six flags, TT, cnt, err.
+
+        ``num_tones`` sets how many tone IQ words to include; ``None`` uses the
+        current active tone count.
+        """
         if num_tones is None:
             num_tones = len(self.tone_frequencies)
         tone_idx = np.arange(num_tones, dtype=float)
@@ -744,7 +854,11 @@ class MockReadoutServer:
         return np.concatenate((iq_words, tail_u.view('<i4'))).tobytes()
 
     def get_samples(self, num_samples, incl_system_info=True, burst=False):
-        """Return mock raw samples in the same shape as ReadoutClient.get_samples."""
+        """Return mock raw samples in the same shape as ReadoutClient.get_samples.
+
+        ``num_samples``, ``incl_system_info`` and ``burst`` mean the same as in
+        :py:meth:`ReadoutClient.get_samples`.
+        """
         self.client._warn_zero_phases()
         num_tones = len(self.tone_frequencies)
         data_raw = bytearray()
@@ -766,7 +880,11 @@ class MockReadoutServer:
         }
 
     def stream_metadata(self, num_tones, info):
-        """Metadata sidecar shared by mock binary and G3 stream receivers."""
+        """Metadata sidecar shared by mock binary and G3 stream receivers.
+
+        ``num_tones`` is the active tone count recorded in the metadata, and
+        ``info`` is the system-info dict to embed.
+        """
         return {
             'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
             'num_tones': num_tones,
@@ -790,7 +908,11 @@ class MockReadoutServer:
         }
 
     def receive_stream(self, num_tones=None, filename=None, print_data=False):
-        """Mock implementation of continuous binary stream capture."""
+        """Mock implementation of continuous binary stream capture.
+
+        ``num_tones``, ``filename`` and ``print_data`` mean the same as in
+        :py:meth:`ReadoutClient.receive_stream`.
+        """
         iq_data = None
         if filename is None:
             filename = os.path.join(os.getcwd(), 'tmp_stream')
@@ -842,7 +964,12 @@ class MockReadoutServer:
 
     def receive_stream_g3(self, num_tones=None, filename=None, print_data=False,
                           kid_stream_id='UNSET', duration=30):
-        """Mock implementation of ``receive_stream_g3`` using generated packets."""
+        """Mock implementation of ``receive_stream_g3`` using generated packets.
+
+        ``num_tones``, ``filename``, ``print_data``, ``kid_stream_id`` and
+        ``duration`` mean the same as in
+        :py:meth:`ReadoutClient.receive_stream_g3`.
+        """
         SOSTREAM_VERSION = 1
         num_sample_rows_per_frame = 400
         iq_data = None
@@ -994,7 +1121,20 @@ class MockReadoutServer:
         return iq_data
 
     def sweep_data(self, centers=None, spans=None, points=11, samples_per_point=10):
-        """Create base64-encoded sweep data compatible with parse_sweep_data."""
+        """Create base64-encoded sweep data compatible with parse_sweep_data.
+
+        Parameters
+        ----------
+        centers : array-like or None, optional
+            Per-tone sweep centre frequencies (Hz); defaults to the current
+            tone frequencies.
+        spans : array-like or None, optional
+            Per-tone sweep spans (Hz); a default span is used when ``None``.
+        points : int, optional
+            Frequency points per tone (default 11).
+        samples_per_point : int, optional
+            Averaged samples per frequency point (default 10).
+        """
         if centers is None:
             centers = self.tone_frequencies
         centers = np.asarray(centers, dtype=float).reshape(-1)
@@ -1039,7 +1179,11 @@ class MockReadoutServer:
         }
 
     def send_request(self, message):
-        """Emulate common readout-server requests for ``mock=True`` clients."""
+        """Emulate common readout-server requests for ``mock=True`` clients.
+
+        ``message`` is the request dict the client would otherwise send over
+        the socket (must contain a ``'request'`` key).
+        """
         request = message.get('request')
 
         if request == 'get':

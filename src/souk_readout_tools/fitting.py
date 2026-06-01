@@ -310,7 +310,10 @@ class FitResult:
 
 
 def wrap_phase(x):
-    """Wrap a phase to [-pi, pi) for stable public parameters."""
+    """Wrap a phase to [-pi, pi) for stable public parameters.
+
+    ``x`` is a phase (or array of phases) in radians.
+    """
     return (x + np.pi) % (2.0 * np.pi) - np.pi
 
 
@@ -333,12 +336,26 @@ def complex_coupling_q(Qc, phi):
 
 
 def loaded_q(Qi, Qc, phi):
-    """Return loaded Q from Qi and the complex coupling."""
+    """Return loaded Q from internal ``Qi`` and the complex coupling.
+
+    ``Qc`` is the fitted real coupling Q and ``phi`` the coupling mismatch
+    angle (radians); see :func:`complex_coupling_q`.
+    """
     return 1.0 / (1.0 / Qi + np.real(1.0 / complex_coupling_q(Qc, phi)))
 
 
 def duffing_y(y0, anl, sweep_direction="up"):
-    """Solve the Duffing cubic on the requested sweep branch."""
+    """Solve the Duffing cubic on the requested sweep branch.
+
+    Parameters
+    ----------
+    y0 : array-like
+        Linear detuning coordinate ``x / Qr_inv``.
+    anl : array-like
+        Duffing nonlinearity parameter (broadcast to ``y0``).
+    sweep_direction : {'up', 'down'}, optional
+        Which bistable branch to take (default ``'up'``).
+    """
     y0 = np.asarray(y0, float)
     anl = np.broadcast_to(np.asarray(anl, float), y0.shape)
     A, B, C, D = 4.0, -4.0 * y0, 1.0, -y0 - anl
@@ -360,7 +377,31 @@ def duffing_y(y0, anl, sweep_direction="up"):
 
 
 def s21_model(f, fr, Qi, Qc, phi, a, alpha, tau, anl=0.0, sweep_direction="up"):
-    """Evaluate the physical S21 model in returned-parameter coordinates."""
+    """Evaluate the physical S21 model in returned-parameter coordinates.
+
+    Parameters
+    ----------
+    f : array-like
+        Frequencies (Hz) to evaluate at.
+    fr : float
+        Resonance frequency (Hz).
+    Qi : float
+        Internal quality factor.
+    Qc : float
+        Real coupling quality factor (not ``abs(Qe)`` unless ``phi == 0``).
+    phi : float
+        Coupling impedance-mismatch angle (radians).
+    a : float
+        Overall gain magnitude of the cable/electronics envelope.
+    alpha : float
+        Overall gain phase (radians) at ``f = 0``.
+    tau : float
+        Cable delay (s), giving a linear phase slope ``-2*pi*f*tau``.
+    anl : float, optional
+        Duffing nonlinearity; ``0`` (default) gives the linear model.
+    sweep_direction : {'up', 'down'}, optional
+        Bistable branch used when ``anl != 0`` (default ``'up'``).
+    """
     f = np.asarray(f, float)
     Qe = complex_coupling_q(Qc, phi)
     x = (f - fr) / fr
@@ -376,7 +417,14 @@ def s21_model(f, fr, Qi, Qc, phi, a, alpha, tau, anl=0.0, sweep_direction="up"):
 
 def s21_model_centered_delay(f, fr, Qi, Qc, phi, a, alpha0, tau,
                              anl=0.0, f0=0.0, sweep_direction="up"):
-    """Evaluate S21 with gain phase referenced to f0 for better conditioning."""
+    """Evaluate S21 with gain phase referenced to ``f0`` for better conditioning.
+
+    Same model as :func:`s21_model` (see it for ``f``, ``fr``, ``Qi``,
+    ``Qc``, ``phi``, ``a``, ``tau``, ``anl``, ``sweep_direction``), except the
+    gain phase ``alpha0`` is defined at ``f = f0`` rather than at ``f = 0``,
+    which decorrelates it from ``tau`` during fitting.  ``f0`` is the
+    reference frequency (Hz, usually the dip centre).
+    """
     f = np.asarray(f, float)
     Qe = complex_coupling_q(Qc, phi)
     x = (f - fr) / fr
@@ -604,7 +652,12 @@ def _apply_bounds(lower, upper, names, param_bounds, f0, tau0):
 
 
 def nonlinear_detuning_hz(fr, Qi, Qc, anl, phi=0.0):
-    """Return the Duffing coordinate converted to Hz."""
+    """Return the Duffing nonlinear detuning converted to Hz.
+
+    ``fr``/``Qi``/``Qc``/``phi`` are the resonator parameters (see
+    :func:`s21_model`) and ``anl`` the dimensionless Duffing parameter; the
+    result is ``fr * Qr_inv * anl``.
+    """
     return float(fr * (1.0 / Qi + np.real(1.0 / complex_coupling_q(Qc, phi))) * anl)
 
 
@@ -1189,6 +1242,39 @@ def fit_resonance(f, z, z_err=None, nonlinear=False, sweep_direction="up",
     If ``min_dip_depth_db`` is not ``None``, sweeps whose empirical dip depth
     is below the threshold return ``success=False`` and ``noise_only=True``
     instead of fitting a random fluctuation.
+
+    Parameters
+    ----------
+    f : array-like
+        Sweep frequencies (Hz).
+    z : array-like of complex
+        Complex S21 at each frequency.
+    z_err : array-like of complex or None, optional
+        Per-point S21 uncertainty; propagated into
+        ``parameter_uncertainties`` and (optionally) the fit weights.
+    nonlinear : bool, optional
+        Fit the Duffing ``anl`` term by delegating to
+        :func:`fit_resonance_nonlinear` (default ``False``).
+    sweep_direction : {'up', 'down'}, optional
+        Direction the sweep was taken in (default ``'up'``); only affects
+        nonlinear fits.
+    max_nfev : int, optional
+        Maximum optimiser function evaluations (default ``1000``).
+    tol : float, optional
+        Optimiser tolerance (default ``1e-8``); overridden by
+        ``fit_tolerance`` when that is given.
+    return_uncertainties : bool, optional
+        Compute parameter uncertainties from the Jacobian (default ``True``).
+    optimizer_z_err : array-like or bool or None, optional
+        Per-point errors used to weight the optimiser residuals; ``True``
+        reuses ``z_err``.  ``None`` (default) leaves the fit unweighted.
+    use_error_weights : bool or None, optional
+        Convenience switch: ``True`` sets ``optimizer_z_err=True``, ``False``
+        disables weighting.  ``None`` (default) defers to ``optimizer_z_err``.
+    error_weight_power : float, optional
+        Exponent applied to the error weights (default ``1.0``).
+    fit_tolerance : float or None, optional
+        Alias for ``tol`` taking precedence when set (default ``None``).
     """
     if nonlinear:
         return fit_resonance_nonlinear(
@@ -1282,6 +1368,11 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
     ``initial_guess`` instead; that path is faster and lands in the same
     basin as the original fit. The same ``min_dip_depth_db`` pre-check used by
     ``fit_resonance`` runs before the linear seed.
+
+    The data and optimiser arguments (``f``, ``z``, ``z_err``,
+    ``sweep_direction``, ``max_nfev``, ``tol``, ``return_uncertainties``,
+    ``optimizer_z_err``, ``use_error_weights``, ``error_weight_power``,
+    ``fit_tolerance``) mean the same as in :func:`fit_resonance`.
     """
     fit_start = time.time()
     tol = fit_tolerance if fit_tolerance is not None else tol
@@ -1410,7 +1501,21 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
 
 
 def evaluate_fit(f, fit_result, deembed=False, phase_center=False):
-    """Evaluate a FitResult at new frequencies, optionally in calibrated planes."""
+    """Evaluate a FitResult at new frequencies, optionally in calibrated planes.
+
+    Parameters
+    ----------
+    f : array-like
+        Frequencies (Hz) at which to evaluate the fitted model.
+    fit_result : FitResult
+        A result from :func:`fit_resonance` / :func:`batch_fit`.
+    deembed : bool, optional
+        If ``True``, remove the fitted cable gain/delay envelope so the curve
+        is referred to the resonator plane (default ``False``).
+    phase_center : bool, optional
+        If ``True``, rotate so the off-resonance point sits on the real axis
+        (default ``False``).
+    """
     p = np.asarray(fit_result.p if getattr(fit_result, "p", None) is not None else [
         fit_result.fr, fit_result.Qi, fit_result.Qc, fit_result.phi,
         fit_result.a, fit_result.alpha, fit_result.tau, fit_result.anl,
@@ -1755,6 +1860,20 @@ def fit_sweep_stack(f_stack, z_stack, z_err_stack=None, nonlinear=False,
     Single-fit options, including ``initial_guess``, ``param_bounds`` and
     ``param_fixed`` and ``min_dip_depth_db``, are forwarded through
     ``**fit_kwargs``.
+
+    Parameters
+    ----------
+    f_stack : array-like
+        Stack of per-row frequency arrays (Hz).
+    z_stack : array-like of complex
+        Matching stack of complex S21 rows.
+    z_err_stack : array-like of complex or None, optional
+        Matching per-point S21 uncertainties forwarded as ``z_err`` to each
+        row fit; ``None`` (default) fits unweighted.
+    nonlinear : bool, optional
+        Fit the Duffing ``anl`` term on every row (default ``False``).
+    sweep_direction : {'up', 'down'}, optional
+        Direction the sweeps were taken in (default ``'up'``).
     """
     rows = _stack_rows(f_stack, z_stack, z_err_stack)
     tasks = [
@@ -1839,6 +1958,37 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
     lowpass 0.5, highpass 0, and dip finding. By default, targeted sweeps skip
     tones marked as blind in ``sweep_data['info']['tones']`` or
     ``sweep_data['tone_metadata']``.
+
+    Parameters
+    ----------
+    sweep_data : dict
+        A parsed sweep-data dict from the readout client/server.
+    resonances : list or None, optional
+        Explicit resonance windows; ``None`` (default) fits one trace per tone
+        (targeted) or auto-detects when ``find_resonances=True``.
+    data_format : str, optional
+        Interpretation of the sweep traces (default ``'log_magnitude'``).
+    window_fwhm : float, optional
+        Half-window width, in dip FWHMs, kept around each resonance for
+        auto-detected windows (default ``10.0``).
+    nonlinear : bool, optional
+        Fit the Duffing ``anl`` term (default ``False``).
+    sweep_direction : {'up', 'down'}, optional
+        Direction the sweep was taken in (default ``'up'``).
+    verbose : bool, optional
+        Print per-fit progress (default ``True``).
+    z_err : array-like or None, optional
+        Per-point S21 uncertainty for the fits / uncertainty propagation.
+    optimizer_z_err : optional
+        Errors used to weight the optimiser residuals (``True`` reuses
+        ``z_err``); ``None`` (default) fits unweighted.
+    use_error_weights : bool or None, optional
+        Convenience switch equivalent to setting ``optimizer_z_err``.
+    max_points : int or None, optional
+        Cap on points fed to each fit (decimated if exceeded); ``None`` keeps
+        all points.
+    skip_blind : bool, optional
+        Skip tones flagged as blind in the sweep metadata (default ``True``).
     """
     from .peak_finder import find_mkid_resonances
 
@@ -1957,7 +2107,12 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
 
 
 def extract_parameters(fit_results):
-    """Extract common fitted parameters from one or more FitResult objects."""
+    """Extract common fitted parameters from one or more FitResult objects.
+
+    ``fit_results`` is a single :class:`FitResult`, an iterable of them, or
+    ``None``.  Returns a dict of arrays keyed by parameter name (one entry per
+    fit), with ``anl`` set to NaN for noise-only rows.
+    """
     keys = ("fr", "Ql", "Qi", "Qc", "Qc_abs", "phi", "a", "alpha",
             "tau", "anl", "nonlinear_detuning_hz", "residual_rms",
             "weighted_rms", "reduced_chi2", "success", "nfev",
@@ -2004,6 +2159,18 @@ def fit_result_summary_row(
     Power-sweep tooling adds sweep/tone/power columns around this generic
     fitter-level row, so the list of exported fit fields lives with the fitter
     instead of being duplicated by each workflow.
+
+    Parameters
+    ----------
+    fit : FitResult
+        The fit to summarise.
+    keys : sequence of str, optional
+        Fitted-value field names to export (default :data:`FIT_SUMMARY_KEYS`).
+    uncertainty_keys : sequence of str, optional
+        Field names to also export as ``<name>_err`` uncertainty columns
+        (default :data:`FIT_UNCERTAINTY_KEYS`).
+    include_message : bool, optional
+        Include the solver ``message`` string column (default ``True``).
     """
     row = {}
     uncertainty_keys = set(uncertainty_keys or ())

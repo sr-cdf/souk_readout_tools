@@ -15,7 +15,10 @@ class TimingStatusError(RuntimeError):
 
 
 def unavailable_timing_status(error: str) -> dict[str, Any]:
-    """Return a structured timing status when the monitor is unavailable."""
+    """Return a structured timing status when the monitor is unavailable.
+
+    ``error`` is the failure message embedded in the returned status dict.
+    """
     return {
         "ready": False,
         "available": False,
@@ -36,6 +39,17 @@ def get_timing_status(
     When ``raise_on_error`` is false, connection/protocol failures are returned
     as a normal structured status so callers can include timing in broad status
     reports without making the readout server depend on the timing service.
+
+    Parameters
+    ----------
+    socket_path : str, optional
+        Path to the timing-monitor Unix socket (default
+        :data:`DEFAULT_TIMING_SOCKET`).
+    timeout_s : float, optional
+        Socket connect/recv timeout in seconds (default ``0.5``).
+    raise_on_error : bool, optional
+        Raise :class:`TimingStatusError` on failure instead of returning an
+        ``unavailable`` status (default ``False``).
     """
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -136,7 +150,10 @@ def _best_source_by_error(sources: list[dict[str, Any]]) -> dict[str, Any] | Non
 
 
 def timing_public_view(status: dict[str, Any]) -> dict[str, Any]:
-    """Return the user-facing timing view for ``get_info('timing')``."""
+    """Return the user-facing timing view for ``get_info('timing')``.
+
+    ``status`` is a raw status dict from :func:`get_timing_status`.
+    """
     state = status.get("state", "unknown")
     source_type = status.get("chrony_source_type", "unknown")
     chrony_sources = status.get("chrony_sources") or []
@@ -338,7 +355,11 @@ def get_timing_summary(
     socket_path: str = DEFAULT_TIMING_SOCKET,
     timeout_s: float = 0.5,
 ) -> dict[str, Any]:
-    """Return the public timing view used by ``get_info('timing')``."""
+    """Return the public timing view used by ``get_info('timing')``.
+
+    ``socket_path`` and ``timeout_s`` are forwarded to
+    :func:`get_timing_status`.
+    """
     status = get_timing_status(socket_path=socket_path, timeout_s=timeout_s)
     if not status.get("available", True):
         return {

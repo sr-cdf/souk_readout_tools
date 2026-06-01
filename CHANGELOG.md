@@ -59,6 +59,19 @@ Forward-ported the `jl_ocs_devel` branch (PR #10) plus follow-on hardening.
   fitted resonator geometry is handled consistently across fitting, plotting,
   and frequency/dissipation conversion.
 
+**Noise Analysis**
+- Added `noise.remove_common_modes_svd()` for NumPy-only common-mode
+  subtraction across slow accumulated detector timestreams, plus
+  `noise.fractional_frequency_and_dissipation_timestreams()` for converting
+  multi-tone I/Q captures with a matching calibration sweep.
+- Added `noise.remove_blind_tone_common_modes()` to fit temporal reference
+  modes from simultaneous blind-tone amplitude/phase variations and regress
+  those modes out of regular-tone I/Q before frequency/dissipation
+  conversion. Blind sweep traces are not used.
+- `plot_timestream_psd(..., format='freq_diss')` can overlay SVD-cleaned
+  and blind-tone-cleaned spectra or plot them in place of the raw spectra.
+  Legends record the number of removed modes.
+
 **CSV Import Hardening**
 - `import_sweep` and the equivalent stream/snapshot CSV importers now use
   `ast.literal_eval` instead of `eval` for metadata parsing. This removes
@@ -74,6 +87,12 @@ Forward-ported the `jl_ocs_devel` branch (PR #10) plus follow-on hardening.
   dispatch.
 
 **Power Sweep Workflow Polish**
+- `power_sweep.run_power_sweep()` now defaults to pre-centering before the
+  first saved sweep and following dips between power steps. The initial
+  unsaved center-search sweep uses `search_span_factor=2.0` by default so
+  edge-clipped dips can be pulled back into the saved sweep span. Pass
+  `follow_dips=False` for fixed centers or `search_for_center=False` to skip
+  only the initial search.
 - `power_sweep.run_power_sweep()` now defaults `follow_min_depth_db=0.5`
   (matching `fit_power_sweep()`'s `min_dip_depth_db` default), so
   `follow_dips=True` no longer chases shallow noise minima between power
@@ -85,6 +104,22 @@ Forward-ported the `jl_ocs_devel` branch (PR #10) plus follow-on hardening.
   full `find_best_power()` result to `best_power.json`.
 - `plot_fits()` now disables the shared axis offset annotation
   (`+1.5e9`-style text) on every magnitude/phase/IQ panel it draws.
+- `plot_power_sweep()` and `plot_best_power()` are faster on many-tone runs.
+  Both gained an `n_jobs` argument (joblib convention: `1` serial default,
+  `-1` all CPUs) that renders the independent per-tone PNGs across worker
+  processes; `savefig` is the dominant, CPU-bound cost so this scales toward
+  the core count (`plot_best_power()` is forced serial when `show=True`).
+  `analyse_power_sweep()` forwards its `n_jobs` to both, so the convenience
+  path is parallel by default. The default `dpi` dropped from `100` to `80`
+  (savefig raster time scales with `dpi**2`); raise it for publication
+  figures. Per-tone output is byte-identical between serial and parallel runs.
+- Removed the `UserWarning: ... Axes that are not compatible with
+  tight_layout` emitted (once per tone) by `plot_power_sweep()` and
+  `plot_best_power()` on `mag+phase+iq` layouts. Those figures now lay out via
+  `savefig(bbox_inches='tight')` instead of `tight_layout()`, which also
+  prevents long calibrated axis labels from being clipped.
+- Fixed `analyse_power_sweep(plot=True)` passing an invalid `show=` argument
+  to `plot_power_sweep()` (now `show_overlay=`), which raised `TypeError`.
 
 ## v1.2.0
 

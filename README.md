@@ -160,6 +160,7 @@ For full installation details (including server setup, SD card imaging, and daem
 | [Getting Started](doc/getting_started.md) | Configuration, usage guide, and worked examples for all features |
 | [Calibration](doc/calibration.md) | Power calibration model and RF signal-chain configuration |
 | [Tone Power Notes](doc/tone_power_notes.md) | Dynamic-range, VACC, crest-factor, and blind-tone power guidance |
+| [Resonator Noise Workflow](doc/resonator_noise_workflow.md) | Drive-power tuning, blackbody-load directory layout, and on/off-resonance noise captures |
 | [RF Peripherals](doc/rf_peripherals.md) | RF attenuator, bypass amplifier, and discovery tooling |
 | [LNA Bias](doc/lna_bias.md) | Cryostat LNA bias control, soft-off, and status monitoring |
 | [Dual Pipeline](doc/dual_pipeline.md) | Dual-pipeline setup, initialisation model, and multi-server operation |
