@@ -105,6 +105,17 @@ def wideband_resonance_search_params(frequencies, filter_params=None,
     prominence/width/spacing to avoid fitting every small noise fluctuation.
     Caller-supplied dicts override individual defaults; fully constructed
     parameter objects are used unchanged.
+
+    Parameters
+    ----------
+    frequencies : array-like
+        Sweep frequency axis (Hz), used to set the inner frequency trim.
+    filter_params : dict or FilterParams or None, optional
+        Overrides for the pre-filter defaults (a dict updates individual
+        fields; a :class:`FilterParams` is used as-is).
+    finder_params : dict or PeakFinderParams or None, optional
+        Overrides for the peak-finder defaults (prominence/width/spacing/dip
+        settings), same dict-vs-object rule as ``filter_params``.
     """
     f_low, f_high = _inner_frequency_trim(frequencies)
     default_filter = FilterParams(
@@ -199,6 +210,7 @@ class ResonanceSearchResult:
         return tuple((key, getattr(self, key)) for key in self._mapping_keys)
 
     def get(self, key, default=None):
+        """Dict-style accessor: return field ``key`` if present, else ``default``."""
         if key in self._mapping_keys:
             return getattr(self, key)
         return default

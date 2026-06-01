@@ -71,6 +71,7 @@ class ScientificSpinBox(QDoubleSpinBox):
         self.lineEdit().setValidator(validator)
 
     def valueFromText(self, text):
+        """Parse spinbox ``text`` into a numeric value (QSpinBox override)."""
         try:
             text=text.replace(',','')
             return float(text)
@@ -108,7 +109,13 @@ class Resonance:
         filtered_data,
         peak_idx,
     ):
-        """Perform analysis and store results."""
+        """Perform analysis and store results.
+
+        ``frequencies`` and ``s21_complex`` are the sweep axis (Hz) and complex
+        S21; ``logmag_data`` and ``filtered_data`` are the log-magnitude trace
+        and its filtered version; ``peak_idx`` indexes this resonance's dip
+        within those arrays.
+        """
         _log.debug(f'Resonance.analyse at {frequencies[peak_idx]/1e6:.3f} MHz')
         self.peak_idx = peak_idx
         estimate = estimate_resonance_empirical(
@@ -132,21 +139,26 @@ class Resonance:
         self.marker_filt = filtered_data[peak_idx]
 
     def set_id(self,new_id):
+        """Set this resonance's id to ``new_id``."""
         self.id = new_id
     
     def set_save_state(self,state):
+        """Set whether this resonance is flagged to save (``state``)."""
         self.save = state
         # self.update_marker_style()
     
     def set_active_state(self,state):
+        """Set this resonance's active ``state``."""
         self.is_active = state
         # self.update_marker_style()
     
     def set_selected_state(self,state):
+        """Set this resonance's selected ``state``."""
         self.is_selected = state
         # self.update_marker_style()
     
     def set_name(self,new_name):
+        """Set this resonance's display name to ``new_name``."""
         self.name = new_name
         # self.update_marker_style()
 
@@ -161,6 +173,7 @@ class DataLoader():
         pass
 
     def load_file(self,filename):
+        """Load resonator sweep data from ``filename`` (dispatches on its extension)."""
         if not filename:
             raise ValueError('No filename provided')
         ext = os.path.splitext(filename)[-1]
@@ -178,6 +191,7 @@ class DataLoader():
         return f,z
 
     def load_from_fits(self,filename):
+        """Load sweep data from the FITS file ``filename``."""
         try:
             from astropy.io import fits
         except ImportError as e:
@@ -196,6 +210,7 @@ class DataLoader():
         return frequencies, s21_complex
 
     def load_from_npy(self, filename):
+        """Load sweep data from the ``.npy`` file ``filename``."""
         _log.debug(f'Loading npy file: {filename}')
         data = np.load(filename,allow_pickle=True)
         if data.dtype == np.object_:
@@ -231,6 +246,7 @@ class DataLoader():
             raise ValueError('format of data in npy file not understood')
 
     def load_from_txt(self, filename):
+        """Load sweep data from the text/CSV file ``filename``."""
         try:
             data = np.loadtxt(filename, delimiter=',')
             frequencies = data[:, 0]
@@ -257,6 +273,7 @@ class FilterManager():
         return params
 
     def set_filter_params(self,filter_params):
+        """Store the pre-filter parameters ``filter_params`` for this dataset."""
         highpass_edge = filter_params.get('highpass_edge', self.highpass_edge)
         lowpass_edge = filter_params.get('lowpass_edge', self.lowpass_edge)
         median_kernel_size = filter_params.get('median_kernel_size', self.median_kernel_size)
@@ -291,6 +308,7 @@ class FilterManager():
         self.median_kernel_size = int(value)
 
     def filter_data(self, data):
+        """Return ``data`` after the configured high/low-pass and median filters."""
         _log.debug('filter_data')
         self.align_with_sample_interval(len(data))
         data = self.perform_highpass(data, self.highpass_edge)
@@ -299,6 +317,7 @@ class FilterManager():
         return data
 
     def align_with_sample_interval(self, num_samples):
+        """Trim the data length to a multiple of ``num_samples`` for filtering."""
         _log.debug('align_with_sample_interval')
         # self.highpass_edge = self.highpass_edge %  (1./num_samples)
         # self.lowpass_edge = self.lowpass_edge % (1./num_samples)
@@ -317,6 +336,7 @@ class FilterManager():
             self._set_median_kernel_size(num_samples)
             
     def perform_highpass(self, data, highpass_edge):
+        """High-pass filter ``data`` at the normalised ``highpass_edge``."""
         if self.highpass_edge == 0:
             return data
         else:
@@ -324,6 +344,7 @@ class FilterManager():
             return filtfilt(b, a, data)
     
     def perform_lowpass(self, data,lowpass_edge):
+        """Low-pass filter ``data`` at the normalised ``lowpass_edge``."""
         if lowpass_edge == 1:
             return data
         else:
@@ -331,6 +352,7 @@ class FilterManager():
             return filtfilt(b, a, data)
     
     def perform_median_filter(self, data, kernel_size):
+        """Median-filter ``data`` with the given ``kernel_size``."""
         if kernel_size == 1:
             return data
         else:
@@ -382,6 +404,7 @@ class PeakFinderManager():
         return params
 
     def set_finder_parameters(self,params):
+        """Store the peak-finder parameters ``params``."""
         self.prominence_enabled = params.get('prominence_enabled', self.prominence_enabled)
         self.prominence_min = params.get('prominence_min', self.prominence_min)
         self.prominence_max = params.get('prominence_max', self.prominence_max)
@@ -403,6 +426,7 @@ class PeakFinderManager():
 
 
     def perform_find_peaks(self, data, frequencies=None):
+        """Run peak finding on ``data`` (``frequencies`` enables axis-aware widths)."""
         _log.debug(f'perform_find_peaks, data shape={data.shape if hasattr(data,"shape") else len(data)}')
         params = self.get_finder_params()
         prominence = (params['prominence_min'], params['prominence_max']) if params['prominence_enabled'] else None
@@ -819,6 +843,7 @@ class ResonanceFinderApp(QMainWindow):
 
     #optimisations
     def scheduleRefresh(self, delay_ms=0):
+        """Schedule a debounced UI refresh after ``delay_ms`` milliseconds."""
         if self._refresh_pending:
             return
         self._refresh_pending = True
@@ -996,7 +1021,10 @@ class ResonanceFinderApp(QMainWindow):
         self.peakFinderManager.set_finder_parameters(active_params)
 
     def apply_cli_overrides(self, args):
-        """Apply command-line argument overrides to settings and refresh UI."""
+        """Apply command-line argument overrides to settings and refresh UI.
+
+        ``args`` is the parsed ``argparse`` namespace.
+        """
         changed = False
 
         if args.format:
@@ -1085,6 +1113,7 @@ class ResonanceFinderApp(QMainWindow):
     
 
     def loadFile(self,filename=None):
+        """Load a sweep file into the app (prompts when ``filename`` is None)."""
         _log.debug('loadFile')
         if not filename:
             filename = self.filename
@@ -1115,6 +1144,7 @@ class ResonanceFinderApp(QMainWindow):
         _log.debug('postLoadDataSetup')
     
     def handleLoadError(self, e):
+        """Report a file-load exception ``e`` to the user."""
         tb=traceback.format_exc()
         _log.error(f"Error loading file: {e}\n{tb}")
         QMessageBox.warning(None, "Error", f"Error loading file: {e}\n{tb}")
@@ -1198,6 +1228,7 @@ class ResonanceFinderApp(QMainWindow):
         return self.filterManager.get_filter_params()
     
     def setFilterParams(self,params):
+        """Apply filter parameters ``params`` and refresh the filtered trace."""
         _log.debug('setFilterParams')
         self.filterManager.set_filter_params(params)
     
@@ -1471,6 +1502,7 @@ class ResonanceFinderApp(QMainWindow):
         
 
     def addResonance(self, frequency_mhz=None, refreshUI=True):
+        """Add a resonance at ``frequency_mhz`` (refresh the UI when ``refreshUI``)."""
         _log.debug(f'addResonance {frequency_mhz}')
         if frequency_mhz is None:
             if self.active_resonance_index is not None:
@@ -1504,6 +1536,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def editResonance(self, resonance_index, new_frequency_mhz=None,refreshUI=True):
+        """Move resonance ``resonance_index`` to ``new_frequency_mhz`` (refresh when ``refreshUI``)."""
         _log.debug('editResonance')
         if (resonance_index <0) or (resonance_index>=len(self.resonances)):
             _log.debug(f'invalid index,{resonance_index}/{len(self.resonances)}')
@@ -1538,6 +1571,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def deleteResonance(self,resonance_index,refreshUI=True):
+        """Delete resonance ``resonance_index`` (refresh the UI when ``refreshUI``)."""
         _log.debug('deleteResonance')
         for i in range(len(self.resonances)):
             if self.resonances[i].id == resonance_index:
@@ -1556,6 +1590,7 @@ class ResonanceFinderApp(QMainWindow):
             self.refreshUI()
 
     def deleteResonances(self,resonance_indexes,refreshUI=True):
+        """Delete the resonances in ``resonance_indexes`` (refresh when ``refreshUI``)."""
         _log.debug('deleteResonances')
         for i in range(len(resonance_indexes)):
             for j in range(len(self.resonances)):
@@ -1575,6 +1610,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def deleteSelectedResonances(self,refreshUI=True):
+        """Delete all currently selected resonances (refresh when ``refreshUI``)."""
         _log.debug('deleteSelectedResonances')
         # dialog to warn about deletion...
         if not self.selected_resonance_indexes:
@@ -1767,6 +1803,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def refreshResonancesTable(self, full=False):
+        """Refresh the resonances table (``full=True`` rebuilds every row)."""
         _log.debug(f"refreshResonancesTable {'full' if full else 'incremental'}")
 
         if full:
@@ -1791,6 +1828,7 @@ class ResonanceFinderApp(QMainWindow):
         #     self.resonances_table.scrollToItem(self.resonances_table.item(self.active_resonance_index, 1))
 
     def updateResonancesTableRow(self, row, resonance):
+        """Update table ``row`` to display ``resonance``."""
         _log.debug(f'updateResonancesTableRow {row}')
         
         # Save checkbox
@@ -1871,6 +1909,7 @@ class ResonanceFinderApp(QMainWindow):
         
 
     def onSaveCheckboxChanged(self,state):
+        """Slot: handle the save-checkbox ``state`` changing."""
         _log.debug('onSaveCheckboxChanged')
         checkbox = self.sender()
         id = checkbox.property('resonance_id')
@@ -1979,6 +2018,7 @@ class ResonanceFinderApp(QMainWindow):
         self.marker_text_dict = marker_text_dict
 
     def addMarkerText(self,mtext):
+        """Append ``mtext`` to the on-plot marker annotation."""
         _log.debug('addMarkerText')
         if mtext not in self.marker_text_dict:
             FONT_PROP = matplotlib.font_manager.FontProperties(size=10,weight='ultralight')
@@ -2205,6 +2245,7 @@ class ResonanceFinderApp(QMainWindow):
         self.active_resonance_index = None
     
     def setActiveResonanceIndex(self, index, refresh=True):
+        """Make resonance ``index`` the active one (refresh the UI when ``refresh``)."""
         _log.debug(f'setActiveResonanceIndex {index}')
         
         # Early exit if no change
@@ -2444,6 +2485,7 @@ class ResonanceFinderApp(QMainWindow):
         # self.selected_resonance_indexes = selected_resonance_indexes
 
     def setSelectedResonances(self, resonance_indexes, refresh=True):
+        """Set the selection to ``resonance_indexes`` (refresh when ``refresh``)."""
         _log.debug('setSelectedResonances')
         # Use set for O(1) lookup instead of O(n) list membership
         index_set = set(resonance_indexes)
@@ -2573,6 +2615,7 @@ class ResonanceFinderApp(QMainWindow):
                 self.label_analysis.setText("No resonances found\n\nTry adjusting parameters")
 
     def closeEvent(self, event):
+        """Qt close handler: persist state as the window ``event`` closes."""
         _log.debug('closeEvent')
         self.saveSettings()
         super().closeEvent(event)  # Ensure the base class method is called
@@ -3331,6 +3374,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def resizeEvent(self, event):
+        """Qt resize handler for the window ``event``."""
         super().resizeEvent(event)
         if self.resize_timer:
             self.resize_timer.start(200)
@@ -3347,6 +3391,7 @@ class ResonanceFinderApp(QMainWindow):
             _log.exception(f"Error in onResizeFinished: {e}")
 
     def onSplitterMoved(self, pos, index):
+        """Slot: handle splitter handle ``index`` moving to position ``pos``."""
         _log.debug('onSplitterMoved')
         if self.hsplitter_timer:
             self.hsplitter_timer.start(200)
@@ -3418,6 +3463,7 @@ class ResonanceFinderApp(QMainWindow):
         self.scheduleRefresh(0)
 
     def onResonanceTableCellClicked(self, row, column):
+        """Slot: handle a click on table cell (``row``, ``column``)."""
         # Note: selectionChanged already handles this, so we only need to
         # ensure the active resonance is set. Don't trigger extra refresh.
         _log.debug('onResonanceTableCellClicked')
@@ -3450,6 +3496,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def toggleSelectionMode(self, state):
+        """Enable/disable rectangle-selection mode from checkbox ``state``."""
         _log.debug('toggleSelectionMode')
         if state == Qt.Checked:
             self.activateRectangleSelectors()
@@ -3499,6 +3546,7 @@ class ResonanceFinderApp(QMainWindow):
         self.canvas_active_filtered.setCursor(Qt.ArrowCursor)
 
     def onSelectRectangle(self, eclick, erelease):
+        """RectangleSelector callback: select between mouse ``eclick`` and ``erelease``."""
         _log.debug('onSelectRectangle')
         try:
             ax = eclick.inaxes
@@ -3510,6 +3558,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def handleRectangleSelection(self, ax, eclick, erelease):
+        """Select resonances on axis ``ax`` within the ``eclick``-``erelease`` rectangle."""
         _log.debug('handleRectangleSelection')
         # Get rectangle coordinates in data units
         x_min, x_max = sorted([eclick.xdata, erelease.xdata])
@@ -3547,7 +3596,8 @@ class ResonanceFinderApp(QMainWindow):
 
     def showResonanceContextMenu(self, resonance_index, mouse_event):
         """
-        Show a right-click menu for the given resonance index.
+        Show a right-click menu for resonance ``resonance_index`` at the
+        position of ``mouse_event``.
         """
         _log.debug('showResonanceContextMenu')
         menu = QMenu()
@@ -3573,6 +3623,7 @@ class ResonanceFinderApp(QMainWindow):
    
 
     def showEmptySpaceContextMenu(self, event):
+        """Show the empty-plot-area context menu for mouse ``event``."""
         _log.debug('showEmptySpaceContextMenu')
         menu = QMenu()
         action_add_new = QAction("Add Resonance Here", self)
@@ -3582,8 +3633,8 @@ class ResonanceFinderApp(QMainWindow):
 
     def getClickedResonanceIndex(self, event, pick_tolerance=10):
         """
-        Return the resonance index if the click is within pick_tolerance (pixels) of a marker,
-        or None if not near any marker.
+        Return the resonance index if the click ``event`` is within
+        ``pick_tolerance`` (pixels) of a marker, or None if not near any marker.
         """
         _log.debug('getClickedResonanceIndex')
         if event.inaxes == self.ax_raw:
@@ -3648,7 +3699,8 @@ class ResonanceFinderApp(QMainWindow):
 
     def onAxesRightClick(self, event):
         """
-        Right-click logic. Show a context menu depending on whether we clicked near a marker.
+        Right-click logic for plot mouse ``event``: show a context menu
+        depending on whether we clicked near a marker.
         """
         _log.debug('onAxesRightClick')
         pick_tolerance = 10
@@ -3669,8 +3721,8 @@ class ResonanceFinderApp(QMainWindow):
 
     def onAxesLeftClick(self, event):
         """
-        Left-click logic. If near a marker, select that resonance.
-        Otherwise, you might do something like adding a new resonance or ignoring.
+        Left-click logic for plot mouse ``event``: if near a marker, select that
+        resonance; otherwise add a new resonance or ignore.
         """
         _log.debug('onAxesLeftClick')
         # Tolerance in pixels
@@ -3689,6 +3741,7 @@ class ResonanceFinderApp(QMainWindow):
             pass
 
     def addResonanceAtPlotPosition(self, event):
+        """Add a resonance at the plot x-position of mouse ``event``."""
         _log.debug(f'addResonanceAtPlotPosition {event}')
         ax = event.inaxes
         if ax is None or event.xdata is None:
@@ -3698,6 +3751,7 @@ class ResonanceFinderApp(QMainWindow):
         self.addResonance(initial_freq_mhz=freq_mhz)
 
     def editResonanceAtPlotPosition(self, resonance_idx):
+        """Open the edit dialog for resonance ``resonance_idx``."""
         _log.debug(f'editResonanceAtPlotPosition {resonance_idx}')
         if resonance_idx is None:
             QMessageBox.information(self, "Edit Resonance", "No resonance selected.")
@@ -3707,6 +3761,7 @@ class ResonanceFinderApp(QMainWindow):
 
 
     def deleteResonanceAtPosition(self, resonance_idx):
+        """Delete resonance ``resonance_idx`` (from a plot context action)."""
         _log.debug(f'deleteResonanceAtPosition {resonance_idx}')
         if resonance_idx is None:
             QMessageBox.information(self, "Delete Resonance", "No resonance selected.")
@@ -3732,6 +3787,7 @@ class ResonanceFinderApp(QMainWindow):
             self.zoom_filt_canvas.draw_idle()
 
     def toggleSaveResonanceAtPosition(self, resonance_idx):
+        """Toggle the save flag of resonance ``resonance_idx``."""
         _log.debug(f'toggleSaveResonanceAtPosition {resonance_idx}')
         if resonance_idx is None:
             QMessageBox.information(self, "Toggle Save Resonance", "No resonance selected.")
@@ -3804,7 +3860,8 @@ class ResonanceFinderApp(QMainWindow):
 
     def showResonancesTableContextMenu(self, position):
         """
-        Show a right-click context menu for the resonances table.
+        Show a right-click context menu for the resonances table at ``position``
+        (the table-local point from the contextMenuRequested signal).
         """
         menu = QMenu(self)
 
@@ -3912,13 +3969,14 @@ class SplashScreen(QSplashScreen):
             
 
     def show_progress(self, current_step, total_steps):
-        """Update the splash screen's progress bar."""
+        """Update the splash screen's progress bar to ``current_step`` of
+        ``total_steps``."""
         percent = int(current_step / total_steps * 100)
         self.progress_bar.setValue(percent)
         QApplication.processEvents()
 
     def add_log_line(self, message):
-        """Append a line to the log box and scroll to the latest line."""
+        """Append ``message`` to the log box and scroll to the latest line."""
         self.log_box.appendPlainText(message)
         # Scroll to bottom
         vertical_scroll = self.log_box.verticalScrollBar()
@@ -4021,6 +4079,7 @@ if __name__ == "__main__":
 
 # do a butterbowrth lowpass filterdef butter_lowpass(cutoff, fs, order=5):
 def lowpass(data, cutoff, fs=1, order=5):
+    """Butterworth low-pass filter ``data`` at ``cutoff`` (sample rate ``fs``, filter ``order``)."""
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
     b, a = butter(order, normal_cutoff, btype='low', analog=False)
@@ -4028,6 +4087,7 @@ def lowpass(data, cutoff, fs=1, order=5):
     return y
 
 def highpass(data, cutoff, fs=1, order=5):
+    """Butterworth high-pass filter ``data`` at ``cutoff`` (sample rate ``fs``, filter ``order``)."""
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
     b, a = butter(order, normal_cutoff, btype='high', analog=False)

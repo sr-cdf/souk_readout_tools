@@ -114,12 +114,16 @@ class RudatAdapter:
         }
 
     def set_attenuation(self, channel, dev_name, attenuation_db):
+        """Set device ``dev_name`` on ``channel`` to ``attenuation_db`` (dB)."""
         self._attens[dev_name].att = float(attenuation_db)
 
     def get_attenuation_value(self, channel, dev_name):
+        """Return the current attenuation (dB) of ``dev_name`` on ``channel``."""
         return float(self._attens[dev_name].att)
 
     def get_transfer(self, channel):
+        """Return the transfer calibration for ``channel`` (``None`` for
+        standalone attenuators)."""
         return None  # not applicable for standalone attenuators
 
 
@@ -294,7 +298,7 @@ class RFPeripheralController:
     # -- TX/RX attenuation --
 
     def set_tx_attenuation(self, attenuation_db):
-        """Set TX variable attenuator (0-31.5 dB)."""
+        """Set the TX variable attenuator to ``attenuation_db`` (0-31.5 dB)."""
         self._set_attenuation('transmit_atten', attenuation_db)
 
     def get_tx_attenuation(self):
@@ -302,7 +306,7 @@ class RFPeripheralController:
         return self._get_attenuation('transmit_atten')
 
     def set_rx_attenuation(self, attenuation_db):
-        """Set RX variable attenuator (0-31.5 dB)."""
+        """Set the RX variable attenuator to ``attenuation_db`` (0-31.5 dB)."""
         self._set_attenuation('recv_atten', attenuation_db)
 
     def get_rx_attenuation(self):
@@ -459,6 +463,9 @@ class RFPeripheralController:
         Reads ``attenuator.tx_value_db`` / ``attenuator.rx_value_db`` and
         ``bypass_amps.tx_amp_bypass`` / ``bypass_amps.rx_amp_bypass`` and
         programs the hardware to match.
+
+        ``config_dict`` is the config to apply; ``None`` (default) uses this
+        controller's stored ``self.config``.
         """
         if not self.enabled:
             return

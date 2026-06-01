@@ -52,7 +52,18 @@ class EmpiricalResonanceEstimate:
 
 
 def estimate_resonance_empirical(frequencies, s21, peak_index=None):
-    """Estimate quick-look resonance values directly from complex S21 data."""
+    """Estimate quick-look resonance values directly from complex S21 data.
+
+    Parameters
+    ----------
+    frequencies : array-like
+        Sweep frequencies (Hz).
+    s21 : array-like of complex
+        Complex S21 at each frequency.
+    peak_index : int or None, optional
+        Index to treat as the resonance; ``None`` (default) uses the deepest
+        finite dip in the log-magnitude trace.
+    """
     f = np.asarray(frequencies, dtype=float).ravel()
     z = np.asarray(s21, dtype=complex).ravel()
     if f.size != z.size:
@@ -717,7 +728,7 @@ class ResonatorCalibration:
     @classmethod
     def from_fit(cls, fit_result):
         """
-        Build from a fitting.FitResult.
+        Build from a fitting.FitResult ``fit_result``.
 
         Derives the phase-centering geometry (center, radius, rotation)
         from the fitted model parameters rather than from a Kasa circle

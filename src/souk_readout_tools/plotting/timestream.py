@@ -8,6 +8,9 @@ circle from sweep data, with optional deembedding or phase centering.
 """
 
 import numpy as np
+from ..noise import (fractional_frequency_and_dissipation_timestreams,
+                     remove_blind_tone_common_modes,
+                     remove_common_modes_svd)
 from ._common import (_get_pyplot, _compute_mag_phase,
                        _apply_deembed, _apply_phase_center,
                        _resolve_label,
@@ -73,41 +76,80 @@ def _get_tone_data(ts_data, tones=None):
     return selected
 
 
-def _compute_freq_diss(ts_data, tone_key, i_arr, q_arr, sweep_data):
-    """
-    Compute fractional frequency and dissipation from timestream + sweep.
-
-    Uses ReadoutClient.calculate_frequency_and_dissipation_noise as a
-    static method.
-    """
-    from souk_readout_tools.client.readout_client import ReadoutClient
-
-    z_ts = i_arr + 1j * q_arr
-    tone_idx = int(tone_key)
-
-    # Extract per-tone sweep data
+def _get_sweep_trace(sweep_data, tone_index):
+    """Extract the sweep frequency and I/Q trace for a timestream tone."""
     sf = np.atleast_2d(sweep_data['sweep_f'])
     si = np.atleast_2d(sweep_data['sweep_i'])
     sq = np.atleast_2d(sweep_data['sweep_q'])
 
     is_wideband = sweep_data.get('wideband_sweep', False)
     if is_wideband or sf.shape[0] == 1:
-        sweep_f = sf[0]
-        sweep_z = si[0] + 1j * sq[0]
-    else:
-        # Per-tone: column index
-        n_pts, n_tones = sf.shape
-        if tone_idx >= n_tones:
-            raise ValueError(
-                f"Tone {tone_idx} not in sweep data ({n_tones} tones)")
-        sweep_f = sf[:, tone_idx]
-        sweep_z = si[:, tone_idx] + 1j * sq[:, tone_idx]
+        return sf[0], si[0].copy(), sq[0].copy()
 
-    # Tone frequency: middle of sweep range for this tone
-    tone_freq = np.mean(sweep_f)
+    _, n_tones = sf.shape
+    if tone_index >= n_tones:
+        raise ValueError(
+            f"Tone {tone_index} not in sweep data ({n_tones} tones)")
+    return sf[:, tone_index], si[:, tone_index].copy(), sq[:, tone_index].copy()
+
+
+def _resolve_reference_tone_frequency(ts_data, tone_idx, sweep_f,
+                                       reference_tone_frequency):
+    """Resolve the timestream tone frequency for freq/diss computation.
+
+    reference_tone_frequency:
+        None: look up ``ts_data['info']['tones']['frequencies_hz'][tone_idx]``.
+            Falls back to ``np.mean(sweep_f)`` with a warning if unavailable.
+        scalar: used directly for every tone.
+        dict: ``{tone_idx: frequency_hz}``.
+    """
+    if reference_tone_frequency is None:
+        info = ts_data.get('info')
+        if isinstance(info, dict):
+            tf = info.get('tones', {}).get('frequencies_hz')
+            if tf is not None:
+                try:
+                    return float(np.asarray(tf)[tone_idx])
+                except (IndexError, ValueError, TypeError):
+                    pass
+        import warnings
+        warnings.warn(
+            f"Tone {tone_idx} has no frequency in ts_data['info']; "
+            "falling back to the midpoint of the sweep range. Pass "
+            "reference_tone_frequency to set this explicitly.",
+            stacklevel=3)
+        return float(np.mean(sweep_f))
+    if isinstance(reference_tone_frequency, dict):
+        if tone_idx not in reference_tone_frequency:
+            raise ValueError(
+                f"reference_tone_frequency dict missing tone {tone_idx}")
+        return float(reference_tone_frequency[tone_idx])
+    return float(reference_tone_frequency)
+
+
+def _compute_freq_diss(ts_data, tone_key, i_arr, q_arr, sweep_data,
+                       reference_tone_frequency=None, smooth_window_hz=1000):
+    """
+    Compute fractional frequency and dissipation from timestream + sweep.
+
+    Uses ReadoutClient.calculate_frequency_and_dissipation_noise as a
+    static method.  ``smooth_window_hz`` is passed through to that method
+    to control the Savitzky-Golay smoothing applied to the sweep gradient
+    estimate.
+    """
+    from souk_readout_tools.client.readout_client import ReadoutClient
+
+    z_ts = i_arr + 1j * q_arr
+    tone_idx = int(tone_key)
+
+    sweep_f, sweep_i, sweep_q = _get_sweep_trace(sweep_data, tone_idx)
+    sweep_z = sweep_i + 1j * sweep_q
+
+    tone_freq = _resolve_reference_tone_frequency(
+        ts_data, tone_idx, sweep_f, reference_tone_frequency)
 
     frac_f, frac_d, *_ = ReadoutClient.calculate_frequency_and_dissipation_noise(
-        sweep_f, sweep_z, tone_freq, z_ts)
+        sweep_f, sweep_z, tone_freq, z_ts, smooth_window_hz=smooth_window_hz)
 
     return frac_f, frac_d
 
@@ -126,6 +168,54 @@ def _apply_transforms(z, deembed, phase_center):
     return z, d_params, pc_params
 
 
+def _apply_tone_transforms(z, tone_idx, deembed, phase_center, *,
+                           sweep_data=None, tone_frequency=None,
+                           units='raw', info=None, config=None,
+                           reference_plane='adc_input',
+                           calibration_cache=None):
+    """Apply timestream transforms, using sweep-derived params when possible."""
+    d_params = None
+    pc_params = None
+    sweep_f = None
+    z_sweep = None
+
+    if sweep_data is not None and (deembed is True or phase_center is True):
+        sweep_f, sw_i, sw_q = _get_sweep_trace(sweep_data, tone_idx)
+        if tone_frequency is None:
+            tone_frequency = float(np.mean(sweep_f))
+        if units != 'raw':
+            sweep_info = info if isinstance(info, dict) else sweep_data.get('info')
+            sw_i, sw_q, _, _, _, _ = _normalise_iq(
+                sw_i, sw_q, units, sweep_info, config=config,
+                reference_plane=reference_plane, frequencies=sweep_f,
+                calibration_cache=calibration_cache)
+        z_sweep = sw_i + 1j * sw_q
+
+    if deembed:
+        if deembed is True:
+            if z_sweep is None:
+                raise ValueError(
+                    "deembed=True for timestream data requires sweep_data "
+                    "or a pre-computed deembed params dict.")
+            z_sweep, d_params = _apply_deembed(sweep_f, z_sweep, True)
+            z, _ = _apply_deembed(None, z, d_params, frequency=tone_frequency)
+        else:
+            z, d_params = _apply_deembed(
+                None, z, deembed, frequency=tone_frequency)
+            if z_sweep is not None and isinstance(deembed, dict):
+                z_sweep, _ = _apply_deembed(
+                    None, z_sweep, deembed, frequency=sweep_f)
+
+    if phase_center:
+        if phase_center is True and z_sweep is not None:
+            z_sweep, pc_params = _apply_phase_center(z_sweep, True)
+            z, _ = _apply_phase_center(z, pc_params)
+        else:
+            z, pc_params = _apply_phase_center(z, phase_center)
+
+    return z, d_params, pc_params
+
+
 def _transform_title_suffix(deembed, phase_center):
     """Return a parenthesised title suffix describing active transforms."""
     parts = []
@@ -136,11 +226,91 @@ def _transform_title_suffix(deembed, phase_center):
     return f' ({", ".join(parts)})' if parts else ''
 
 
+def _filter_psd_dc_point(f, p, include_dc_point):
+    """Drop the zero-frequency PSD point for log-x plotting by default."""
+    if include_dc_point:
+        return f, p
+
+    f = np.asarray(f)
+    p = np.asarray(p)
+    non_dc = f != 0
+    return f[non_dc], p[non_dc]
+
+
+def _match_y_limits(*axes):
+    """Set all axes to the combined current y-limits."""
+    limits = [ax.get_ylim() for ax in axes]
+    ymin = min(limit[0] for limit in limits)
+    ymax = max(limit[1] for limit in limits)
+    for ax in axes:
+        ax.set_ylim(ymin, ymax)
+
+
+def _compute_cleaned_freq_diss(
+        ts_data, sweep_data, plotted_tones, decorrelate_modes,
+        decorrelate_tones, blind_tone_modes, blind_tones,
+        reference_tone_frequency, smooth_window_hz):
+    """Return reusable raw rows and sequentially cleaned freq/diss rows."""
+    analysis_tones = plotted_tones
+    if decorrelate_modes:
+        info = ts_data.get('info')
+        metadata = info.get('tones', {}) if isinstance(info, dict) else {}
+        regular_tones = metadata.get('regular_indices')
+        analysis_tones = decorrelate_tones
+        if analysis_tones is None:
+            analysis_tones = regular_tones if (
+                regular_tones is not None and len(regular_tones)
+            ) else None
+
+    cleaned_ts_data = ts_data
+    if blind_tone_modes:
+        cleaned_ts_data, blind_info = remove_blind_tone_common_modes(
+            ts_data,
+            n_modes=blind_tone_modes,
+            regular_tones=analysis_tones,
+            blind_tones=blind_tones,
+            return_info=True,
+        )
+        if analysis_tones is None:
+            analysis_tones = blind_info['regular_tones']
+
+    converted = fractional_frequency_and_dissipation_timestreams(
+        cleaned_ts_data,
+        sweep_data,
+        tones=analysis_tones,
+        reference_tone_frequency=reference_tone_frequency,
+        smooth_window_hz=smooth_window_hz,
+    )
+    if decorrelate_modes:
+        frequency = remove_common_modes_svd(
+            converted['frequency'], decorrelate_modes)
+        dissipation = remove_common_modes_svd(
+            converted['dissipation'], decorrelate_modes)
+    else:
+        frequency = converted['frequency']
+        dissipation = converted['dissipation']
+
+    raw = {}
+    if not blind_tone_modes:
+        raw = {
+            int(tone_index): (converted['frequency'][row],
+                              converted['dissipation'][row])
+            for row, tone_index in enumerate(converted['tone_indices'])
+        }
+    cleaned = {
+        int(tone_index): (frequency[row], dissipation[row])
+        for row, tone_index in enumerate(converted['tone_indices'])
+    }
+    return raw, cleaned
+
+
 def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     deembed=False, phase_center=False,
-                    sweep_data=None, fig=None, label=None,
+                    sweep_data=None, reference_tone_frequency=None,
+                    fig=None, label=None,
                     units='raw', config=None, reference_plane='adc_input',
-                    x_axis='time', unwrap_phase=True, **kwargs):
+                    x_axis='time', unwrap_phase=True,
+                    smooth_window_hz=1000, **kwargs):
     """
     Plot timestream data in various formats.
 
@@ -150,15 +320,32 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         format: 'iq' | 'iq_vs_t' | 'magphase' | 'freq_diss'
         tones: List of tone indices (int) to plot, or None for [0].
         deembed: bool or deembed params dict.  Applies true RF
-            deembedding (baseline normalisation).  For timestream data
-            this must be a pre-computed params dict from
+            deembedding (baseline normalisation).  For timestream data,
+            ``True`` derives params from the matching ``sweep_data`` trace;
+            otherwise pass a pre-computed params dict from
             ``resonator.deembed()``.
         phase_center: bool or phase-centering params dict.  Applies
-            circle centering and rotation.  For timestream data this
-            must be a pre-computed params dict from
-            ``resonator.phase_center()``, or True to compute from the
-            data directly.  Applied after deembedding when both are set.
-        sweep_data: Sweep data dict. Required for 'freq_diss' format.
+            circle centering and rotation.  For timestream data, ``True``
+            derives params from the matching ``sweep_data`` trace when
+            available; without ``sweep_data`` it computes from the timestream
+            directly.  Pass a pre-computed params dict from
+            ``resonator.phase_center()`` to apply specific params.  Applied
+            after deembedding when both are set.
+        sweep_data: Sweep data dict. Required for 'freq_diss' format and
+            used as the parameter source for ``deembed=True`` or
+            ``phase_center=True`` on I/Q and mag/phase timestream plots.
+        reference_tone_frequency: Tone frequency to use for the freq/diss
+            calculation (``format='freq_diss'``).  ``None`` (default) looks
+            up the per-tone frequency from
+            ``ts_data['info']['tones']['frequencies_hz']`` — for on-resonance
+            timestreams this is the actual tone frequency.  Pass a scalar to
+            apply one value to every selected tone, or a ``{tone_idx: hz}``
+            dict for per-tone overrides (useful for off-resonance analyses).
+        smooth_window_hz: Smoothing window passed to
+            ``ReadoutClient.calculate_frequency_and_dissipation_noise`` for
+            ``format='freq_diss'``.  The default, ``1000``, preserves the
+            client default.  Pass ``None`` or ``0`` to disable sweep
+            smoothing.
         fig: Existing figure. If None, create new.
         label: Legend label. If None, uses an auto-incrementing index.
         units: Unit for I/Q normalisation.  One of:
@@ -258,7 +445,12 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             ax = fig.gca()
         for key, i_arr, q_arr in selected:
             z = i_arr + 1j * q_arr
-            z, _, _ = _apply_transforms(z, deembed, phase_center)
+            z, _, _ = _apply_tone_transforms(
+                z, int(key), deembed, phase_center,
+                sweep_data=sweep_data, tone_frequency=_tone_frequency(key),
+                units=units, info=info, config=config,
+                reference_plane=reference_plane,
+                calibration_cache=calibration_cache)
             trace_label = _resolve_label(ax, label,
                                          suffix=f'Tone {key}' if len(selected) > 1 else None)
             ax.plot(z.real, z.imag, '.', markersize=1,
@@ -284,7 +476,12 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         z = i_arr + 1j * q_arr
 
         if format == 'iq_vs_t':
-            z, _, _ = _apply_transforms(z, deembed, phase_center)
+            z, _, _ = _apply_tone_transforms(
+                z, int(key), deembed, phase_center,
+                sweep_data=sweep_data, tone_frequency=_tone_frequency(key),
+                units=units, info=info, config=config,
+                reference_plane=reference_plane,
+                calibration_cache=calibration_cache)
             ax1.plot(x_values, z.real, linewidth=0.5, label=trace_label, **kwargs)
             ax2.plot(x_values, z.imag, linewidth=0.5, label=trace_label, **kwargs)
             ax1.set_ylabel(f'I {iq_label}'.strip())
@@ -292,7 +489,12 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
 
         elif format == 'magphase':
             tone_f = _tone_frequency(key)
-            z, _, _ = _apply_transforms(z, deembed, phase_center)
+            z, _, _ = _apply_tone_transforms(
+                z, int(key), deembed, phase_center,
+                sweep_data=sweep_data, tone_frequency=tone_f,
+                units=units, info=info, config=config,
+                reference_plane=reference_plane,
+                calibration_cache=calibration_cache)
             mag_db, phase = _compute_mag_phase_units(
                 z, units, info=info, config=config,
                 reference_plane=reference_plane, frequencies=tone_f,
@@ -303,8 +505,10 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             ax2.set_ylabel('Phase (rad)')
 
         elif format == 'freq_diss':
-            frac_f, frac_d = _compute_freq_diss(ts_data, key, i_arr, q_arr,
-                                                 sweep_data)
+            frac_f, frac_d = _compute_freq_diss(
+                ts_data, key, i_arr, q_arr, sweep_data,
+                reference_tone_frequency=reference_tone_frequency,
+                smooth_window_hz=smooth_window_hz)
             ax1.plot(x_values, frac_f, linewidth=0.5, label=trace_label, **kwargs)
             ax2.plot(x_values, frac_d, linewidth=0.5, label=trace_label, **kwargs)
             ax1.set_ylabel('Fractional frequency shift')
@@ -335,8 +539,17 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
 
 
 def plot_timestream_psd(ts_data, format='iq', tones=None,
-                        sweep_data=None, psd_kwargs=None,
-                        precomputed_psd=None, fig=None, label=None, **kwargs):
+                        sweep_data=None, reference_tone_frequency=None,
+                        psd_kwargs=None,
+                        precomputed_psd=None, fig=None, label=None,
+                        smooth_window_hz=1000, *,
+                        include_dc_point=False,
+                        decorrelate_modes=0,
+                        decorrelate_plot='overlay',
+                        decorrelate_tones=None,
+                        blind_tone_modes=0,
+                        blind_tones=None,
+                        **kwargs):
     """
     Plot power spectral density of timestream data.
 
@@ -346,11 +559,44 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
             Selects which quantity to compute PSD of.
         tones: List of tone indices. Default: [0].
         sweep_data: Required for 'freq_diss' format.
+        reference_tone_frequency: Tone frequency to use for the freq/diss
+            calculation (``format='freq_diss'``).  ``None`` (default) looks
+            up the per-tone frequency from
+            ``ts_data['info']['tones']['frequencies_hz']``.  Pass a scalar
+            for a single override, or a ``{tone_idx: hz}`` dict for per-tone
+            overrides.
+        smooth_window_hz: Smoothing window passed to
+            ``ReadoutClient.calculate_frequency_and_dissipation_noise`` for
+            ``format='freq_diss'``.  The default, ``1000``, preserves the
+            client default.  Pass ``None`` or ``0`` to disable sweep
+            smoothing.
         psd_kwargs: dict of kwargs passed to compute_psd().
         precomputed_psd: dict mapping tone_key -> (f_psd, psd_values).
             If provided, skip computation.
         fig: Existing figure.
         label: Legend label. If None, uses an auto-incrementing index.
+        include_dc_point: bool, optional. Include the zero-frequency PSD
+            point. Defaults to ``False`` because the plot uses a log x-axis.
+        decorrelate_modes: int, optional. For ``format='freq_diss'``, remove
+            this many leading SVD modes across the calibrated slow-timestream
+            tone rows. ``0`` (default) disables decorrelation.
+        decorrelate_plot: {'overlay', 'replace'}, optional. Plot decorrelated
+            spectra alongside the raw spectra or instead of them. The
+            cleaned legend records each active cleaning step.
+        decorrelate_tones: iterable of int or None, optional. Tones used to
+            estimate the SVD common modes. ``None`` (default) uses regular
+            tones from the saved metadata when available, otherwise every
+            active tone. Every tone selected for plotting must be included.
+        blind_tone_modes: int, optional. For ``format='freq_diss'``, fit this
+            many temporal modes from simultaneous blind-tone amplitude/phase
+            variations and regress them out of regular-tone I/Q before
+            frequency/dissipation conversion. ``0`` (default) disables
+            blind-tone cleaning. Blind sweep traces are not used. When both
+            cleaning options are enabled, regular-tone SVD cleaning follows
+            blind-tone subtraction and calibration.
+        blind_tones: iterable of int or None, optional. Explicit blind-tone
+            indices. ``None`` (default) infers them from saved timestream
+            metadata. Use this for older captures without role metadata.
         **kwargs: Passed to plot calls.
 
     Returns:
@@ -363,6 +609,21 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
 
     if format == 'freq_diss' and sweep_data is None:
         raise ValueError("sweep_data is required for format='freq_diss'")
+    if not isinstance(decorrelate_modes, (int, np.integer)):
+        raise TypeError("decorrelate_modes must be an integer")
+    if decorrelate_modes < 0:
+        raise ValueError("decorrelate_modes must be non-negative")
+    if not isinstance(blind_tone_modes, (int, np.integer)):
+        raise TypeError("blind_tone_modes must be an integer")
+    if blind_tone_modes < 0:
+        raise ValueError("blind_tone_modes must be non-negative")
+    if decorrelate_plot not in ('overlay', 'replace'):
+        raise ValueError(
+            "decorrelate_plot must be either 'overlay' or 'replace'")
+    if (decorrelate_modes or blind_tone_modes) and format != 'freq_diss':
+        raise ValueError(
+            "SVD and blind-tone cleaning are supported only for "
+            "format='freq_diss'")
 
     if format in ('iq', 'magphase'):
         if fig is None:
@@ -387,6 +648,8 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                 f1, p1 = compute_psd(mag, sample_rate, **psd_kw)
                 f2, p2 = compute_psd(phase, sample_rate, **psd_kw)
 
+            f1, p1 = _filter_psd_dc_point(f1, p1, include_dc_point)
+            f2, p2 = _filter_psd_dc_point(f2, p2, include_dc_point)
             ax1.loglog(f1, p1, linewidth=0.5, label=trace_label, **kwargs)
             ax2.loglog(f2, p2, linewidth=0.5, label=trace_label, **kwargs)
 
@@ -399,23 +662,80 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
 
     elif format == 'freq_diss':
         if fig is None:
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6))
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6),
+                                           sharex=True, sharey=True)
         else:
             ax1, ax2 = fig.axes[:2]
+
+        raw_converted = {}
+        cleaned = {}
+        if decorrelate_modes or blind_tone_modes:
+            raw_converted, cleaned = _compute_cleaned_freq_diss(
+                ts_data,
+                sweep_data,
+                [int(key) for key, _, _ in selected],
+                decorrelate_modes,
+                decorrelate_tones,
+                blind_tone_modes,
+                blind_tones,
+                reference_tone_frequency,
+                smooth_window_hz,
+            )
 
         for key, i_arr, q_arr in selected:
             trace_label = _resolve_label(ax1, label,
                                          suffix=f'Tone {key}' if len(selected) > 1 else None)
-            frac_f, frac_d = _compute_freq_diss(ts_data, key, i_arr, q_arr,
-                                                 sweep_data)
-            f1, p1 = compute_psd(frac_f, sample_rate, **psd_kw)
-            f2, p2 = compute_psd(frac_d, sample_rate, **psd_kw)
+            tone_index = int(key)
+            raw_color = None
+            if (not (decorrelate_modes or blind_tone_modes)
+                    or decorrelate_plot == 'overlay'):
+                if ((decorrelate_modes or blind_tone_modes)
+                        and tone_index in raw_converted):
+                    frac_f, frac_d = raw_converted[tone_index]
+                else:
+                    frac_f, frac_d = _compute_freq_diss(
+                        ts_data, key, i_arr, q_arr, sweep_data,
+                        reference_tone_frequency=reference_tone_frequency,
+                        smooth_window_hz=smooth_window_hz)
+                f1, p1 = compute_psd(frac_f, sample_rate, **psd_kw)
+                f2, p2 = compute_psd(frac_d, sample_rate, **psd_kw)
 
-            ax1.loglog(f1, p1, linewidth=0.5, label=trace_label, **kwargs)
-            ax2.loglog(f2, p2, linewidth=0.5, label=trace_label, **kwargs)
+                f1, p1 = _filter_psd_dc_point(f1, p1, include_dc_point)
+                f2, p2 = _filter_psd_dc_point(f2, p2, include_dc_point)
+                lines = ax1.loglog(
+                    f1, p1, linewidth=0.5, label=trace_label, **kwargs)
+                raw_color = lines[0].get_color()
+                ax2.loglog(
+                    f2, p2, linewidth=0.5, label=trace_label, **kwargs)
+
+            if decorrelate_modes or blind_tone_modes:
+                if tone_index not in cleaned:
+                    raise ValueError(
+                        f"Tone {tone_index} selected for plotting is not in "
+                        "the cleaned tone set")
+                frac_f, frac_d = cleaned[tone_index]
+                f1, p1 = compute_psd(frac_f, sample_rate, **psd_kw)
+                f2, p2 = compute_psd(frac_d, sample_rate, **psd_kw)
+                f1, p1 = _filter_psd_dc_point(f1, p1, include_dc_point)
+                f2, p2 = _filter_psd_dc_point(f2, p2, include_dc_point)
+                clean_kwargs = dict(kwargs)
+                if decorrelate_plot == 'overlay':
+                    clean_kwargs.setdefault('linestyle', '--')
+                    clean_kwargs.setdefault('color', raw_color)
+                steps = []
+                if blind_tone_modes:
+                    steps.append(f'Blind N={blind_tone_modes}')
+                if decorrelate_modes:
+                    steps.append(f'SVD N={decorrelate_modes}')
+                clean_label = f'{trace_label} ({", ".join(steps)})'
+                ax1.loglog(
+                    f1, p1, linewidth=0.5, label=clean_label, **clean_kwargs)
+                ax2.loglog(
+                    f2, p2, linewidth=0.5, label=clean_label, **clean_kwargs)
 
         ax1.set_ylabel('Frequency noise PSD')
         ax2.set_ylabel('Dissipation noise PSD')
+        _match_y_limits(ax1, ax2)
 
     else:
         raise ValueError(
@@ -465,17 +785,7 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     key, i_arr, q_arr = selected[0]
 
     # Extract sweep trace for this tone
-    sf = np.atleast_2d(sweep_data['sweep_f'])
-    si = np.atleast_2d(sweep_data['sweep_i'])
-    sq = np.atleast_2d(sweep_data['sweep_q'])
-
-    is_wideband = sweep_data.get('wideband_sweep', False)
-    if is_wideband or sf.shape[0] == 1:
-        sweep_f = sf[0]
-        sw_i, sw_q = si[0].copy(), sq[0].copy()
-    else:
-        sweep_f = sf[:, tone_index]
-        sw_i, sw_q = si[:, tone_index].copy(), sq[:, tone_index].copy()
+    sweep_f, sw_i, sw_q = _get_sweep_trace(sweep_data, tone_index)
 
     # Normalise both sweep and timestream with the same units
     if _is_calibrated_magnitude_unit(units):
@@ -499,12 +809,19 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     z_ts = i_arr + 1j * q_arr
     z_sweep = sw_i + 1j * sw_q
 
-    # Apply transforms to sweep (with frequencies) and timestream (without)
+    ts_info = ts_data.get('info') or {}
+    ts_tone_freqs = ts_info.get('tones', {}).get('frequencies_hz')
+    if ts_tone_freqs is not None:
+        tone_freq = float(np.asarray(ts_tone_freqs)[tone_index])
+    else:
+        tone_freq = float(np.mean(sweep_f))
+
+    # Apply transforms to sweep (with frequencies) and timestream (single tone)
     d_params = None
     pc_params = None
     if deembed:
         z_sweep, d_params = _apply_deembed(sweep_f, z_sweep, True)
-        z_ts, _ = _apply_deembed(None, z_ts, d_params)
+        z_ts, _ = _apply_deembed(None, z_ts, d_params, frequency=tone_freq)
     if phase_center:
         z_sweep, pc_params = _apply_phase_center(z_sweep, True)
         z_ts, _ = _apply_phase_center(z_ts, pc_params)
@@ -512,13 +829,6 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     # Compute phase for the frequency-domain panel
     _, phase_sweep = _compute_mag_phase(z_sweep, unwrap=unwrap)
     _, phase_ts = _compute_mag_phase(z_ts, unwrap=unwrap)
-
-    ts_info = ts_data.get('info') or {}
-    ts_tone_freqs = ts_info.get('tones', {}).get('frequencies_hz')
-    if ts_tone_freqs is not None:
-        tone_freq = float(np.asarray(ts_tone_freqs)[tone_index])
-    else:
-        tone_freq = np.mean(sweep_f)
 
     if fig is None:
         fig, (ax_iq, ax_pf) = plt.subplots(1, 2, figsize=(14, 6))

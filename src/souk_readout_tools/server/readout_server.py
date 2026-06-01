@@ -68,6 +68,98 @@ def _format_log_value(value):
     return str(value)
 
 
+def _format_request_scalar(value, max_chars=48):
+    """Format a single scalar for a request log line (short, one line)."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float):
+        return f'{value:.6g}'
+    # Truncate long reprs (with an ellipsis) so request logs stay one line.
+    text = _format_log_value(value)
+    if len(text) > max_chars:
+        text = text[:max_chars - 3] + '...'
+    return text
+
+
+def _format_request_value(value, max_items=4, max_chars=96):
+    """Format any request value for logging, previewing arrays/lists/dicts
+    compactly (shape, first few items, lengths) rather than dumping them."""
+    if isinstance(value, np.ndarray):
+        values = _format_request_value(
+            value.ravel().tolist(), max_items=max_items, max_chars=max_chars)
+        return f'array(shape={value.shape}, {values})'
+
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return '[]'
+        preview = ', '.join(
+            _format_request_scalar(item, max_chars=24)
+            for item in value[:max_items]
+        )
+        if len(value) > max_items:
+            preview += ', ...'
+        return f'[{preview}] (len={len(value)})'
+
+    if isinstance(value, dict):
+        if not value:
+            return '{}'
+        keys = list(value.keys())
+        preview = ', '.join(str(key) for key in keys[:max_items])
+        if len(keys) > max_items:
+            preview += ', ...'
+        return f'{{{preview}}} (keys={len(keys)})'
+
+    return _format_request_scalar(value, max_chars=max_chars)
+
+
+def _format_request_log(message):
+    """Build a one-line summary of an incoming request for the server log,
+    showing only the fields that matter for the request type."""
+    request = message.get('request')
+    if request in ('get', 'set'):
+        fields = [('param', message.get('param'))]
+        if request == 'set' and 'value' in message:
+            fields.append(('value', message.get('value')))
+        for key in (
+            'reference_plane',
+            'optimise_dynamic_range',
+            'rx_policy',
+        ):
+            if key in message:
+                fields.append((key, message[key]))
+        for key in sorted(k for k in message if k.startswith('force_')):
+            fields.append((key, message[key]))
+        details = ' '.join(
+            f'{key}={_format_request_value(value)}'
+            for key, value in fields
+        )
+        return f'{request} {details}'
+
+    request_log_fields = {
+        'get_info': ('sections',),
+        'get_samples': ('num_samples', 'burst'),
+        'get_accumulator_snapshots': ('tone_index', 'num_snapshots', 'fast'),
+        'batch_accumulator_snapshots': ('tone_indices', 'num_snapshots'),
+        'sweep': ('centers', 'spans', 'points', 'samples_per_point', 'direction'),
+        'retune': (
+            'centers', 'spans', 'points', 'samples_per_point',
+            'direction', 'method'),
+        'refresh_adc_cal': ('adc_cal_settle_time',),
+    }
+    fields = [
+        (key, message[key])
+        for key in request_log_fields.get(request, ())
+        if key in message
+    ]
+    if not fields:
+        return _format_request_value(request)
+    details = ' '.join(
+        f'{key}={_format_request_value(value)}'
+        for key, value in fields
+    )
+    return f'{request} {details}'
+
+
 def _server_log(message, source='general'):
     print(f'server:{source}: {message}', flush=True)
 
@@ -126,6 +218,7 @@ def get_pipeline_dirs(pipeline_id):
       ~/.souk_readout_tools/pipeline_<id>/config/
       ~/.souk_readout_tools/pipeline_<id>/calibrations/
 
+    ``pipeline_id`` selects the pipeline subdirectory.
     Returns a dict with keys: 'config', 'calibrations', 'default_config'
     """
     base_dir = os.path.join(HOME, '.souk_readout_tools', f'pipeline_{pipeline_id}')
@@ -142,6 +235,8 @@ def ensure_pipeline_dirs(pipeline_id):
     """
     Ensure pipeline-specific directories exist with correct ownership.
     If the default config doesn't exist, copy template files from package data.
+
+    ``pipeline_id`` selects which pipeline's directories to create/populate.
     """
     dirs = get_pipeline_dirs(pipeline_id)
     for key in ('config', 'calibrations'):
@@ -289,8 +384,8 @@ def _ensure_daemon_files(dirs, pipeline_id):
 
 def extract_pipeline_id_from_config(config_file):
     """
-    Extract pipeline_id from a config file without fully loading it.
-    Returns the pipeline_id (int) or 0 if not found.
+    Extract pipeline_id from the config at ``config_file`` without fully
+    loading it.  Returns the pipeline_id (int) or 0 if not found.
     """
     if config_file is None:
         return 0
@@ -341,6 +436,9 @@ def set_process_name(pipeline_id=None):
 
     Linux task names shown by top/ps comm are limited to 15 visible bytes, so
     keep the default short enough that the pipeline suffix is not truncated.
+
+    ``pipeline_id`` is appended to the process name when given so the two
+    pipelines are distinguishable in ``top``/``ps``.
     """
     import os
     import ctypes
@@ -412,7 +510,6 @@ class ReadoutServer:
                          default config to load. Ignored if config_file is provided
                          (config file's pipeline_id takes precedence).
         """
-        
         _server_log_fields('starting readout server', [
             ('config file', config_file or 'default'),
             ('pipeline hint', pipeline_id if pipeline_id is not None else 'default'),
@@ -507,6 +604,7 @@ class ReadoutServer:
         self.latest_sweep_results = {}
         self.latest_sweep_data_valid = False
         self.sweep_progress = 0.0
+        self.sweep_state = {'state': 'idle', 'message': 'No sweep in progress'}
 
         #rf peripheral controller
         self.rf_peripherals = None
@@ -523,10 +621,14 @@ class ReadoutServer:
 
         Does not notice if config parameters have changed - but it definitely should!
         
+        config_file:
+          optional config to (re)load first; None keeps the current config.
         level:
           - "server": no firmware operations
           - "firmware": (re)program if needed, then initialise shared resources
           - "pipeline": firmware level + initialise pipeline resources
+        log_source:
+          label used to tag this operation's server-log lines.
         """
         if level not in ("server", "firmware", "pipeline"):
             raise ValueError(f"Invalid ready level: {level}")
@@ -645,7 +747,9 @@ class ReadoutServer:
     def init_server(self, config_file,ensure_ready=False, force_ready=False):
         """
         Initialize server runtime + load config + create firmware interfaces.
-        
+
+        ``config_file`` is the configuration to load on startup.
+
         If ensure_ready is True, bring system to pipeline-ready state
 
         If force_ready is True, reprogram and bring system to pipeline-ready state
@@ -679,6 +783,7 @@ class ReadoutServer:
         self.latest_sweep_results = {}
         self.latest_sweep_data_valid = False
         self.sweep_progress = 0.0
+        self.sweep_state = {'state': 'idle', 'message': 'No sweep in progress'}
 
         #load config
         self.load_config(config_file, log_source='init')
@@ -763,13 +868,13 @@ class ReadoutServer:
                 _server_log(
                     f'  TX: atten={status["tx_attenuation_db"]:.1f} dB, '
                     f'amp_bypass={tx_bypass}, '
-                    f'total_gain={status["tx_total_gain_db"]:.1f} dB',
+                    f'total_gain_model={status["tx_total_gain_db"]:.1f} dB',
                     source='rf',
                 )
                 _server_log(
                     f'  RX: atten={status["rx_attenuation_db"]:.1f} dB, '
                     f'amp_bypass={rx_bypass}, '
-                    f'total_gain={status["rx_total_gain_db"]:.1f} dB',
+                    f'total_gain_model={status["rx_total_gain_db"]:.1f} dB',
                     source='rf',
                 )
 
@@ -813,6 +918,9 @@ class ReadoutServer:
         Ensure shared resources and pipeline resources are initialised.
         Does not force a reprogram unless needs_programming() says so.
         Does not force shared resource initialisation unless needs_shared_resource_initialising() says so.
+
+        ``config_file`` optionally (re)loads a config first; ``None`` keeps the
+        current one.
         """
         _server_log_fields('initialising pipeline', [
             ('config file', config_file),
@@ -866,6 +974,9 @@ class ReadoutServer:
         Load a new configuration file.
         Does not reload or initialise the firmware.
         Uses pipeline-specific directories.
+
+        ``config_file`` is the config path to load (``None`` falls back to the
+        pipeline default); ``log_source`` tags this operation's server-log lines.
         """
         requested_config_file = config_file
         if config_file is None:
@@ -920,6 +1031,9 @@ class ReadoutServer:
         Uses pipeline-specific directories.
 
         Now also applies any modified config parameters in hardware.
+
+        ``config_filename`` is the name to save the config under and
+        ``config_contents`` is its text (e.g. uploaded by a client).
         """
         _server_log_fields('applying config', [
             ('config filename', config_filename),
@@ -1203,7 +1317,8 @@ class ReadoutServer:
         return firmware_lib.info_pipeline(self.r)
 
     def _info_tones(self):
-        return firmware_lib.info_tones(self.r, self.config)
+        return firmware_lib.info_tones(
+            self.r, self.config, rf_peripherals=self.rf_peripherals)
 
     def _info_rf_frontend(self):
         rf = getattr(self, 'rf_peripherals', None)
@@ -1233,10 +1348,34 @@ class ReadoutServer:
 
         # Live state from hardware, or explicit fixed values from config.
         if rf.is_hardware or rf.attenuator_backend == 'fixed':
+            tx_total_gain_model = status.get('tx_total_gain_db')
+            rx_total_gain_model = status.get('rx_total_gain_db')
+            tx_total_gain_cal = firmware_lib.estimate_rf_total_gain_from_config(
+                self.config, status, 'tx')
+            rx_total_gain_cal = firmware_lib.estimate_rf_total_gain_from_config(
+                self.config, status, 'rx')
             info['tx_attenuation_db'] = status.get('tx_attenuation_db')
             info['rx_attenuation_db'] = status.get('rx_attenuation_db')
-            info['tx_total_gain_db'] = status.get('tx_total_gain_db')
-            info['rx_total_gain_db'] = status.get('rx_total_gain_db')
+            info['tx_total_gain_db'] = (
+                tx_total_gain_cal
+                if tx_total_gain_cal is not None else tx_total_gain_model
+            )
+            info['rx_total_gain_db'] = (
+                rx_total_gain_cal
+                if rx_total_gain_cal is not None else rx_total_gain_model
+            )
+            info['tx_total_gain_source'] = (
+                'calibrated_config'
+                if tx_total_gain_cal is not None else 'peripheral_model'
+            )
+            info['rx_total_gain_source'] = (
+                'calibrated_config'
+                if rx_total_gain_cal is not None else 'peripheral_model'
+            )
+            info['tx_total_gain_model_db'] = tx_total_gain_model
+            info['rx_total_gain_model_db'] = rx_total_gain_model
+            info['tx_total_gain_calibrated_estimate_db'] = tx_total_gain_cal
+            info['rx_total_gain_calibrated_estimate_db'] = rx_total_gain_cal
             info['tx_input_1db_comp_dbm'] = status.get('tx_input_1db_comp_dbm')
             info['rx_input_1db_comp_dbm'] = status.get('rx_input_1db_comp_dbm')
         else:
@@ -1244,15 +1383,51 @@ class ReadoutServer:
             info['rx_attenuation_db'] = None
             info['tx_total_gain_db'] = None
             info['rx_total_gain_db'] = None
+            info['tx_total_gain_source'] = None
+            info['rx_total_gain_source'] = None
+            info['tx_total_gain_model_db'] = None
+            info['rx_total_gain_model_db'] = None
+            info['tx_total_gain_calibrated_estimate_db'] = None
+            info['rx_total_gain_calibrated_estimate_db'] = None
             info['tx_input_1db_comp_dbm'] = None
             info['rx_input_1db_comp_dbm'] = None
 
         # Bypass-amp state (only when the mixerless module is the active frontend)
         if rf.supports_bypass_amps:
+            tx_amp_bypass = status.get('tx_amp_bypass')
+            rx_amp_bypass = status.get('rx_amp_bypass')
+            tx_amp_model = status.get('tx_bypass_amp_s21_db')
+            rx_amp_model = status.get('rx_bypass_amp_s21_db')
+            tx_amp_cal = (
+                firmware_lib.estimate_rf_bypass_amp_s21_from_config(
+                    self.config, 'tx', bool(tx_amp_bypass))
+                if tx_amp_bypass is not None else None
+            )
+            rx_amp_cal = (
+                firmware_lib.estimate_rf_bypass_amp_s21_from_config(
+                    self.config, 'rx', bool(rx_amp_bypass))
+                if rx_amp_bypass is not None else None
+            )
             info['tx_amp_bypass'] = status.get('tx_amp_bypass')
             info['rx_amp_bypass'] = status.get('rx_amp_bypass')
-            info['tx_bypass_amp_s21_db'] = status.get('tx_bypass_amp_s21_db')
-            info['rx_bypass_amp_s21_db'] = status.get('rx_bypass_amp_s21_db')
+            info['tx_bypass_amp_s21_db'] = (
+                tx_amp_cal if tx_amp_cal is not None else tx_amp_model
+            )
+            info['rx_bypass_amp_s21_db'] = (
+                rx_amp_cal if rx_amp_cal is not None else rx_amp_model
+            )
+            info['tx_bypass_amp_s21_source'] = (
+                'calibrated_config'
+                if tx_amp_cal is not None else 'peripheral_model'
+            )
+            info['rx_bypass_amp_s21_source'] = (
+                'calibrated_config'
+                if rx_amp_cal is not None else 'peripheral_model'
+            )
+            info['tx_bypass_amp_s21_model_db'] = tx_amp_model
+            info['rx_bypass_amp_s21_model_db'] = rx_amp_model
+            info['tx_bypass_amp_s21_calibrated_estimate_db'] = tx_amp_cal
+            info['rx_bypass_amp_s21_calibrated_estimate_db'] = rx_amp_cal
 
         # Updownconverter characterisation (from config, flat keys)
         for key in ('tx_mixer_lo_frequency_hz', 'rx_mixer_lo_frequency_hz',
@@ -1391,9 +1566,9 @@ class ReadoutServer:
                 msglen = struct.unpack('>I', raw_msglen)[0]
 
                 data = await reader.readexactly(msglen)
-                print(data)
                 message = json.loads(data.decode())
                 request = message.get('request')
+                print(f"request: {_format_request_log(message)}")
 
                 if request == 'ensure_ready':
                     level = message.get('level', 'pipeline')
@@ -1647,7 +1822,9 @@ class ReadoutServer:
                             reference_plane=ref_plane,
                             optimise_dynamic_range=opt_dr,
                             rf_peripherals=self.rf_peripherals,
-                            rx_policy=rx_pol)
+                            rx_policy=rx_pol,
+                            **{k: message[k] for k in firmware_lib.POWER_FORCE_CONTROL_KEYS
+                               if k in message})
                         self.stream_flags[FLAG_SET_AMPS].clear()
                         await asyncio.sleep(0)
                         response = {'status': 'success', 'result': result}
@@ -1744,13 +1921,17 @@ class ReadoutServer:
                     rx_policy = message.get('rx_policy', 'protect')
                     digital_only = message.get('digital_only', False)
                     rf_only = message.get('rf_only', False)
+                    forced_controls = {
+                        k: message[k] for k in firmware_lib.POWER_FORCE_CONTROL_KEYS
+                        if k in message
+                    }
                     amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.maximise_tx_power(
                         self.r, self.r_fast, self.config, headroom_db=headroom_db,
                         reference_plane=reference_plane, rf_peripherals=self.rf_peripherals,
                         power_limit_dbm=power_limit_dbm,
                         compression_headroom_db=compression_headroom_db,
                         rx_policy=rx_policy, digital_only=digital_only,
-                        rf_only=rf_only)
+                        rf_only=rf_only, **forced_controls)
                     result = {'amps': amps.tolist(), 'psb_fft_shift': psb_fft_shift, 'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
                     if isinstance(dac, dict) and 'tx_compression' in dac:
                         result['tx_compression'] = dac['tx_compression']
@@ -1764,6 +1945,9 @@ class ReadoutServer:
                         kwargs['digital_only'] = message['digital_only']
                     if 'rf_only' in message:
                         kwargs['rf_only'] = message['rf_only']
+                    for key in firmware_lib.POWER_FORCE_CONTROL_KEYS:
+                        if key in message:
+                            kwargs[key] = message[key]
                     dsa, pfb_fft_shift, dsp, adc, rx_atten = firmware_lib.maximise_rx_power(self.r, self.r_fast, self.config, **kwargs)
                     # Get RX amp bypass state if available
                     has_bypass_amps = hasattr(self.rf_peripherals, 'get_rx_amp_bypass')
@@ -1788,6 +1972,9 @@ class ReadoutServer:
                         kwargs['digital_only'] = message['digital_only']
                     if 'rf_only' in message:
                         kwargs['rf_only'] = message['rf_only']
+                    for key in firmware_lib.POWER_FORCE_CONTROL_KEYS:
+                        if key in message:
+                            kwargs[key] = message[key]
                     amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.optimise_tx_snr(self.r,self.r_fast,self.config, **kwargs)
                     result = {'amps': amps.tolist(), 'psb_fft_shift': psb_fft_shift, 'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
                     await self.send_response(writer, {'status': 'success', 'result': result})
@@ -1800,6 +1987,9 @@ class ReadoutServer:
                         kwargs['digital_only'] = message['digital_only']
                     if 'rf_only' in message:
                         kwargs['rf_only'] = message['rf_only']
+                    for key in firmware_lib.POWER_FORCE_CONTROL_KEYS:
+                        if key in message:
+                            kwargs[key] = message[key]
                     pfb_fft_shift,dsp,adc = firmware_lib.optimise_rx_snr(self.r,self.r_fast,self.config, **kwargs)
                     result = {'pfb_fft_shift': pfb_fft_shift, 'dsp_ovf': dsp, 'adc_levels': adc}
                     await self.send_response(writer, {'status': 'success', 'result': result})
@@ -2010,6 +2200,7 @@ class ReadoutServer:
                         adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
                         self.latest_sweep_data_valid = False
                         self.sweep_progress = 0.0
+                        self.sweep_state = {'state': 'running', 'message': 'Sweep in progress'}
                         #print('asyncio create task, sweep task')
                         self.sweep_task = asyncio.create_task(
                             self.sweep(centers, spans, points, samples_per_point, direction, refresh_adc_cal=refresh_adc_cal, adc_cal_settle_time=adc_cal_settle_time)
@@ -2024,7 +2215,9 @@ class ReadoutServer:
                     progress = self.sweep_progress
                     if self.sweep_task is not None and not self.sweep_task.done():
                         progress = min(progress, 0.999999)
-                    await self.send_response(writer, {'status': 'success', 'progress': progress})
+                    response = {'status': 'success', 'progress': progress}
+                    response.update(self.sweep_state)
+                    await self.send_response(writer, response)
                     
                 elif request == 'get_sweep_data':
                     if self.latest_sweep_data_valid:
@@ -2118,6 +2311,7 @@ class ReadoutServer:
                         adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
                         self.latest_sweep_data_valid = False
                         self.sweep_progress = 0.0
+                        self.sweep_state = {'state': 'running', 'message': 'Retune in progress'}
                         self.sweep_task = asyncio.create_task(
                             self.retune(centers, spans, points, samples_per_point, direction, method, freq_offsets, refresh_adc_cal=refresh_adc_cal, adc_cal_settle_time=adc_cal_settle_time)
                         )
@@ -2144,6 +2338,7 @@ class ReadoutServer:
                         self.sweep_task.cancel()
                         self.sweep_task = None
                         self.sweep_progress=0.0
+                        self.sweep_state = {'state': 'cancelled', 'message': 'Sweep cancelled'}
                     for task in self.tasks:
                         task.cancel()
                     self.tasks = []
@@ -2171,7 +2366,7 @@ class ReadoutServer:
 
     def stream_keepalive(self, sock, after_idle_sec=1, interval_sec=3, max_fails=5):
         """
-        Enable TCP keepalive on an open socket.
+        Enable TCP keepalive on the open socket ``sock``.
         If the connection is idle for after_idle_sec seconds, start sending keepalive packets every interval_sec seconds.
         If max_fails keepalive packets are sent with no response, the connection is considered dead.
         If the connection is dead, the next operation on the socket will raise an exception, the socket will be closed, and the client will be disconnected (removed from the list of clients).
@@ -2290,6 +2485,11 @@ class ReadoutServer:
         )
 
     def get_blind_tones(self, reference_plane='detector'):
+        """Return the current blind-tone state and indices.
+
+        ``reference_plane`` ('dac', 'rf_output', 'adc_input', or 'detector')
+        sets the plane any reported blind-tone powers are referred to.
+        """
         freqs, amps, phases, metadata = self._live_tone_state()
         blind_indices = metadata['blind_indices']
         powers = None
@@ -2331,6 +2531,15 @@ class ReadoutServer:
                         reference_plane='detector',
                         optimise_dynamic_range=False,
                         rx_policy='protect'):
+        """Append blind tones to the active comb and apply to firmware.
+
+        ``frequencies`` are the blind-tone frequencies (Hz); ``amplitudes``,
+        ``phases``, ``spans`` and ``powers_dbm`` are optional per-tone arrays
+        (server defaults used when omitted).  ``reference_plane`` is the plane
+        ``powers_dbm`` is given at, ``optimise_dynamic_range`` re-optimises DAC
+        utilisation on apply, and ``rx_policy`` is the RX-path policy (as in the
+        client's ``set_tone_powers``).  Empty ``frequencies`` removes blind tones.
+        """
         blind_freqs = np.atleast_1d(frequencies).astype(float)
         if len(blind_freqs) == 0:
             return self.remove_blind_tones()
@@ -2538,6 +2747,9 @@ class ReadoutServer:
         Reads accumulated data at the active tone indices (user order)
         so that clients receive only active tones without needing to
         reindex.
+
+        ``fast_read_params`` is the precomputed fast-read parameter bundle
+        (firmware addresses/sizes) used to read the accumulator efficiently.
         """
         num_headers = 10
 
@@ -2989,6 +3201,8 @@ class ReadoutServer:
             #self.latest_sweep_data['z'] = results['sweep_responses']
             #self.latest_sweep_data['e'] = results['sweep_stds']
             self.latest_sweep_data_valid = True
+            self.sweep_state = {'state': 'success', 'message': 'Sweep complete'}
+            return True
 
         except asyncio.CancelledError:
             print('ayncio sweep cancelled')
@@ -3013,11 +3227,14 @@ class ReadoutServer:
                 'telescope_time': sweep_tt
                 }
 
-            pass
+            self.sweep_state = {'state': 'cancelled', 'message': 'Sweep cancelled'}
+            return False
         except Exception as e:
             self.sweep_progress = float(1.0)
+            self.sweep_state = {'state': 'error', 'message': f'Error performing sweep: {e}'}
             print(f"Error performing sweep: {e}")
             print(traceback.format_exc())
+            return False
         finally:
             if init_psb_scale is not None:
                 try:
@@ -3063,10 +3280,15 @@ class ReadoutServer:
             print("Warning: some freq_offsets are larger than half the span, which may cause tones to be set outside the sweep range")
 
         try:
-            if method not in ('max_gradient','min_mag'):
-                raise ValueError(f'Invalid retune method "{method}", must be "max_gradient" or "min_mag"')
+            if method not in ('max_gradient','min_mag','max_dphidf'):
+                raise ValueError(f'Invalid retune method "{method}", must be "max_gradient", "min_mag", or "max_dphidf"')
 
-            await self.sweep(center, span, points, samples_per_point, direction, refresh_adc_cal=refresh_adc_cal, adc_cal_settle_time=adc_cal_settle_time)
+            sweep_ok = await self.sweep(center, span, points, samples_per_point, direction, refresh_adc_cal=refresh_adc_cal, adc_cal_settle_time=adc_cal_settle_time)
+            if not sweep_ok:
+                if self.sweep_state.get('state') not in ('cancelled', 'error'):
+                    self.sweep_progress = float(1.0)
+                    self.sweep_state = {'state': 'error', 'message': 'Error performing retune: sweep failed'}
+                return False
 
             # sweep_f = self.latest_sweep_data['f']
             # sweep_z = self.latest_sweep_data['z']
@@ -3095,6 +3317,13 @@ class ReadoutServer:
                     mags = np.abs(sweep_z[:,t])
                     min_mag = np.argmin(mags)
                     retune_freqs[t] = freqs[min_mag] + freq_offsets[t]
+            elif method == 'max_dphidf':
+                for t in regular_indices:
+                    freqs = sweep_f[:,t]
+                    phase = np.unwrap(np.angle(sweep_z[:,t]))
+                    dphidf = np.abs(np.gradient(phase, freqs))
+                    max_slope = np.argmax(dphidf)
+                    retune_freqs[t] = freqs[max_slope] + freq_offsets[t]
 
             if blind_indices:
                 retune_freqs[blind_indices] = plan['blind_frequencies']
@@ -3104,6 +3333,7 @@ class ReadoutServer:
             firmware_lib.set_tone_frequencies_fast(self.r,self.r_fast,self.config,retune_freqs)
             self.update_active_tone_indices()
             self.sweep_progress = 1.0
+            self.sweep_state = {'state': 'success', 'message': 'Retune complete'}
             # print('New frequencies:',firmware_lib.get_tone_frequencies(self.r,self.config))
 
             # results = firmware_lib.perform_retune(self.r,self.r_fast, self.config, center, span, points, samples_per_point, direction, method)
@@ -3111,12 +3341,17 @@ class ReadoutServer:
             # self.latest_sweep_data['z'] = results['sweep_responses']
             # self.latest_sweep_data['e'] = results['sweep_stds']
             # self.latest_sweep_data_valid = True
+            return True
 
         except asyncio.CancelledError:
-            pass
+            self.sweep_state = {'state': 'cancelled', 'message': 'Retune cancelled'}
+            return False
         except Exception as e:
+            self.sweep_progress = float(1.0)
+            self.sweep_state = {'state': 'error', 'message': f'Error performing retune: {e}'}
             print(f"Error performing retune: {e}")
             print(traceback.format_exc())
+            return False
 
     async def to_thread(self, func, /, *args, **kwargs):
         """

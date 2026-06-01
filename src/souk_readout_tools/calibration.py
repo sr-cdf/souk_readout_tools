@@ -24,6 +24,52 @@ def calc_tone_powers(amps,
     Accounts for scaling in the firmware, DAC DUC Mixer, and VOP.
     Requires a calibration of the DAC output power to convert from dBFS to dBm,
     Optionally accounts for analog RF frontend and/or cryostat.
+
+    Parameters
+    ----------
+    amps : array-like
+        Raw per-tone amplitude settings (PSB input units).
+    psb_fftshift : int
+        PSB FFT-shift schedule (bitmask); its set-bit count sets the FFT
+        scaling applied before the DAC.
+    psb_scale : float
+        PSB output scale factor.
+    mixer_scale_is_1p0 : bool
+        ``True`` if the DAC DUC mixer scale is 1.0 (otherwise 1/sqrt(2));
+        rescales the full-scale voltage accordingly.
+    mixer_qmc_gain : float
+        DAC DUC QMC gain-correction factor.
+    vop_current : float
+        DAC VOP output-current setting (uA).
+    vop_current_fs : float, optional
+        Full-scale VOP current (uA) used in the current ratio (default 20000).
+    dac_dbfs_to_dbm : float, optional
+        Calibration offset converting DAC dBFS to absolute dBm (default -6.0).
+    tx_combiner_loss_db : float, optional
+        TX combiner loss (dB magnitude; default 0).
+    tx_attenuator_value_db : float, optional
+        TX programmable-attenuator setting (dB magnitude; default 0).
+    tx_if_s21_db : float, optional
+        TX IF-stage S21 gain (dB; default 0).
+    tx_mixer_conversion_loss_db : float, optional
+        TX up-mixer conversion loss (dB magnitude; default 0).
+    tx_rf_s21_db : float, optional
+        TX RF-stage S21 gain (dB; default 0).
+    tx_bypass_amp_s21_db : float, optional
+        TX amplifier S21 in its current bypass state (dB; default 0).
+    cryostat_input_s21_db : float, optional
+        Cryostat input-line S21 to the device plane (dB; default 0).
+    dac_fs_bits : int, optional
+        DAC full-scale bit depth (default 16).
+    detailed_output : bool, optional
+        If ``True``, also return a dict of every intermediate-stage power
+        (default ``False``).
+
+    Returns
+    -------
+    output_power_dbm : ndarray
+        Per-tone power (dBm) at the final (cryostat/device) plane.  When
+        ``detailed_output`` is ``True``, returns ``(output_power_dbm, details)``.
     """
     #convert to numpy array
     amps=np.atleast_1d(amps)
@@ -99,6 +145,18 @@ def calc_tone_amplitudes(powers_dbm,
     Calculate tone amplitudes from desired powers.
     Accounts for scaling in the firmware, DAC DUC Mixer, VOP, rf frontend and cryostat.
     Requires a calibration of the DAC output power to convert from dBFS to dBm, defaulting to 0 dBFS = -6.0 dBm if unavailable.
+
+    This is the inverse of :func:`calc_tone_powers`.  ``powers_dbm`` is the
+    desired per-tone power (dBm) at the final (cryostat/device) plane.  The
+    firmware/RF arguments ``psb_fftshift``, ``psb_scale``,
+    ``mixer_scale_is_1p0``, ``mixer_qmc_gain``, ``vop_current``,
+    ``vop_current_fs``, ``dac_dbfs_to_dbm``, ``tx_combiner_loss_db``,
+    ``tx_attenuator_value_db``, ``tx_if_s21_db``,
+    ``tx_mixer_conversion_loss_db``, ``tx_rf_s21_db``, ``tx_bypass_amp_s21_db``,
+    ``cryostat_input_s21_db``, ``dac_fs_bits`` and ``detailed_output`` have the
+    same meaning as in :func:`calc_tone_powers`.  Returns the raw per-tone
+    amplitude settings (and a stage details dict when ``detailed_output`` is
+    ``True``).
     """
     #convert to numpy array
     output_powers_dbm = np.atleast_1d(powers_dbm)
@@ -177,6 +235,55 @@ def calc_accumulated_iq_level(adc_input_power_dbm,adc_dbm_to_dbfs,mixer_qmc_gain
 
     Computes forward through the RX analog frontend and digital chain.
     When detailed_output is True, returns per-stage power values.
+
+    Parameters
+    ----------
+    adc_input_power_dbm : array-like
+        Signal power (dBm) at the cryostat output (or ADC input when the RX
+        frontend gains below are all zero).
+    adc_dbm_to_dbfs : float
+        Calibration offset converting absolute dBm at the ADC to ADC dBFS.
+    mixer_qmc_gain : float
+        ADC DDC QMC gain-correction factor.
+    mixer_scale_is_1p0 : bool
+        ``True`` if the DDC mixer scale is 1.0 (otherwise 1/sqrt(2)).
+    adc_bits : int
+        ADC bit depth (sets the full-scale digital amplitude).
+    pfb_fftshift : int
+        PFB FFT-shift schedule (bitmask); its set-bit count sets PFB scaling.
+    rx_mix_scale : float
+        RX digital mixer scale factor.
+    acclen : int
+        Accumulation length (samples summed per readout point).
+    rx_combiner_loss_db : float, optional
+        RX combiner loss (dB magnitude; default 0).
+    rx_attenuator_value_db : float, optional
+        RX programmable-attenuator setting (dB magnitude; default 0).
+    rx_if_s21_db : float, optional
+        RX IF-stage S21 gain (dB; default 0).
+    rx_mixer_conversion_loss_db : float, optional
+        RX down-mixer conversion loss (dB magnitude; default 0).
+    rx_rf_s21_db : float, optional
+        RX RF-stage S21 gain (dB; default 0).
+    rx_bypass_amp_s21_db : float, optional
+        RX amplifier S21 in its current bypass state (dB; default 0).
+    cryostat_output_s21_db : float, optional
+        Cryostat output-line S21 from the device plane (dB; default 0).
+    adc_dsa_db : float, optional
+        ADC digital step-attenuator setting (dB magnitude; default 0).
+    windowfactor : float, optional
+        Coherent-gain factor of the accumulation window (default 1).
+    accumulated_iq_phase : float, optional
+        Phase (radians) used to split the accumulated level into I/Q
+        (default 0).
+    detailed_output : bool, optional
+        If ``True``, also return a dict of per-stage values (default ``False``).
+
+    Returns
+    -------
+    accumulated_iq_level : ndarray
+        Estimated accumulated-IQ magnitude per tone (and a details dict when
+        ``detailed_output`` is ``True``).
     """
     #convert to numpy array
     sig_dbm = np.atleast_1d(adc_input_power_dbm)
@@ -253,6 +360,17 @@ def calc_adc_input_power(accumulated_iq_level,adc_dbm_to_dbfs,mixer_qmc_gain,mix
     stages. When RX frontend parameters are zero (default), the result is
     power at the ADC input. When they are provided, the result is referred
     back to the cryostat output.
+
+    This is the inverse of :func:`calc_accumulated_iq_level`.
+    ``accumulated_iq_level`` is the measured (complex or magnitude) accumulated
+    IQ level.  The arguments ``adc_dbm_to_dbfs``, ``mixer_qmc_gain``,
+    ``mixer_scale_is_1p0``, ``adc_bits``, ``pfb_fftshift``, ``rx_mix_scale``,
+    ``acclen``, ``rx_combiner_loss_db``, ``rx_attenuator_value_db``,
+    ``rx_if_s21_db``, ``rx_mixer_conversion_loss_db``, ``rx_rf_s21_db``,
+    ``rx_bypass_amp_s21_db``, ``cryostat_output_s21_db``, ``adc_dsa_db``,
+    ``windowfactor`` and ``detailed_output`` have the same meaning as in
+    :func:`calc_accumulated_iq_level`.  Returns the inferred input power (dBm),
+    and a per-stage details dict when ``detailed_output`` is ``True``.
     """
     #convert to numpy array
     accumulated_iq_levels = np.atleast_1d(accumulated_iq_level)

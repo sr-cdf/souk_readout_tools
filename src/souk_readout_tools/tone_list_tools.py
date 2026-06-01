@@ -5,6 +5,18 @@ import numpy as np
 def read_automeasure_toneslist(filename,printing=True):
     """
     Read a standard tones list file from the cardiff kids lab automeasure program.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the tab-delimited ToneList file.
+    printing : bool, optional
+        Print a per-tone summary as the file is read (default ``True``).
+
+    Returns
+    -------
+    tuple
+        ``(name, freqs, offset_att, all_flag, none_flag)`` arrays.
     """
     try:
         result =np.genfromtxt(filename,names=True,delimiter='\t',dtype=('S32','f8','f8','i4','i4'),unpack=True)
@@ -30,6 +42,25 @@ def write_automeasure_toneslist(filename,freqs,names=None,offset_att=None,all_fl
     Write a standard tones list file for the cardiff kids lab automeasure program.
 
     If <amps> is given, offset_att is calculated from the amplitudes, overwriting any value given in <offset_att>.
+
+    Parameters
+    ----------
+    filename : str
+        Output ToneList path.
+    freqs : array-like
+        Tone frequencies (Hz), one per tone.
+    names : list of str or None, optional
+        Per-tone names; defaults to ``K000``, ``K001``, ... when ``None``.
+    offset_att : array-like or None, optional
+        Per-tone offset attenuation (dB); defaults to zeros (overwritten when
+        ``amps`` is given).
+    all_flag : array-like or None, optional
+        Per-tone "All" flag; defaults to ones.
+    none_flag_flag : array-like or None, optional
+        Per-tone "None" flag; defaults to zeros.
+    amps : array-like or None, optional
+        Per-tone amplitudes; if given, ``offset_att`` is derived from them
+        (relative dB, min-subtracted).
     """
     if names is None:
         names=['K%03d'%k for k in range(len(freqs))]

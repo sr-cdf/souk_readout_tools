@@ -974,7 +974,7 @@ def get_configured_tone_metadata(config_dict, active_count=None):
     }
 
 
-def info_tones(r, config_dict):
+def info_tones(r, config_dict, rf_peripherals=None, reference_plane='detector'):
     """Tone frequencies, amplitudes, phases, powers, and firmware indices."""
     pipeline_ready = (r is not None and hasattr(r, 'accumulators')
                       and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0)
@@ -991,7 +991,9 @@ def info_tones(r, config_dict):
     amps = get_tone_amplitudes(r, config_dict)
     phases = get_tone_phases(r, config_dict)
     try:
-        powers = get_tone_powers(r, config_dict)
+        powers = get_tone_powers(
+            r, config_dict, reference_plane=reference_plane,
+            rf_peripherals=rf_peripherals)
     except Exception:
         powers = np.array([])
     metadata = get_configured_tone_metadata(config_dict, active_count=len(freqs))
@@ -1007,6 +1009,7 @@ def info_tones(r, config_dict):
         'amplitudes': amps.tolist(),
         'phases_rad': phases.tolist(),
         'powers_dbm': powers.tolist() if len(powers) > 0 else None,
+        'powers_reference_plane': reference_plane,
         'firmware_indices': details['rx']['tone_indices'],
         'blind_spans': blind_spans,
         **metadata,
@@ -2468,10 +2471,12 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
         },
     }
     if tone_amplitudes is not None:
-        scaling_full = np.zeros(n_chans, dtype=float)
-        scaling_full[tone_indices] = tone_amplitudes
-        lo_control_values['tx']['scaling'] = scaling_full
-        lo_control_values['rx']['scaling'] = scaling_full
+        scaling_tx_full = np.zeros(n_chans, dtype=float)
+        scaling_rx_full = np.zeros(n_chans, dtype=float)
+        scaling_tx_full[tone_indices] = tone_amplitudes
+        scaling_rx_full[tone_indices] = 1.0
+        lo_control_values['tx']['scaling'] = scaling_tx_full
+        lo_control_values['rx']['scaling'] = scaling_rx_full
     if tone_phases is not None:
         phase_offsets_full = np.zeros(n_chans, dtype=float)
         phase_offsets_full[tone_indices] = tone_phases
@@ -2728,7 +2733,8 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
     }
     if tone_amplitudes is not None:
         lo_control_values['tx']['scaling'] = tone_amplitudes
-        lo_control_values['rx']['scaling'] = tone_amplitudes
+        lo_control_values['rx']['scaling'] = np.ones_like(
+            tone_amplitudes, dtype=float)
     if tone_phases is not None:
         lo_control_values['tx']['phase_offsets'] = tone_phases
         lo_control_values['rx']['phase_offsets'] = tone_phases
@@ -2984,7 +2990,8 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
         }
         if tone_amplitudes is not None:
             lo_control_values['tx']['scaling'] = tone_amplitudes
-            lo_control_values['rx']['scaling'] = tone_amplitudes
+            lo_control_values['rx']['scaling'] = np.ones_like(
+                tone_amplitudes, dtype=float)
         if tone_phases is not None:
             lo_control_values['tx']['phase_offsets'] = tone_phases
             lo_control_values['rx']['phase_offsets'] = tone_phases
@@ -3559,7 +3566,7 @@ def get_fast_sweep_params(r_fast, config_dict,tone_frequencies):
 
 def get_tone_amplitudes(r,config_dict):
     """
-    Query the RFSOC for the current tone amplitude scale factors.
+    Query the RFSOC for the current TX tone amplitude scale factors.
     """
     # moved from outmap to inmap in the v7.9 psb_chanselect
     chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
@@ -3582,16 +3589,17 @@ def get_tone_amplitudes(r,config_dict):
 
     control_buffer = read_from_current_control_buffer(r)
     scaling_tx = control_buffer['tx']['scaling']
-    scaling_rx = control_buffer['rx']['scaling']
     # index by psb_tones_active (not :num_tones) since tone indices may be non-contiguous with VACC
     return scaling_tx[psb_tones_active]
 
 def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
     """
-    Set the tone amplitude scale factors in the RFSOC.
+    Set the TX tone amplitude scale factors in the RFSOC.
 
-    Currently sets both halfs of the double buffer to the same value.
-    This is not ideal, but for now it will
+    RX tone amplitude scale factors are kept at unity so readout-side LO
+    scaling stays at maximum while TX power is controlled independently.
+
+    Currently updates both halves of the double buffer.
     """
     tone_amplitudes = np.atleast_1d(tone_amplitudes)
 
@@ -3603,14 +3611,16 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
     if len(tone_amplitudes) != len(psb_tones_active):
         raise ValueError(f'Number of amplitudes ({len(tone_amplitudes)}) does not match number of active tones ({len(psb_tones_active)})')
 
-    # Create full-sized array and place values at correct LO indices
-    scaling_full = np.zeros(r.mixer.n_chans, dtype=float)
-    scaling_full[psb_tones_active] = tone_amplitudes
+    # Create full-sized arrays and place values at correct LO indices.
+    scaling_tx_full = np.zeros(r.mixer.n_chans, dtype=float)
+    scaling_rx_full = np.zeros(r.mixer.n_chans, dtype=float)
+    scaling_tx_full[psb_tones_active] = tone_amplitudes
+    scaling_rx_full[psb_tones_active] = 1.0
 
     # buf = get_control_buffer_idx(r)
     for buf in [0,1]:
-        v = prepare_control_buffer_data(r,buf,{'tx':{'scaling':scaling_full},
-                                    'rx':{'scaling':scaling_full}})
+        v = prepare_control_buffer_data(r,buf,{'tx':{'scaling':scaling_tx_full},
+                                    'rx':{'scaling':scaling_rx_full}})
 
         write_control_buffer_data(r,buf,v)
 
@@ -4872,6 +4882,84 @@ def _gather_bypass_amp_s21(config_dict, rf_peripherals, path, freq_axis):
         config_dict, rf_peripherals, path, freq_axis, bypassed)
 
 
+def _calibration_report_estimate_db(value, freq_axis=None):
+    """Return a scalar dB estimate for report-only calibration summaries."""
+    if value is None:
+        return None
+    try:
+        if freq_axis is not None:
+            return _mean_cal_value_db(
+                _resolve_optional_cal_value(value, freq_axis))
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                path = os.path.join(USER_DIR, value)
+                try:
+                    value = np.loadtxt(path, ndmin=2)
+                except ValueError:
+                    value = np.loadtxt(path, ndmin=2, delimiter=',')
+        if not np.isscalar(value):
+            arr = np.asarray(value, dtype=float)
+            if arr.ndim >= 2 and arr.shape[-1] >= 2:
+                value = arr[..., 1]
+            else:
+                value = arr
+        return _mean_cal_value_db(value)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def estimate_rf_bypass_amp_s21_from_config(config_dict, path, bypassed,
+                                           freq_axis=None):
+    """Estimate active TX/RX bypass-amp S21 from measured config values."""
+    if path not in ('tx', 'rx'):
+        raise ValueError("path must be 'tx' or 'rx'")
+
+    rf_cfg = config_dict.get('rf_frontend', {}) or {}
+    mixerless_cfg = rf_cfg.get('mixerless_module', {}) or {}
+    direct_key = (
+        f'{path}_amp_bypassed_s21_db'
+        if bypassed else f'{path}_amp_enabled_s21_db'
+    )
+    direct = _calibration_report_estimate_db(
+        mixerless_cfg.get(direct_key), freq_axis=freq_axis)
+    if direct is not None:
+        return direct
+
+    delta = _calibration_report_estimate_db(
+        mixerless_cfg.get(f'{path}_amp_bypass_delta_s21_db'),
+        freq_axis=freq_axis)
+    if delta is None:
+        return None
+
+    enabled = _calibration_report_estimate_db(
+        mixerless_cfg.get(f'{path}_amp_enabled_s21_db'), freq_axis=freq_axis)
+    bypassed_s21 = _calibration_report_estimate_db(
+        mixerless_cfg.get(f'{path}_amp_bypassed_s21_db'), freq_axis=freq_axis)
+    if bypassed and enabled is not None:
+        return enabled + delta
+    if not bypassed and bypassed_s21 is not None:
+        return bypassed_s21 - delta
+    return None
+
+
+def estimate_rf_total_gain_from_config(config_dict, rf_status, path,
+                                       freq_axis=None):
+    """Estimate active TX/RX frontend gain from measured config values."""
+    if path not in ('tx', 'rx'):
+        raise ValueError("path must be 'tx' or 'rx'")
+    bypassed = rf_status.get(f'{path}_amp_bypass')
+    attenuation = rf_status.get(f'{path}_attenuation_db')
+    if bypassed is None or attenuation is None:
+        return None
+    amp_s21 = estimate_rf_bypass_amp_s21_from_config(
+        config_dict, path, bool(bypassed), freq_axis=freq_axis)
+    if amp_s21 is None:
+        return None
+    return amp_s21 - abs(float(attenuation))
+
+
 def _gather_tx_chain_params(r, config_dict, rf_peripherals=None):
     """Read firmware state and resolve all TX chain calibration parameters.
 
@@ -5168,6 +5256,144 @@ def _validate_control_scope(digital_only=False, rf_only=False):
     return digital_only, rf_only
 
 
+POWER_FORCE_CONTROL_KEYS = (
+    'force_tx_amp_bypass',
+    'force_rx_amp_bypass',
+    'force_tx_attenuation_db',
+    'force_rx_attenuation_db',
+    'force_adc_dsa_db',
+    'force_tone_amplitudes',
+    'force_psb_fftshift',
+    'force_psb_scale',
+    'force_pfb_fftshift',
+)
+
+
+def _coerce_forced_bool(value, name):
+    """Return a bool for a forced-control value, accepting common strings."""
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ('true', '1', 'yes', 'on'):
+            return True
+        if text in ('false', '0', 'no', 'off'):
+            return False
+        raise ValueError(f'{name} must be boolean, got {value!r}')
+    return bool(value)
+
+
+def _set_adc_dsa_db(r, config_dict, value):
+    """Set ADC DSA to an integer dB value and return the applied setting."""
+    if config_dict is None:
+        raise ValueError('config_dict is required to set ADC DSA')
+    adc_tile = int(config_dict['firmware']['adc_tile'])
+    adc_block = int(config_dict['firmware']['adc_block'])
+    dsa = int(np.clip(round(float(value)), 0, 27))
+    r.rfdc.core.set_dsa(adc_tile, adc_block, dsa)
+    time.sleep(0.1)
+    return dsa
+
+
+def _apply_forced_power_controls(
+        r, config_dict, rf_peripherals=None,
+        force_tx_amp_bypass=None, force_rx_amp_bypass=None,
+        force_tx_attenuation_db=None, force_rx_attenuation_db=None,
+        force_adc_dsa_db=None, force_tone_amplitudes=None,
+        force_psb_fftshift=None, force_psb_scale=None,
+        force_pfb_fftshift=None):
+    """Apply fixed-value controls requested by a power optimisation caller."""
+    applied = {}
+
+    if force_tx_amp_bypass is not None:
+        if not _rf_supports_bypass_amps(rf_peripherals):
+            raise RuntimeError('Cannot force TX amp bypass: bypass amps are not available')
+        value = _coerce_forced_bool(force_tx_amp_bypass, 'force_tx_amp_bypass')
+        rf_peripherals.set_tx_amp_bypass(value)
+        time.sleep(0.1)
+        applied['tx_amp_bypass'] = value
+        print(f'  forced TX amp bypass={value}')
+
+    if force_rx_amp_bypass is not None:
+        if not _rf_supports_bypass_amps(rf_peripherals):
+            raise RuntimeError('Cannot force RX amp bypass: bypass amps are not available')
+        value = _coerce_forced_bool(force_rx_amp_bypass, 'force_rx_amp_bypass')
+        rf_peripherals.set_rx_amp_bypass(value)
+        time.sleep(0.1)
+        applied['rx_amp_bypass'] = value
+        print(f'  forced RX amp bypass={value}')
+
+    if force_tx_attenuation_db is not None:
+        value = float(force_tx_attenuation_db)
+        if _rf_has_controllable_attenuator(rf_peripherals):
+            rf_peripherals.set_tx_attenuation(value)
+            time.sleep(0.1)
+        elif _rf_has_readable_attenuator(rf_peripherals):
+            current = float(rf_peripherals.get_tx_attenuation())
+            if not np.isclose(current, value, atol=1e-6):
+                raise RuntimeError(
+                    f'Cannot force TX attenuation to {value:.1f} dB: '
+                    f'attenuator is read-only at {current:.1f} dB')
+        else:
+            raise RuntimeError('Cannot force TX attenuation: no RF attenuator is available')
+        applied['tx_attenuation_db'] = value
+        print(f'  forced TX attenuation={value:.1f} dB')
+
+    if force_rx_attenuation_db is not None:
+        value = float(force_rx_attenuation_db)
+        if _rf_has_controllable_attenuator(rf_peripherals):
+            rf_peripherals.set_rx_attenuation(value)
+            time.sleep(0.1)
+        elif _rf_has_readable_attenuator(rf_peripherals):
+            current = float(rf_peripherals.get_rx_attenuation())
+            if not np.isclose(current, value, atol=1e-6):
+                raise RuntimeError(
+                    f'Cannot force RX attenuation to {value:.1f} dB: '
+                    f'attenuator is read-only at {current:.1f} dB')
+        else:
+            raise RuntimeError('Cannot force RX attenuation: no RF attenuator is available')
+        applied['rx_attenuation_db'] = value
+        print(f'  forced RX attenuation={value:.1f} dB')
+
+    if force_adc_dsa_db is not None:
+        value = _set_adc_dsa_db(r, config_dict, force_adc_dsa_db)
+        applied['adc_dsa_db'] = value
+        print(f'  forced ADC DSA={value} dB')
+
+    if force_tone_amplitudes is not None:
+        if config_dict is None:
+            raise ValueError('config_dict is required to set tone amplitudes')
+        amplitudes = np.atleast_1d(force_tone_amplitudes).astype(float)
+        current_amplitudes = get_tone_amplitudes(r, config_dict)
+        if amplitudes.size == 1 and current_amplitudes.size > 1:
+            amplitudes = np.full(current_amplitudes.size, amplitudes[0], dtype=float)
+        set_tone_amplitudes(r, config_dict, amplitudes)
+        time.sleep(0.01)
+        applied['tone_amplitudes'] = amplitudes
+        print(f'  forced tone amplitudes ({len(amplitudes)} tone(s))')
+
+    if force_psb_fftshift is not None:
+        value = int(force_psb_fftshift)
+        r.psb.set_fftshift(value)
+        time.sleep(0.01)
+        applied['psb_fftshift'] = value
+        print(f'  forced PSB fftshift={format(value, "#016b")}')
+
+    if force_psb_scale is not None:
+        value = float(force_psb_scale)
+        r.psbscale.set_scale(value)
+        time.sleep(0.01)
+        applied['psb_scale'] = value
+        print(f'  forced psb_scale={value:.6f}')
+
+    if force_pfb_fftshift is not None:
+        value = int(force_pfb_fftshift)
+        r.pfb.set_fftshift(value)
+        time.sleep(0.01)
+        applied['pfb_fftshift'] = value
+        print(f'  forced PFB fftshift={format(value, "#016b")}')
+
+    return applied
+
+
 def _sum_tone_powers_dbm(powers_dbm):
     """Sum independent per-tone powers in dBm and return total power in dBm."""
     powers = np.asarray(powers_dbm, dtype=float)
@@ -5302,7 +5528,9 @@ def _enforce_tx_compression_margin(r, config_dict, rf_peripherals,
 
 
 def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
-                     tx_power_change_db=None, digital_only=False, rf_only=False):
+                     tx_power_change_db=None, digital_only=False, rf_only=False,
+                     force_rx_amp_bypass=None, force_rx_attenuation_db=None,
+                     force_adc_dsa_db=None, force_pfb_fftshift=None):
     """Check and optionally protect the RX path after a TX power change.
 
     Called after each incremental TX power change (attenuator step,
@@ -5384,6 +5612,8 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
     digital_only, rf_only = _validate_control_scope(digital_only, rf_only)
     allow_digital = not rf_only
     allow_rf = not digital_only
+    force_rx_atten = force_rx_attenuation_db is not None
+    force_dsa = force_adc_dsa_db is not None
 
     if rx_policy == 'none':
         return None
@@ -5391,7 +5621,11 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
     if rx_policy == 'maximise':
         dsa, pfb_fftshift, dsp, adc, rx_atten = maximise_rx_power(
             r, r_fast, config_dict, rf_peripherals=rf_peripherals,
-            digital_only=digital_only, rf_only=rf_only)
+            digital_only=digital_only, rf_only=rf_only,
+            force_rx_amp_bypass=force_rx_amp_bypass,
+            force_rx_attenuation_db=force_rx_attenuation_db,
+            force_adc_dsa_db=force_adc_dsa_db,
+            force_pfb_fftshift=force_pfb_fftshift)
         if isinstance(adc, dict):
             threshold = float(adc.get('threshold', 0.45))
             peak = max(
@@ -5440,7 +5674,7 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
 
         if delta > 0.1:
             # TX power increased — add attenuation on RX side
-            if has_rf:
+            if has_rf and not force_rx_atten:
                 atten_step = rf_peripherals.ATTEN_STEP
                 atten_max = rf_peripherals.ATTEN_MAX
                 current_atten = rf_peripherals.get_rx_attenuation()
@@ -5453,7 +5687,7 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                     rx_atten_change = new_atten - current_atten
                     delta -= rx_atten_change
 
-            if allow_digital and delta > 0.5:
+            if allow_digital and not force_dsa and delta > 0.5:
                 # Remaining delta absorbed by DSA
                 current_dsa = int(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
                 add_dsa = min(int(round(delta)), DSA_MAX - current_dsa)
@@ -5467,7 +5701,7 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
         elif delta < -0.1:
             # TX power decreased — reduce RX attenuation to recover signal
             recover = -delta
-            if has_rf:
+            if has_rf and not force_rx_atten:
                 atten_step = rf_peripherals.ATTEN_STEP
                 atten_min = rf_peripherals.ATTEN_MIN
                 current_atten = rf_peripherals.get_rx_attenuation()
@@ -5480,7 +5714,7 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                     rx_atten_change = new_atten - current_atten  # negative
                     recover += rx_atten_change  # rx_atten_change is negative
 
-            if allow_digital and recover > 0.5:
+            if allow_digital and not force_dsa and recover > 0.5:
                 current_dsa = int(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
                 remove_dsa = min(int(round(recover)), current_dsa)
                 if remove_dsa >= 1:
@@ -5523,7 +5757,7 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
     init_rx_atten = rf_peripherals.get_rx_attenuation() if has_rf else None
     init_dsa = int(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
 
-    if has_rf:
+    if has_rf and not force_rx_atten:
         atten_step = rf_peripherals.ATTEN_STEP
         atten_max = rf_peripherals.ATTEN_MAX
         current_atten = init_rx_atten
@@ -5535,13 +5769,15 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
             time.sleep(0.1)
             saturated, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
 
-    if allow_digital and saturated:
+    if allow_digital and not force_dsa and saturated:
         current_dsa = init_dsa
         while saturated and current_dsa < DSA_MAX:
             current_dsa = min(current_dsa + 2, DSA_MAX)
             r.rfdc.core.set_dsa(adc_tile, adc_block, int(current_dsa))
             time.sleep(0.1)
             saturated, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+    elif saturated and force_dsa:
+        print('    rx_policy: ADC DSA fixed; skipping DSA protection step')
 
     final_rx_atten = rf_peripherals.get_rx_attenuation() if has_rf else None
     final_dsa = int(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
@@ -5573,7 +5809,13 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
 def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
                       reference_plane='dac', rf_peripherals=None,
                       power_limit_dbm=None, compression_headroom_db=None,
-                      rx_policy='protect', digital_only=False, rf_only=False):
+                      rx_policy='protect', digital_only=False, rf_only=False,
+                      force_tx_amp_bypass=None, force_rx_amp_bypass=None,
+                      force_tx_attenuation_db=None,
+                      force_rx_attenuation_db=None,
+                      force_adc_dsa_db=None, force_tone_amplitudes=None,
+                      force_psb_fftshift=None, force_psb_scale=None,
+                      force_pfb_fftshift=None):
     """Maximise the TX output power at the chosen reference plane.
 
     Scales tone amplitudes to near-max, finds the highest PSB FFT shift
@@ -5647,7 +5889,24 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
         raise ValueError(f"reference_plane must be 'dac', 'rf_output', or 'detector', "
                          f"got '{reference_plane}'")
 
+    _apply_forced_power_controls(
+        r, config_dict, rf_peripherals=rf_peripherals,
+        force_tx_amp_bypass=force_tx_amp_bypass,
+        force_rx_amp_bypass=force_rx_amp_bypass,
+        force_tx_attenuation_db=force_tx_attenuation_db,
+        force_rx_attenuation_db=force_rx_attenuation_db,
+        force_adc_dsa_db=force_adc_dsa_db,
+        force_tone_amplitudes=force_tone_amplitudes,
+        force_psb_fftshift=force_psb_fftshift,
+        force_psb_scale=force_psb_scale,
+        force_pfb_fftshift=force_pfb_fftshift)
+
     has_rf = allow_rf and _rf_has_controllable_attenuator(rf_peripherals)
+    tx_atten_fixed = force_tx_attenuation_db is not None
+    tx_amp_fixed = force_tx_amp_bypass is not None
+    tone_amplitudes_fixed = force_tone_amplitudes is not None
+    psb_fftshift_fixed = force_psb_fftshift is not None
+    psb_scale_fixed = force_psb_scale is not None
 
     init_dac_saturation, _ = check_output_saturation(r_fast, iterations=250, verbose=False)
     init_amps = get_tone_amplitudes(r, config_dict)
@@ -5670,95 +5929,123 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
         psb_scale = init_psb_scale
         print('  digital stages skipped (rf_only=True)')
     else:
+        if init_dac_saturation and psb_scale_fixed:
+            raise ValueError(
+                'DAC is saturating and force_psb_scale prevents automatic recovery')
         if init_dac_saturation:
             print('  DAC saturating — fixing first')
             fix_dac_saturation(r, r_fast, config_dict)
 
         # --- Step 1: Mute, maximise amplitudes ---
-        amps_max = np.max(init_amps)
-        if amps_max == 0:
-            raise ValueError('Tone powers are all zero')
-        amps_gain = max_amp / amps_max
-        r.psbscale.set_scale(0)
-        time.sleep(0.01)
-        amps = init_amps * amps_gain
-        amps = _apply_per_bin_scaling(r, config_dict, amps)
-        set_tone_amplitudes(r, config_dict, amps)
-        time.sleep(0.01)
-        print(f'  step 1: amplitudes maximised (x{amps_gain:.4f})')
+        if tone_amplitudes_fixed:
+            amps = init_amps
+            amps_gain = 1.0
+            print('  step 1: amplitudes fixed — skipping amplitude maximisation')
+        else:
+            amps_max = np.max(init_amps)
+            if amps_max == 0:
+                raise ValueError('Tone powers are all zero')
+            amps_gain = max_amp / amps_max
+            if psb_scale_fixed:
+                print('  step 1: psb_scale fixed — changing amplitudes without mute')
+            else:
+                r.psbscale.set_scale(0)
+                time.sleep(0.01)
+            amps = init_amps * amps_gain
+            amps = _apply_per_bin_scaling(r, config_dict, amps)
+            set_tone_amplitudes(r, config_dict, amps)
+            time.sleep(0.01)
+            print(f'  step 1: amplitudes maximised (x{amps_gain:.4f})')
 
         # --- Step 2: Find best PSB FFT shift (output muted) ---
-        print(f'  step 2: PSB fftshift search')
-        best_fftshift, _, _ = _find_best_psb_fftshift(r)
+        if psb_fftshift_fixed:
+            best_fftshift = r.psb.get_fftshift()
+            print(f'  step 2: PSB fftshift fixed at {format(best_fftshift, "#016b")}')
+        elif psb_scale_fixed:
+            best_fftshift = r.psb.get_fftshift()
+            print('  step 2: PSB fftshift search skipped because psb_scale is fixed')
+        else:
+            print(f'  step 2: PSB fftshift search')
+            best_fftshift, _, _ = _find_best_psb_fftshift(r)
 
-        # --- Step 3: Multi-resolution psb_scale ramp ---
-        print(f'  step 3: psb_scale ramp')
-        headroom_linear = 10**(-headroom_db / 20)
-
-        def _is_ok(scale):
-            """Check if a psb_scale value is safe (no overflow, no saturation)."""
-            scale = float(np.clip(scale, scalemin, scalemax))
-            r.psbscale.set_scale(scale)
-            time.sleep(0.01)
-            _, ovf_details = check_dsp_overflow(r, 0.1, verbose=False)
-            ovf = ovf_details['psbscale_ovf_delta'] or ovf_details['psb_ovf_delta']
-            sat = check_output_saturation(r_fast, iterations=250, verbose=False)[0]
-            return not (ovf or sat)
-
-        # Estimate starting psb_scale from initial conditions.
         init_popcount = bin(init_psb_fftshift).count('1')
         best_popcount = bin(best_fftshift).count('1')
         fftshift_gain_ratio = 2.0 ** (init_popcount - best_popcount)
-        if init_psb_scale > 0:
-            estimated_scale = init_psb_scale / (amps_gain * fftshift_gain_ratio)
-            estimated_scale = float(np.clip(estimated_scale, scalemin, scalemax))
+
+        # --- Step 3: Multi-resolution psb_scale ramp ---
+        if psb_scale_fixed:
+            psb_scale = r.psbscale.get_scale()
+            print(f'  step 3: psb_scale fixed at {psb_scale:.6f}')
         else:
-            estimated_scale = scalemin
-        print(f'    estimate from init: {estimated_scale:.4f} '
-              f'(amps x{amps_gain:.2f}, fftshift x{fftshift_gain_ratio:.2f})')
+            print(f'  step 3: psb_scale ramp')
+            headroom_linear = 10**(-headroom_db / 20)
 
-        # Multi-resolution ramp: 6dB, 3dB, 1dB, 0.5dB, 0.1dB steps.
-        step_factors = [2.0, 2**0.5, 10**(1/20), 10**(0.5/20), 10**(0.1/20)]
-        safe_scale = scalemin
-        failed_scale = float('inf')
-        for step_db, factor in zip([6, 3, 1, 0.5, 0.1], step_factors):
-            scale = safe_scale
-            if step_db == 6 and estimated_scale > scale:
-                if estimated_scale < failed_scale and _is_ok(estimated_scale):
-                    safe_scale = estimated_scale
-                    scale = estimated_scale
-                    print(f'    {step_db:4.1f} dB: estimate {estimated_scale:.4f} ok')
-                else:
-                    failed_scale = min(failed_scale, estimated_scale)
-                    print(f'    {step_db:4.1f} dB: estimate {estimated_scale:.4f} saturates')
-            next_scale = min(scale * factor, scalemax)
-            while next_scale > scale:
-                if next_scale >= failed_scale:
-                    print(f'    {step_db:4.1f} dB: {next_scale:.4f} skip (already failed)')
-                    break
-                if _is_ok(next_scale):
-                    safe_scale = next_scale
-                    print(f'    {step_db:4.1f} dB: {next_scale:.4f} ok')
-                    if next_scale >= scalemax:
+            def _is_ok(scale):
+                """Check if a psb_scale value is safe (no overflow, no saturation)."""
+                scale = float(np.clip(scale, scalemin, scalemax))
+                r.psbscale.set_scale(scale)
+                time.sleep(0.01)
+                _, ovf_details = check_dsp_overflow(r, 0.1, verbose=False)
+                ovf = ovf_details['psbscale_ovf_delta'] or ovf_details['psb_ovf_delta']
+                sat = check_output_saturation(r_fast, iterations=250, verbose=False)[0]
+                return not (ovf or sat)
+
+            # Estimate starting psb_scale from initial conditions.
+            if init_psb_scale > 0:
+                estimated_scale = init_psb_scale / (amps_gain * fftshift_gain_ratio)
+                estimated_scale = float(np.clip(estimated_scale, scalemin, scalemax))
+            else:
+                estimated_scale = scalemin
+            print(f'    estimate from init: {estimated_scale:.4f} '
+                  f'(amps x{amps_gain:.2f}, fftshift x{fftshift_gain_ratio:.2f})')
+
+            # Multi-resolution ramp: 6dB, 3dB, 1dB, 0.5dB, 0.1dB steps.
+            step_factors = [2.0, 2**0.5, 10**(1/20), 10**(0.5/20), 10**(0.1/20)]
+            safe_scale = scalemin
+            failed_scale = float('inf')
+            for step_db, factor in zip([6, 3, 1, 0.5, 0.1], step_factors):
+                scale = safe_scale
+                if step_db == 6 and estimated_scale > scale:
+                    if estimated_scale < failed_scale and _is_ok(estimated_scale):
+                        safe_scale = estimated_scale
+                        scale = estimated_scale
+                        print(f'    {step_db:4.1f} dB: estimate {estimated_scale:.4f} ok')
+                    else:
+                        failed_scale = min(failed_scale, estimated_scale)
+                        print(f'    {step_db:4.1f} dB: estimate {estimated_scale:.4f} saturates')
+                next_scale = min(scale * factor, scalemax)
+                while next_scale > scale:
+                    if next_scale >= failed_scale:
+                        print(f'    {step_db:4.1f} dB: {next_scale:.4f} skip (already failed)')
                         break
-                    scale = next_scale
-                    next_scale = min(scale * factor, scalemax)
-                else:
-                    failed_scale = next_scale
-                    print(f'    {step_db:4.1f} dB: {next_scale:.4f} LIMIT')
-                    break
+                    if _is_ok(next_scale):
+                        safe_scale = next_scale
+                        print(f'    {step_db:4.1f} dB: {next_scale:.4f} ok')
+                        if next_scale >= scalemax:
+                            break
+                        scale = next_scale
+                        next_scale = min(scale * factor, scalemax)
+                    else:
+                        failed_scale = next_scale
+                        print(f'    {step_db:4.1f} dB: {next_scale:.4f} LIMIT')
+                        break
 
-        psb_scale = safe_scale * headroom_linear
-        psb_scale = float(np.clip(psb_scale, scalemin, scalemax))
-        r.psbscale.set_scale(psb_scale)
-        time.sleep(0.01)
-        print(f'  psb_scale: {psb_scale:.4f} ({headroom_db} dB headroom)')
+            psb_scale = safe_scale * headroom_linear
+            psb_scale = float(np.clip(psb_scale, scalemin, scalemax))
+            r.psbscale.set_scale(psb_scale)
+            time.sleep(0.01)
+            print(f'  psb_scale: {psb_scale:.4f} ({headroom_db} dB headroom)')
 
         # Optional RF compression guard.  This compares total multitone power
         # at the TX frontend input with the modelled input-referred P1dB.
-        psb_scale, tx_compression_state = _enforce_tx_compression_margin(
-            r, config_dict, rf_peripherals, compression_headroom_db,
-            scalemin, scalemax)
+        if compression_headroom_db is not None and psb_scale_fixed:
+            tx_compression_state = _get_tx_compression_state(
+                r, config_dict, rf_peripherals, compression_headroom_db)
+            print('  compression guard: skipped because psb_scale is fixed')
+        else:
+            psb_scale, tx_compression_state = _enforce_tx_compression_margin(
+                r, config_dict, rf_peripherals, compression_headroom_db,
+                scalemin, scalemax)
 
         # Estimate total TX power change at the DAC from the combined effect
         # of amplitude scaling, fftshift change, and psb_scale change.
@@ -5771,7 +6058,11 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
             tx_change_db = None  # can't estimate from zero
         _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                          tx_power_change_db=tx_change_db,
-                         digital_only=digital_only, rf_only=rf_only)
+                         digital_only=digital_only, rf_only=rf_only,
+                         force_rx_amp_bypass=force_rx_amp_bypass,
+                         force_rx_attenuation_db=force_rx_attenuation_db,
+                         force_adc_dsa_db=force_adc_dsa_db,
+                         force_pfb_fftshift=force_pfb_fftshift)
 
     # --- Step 4: Maximise analog chain (if reference plane beyond DAC) ---
     tx_atten_db = None
@@ -5785,7 +6076,10 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
             else:
                 current_bypass = None
 
-            if current_bypass:
+            if tx_amp_fixed:
+                tx_amp_bypass = rf_peripherals.get_tx_amp_bypass() if current_bypass is not None else None
+                print(f'    TX amp fixed at bypass={tx_amp_bypass}')
+            elif current_bypass:
                 # Check model S21 in both states to see if amp has any effect
                 s21_bypassed = rf_peripherals._get_amp_s21('transmit_atten')
                 rf_peripherals.set_tx_amp_bypass(False)
@@ -5804,7 +6098,11 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
                     print(f'    TX amp: enabled ({expected_gain_db:+.1f} dB expected gain)')
                     _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                                      tx_power_change_db=expected_gain_db,
-                                     digital_only=digital_only, rf_only=rf_only)
+                                     digital_only=digital_only, rf_only=rf_only,
+                                     force_rx_amp_bypass=force_rx_amp_bypass,
+                                     force_rx_attenuation_db=force_rx_attenuation_db,
+                                     force_adc_dsa_db=force_adc_dsa_db,
+                                     force_pfb_fftshift=force_pfb_fftshift)
                     tx_amp_bypass = False
             elif current_bypass is False:
                 tx_amp_bypass = False
@@ -5816,7 +6114,10 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
             current_atten = rf_peripherals.get_tx_attenuation()
             min_atten = rf_peripherals.ATTEN_MIN
             atten_step = rf_peripherals.ATTEN_STEP
-            if current_atten > min_atten:
+            if tx_atten_fixed:
+                print(f'    TX atten fixed at {current_atten:.1f} dB')
+                tx_atten_db = current_atten
+            elif current_atten > min_atten:
                 atten = current_atten
                 ramp_step = max(3.0, atten_step)
                 while atten > min_atten:
@@ -5829,11 +6130,16 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
                     step_change_db = prev_atten - atten  # positive = TX power increased
                     _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                                      tx_power_change_db=step_change_db,
-                                     digital_only=digital_only, rf_only=rf_only)
+                                     digital_only=digital_only, rf_only=rf_only,
+                                     force_rx_amp_bypass=force_rx_amp_bypass,
+                                     force_rx_attenuation_db=force_rx_attenuation_db,
+                                     force_adc_dsa_db=force_adc_dsa_db,
+                                     force_pfb_fftshift=force_pfb_fftshift)
                 print(f'    TX atten: {current_atten:.1f} -> {atten:.1f} dB')
+                tx_atten_db = atten
             else:
                 print(f'    TX atten: already at minimum ({current_atten:.1f} dB)')
-            tx_atten_db = min_atten
+                tx_atten_db = min_atten
         else:
             print(f'  step 4: WARNING — no controllable rf_peripherals')
     elif reference_plane != 'dac':
@@ -5848,7 +6154,7 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
         print(f'  step 5: power limit {power_limit_dbm} dBm — '
               f'achieved {max_achieved:.1f} dBm, excess {excess_db:+.1f} dB')
         if excess_db > 0.1:
-            if has_rf:
+            if has_rf and not tx_atten_fixed:
                 current_atten = rf_peripherals.get_tx_attenuation()
                 atten_step = rf_peripherals.ATTEN_STEP
                 atten_max = rf_peripherals.ATTEN_MAX
@@ -5861,9 +6167,9 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
                 print(f'    TX atten: {current_atten:.1f} → {new_atten:.1f} dB')
                 remaining_db = needed_atten - new_atten
                 if remaining_db > 0.1:
-                    if rf_only:
+                    if rf_only or psb_scale_fixed:
                         print(f'    WARNING: power limit still exceeded by '
-                              f'{remaining_db:.1f} dB; rf_only=True prevents psb_scale reduction')
+                              f'{remaining_db:.1f} dB; psb_scale reduction is disabled')
                     else:
                         psb_scale = r.psbscale.get_scale()
                         psb_scale *= 10**(-remaining_db / 20)
@@ -5873,9 +6179,9 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
                         print(f'    psb_scale reduced to {psb_scale:.4f} '
                               f'({remaining_db:.1f} dB remaining)')
             else:
-                if rf_only:
+                if rf_only or psb_scale_fixed:
                     print(f'    WARNING: power limit still exceeded by '
-                          f'{excess_db:.1f} dB; rf_only=True prevents psb_scale reduction')
+                          f'{excess_db:.1f} dB; psb_scale reduction is disabled')
                 else:
                     psb_scale = r.psbscale.get_scale()
                     psb_scale *= 10**(-excess_db / 20)
@@ -6017,7 +6323,13 @@ def fix_dsp_overflow(r, duration_s=0.5, max_iterations=10):
 
 def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector',
                     rf_peripherals=None, headroom_db=1.0,
-                    digital_only=False, rf_only=False):
+                    digital_only=False, rf_only=False,
+                    force_tx_amp_bypass=None, force_rx_amp_bypass=None,
+                    force_tx_attenuation_db=None,
+                    force_rx_attenuation_db=None,
+                    force_adc_dsa_db=None, force_tone_amplitudes=None,
+                    force_psb_fftshift=None, force_psb_scale=None,
+                    force_pfb_fftshift=None):
     """Optimise the TX digital dynamic range while preserving output power.
 
     Maximises digital gain (amplitudes near max, best fftshift, highest
@@ -6051,9 +6363,29 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
     if reference_plane not in ('dac', 'rf_output', 'detector'):
         raise ValueError(f"reference_plane must be 'dac', 'rf_output', or 'detector', "
                          f"got '{reference_plane}'")
+
+    _apply_forced_power_controls(
+        r, config_dict, rf_peripherals=rf_peripherals,
+        force_tx_amp_bypass=force_tx_amp_bypass,
+        force_rx_amp_bypass=force_rx_amp_bypass,
+        force_tx_attenuation_db=force_tx_attenuation_db,
+        force_rx_attenuation_db=force_rx_attenuation_db,
+        force_adc_dsa_db=force_adc_dsa_db,
+        force_tone_amplitudes=force_tone_amplitudes,
+        force_psb_fftshift=force_psb_fftshift,
+        force_psb_scale=force_psb_scale,
+        force_pfb_fftshift=force_pfb_fftshift)
+
     has_rf = (not digital_only) and _rf_has_controllable_attenuator(rf_peripherals)
+    tx_atten_fixed = force_tx_attenuation_db is not None
+    tone_amplitudes_fixed = force_tone_amplitudes is not None
+    psb_fftshift_fixed = force_psb_fftshift is not None
+    psb_scale_fixed = force_psb_scale is not None
 
     init_dac_saturation, _ = check_output_saturation(r_fast, iterations=250, verbose=False)
+    if init_dac_saturation and psb_scale_fixed:
+        raise ValueError(
+            'DAC is saturating and force_psb_scale prevents automatic recovery')
     if init_dac_saturation and not rf_only:
         print('  DAC saturation detected — fixing first')
         fix_dac_saturation(r, r_fast, config_dict)
@@ -6079,88 +6411,108 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
         return init_amps, init_psb_fftshift, init_psb_scale, dsp_overflow_details, dac_levels
 
     # --- Step 1: Mute and maximise amplitudes ---
-    print('  step 1: mute and maximise amplitudes')
     max_amp = 1 - 2**-12
-    amps_max = np.max(init_amps)
-    if amps_max == 0:
-        raise ValueError('Tone powers are all zero')
-    amps_gain = max_amp / amps_max
-    r.psbscale.set_scale(0)
-    time.sleep(0.01)
-    amps = init_amps * amps_gain
-    amps = _apply_per_bin_scaling(r, config_dict, amps)
-    set_tone_amplitudes(r, config_dict, amps)
-    time.sleep(0.01)
-    print(f'    amplitudes scaled by {amps_gain:.4f}')
+    if tone_amplitudes_fixed:
+        amps = init_amps
+        amps_gain = 1.0
+        print('  step 1: amplitudes fixed — skipping amplitude maximisation')
+    else:
+        print('  step 1: mute and maximise amplitudes')
+        amps_max = np.max(init_amps)
+        if amps_max == 0:
+            raise ValueError('Tone powers are all zero')
+        amps_gain = max_amp / amps_max
+        if psb_scale_fixed:
+            print('    psb_scale fixed — changing amplitudes without mute')
+        else:
+            r.psbscale.set_scale(0)
+            time.sleep(0.01)
+        amps = init_amps * amps_gain
+        amps = _apply_per_bin_scaling(r, config_dict, amps)
+        set_tone_amplitudes(r, config_dict, amps)
+        time.sleep(0.01)
+        print(f'    amplitudes scaled by {amps_gain:.4f}')
 
     # --- Step 2: Find best PSB FFT shift (output muted) ---
-    print('  step 2: find best PSB fftshift')
-    best_fftshift, _, _ = _find_best_psb_fftshift(r)
+    if psb_fftshift_fixed:
+        best_fftshift = r.psb.get_fftshift()
+        print(f'  step 2: PSB fftshift fixed at {format(best_fftshift, "#016b")}')
+    elif psb_scale_fixed:
+        best_fftshift = r.psb.get_fftshift()
+        print('  step 2: PSB fftshift search skipped because psb_scale is fixed')
+    else:
+        print('  step 2: find best PSB fftshift')
+        best_fftshift, _, _ = _find_best_psb_fftshift(r)
+
+    init_popcount = bin(init_psb_fftshift).count('1')
+    best_popcount = bin(best_fftshift).count('1')
+    fftshift_gain_ratio = 2.0 ** (init_popcount - best_popcount)
 
     # --- Step 3: Maximise psb_scale ---
     if has_rf:
         print('  step 3: ramp psb_scale to max (analog compensation)')
-        headroom_linear = 10**(-headroom_db / 20)
-
-        def _is_ok(scale):
-            scale = float(np.clip(scale, scalemin, scalemax))
-            r.psbscale.set_scale(scale)
-            time.sleep(0.01)
-            ovf_details = check_dsp_overflow(r, 0.1, verbose=False)[1]
-            ovf = ovf_details['psbscale_ovf_delta'] or ovf_details['psb_ovf_delta']
-            sat = check_output_saturation(r_fast, iterations=250, verbose=False)[0]
-            return not (ovf or sat)
-
-        # Estimate starting psb_scale from initial conditions
-        init_popcount = bin(init_psb_fftshift).count('1')
-        best_popcount = bin(best_fftshift).count('1')
-        fftshift_gain_ratio = 2.0 ** (init_popcount - best_popcount)
-        if init_psb_scale > 0:
-            estimated_scale = init_psb_scale / (amps_gain * fftshift_gain_ratio)
-            estimated_scale = float(np.clip(estimated_scale, scalemin, scalemax))
-            print(f'    analytical estimate: {estimated_scale:.6f} '
-                  f'(amps_gain={amps_gain:.4f}, fftshift_gain={fftshift_gain_ratio:.4f})')
+        if psb_scale_fixed:
+            psb_scale = r.psbscale.get_scale()
+            print(f'    psb_scale fixed at {psb_scale:.6f}')
         else:
-            estimated_scale = scalemin
-            print(f'    init psb_scale was 0, starting from scalemin')
+            headroom_linear = 10**(-headroom_db / 20)
 
-        # Multi-resolution ramp
-        step_factors = [2.0, 2**0.5, 10**(1/20), 10**(0.5/20), 10**(0.1/20)]
-        safe_scale = scalemin
-        failed_scale = float('inf')
-        for step_db, factor in zip([6, 3, 1, 0.5, 0.1], step_factors):
-            scale = safe_scale
-            if step_db == 6 and estimated_scale > scale:
-                if estimated_scale < failed_scale and _is_ok(estimated_scale):
-                    print(f'    ramp ({step_db} dB): jumped to estimate {estimated_scale:.6f} OK')
-                    safe_scale = estimated_scale
-                    scale = estimated_scale
-                else:
-                    failed_scale = min(failed_scale, estimated_scale)
-                    print(f'    ramp ({step_db} dB): estimate {estimated_scale:.6f} saturates, '
-                          f'starting from {scale:.6f}')
-            next_scale = min(scale * factor, scalemax)
-            while next_scale > scale:
-                if next_scale >= failed_scale:
-                    print(f'    ramp ({step_db} dB): {next_scale:.6f} skip (already failed)')
-                    break
-                if _is_ok(next_scale):
-                    safe_scale = next_scale
-                    print(f'    ramp ({step_db} dB): {next_scale:.6f} OK')
-                    if next_scale >= scalemax:
+            def _is_ok(scale):
+                scale = float(np.clip(scale, scalemin, scalemax))
+                r.psbscale.set_scale(scale)
+                time.sleep(0.01)
+                ovf_details = check_dsp_overflow(r, 0.1, verbose=False)[1]
+                ovf = ovf_details['psbscale_ovf_delta'] or ovf_details['psb_ovf_delta']
+                sat = check_output_saturation(r_fast, iterations=250, verbose=False)[0]
+                return not (ovf or sat)
+
+            # Estimate starting psb_scale from initial conditions
+            if init_psb_scale > 0:
+                estimated_scale = init_psb_scale / (amps_gain * fftshift_gain_ratio)
+                estimated_scale = float(np.clip(estimated_scale, scalemin, scalemax))
+                print(f'    analytical estimate: {estimated_scale:.6f} '
+                      f'(amps_gain={amps_gain:.4f}, fftshift_gain={fftshift_gain_ratio:.4f})')
+            else:
+                estimated_scale = scalemin
+                print(f'    init psb_scale was 0, starting from scalemin')
+
+            # Multi-resolution ramp
+            step_factors = [2.0, 2**0.5, 10**(1/20), 10**(0.5/20), 10**(0.1/20)]
+            safe_scale = scalemin
+            failed_scale = float('inf')
+            for step_db, factor in zip([6, 3, 1, 0.5, 0.1], step_factors):
+                scale = safe_scale
+                if step_db == 6 and estimated_scale > scale:
+                    if estimated_scale < failed_scale and _is_ok(estimated_scale):
+                        print(f'    ramp ({step_db} dB): jumped to estimate {estimated_scale:.6f} OK')
+                        safe_scale = estimated_scale
+                        scale = estimated_scale
+                    else:
+                        failed_scale = min(failed_scale, estimated_scale)
+                        print(f'    ramp ({step_db} dB): estimate {estimated_scale:.6f} saturates, '
+                              f'starting from {scale:.6f}')
+                next_scale = min(scale * factor, scalemax)
+                while next_scale > scale:
+                    if next_scale >= failed_scale:
+                        print(f'    ramp ({step_db} dB): {next_scale:.6f} skip (already failed)')
                         break
-                    scale = next_scale
-                    next_scale = min(scale * factor, scalemax)
-                else:
-                    failed_scale = next_scale
-                    print(f'    ramp ({step_db} dB): {next_scale:.6f} LIMIT')
-                    break
+                    if _is_ok(next_scale):
+                        safe_scale = next_scale
+                        print(f'    ramp ({step_db} dB): {next_scale:.6f} OK')
+                        if next_scale >= scalemax:
+                            break
+                        scale = next_scale
+                        next_scale = min(scale * factor, scalemax)
+                    else:
+                        failed_scale = next_scale
+                        print(f'    ramp ({step_db} dB): {next_scale:.6f} LIMIT')
+                        break
 
-        psb_scale = safe_scale * headroom_linear
-        psb_scale = float(np.clip(psb_scale, scalemin, scalemax))
-        r.psbscale.set_scale(psb_scale)
-        time.sleep(0.01)
-        print(f'    psb_scale={psb_scale:.6f} (headroom={headroom_db} dB)')
+            psb_scale = safe_scale * headroom_linear
+            psb_scale = float(np.clip(psb_scale, scalemin, scalemax))
+            r.psbscale.set_scale(psb_scale)
+            time.sleep(0.01)
+            print(f'    psb_scale={psb_scale:.6f} (headroom={headroom_db} dB)')
 
         # --- Step 4: Compensate with TX attenuator ---
         print('  step 4: compensate with TX attenuator')
@@ -6169,7 +6521,16 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
         power_increase_db = float(np.max(new_powers)) - float(np.max(init_powers))
         print(f'    power change from digital maximisation: {power_increase_db:+.1f} dB')
 
-        if power_increase_db > 0.1:
+        if tx_atten_fixed:
+            print(f'    TX attenuator fixed at {rf_peripherals.get_tx_attenuation():.1f} dB')
+            if abs(power_increase_db) > 0.1 and not psb_scale_fixed:
+                psb_scale = r.psbscale.get_scale()
+                psb_scale *= 10**(-power_increase_db / 20)
+                psb_scale = float(np.clip(psb_scale, scalemin, scalemax))
+                r.psbscale.set_scale(psb_scale)
+                time.sleep(0.01)
+                print(f'    psb_scale adjusted to {psb_scale:.6f} to preserve power')
+        elif power_increase_db > 0.1:
             atten_step = rf_peripherals.ATTEN_STEP
             atten_max = rf_peripherals.ATTEN_MAX
             min_atten = rf_peripherals.ATTEN_MIN
@@ -6196,13 +6557,16 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
             # If attenuator can't absorb all excess, reduce psb_scale
             remaining_db = needed_atten - new_atten
             if remaining_db > 0.1:
-                psb_scale = r.psbscale.get_scale()
-                psb_scale *= 10**(-remaining_db / 20)
-                psb_scale = float(np.clip(psb_scale, scalemin, scalemax))
-                r.psbscale.set_scale(psb_scale)
-                time.sleep(0.01)
-                print(f'    psb_scale reduced to {psb_scale:.6f} '
-                      f'(remaining {remaining_db:.1f} dB)')
+                if psb_scale_fixed:
+                    print(f'    WARNING: psb_scale fixed; residual power change {remaining_db:.1f} dB')
+                else:
+                    psb_scale = r.psbscale.get_scale()
+                    psb_scale *= 10**(-remaining_db / 20)
+                    psb_scale = float(np.clip(psb_scale, scalemin, scalemax))
+                    r.psbscale.set_scale(psb_scale)
+                    time.sleep(0.01)
+                    print(f'    psb_scale reduced to {psb_scale:.6f} '
+                          f'(remaining {remaining_db:.1f} dB)')
         elif power_increase_db < -0.1:
             decrease = -power_increase_db
             min_atten = rf_peripherals.ATTEN_MIN
@@ -6218,17 +6582,18 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
             print('    power unchanged, no attenuator adjustment needed')
 
     else:
-        print('  step 3: compute psb_scale analytically (no RF peripherals)')
-        init_popcount = bin(init_psb_fftshift).count('1')
-        best_popcount = bin(best_fftshift).count('1')
-        fftshift_gain = 2**(init_popcount - best_popcount)
-        psb_scale = init_psb_scale / (fftshift_gain * amps_gain)
-        psb_scale = float(np.clip(psb_scale, scalemin, scalemax))
-        print(f'    fftshift_gain={fftshift_gain:.4f}, amps_gain={amps_gain:.4f}, '
-              f'psb_scale={psb_scale:.6f}')
+        if psb_scale_fixed:
+            psb_scale = r.psbscale.get_scale()
+            print(f'  step 3: psb_scale fixed at {psb_scale:.6f} (no RF peripherals)')
+        else:
+            print('  step 3: compute psb_scale analytically (no RF peripherals)')
+            psb_scale = init_psb_scale / (fftshift_gain_ratio * amps_gain)
+            psb_scale = float(np.clip(psb_scale, scalemin, scalemax))
+            print(f'    fftshift_gain={fftshift_gain_ratio:.4f}, amps_gain={amps_gain:.4f}, '
+                  f'psb_scale={psb_scale:.6f}')
 
-        r.psbscale.set_scale(psb_scale)
-        time.sleep(0.01)
+            r.psbscale.set_scale(psb_scale)
+            time.sleep(0.01)
 
     print(f'  result: fftshift={format(best_fftshift, "#016b")}, '
           f'psb_scale={r.psbscale.get_scale():.6f}')
@@ -6242,7 +6607,7 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
         set_tone_amplitudes(r, config_dict, init_amps)
         r.psb.set_fftshift(init_psb_fftshift)
         r.psbscale.set_scale(init_psb_scale)
-        if has_rf:
+        if has_rf and not tx_atten_fixed:
             rf_peripherals.set_tx_attenuation(init_tx_atten)
         raise ValueError('TX DSP overflow detected after optimisation')
 
@@ -6259,7 +6624,13 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
 
 
 def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=None,
-                      digital_only=False, rf_only=False):
+                      digital_only=False, rf_only=False,
+                      force_tx_amp_bypass=None, force_rx_amp_bypass=None,
+                      force_tx_attenuation_db=None,
+                      force_rx_attenuation_db=None,
+                      force_adc_dsa_db=None, force_tone_amplitudes=None,
+                      force_psb_fftshift=None, force_psb_scale=None,
+                      force_pfb_fftshift=None):
     """Maximise RX signal power into the ADC without clipping.
 
     Reduces attenuation to bring ADC levels as close to full-scale as
@@ -6289,12 +6660,29 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
     allow_digital = not rf_only
     allow_rf = not digital_only
     print(f'maximise_rx_power (digital_only={digital_only}, rf_only={rf_only})')
+
+    _apply_forced_power_controls(
+        r, config_dict, rf_peripherals=rf_peripherals,
+        force_tx_amp_bypass=force_tx_amp_bypass,
+        force_rx_amp_bypass=force_rx_amp_bypass,
+        force_tx_attenuation_db=force_tx_attenuation_db,
+        force_rx_attenuation_db=force_rx_attenuation_db,
+        force_adc_dsa_db=force_adc_dsa_db,
+        force_tone_amplitudes=force_tone_amplitudes,
+        force_psb_fftshift=force_psb_fftshift,
+        force_psb_scale=force_psb_scale,
+        force_pfb_fftshift=force_pfb_fftshift)
+
     DSA_MAX = 27
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
     rf_available = _rf_has_controllable_attenuator(rf_peripherals)
     has_rf = allow_rf and rf_available
     has_bypass_amps = allow_rf and _rf_supports_bypass_amps(rf_peripherals)
+    dsa_fixed = force_adc_dsa_db is not None
+    rx_atten_fixed = force_rx_attenuation_db is not None
+    rx_amp_fixed = force_rx_amp_bypass is not None
+    pfb_fftshift_fixed = force_pfb_fftshift is not None
 
     def _get_dsa():
         return int(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
@@ -6343,10 +6731,13 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
     if saturated:
         print('    ADC saturated — fixing first')
         fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=rf_peripherals,
-                           digital_only=digital_only, rf_only=rf_only)
+                           digital_only=digital_only, rf_only=rf_only,
+                           force_rx_amp_bypass=force_rx_amp_bypass,
+                           force_rx_attenuation_db=force_rx_attenuation_db,
+                           force_adc_dsa_db=force_adc_dsa_db)
 
     # --- Reduce DSA towards zero ---
-    if allow_digital:
+    if allow_digital and not dsa_fixed:
         print('  step 2: reduce DSA')
         current_dsa = _get_dsa()
         if current_dsa > 0:
@@ -6363,10 +6754,11 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
                     print(f'    DSA step back to {new_dsa} dB')
                     sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
     else:
-        print('  step 2: DSA skipped (rf_only=True)')
+        reason = 'fixed' if dsa_fixed else 'rf_only=True'
+        print(f'  step 2: DSA skipped ({reason})')
 
     # --- Reduce RX attenuator ---
-    if has_rf:
+    if has_rf and not rx_atten_fixed:
         print('  step 3: reduce RX attenuator')
         current_atten = rf_peripherals.get_rx_attenuation()
         atten_min = rf_peripherals.ATTEN_MIN
@@ -6404,11 +6796,13 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
                     sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
 
         # --- Try enabling RX amp ---
-        if has_bypass_amps:
+        if has_bypass_amps and not rx_amp_fixed:
             print('  step 4: try enabling RX amp')
+        elif rx_amp_fixed:
+            print('  step 4: RX amp fixed — skipping')
         else:
             print('  step 4: RX amp not available — skipping')
-        if has_bypass_amps and rf_peripherals.get_rx_amp_bypass():
+        if has_bypass_amps and not rx_amp_fixed and rf_peripherals.get_rx_amp_bypass():
             # Check model S21 in both states to see if amp has any effect
             s21_bypassed = rf_peripherals._get_amp_s21('recv_atten')
             rf_peripherals.set_rx_amp_bypass(False)
@@ -6430,6 +6824,8 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
                     print('    RX amp causes saturation — keeping bypassed')
                 else:
                     print(f'    RX amplifier enabled ({expected_gain_db:+.1f} dB expected gain)')
+    elif has_rf:
+        print(f'  step 3: RX attenuator fixed at {rf_peripherals.get_rx_attenuation():.1f} dB')
 
     # --- Final assessment ---
     print('  step 5: final assessment and PFB fftshift')
@@ -6440,16 +6836,20 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
     print(f'  done: peak={peak_db:.1f} dBFS, DSA={best_dsa} dB, saturated={saturated}')
 
     # --- Optimise PFB FFT shift ---
-    if allow_digital:
+    if allow_digital and not pfb_fftshift_fixed:
         best_fftshift, _ = _find_best_pfb_fftshift(r)
     else:
         best_fftshift = r.pfb.get_fftshift()
-        print(f'  PFB fftshift unchanged (rf_only=True): {format(best_fftshift, "#016b")}')
+        reason = 'fixed' if pfb_fftshift_fixed else 'rf_only=True'
+        print(f'  PFB fftshift unchanged ({reason}): {format(best_fftshift, "#016b")}')
 
     return best_dsa, best_fftshift, check_dsp_overflow(r, 0.1, verbose=False)[1], levels, best_rx_atten
 
 def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
-                       digital_only=False, rf_only=False):
+                       digital_only=False, rf_only=False,
+                       force_rx_amp_bypass=None,
+                       force_rx_attenuation_db=None,
+                       force_adc_dsa_db=None):
     """Attempt to clear ADC saturation using RF peripherals and ADC DSA.
 
     Steps through controls in order of preference:
@@ -6470,6 +6870,15 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
     DSA_MAX = 27
     has_rf = allow_rf and _rf_has_controllable_attenuator(rf_peripherals)
     has_bypass_amps = allow_rf and _rf_supports_bypass_amps(rf_peripherals)
+    rx_amp_fixed = force_rx_amp_bypass is not None
+    rx_atten_fixed = force_rx_attenuation_db is not None
+    dsa_fixed = force_adc_dsa_db is not None
+
+    _apply_forced_power_controls(
+        r, config_dict, rf_peripherals=rf_peripherals,
+        force_rx_amp_bypass=force_rx_amp_bypass,
+        force_rx_attenuation_db=force_rx_attenuation_db,
+        force_adc_dsa_db=force_adc_dsa_db)
 
     def _make_result():
         check_rfdc_rts_events(r, clear=True)
@@ -6489,14 +6898,15 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
 
     # --- Handle RTS over-voltage (hidden firmware DSA) ---
     rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
-    if allow_digital and rts_details.get('rts_over_voltage', False):
+    if allow_digital and not dsa_fixed and rts_details.get('rts_over_voltage', False):
         print('fix_adc_saturation: RTS over-voltage — clearing hidden firmware DSA')
         r.rfdc.core.set_dsa(adc_tile, adc_block, int(DSA_MAX))
         time.sleep(0.1)
         check_rfdc_rts_events(r, clear=True)
         time.sleep(0.1)
     elif rts_details.get('rts_over_voltage', False):
-        print('fix_adc_saturation: RTS over-voltage detected; rf_only=True leaves DSA unchanged')
+        reason = 'force_adc_dsa_db set' if dsa_fixed else 'rf_only=True'
+        print(f'fix_adc_saturation: RTS over-voltage detected; {reason} leaves DSA unchanged')
         check_rfdc_rts_events(r, clear=True)
         time.sleep(0.1)
     else:
@@ -6511,7 +6921,7 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
     print('fix_adc_saturation: ADC saturation detected')
 
     # --- Step 1: Bypass RX amplifier ---
-    if has_bypass_amps and not rf_peripherals.get_rx_amp_bypass():
+    if has_bypass_amps and not rx_amp_fixed and not rf_peripherals.get_rx_amp_bypass():
         # Check model S21 to see if bypassing would reduce gain
         s21_enabled = rf_peripherals._get_amp_s21('recv_atten')
         rf_peripherals.set_rx_amp_bypass(True)
@@ -6531,9 +6941,11 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
                 print('  Resolved by bypassing RX amplifier')
                 return _make_result()
             print('  Still saturated after bypassing RX amplifier')
+    elif has_bypass_amps and rx_amp_fixed:
+        print('  RX amplifier bypass fixed — skipping bypass step')
 
     # --- Step 2: Step RX attenuator up in 3 dB increments ---
-    if has_rf:
+    if has_rf and not rx_atten_fixed:
         atten_step = 3.0
         atten_max = rf_peripherals.ATTEN_MAX
         hw_step = rf_peripherals.ATTEN_STEP
@@ -6550,9 +6962,11 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
                 print(f'  Resolved at RX attenuation = {current_atten:.1f} dB')
                 return _make_result()
         print(f'  RX attenuator at max ({atten_max:.1f} dB), still saturated')
+    elif has_rf:
+        print(f'  RX attenuator fixed at {rf_peripherals.get_rx_attenuation():.1f} dB')
 
     # --- Step 3: Step ADC DSA up in 2 dB increments ---
-    if allow_digital:
+    if allow_digital and not dsa_fixed:
         dsa_step = 2
         current_dsa = int(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
         while current_dsa < DSA_MAX:
@@ -6565,13 +6979,20 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
                 print(f'  Resolved at ADC DSA = {current_dsa} dB')
                 return _make_result()
     else:
-        print('  ADC DSA skipped (rf_only=True)')
+        reason = 'fixed' if dsa_fixed else 'rf_only=True'
+        print(f'  ADC DSA skipped ({reason})')
 
     print('  WARNING: ADC saturation persists after allowed saturation controls')
     return _make_result()
 
 def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
-                    rf_peripherals=None, digital_only=False, rf_only=False):
+                    rf_peripherals=None, digital_only=False, rf_only=False,
+                    force_tx_amp_bypass=None, force_rx_amp_bypass=None,
+                    force_tx_attenuation_db=None,
+                    force_rx_attenuation_db=None,
+                    force_adc_dsa_db=None, force_tone_amplitudes=None,
+                    force_psb_fftshift=None, force_psb_scale=None,
+                    force_pfb_fftshift=None):
     """Optimise the RX signal-to-noise ratio.
 
     Maximises the analog signal into the ADC by preferring the RX
@@ -6603,10 +7024,27 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
     digital_only, rf_only = _validate_control_scope(digital_only, rf_only)
     allow_digital = not rf_only
     allow_rf = not digital_only
+
+    _apply_forced_power_controls(
+        r, config_dict, rf_peripherals=rf_peripherals,
+        force_tx_amp_bypass=force_tx_amp_bypass,
+        force_rx_amp_bypass=force_rx_amp_bypass,
+        force_tx_attenuation_db=force_tx_attenuation_db,
+        force_rx_attenuation_db=force_rx_attenuation_db,
+        force_adc_dsa_db=force_adc_dsa_db,
+        force_tone_amplitudes=force_tone_amplitudes,
+        force_psb_fftshift=force_psb_fftshift,
+        force_psb_scale=force_psb_scale,
+        force_pfb_fftshift=force_pfb_fftshift)
+
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
     has_rf = allow_rf and _rf_has_controllable_attenuator(rf_peripherals)
     has_bypass_amps = allow_rf and _rf_supports_bypass_amps(rf_peripherals)
+    dsa_fixed = force_adc_dsa_db is not None
+    rx_atten_fixed = force_rx_attenuation_db is not None
+    rx_amp_fixed = force_rx_amp_bypass is not None
+    pfb_fftshift_fixed = force_pfb_fftshift is not None
 
     print(f'optimise_rx_snr (digital_only={digital_only}, rf_only={rf_only})')
 
@@ -6615,10 +7053,13 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
     if sat:
         print('  ADC saturated — fixing first')
         fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=rf_peripherals,
-                           digital_only=digital_only, rf_only=rf_only)
+                           digital_only=digital_only, rf_only=rf_only,
+                           force_rx_amp_bypass=force_rx_amp_bypass,
+                           force_rx_attenuation_db=force_rx_attenuation_db,
+                           force_adc_dsa_db=force_adc_dsa_db)
 
     # --- Step 1: Set DSA to 0 ---
-    if allow_digital:
+    if allow_digital and not dsa_fixed:
         current_dsa = float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
         if current_dsa > 0:
             print(f'  step 1: set DSA to 0 (was {current_dsa:.0f} dB)')
@@ -6626,7 +7067,7 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
             time.sleep(0.1)
 
             sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
-            if sat and has_rf:
+            if sat and has_rf and not rx_atten_fixed:
                 atten_step = rf_peripherals.ATTEN_STEP
                 atten_max = rf_peripherals.ATTEN_MAX
                 current_atten = rf_peripherals.get_rx_attenuation()
@@ -6666,10 +7107,11 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
             else:
                 print(f'    no saturation at DSA=0')
     else:
-        print('  step 1: DSA skipped (rf_only=True)')
+        reason = 'fixed' if dsa_fixed else 'rf_only=True'
+        print(f'  step 1: DSA skipped ({reason})')
 
     # --- Step 2: Reduce RX attenuation to maximise signal ---
-    if has_rf:
+    if has_rf and not rx_atten_fixed:
         atten_step = rf_peripherals.ATTEN_STEP
         atten_min = rf_peripherals.ATTEN_MIN
         current_atten = rf_peripherals.get_rx_attenuation()
@@ -6696,7 +7138,8 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
             else:
                 print(f'    no saturation at minimum RX atten: {atten_min:.1f} dB')
 
-        if rf_only and has_bypass_amps and rf_peripherals.get_rx_amp_bypass():
+        if (rf_only and has_bypass_amps and not rx_amp_fixed
+                and rf_peripherals.get_rx_amp_bypass()):
             print('  step 2b: try enabling RX amp')
             s21_bypassed = rf_peripherals._get_amp_s21('recv_atten')
             rf_peripherals.set_rx_amp_bypass(False)
@@ -6717,14 +7160,20 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
                     print('    RX amp causes saturation — keeping bypassed')
                 else:
                     print(f'    RX amplifier enabled ({expected_gain_db:+.1f} dB expected gain)')
+    elif has_rf:
+        print(f'  step 2: RX attenuation fixed at {rf_peripherals.get_rx_attenuation():.1f} dB')
+
+    if rx_amp_fixed:
+        print('  step 2b: RX amp fixed — skipping')
 
     # --- Step 3: Find best PFB FFT shift ---
-    if allow_digital:
+    if allow_digital and not pfb_fftshift_fixed:
         print('  step 3: find best PFB fftshift')
         best_fftshift, _ = _find_best_pfb_fftshift(r)
     else:
         best_fftshift = r.pfb.get_fftshift()
-        print(f'  step 3: PFB fftshift unchanged (rf_only=True): '
+        reason = 'fixed' if pfb_fftshift_fixed else 'rf_only=True'
+        print(f'  step 3: PFB fftshift unchanged ({reason}): '
               f'{format(best_fftshift, "#016b")}')
 
     _, levels = check_input_saturation(r, r_fast, iterations=250, verbose=False)
@@ -7195,8 +7644,8 @@ def perform_retune(r, r_fast,config_dict, centers, spans, points, samples_per_po
             raise ValueError("freq_offsets must be None, a scalar, or have the same shape as centers")
 
     #results = r.retune(center, span, points, samples_per_point,direction,method)
-    if method not in ('max_gradient','min_mag'):
-        raise ValueError(f'Invalid retune method "{method}", must be "max_gradient" or "min_mag"')
+    if method not in ('max_gradient','min_mag','max_dphidf'):
+        raise ValueError(f'Invalid retune method "{method}", must be "max_gradient", "min_mag", or "max_dphidf"')
     results = perform_sweep(r,r_fast,config_dict,centers, spans, points, samples_per_point, direction)
 
     if method == 'max_gradient':
@@ -7213,6 +7662,14 @@ def perform_retune(r, r_fast,config_dict, centers, spans, points, samples_per_po
             mags = np.abs(results['sweep_responses'][t])
             min_mag = np.argmin(mags)
             retune_freqs[t] = freqs[min_mag] + freq_offsets[t]
+    elif method == 'max_dphidf':
+        retune_freqs = np.zeros_like(results['sweep_frequencies'])
+        for t in range(len(centers)):
+            freqs = results['sweep_frequencies'][t]
+            phase = np.unwrap(np.angle(results['sweep_responses'][t]))
+            dphidf = np.abs(np.gradient(phase, freqs))
+            max_slope = np.argmax(dphidf)
+            retune_freqs[t] = freqs[max_slope] + freq_offsets[t]
 
     set_tone_frequencies_fast(r, r_fast, config_dict, retune_freqs)
     results['retune_freqs'] = retune_freqs
@@ -7497,8 +7954,20 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
         # ADC DSA (RFDC digital step attenuator, before ADC)
         adc_dsa_db = float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
 
-        # RX frontend parameters
-        rx_combiner_loss_db = config_dict['rf_frontend'].get('rx_combiner_loss_db', 0) or 0
+        # RX frontend parameters.  The forward RX model starts from the TX
+        # tone powers, so frequency-dependent cryostat/RF terms must be
+        # resolved in TX tone order.
+        tx_rf_freq = np.asarray(freq_details['tx']['rf_output_freq'], dtype=float)
+        tx_if_freq = np.asarray(freq_details['tx']['analog_output_freq'], dtype=float)
+        rx_if_freq = np.asarray(
+            freq_details['rx'].get('analog_input_freq', tx_if_freq),
+            dtype=float)
+        if rx_if_freq.size != tx_rf_freq.size:
+            rx_if_freq = tx_if_freq
+
+        rx_combiner_loss_db = _resolve_cal_value(
+            config_dict['rf_frontend'].get('rx_combiner_loss_db', 0),
+            rx_if_freq)
         has_live_rf = has_rf and getattr(rf_peripherals, 'is_hardware', False)
         rx_attenuator_value_db = None
         if has_live_rf:
@@ -7507,12 +7976,20 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
             rx_attenuator_value_db = config_dict['rf_frontend'].get('attenuator', {}).get('rx_value_db', None)
         if rx_attenuator_value_db is None:
             rx_attenuator_value_db = 0
-        rx_if_s21_db = config_dict['rf_frontend'].get('rx_if_s21_db', 0) or 0
-        rx_mixer_conversion_loss_db = config_dict['rf_frontend'].get('rx_mixer_conversion_loss_db', 0) or 0
-        rx_rf_s21_db = config_dict['rf_frontend'].get('rx_rf_s21_db', 0) or 0
+        rx_if_s21_db = _resolve_cal_value(
+            config_dict['rf_frontend'].get('rx_if_s21_db', 0),
+            rx_if_freq)
+        rx_mixer_conversion_loss_db = _resolve_cal_value(
+            config_dict['rf_frontend'].get('rx_mixer_conversion_loss_db', 0),
+            rx_if_freq)
+        rx_rf_s21_db = _resolve_cal_value(
+            config_dict['rf_frontend'].get('rx_rf_s21_db', 0),
+            tx_rf_freq)
         rx_bypass_amp_s21_db = _gather_bypass_amp_s21(
-            config_dict, rf_peripherals, 'rx', freq_details['rx']['rf_input_freq'])
-        cryostat_output_s21_db = config_dict['cryostat'].get('output_s21_db', 0) or 0
+            config_dict, rf_peripherals, 'rx', tx_rf_freq)
+        cryostat_output_s21_db = _resolve_cal_value(
+            config_dict['cryostat'].get('output_s21_db', 0),
+            tx_rf_freq)
 
         if not p['rf_connected']:
             rx_combiner_loss_db = 0
@@ -7524,11 +8001,13 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
         if not p['cryo_connected']:
             cryostat_output_s21_db = 0
 
-        # Forward computation: use the TX endpoint power as RX-chain input.
+        # Forward computation: start from the detector-side TX endpoint, then
+        # apply the cryostat output S21 to reach the RX frontend input plane.
         tx_endpoint_power_dbm = tx_powers
+        cryostat_output_power_dbm = tx_endpoint_power_dbm + cryostat_output_s21_db
 
         rx_iq, rx_details = calibration.calc_accumulated_iq_level(
-            tx_endpoint_power_dbm, adc_dbm_to_dbfs, adc_mixer_qmc_gain, adc_mixer_scale_is_1p0,
+            cryostat_output_power_dbm, adc_dbm_to_dbfs, adc_mixer_qmc_gain, adc_mixer_scale_is_1p0,
             adc_bits, pfb_fftshift, rx_mix_scale, acc_len,
             rx_combiner_loss_db=rx_combiner_loss_db,
             rx_attenuator_value_db=rx_attenuator_value_db,
@@ -7536,9 +8015,11 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
             rx_mixer_conversion_loss_db=rx_mixer_conversion_loss_db,
             rx_rf_s21_db=rx_rf_s21_db,
             rx_bypass_amp_s21_db=rx_bypass_amp_s21_db,
-            cryostat_output_s21_db=cryostat_output_s21_db,
+            cryostat_output_s21_db=0,
             adc_dsa_db=adc_dsa_db,
             detailed_output=True)
+        rx_details['detector_dbm'] = np.atleast_1d(tx_endpoint_power_dbm).tolist()
+        rx_details['cryostat_output_s21_db'] = np.atleast_1d(cryostat_output_s21_db).tolist()
         details.update(rx_details)
 
     # Select power at requested reference plane
@@ -7564,7 +8045,13 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
 
 def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detector',
                     optimise_dynamic_range=False, rf_peripherals=None,
-                    rx_policy='protect'):
+                    rx_policy='protect',
+                    force_tx_amp_bypass=None, force_rx_amp_bypass=None,
+                    force_tx_attenuation_db=None,
+                    force_rx_attenuation_db=None,
+                    force_adc_dsa_db=None, force_tone_amplitudes=None,
+                    force_psb_fftshift=None, force_psb_scale=None,
+                    force_pfb_fftshift=None):
     """Set tone powers to specified levels in dBm at the chosen reference plane.
 
     Always preserves relative tone powers.  When optimise_dynamic_range is True,
@@ -7625,6 +8112,28 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
 
     powers_dbm = np.atleast_1d(powers_dbm).astype(float)
 
+    _apply_forced_power_controls(
+        r, config_dict, rf_peripherals=rf_peripherals,
+        force_tx_amp_bypass=force_tx_amp_bypass,
+        force_rx_amp_bypass=force_rx_amp_bypass,
+        force_tx_attenuation_db=force_tx_attenuation_db,
+        force_rx_attenuation_db=force_rx_attenuation_db,
+        force_adc_dsa_db=force_adc_dsa_db,
+        force_tone_amplitudes=force_tone_amplitudes,
+        force_psb_fftshift=force_psb_fftshift,
+        force_psb_scale=force_psb_scale,
+        force_pfb_fftshift=force_pfb_fftshift)
+
+    tx_atten_fixed = force_tx_attenuation_db is not None
+    tx_amp_fixed = force_tx_amp_bypass is not None
+    tx_amp_forced_bypassed = (
+        tx_amp_fixed
+        and _coerce_forced_bool(force_tx_amp_bypass, 'force_tx_amp_bypass')
+    )
+    tone_amplitudes_fixed = force_tone_amplitudes is not None
+    psb_fftshift_fixed = force_psb_fftshift is not None
+    psb_scale_fixed = force_psb_scale is not None
+
     # ---- Phase 1: GATHER ----
     p = _gather_tx_chain_params(r, config_dict, rf_peripherals=rf_peripherals)
     cal = _mask_cal_for_reference_plane(p, reference_plane)
@@ -7643,28 +8152,37 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
     has_rf = (_rf_has_controllable_attenuator(rf_peripherals)
               and reference_plane != 'dac')
     has_bypass_amps = has_rf and _rf_supports_bypass_amps(rf_peripherals)
+    s21_enabled_value = 0.0
+    s21_bypassed_value = 0.0
     s21_enabled = 0.0
     s21_bypassed = 0.0
     if has_bypass_amps:
         current_bypass = rf_peripherals.get_tx_amp_bypass()
-        s21_enabled = _mean_cal_value_db(_gather_bypass_amp_s21_for_state(
-            config_dict, rf_peripherals, 'tx',
-            p['freq_details']['tx']['rf_output_freq'], False))
-        s21_bypassed = _mean_cal_value_db(_gather_bypass_amp_s21_for_state(
-            config_dict, rf_peripherals, 'tx',
-            p['freq_details']['tx']['rf_output_freq'], True))
+        if not tx_amp_fixed:
+            s21_enabled_value = _gather_bypass_amp_s21_for_state(
+                config_dict, rf_peripherals, 'tx',
+                p['freq_details']['tx']['rf_output_freq'], False)
+            s21_bypassed_value = _gather_bypass_amp_s21_for_state(
+                config_dict, rf_peripherals, 'tx',
+                p['freq_details']['tx']['rf_output_freq'], True)
+            s21_enabled = _mean_cal_value_db(s21_enabled_value)
+            s21_bypassed = _mean_cal_value_db(s21_bypassed_value)
 
     if not optimise_dynamic_range:
         # Simple mode: just compute amplitudes with current settings
         max_amp = (1 - 2**-12) / max_tones_per_bin
-        amps = calibration.calc_tone_amplitudes(
-            powers_dbm, p['psb_fftshift'], p['psb_scale'],
-            cal['mixer_scale_is_1p0'], cal['mixer_qmc_gain'], cal['vop_current'],
-            cal['vop_current_fs'], cal['dac_dbfs_to_dbm'],
-            cal['tx_combiner_loss_db'], cal['tx_attenuator_value_db'],
-            cal['tx_if_s21_db'], cal['tx_mixer_conversion_loss_db'],
-            cal['tx_rf_s21_db'], cal['tx_bypass_amp_s21_db'],
-            cal['cryostat_input_s21_db'], cal['dac_fs_bits'])
+        if tone_amplitudes_fixed:
+            amps = get_tone_amplitudes(r, config_dict)
+            print('set_tone_powers: tone amplitudes fixed — skipping amplitude calculation')
+        else:
+            amps = calibration.calc_tone_amplitudes(
+                powers_dbm, p['psb_fftshift'], p['psb_scale'],
+                cal['mixer_scale_is_1p0'], cal['mixer_qmc_gain'], cal['vop_current'],
+                cal['vop_current_fs'], cal['dac_dbfs_to_dbm'],
+                cal['tx_combiner_loss_db'], cal['tx_attenuator_value_db'],
+                cal['tx_if_s21_db'], cal['tx_mixer_conversion_loss_db'],
+                cal['tx_rf_s21_db'], cal['tx_bypass_amp_s21_db'],
+                cal['cryostat_input_s21_db'], cal['dac_fs_bits'])
 
         warnings_list = []
         if np.any(amps > max_amp):
@@ -7705,15 +8223,24 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         print(f'set_tone_powers: setting {len(powers_dbm)} tones at '
               f'reference_plane={reference_plane!r}')
         init_amps_max = float(np.max(get_tone_amplitudes(r, config_dict)))
-        set_tone_amplitudes(r, config_dict, amps)
+        if not tone_amplitudes_fixed:
+            set_tone_amplitudes(r, config_dict, amps)
         new_amps_max = float(np.max(np.abs(amps)))
         if init_amps_max > 0 and new_amps_max > 0:
             amp_change_db = float(20 * np.log10(new_amps_max / init_amps_max))
             _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
-                             tx_power_change_db=amp_change_db)
+                             tx_power_change_db=amp_change_db,
+                             force_rx_amp_bypass=force_rx_amp_bypass,
+                             force_rx_attenuation_db=force_rx_attenuation_db,
+                             force_adc_dsa_db=force_adc_dsa_db,
+                             force_pfb_fftshift=force_pfb_fftshift)
         else:
             _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
-                             tx_power_change_db=None)
+                             tx_power_change_db=None,
+                             force_rx_amp_bypass=force_rx_amp_bypass,
+                             force_rx_attenuation_db=force_rx_attenuation_db,
+                             force_adc_dsa_db=force_adc_dsa_db,
+                             force_pfb_fftshift=force_pfb_fftshift)
 
         # DAC Saturation Check
         dac_saturation, dac_saturation_details = check_output_saturation(r_fast, iterations=250)
@@ -7743,7 +8270,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
             'psb_fftshift': int(p['psb_fftshift']),
             'psb_scale': float(p['psb_scale']),
             'tx_attenuation_db': float(cal['tx_attenuator_value_db']) if np.isscalar(cal['tx_attenuator_value_db']) else float(np.mean(cal['tx_attenuator_value_db'])),
-            'tx_amp_bypass': None,
+            'tx_amp_bypass': rf_peripherals.get_tx_amp_bypass() if has_bypass_amps else None,
             'tx_bypass_amp_s21_db': float(cal['tx_bypass_amp_s21_db']) if np.isscalar(cal['tx_bypass_amp_s21_db']) else float(np.mean(cal['tx_bypass_amp_s21_db'])),
             'optimised': False,
             'effective_bits_per_tone': eff_bits.tolist(),
@@ -7773,94 +8300,122 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
     headroom_linear = 10**(-headroom_db / 20)
 
     # --- Step 1: Maximise digital gain ---
-    # Compute amplitudes that preserve relative tone powers with max = max_amp.
-    ref_amps = calibration.calc_tone_amplitudes(
-        powers_dbm, p['psb_fftshift'], psb_scale=1.0,
-        mixer_scale_is_1p0=cal['mixer_scale_is_1p0'],
-        mixer_qmc_gain=cal['mixer_qmc_gain'],
-        vop_current=cal['vop_current'],
-        vop_current_fs=cal['vop_current_fs'],
-        dac_dbfs_to_dbm=cal['dac_dbfs_to_dbm'],
-        tx_combiner_loss_db=cal['tx_combiner_loss_db'],
-        tx_attenuator_value_db=cal['tx_attenuator_value_db'],
-        tx_if_s21_db=cal['tx_if_s21_db'],
-        tx_mixer_conversion_loss_db=cal['tx_mixer_conversion_loss_db'],
-        tx_rf_s21_db=cal['tx_rf_s21_db'],
-        tx_bypass_amp_s21_db=cal['tx_bypass_amp_s21_db'],
-        cryostat_input_s21_db=cal['cryostat_input_s21_db'],
-        dac_fs_bits=cal['dac_fs_bits'])
-    max_ref = float(np.max(np.abs(ref_amps)))
-    if max_ref <= 0:
-        raise ValueError('Target powers result in zero amplitudes')
-    amps = ref_amps * (max_amp / max_ref)
+    if tone_amplitudes_fixed:
+        amps = get_tone_amplitudes(r, config_dict)
+        print('  step 1: tone amplitudes fixed')
+    else:
+        # Compute amplitudes that preserve relative tone powers with max = max_amp.
+        ref_amps = calibration.calc_tone_amplitudes(
+            powers_dbm, p['psb_fftshift'], psb_scale=1.0,
+            mixer_scale_is_1p0=cal['mixer_scale_is_1p0'],
+            mixer_qmc_gain=cal['mixer_qmc_gain'],
+            vop_current=cal['vop_current'],
+            vop_current_fs=cal['vop_current_fs'],
+            dac_dbfs_to_dbm=cal['dac_dbfs_to_dbm'],
+            tx_combiner_loss_db=cal['tx_combiner_loss_db'],
+            tx_attenuator_value_db=cal['tx_attenuator_value_db'],
+            tx_if_s21_db=cal['tx_if_s21_db'],
+            tx_mixer_conversion_loss_db=cal['tx_mixer_conversion_loss_db'],
+            tx_rf_s21_db=cal['tx_rf_s21_db'],
+            tx_bypass_amp_s21_db=cal['tx_bypass_amp_s21_db'],
+            cryostat_input_s21_db=cal['cryostat_input_s21_db'],
+            dac_fs_bits=cal['dac_fs_bits'])
+        max_ref = float(np.max(np.abs(ref_amps)))
+        if max_ref <= 0:
+            raise ValueError('Target powers result in zero amplitudes')
+        amps = ref_amps * (max_amp / max_ref)
 
-    # Mute, set amplitudes, find best fftshift
-    r.psbscale.set_scale(0)
-    time.sleep(0.01)
-    set_tone_amplitudes(r, config_dict, amps)
-    time.sleep(0.01)
-    print(f'  step 1: maximise digital — amplitudes at max')
+        if psb_scale_fixed:
+            print('  step 1: psb_scale fixed — setting amplitudes without mute')
+        else:
+            r.psbscale.set_scale(0)
+            time.sleep(0.01)
+        set_tone_amplitudes(r, config_dict, amps)
+        time.sleep(0.01)
+        print(f'  step 1: maximise digital — amplitudes at max')
 
-    best_fftshift, _, _ = _find_best_psb_fftshift(r)
+    if psb_fftshift_fixed:
+        best_fftshift = r.psb.get_fftshift()
+        print(f'  step 2: PSB fftshift fixed at {format(best_fftshift, "#016b")}')
+    elif psb_scale_fixed:
+        best_fftshift = r.psb.get_fftshift()
+        print('  step 2: PSB fftshift search skipped because psb_scale is fixed')
+    else:
+        best_fftshift, _, _ = _find_best_psb_fftshift(r)
 
     # Ramp psb_scale to just below DAC saturation (same as maximise_tx_power)
-    print(f'  step 2: ramp psb_scale')
-
-    def _is_ok(scale):
-        scale = float(np.clip(scale, scalemin, scalemax))
-        r.psbscale.set_scale(scale)
-        time.sleep(0.01)
-        _, ovf_details = check_dsp_overflow(r, 0.1, verbose=False)
-        ovf = ovf_details['psbscale_ovf_delta'] or ovf_details['psb_ovf_delta']
-        sat = check_output_saturation(r_fast, iterations=250, verbose=False)[0]
-        return not (ovf or sat)
-
-    # Estimate starting psb_scale from amplitudes and fftshift
-    popcount = bin(best_fftshift).count('1')
-    amp_sum = float(np.sum(np.abs(amps)))
-    if amp_sum > 0:
-        estimated_scale = 2.0 ** (popcount + 1) / amp_sum
-        estimated_scale = float(np.clip(estimated_scale, scalemin, scalemax))
-        print(f'    analytical estimate: {estimated_scale:.4f} '
-              f'(popcount={popcount}, amp_sum={amp_sum:.4f})')
+    if psb_scale_fixed:
+        optimal_psb_scale = r.psbscale.get_scale()
+        print(f'  step 2: psb_scale fixed at {optimal_psb_scale:.6f}')
     else:
-        estimated_scale = scalemin
+        print(f'  step 2: ramp psb_scale')
 
-    step_factors = [2.0, 2**0.5, 10**(1/20), 10**(0.5/20), 10**(0.1/20)]
-    safe_scale = scalemin
-    failed_scale = float('inf')
-    for step_db, factor in zip([6, 3, 1, 0.5, 0.1], step_factors):
-        scale = safe_scale
-        if step_db == 6 and estimated_scale > scale:
-            if estimated_scale < failed_scale and _is_ok(estimated_scale):
+        def _is_ok(scale):
+            scale = float(np.clip(scale, scalemin, scalemax))
+            r.psbscale.set_scale(scale)
+            time.sleep(0.01)
+            _, ovf_details = check_dsp_overflow(r, 0.1, verbose=False)
+            ovf = ovf_details['psbscale_ovf_delta'] or ovf_details['psb_ovf_delta']
+            sat = check_output_saturation(r_fast, iterations=250, verbose=False)[0]
+            return not (ovf or sat)
+
+        # Estimate starting psb_scale from amplitudes and fftshift
+        popcount = bin(best_fftshift).count('1')
+        amp_sum = float(np.sum(np.abs(amps)))
+        if amp_sum > 0:
+            estimated_scale = 2.0 ** (popcount + 1) / amp_sum
+            estimated_scale = float(np.clip(estimated_scale, scalemin, scalemax))
+            print(f'    analytical estimate: {estimated_scale:.4f} '
+                  f'(popcount={popcount}, amp_sum={amp_sum:.4f})')
+        else:
+            estimated_scale = scalemin
+
+        safe_scale = scalemin
+        failed_scale = float('inf')
+        if estimated_scale > scalemin:
+            if _is_ok(estimated_scale):
                 safe_scale = estimated_scale
-                scale = estimated_scale
-                print(f'    {step_db:4.1f} dB: jumped to estimate {estimated_scale:.4f} ok')
+                print(f'     estimate {estimated_scale:.4f} ok')
             else:
-                failed_scale = min(failed_scale, estimated_scale)
-                print(f'    {step_db:4.1f} dB: estimate {estimated_scale:.4f} saturates')
-        next_scale = min(scale * factor, scalemax)
-        while next_scale > scale:
-            if next_scale >= failed_scale:
-                print(f'    {step_db:4.1f} dB: {next_scale:.4f} skip (already failed)')
-                break
-            if _is_ok(next_scale):
-                safe_scale = next_scale
-                print(f'    {step_db:4.1f} dB: {next_scale:.4f} ok')
-                if next_scale >= scalemax:
-                    break
-                scale = next_scale
-                next_scale = min(scale * factor, scalemax)
-            else:
-                failed_scale = next_scale
-                print(f'    {step_db:4.1f} dB: {next_scale:.4f} LIMIT')
-                break
+                failed_scale = estimated_scale
+                print(f'     estimate {estimated_scale:.4f} saturates')
+                probe_scale = max(estimated_scale / 2.0, scalemin)
+                while probe_scale >= scalemin:
+                    if _is_ok(probe_scale):
+                        safe_scale = probe_scale
+                        print(f'     backoff 6.0 dB: {probe_scale:.4f} ok')
+                        break
+                    failed_scale = min(failed_scale, probe_scale)
+                    print(f'     backoff 6.0 dB: {probe_scale:.4f} saturates')
+                    if probe_scale <= scalemin:
+                        break
+                    probe_scale = max(probe_scale / 2.0, scalemin)
 
-    optimal_psb_scale = safe_scale * headroom_linear
-    optimal_psb_scale = float(np.clip(optimal_psb_scale, scalemin, scalemax))
-    r.psbscale.set_scale(optimal_psb_scale)
-    time.sleep(0.01)
-    print(f'    psb_scale: {optimal_psb_scale:.4f} ({headroom_db} dB headroom)')
+        step_factors = [2.0, 2**0.5, 10**(1/20), 10**(0.5/20), 10**(0.1/20)]
+        for step_db, factor in zip([6, 3, 1, 0.5, 0.1], step_factors):
+            scale = safe_scale
+            next_scale = min(scale * factor, scalemax)
+            while next_scale > scale:
+                if next_scale >= failed_scale:
+                    print(f'    {step_db:4.1f} dB: {next_scale:.4f} skip (already failed)')
+                    break
+                if _is_ok(next_scale):
+                    safe_scale = next_scale
+                    print(f'    {step_db:4.1f} dB: {next_scale:.4f} ok')
+                    if next_scale >= scalemax:
+                        break
+                    scale = next_scale
+                    next_scale = min(scale * factor, scalemax)
+                else:
+                    failed_scale = next_scale
+                    print(f'    {step_db:4.1f} dB: {next_scale:.4f} LIMIT')
+                    break
+
+        optimal_psb_scale = safe_scale * headroom_linear
+        optimal_psb_scale = float(np.clip(optimal_psb_scale, scalemin, scalemax))
+        r.psbscale.set_scale(optimal_psb_scale)
+        time.sleep(0.01)
+        print(f'    psb_scale: {optimal_psb_scale:.4f} ({headroom_db} dB headroom)')
     ramp_psb_scale = optimal_psb_scale  # before any step-4c reduction
 
     # --- Step 3: Measure achieved power at reference plane ---
@@ -7882,6 +8437,9 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         cal['tx_attenuator_value_db']) else np.mean(cal['tx_attenuator_value_db']))
     tx_amp_bypass = rf_peripherals.get_tx_amp_bypass() if has_bypass_amps else None
     tx_amp_s21 = cal['tx_bypass_amp_s21_db']
+    current_tx_amp_s21_db = _mean_cal_value_db(tx_amp_s21)
+    if not np.isfinite(current_tx_amp_s21_db):
+        current_tx_amp_s21_db = 0.0
 
     if abs(delta_db) > 0.5:
         print(f'  step 4: adjust analog ({delta_db:+.1f} dB)')
@@ -7892,82 +8450,120 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
             atten_max = rf_peripherals.ATTEN_MAX
             min_atten = rf_peripherals.ATTEN_MIN
 
-            if remaining < -0.1:
-                # --- Need MORE power: reduce attenuation, enable amp ---
+            def _round_attenuation(value):
+                if atten_step <= 0:
+                    return float(np.clip(value, min_atten, atten_max))
+                rounded = round(value / atten_step) * atten_step
+                return float(np.clip(rounded, min_atten, atten_max))
 
-                # 4a: Enable TX amp if bypassed
-                if has_bypass_amps and tx_amp_bypass:
-                    amp_gain = s21_enabled - s21_bypassed
-                    if amp_gain > 0.5:
-                        rf_peripherals.set_tx_amp_bypass(False)
-                        time.sleep(0.1)
-                        tx_amp_bypass = False
-                        tx_amp_s21 = s21_enabled
-                        remaining += amp_gain  # remaining gets less negative
-                        print(f'    TX amp: enabled (+{amp_gain:.1f} dB)')
+            if has_bypass_amps:
+                if tx_amp_fixed:
+                    amp_candidates = [(
+                        tx_amp_bypass, tx_amp_s21, current_tx_amp_s21_db,
+                        'fixed')]
+                else:
+                    amp_candidates = [
+                        (True, s21_bypassed_value, s21_bypassed, 'bypassed'),
+                        (False, s21_enabled_value, s21_enabled, 'enabled'),
+                    ]
+            else:
+                amp_candidates = [(
+                    tx_amp_bypass, tx_amp_s21, current_tx_amp_s21_db,
+                    'current')]
 
-                # 4b: Reduce TX attenuator
-                if remaining < -0.1 and tx_atten_db > min_atten:
-                    needed = -remaining  # how much more power we need
-                    reduce = min(needed, tx_atten_db - min_atten)
-                    new_atten = round((tx_atten_db - reduce) / atten_step) * atten_step
-                    new_atten = float(np.clip(new_atten, min_atten, atten_max))
-                    rf_peripherals.set_tx_attenuation(new_atten)
-                    time.sleep(0.1)
-                    gained = tx_atten_db - new_atten
-                    remaining += gained  # remaining gets less negative
-                    print(f'    TX atten: {tx_atten_db:.1f} -> {new_atten:.1f} dB '
-                          f'(+{gained:.1f} dB)')
-                    tx_atten_db = new_atten
+            candidates = []
+            for bypass_state, amp_s21_value, amp_s21_db, amp_label in amp_candidates:
+                if not np.isfinite(amp_s21_db):
+                    amp_s21_db = current_tx_amp_s21_db
+                required_atten = (
+                    tx_atten_db + delta_db
+                    + (amp_s21_db - current_tx_amp_s21_db)
+                )
+                new_atten = (
+                    tx_atten_db if tx_atten_fixed
+                    else _round_attenuation(required_atten)
+                )
+                candidate_remaining = (
+                    delta_db
+                    + (amp_s21_db - current_tx_amp_s21_db)
+                    - (new_atten - tx_atten_db)
+                )
+                margin = min(new_atten - min_atten, atten_max - new_atten)
+                candidates.append({
+                    'bypass': bypass_state,
+                    'amp_s21': amp_s21_value,
+                    'amp_s21_db': amp_s21_db,
+                    'amp_label': amp_label,
+                    'atten': new_atten,
+                    'remaining': float(candidate_remaining),
+                    'margin': float(margin),
+                })
 
-                # If still short after exhausting analog, error
-                if remaining < -0.5:
-                    raise ValueError(
-                        f'Target power exceeds maximum achievable by '
-                        f'{-remaining:.1f} dB at '
-                        f'reference_plane={reference_plane!r}. '
-                        f'Reduce tone_powers_dbm or num_tones.')
+            exact_candidates = [
+                c for c in candidates if abs(c['remaining']) <= 0.5
+            ]
+            positive_candidates = [
+                c for c in candidates if c['remaining'] > 0.1
+            ]
 
-            elif remaining > 0.1:
-                # --- Need LESS power: add attenuation, bypass amp ---
+            def _bypass_rank(candidate):
+                if not has_bypass_amps or tx_amp_fixed:
+                    return 0
+                return 0 if candidate['bypass'] is True else 1
 
-                # 4a: Increase TX attenuator
-                atten_headroom = atten_max - tx_atten_db
-                if remaining > 0.1 and atten_headroom >= atten_step:
-                    add_atten = min(remaining, atten_headroom)
-                    new_atten = round((tx_atten_db + add_atten) / atten_step) * atten_step
-                    new_atten = float(np.clip(new_atten, min_atten, atten_max))
-                    rf_peripherals.set_tx_attenuation(new_atten)
-                    time.sleep(0.1)
-                    absorbed = new_atten - tx_atten_db
-                    remaining -= absorbed
-                    print(f'    TX atten: {tx_atten_db:.1f} -> {new_atten:.1f} dB '
-                          f'(-{absorbed:.1f} dB)')
-                    tx_atten_db = new_atten
+            if exact_candidates:
+                best = min(
+                    exact_candidates,
+                    key=lambda c: (
+                        _bypass_rank(c),
+                        abs(c['remaining']),
+                        -c['margin'],
+                    ))
+            elif positive_candidates:
+                best = min(
+                    positive_candidates,
+                    key=lambda c: (
+                        c['remaining'],
+                        _bypass_rank(c),
+                        -c['margin'],
+                    ))
+            else:
+                best = max(candidates, key=lambda c: c['remaining'])
 
-                # 4b: Bypass TX amp if still excess
-                if has_bypass_amps and remaining > 0.5 and tx_amp_bypass is False:
-                    amp_gain = s21_enabled - s21_bypassed
-                    if amp_gain > 0.5:
-                        rf_peripherals.set_tx_amp_bypass(True)
-                        time.sleep(0.1)
-                        tx_amp_bypass = True
-                        tx_amp_s21 = s21_bypassed
-                        remaining -= amp_gain
-                        print(f'    TX amp: bypassed (-{amp_gain:.1f} dB)')
+            if (has_bypass_amps and best['bypass'] != tx_amp_bypass
+                    and not tx_amp_fixed):
+                rf_peripherals.set_tx_amp_bypass(best['bypass'])
+                time.sleep(0.1)
+                state = 'bypassed' if best['bypass'] else 'enabled'
+                print(f'    TX amp: {state}')
+            elif has_bypass_amps and tx_amp_fixed:
+                print(f'    TX amp fixed at bypass={tx_amp_bypass}')
 
-                        # Bypassing may have overshot — recover with attenuator
-                        if remaining < -0.1:
-                            current_atten = rf_peripherals.get_tx_attenuation()
-                            remove = -remaining
-                            new_atten = round((current_atten - remove) / atten_step) * atten_step
-                            new_atten = float(np.clip(new_atten, min_atten, atten_max))
-                            rf_peripherals.set_tx_attenuation(new_atten)
-                            time.sleep(0.1)
-                            remaining += (current_atten - new_atten)
-                            print(f'    TX atten: {current_atten:.1f} -> {new_atten:.1f} dB '
-                                  f'(recovering after bypass)')
-                            tx_atten_db = new_atten
+            if abs(best['atten'] - tx_atten_db) > 1e-6 and not tx_atten_fixed:
+                old_atten = tx_atten_db
+                rf_peripherals.set_tx_attenuation(best['atten'])
+                time.sleep(0.1)
+                print(f'    TX atten: {old_atten:.1f} -> {best["atten"]:.1f} dB')
+            elif tx_atten_fixed:
+                print(f'    TX atten fixed at {tx_atten_db:.1f} dB')
+
+            tx_amp_bypass = best['bypass']
+            tx_amp_s21 = best['amp_s21']
+            tx_atten_db = best['atten']
+            remaining = best['remaining']
+            print(f'    RF candidate: amp {best["amp_label"]}, '
+                  f'atten {tx_atten_db:.1f} dB, residual {remaining:+.2f} dB')
+
+            if remaining < -0.5:
+                hint = (
+                    ' Try disabling the TX amp bypass.'
+                    if tx_amp_forced_bypassed else ''
+                )
+                raise ValueError(
+                    f'Target power exceeds maximum achievable by '
+                    f'{-remaining:.1f} dB at '
+                    f'reference_plane={reference_plane!r}. '
+                    f'Reduce tone_powers_dbm or num_tones.{hint}')
 
         elif remaining < -0.5:
             # No RF peripherals and need more power than digital max
@@ -7978,37 +8574,46 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
 
         # 4c: Last resort — reduce psb_scale for any remaining excess
         if remaining > 0.1:
-            optimal_psb_scale = r.psbscale.get_scale()
-            optimal_psb_scale *= 10**(-remaining / 20)
-            optimal_psb_scale = float(np.clip(optimal_psb_scale, scalemin, scalemax))
-            r.psbscale.set_scale(optimal_psb_scale)
-            time.sleep(0.01)
-            print(f'    psb_scale reduced to {optimal_psb_scale:.4f} '
-                  f'(remaining {remaining:.1f} dB)')
+            if psb_scale_fixed:
+                msg = (f'psb_scale fixed; {remaining:.1f} dB excess power remains')
+                print(f'    WARNING: {msg}')
+                warnings_list.append(msg)
+            else:
+                optimal_psb_scale = r.psbscale.get_scale()
+                optimal_psb_scale *= 10**(-remaining / 20)
+                optimal_psb_scale = float(np.clip(optimal_psb_scale, scalemin, scalemax))
+                r.psbscale.set_scale(optimal_psb_scale)
+                time.sleep(0.01)
+                print(f'    psb_scale reduced to {optimal_psb_scale:.4f} '
+                      f'(remaining {remaining:.1f} dB)')
 
     # Now compute final amplitudes analytically for the chosen settings.
     # The amplitudes are still at max from step 1, preserving relative
     # ratios.  The psb_scale + attenuator + amp bypass together set the
     # absolute power level.  We just need to recompute the amplitudes
     # to exactly hit the target.
-    final_amps = calibration.calc_tone_amplitudes(
-        powers_dbm, best_fftshift, optimal_psb_scale,
-        mixer_scale_is_1p0=cal['mixer_scale_is_1p0'],
-        mixer_qmc_gain=cal['mixer_qmc_gain'],
-        vop_current=cal['vop_current'],
-        vop_current_fs=cal['vop_current_fs'],
-        dac_dbfs_to_dbm=cal['dac_dbfs_to_dbm'],
-        tx_combiner_loss_db=cal['tx_combiner_loss_db'],
-        tx_attenuator_value_db=tx_atten_db,
-        tx_if_s21_db=cal['tx_if_s21_db'],
-        tx_mixer_conversion_loss_db=cal['tx_mixer_conversion_loss_db'],
-        tx_rf_s21_db=cal['tx_rf_s21_db'],
-        tx_bypass_amp_s21_db=tx_amp_s21,
-        cryostat_input_s21_db=cal['cryostat_input_s21_db'],
-        dac_fs_bits=cal['dac_fs_bits'])
-    final_amps = np.clip(final_amps, 0, max_amp)
-    set_tone_amplitudes(r, config_dict, final_amps)
-    time.sleep(0.01)
+    if tone_amplitudes_fixed:
+        final_amps = get_tone_amplitudes(r, config_dict)
+        print('  final amplitudes fixed — skipping exact amplitude solve')
+    else:
+        final_amps = calibration.calc_tone_amplitudes(
+            powers_dbm, best_fftshift, optimal_psb_scale,
+            mixer_scale_is_1p0=cal['mixer_scale_is_1p0'],
+            mixer_qmc_gain=cal['mixer_qmc_gain'],
+            vop_current=cal['vop_current'],
+            vop_current_fs=cal['vop_current_fs'],
+            dac_dbfs_to_dbm=cal['dac_dbfs_to_dbm'],
+            tx_combiner_loss_db=cal['tx_combiner_loss_db'],
+            tx_attenuator_value_db=tx_atten_db,
+            tx_if_s21_db=cal['tx_if_s21_db'],
+            tx_mixer_conversion_loss_db=cal['tx_mixer_conversion_loss_db'],
+            tx_rf_s21_db=cal['tx_rf_s21_db'],
+            tx_bypass_amp_s21_db=tx_amp_s21,
+            cryostat_input_s21_db=cal['cryostat_input_s21_db'],
+            dac_fs_bits=cal['dac_fs_bits'])
+        final_amps = np.clip(final_amps, 0, max_amp)
+        set_tone_amplitudes(r, config_dict, final_amps)
+        time.sleep(0.01)
 
     # RX policy check for the overall TX power change
     init_powers = get_tone_powers(r, config_dict, reference_plane=reference_plane,
@@ -8032,7 +8637,11 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         dac_fs_bits=cal['dac_fs_bits'])
     tx_power_change_db = float(np.max(init_powers)) - float(np.max(entry_powers))
     _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
-                     tx_power_change_db=tx_power_change_db)
+                     tx_power_change_db=tx_power_change_db,
+                     force_rx_amp_bypass=force_rx_amp_bypass,
+                     force_rx_attenuation_db=force_rx_attenuation_db,
+                     force_adc_dsa_db=force_adc_dsa_db,
+                     force_pfb_fftshift=force_pfb_fftshift)
 
     # --- Dynamic range metrics ---
     popcount = bin(best_fftshift).count('1')

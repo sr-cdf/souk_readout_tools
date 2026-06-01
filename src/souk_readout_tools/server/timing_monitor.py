@@ -45,7 +45,7 @@ from typing import Optional
 
 
 def parse_bool(value: Optional[str]) -> Optional[bool]:
-    """Parse common pmc/chrony boolean spellings."""
+    """Parse common pmc/chrony boolean spellings in ``value`` (None if unknown)."""
     if value is None:
         return None
     value_l = value.strip().lower()
@@ -57,7 +57,7 @@ def parse_bool(value: Optional[str]) -> Optional[bool]:
 
 
 def parse_seconds(value: Optional[str]) -> Optional[float]:
-    """Parse chrony time strings, returning seconds when possible."""
+    """Parse a chrony time string ``value`` into seconds (None if not parseable)."""
     if value is None:
         return None
     value = value.strip()
@@ -97,7 +97,8 @@ def set_proc_comm(name: str) -> None:
 
 
 def set_process_title(name: str) -> None:
-    """Set user-space and kernel process names when optional support exists."""
+    """Set the user-space and kernel process names to ``name`` when optional
+    support exists."""
     try:
         import setproctitle
         setproctitle.setproctitle(name)

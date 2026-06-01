@@ -85,7 +85,7 @@ Default ports: pipeline 0 uses 10000/20000, pipeline 1 uses 10001/20001.
 | `fitting.py` | Nonlinear resonator model fitting (Khalil notch model) |
 | `resonator.py` | Resonator S21 transforms: RF deembedding and phase centering |
 | `plotting/` | Plotting library for sweep, timestream, and snapshot data |
-| `measurement.py` | Parameter space measurement framework |
+| `measurement.py` | Simple repeat-measurement runner |
 | `mkid_finder_app.py` | PyQt5 GUI for interactive resonance finding |
 | `tone_list_tools.py` | Tone list file I/O utilities |
 
@@ -1001,7 +1001,9 @@ client.fix_dac_saturation()    # Auto-fix DAC clipping
 client.fix_adc_saturation()    # Auto-fix ADC clipping
 ```
 
-`maximise_tx_power()` and `maximise_rx_power()` accept a `headroom_db` parameter (default 1.0 dB) that sets the safety margin below saturation:
+`maximise_tx_power()` and `maximise_rx_power()` accept a `headroom_db`
+parameter that sets the safety margin below saturation. The TX default is
+`2.0 dB`; the RX default is `1.0 dB`:
 
 ```python
 client.maximise_tx_power(headroom_db=3.0)   # 3 dB below saturation
@@ -1164,6 +1166,10 @@ for tidx, snap in batch['results'].items():
 ```
 
 CLI: `souk-batch-snapshots -C config.yaml -n 20 --tones 0 3 7 -P`
+
+For a worked example that combines snapshots with on/off-resonance
+timestreams, see [Resonator Drive Tuning and Noise
+Measurements](resonator_noise_workflow.md).
 
 ---
 
@@ -1354,66 +1360,64 @@ for t, ress in enumerate(result['per_tone']):
 
 ## Parameter Space Measurements
 
-The `souk_readout_tools.measurement` module provides tools for repeating measurements across an external parameter. The parameter is abstract — supply set/get callbacks for any controllable or monitored quantity.
+The `souk_readout_tools.measurement` module records a measurement as a **run
+directory**: a top-level `measurement.json` manifest plus the data, analysis,
+and plot files it points at.  The manifest is plain JSON and the data model is
+plain dataclasses:
 
-### Sweeping a Controllable Parameter
+- `MeasurementRun` — one run: its `kind`, `parameters`, `metadata`, and a list
+  of steps, plus run-level artifacts such as the `client.get_info("all")`
+  system-info captures saved at the start and end.
+- `MeasurementStep` — one point on the swept axis: the requested `axis` values,
+  the `readback` values read from the hardware, free-form `metadata`, and the
+  artifacts saved for that step.
+- `MeasurementArtifact` — a pointer to one saved file (a sweep `.npz`, a plot
+  `.png`, ...), tagged with its `kind` and `role`.
 
-```python
-from souk_readout_tools.measurement import ParameterSweep
-
-# Example: sweep TX attenuation
-sweep = ParameterSweep(
-    client,
-    parameter_name='tx_attenuation_db',
-    set_parameter=lambda v: client.set_tx_attenuation(v),
-    get_parameter=lambda: client.get_rf_peripheral_status().get('result', {}).get('tx_attenuation_db'),
-    settle_time=1.0,
-)
-
-results = sweep.sweep(
-    values=[0, 5, 10, 15, 20],
-    measure_func=lambda c: c.wideband_sweep(verbose=False),
-)
-```
-
-### Timed Measurements
+`MeasurementStore` reads and writes those files; it does not drive the
+measurement.  The acquisition loop lives with the measurement itself.
+`run_power_sweep()` is the worked example: it steps tone power, saves one
+targeted sweep per step (rewriting the manifest as it goes so an interrupted
+run can still be inspected), and returns the `MeasurementRun`:
 
 ```python
-from souk_readout_tools.measurement import TimedMeasurement
+from souk_readout_tools import power_sweep as ps
 
-timed = TimedMeasurement(
+run = ps.run_power_sweep(
     client,
-    parameter_name='temperature_mk',
-    get_parameter=lambda: read_thermometer(),  # your function
-    interval_s=60.0,
+    centers=freqs,
+    spans=0.5e6,
+    powers_dbm=[-95, -90, -85, -80],
+    output_dir="kid_power_sweep",
+    follow_dips=True,  # default: pre-center first, then follow between steps
 )
 
-# Take 10 measurements, one per minute
-results = timed.run(
-    measure_func=lambda c: c.wideband_sweep(verbose=False),
-    n_points=10,
+loaded = ps.load_power_sweep("kid_power_sweep")
+analysis = ps.analyse_power_sweep(
+    loaded,
+    nonlinear=True,
+    n_jobs=-1,
+    target_anl=0.01,
 )
+
+best_power = analysis["best_power"]
 ```
 
-### Conditional Measurements
+To add a new kind of measurement, write a plain function in the same shape as
+`run_power_sweep`: build a `MeasurementRun`, loop over your steps (writing the
+manifest as you go), save each data product with
+`MeasurementStore.save_step_npz_artifact(...)`, and return the run.  The body
+of `run_power_sweep` in `power_sweep.py` is a complete template.
 
-```python
-from souk_readout_tools.measurement import ConditionalMeasurement
+The artifact kinds are `sweep`, `timestream`, `accumulator_snapshot`,
+`adc_snapshot`, `dac_snapshot`, `fit_results`, `summary_table`, and `plot`.
+Accumulator snapshots are treated separately from timestreams because they are
+pre-accumulation, high-rate captures for one tone at a time and are not valid
+for tone-tone correlation analysis.
 
-cond = ConditionalMeasurement(
-    client,
-    parameter_name='temperature_mk',
-    get_parameter=lambda: read_thermometer(),
-    condition=lambda t: abs(t - target_temp) < 5,  # within 5 mK
-    poll_interval_s=5.0,
-)
-
-results = cond.run(
-    measure_func=lambda c: c.wideband_sweep(verbose=False),
-    target_values=[100, 200, 300, 400],  # target temperatures in mK
-    timeout_s=3600,
-)
-```
+For a practical blackbody-load directory convention and an end-to-end
+drive-tuning plus on/off-resonance noise workflow, see [Resonator Drive Tuning
+and Noise Measurements](resonator_noise_workflow.md).
 
 ---
 

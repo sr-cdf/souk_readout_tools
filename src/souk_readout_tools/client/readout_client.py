@@ -317,6 +317,101 @@ class ReadoutClient:
                 writer.writerow([f'# {section}', ReadoutClient._csv_metadata_value(section_data)])
 
     @staticmethod
+    def _read_csv_comment_metadata(filename):
+        """Read leading ``#`` metadata rows from a CSV export."""
+        metadata = {}
+        header_lines = 0
+        with open(filename, mode='r') as file:
+            for line in file:
+                if not line.startswith('#'):
+                    break
+                header_lines += 1
+                key = line.split(',')[0].lstrip('# ')
+                value = line[line.find(',')+1:].strip()
+                if value.startswith('"') and value.endswith('"'):
+                    value = value[1:-1]
+                try:
+                    value = ast.literal_eval(value)
+                except (ValueError, SyntaxError):
+                    pass
+                metadata[key] = value
+        return metadata, header_lines
+
+    @staticmethod
+    def _json_ready(value):
+        """Convert nested numpy/complex values into JSON-serialisable data."""
+        if isinstance(value, np.ndarray):
+            if np.iscomplexobj(value):
+                return {
+                    '__complex_ndarray__': True,
+                    'real': value.real.tolist(),
+                    'imag': value.imag.tolist(),
+                }
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, complex):
+            return {
+                '__complex__': True,
+                'real': float(value.real),
+                'imag': float(value.imag),
+            }
+        if isinstance(value, dict):
+            return {
+                str(key): ReadoutClient._json_ready(sub_value)
+                for key, sub_value in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [ReadoutClient._json_ready(item) for item in value]
+        return value
+
+    @staticmethod
+    def _restore_json_value(value):
+        """Restore values written by ``_json_ready``."""
+        if isinstance(value, dict):
+            if value.get('__complex_ndarray__'):
+                return (np.asarray(value['real'], dtype=float)
+                        + 1j*np.asarray(value['imag'], dtype=float))
+            if value.get('__complex__'):
+                return complex(value['real'], value['imag'])
+            return {
+                key: ReadoutClient._restore_json_value(sub_value)
+                for key, sub_value in value.items()
+            }
+        if isinstance(value, list):
+            restored = [ReadoutClient._restore_json_value(item) for item in value]
+            try:
+                array = np.asarray(restored)
+                if array.dtype != object:
+                    return array
+            except (TypeError, ValueError):
+                pass
+            return restored
+        return value
+
+    @staticmethod
+    def _snapshot_csv_indices(field_names):
+        """Return contiguous snapshot indices from snapshot_NNNN_i/q columns."""
+        indices = []
+        for name in field_names:
+            if name.startswith('snapshot_') and name.endswith('_i'):
+                suffix = name[len('snapshot_'):-len('_i')]
+                if suffix.isdigit():
+                    indices.append(int(suffix))
+
+        indices = sorted(indices)
+        if not indices:
+            raise ValueError("No snapshot_NNNN_i columns found in snapshot CSV.")
+        if indices != list(range(len(indices))):
+            raise ValueError(
+                "Snapshot CSV columns must be contiguous from snapshot_0000.")
+        for index in indices:
+            if f'snapshot_{index:04d}_q' not in field_names:
+                raise ValueError(
+                    f"Snapshot CSV missing snapshot_{index:04d}_q column.")
+        return indices
+
+    @staticmethod
     def _sweep_csv_indices(field_names, prefix):
         """Return and validate the numeric suffixes for one sweep CSV column family."""
         column_prefix = f'{prefix}_'
@@ -382,7 +477,11 @@ class ReadoutClient:
         return columns
 
     def send_request(self, message):
-        """Send a length-prefixed JSON request to the server and return its response."""
+        """Send a length-prefixed JSON request to the server and return its response.
+
+        ``message`` is the request ``dict`` (must contain a ``'request'`` key);
+        it is JSON-encoded and sent to the server (or the mock).
+        """
         if self.mock:
             return self._mock_server.send_request(message)
 
@@ -460,7 +559,12 @@ class ReadoutClient:
         return response
 
     def ensure_ready(self, config_file=None, level="pipeline"):
-        """Ensure the server, firmware, or pipeline is ready before use."""
+        """Ensure the server, firmware, or pipeline is ready before use.
+
+        ``config_file`` is an optional config the server should (re)load first;
+        ``level`` selects how much to bring up, one of ``'server'``,
+        ``'firmware'``, or ``'pipeline'`` (default).
+        """
         message = {'request': 'ensure_ready', 'config_filename': config_file, 'level': level}
         response = self.send_request(message)
         if response['status'] == 'success':
@@ -673,7 +777,12 @@ class ReadoutClient:
         }
 
     def load_path_group_delay_calibration(self, value=None, pull_if_missing=True):
-        """Load ``rf_frontend.path_group_delay_ns`` into an in-memory calibration dict."""
+        """Load ``rf_frontend.path_group_delay_ns`` into an in-memory calibration dict.
+
+        ``value`` is an explicit calibration (dict, array, or file path); when
+        ``None`` it is read from the loaded config.  ``pull_if_missing`` pulls
+        the config from the server first if none is loaded locally.
+        """
         if value is None:
             if self.config is None:
                 raise RuntimeError(
@@ -721,7 +830,8 @@ class ReadoutClient:
 
 
     def push_calibration(self, calibration_file):
-        """Upload one local calibration file to the RFSoC server."""
+        """Upload one local calibration file (``calibration_file`` path) to the
+        RFSoC server, keyed by its basename."""
         with open(calibration_file,'r') as file:
             cal = file.read()
         cal_filename=os.path.basename(calibration_file)
@@ -735,7 +845,11 @@ class ReadoutClient:
             return response
 
     def pull_calibration(self, remote_file, destination_file=None):
-        """Download one calibration file from the RFSoC server."""
+        """Download one calibration file from the RFSoC server.
+
+        ``remote_file`` is the server-side filename; ``destination_file`` is
+        the local path to write (defaults to the config dir + basename).
+        """
         if destination_file is None:
             destination_file = os.path.join(self.config_dir, os.path.basename(remote_file))
         message = {'request':'pull_calibration',
@@ -995,11 +1109,28 @@ class ReadoutClient:
         return self.config
 
     def sync_config_to_local(self, save_as=None):
-        """Capture current runtime settings into this client's local config."""
+        """Capture current runtime settings into this client's local config.
+
+        ``save_as`` optionally writes the synced config to that path (otherwise
+        it is only updated in memory).
+        """
         return self.sync_config_from_system(save_as=save_as)
 
     def set_parameter(self, param_name, param_value):
-        """Set a named server/firmware parameter."""
+        """Set a named server/firmware parameter.
+
+        Parameters
+        ----------
+        param_name : str
+            Name of a server-registered parameter, e.g. ``'sample_rate_hz'``,
+            ``'tone_frequencies'``, ``'tone_powers'``, ``'tone_amplitudes'``,
+            ``'tone_phases'``, ``'fft_shift'``, ``'tx_attenuation_db'``,
+            ``'rx_attenuation_db'``.  Most named setters on this client
+            (``set_sample_rate`` etc.) are thin wrappers over this.
+        param_value
+            New value, in the type/shape the server expects for that
+            parameter (scalar, array-like, or dict as appropriate).
+        """
         message = {'request': 'set', 'param': param_name, 'value': param_value}
         response = self.send_request(message)
         if response['status'] == 'success':
@@ -1009,7 +1140,20 @@ class ReadoutClient:
             return response
 
     def get_parameter(self, param_name, **kwargs):
-        """Get a named server/firmware parameter, with optional request metadata."""
+        """Get a named server/firmware parameter, with optional request metadata.
+
+        Parameters
+        ----------
+        param_name : str
+            Name of a server-registered parameter (see
+            :py:meth:`set_parameter` for examples).
+        **kwargs
+            Extra fields merged into the request and interpreted by the
+            server's handler for ``param_name``.  For power-related
+            parameters this includes ``reference_plane`` (one of ``'dac'``,
+            ``'rf_output'``, ``'adc_input'``, ``'detector'``); other handlers
+            accept their own qualifiers.
+        """
         message = {'request': 'get', 'param': param_name}
         message.update(kwargs)
         response = self.send_request(message)
@@ -1020,7 +1164,7 @@ class ReadoutClient:
             return response
 
     def set_sample_rate(self, sample_rate_hz):
-        """Set the accumulator sample rate in Hz."""
+        """Set the accumulator sample rate to ``sample_rate_hz`` (Hz)."""
         return self.set_parameter('sample_rate_hz',sample_rate_hz)
 
     def get_sample_rate(self):
@@ -1032,12 +1176,13 @@ class ReadoutClient:
         return self.get_parameter('telescope_time')
 
     def set_tone_frequencies(self, tone_frequencies):
-        """Set active tone frequencies in Hz."""
+        """Set the active ``tone_frequencies`` (array-like, Hz)."""
         tone_frequencies = np.atleast_1d(tone_frequencies).tolist()
         return self.set_parameter('tone_frequencies',tone_frequencies)
 
     def get_tone_frequencies(self,detailed_output=False):
-        """Return active tone frequencies, optionally with detailed metadata."""
+        """Return active tone frequencies; with ``detailed_output=True`` return
+        the per-tone metadata dict instead of the bare frequency array."""
         if detailed_output:
             return self.get_parameter('tone_frequencies_detailed')
         else:
@@ -1068,7 +1213,11 @@ class ReadoutClient:
         self.config_raw_text = None
 
     def get_blind_tones(self, reference_plane='detector'):
-        """Return current blind-tone state and user-facing indices."""
+        """Return current blind-tone state and user-facing indices.
+
+        ``reference_plane`` ('dac', 'rf_output', 'adc_input', or 'detector')
+        sets the plane any reported powers are referred to.
+        """
         response = self.send_request({
             'request': 'get_blind_tones',
             'reference_plane': reference_plane,
@@ -1088,6 +1237,27 @@ class ReadoutClient:
         The server snapshots the currently active regular tones, appends the
         supplied blind tones, updates its in-memory tone
         metadata, and immediately applies to firmware.
+
+        Parameters
+        ----------
+        frequencies : array-like
+            Blind-tone frequencies (Hz).
+        amplitudes : array-like or None, optional
+            Per-tone amplitudes; server default used when ``None``.
+        phases : array-like or None, optional
+            Per-tone phases (radians); server default used when ``None``.
+        spans : array-like or None, optional
+            Per-tone sweep spans (Hz) recorded with the blind tones.
+        powers_dbm : array-like or None, optional
+            Per-tone powers (dBm at ``reference_plane``); used instead of
+            ``amplitudes`` when given.
+        reference_plane : str, optional
+            Plane ``powers_dbm`` is specified at (default ``'detector'``).
+        optimise_dynamic_range : bool, optional
+            Re-optimise DAC bit utilisation when applying (default ``False``).
+        rx_policy : str, optional
+            RX-path policy when applying, as in :py:meth:`set_tone_powers`
+            (default ``'protect'``).
         """
         message = {
             'request': 'set_blind_tones',
@@ -1121,7 +1291,7 @@ class ReadoutClient:
         return response
 
     def set_tone_amplitudes(self, tone_amplitudes):
-        """Set per-tone amplitude scale factors."""
+        """Set the per-tone amplitude scale factors from ``tone_amplitudes``."""
         tone_amplitudes = np.atleast_1d(tone_amplitudes).tolist()
         return self.set_parameter('tone_amplitudes',tone_amplitudes)
 
@@ -1130,7 +1300,7 @@ class ReadoutClient:
         return np.atleast_1d(self.get_parameter('tone_amplitudes'))
 
     def set_tone_phases(self, tone_phases):
-        """Set per-tone phase offsets in radians."""
+        """Set the per-tone phase offsets (radians) from ``tone_phases``."""
         tone_phases = np.atleast_1d(tone_phases).tolist()
         return self.set_parameter('tone_phases',tone_phases)
 
@@ -1164,7 +1334,7 @@ class ReadoutClient:
     # -- Pipeline DSP parameters --
 
     def set_sync_delay(self, value):
-        """Set the sync delay (integer)."""
+        """Set the sync delay to integer ``value``."""
         return self.set_parameter('sync_delay', int(value))
 
     def get_sync_delay(self):
@@ -1172,7 +1342,7 @@ class ReadoutClient:
         return self.get_parameter('sync_delay')
 
     def set_acc_len(self, value):
-        """Set the accumulation length (integer)."""
+        """Set the accumulation length to integer ``value``."""
         return self.set_parameter('acc_len', int(value))
 
     def get_acc_len(self):
@@ -1180,7 +1350,7 @@ class ReadoutClient:
         return self.get_parameter('acc_len')
 
     def set_internal_loopback(self, enabled):
-        """Enable or disable the internal loopback."""
+        """Enable (``enabled=True``) or disable (``False``) the internal loopback."""
         return self.set_parameter('internal_loopback', bool(enabled))
 
     def get_internal_loopback(self):
@@ -1188,7 +1358,7 @@ class ReadoutClient:
         return self.get_parameter('internal_loopback')
 
     def set_psb_scale(self, value):
-        """Set the PSB scale factor (integer)."""
+        """Set the PSB scale factor to integer ``value``."""
         return self.set_parameter('psb_scale', int(value))
 
     def get_psb_scale(self):
@@ -1196,7 +1366,7 @@ class ReadoutClient:
         return self.get_parameter('psb_scale')
 
     def set_psb_fftshift(self, value):
-        """Set the PSB FFT shift pattern (integer bitmask)."""
+        """Set the PSB FFT shift pattern to integer bitmask ``value``."""
         return self.set_parameter('psb_fftshift', int(value))
 
     def get_psb_fftshift(self):
@@ -1204,16 +1374,73 @@ class ReadoutClient:
         return self.get_parameter('psb_fftshift')
 
     def set_pfb_fftshift(self, value):
-        """Set the PFB FFT shift pattern (integer bitmask)."""
+        """Set the PFB FFT shift pattern to integer bitmask ``value``."""
         return self.set_parameter('pfb_fftshift', int(value))
 
     def get_pfb_fftshift(self):
         """Get the current PFB FFT shift pattern."""
         return self.get_parameter('pfb_fftshift')
 
+    @staticmethod
+    def _add_power_force_controls(
+            message, force_tx_amp_bypass=None, force_rx_amp_bypass=None,
+            force_tx_attenuation_db=None, force_rx_attenuation_db=None,
+            force_adc_dsa_db=None, force_tone_amplitudes=None,
+            force_tone_amplitude=None, force_psb_fftshift=None,
+            force_psb_shift=None, force_psb_scale=None,
+            force_pfb_fftshift=None, force_pfb_shift=None):
+        """Add fixed-value power optimisation controls to a request message."""
+        if force_tone_amplitudes is not None and force_tone_amplitude is not None:
+            raise ValueError(
+                'Specify only one of force_tone_amplitudes or force_tone_amplitude')
+        if force_psb_fftshift is not None and force_psb_shift is not None:
+            raise ValueError(
+                'Specify only one of force_psb_fftshift or force_psb_shift')
+        if force_pfb_fftshift is not None and force_pfb_shift is not None:
+            raise ValueError(
+                'Specify only one of force_pfb_fftshift or force_pfb_shift')
+
+        if force_tone_amplitudes is None:
+            force_tone_amplitudes = force_tone_amplitude
+        if force_psb_fftshift is None:
+            force_psb_fftshift = force_psb_shift
+        if force_pfb_fftshift is None:
+            force_pfb_fftshift = force_pfb_shift
+
+        controls = {
+            'force_tx_amp_bypass': force_tx_amp_bypass,
+            'force_rx_amp_bypass': force_rx_amp_bypass,
+            'force_tx_attenuation_db': force_tx_attenuation_db,
+            'force_rx_attenuation_db': force_rx_attenuation_db,
+            'force_adc_dsa_db': force_adc_dsa_db,
+            'force_tone_amplitudes': force_tone_amplitudes,
+            'force_psb_fftshift': force_psb_fftshift,
+            'force_psb_scale': force_psb_scale,
+            'force_pfb_fftshift': force_pfb_fftshift,
+        }
+        for key, value in controls.items():
+            if value is None:
+                continue
+            if key in ('force_tx_amp_bypass', 'force_rx_amp_bypass'):
+                message[key] = bool(value)
+            elif key == 'force_tone_amplitudes':
+                message[key] = np.atleast_1d(value).astype(float).tolist()
+            elif key in ('force_psb_fftshift', 'force_pfb_fftshift'):
+                message[key] = int(value)
+            else:
+                message[key] = float(value)
+        return message
+
     def set_tone_powers(self, tone_powers_dbm, reference_plane='detector',
                         optimise_dynamic_range=True, rx_policy='protect',
-                        verbose=True):
+                        verbose=True, *, force_tx_amp_bypass=None,
+                        force_rx_amp_bypass=None,
+                        force_tx_attenuation_db=None,
+                        force_rx_attenuation_db=None,
+                        force_adc_dsa_db=None, force_tone_amplitudes=None,
+                        force_tone_amplitude=None, force_psb_fftshift=None,
+                        force_psb_shift=None, force_psb_scale=None,
+                        force_pfb_fftshift=None, force_pfb_shift=None):
         """Set tone powers to specified levels in dBm.
 
         Parameters
@@ -1244,6 +1471,38 @@ class ReadoutClient:
         verbose : bool
             If False, suppress client-side informational summaries.  Warnings
             and errors are still printed.
+        force_tx_amp_bypass, force_rx_amp_bypass : bool or None, optional
+            Pin the TX/RX amplifier bypass state instead of letting the
+            optimiser choose it.
+        force_tx_attenuation_db, force_rx_attenuation_db : float or None, optional
+            Pin the TX/RX programmable-attenuator values (dB).
+        force_adc_dsa_db : float or None, optional
+            Pin the ADC digital step-attenuator value (dB).
+        force_tone_amplitudes : array-like or None, optional
+            Pin the per-tone digital amplitudes.
+        force_tone_amplitude : float or None, optional
+            Pin a single amplitude for all tones (mutually exclusive with
+            ``force_tone_amplitudes``).
+        force_psb_fftshift : int or None, optional
+            Pin the PSB FFT-shift schedule (``force_psb_shift`` is an accepted
+            alias).
+        force_psb_shift : int or None, optional
+            Alias for ``force_psb_fftshift``.
+        force_psb_scale : float or None, optional
+            Pin the PSB output scale.
+        force_pfb_fftshift : int or None, optional
+            Pin the PFB FFT-shift schedule (``force_pfb_shift`` is an accepted
+            alias).
+        force_pfb_shift : int or None, optional
+            Alias for ``force_pfb_fftshift``.
+
+        Notes
+        -----
+        The ``force_*`` overrides pin individual power-chain controls instead
+        of letting ``optimise_dynamic_range`` choose them; any left ``None``
+        are optimised as usual.  The same set is accepted by
+        :py:meth:`maximise_tx_power`, :py:meth:`maximise_rx_power`,
+        :py:meth:`optimise_tx_snr`, and :py:meth:`optimise_rx_snr`.
         """
         tone_powers_dbm = np.atleast_1d(tone_powers_dbm).tolist()
         message = {'request': 'set', 'param': 'tone_powers',
@@ -1251,6 +1510,20 @@ class ReadoutClient:
                    'reference_plane': reference_plane,
                    'optimise_dynamic_range': optimise_dynamic_range,
                    'rx_policy': rx_policy}
+        self._add_power_force_controls(
+            message,
+            force_tx_amp_bypass=force_tx_amp_bypass,
+            force_rx_amp_bypass=force_rx_amp_bypass,
+            force_tx_attenuation_db=force_tx_attenuation_db,
+            force_rx_attenuation_db=force_rx_attenuation_db,
+            force_adc_dsa_db=force_adc_dsa_db,
+            force_tone_amplitudes=force_tone_amplitudes,
+            force_tone_amplitude=force_tone_amplitude,
+            force_psb_fftshift=force_psb_fftshift,
+            force_psb_shift=force_psb_shift,
+            force_psb_scale=force_psb_scale,
+            force_pfb_fftshift=force_pfb_fftshift,
+            force_pfb_shift=force_pfb_shift)
         response = self.send_request(message)
         if response.get('status') != 'success':
             print(f"Error setting tone powers: {response.get('message')}")
@@ -1308,17 +1581,26 @@ class ReadoutClient:
             return np.atleast_1d(self.get_parameter('tone_powers', reference_plane=reference_plane))
 
     def check_input_saturation(self,iterations=250):
-        """Check whether the ADC/input path is saturating."""
+        """Check whether the ADC/input path is saturating.
+
+        ``iterations`` is the number of samples checked (default 250).
+        """
         message = {'request': 'check_input_saturation','iterations':iterations}
         return self.send_request(message)
 
     def check_output_saturation(self,iterations=250):
-        """Check whether the DAC/output path is saturating."""
+        """Check whether the DAC/output path is saturating.
+
+        ``iterations`` is the number of samples checked (default 250).
+        """
         message = {'request': 'check_output_saturation','iterations':iterations}
         return self.send_request(message)
 
     def check_dsp_overflow(self,duration_s=0.2):
-        """Check whether DSP overflow flags occur during a short interval."""
+        """Check whether DSP overflow flags occur during a short interval.
+
+        ``duration_s`` is how long to watch the overflow flags (seconds).
+        """
         message = {'request': 'check_dsp_overflow','duration_s':duration_s}
         return self.send_request(message)
     
@@ -1326,7 +1608,15 @@ class ReadoutClient:
     #       maximise/optimise/fix operations (requires save_config, see push_config TODO).
     def maximise_tx_power(self, headroom_db=2.0, reference_plane='dac',
                           power_limit_dbm=None, compression_headroom_db=None,
-                          rx_policy='protect', digital_only=False, rf_only=False):
+                          rx_policy='protect', digital_only=False, rf_only=False,
+                          *, force_tx_amp_bypass=None,
+                          force_rx_amp_bypass=None,
+                          force_tx_attenuation_db=None,
+                          force_rx_attenuation_db=None,
+                          force_adc_dsa_db=None, force_tone_amplitudes=None,
+                          force_tone_amplitude=None, force_psb_fftshift=None,
+                          force_psb_shift=None, force_psb_scale=None,
+                          force_pfb_fftshift=None, force_pfb_shift=None):
         """Maximise TX output power at the chosen reference plane.
 
         Parameters
@@ -1358,37 +1648,163 @@ class ReadoutClient:
             If True, only firmware/RFDC parameters are adjusted.
         rf_only : bool
             If True, only RF frontend attenuators and bypass amps are adjusted.
+        force_tx_amp_bypass, force_rx_amp_bypass, force_tx_attenuation_db, force_rx_attenuation_db, force_adc_dsa_db, force_tone_amplitudes, force_tone_amplitude, force_psb_fftshift, force_psb_shift, force_psb_scale, force_pfb_fftshift, force_pfb_shift : optional
+            Pin individual power-chain controls instead of optimising them; see
+            :py:meth:`set_tone_powers` for the full description of each.
         """
         msg = {'request': 'maximise_tx_power', 'headroom_db': headroom_db,
                'reference_plane': reference_plane, 'rx_policy': rx_policy,
                'digital_only': digital_only, 'rf_only': rf_only}
+        self._add_power_force_controls(
+            msg,
+            force_tx_amp_bypass=force_tx_amp_bypass,
+            force_rx_amp_bypass=force_rx_amp_bypass,
+            force_tx_attenuation_db=force_tx_attenuation_db,
+            force_rx_attenuation_db=force_rx_attenuation_db,
+            force_adc_dsa_db=force_adc_dsa_db,
+            force_tone_amplitudes=force_tone_amplitudes,
+            force_tone_amplitude=force_tone_amplitude,
+            force_psb_fftshift=force_psb_fftshift,
+            force_psb_shift=force_psb_shift,
+            force_psb_scale=force_psb_scale,
+            force_pfb_fftshift=force_pfb_fftshift,
+            force_pfb_shift=force_pfb_shift)
         if power_limit_dbm is not None:
             msg['power_limit_dbm'] = power_limit_dbm
         if compression_headroom_db is not None:
             msg['compression_headroom_db'] = compression_headroom_db
         return self.send_request(msg)
 
-    def maximise_rx_power(self, headroom_db=1.0, digital_only=False, rf_only=False):
-        """Maximise RX chain power while retaining the requested headroom."""
-        return self.send_request({'request': 'maximise_rx_power',
-                                  'headroom_db': headroom_db,
-                                  'digital_only': digital_only,
-                                  'rf_only': rf_only})
+    def maximise_rx_power(self, headroom_db=1.0, digital_only=False, rf_only=False,
+                          *, force_tx_amp_bypass=None,
+                          force_rx_amp_bypass=None,
+                          force_tx_attenuation_db=None,
+                          force_rx_attenuation_db=None,
+                          force_adc_dsa_db=None, force_tone_amplitudes=None,
+                          force_tone_amplitude=None, force_psb_fftshift=None,
+                          force_psb_shift=None, force_psb_scale=None,
+                          force_pfb_fftshift=None, force_pfb_shift=None):
+        """Maximise RX chain power while retaining the requested headroom.
+
+        Parameters
+        ----------
+        headroom_db : float, optional
+            Safety margin below ADC saturation to retain (default 1.0 dB).
+        digital_only : bool, optional
+            If True, only firmware/RFDC parameters are adjusted.
+        rf_only : bool, optional
+            If True, only RF frontend attenuators and bypass amps are adjusted.
+        force_tx_amp_bypass, force_rx_amp_bypass, force_tx_attenuation_db, force_rx_attenuation_db, force_adc_dsa_db, force_tone_amplitudes, force_tone_amplitude, force_psb_fftshift, force_psb_shift, force_psb_scale, force_pfb_fftshift, force_pfb_shift : optional
+            Pin individual power-chain controls instead of optimising them; see
+            :py:meth:`set_tone_powers` for the full description of each.
+        """
+        msg = {'request': 'maximise_rx_power',
+               'headroom_db': headroom_db,
+               'digital_only': digital_only,
+               'rf_only': rf_only}
+        self._add_power_force_controls(
+            msg,
+            force_tx_amp_bypass=force_tx_amp_bypass,
+            force_rx_amp_bypass=force_rx_amp_bypass,
+            force_tx_attenuation_db=force_tx_attenuation_db,
+            force_rx_attenuation_db=force_rx_attenuation_db,
+            force_adc_dsa_db=force_adc_dsa_db,
+            force_tone_amplitudes=force_tone_amplitudes,
+            force_tone_amplitude=force_tone_amplitude,
+            force_psb_fftshift=force_psb_fftshift,
+            force_psb_shift=force_psb_shift,
+            force_psb_scale=force_psb_scale,
+            force_pfb_fftshift=force_pfb_fftshift,
+            force_pfb_shift=force_pfb_shift)
+        return self.send_request(msg)
 
     def optimise_tx_snr(self, reference_plane='detector', headroom_db=2.0,
-                        digital_only=False, rf_only=False):
-        """Optimise TX settings for SNR at the requested reference plane."""
-        return self.send_request({'request': 'optimise_tx_snr',
-                                  'reference_plane': reference_plane,
-                                  'headroom_db': headroom_db,
-                                  'digital_only': digital_only,
-                                  'rf_only': rf_only})
+                        digital_only=False, rf_only=False, *,
+                        force_tx_amp_bypass=None,
+                        force_rx_amp_bypass=None,
+                        force_tx_attenuation_db=None,
+                        force_rx_attenuation_db=None,
+                        force_adc_dsa_db=None, force_tone_amplitudes=None,
+                        force_tone_amplitude=None, force_psb_fftshift=None,
+                        force_psb_shift=None, force_psb_scale=None,
+                        force_pfb_fftshift=None, force_pfb_shift=None):
+        """Optimise TX settings for SNR at the requested reference plane.
 
-    def optimise_rx_snr(self, digital_only=False, rf_only=False):
-        """Optimise RX settings for SNR."""
-        return self.send_request({'request': 'optimise_rx_snr',
-                                  'digital_only': digital_only,
-                                  'rf_only': rf_only})
+        Parameters
+        ----------
+        reference_plane : str, optional
+            Plane the optimisation targets: 'dac', 'rf_output', or 'detector'
+            (default).
+        headroom_db : float, optional
+            Safety margin below DAC saturation to retain (default 2.0 dB).
+        digital_only : bool, optional
+            If True, only firmware/RFDC parameters are adjusted.
+        rf_only : bool, optional
+            If True, only RF frontend attenuators and bypass amps are adjusted.
+        force_tx_amp_bypass, force_rx_amp_bypass, force_tx_attenuation_db, force_rx_attenuation_db, force_adc_dsa_db, force_tone_amplitudes, force_tone_amplitude, force_psb_fftshift, force_psb_shift, force_psb_scale, force_pfb_fftshift, force_pfb_shift : optional
+            Pin individual power-chain controls instead of optimising them; see
+            :py:meth:`set_tone_powers` for the full description of each.
+        """
+        msg = {'request': 'optimise_tx_snr',
+               'reference_plane': reference_plane,
+               'headroom_db': headroom_db,
+               'digital_only': digital_only,
+               'rf_only': rf_only}
+        self._add_power_force_controls(
+            msg,
+            force_tx_amp_bypass=force_tx_amp_bypass,
+            force_rx_amp_bypass=force_rx_amp_bypass,
+            force_tx_attenuation_db=force_tx_attenuation_db,
+            force_rx_attenuation_db=force_rx_attenuation_db,
+            force_adc_dsa_db=force_adc_dsa_db,
+            force_tone_amplitudes=force_tone_amplitudes,
+            force_tone_amplitude=force_tone_amplitude,
+            force_psb_fftshift=force_psb_fftshift,
+            force_psb_shift=force_psb_shift,
+            force_psb_scale=force_psb_scale,
+            force_pfb_fftshift=force_pfb_fftshift,
+            force_pfb_shift=force_pfb_shift)
+        return self.send_request(msg)
+
+    def optimise_rx_snr(self, digital_only=False, rf_only=False, *,
+                        force_tx_amp_bypass=None,
+                        force_rx_amp_bypass=None,
+                        force_tx_attenuation_db=None,
+                        force_rx_attenuation_db=None,
+                        force_adc_dsa_db=None, force_tone_amplitudes=None,
+                        force_tone_amplitude=None, force_psb_fftshift=None,
+                        force_psb_shift=None, force_psb_scale=None,
+                        force_pfb_fftshift=None, force_pfb_shift=None):
+        """Optimise RX settings for SNR.
+
+        Parameters
+        ----------
+        digital_only : bool, optional
+            If True, only firmware/RFDC parameters are adjusted.
+        rf_only : bool, optional
+            If True, only RF frontend attenuators and bypass amps are adjusted.
+        force_tx_amp_bypass, force_rx_amp_bypass, force_tx_attenuation_db, force_rx_attenuation_db, force_adc_dsa_db, force_tone_amplitudes, force_tone_amplitude, force_psb_fftshift, force_psb_shift, force_psb_scale, force_pfb_fftshift, force_pfb_shift : optional
+            Pin individual power-chain controls instead of optimising them; see
+            :py:meth:`set_tone_powers` for the full description of each.
+        """
+        msg = {'request': 'optimise_rx_snr',
+               'digital_only': digital_only,
+               'rf_only': rf_only}
+        self._add_power_force_controls(
+            msg,
+            force_tx_amp_bypass=force_tx_amp_bypass,
+            force_rx_amp_bypass=force_rx_amp_bypass,
+            force_tx_attenuation_db=force_tx_attenuation_db,
+            force_rx_attenuation_db=force_rx_attenuation_db,
+            force_adc_dsa_db=force_adc_dsa_db,
+            force_tone_amplitudes=force_tone_amplitudes,
+            force_tone_amplitude=force_tone_amplitude,
+            force_psb_fftshift=force_psb_fftshift,
+            force_psb_shift=force_psb_shift,
+            force_psb_scale=force_psb_scale,
+            force_pfb_fftshift=force_pfb_fftshift,
+            force_pfb_shift=force_pfb_shift)
+        return self.send_request(msg)
 
     def fix_dac_saturation(self):
         """Ask the server to reduce or reconfigure output drive to clear DAC saturation."""
@@ -1399,7 +1815,11 @@ class ReadoutClient:
         return self.send_request({'request': 'fix_adc_saturation'})
 
     def fix_dsp_overflow(self, duration_s=0.5, max_iterations=10):
-        """Ask the server to adjust DSP settings until overflow clears."""
+        """Ask the server to adjust DSP settings until overflow clears.
+
+        ``duration_s`` is the overflow-watch interval per attempt (seconds);
+        ``max_iterations`` caps the number of adjustment attempts.
+        """
         return self.send_request({'request': 'fix_dsp_overflow',
                                   'duration_s': duration_s,
                                   'max_iterations': max_iterations})
@@ -1411,7 +1831,7 @@ class ReadoutClient:
         return self.send_request({'request': 'get_rf_peripheral_status'})
 
     def set_tx_attenuation(self, value_db):
-        """Set TX attenuation in dB."""
+        """Set the TX programmable attenuation to ``value_db`` (dB)."""
         return self.send_request({'request': 'set_tx_attenuation', 'value': float(value_db)})
 
     def get_tx_attenuation(self):
@@ -1419,7 +1839,7 @@ class ReadoutClient:
         return self.send_request({'request': 'get_tx_attenuation'})
 
     def set_rx_attenuation(self, value_db):
-        """Set RX attenuation in dB."""
+        """Set the RX programmable attenuation to ``value_db`` (dB)."""
         return self.send_request({'request': 'set_rx_attenuation', 'value': float(value_db)})
 
     def get_rx_attenuation(self):
@@ -1582,7 +2002,8 @@ class ReadoutClient:
         return self.get_parameter('cal_freeze')
 
     def set_cal_freeze(self,freeze):
-        """Freeze or unfreeze ADC calibration."""
+        """Freeze (``freeze=True``) or unfreeze (``False``) the ADC background
+        calibration."""
         return self.set_parameter('cal_freeze',freeze)
 
     def refresh_adc_cal(self, adc_cal_settle_time=2.0):
@@ -1635,6 +2056,16 @@ class ReadoutClient:
         The server sends only active tones in user order, so the frame
         size depends on the number of active tones. The per-frame byte
         count is stored in sample_data['frame_bytes'] for parse_samples.
+
+        Parameters
+        ----------
+        num_samples : int
+            Number of accumulator samples to acquire.
+        incl_system_info : bool, optional
+            Include a system-info block in the returned data (default ``True``).
+        burst : bool, optional
+            Use a single burst transfer instead of streaming frames (default
+            ``False``).
         """
         if self.mock:
             return self._mock_server.get_samples(num_samples, incl_system_info, burst)
@@ -1697,6 +2128,14 @@ class ReadoutClient:
 
         Falls back to 2048 channels for data from older servers that
         send all channels.
+
+        Parameters
+        ----------
+        sample_data : dict
+            Raw sample data returned by :py:meth:`get_samples`.
+        num_tones : int or None, optional
+            Override the tone count; ``None`` (default) infers it from the
+            frame size / tone metadata.
         """
         data_raw = sample_data['data_raw']
         sample_rate = sample_data['sample_rate']
@@ -1750,7 +2189,21 @@ class ReadoutClient:
 
     @staticmethod
     def export_samples(filename, sample_data, num_tones_to_save=None,file_format=None):
-        """Export raw or parsed sample captures to npy, json, or CSV."""
+        """Export raw or parsed sample captures to npy, json, or CSV.
+
+        Parameters
+        ----------
+        filename : str
+            Output path; its extension selects the format if ``file_format``
+            is not given.
+        sample_data : dict
+            Raw (from :py:meth:`get_samples`) or already-parsed sample data.
+        num_tones_to_save : int or None, optional
+            Limit the number of tones written when parsing raw data; ``None``
+            saves all.
+        file_format : {'npy', 'json', 'csv'} or None, optional
+            Output format; ``None`` (default) infers it from ``filename``.
+        """
         filepath, file_format = ReadoutClient._resolve_export_path(
             filename, file_format, ('npy', 'json', 'csv'))
 
@@ -1818,7 +2271,8 @@ class ReadoutClient:
 
     @staticmethod
     def import_samples(filename):
-        """Import sample captures previously written by ``export_samples``."""
+        """Import sample captures from ``filename`` (written by
+        ``export_samples``); the format is inferred from its extension."""
         data_dict={}
         if filename.endswith('.npy'):
             data_dict = np.load(filename,allow_pickle=True).item()
@@ -1948,20 +2402,155 @@ class ReadoutClient:
                 'fast': bool(fast)}
 
     @staticmethod
-    def analyse_accumulator_snapshots(snapshot_data, threshold=1.5):
+    def _normalise_snapshot_data(snapshot_data):
+        """Return accumulator snapshot data with consistent array metadata."""
+        if 'snapshots' not in snapshot_data:
+            raise ValueError(
+                "Accumulator snapshot data must contain a 'snapshots' array.")
+
+        data_dict = dict(snapshot_data)
+        snapshots = np.asarray(data_dict['snapshots'], dtype=np.complex128)
+        if snapshots.ndim == 1:
+            snapshots = snapshots[np.newaxis, :]
+        if snapshots.ndim != 2:
+            raise ValueError(
+                "snapshots must be a 2D array of shape "
+                "(num_snapshots, len_snapshot).")
+
+        data_dict['snapshots'] = snapshots
+        data_dict.setdefault('num_snapshots', snapshots.shape[0])
+        data_dict.setdefault('len_snapshot', snapshots.shape[1])
+        return data_dict
+
+    @staticmethod
+    def export_snapshot(filename, snapshot_data, file_format=None):
+        """
+        Export accumulator snapshot data to npy, json, or CSV.
+
+        This is for pre-accumulation snapshots returned by
+        ``get_accumulator_snapshots()``, not ADC/DAC snapshots.
+
+        Parameters
+        ----------
+        filename : str
+            Output path; its extension selects the format when ``file_format``
+            is not given.
+        snapshot_data : dict
+            Snapshot data to export.
+        file_format : {'npy', 'json', 'csv'} or None, optional
+            Output format; ``None`` (default) infers it from ``filename``
+            (falling back to ``'npy'``).
+        """
+        filepath, file_format = ReadoutClient._resolve_export_path(
+            filename, file_format, ('npy', 'json', 'csv'), default='npy')
+        data_dict = ReadoutClient._normalise_snapshot_data(snapshot_data)
+
+        dirpath = os.path.dirname(filepath)
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath)
+
+        if file_format == 'npy':
+            np.save(filepath, data_dict)
+
+        elif file_format == 'json':
+            with open(filepath, 'w') as file:
+                json.dump(ReadoutClient._json_ready(data_dict), file, indent=4)
+
+        elif file_format == 'csv':
+            snapshots = data_dict['snapshots']
+            with open(filepath, mode='w', newline='') as file:
+                writer = csv.writer(file)
+                if 'date' in data_dict:
+                    writer.writerow(['# date', data_dict['date']])
+                if 'tone_index' in data_dict:
+                    writer.writerow(['# tone_index', data_dict['tone_index']])
+                writer.writerow(['# sample_rate', data_dict.get('sample_rate', '')])
+                writer.writerow(['# num_snapshots', snapshots.shape[0]])
+                writer.writerow(['# len_snapshot', snapshots.shape[1]])
+                if 'fast' in data_dict:
+                    writer.writerow(['# fast', data_dict['fast']])
+                writer.writerow(['# csv_layout', 'snapshot_columns'])
+                if isinstance(data_dict.get('info'), dict):
+                    ReadoutClient._write_csv_info_metadata(
+                        writer, data_dict['info'])
+
+                header = ['sample_index']
+                for snap_index in range(snapshots.shape[0]):
+                    header.extend([
+                        f'snapshot_{snap_index:04d}_i',
+                        f'snapshot_{snap_index:04d}_q',
+                    ])
+                writer.writerow(header)
+                for sample_index in range(snapshots.shape[1]):
+                    row = [sample_index]
+                    for snap_index in range(snapshots.shape[0]):
+                        value = snapshots[snap_index, sample_index]
+                        row.extend([value.real, value.imag])
+                    writer.writerow(row)
+
+        else:
+            raise ValueError(
+                f"Invalid file_format {file_format}. Must be one of "
+                "'npy', 'json', or 'csv'.")
+
+    @staticmethod
+    def import_snapshot(filename):
+        """Import accumulator snapshot data from ``filename`` (written by
+        ``export_snapshot``)."""
+        if filename.endswith('.npy'):
+            data_dict = np.load(filename, allow_pickle=True).item()
+            return ReadoutClient._normalise_snapshot_data(data_dict)
+
+        if filename.endswith('.json'):
+            with open(filename, 'r') as file:
+                data_dict = ReadoutClient._restore_json_value(json.load(file))
+            return ReadoutClient._normalise_snapshot_data(data_dict)
+
+        if filename.endswith('.csv'):
+            data_dict, header_lines = ReadoutClient._read_csv_comment_metadata(
+                filename)
+            data = np.genfromtxt(
+                filename, delimiter=',', names=True, skip_header=header_lines)
+            data = np.atleast_1d(data)
+            snapshot_indices = ReadoutClient._snapshot_csv_indices(
+                data.dtype.names)
+            snapshots = np.vstack([
+                np.atleast_1d(data[f'snapshot_{index:04d}_i'])
+                + 1j*np.atleast_1d(data[f'snapshot_{index:04d}_q'])
+                for index in snapshot_indices
+            ])
+            data_dict['snapshots'] = snapshots
+            data_dict.setdefault('num_snapshots', snapshots.shape[0])
+            data_dict.setdefault('len_snapshot', snapshots.shape[1])
+            return ReadoutClient._normalise_snapshot_data(data_dict)
+
+        if filename.endswith('.hdf5'):
+            raise NotImplementedError("hdf5 format not yet implemented.")
+        if filename.endswith('.dirfile'):
+            raise NotImplementedError("dirfile format not yet implemented.")
+        raise ValueError(f"Invalid file format {filename.split('.')[-1]}")
+
+    @staticmethod
+    def analyse_accumulator_snapshots(snapshot_data, threshold=6.0):
         """
         Summarise per-frame changes in pre-accumulator snapshots.
 
-        This is intended for spotting whole-snapshot excursions such as
-        apparent gain jumps, I/Q rotations, or mean/noise changes.
+        Frames are flagged using a robust (MAD-based) z-score on each
+        per-frame metric: |mean|, real/imag mean, noise RMS, I std, Q std.
+        A frame is suspect if any metric's |z| exceeds ``threshold``. The
+        MAD is scaled by 1.4826 so ``threshold`` is in units of equivalent
+        Gaussian sigma.
 
         Args:
             snapshot_data: Dict returned by get_accumulator_snapshots(), or a
                            2D complex array with shape (frames, samples).
-            threshold: Ratio threshold used to flag suspect frames.
+            threshold: MAD z-score above which frames are flagged. Typical
+                       values are 5-6. Lower flags more frames; higher
+                       flags fewer.
 
         Returns:
-            Dict of per-frame arrays and ``suspect_indices``.
+            Dict of per-frame arrays, per-metric z-scores (``*_z``), and
+            ``suspect_indices``.
         """
         if isinstance(snapshot_data, dict):
             snapshots = snapshot_data.get('snapshots')
@@ -1977,18 +2566,19 @@ class ReadoutClient:
 
         eps = np.finfo(float).tiny
         threshold = float(threshold)
-        if threshold <= 1.0:
-            raise ValueError('threshold must be greater than 1.0')
+        if threshold <= 0.0:
+            raise ValueError('threshold must be positive')
 
         frame_mean = np.mean(snapshots, axis=1)
         centered = snapshots - frame_mean[:, None]
         noise_rms = np.sqrt(np.mean(np.abs(centered) ** 2, axis=1))
         i_std = np.std(snapshots.real, axis=1)
         q_std = np.std(snapshots.imag, axis=1)
+        abs_mean = np.abs(frame_mean)
 
         reference_mean = (np.median(frame_mean.real)
                           + 1j * np.median(frame_mean.imag))
-        reference_abs_mean = max(float(np.median(np.abs(frame_mean))), eps)
+        reference_abs_mean = max(float(np.median(abs_mean)), eps)
         reference_noise_rms = max(float(np.median(noise_rms)), eps)
         reference_i_std = max(float(np.median(i_std)), eps)
         reference_q_std = max(float(np.median(q_std)), eps)
@@ -2002,34 +2592,42 @@ class ReadoutClient:
             complex_mean_ratio = np.full(frame_mean.shape, np.nan + 1j*np.nan)
             phase_offset_rad = np.full(frame_mean.shape, np.nan)
 
-        if abs(reference_i_mean) > eps:
-            i_mean_ratio = frame_mean.real / reference_i_mean
-            i_mean_suspect = ((np.abs(i_mean_ratio) < 1.0 / threshold) |
-                              (np.abs(i_mean_ratio) > threshold))
-        else:
-            i_mean_ratio = np.full(frame_mean.shape, np.nan)
-            i_mean_suspect = np.zeros(frame_mean.shape, dtype=bool)
-
-        if abs(reference_q_mean) > eps:
-            q_mean_ratio = frame_mean.imag / reference_q_mean
-            q_mean_suspect = ((np.abs(q_mean_ratio) < 1.0 / threshold) |
-                              (np.abs(q_mean_ratio) > threshold))
-        else:
-            q_mean_ratio = np.full(frame_mean.shape, np.nan)
-            q_mean_suspect = np.zeros(frame_mean.shape, dtype=bool)
-
-        abs_mean_ratio = np.abs(frame_mean) / reference_abs_mean
+        abs_mean_ratio = abs_mean / reference_abs_mean
         noise_rms_ratio = noise_rms / reference_noise_rms
         i_std_ratio = i_std / reference_i_std
         q_std_ratio = q_std / reference_q_std
+        if abs(reference_i_mean) > eps:
+            i_mean_ratio = frame_mean.real / reference_i_mean
+        else:
+            i_mean_ratio = np.full(frame_mean.shape, np.nan)
+        if abs(reference_q_mean) > eps:
+            q_mean_ratio = frame_mean.imag / reference_q_mean
+        else:
+            q_mean_ratio = np.full(frame_mean.shape, np.nan)
 
-        lower = 1.0 / threshold
+        def _mad_z(values):
+            """Robust z-scores via the median absolute deviation (0 if no spread)."""
+            v = np.asarray(values, dtype=float)
+            med = np.median(v)
+            scale = 1.4826 * np.median(np.abs(v - med))
+            if scale <= eps:
+                return np.zeros_like(v)
+            return (v - med) / scale
+
+        abs_mean_z = _mad_z(abs_mean)
+        noise_rms_z = _mad_z(noise_rms)
+        i_std_z = _mad_z(i_std)
+        q_std_z = _mad_z(q_std)
+        i_mean_z = _mad_z(frame_mean.real)
+        q_mean_z = _mad_z(frame_mean.imag)
+
         suspect_mask = (
-            (abs_mean_ratio < lower) | (abs_mean_ratio > threshold) |
-            (noise_rms_ratio < lower) | (noise_rms_ratio > threshold) |
-            (i_std_ratio < lower) | (i_std_ratio > threshold) |
-            (q_std_ratio < lower) | (q_std_ratio > threshold) |
-            i_mean_suspect | q_mean_suspect
+            (np.abs(abs_mean_z) > threshold) |
+            (np.abs(noise_rms_z) > threshold) |
+            (np.abs(i_std_z) > threshold) |
+            (np.abs(q_std_z) > threshold) |
+            (np.abs(i_mean_z) > threshold) |
+            (np.abs(q_mean_z) > threshold)
         )
 
         return {
@@ -2045,6 +2643,12 @@ class ReadoutClient:
             'q_std': q_std,
             'i_std_ratio': i_std_ratio,
             'q_std_ratio': q_std_ratio,
+            'abs_mean_z': abs_mean_z,
+            'noise_rms_z': noise_rms_z,
+            'i_std_z': i_std_z,
+            'q_std_z': q_std_z,
+            'i_mean_z': i_mean_z,
+            'q_mean_z': q_mean_z,
             'reference_mean': reference_mean,
             'reference_abs_mean': reference_abs_mean,
             'reference_i_mean': reference_i_mean,
@@ -2073,7 +2677,8 @@ class ReadoutClient:
             tone_indices: List of user-facing tone indices to snapshot,
                           or None for all active tones.
             num_snapshots (int): Number of 1024-sample snapshots per tone.
-            export_file (str): Path to save results as .npz. None to skip.
+            export_file (str): Path to save results. Defaults to .npz when
+                               no recognised extension is supplied. None to skip.
             plot (bool): If True, plot time-domain and power spectrum for
                          each tone.
             verbose (bool): Print progress.
@@ -2084,6 +2689,7 @@ class ReadoutClient:
                            returned by get_accumulator_snapshots).
                 'sample_rate': Pre-accumulator sample rate in Hz.
                 'num_snapshots': Snapshots per tone.
+                'len_snapshot': Samples per snapshot.
                 'tone_frequencies': Array of tone frequencies in Hz.
                 'firmware_indices': Firmware LO channel indices for each
                                     tone (from detailed tone frequency query).
@@ -2151,6 +2757,9 @@ class ReadoutClient:
                     'snapshots': tone_data,
                     'tone_index': tidx,
                     'sample_rate': snapshot_rate,
+                    'num_snapshots': num_snapshots,
+                    'len_snapshot': (
+                        tone_data.shape[1] if tone_data is not None else 0),
                 }
             t1 = time.time()
             if verbose:
@@ -2161,9 +2770,11 @@ class ReadoutClient:
             'results': results,
             'sample_rate': snapshot_rate,
             'num_snapshots': num_snapshots,
+            'tone_indices': np.asarray(tone_indices, dtype=int),
             'tone_frequencies': freqs,
             'firmware_indices': fw_indices,
         }
+        output = self._normalise_batch_snapshot_data(output)
 
         if export_file is not None:
             self._export_batch_snapshots(output, export_file, verbose)
@@ -2173,25 +2784,268 @@ class ReadoutClient:
 
         return output
 
+    def batch_snapshot(self, *args, **kwargs):
+        """Alias for :py:meth:`batch_snapshots` using singular naming.
+
+        ``*args`` and ``**kwargs`` are forwarded unchanged; see
+        :py:meth:`batch_snapshots` for the accepted parameters.
+        """
+        return self.batch_snapshots(*args, **kwargs)
+
+    @staticmethod
+    def _normalise_batch_snapshot_data(batch_data):
+        """Return batch accumulator snapshot data with consistent metadata."""
+        if 'results' not in batch_data:
+            raise ValueError("Batch snapshot data must contain 'results'.")
+
+        data_dict = dict(batch_data)
+        results = {}
+        for tone_index, snap_data in data_dict['results'].items():
+            tone_index = int(tone_index)
+            snap_dict = dict(snap_data)
+            snap_dict.setdefault('tone_index', tone_index)
+            if 'sample_rate' not in snap_dict and 'sample_rate' in data_dict:
+                snap_dict['sample_rate'] = data_dict['sample_rate']
+            results[tone_index] = ReadoutClient._normalise_snapshot_data(
+                snap_dict)
+
+        tone_indices = np.asarray(list(results.keys()), dtype=int)
+        data_dict['results'] = results
+        data_dict['tone_indices'] = np.asarray(
+            data_dict.get('tone_indices', tone_indices), dtype=int)
+        data_dict['num_snapshots'] = int(data_dict.get(
+            'num_snapshots',
+            next(iter(results.values()))['num_snapshots']
+            if results else 0))
+        if 'len_snapshot' not in data_dict:
+            if results:
+                len_snapshots = np.asarray(
+                    [snap['len_snapshot'] for snap in results.values()],
+                    dtype=int)
+                if np.all(len_snapshots == len_snapshots[0]):
+                    data_dict['len_snapshot'] = int(len_snapshots[0])
+                else:
+                    data_dict['len_snapshot'] = len_snapshots
+            else:
+                data_dict['len_snapshot'] = 0
+        if 'sample_rate' not in data_dict and results:
+            data_dict['sample_rate'] = next(iter(results.values())).get(
+                'sample_rate', 0.0)
+        data_dict['tone_frequencies'] = np.asarray(
+            data_dict.get('tone_frequencies', []))
+        data_dict['firmware_indices'] = np.asarray(
+            data_dict.get('firmware_indices', []))
+        return data_dict
+
+    @staticmethod
+    def export_batch_snapshots(filename, batch_data, file_format=None):
+        """
+        Export batch accumulator snapshot data to npz, npy, json, or CSV.
+
+        ``npz`` is the default and matches the original batch snapshot save
+        layout used by ``batch_snapshots(export_file=...)``.
+
+        Parameters
+        ----------
+        filename : str
+            Output path; its extension selects the format when ``file_format``
+            is not given.
+        batch_data : dict
+            Batch snapshot data from :py:meth:`batch_snapshots`.
+        file_format : {'npz', 'npy', 'json', 'csv'} or None, optional
+            Output format; ``None`` (default) infers it from ``filename``
+            (falling back to ``'npz'``).
+        """
+        filepath, file_format = ReadoutClient._resolve_export_path(
+            filename, file_format, ('npz', 'npy', 'json', 'csv'), default='npz')
+        data_dict = ReadoutClient._normalise_batch_snapshot_data(batch_data)
+
+        dirpath = os.path.dirname(filepath)
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath)
+
+        if file_format == 'npz':
+            save_dict = {
+                'sample_rate': data_dict['sample_rate'],
+                'num_snapshots': data_dict['num_snapshots'],
+                'len_snapshot': data_dict['len_snapshot'],
+                'tone_frequencies': data_dict['tone_frequencies'],
+                'tone_indices': data_dict['tone_indices'],
+                'firmware_indices': data_dict['firmware_indices'],
+            }
+            for tone_index, snap in data_dict['results'].items():
+                save_dict[f'snapshots_tone_{tone_index}'] = snap['snapshots']
+            np.savez(filepath, **save_dict)
+
+        elif file_format == 'npy':
+            np.save(filepath, data_dict)
+
+        elif file_format == 'json':
+            with open(filepath, 'w') as file:
+                json.dump(ReadoutClient._json_ready(data_dict), file, indent=4)
+
+        elif file_format == 'csv':
+            tone_indices = np.asarray(data_dict['tone_indices'], dtype=int)
+            num_snapshots = int(data_dict['num_snapshots'])
+            with open(filepath, mode='w', newline='') as file:
+                writer = csv.writer(file)
+                if 'date' in data_dict:
+                    writer.writerow(['# date', data_dict['date']])
+                writer.writerow(['# sample_rate', data_dict.get('sample_rate', '')])
+                writer.writerow(['# num_snapshots', num_snapshots])
+                len_snapshot = data_dict.get('len_snapshot', '')
+                if isinstance(len_snapshot, np.ndarray):
+                    len_snapshot = len_snapshot.tolist()
+                writer.writerow(['# len_snapshot', len_snapshot])
+                writer.writerow(['# tone_indices', tone_indices.tolist()])
+                writer.writerow([
+                    '# tone_frequencies',
+                    np.asarray(data_dict['tone_frequencies']).tolist(),
+                ])
+                writer.writerow([
+                    '# firmware_indices',
+                    np.asarray(data_dict['firmware_indices']).tolist(),
+                ])
+                writer.writerow(['# csv_layout', 'batch_snapshot_columns'])
+
+                header = ['tone_index', 'sample_index']
+                for snap_index in range(num_snapshots):
+                    header.extend([
+                        f'snapshot_{snap_index:04d}_i',
+                        f'snapshot_{snap_index:04d}_q',
+                    ])
+                writer.writerow(header)
+
+                for tone_index in tone_indices:
+                    snapshots = data_dict['results'][int(tone_index)]['snapshots']
+                    if snapshots.shape[0] != num_snapshots:
+                        raise ValueError(
+                            "All batch snapshot entries must have "
+                            "num_snapshots rows for CSV export.")
+                    for sample_index in range(snapshots.shape[1]):
+                        row = [int(tone_index), sample_index]
+                        for snap_index in range(num_snapshots):
+                            value = snapshots[snap_index, sample_index]
+                            row.extend([value.real, value.imag])
+                        writer.writerow(row)
+
+        else:
+            raise ValueError(
+                f"Invalid file_format {file_format}. Must be one of "
+                "'npz', 'npy', 'json', or 'csv'.")
+
+    @staticmethod
+    def import_batch_snapshots(filename):
+        """Import batch accumulator snapshots from ``filename`` (written by
+        ``export_batch_snapshots``)."""
+        if filename.endswith('.npz'):
+            with np.load(filename, allow_pickle=True) as npz_data:
+                sample_rate = np.asarray(npz_data['sample_rate']).item()
+                num_snapshots = int(np.asarray(
+                    npz_data['num_snapshots']).item())
+                len_snapshot = (
+                    np.asarray(npz_data['len_snapshot'])
+                    if 'len_snapshot' in npz_data.files else None)
+                tone_indices = np.asarray(npz_data['tone_indices'], dtype=int)
+                tone_frequencies = np.asarray(
+                    npz_data['tone_frequencies']
+                    if 'tone_frequencies' in npz_data.files else [])
+                firmware_indices = np.asarray(
+                    npz_data['firmware_indices']
+                    if 'firmware_indices' in npz_data.files else [])
+                results = {}
+                for tone_index in tone_indices:
+                    tone_index = int(tone_index)
+                    snapshots = np.asarray(
+                        npz_data[f'snapshots_tone_{tone_index}'],
+                        dtype=np.complex128)
+                    results[tone_index] = {
+                        'snapshots': snapshots,
+                        'tone_index': tone_index,
+                        'sample_rate': sample_rate,
+                        'num_snapshots': num_snapshots,
+                        'len_snapshot': snapshots.shape[1],
+                    }
+            data_dict = {
+                'results': results,
+                'sample_rate': sample_rate,
+                'num_snapshots': num_snapshots,
+                'tone_indices': tone_indices,
+                'tone_frequencies': tone_frequencies,
+                'firmware_indices': firmware_indices,
+            }
+            if len_snapshot is not None:
+                data_dict['len_snapshot'] = (
+                    int(len_snapshot.item())
+                    if len_snapshot.size == 1 else len_snapshot.astype(int))
+            return ReadoutClient._normalise_batch_snapshot_data(data_dict)
+
+        if filename.endswith('.npy'):
+            data_dict = np.load(filename, allow_pickle=True).item()
+            return ReadoutClient._normalise_batch_snapshot_data(data_dict)
+
+        if filename.endswith('.json'):
+            with open(filename, 'r') as file:
+                data_dict = ReadoutClient._restore_json_value(json.load(file))
+            return ReadoutClient._normalise_batch_snapshot_data(data_dict)
+
+        if filename.endswith('.csv'):
+            data_dict, header_lines = ReadoutClient._read_csv_comment_metadata(
+                filename)
+            data = np.genfromtxt(
+                filename, delimiter=',', names=True, skip_header=header_lines)
+            data = np.atleast_1d(data)
+            snapshot_indices = ReadoutClient._snapshot_csv_indices(
+                data.dtype.names)
+            if 'tone_indices' in data_dict:
+                tone_indices = np.asarray(data_dict['tone_indices'], dtype=int)
+            else:
+                tone_indices = np.unique(data['tone_index'].astype(int))
+
+            results = {}
+            for tone_index in tone_indices:
+                mask = data['tone_index'].astype(int) == int(tone_index)
+                tone_rows = np.atleast_1d(data[mask])
+                order = np.argsort(tone_rows['sample_index'])
+                tone_rows = tone_rows[order]
+                snapshots = np.vstack([
+                    np.atleast_1d(tone_rows[f'snapshot_{index:04d}_i'])
+                    + 1j*np.atleast_1d(
+                        tone_rows[f'snapshot_{index:04d}_q'])
+                    for index in snapshot_indices
+                ])
+                results[int(tone_index)] = {
+                    'snapshots': snapshots,
+                    'tone_index': int(tone_index),
+                    'sample_rate': data_dict.get('sample_rate', 0.0),
+                    'num_snapshots': snapshots.shape[0],
+                    'len_snapshot': snapshots.shape[1],
+                }
+
+            data_dict['results'] = results
+            data_dict['tone_indices'] = tone_indices
+            data_dict.setdefault('num_snapshots', len(snapshot_indices))
+            data_dict.setdefault('tone_frequencies', [])
+            data_dict.setdefault('firmware_indices', [])
+            return ReadoutClient._normalise_batch_snapshot_data(data_dict)
+
+        if filename.endswith('.hdf5'):
+            raise NotImplementedError("hdf5 format not yet implemented.")
+        if filename.endswith('.dirfile'):
+            raise NotImplementedError("dirfile format not yet implemented.")
+        raise ValueError(f"Invalid file format {filename.split('.')[-1]}")
+
+    import_batch_snapshot = import_batch_snapshots
+    export_batch_snapshot = export_batch_snapshots
+
     @staticmethod
     def _export_batch_snapshots(batch_data, filepath, verbose=True):
-        """Save batch snapshot data to a .npz file."""
-        if not filepath.endswith('.npz'):
-            filepath += '.npz'
-
-        save_dict = {
-            'sample_rate': batch_data['sample_rate'],
-            'num_snapshots': batch_data['num_snapshots'],
-            'tone_frequencies': batch_data['tone_frequencies'],
-            'tone_indices': np.array(list(batch_data['results'].keys())),
-            'firmware_indices': np.array(batch_data['firmware_indices']),
-        }
-        for tidx, snap in batch_data['results'].items():
-            save_dict[f'snapshots_tone_{tidx}'] = snap['snapshots']
-
-        np.savez(filepath, **save_dict)
+        """Compatibility wrapper for the original batch snapshot saver."""
+        resolved_path, _ = ReadoutClient._resolve_export_path(
+            filepath, None, ('npz', 'npy', 'json', 'csv'), default='npz')
+        ReadoutClient.export_batch_snapshots(filepath, batch_data)
         if verbose:
-            print(f"Batch snapshots saved to {filepath}")
+            print(f"Batch snapshots saved to {resolved_path}")
 
     @staticmethod
     def _plot_batch_snapshots(batch_data):
@@ -2412,8 +3266,9 @@ class ReadoutClient:
                 the refresh but still ensure the calibration is frozen.
             adc_cal_settle_time (float): Seconds to wait for ADC calibration
                 to settle. Default 2.0.
-            wait (bool): If True, block until the sweep completes by calling
-                wait_for_sweep() after dispatching the request. Default False.
+            wait (bool): If True, print the dispatch response, then block until
+                the sweep completes and return the final completion response.
+                Default False.
         """
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(centers)
@@ -2439,8 +3294,10 @@ class ReadoutClient:
             'adc_cal_settle_time': adc_cal_settle_time
         }
         response = self.send_request(message)
-        if wait and response.get('status') == 'success':
-            self.wait_for_sweep()
+        if wait:
+            print(response)
+            if response.get('status') == 'success':
+                return self.wait_for_sweep(completion_message='Sweep complete')
         return response
 
     def perform_retune(self, centers, spans, points, samples_per_point, direction='up', method='max_gradient', freq_offsets=None, phases=None, refresh_adc_cal=True, adc_cal_settle_time=2.0, wait=False):
@@ -2456,15 +3313,16 @@ class ReadoutClient:
             points: Number of sweep points.
             samples_per_point: Number of samples per sweep point.
             direction: Sweep direction, 'up' or 'down'. Default 'up'.
-            method: Retune method, 'max_gradient' or 'min_mag'. Default 'max_gradient'.
+            method: Retune method, 'max_gradient', 'min_mag', or 'max_dphidf'. Default 'max_gradient'.
             freq_offsets: Frequency offsets for noise estimation. Default None (zeros).
             phases: Tone phases. If None, warns about zero phases.
             refresh_adc_cal (bool): If True (default), refresh ADC calibration
                 before sweeping. If False, skip refresh but still ensure frozen.
             adc_cal_settle_time (float): Seconds to wait for ADC calibration
                 to settle. Default 2.0.
-            wait (bool): If True, block until the retune completes by calling
-                wait_for_sweep() after dispatching the request. Default False.
+            wait (bool): If True, print the dispatch response, then block until
+                the retune completes and return the final completion response.
+                Default False.
         """
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(centers)
@@ -2489,7 +3347,7 @@ class ReadoutClient:
         if freq_offsets.shape != centers.shape:
             raise ValueError("freq_offsets must be None, a scalar, or have the same shape as centers")
 
-        assert method in ['max_gradient','min_mag'], "method must be 'max_gradient' or 'min_mag'"
+        assert method in ['max_gradient','min_mag','max_dphidf'], "method must be 'max_gradient', 'min_mag', or 'max_dphidf'"
 
         #warn if freq_offsets are much larger than half of the spans
         if np.any(np.abs(freq_offsets) > spans / 2):
@@ -2509,8 +3367,10 @@ class ReadoutClient:
             'adc_cal_settle_time': adc_cal_settle_time
         }
         response = self.send_request(message)
-        if wait and response.get('status') == 'success':
-            self.wait_for_sweep()
+        if wait:
+            print(response)
+            if response.get('status') == 'success':
+                return self.wait_for_sweep(completion_message='Retune complete')
         return response
 
     def get_sweep_progress(self):
@@ -2523,7 +3383,7 @@ class ReadoutClient:
             print(f"Error getting sweep progress: {response['message']}")
             return response
 
-    def wait_for_sweep(self, poll_interval=1.0, progress_bar=True):
+    def wait_for_sweep(self, poll_interval=1.0, progress_bar=True, completion_message='Sweep complete'):
         """
         Block until the current sweep completes, optionally displaying progress.
 
@@ -2531,14 +3391,23 @@ class ReadoutClient:
             poll_interval (float): Seconds between progress polls. Default 1.0.
             progress_bar (bool): If True, display an ASCII progress bar. If False,
                                  print a plain numeric progress line. Default True.
+            completion_message (str): Message returned in the final success
+                response once progress reaches 100%. Default 'Sweep complete'.
         """
         import sys
         bar_width = 40
+        printed_progress = False
         while True:
-            progress = self.get_sweep_progress()
-            if isinstance(progress, dict):
-                # Error response from get_sweep_progress
-                break
+            response = self.send_request({'request': 'get_sweep_progress'})
+            if not isinstance(response, dict):
+                response = {'status': 'error', 'message': 'No response getting sweep progress'}
+            if response.get('status') != 'success':
+                print(f"Error getting sweep progress: {response.get('message', 'unknown error')}")
+                if printed_progress:
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+                return response
+            progress = response['progress']
             pct = float(progress)
             if progress_bar:
                 filled = int(bar_width * pct)
@@ -2548,22 +3417,27 @@ class ReadoutClient:
             else:
                 sys.stdout.write(f'\rSweep progress: {pct*100:5.1f}%')
                 sys.stdout.flush()
-            if pct >= 1.0:
+            printed_progress = True
+            final_state = response.get('state')
+            if pct >= 1.0 or final_state in ('idle', 'cancelled', 'error'):
                 sys.stdout.write('\n')
                 sys.stdout.flush()
-                break
+                final_status = 'error' if final_state in ('cancelled', 'error') else 'success'
+                final_message = response.get('message') or completion_message
+                return {'status': final_status, 'message': final_message}
             time.sleep(poll_interval)
 
     def get_sweep_data(self):
         """Fetch the latest averaged sweep data from the server."""
         message = {'request': 'get_sweep_data'}
         response = self.send_request(message)
-        if response['status'] == 'success':
+        if not isinstance(response, dict):
+            raise RuntimeError("Error getting sweep_data: no response from server")
+        if response.get('status') == 'success':
             sweep_data = response['data']
             return sweep_data
-        else:
-            print(f"Error getting sweep_data: {response['message']}")
-            return response
+        raise RuntimeError(
+            f"Error getting sweep_data: {response.get('message', 'unknown error')}")
 
     def get_sweep_raw_samples(self):
         """Fetch unaveraged per-sample sweep data as a complex array."""
@@ -2609,6 +3483,24 @@ class ReadoutClient:
             dict: Parsed sweep data with 'sweep_f', 'sweep_i', 'sweep_q', 'sweep_ei', 
                   'sweep_eq' arrays and metadata.
         """
+        if not isinstance(sweep_data, dict):
+            raise TypeError("sweep_data must be a dictionary returned by get_sweep_data().")
+
+        if sweep_data.get('status') == 'error':
+            raise RuntimeError(
+                f"Error getting sweep_data: {sweep_data.get('message', 'unknown error')}")
+        if sweep_data.get('status') == 'success' and 'data' in sweep_data:
+            sweep_data = sweep_data['data']
+
+        required_keys = (
+            'info', 'date', 'num_tones', 'num_points', 'samples_per_point',
+            'sweep')
+        missing_keys = [key for key in required_keys if key not in sweep_data]
+        if missing_keys:
+            raise ValueError(
+                "Invalid sweep data: missing "
+                + ", ".join(repr(key) for key in missing_keys))
+
         info = sweep_data['info']
         date = sweep_data['date']
         num_tones = int(sweep_data['num_tones'])
@@ -2697,6 +3589,17 @@ class ReadoutClient:
         tone/trace zero, and each data row is one sweep point.  Wideband sweeps
         are stored as a single trace so importing them preserves the
         ``(1, N_total_points)`` shape used by plotting and analysis helpers.
+
+        Parameters
+        ----------
+        filename : str
+            Output path; its extension selects the format when ``file_format``
+            is not given.
+        sweep_data : dict
+            Parsed or raw sweep-data dict to export.
+        file_format : {'npy', 'json', 'csv', 'dirfile', 'hdf5'} or None, optional
+            Output format; ``None`` (default) infers it from ``filename``
+            (falling back to ``'npy'``).
         """
         filepath, file_format = ReadoutClient._resolve_export_path(
             filename, file_format, ('npy', 'json', 'csv', 'dirfile', 'hdf5'), default='npy')
@@ -2789,7 +3692,8 @@ class ReadoutClient:
 
     @staticmethod
     def import_sweep(filename):
-        """Import sweep data from npy, json, or CSV.
+        """Import sweep data from ``filename`` (npy, json, or CSV; format from
+        the extension).
 
         CSV imports accept both the corrected tone-column layout and the legacy
         point-column layout.  New CSVs include a ``csv_layout`` marker; older
@@ -2874,7 +3778,18 @@ class ReadoutClient:
 
 
     def receive_stream(self, num_tones=None, filename=None, print_data=False):
-        """Receive continuous stream frames from the stream socket and write them to disk."""
+        """Receive continuous stream frames from the stream socket and write them to disk.
+
+        Parameters
+        ----------
+        num_tones : int or None, optional
+            Number of active tones to expect per frame; ``None`` infers it from
+            the server info.
+        filename : str or None, optional
+            Output basename; defaults to ``tmp_stream`` in the cwd.
+        print_data : bool, optional
+            Print frames as they arrive (default ``False``).
+        """
         if self.mock:
             return self._mock_server.receive_stream(num_tones, filename, print_data)
 
@@ -2975,7 +3890,21 @@ class ReadoutClient:
 
     def receive_stream_g3(self, num_tones=None, filename=None, print_data=False,
                           kid_stream_id='UNSET', duration=30):
-        '''JL: Receives a data stream and writes it to a G3 file.'''
+        '''Receive a data stream and write it to a G3 (spt3g) file.
+
+        Parameters
+        ----------
+        num_tones : int or None, optional
+            Number of active tones to expect; ``None`` infers it from server info.
+        filename : str or None, optional
+            Output basename; a default is chosen when ``None``.
+        print_data : bool, optional
+            Print frames as they arrive (default ``False``).
+        kid_stream_id : str, optional
+            Stream identifier written into the G3 metadata (default ``'UNSET'``).
+        duration : float, optional
+            Capture duration in seconds (default ``30``).
+        '''
         if self.mock:
             return self._mock_server.receive_stream_g3(
                 num_tones=num_tones, filename=filename, print_data=print_data,
@@ -3304,7 +4233,18 @@ class ReadoutClient:
 
 
     def receive_triggered_stream(self, num_tones=None, filename=None, print_data=False):
-        """Receive triggered stream frames from the stream socket and write them to disk."""
+        """Receive triggered stream frames from the stream socket and write them to disk.
+
+        Parameters
+        ----------
+        num_tones : int or None, optional
+            Number of active tones to expect per frame; ``None`` infers it from
+            the server info.
+        filename : str or None, optional
+            Output basename; defaults to ``tmp_triggered_stream`` in the cwd.
+        print_data : bool, optional
+            Print frames as they arrive (default ``False``).
+        """
         if self.mock:
             return self._mock_server.receive_stream(num_tones, filename, print_data)
 
@@ -3404,6 +4344,8 @@ class ReadoutClient:
         """
         Parse a saved stream file into per-tone I/Q arrays.
 
+        ``filename`` is the stream-capture basename (without extension); the
+        matching ``.json`` metadata and binary data files are read from it.
         Data is already in user-tone order (the server sends only active
         tones in user order). num_tones in the metadata reflects the
         actual number of active tones.
@@ -3455,7 +4397,19 @@ class ReadoutClient:
 
     @staticmethod
     def export_stream_data(filename,data_dict,file_format=None):
-        """Export parsed stream data to npy, json, or CSV."""
+        """Export parsed stream data to npy, json, or CSV.
+
+        Parameters
+        ----------
+        filename : str
+            Output path; its extension selects the format when ``file_format``
+            is not given.
+        data_dict : dict
+            Parsed stream data (e.g. from :py:meth:`parse_stream`).
+        file_format : {'npy', 'json', 'csv'} or None, optional
+            Output format; ``None`` (default) infers it from ``filename``
+            (falling back to ``'npy'``).
+        """
         filepath, file_format = ReadoutClient._resolve_export_path(
             filename, file_format, ('npy', 'json', 'csv'), default='npy')
 
@@ -3529,7 +4483,8 @@ class ReadoutClient:
 
     @staticmethod
     def import_stream_data(filename):
-        """Import stream data previously written by ``export_stream_data``."""
+        """Import stream data from ``filename`` (written by
+        ``export_stream_data``)."""
         data_dict={}
         if filename.endswith('.npy'):
             data_dict = np.load(filename,allow_pickle=True).item()
@@ -3589,14 +4544,14 @@ class ReadoutClient:
     @staticmethod
     def generate_random_phases(freqs):
         """
-        Generate random phases for a set of frequencies.
+        Generate uniform-random phases (radians), one per frequency in ``freqs``.
         """
         return np.random.uniform(0,2*np.pi,len(freqs))
     
     @staticmethod
     def generate_newman_phases(freqs):
         """
-        Generate the Newman phases for a set of frequencies.
+        Generate the Newman phases (radians), one per frequency in ``freqs``.
 
         If frequencies are exactly evenly spaced, the crest factor is minimised.
 
@@ -3807,8 +4762,8 @@ class ReadoutClient:
     @staticmethod
     def read_resonances_file(filename):
         """
-        Read a resonances file and return columns keyed by the names that
-        numpy.genfromtxt assigns (sanitized from the file header).
+        Read a resonances file ``filename`` and return columns keyed by the
+        names that numpy.genfromtxt assigns (sanitized from the file header).
         """
         # Let genfromtxt parse the header itself
         data = np.genfromtxt(
@@ -4631,6 +5586,72 @@ class ReadoutClient:
         return save_to_csv
 
 
+    @staticmethod
+    def _overlapping_tone_groups(sweep_f):
+        """Return connected groups of tone columns whose sweep ranges overlap."""
+        sf = np.atleast_2d(np.asarray(sweep_f, dtype=float))
+        intervals = []
+        for tone in range(sf.shape[1]):
+            finite = sf[:, tone][np.isfinite(sf[:, tone])]
+            if finite.size == 0:
+                continue
+            lo = float(np.min(finite))
+            hi = float(np.max(finite))
+            intervals.append((lo, hi, tone))
+
+        if len(intervals) < 2:
+            return []
+
+        intervals.sort(key=lambda item: (item[0], item[1], item[2]))
+        groups = []
+        group = [intervals[0][2]]
+        group_hi = intervals[0][1]
+
+        for lo, hi, tone in intervals[1:]:
+            if lo <= group_hi:
+                group.append(tone)
+                group_hi = max(group_hi, hi)
+            else:
+                if len(group) > 1:
+                    groups.append(group)
+                group = [tone]
+                group_hi = hi
+
+        if len(group) > 1:
+            groups.append(group)
+        return groups
+
+    @staticmethod
+    def _select_overlapping_targeted_resonances(per_tone, sweep_f):
+        """Assign ordered candidates across overlapping targeted sweep columns.
+
+        This only resolves the simple common case: an overlap group of N tones
+        where every tone found exactly N ordered resonances.  Then the
+        lower-frequency tone center gets the lower-frequency candidate, etc.
+        More ambiguous doubles/triples are left in place and flagged normally.
+        """
+        sf = np.atleast_2d(np.asarray(sweep_f, dtype=float))
+        selected = [list(results) for results in per_tone]
+        resolved_tones = set()
+
+        centers = []
+        for tone in range(sf.shape[1]):
+            finite = sf[:, tone][np.isfinite(sf[:, tone])]
+            center = float(np.median(finite)) if finite.size else float(tone)
+            centers.append(center)
+
+        for group in ReadoutClient._overlapping_tone_groups(sf):
+            n_group = len(group)
+            if not all(len(per_tone[tone]) == n_group for tone in group):
+                continue
+            ordered_tones = sorted(group, key=lambda tone: (centers[tone], tone))
+            for rank, tone in enumerate(ordered_tones):
+                selected[tone] = [per_tone[tone][rank]]
+                resolved_tones.add(tone)
+
+        return selected, sorted(resolved_tones)
+
+
     def find_resonances(self, sweep_data=None, mode='auto',
                         data_format='log_magnitude',
                         filter_params=None, finder_params=None, **kwargs):
@@ -4654,12 +5675,25 @@ class ReadoutClient:
             data_format (str): Analysis format for peak finding. One of:
                 'lin_magnitude', 'log_magnitude', 'phase', 'unwrapped_phase',
                 'group_delay', 'complex_gradient'. Default is 'log_magnitude'.
-            filter_params: FilterParams instance or dict.
-            finder_params: PeakFinderParams instance or dict.
+            filter_params: FilterParams instance or dict using exact keys:
+                ``highpass_edge``, ``lowpass_edge``, ``median_kernel_size``.
+            finder_params: PeakFinderParams instance or dict using exact keys:
+                ``prominence_enabled``, ``prominence_min``,
+                ``prominence_max``, ``width_enabled``, ``width_min``,
+                ``width_max``, ``distance_enabled``, ``distance_value``,
+                ``height_enabled``, ``height_min``, ``height_max``,
+                ``threshold_enabled``, ``threshold_min``, ``threshold_max``,
+                ``peak_direction``, ``max_num_peaks``, ``f_low``,
+                ``f_high``. For example:
+                ``finder_params={'prominence_min': 0.5}``.
                 In wideband mode, omitted values use conservative MKID defaults:
                 inner 10-90% of the frequency span, dip finding, 1-100 dB
                 prominence, 1 kHz-10 MHz width, 100 kHz minimum spacing,
                 lowpass 0.5 and highpass 0. Dicts override individual defaults.
+                In targeted mode, omitted values use ``PeakFinderParams()``
+                defaults. Dict aliases such as ``min_height`` are not accepted;
+                use the exact field name such as ``height_min`` and set the
+                matching ``*_enabled`` field when needed.
             **kwargs: Passed to wideband_sweep if sweep_data is None.
 
         Returns:
@@ -4671,7 +5705,8 @@ class ReadoutClient:
                 'per_tone': list of lists. In wideband mode this has one
                     entry containing the single concatenated-trace result.
                 'all_resonances': flat list of all ResonanceResult objects.
-                'flagged_tones': tone indices with >1 resonance.
+                'flagged_tones': tone indices with >1 resonance after simple
+                    overlap resolution.
                 'num_tones': total number of tones in the sweep metadata.
         """
         from ..peak_finder import (
@@ -4738,9 +5773,7 @@ class ReadoutClient:
                     "(shape N_points x N_tones), not wideband.")
 
             _, n_tones = sf.shape
-            per_tone = []
-            all_resonances = []
-            flagged_tones = []
+            per_tone_raw = []
 
             for t in range(n_tones):
                 f_tone = sf[:, t]
@@ -4753,12 +5786,17 @@ class ReadoutClient:
                     filter_params=filter_params,
                     finder_params=finder_params,
                 )
-                per_tone.append(results)
-                all_resonances.extend(results)
+                per_tone_raw.append(results)
 
+            per_tone, _ = self._select_overlapping_targeted_resonances(
+                per_tone_raw, sf)
+
+            all_resonances = []
+            flagged_tones = []
+            for t, results in enumerate(per_tone):
+                all_resonances.extend(results)
                 if len(results) == 0:
                     print(f'Warning: no resonances found in tone {t} sweep.')
-
 
                 if len(results) > 1:
                     flagged_tones.append(t)

@@ -274,6 +274,7 @@ class Attenuator:
 
     # ---- info getters unchanged (use cache=True to avoid extra traffic) ----
     def get_model(self, cache=True):
+        """Return the device model string (``cache=True`` reuses a stored value)."""
         if cache and self._model is not None:
             return self._model
         s = _read_string_field(self._bus, self._addr, GET_DEVICE_MODEL_NAME, self._serial or None)
@@ -281,6 +282,7 @@ class Attenuator:
         return s
 
     def get_serial(self, cache=True):
+        """Return the device serial number (``cache=True`` reuses a stored value)."""
         if cache and self._serial is not None:
             return self._serial
         s = _read_string_field(self._bus, self._addr, GET_DEVICE_SERIAL_NUMBER, self._serial or None)
@@ -288,6 +290,7 @@ class Attenuator:
         return s
 
     def get_firmware_version(self, cache=True):
+        """Return the device firmware version (``cache=True`` reuses a stored value)."""
         if cache and self._firmware is not None:
             return self._firmware
         s = _read_string_field(self._bus, self._addr, GET_FIRMWARE, self._serial or None)
@@ -315,6 +318,8 @@ class Attenuator:
 
     @att.setter
     def att(self, value):
+        """Set the attenuation to ``value`` (dB), quantised to the device step
+        and clamped to its range (a warning is printed if adjusted)."""
         try:
             v_in = float(value)
         except Exception:
@@ -346,7 +351,11 @@ class Attenuator:
 
 
     def set_params(self, att_min=None, att_max=None, resolution=None):
-        """Update stored device parameters on this object."""
+        """Update stored device parameters on this object.
+
+        ``att_min``/``att_max`` are the attenuation limits (dB) and
+        ``resolution`` the step size (dB); any left ``None`` are unchanged.
+        """
         if att_min is not None:   self.att_min = float(att_min)
         if att_max is not None:   self.att_max = float(att_max)
         if resolution is not None:self.resolution = float(resolution)
@@ -381,6 +390,7 @@ class Attenuator:
         return self.att
 
     def set_atten(self, atten):  # alias
+        """Alias for the ``att`` setter: set the attenuation to ``atten`` (dB)."""
         self.att = atten
 
 
