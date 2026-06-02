@@ -1981,6 +1981,105 @@ class ReadoutClient:
         message = {'request': 'disable_stream'}
         return self.send_request(message)
 
+    def enable_modulation(self, center=None, offsets=None, mod_indices=None,
+                          samples_per_point=1, n_settle=1):
+        """
+        Arm fast tone-frequency modulation. This only **arms** (loads the config
+        on the server); it does not start output. Call :meth:`enable_stream` for
+        continuous modulated streaming, or :meth:`get_samples` for a finite
+        modulated capture — both return frames tagged with the active point.
+
+        Parameters
+        ----------
+        center : array-like or None
+            Per-tone centre RF frequencies in Hz (user-facing tone order).
+            ``None`` uses the current live comb. With no args at all (and a
+            previously-armed config) this re-arms that config.
+        offsets : array-like or None
+            Probe offsets in Hz: shape ``(n_points,)`` (broadcast across the
+            modulated tones) or ``(n_points, len(mod_indices))`` (per tone).
+        mod_indices : array-like or None
+            User-facing indices of tones to modulate. ``None`` = all regular
+            (resonator) tones. Blind tones are rejected by the server.
+        samples_per_point : int, optional
+            Dwell: accumulations per point per cycle (default 1).
+        n_settle : int, optional
+            Leading samples per point flagged as settling (default 1).
+
+        Returns
+        -------
+        dict
+            Server ack, including ``result.revision`` and
+            ``result.needs_recenter``.
+        """
+        self._warn_zero_phases()
+        message = {'request': 'enable_modulation',
+                   'samples_per_point': int(samples_per_point),
+                   'n_settle': int(n_settle)}
+        if center is not None:
+            message['center'] = np.asarray(center, dtype=float).tolist()
+        if offsets is not None:
+            message['offsets'] = np.asarray(offsets, dtype=float).tolist()
+        if mod_indices is not None:
+            message['mod_indices'] = [int(i) for i in np.atleast_1d(mod_indices)]
+        return self.send_request(message)
+
+    def update_modulation(self, center=None, offsets=None, on_map_change='continue'):
+        """
+        Seamlessly update the modulation centre and/or offsets while armed, with
+        no dropped frames. Rides the existing armed channel maps.
+
+        Parameters
+        ----------
+        center : array-like or None
+            New per-tone centre RF frequencies in Hz (user order). ``None`` keeps
+            the current centres.
+        offsets : array-like or None
+            New probe offsets in Hz (same shapes as :meth:`enable_modulation`).
+            ``None`` keeps the current offsets.
+        on_map_change : {'continue', 'recenter'}, optional
+            What to do if the update would push a tone beyond the filterbank
+            overlap coverage: ``'continue'`` (default) rejects with diagnostics
+            and asks you to recenter; ``'recenter'`` performs the brief map reload.
+
+        Returns
+        -------
+        dict
+            Server ack (``result.revision`` and ``result.op``), or an error with
+            ``result.tones_beyond_coverage`` if a recenter is required.
+        """
+        message = {'request': 'update_modulation', 'on_map_change': on_map_change}
+        if center is not None:
+            message['center'] = np.asarray(center, dtype=float).tolist()
+        if offsets is not None:
+            message['offsets'] = np.asarray(offsets, dtype=float).tolist()
+        return self.send_request(message)
+
+    def recenter_modulation(self):
+        """
+        Recenter modulation: reload the channel maps / mixer frequencies for the
+        current centre and recompute VACC bin-sharing (a deliberate brief break).
+        Use when :meth:`update_modulation` reports tones beyond bin coverage.
+        """
+        return self.send_request({'request': 'recenter_modulation'})
+
+    def disable_modulation(self):
+        """
+        Pause modulation; tones rest at their centre frequencies. The armed
+        config stays resident so :meth:`enable_modulation` with no args re-arms
+        it quickly. Use :meth:`disable_stream` to stop output entirely.
+        """
+        return self.send_request({'request': 'disable_modulation'})
+
+    def get_modulation_state(self):
+        """
+        Return the per-tone modulation state (the ``get_info('tone_modulation')``
+        section): armed flag, desired/applied revision, per-tone centres, offsets,
+        bin occupancy, and ``needs_recenter`` / ``tones_beyond_coverage``. A pure
+        server-side read (no hardware access), safe to poll while streaming.
+        """
+        return self.get_info('tone_modulation')
+
     def enable_triggered_stream(self):
         """Enable triggered sample streaming on the server."""
         self._warn_zero_phases()
@@ -2172,6 +2271,14 @@ class ReadoutClient:
             tt_msb = int(all_data[-4]) & 0xFFFFFFFF
             tt[j] = (tt_msb << 32) + tt_lsb
             flags[j] = all_data[-10:-4]
+        # Fast-modulation tag lives in flag5 (frame[-5]); decode as UNSIGNED
+        # because the revision (bits 17..31) can set the int32 sign bit:
+        #   bits 0..15  = active point (0 = modulation off, 1..N = the point)
+        #   bit 16      = settling/transient marker
+        #   bits 17..31 = config revision
+        # Plain (non-modulated) streams leave flag5 = 0, so these decode to zeros
+        # and remain fully backward compatible.
+        f5 = flags[:, 5].astype(np.uint32)
         data_dict = {'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
                     'num_tones':num_tones,
                     'num_samples':num_samples,
@@ -2182,7 +2289,10 @@ class ReadoutClient:
                     'packet_counter':cnt,
                     'packet_error':err,
                     'telescope_time':tt,
-                    'stream_flags':{f'flag{i}':flags[:,i] for i in range(6)}
+                    'stream_flags':{f'flag{i}':flags[:,i] for i in range(6)},
+                    'modulation_point': (f5 & 0xFFFF).astype(int),
+                    'modulation_settling': ((f5 >> 16) & 0x1).astype(int),
+                    'modulation_revision': ((f5 >> 17) & 0x7FFF).astype(int),
                     }
 
         return data_dict

@@ -60,6 +60,18 @@ class MockReadoutServer:
         self.is_streaming = False
         self.triggered_stream_enabled = False
         self.packet_counter = 0
+        # fast frequency modulation (mock): _mod is the armed config dict (or None);
+        # _mod_enabled is the on/off switch. A simple resonator phase model gives the
+        # demod tool ground truth, and a mock channel grid lets us exercise the
+        # bin-occupancy / recenter logic without real firmware.
+        self._mod = None
+        self._mod_enabled = False
+        self._mod_revision = 0
+        self._mod_revision_history = {}
+        self._mod_f0 = None             # per-tone "true" resonance frequencies (Hz)
+        self._mod_linewidth = 1.0e5     # mock resonator FWHM (Hz)
+        self._mod_bin_hz = 1.0e6        # mock filterbank channel spacing (Hz)
+        self._mod_armed_bin_center = None   # per-tone armed bin centre (Hz), fixed until recenter
         self.cal_freeze = True
         self.clock_source = (
             client.config.get('firmware', {}).get('clock_source', 'internal')
@@ -308,6 +320,7 @@ class MockReadoutServer:
             'calibrations': self._info_calibrations,
             'resonators': self._info_resonators,
             'registers': self._info_registers,
+            'tone_modulation': self._info_tone_modulation,
         }
         if sections is None:
             return {s: dispatchers[s]() for s in self.DEFAULT_INFO_SECTIONS}
@@ -828,24 +841,198 @@ class MockReadoutServer:
             defaults['internal_loopback'] = bool(param_value)
         return {'status': 'success'}
 
+    def _resonator_z(self, f, f0, w, scale=1000.0):
+        """
+        Simple resonator S21 model used as demod ground truth.
+
+        Phase ``-2*arctan(2*(f - f0)/w)`` has its inflection (steepest slope,
+        d2phi/df2 = 0) at the resonance ``f0``; the magnitude dips at ``f0``.
+
+        Parameters
+        ----------
+        f : numpy.ndarray
+            Probe frequencies (Hz).
+        f0 : numpy.ndarray
+            Per-tone resonance frequencies (Hz).
+        w : float
+            Resonator FWHM linewidth (Hz).
+        scale : float, optional
+            Amplitude scale (~int counts). Default 1000.
+        """
+        x = 2.0 * (np.asarray(f, dtype=float) - np.asarray(f0, dtype=float)) / w
+        phi = -2.0 * np.arctan(x)
+        mag = 1.0 - 0.9 / (1.0 + x ** 2)   # dip to 0.1 at resonance
+        return scale * mag * np.exp(1j * phi)
+
+    def _mock_expand_offsets(self, offsets, mod_indices, n_tones):
+        """Expand user offsets to a full ``(n_points, n_tones)`` matrix (0 for
+        non-modulated tones).
+
+        ``offsets`` shape ``(n_points,)`` (broadcast) or ``(n_points,
+        len(mod_indices))``; ``mod_indices`` the modulated tone indices;
+        ``n_tones`` the active tone count.
+        """
+        # 1D of length n_points => one offset per point (broadcast across tones):
+        # reshape to (n_points, 1), NOT (1, n_points).
+        offsets = np.asarray(offsets, dtype=float)
+        if offsets.ndim == 1:
+            offsets = offsets[:, None]
+        n_points = offsets.shape[0]
+        full = np.zeros((n_points, n_tones), dtype=float)
+        if offsets.shape[1] in (1, len(mod_indices)):
+            full[:, mod_indices] = offsets
+        else:
+            raise ValueError(f'offsets has {offsets.shape[1]} columns; '
+                             f'expected 1 or len(mod_indices)={len(mod_indices)}')
+        return full, n_points
+
+    def _mock_modulation_state(self, center, full_offsets, mod_indices, spp, n_settle, armed_bin_center):
+        """Assemble a ``tone_modulation`` state dict mirroring the server's shape,
+        with per-(tone,point) bin occupancy relative to the fixed mock armed bins.
+
+        Parameters
+        ----------
+        center : numpy.ndarray
+            Per-tone centre frequencies (Hz).
+        full_offsets : numpy.ndarray
+            ``(n_points, n_tones)`` probe offsets (Hz).
+        mod_indices : list
+            Modulated tone indices (user order).
+        spp, n_settle : int
+            Dwell and settling-sample counts.
+        armed_bin_center : numpy.ndarray
+            Per-tone armed bin-centre frequencies (Hz), held fixed across updates.
+        """
+        n_tones = len(center)
+        n_points = full_offsets.shape[0]
+        probe = center[None, :] + full_offsets
+        drift = (probe - armed_bin_center[None, :]) / self._mod_bin_hz   # channels
+        ad = np.abs(drift)
+        occ = np.where(ad <= 0.5, 'nearest', np.where(ad <= 1.0, 'second', 'beyond'))
+        beyond = sorted({i for i in range(n_tones) if 'beyond' in set(occ[:, i])})
+        tones = []
+        for i in range(n_tones):
+            tones.append({
+                'index': i, 'firmware_index': i,
+                'center_hz': float(center[i]),
+                'armed_fft_bin': int(round(armed_bin_center[i] / self._mod_bin_hz)),
+                'offsets_hz': full_offsets[:, i].tolist(),
+                'drift_bins': drift[:, i].tolist(),
+                'occupancy': [str(o) for o in occ[:, i]],
+            })
+        return {
+            'enabled': bool(self._mod_enabled),
+            'desired_revision': int(self._mod_revision),
+            'applied_revision': int(self._mod_revision),
+            'revision_history': dict(self._mod_revision_history),
+            'num_points': int(n_points), 'samples_per_point': int(spp), 'n_settle': int(n_settle),
+            'mod_indices': list(mod_indices),
+            'sample_rate_hz': float(self.sample_rate),
+            'cycle_rate_hz': float(self.sample_rate) / (n_points * spp) if n_points else float('nan'),
+            'needs_recenter': bool(len(beyond) > 0),
+            'tones_beyond_coverage': beyond,
+            'tones': tones,
+        }
+
+    def _mock_arm(self, center, offsets, mod_indices, spp, n_settle, reload_bins, set_f0):
+        """Resolve and **commit** an armed modulation config (bumps the revision).
+
+        Parameters
+        ----------
+        center, offsets, mod_indices : array-like or None
+            New config; ``None`` reuses the resident value where sensible.
+        spp, n_settle : int
+            Dwell and settling-sample counts.
+        reload_bins : bool
+            Recompute the armed bin centres from ``center`` (enable/recenter) vs
+            reuse the existing ones (live update riding the overlap).
+        set_f0 : bool
+            Capture ``center`` as the "true" resonance frequencies (enable only),
+            so later centre updates detune relative to them.
+        """
+        freqs = np.asarray(self.tone_frequencies, dtype=float)
+        n_tones = len(freqs)
+        if center is None:
+            center = self._mod['center'].copy() if self._mod is not None else freqs.copy()
+        else:
+            center = np.asarray(center, dtype=float)
+        if mod_indices is None:
+            mod_indices = list(self._mod['mod_indices']) if self._mod is not None else list(range(n_tones))
+        else:
+            mod_indices = [int(i) for i in np.atleast_1d(mod_indices)]
+        if offsets is None and self._mod is not None:
+            full = self._mod['offsets'].copy()
+            n_points = full.shape[0]
+            raw_off = full
+        else:
+            full, n_points = self._mock_expand_offsets(offsets, mod_indices, n_tones)
+            raw_off = np.atleast_2d(np.asarray(offsets, dtype=float))
+        if set_f0 or self._mod_f0 is None:
+            self._mod_f0 = center.copy()
+        if reload_bins or self._mod_armed_bin_center is None:
+            self._mod_armed_bin_center = np.round(center / self._mod_bin_hz) * self._mod_bin_hz
+        self._mod_revision = (self._mod_revision + 1) & 0x7FFF
+        self._mod_revision_history[self._mod_revision] = {
+            'center': center.tolist(), 'offsets': raw_off.tolist(),
+            'mod_indices': list(mod_indices), 'ts': time.time()}
+        state = self._mock_modulation_state(center, full, mod_indices, spp, n_settle,
+                                            self._mod_armed_bin_center)
+        self._mod = {'center': center, 'offsets': full, 'mod_indices': mod_indices,
+                     'n_points': n_points, 'samples_per_point': int(spp),
+                     'n_settle': int(n_settle), 'revision': self._mod_revision, 'state': state}
+        return state
+
+    def _info_tone_modulation(self):
+        """Return the cached mock modulation state for ``get_info('tone_modulation')``."""
+        if self._mod is None:
+            return {'enabled': False, 'num_points': 0, 'tones': []}
+        state = dict(self._mod['state'])
+        state['enabled'] = bool(self._mod_enabled)
+        return state
+
     def stream_frame(self, num_tones=None):
         """Build one modern stream packet: IQ words plus six flags, TT, cnt, err.
+
+        When modulation is armed and enabled, this cycles through the N probe
+        points, evaluates the resonator model at each tone's probe frequency
+        (centre + offset), and stamps the flag5 modulation tag (point/settling/
+        revision). Otherwise it emits the legacy synthetic frame with flag5 = 0.
 
         ``num_tones`` sets how many tone IQ words to include; ``None`` uses the
         current active tone count.
         """
         if num_tones is None:
             num_tones = len(self.tone_frequencies)
-        tone_idx = np.arange(num_tones, dtype=float)
-        phase = 0.07 * self.packet_counter + tone_idx
-        i_words = np.round(1000.0 * np.sin(phase)).astype('<i4')
-        q_words = np.round(1000.0 * np.cos(phase)).astype('<i4')
+
+        if self._mod is not None and self._mod_enabled:
+            mod = self._mod
+            N = mod['n_points']
+            spp = max(1, int(mod['samples_per_point']))
+            point = (self.packet_counter // spp) % N
+            settling = (self.packet_counter % spp) < int(mod['n_settle'])
+            center = np.asarray(mod['center'], dtype=float)[:num_tones]
+            offs = np.asarray(mod['offsets'], dtype=float)[point][:num_tones]
+            f0 = np.asarray(self._mod_f0, dtype=float)[:num_tones]
+            z = self._resonator_z(center + offs, f0, self._mod_linewidth)
+            i_words = np.round(z.real).astype('<i4')
+            q_words = np.round(z.imag).astype('<i4')
+            flag5 = (((int(point) + 1) & 0xFFFF)
+                     | (int(bool(settling)) << 16)
+                     | ((int(mod['revision']) & 0x7FFF) << 17))
+        else:
+            tone_idx = np.arange(num_tones, dtype=float)
+            phase = 0.07 * self.packet_counter + tone_idx
+            i_words = np.round(1000.0 * np.sin(phase)).astype('<i4')
+            q_words = np.round(1000.0 * np.cos(phase)).astype('<i4')
+            flag5 = 0
+
         iq_words = np.empty(2*num_tones, dtype='<i4')
         iq_words[0::2] = i_words
         iq_words[1::2] = q_words
 
         tt = int(time.time_ns())
         tail_u = np.zeros(10, dtype='<u4')
+        tail_u[5] = np.uint32(flag5)   # flag5 (frame[-5]) carries the modulation tag
         tail_u[6] = (tt >> 32) & 0xFFFFFFFF
         tail_u[7] = tt & 0xFFFFFFFF
         tail_u[8] = self.packet_counter & 0xFFFFFFFF
@@ -1239,6 +1426,77 @@ class MockReadoutServer:
 
         if request == 'disable_stream':
             self.is_streaming = False
+            return {'status': 'success'}
+
+        if request == 'enable_modulation':
+            try:
+                if (message.get('offsets') is None and message.get('center') is None
+                        and self._mod is not None):
+                    # Resume a resident config with no args.
+                    self._mod_enabled = True
+                    self._mod['state']['enabled'] = True
+                    return {'status': 'success', 'result': {
+                        'revision': self._mod['revision'],
+                        'needs_recenter': self._mod['state']['needs_recenter']}}
+                spp = int(message.get('samples_per_point', 1))
+                n_settle = int(message.get('n_settle', 1))
+                if message.get('offsets') is None:
+                    raise ValueError('offsets required to arm modulation')
+                state = self._mock_arm(message.get('center'), message.get('offsets'),
+                                       message.get('mod_indices'), spp, n_settle,
+                                       reload_bins=True, set_f0=True)
+                self._mod_enabled = True
+                state['enabled'] = True
+                return {'status': 'success', 'result': {
+                    'revision': self._mod_revision, 'needs_recenter': state['needs_recenter']}}
+            except Exception as e:
+                return {'status': 'error', 'message': str(e)}
+
+        if request == 'update_modulation':
+            if self._mod is None:
+                return {'status': 'error', 'message': 'modulation not armed'}
+            on_map_change = message.get('on_map_change', 'continue')
+            try:
+                # Tentatively evaluate occupancy on the *existing* armed bins
+                # (ride the overlap) without committing, so a rejection has no
+                # side effect.
+                center = (self._mod['center'].copy() if message.get('center') is None
+                          else np.asarray(message.get('center'), dtype=float))
+                mod_indices = self._mod['mod_indices']
+                if message.get('offsets') is None:
+                    full = self._mod['offsets'].copy()
+                else:
+                    full, _ = self._mock_expand_offsets(message.get('offsets'), mod_indices, len(center))
+                tentative = self._mock_modulation_state(
+                    center, full, mod_indices, self._mod['samples_per_point'],
+                    self._mod['n_settle'], self._mod_armed_bin_center)
+                if tentative['needs_recenter'] and on_map_change != 'recenter':
+                    return {'status': 'error',
+                            'message': 'update would push tones beyond bin coverage; '
+                                       'recenter required',
+                            'result': {'tones_beyond_coverage': tentative['tones_beyond_coverage']}}
+                reload_bins = bool(tentative['needs_recenter'])  # recenter path reloads bins
+                state = self._mock_arm(message.get('center'), message.get('offsets'), None,
+                                       self._mod['samples_per_point'], self._mod['n_settle'],
+                                       reload_bins=reload_bins, set_f0=False)
+                self._mod_enabled = True
+                return {'status': 'success', 'result': {
+                    'revision': self._mod_revision, 'op': 'recenter' if reload_bins else 'update'}}
+            except Exception as e:
+                return {'status': 'error', 'message': str(e)}
+
+        if request == 'recenter_modulation':
+            if self._mod is None:
+                return {'status': 'error', 'message': 'modulation not armed'}
+            self._mock_arm(self._mod['center'], None, None, self._mod['samples_per_point'],
+                           self._mod['n_settle'], reload_bins=True, set_f0=False)
+            self._mod_enabled = True
+            return {'status': 'success', 'result': {'revision': self._mod_revision}}
+
+        if request == 'disable_modulation':
+            self._mod_enabled = False
+            if self._mod is not None:
+                self._mod['state']['enabled'] = False
             return {'status': 'success'}
 
         if request == 'enable_triggered_stream':
