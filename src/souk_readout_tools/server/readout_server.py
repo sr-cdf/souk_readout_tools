@@ -3335,7 +3335,11 @@ class ReadoutServer:
                     f'cannot modulate blind tones (indices {bad}); blind tones must stay fixed')
 
         # Expand offsets to full per-tone columns (0 for tones we do not modulate).
-        offsets = np.atleast_2d(np.asarray(offsets, dtype=float))
+        # A 1D array of length n_points means "one offset per point, broadcast
+        # across the modulated tones" -> reshape to (n_points, 1) (NOT (1, n_points)).
+        offsets = np.asarray(offsets, dtype=float)
+        if offsets.ndim == 1:
+            offsets = offsets[:, None]
         num_points = offsets.shape[0]
         point_offsets = np.zeros((num_points, n_tones), dtype=float)
         if offsets.shape[1] == 1:
