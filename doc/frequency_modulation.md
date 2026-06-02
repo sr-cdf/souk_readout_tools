@@ -1,434 +1,353 @@
-# Fast Frequency Modulation
+# Fast Frequency Modulation — Technical Reference
 
-Fast frequency modulation rapidly dithers each readout tone across a small set
-of probe frequencies (typically 2 or 3 points) and streams the result back as
-ordinary data, tagged so you can tell which probe point every sample belongs
-to. It lets you measure each resonator's local response **continuously, in real
-time**, instead of relying on a single calibration sweep taken at the start of
-an observation.
+Fast frequency modulation steps each readout tone through a small set of probe
+frequencies (N = 2 or 3, generally) on every accumulation and returns the
+samples as ordinary stream frames. Each sample is tagged with the **index of the
+step within the modulation cycle** (1..N; 0 when not modulating) and a
+**settling flag**. It provides a real-time measurement of each resonator's local
+phase response (`dφ/df`, and with three points `d²φ/df²`) for live
+frequency-shift / dissipation demodulation and operating-point tracking.
 
-This document starts with a practical user guide to the main tools, then goes
-into the concepts and internals further down.
+- Server: `souk_readout_tools/server/readout_server.py`, `firmware_lib.py`
+- Client: `souk_readout_tools/client/readout_client.py`
+- Modulation toolkit (setup + demod): `souk_readout_tools/modulation.py` (pure functions)
+- Mock + test: `client/mock_readout.py`, `client/client_scripts/test_frequency_modulation.py`
 
 ---
 
 ## Contents
 
-- [Why use it](#why-use-it)
-- [Quick start](#quick-start)
-- [The main tools](#the-main-tools)
-  - [Set it up from a sweep](#1-set-it-up-from-a-sweep)
-  - [Arm, stream, and capture](#2-arm-stream-and-capture)
-  - [Demodulate](#3-demodulate)
-  - [Track: update the centres live](#4-track-update-the-centres-live)
-  - [Inspect the state](#5-inspect-the-state)
-- [Key concepts](#key-concepts)
-- [The data frame tag](#the-data-frame-tag)
-- [API reference](#api-reference)
-- [How it works](#how-it-works)
+- [Usage](#usage)
+- [Data model](#data-model)
+- [Frame tag (flag5)](#frame-tag-flag5)
+- [Control API](#control-api)
+- [Demodulation API](#demodulation-api)
+- [`tone_modulation` state schema](#tone_modulation-state-schema)
+- [Internals](#internals)
 - [Sensitivity](#sensitivity)
-- [Testing without hardware](#testing-without-hardware)
+- [Testing](#testing)
 - [Status and limitations](#status-and-limitations)
 
 ---
 
-## Why use it
+## Usage
 
-A resonator's transmitted phase `φ(f)` sweeps steeply through resonance. Two
-things follow from measuring that phase curve locally and continuously:
-
-1. **Live calibration (dφ/df).** Probing each resonator at two or more nearby
-   frequencies measures the local phase slope `dφ/df` *as the observation runs*.
-   You then convert the streamed I/Q into a **frequency shift** (the detector
-   signal) against a slope that tracks in real time — rather than a one-time
-   start-of-observation sweep that goes stale as the resonators drift. With a
-   resonance-circle calibration the same data also yields **dissipation**.
-
-2. **Tracking the operating point.** With three points you can estimate the
-   curvature `d²φ/df²` and find the **steepest part of the phase curve — the
-   inflection point** (the most responsive operating point, near resonance
-   `f₀`). A slow tracking loop can then steer each tone's centre to follow the
-   resonator as it drifts, **without dropping any data**.
-
-Because the modulation cycles far faster than the ~10 Hz science band (e.g. 3
-points at ~1 kSa/s ≈ 300 cycles/s), it also behaves like a lock-in that rejects
-low-frequency amplifier drift.
-
----
-
-## Quick start
+Canonical sequence (sweep → arm → acquire → demodulate):
 
 ```python
-from souk_readout_tools.client.readout_client import ReadoutClient
-from souk_readout_tools import demod
+from souk_readout_tools import modulation as mod
 
-client = ReadoutClient()                     # or ReadoutClient(mock=True) to try it offline
-
-# 1. Derive modulation parameters from a sweep you already took.
-sweep = client.get_sweep_data()              # {'f': (npts, ntones), 'z': (npts, ntones), ...}
-cfg = demod.modulation_params_from_sweep(sweep, n_points=3, samples_per_point=4)
-print(cfg['summary'])                        # review the per-tone centres and deltas
-
-# 2. Arm modulation and start streaming/capturing.
+cfg = mod.params_from_sweep(client.get_sweep_data(), n_points=3, samples_per_point=4)
 client.enable_modulation(center=cfg['center'], offsets=cfg['offsets'],
                          mod_indices=cfg['mod_indices'],
                          samples_per_point=cfg['samples_per_point'],
-                         n_settle=cfg['n_settle'])
-raw = client.get_samples(3000)               # returns modulated, tagged frames
+                         n_settle=cfg['n_settle'])           # arms only
+raw  = client.get_samples(3000)                              # finite, tagged capture
+# or: client.enable_stream()                                # continuous, tagged stream
 data = client.parse_samples(raw)
+grouped = mod.group_cycles(data, client.get_modulation_state())
+result  = mod.demodulate(grouped, linewidth_hz=cfg['linewidth_hz'])
 
-# 3. Demodulate to per-cycle quantities.
-state = client.get_modulation_state()
-grouped = demod.group_modulation_cycles(data, state)
-result = demod.demodulate(grouped, linewidth_hz=cfg['linewidth_hz'])
-print(result['freq_shift_hz'].shape)         # (n_cycles, n_tones)
+# result is a dict of (n_cycles, n_tones) arrays in user tone order:
+fshift  = result['freq_shift_hz']          # detector frequency-shift signal (Hz)
+slope   = result['dphi_df']                # live calibration slope (rad/Hz)
+detune  = result['detuning_linewidths']    # offset of centre from the inflection
+retune  = result['needs_update']           # bool: True where the centre should be re-tuned
+tone0_fshift = result['freq_shift_hz'][:, 0]   # time series (one value per cycle) for tone 0
 
-# 4. (Optional) re-centre a tone that has drifted, with no dropped data.
-client.update_modulation(center=new_centres)
-
-# 5. Stop modulating; tones rest at their centres.
-client.disable_modulation()
+client.update_modulation(center=new_centres)                # seamless live re-centre
+client.disable_modulation()                                 # tones rest at centre
 ```
+
+Usage notes:
+
+- **Arm ≠ stream.** `enable_modulation` only loads the config and sets the
+  modulation mode; it does **not** start output. Start output with
+  `enable_stream` (continuous) or `get_samples` (finite). Both return tagged
+  frames while armed.
+- **Single producer.** Continuous streaming and a finite `get_samples` capture
+  must not run simultaneously; a `get_samples` modulated capture is rejected
+  while a continuous stream is active. `burst=True` is rejected while modulating.
+- **Indices are user-facing.** `center`, `offsets`, `mod_indices`, the I/Q
+  columns and the `tone_modulation` state are all in user tone order; the server
+  maps to firmware/VACC indices internally.
+- **`offsets` shape** is `(n_points,)` (one offset per point, broadcast across
+  modulated tones) or `(n_points, len(mod_indices))` (per tone). A 1-D array is
+  read as one-per-point, not one-per-tone.
+- **Blind tones are never modulated.** Default `mod_indices` excludes them;
+  passing a blind index is an error.
+- **Decode the tag as unsigned.** `parse_samples` already does this and adds
+  `modulation_point` (1..N, 0 = off), `modulation_settling`, `modulation_revision`.
+- **Settling samples are flagged, not dropped.** Discard `modulation_settling==1`
+  samples in analysis if required; the stream itself omits nothing intentionally.
+- **Keep the probe delta small** (near the inflection) to minimise the
+  sensitivity penalty — see [Sensitivity](#sensitivity).
+- **Detuning needs a linewidth scale.** `detuning_linewidths` / `needs_update`
+  are NaN/False unless `linewidth_hz` (or `method='model'`) is supplied.
+- **Dissipation needs a circle calibration** (`circle_cal`); otherwise NaN.
+- **Live updates are seamless while in coverage.** Small moves ride the
+  filterbank overlap with no dropped data. A move that pushes a tone beyond
+  coverage is rejected unless `on_map_change='recenter'`; use
+  `recenter_modulation()` for a deliberate (brief) channel-map reload.
+- **Reading `demodulate` results.** The return value is a dict of
+  `(n_cycles, n_tones)` arrays in user tone order — one row per completed
+  modulation cycle (cycle rate ≈ `sample_rate / (N · samples_per_point)`). Index
+  `[:, tone]` for a per-cycle time series of one tone. Common keys:
+  `freq_shift_hz` (detector signal), `dphi_df` / `d2phi_df2` (live calibration),
+  `detuning_linewidths` + `needs_update` (tracking), `dissipation`, `z_center`,
+  plus `revision` (shape `(n_cycles,)`). A NaN entry means the quantity is
+  unavailable for that configuration (e.g. `d2phi_df2`/detuning with too few
+  points or no `linewidth_hz`). Full list under [Demodulation API](#demodulation-api).
 
 ---
 
-## The main tools
+## Data model
 
-### 1. Set it up from a sweep
+| term | definition |
+|------|------------|
+| **point (N)** | One probe frequency in the cycle. N≥2 gives `dφ/df`; N≥3 adds `d²φ/df²`. |
+| **center** | Per-tone operating frequency (Hz), user order, length = active tone count. |
+| **offsets** | Per-point (and optionally per-tone) probe offsets (Hz) added to `center`. |
+| **dwell (`samples_per_point`)** | Accumulations emitted per point per cycle. |
+| **settling (`n_settle`)** | Leading samples per point flagged as transient. |
+| **cycle** | One pass through all N points (`N · samples_per_point` samples). |
+| **revision** | 15-bit counter, bumped per enable/update, stamped in every frame. |
+| **armed bins/maps** | The FFT channel each tone is assigned to (and the VACC indices), fixed when you arm; the fast path never rewrites them, so a tone keeps using its armed channel even as it is dithered/drifts. |
+| **bin occupancy** | Where each probe point lands relative to its armed channel, as a drift in channels — i.e. how well the fixed channel map still covers it. Per (tone, point): `nearest` (within ±½ channel, on its home channel), `second` (½–1 channel away — now closer to the neighbouring channel but still fully covered thanks to the ~2× filterbank oversampling; just flagged), `beyond` (>1 channel — no longer covered, so the maps must be reloaded via a recentre). Reported in `drift_bins` (signed, in channels) and `occupancy`. |
 
-`demod.modulation_params_from_sweep(sweep, ...)` turns a calibration sweep into
-a ready-to-use configuration. It fits each resonator for its **centre** (the
-steepest/inflection point) and its **linewidth**, then builds a symmetric probe
-pattern with **each tone's probe spacing scaled to its own linewidth** — narrow
-resonators automatically get a smaller delta.
+---
 
-```python
-cfg = demod.modulation_params_from_sweep(
-    sweep,                 # dict with 'f' and 'z' arrays, shape (n_sweep_points, n_tones)
-    n_points=3,            # 2 = slope only; 3 = slope + curvature/tracking
-    samples_per_point=4,   # dwell: samples per point per cycle
-    n_settle=1,            # leading samples per point flagged as 'settling'
-    delta_linewidths=0.25, # probe half-span in units of each resonator's linewidth
-)
-# cfg = {'center', 'offsets', 'mod_indices', 'samples_per_point', 'n_settle',
-#        'linewidth_hz', 'summary'}
+## Frame tag (flag5)
+
+Modulation repurposes the sixth stream flag word `flag5` = `frame[-5]` (an
+`int32`). The wire format is unchanged; the semantics are **not** boolean while
+modulating. Decode as **unsigned** (the revision can set the sign bit):
+
+```
+bits  0..15   modulation step index  (0 = modulation off, 1..N = step in the cycle)
+bit   16      settling/transient marker
+bits 17..31   modulation configuration revision (0..0x7FFF)
 ```
 
-The returned dict splats straight into `enable_modulation(**cfg-subset)`. The
-`linewidth_hz` it returns is what the demod tool needs later to express detuning
-in linewidths. You can of course build `center`/`offsets` by hand instead.
+- Non-modulated streams leave `flag5 = 0` → all derived fields read 0 (backward
+  compatible).
+- During the settling window the legacy `FLAG_SET_FREQS` flag is also held high
+  for consumers that do not parse `flag5`.
+- Server: written in `ReadoutServer.prepare_frame(..., mod_point, settling, revision)`.
+- Client: `parse_samples` emits `modulation_point`, `modulation_settling`,
+  `modulation_revision` (each shape `(n_samples,)`).
 
-### 2. Arm, stream, and capture
+---
 
-Modulation is a **mode of the normal data stream**, controlled by an on/off
-switch that is independent of whether the stream is running:
+## Control API
 
-```python
-# Arm only (does not start output):
-client.enable_modulation(center=centres,        # per-tone centres (Hz), or None for the live comb
-                         offsets=[-1e3, 0, 1e3], # probe offsets (Hz); (n_points,) or (n_points, n_mod)
-                         mod_indices=None,        # None = all resonator tones (blind tones excluded)
-                         samples_per_point=4,
-                         n_settle=1)
+Client methods (each maps to a server request; mock-mode supported). All return
+the server ack dict (`{'status': 'success'|'error', ...}`).
 
-# Then EITHER continuous streaming ...
-client.enable_stream()        # tagged modulated frames flow to stream clients
-# ... OR a finite capture over the request socket:
-raw = client.get_samples(3000)   # returns modulated, tagged frames while armed
-```
+### `enable_modulation(center=None, offsets=None, mod_indices=None, samples_per_point=1, n_settle=1)`
+Arm modulation (does not start output).
+- `center` — per-tone centre RF freqs (Hz), user order; `None` uses the current comb.
+- `offsets` — probe offsets (Hz); `(n_points,)` or `(n_points, len(mod_indices))`.
+- `mod_indices` — tones to modulate; `None` = all regular (resonator) tones; blind indices error.
+- `samples_per_point`, `n_settle` — dwell and settling counts.
+- No-args call re-arms a previously loaded config.
+- Result: `{'revision', 'needs_recenter'}`. Sets the modulation-enabled event; does **not** set the stream-enabled event.
 
-Both paths return ordinary frames; the only difference from normal data is the
-per-sample modulation tag (see [the data frame tag](#the-data-frame-tag)).
-`parse_samples` decodes the tag for you:
+### `update_modulation(center=None, offsets=None, on_map_change='continue')`
+Seamless live update of centre and/or offsets (applied at a cycle boundary, no dropped data).
+- Omitted args keep their current values.
+- `on_map_change='continue'` (default): rejected if any (tone, point) would leave bin coverage (returns `{'tones_beyond_coverage': [...]}`). `'recenter'`: performs the map reload instead.
+- Result: `{'revision', 'op': 'update'|'recenter'}`.
 
-```python
-data = client.parse_samples(raw)
-data['modulation_point']     # 1..N (0 means modulation was off for that sample)
-data['modulation_settling']  # 1 on the first n_settle samples after each switch
-data['modulation_revision']  # which config revision produced the sample
-```
+### `recenter_modulation()`
+Reload channel maps / mixer frequencies for the current centre and recompute VACC bin-sharing (a deliberate brief break). Result: `{'revision'}`.
 
-> **Arm ≠ stream.** `enable_modulation` only loads the config. Start output
-> separately with `enable_stream` (continuous) or `get_samples` (finite). A
-> finite `get_samples` capture is rejected while a continuous stream is running,
-> so exactly one producer drives the hardware at a time.
+### `disable_modulation()`
+Clear the modulation-enabled event; rest tones at their centres. The config stays resident for a fast re-arm. (Use `disable_stream()` to stop output entirely.)
 
-### 3. Demodulate
+### `get_modulation_state()`
+Return the `tone_modulation` section (see [schema](#tone_modulation-state-schema)). Pure server-side read (no hardware access); safe to poll while streaming.
 
-The demod tool lives in `souk_readout_tools.demod` and is a set of **pure
-functions** (arrays in, arrays out) — no client or socket dependency.
+### Acquisition (existing methods, modulation-aware)
+- `enable_stream()` / `disable_stream()` — continuous output on/off.
+- `get_samples(num_samples, burst=False)` — finite capture; returns tagged frames when armed (whole-cycle warm-up, aligned to point 1; `burst=True` rejected).
+- `parse_samples(raw)` — adds the three `modulation_*` arrays.
 
-```python
-state = client.get_modulation_state()                 # carries the per-point offsets
-grouped = demod.group_modulation_cycles(data, state)  # group by point & cycle, drop settling
-result = demod.demodulate(grouped, linewidth_hz=cfg['linewidth_hz'])
-```
+Server requests: `enable_modulation`, `update_modulation`, `recenter_modulation`,
+`disable_modulation`, plus `get_info('tone_modulation')`. Status dicts
+(`health_check`, server info) include `modulation_streaming`.
 
-`result` holds per-cycle, per-tone arrays of shape `(n_cycles, n_tones)`:
+---
 
-| key | meaning |
-|-----|---------|
-| `dphi_df` | local phase slope, rad/Hz |
-| `d2phi_df2` | local curvature, rad/Hz² (NaN for < 3 points) |
-| `freq_shift_hz` | the detector signal: centre-point phase ÷ slope |
-| `detuning_linewidths` | how far the centre sits from the inflection (needs `linewidth_hz`) |
-| `needs_update` | True when `|detuning_linewidths|` exceeds the threshold (default 0.1) |
-| `dissipation` | loss coordinate (only with a resonance-circle calibration) |
+## Demodulation API
+
+`souk_readout_tools.modulation` — pure functions (arrays/dicts in, arrays out; no
+client/socket dependency, relocatable server-side).
+
+### `params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1, delta_linewidths=0.25, exclude_blind=True, blind_indices=None)`
+Fit a sweep into an `enable_modulation` config.
+- `sweep` — dict with `f`, `z` arrays of shape `(n_sweep_points, n_tones)` (Hz, complex S21); optional `blind_indices`.
+- Per tone: centre = steepest (inflection) point; linewidth from the peak slope (`w ≈ 4/|dφ/df|_max` for an arctan phase).
+- Probe pattern: symmetric `linspace(-1, 1, n_points)` scaled by `delta_linewidths · linewidth` per tone.
+- Returns `{'center', 'offsets' (n_points, n_mod), 'mod_indices', 'samples_per_point', 'n_settle', 'linewidth_hz' (n_mod), 'summary'}`.
+
+### `group_cycles(data_dict, tone_modulation_state, reduce='mean')`
+Group parsed samples by point and cycle.
+- Drops `settling` samples; aligns by the gap-free `packet_counter`; cycle boundary detected on point wrap.
+- Per-(point, tone) offsets read from `tone_modulation_state['tones'][i]['offsets_hz']`.
+- `reduce='mean'` → `z` shape `(n_cycles, N, n_tones)`; `reduce=None` → `(n_cycles, N, n_used, n_tones)`.
+- Returns `{'z', 'offsets_hz' (N, n_tones), 'revision' (n_cycles,), 'point_order'}`.
+
+### `demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None, circle_cal=None, phase_baseline=None, threshold_linewidths=0.1)`
+Per-cycle, per-tone demodulation. Returns arrays of shape `(n_cycles, n_tones)`:
+
+| key | definition |
+|-----|------------|
+| `dphi_df` | local phase slope (rad/Hz) |
+| `d2phi_df2` | local curvature (rad/Hz²); NaN if N<3 |
+| `freq_shift_hz` | `(φ_center − baseline) / dphi_df` |
+| `detuning_linewidths` | `−(d²φ/df² ÷ dφ/df)·linewidth/8` (leading order); NaN without `linewidth_hz` or N<3 |
+| `detuning_hz` | `detuning_linewidths · linewidth_hz` |
+| `needs_update` | `|detuning_linewidths| > threshold_linewidths` |
+| `dissipation` | loss coordinate from `circle_cal`; NaN otherwise |
 | `z_center` | complex value at the centre probe point |
 
-Choose the estimator with `method=`: `'fast'` (finite differences), `'accurate'`
-(weighted polynomial fit — handles asymmetric offsets), or `'model'` (calibrated
-non-ideal fit).
+- `method`: `'fast'` (finite differences), `'accurate'` (weighted polynomial fit; handles asymmetric offsets), `'model'` (calibrated non-ideal fit; currently shares the `accurate` path).
+- `phase_baseline` — per-tone reference phase for `freq_shift_hz`; `None` uses the per-tone mean centre-point phase across cycles.
 
-### 4. Track: update the centres live
+---
 
-`update_modulation` swaps in new centres and/or offsets **without dropping
-data** — the change is applied at a cycle boundary and the stream never pauses:
+## `tone_modulation` state schema
+
+`get_info('tone_modulation')` / `get_modulation_state()`:
 
 ```python
-# A tracking loop computes new centres from result['needs_update'] / detuning, then:
-client.update_modulation(center=new_centres)
+{
+  'enabled': bool,                      # modulation-enabled event state
+  'desired_revision': int,              # last requested config revision
+  'applied_revision': int,              # revision actually applied by the producer
+  'revision_history': {rev: {'center', 'offsets', 'mod_indices', 'ts'}},
+  'num_points': int, 'samples_per_point': int, 'n_settle': int,
+  'mod_indices': [int, ...],            # user-facing
+  'sample_rate_hz': float, 'cycle_rate_hz': float,
+  'needs_recenter': bool,
+  'tones_beyond_coverage': [int, ...],  # user-facing indices
+  'tones': [
+    {'index': int,                      # user-facing (matches stream I/Q columns)
+     'firmware_index': int,             # internal VACC/LO index (annotation only)
+     'center_hz': float,
+     'armed_fft_bin': int,
+     'offsets_hz': [float, ...],        # per point
+     'drift_bins': [float, ...],        # per point, signed, in channels
+     'occupancy': ['nearest'|'second'|'beyond', ...]},  # per point
+    ...
+  ],
+}
 ```
-
-Small moves ride the filterbank's natural channel overlap with no interruption.
-If a move is large enough to push a tone beyond that coverage, the update is
-**rejected** and you must explicitly recentre (a deliberate, brief reload of the
-channel maps):
-
-```python
-ack = client.update_modulation(center=big_move)
-if ack['status'] == 'error':                 # tones beyond coverage
-    client.recenter_modulation()             # reload maps for the current centre
-```
-
-### 5. Inspect the state
-
-`get_modulation_state()` returns a cheap, hardware-free snapshot you can poll
-while streaming:
-
-```python
-st = client.get_modulation_state()
-st['enabled'], st['num_points'], st['samples_per_point']
-st['desired_revision'], st['applied_revision']    # queued vs actually-applied config
-st['needs_recenter'], st['tones_beyond_coverage'] # bin-coverage health
-for tone in st['tones']:
-    tone['index'], tone['center_hz'], tone['offsets_hz'], tone['occupancy']
-```
-
-`occupancy` is per probe point: `'nearest'` (on the home bin), `'second'`
-(riding the overlapping neighbour — fine, just flagged), or `'beyond'` (needs a
-recentre).
 
 ---
 
-## Key concepts
-
-- **Points (N).** The number of probe frequencies per cycle. 2 gives the slope;
-  3 adds curvature (and thus inflection-point tracking). N can be larger.
-- **Centre + offsets.** Each tone has a per-tone **centre** (its operating
-  frequency) and a small set of **probe offsets** added to it. Offsets are
-  per-tone-per-point — each resonator can use a different probe spacing scaled
-  to its own bandwidth.
-- **Dwell (`samples_per_point`).** How many accumulations are taken at each
-  point before switching. Larger dwell = higher live fraction (see
-  [Sensitivity](#sensitivity)).
-- **Settling (`n_settle`).** The first few samples after a switch may not be
-  fully settled; they are **flagged, not dropped**, so you can discard them in
-  analysis if you wish.
-- **Revision.** A counter bumped on every enable/update. It is stamped into
-  every frame so offline analysis knows which centre/offsets produced it.
-- **Bin occupancy / overlap.** The filterbank channels overlap ~2×, so a tone
-  stays well covered even as it drifts up to about a full channel away from its
-  home bin. Modulation exploits this: the channel maps are held **fixed** and
-  the tones ride the overlap, avoiding any map rewrite on the fast path.
-- **User vs firmware indices.** Everything you pass or read back
-  (`center`, `offsets`, `mod_indices`, the I/Q columns, the `tone_modulation`
-  state) is in **user-facing tone order** — the same order as your tone list.
-  The server maps to internal firmware/VACC indices itself.
-- **Blind tones are never modulated.** They have no resonance to track; the
-  default `mod_indices` excludes them and explicitly asking to modulate one is
-  an error.
-
----
-
-## The data frame tag
-
-Modulation reuses the otherwise-unused sixth stream flag word (`flag5`,
-`frame[-5]`) as a packed tag. **It is no longer a boolean** when modulating; the
-wire format is unchanged but the meaning is not. Decode it as **unsigned**:
-
-```
-bits 0..15    active point: 0 = modulation off, 1..N = the probe point
-bit  16       settling/transient marker
-bits 17..31   modulation configuration revision
-```
-
-`parse_samples` does this for you (`modulation_point`, `modulation_settling`,
-`modulation_revision`). Plain (non-modulated) streams leave `flag5 = 0`, so
-these fields read as zeros and existing consumers are unaffected. During the
-settling window the legacy `FLAG_SET_FREQS` flag is also held high so older
-consumers still see "frequencies changing".
-
----
-
-## API reference
-
-### Client (`ReadoutClient`)
-
-| method | summary |
-|--------|---------|
-| `enable_modulation(center=None, offsets=None, mod_indices=None, samples_per_point=1, n_settle=1)` | Arm modulation (does not start output). With no args, re-arms a previously loaded config. Returns an ack with `revision` and `needs_recenter`. |
-| `update_modulation(center=None, offsets=None, on_map_change='continue')` | Live update of centres and/or offsets with no dropped data. `on_map_change='recenter'` permits a map reload if a tone leaves bin coverage; otherwise such an update is rejected. |
-| `recenter_modulation()` | Reload channel maps / mixer frequencies for the current centre and recompute bin sharing (a deliberate brief break). |
-| `disable_modulation()` | Pause modulation; tones rest at their centres. The config stays resident so `enable_modulation()` re-arms quickly. |
-| `get_modulation_state()` | Return the `tone_modulation` state (armed flag, revisions, per-tone centres/offsets/occupancy, `needs_recenter`). Hardware-free; safe to poll. |
-| `get_samples(num_samples)` | When modulation is armed, returns modulated, tagged frames; otherwise unchanged. |
-| `parse_samples(raw)` | Adds `modulation_point`, `modulation_settling`, `modulation_revision` to the parsed dict. |
-
-The same on/off applies to continuous streaming via the existing
-`enable_stream()` / `disable_stream()`.
-
-### Demod (`souk_readout_tools.demod`)
-
-| function | summary |
-|----------|---------|
-| `modulation_params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1, delta_linewidths=0.25, exclude_blind=True, blind_indices=None)` | Fit a sweep → ready-to-use config (`center`, `offsets`, `mod_indices`, dwell, `linewidth_hz`, `summary`). |
-| `group_modulation_cycles(data_dict, tone_modulation_state, reduce='mean')` | Group parsed samples by point and cycle (settling dropped); `reduce='mean'` averages each dwell, `reduce=None` keeps the sample axis. |
-| `demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None, circle_cal=None, phase_baseline=None, threshold_linewidths=0.1)` | Per-cycle `dphi_df`, `d2phi_df2`, `freq_shift_hz`, `detuning_linewidths`, `detuning_hz`, `needs_update`, `dissipation`, `z_center`. |
-
-### Server `get_info('tone_modulation')`
-
-Returns the cached state (no hardware access): `enabled`, `desired_revision`,
-`applied_revision`, `revision_history`, `num_points`, `samples_per_point`,
-`n_settle`, `mod_indices`, `sample_rate_hz`, `cycle_rate_hz`, `needs_recenter`,
-`tones_beyond_coverage`, and a per-tone `tones` list (`index`, `firmware_index`,
-`center_hz`, `armed_fft_bin`, `offsets_hz`, `drift_bins`, `occupancy`).
-
----
-
-## How it works
+## Internals
 
 ### One streamer, modulation as a mode
+A single `stream_data` coroutine produces all stream frames, gated by two
+events: `e_stream_enabled` (output on/off) and `e_modulation_enabled` (modulate
+vs plain). Normal streaming is the modulation-off case. `get_samples` shares the
+same stepping engine for finite captures; an acquisition-owner lock ensures a
+single producer drives the hardware.
 
-There is a single streaming coroutine on the server (`stream_data`). Two events
-gate it: `e_stream_enabled` (is it producing frames at all?) and
-`e_modulation_enabled` (modulate or emit plain frames?). Normal streaming is
-simply the modulation-off case, so there is never a second task to track. The
-finite `get_samples` path shares the same stepping engine; an acquisition-owner
-lock ensures only one producer drives the hardware at a time.
+### Double-buffer ping-pong scheduler (`ModulationScheduler`)
+The firmware has two LO control buffers. The scheduler writes the next point's
+words into the **inactive** buffer, flips the active index, and pulses sync; the
+vacated buffer then receives the following point during the dwell. Rules:
+- Skip the write when the inactive buffer already holds the wanted point. For
+  **N=2** the two points stay resident in the two buffers, so each switch is an
+  index flip + sync only (no per-switch write).
+- The live buffer is never written, so the scheme is correct for any N including
+  odd N across repeated cycles.
+- The first sample emitted is point 1 (armed live); subsequent visits emit after
+  the swap, so settling marks the post-switch samples.
+- Channel maps are written **once** at arm; never in the hot loop.
 
-### The double-buffer ping-pong
+### Armed bins and overlap riding (`firmware_lib.prepare_modulation_settings_fast`)
+Channel maps and VACC indices are computed once from the centre comb and held
+fixed. Each probe point's mixer phase increment is computed relative to the
+**armed** bin centre (not the tone's instantaneous nearest bin), so the phase is
+continuous as a tone dithers/drifts across a bin boundary. The ~2× oversampled
+filterbank keeps a tone covered to roughly a full channel of drift; occupancy
+classification (`nearest`/`second`/`beyond`) reports this and triggers a
+recentre when coverage is exceeded. `_rf_to_digital_baseband` performs the
+RF→baseband mapping (UDC + Nyquist + DUC/DDC), shared with the fast tone setter.
 
-The firmware has two LO control buffers. To change every tone's frequency
-without disturbing the point currently being accumulated, the scheduler writes
-the **next** point's words into the **inactive** buffer, flips the active-buffer
-index, and pulses sync; the just-vacated buffer is then free to receive the
-following point during the current dwell. For **N = 2** the two points live
-permanently in the two buffers, so each switch is just an index flip + sync with
-no buffer write at all (the fastest possible switch). For **N ≥ 3** the
-"write-inactive → swap → prep-next" pattern keeps the live buffer untouched, so
-the scheme is correct for any N, including odd N across repeated cycles.
+### Live update mechanism
+The request handler prepares the bundle off the hot path (thread executor,
+including occupancy classification) and posts it to a single latest-wins slot.
+The producer applies it at the next cycle boundary (`_apply_pending_modulation_command`)
+and is the sole owner of modulation hardware writes — no race with an in-flight
+cycle. A same-maps update swaps the per-point words in place (no map rewrite, no
+reset); the new frequencies take effect within one cycle. The revision is bumped
+and the full revision→config history retained for offline analysis.
 
-### Riding the channel overlap (armed bins)
-
-The channel maps are computed once when you arm, from the centre comb, and then
-**held fixed**. Because the filterbank channels overlap ~2×, a tone stays
-covered as it dithers and drifts. Crucially, each probe point's mixer phase is
-computed relative to the **armed** bin (not the tone's instantaneous nearest
-bin) — otherwise the phase would jump by a whole bin the moment a tone crossed a
-bin boundary. When tones eventually drift past the overlap coverage, that is
-reported (`needs_recenter` / `occupancy = 'beyond'`) and a `recenter_modulation`
-reloads the maps and recomputes bin sharing.
-
-### Seamless live updates
-
-`update_modulation` does the heavy preparation off the streaming hot path (in a
-worker thread) and posts the result to a single latest-wins slot. The streamer
-applies it at the next cycle boundary — it is the sole owner of all modulation
-hardware writes, which avoids any race with an in-flight cycle. A same-maps
-update swaps the per-point words in place (no map rewrite, no reset); the new
-frequencies take effect within one cycle with no dropped frames. Every applied
-update bumps the revision, and the full revision→config history is retained in
-the `tone_modulation` state for offline analysis across updates.
-
-### The demod maths
-
-For each cycle and tone, the probe-point phases are fit against their offsets:
-the first derivative gives `dphi_df`; the second difference / quadratic fit
-gives `d2phi_df2` (needs ≥ 3 points, else NaN). The detector **frequency shift**
-is the centre-point phase deviation divided by the local slope, relative to a
-defined baseline. The **detuning** (how far the centre is from the inflection)
-follows from the ratio `d²φ/df² ÷ dφ/df`, which has units of 1/Hz — so
-expressing it in linewidths needs a **linewidth scale** (or a calibrated model);
-without one, detuning and `needs_update` are returned as NaN/False.
-
-> **Dissipation** is not a naive `d|S21|/df`: as a resonator detunes the
-> operating point slides around the resonance circle, so a reliable dissipation
-> reading needs the resonance-circle calibration (centre/radius/rotation from a
-> fit), supplied via `circle_cal`. Without it, `dissipation` is NaN.
+### Demod definitions
+For each cycle/tone, probe-point phases `φ(fᵢ)` are fit against their offsets:
+`dφ/df` from a first-difference (`fast`) or degree-1 fit (`accurate`); `d²φ/df²`
+from a symmetric second difference (`fast`, N=3) or degree-2 fit (`accurate`,
+N≥3). `freq_shift_hz = (φ_center − baseline)/(dφ/df)`. The ratio
+`d²φ/df² ÷ dφ/df` has units 1/Hz, so detuning in linewidths requires a linewidth
+scale; the `fast` estimator uses the leading-order Lorentzian form
+`detuning_lw ≈ −(ratio·w)/8`, and `model` would calibrate it per device.
+Dissipation is not `d|S21|/df` (the operating point slides around the resonance
+circle as the tone detunes); it requires the circle calibration to refer the
+amplitude back to the on-resonance point.
 
 ---
 
 ## Sensitivity
 
-Time-division-multiplexing the probe across N points does **not** inherently
-cost a factor of N (or √N) in sensitivity to the frequency shift, because every
-probe point carries information about it. Combining points optimally, the
-*variance* penalty versus parking a single tone at the steepest point is
-`N·S_max² / Σᵢ Sᵢ²` (where `Sᵢ` is the local slope at point i) — and the
-noise-amplitude penalty is its square root. For a symmetric two-point pattern in
-the linear regime this is 1 (no penalty); for three points it is ≈ 1 when the
-delta is small (points clustered near the high-slope inflection), and only grows
-if the delta pushes points onto the shallow shoulders. **So keep the per-tone
-delta small / near the inflection.**
-
-The real cost is **duty cycle**: settling samples and switch time are
-*potentially* unusable (the accumulator may still integrate useful signal across
-part of a switch — measure the usable fraction on hardware). Keep
-`samples_per_point` comfortably larger than the settling window, which is why
-the switch is engineered to be fast.
+TDM across N points does not inherently cost N (or √N) for the frequency-shift
+signal, because every point carries information about it. The optimal-combination
+*variance* penalty vs parking at the steepest point is `N·S_max² / Σᵢ Sᵢ²`
+(`Sᵢ` = local slope); the noise-amplitude penalty is its square root. For a
+symmetric 2-point pattern in the linear regime this is 1; for 3 points ≈1 when
+the delta is small (near the high-slope inflection), growing only as the delta
+reaches the shallow shoulders. The dominant real cost is **duty cycle**: settling
+samples and switch time are *potentially* unusable (the accumulator may still
+integrate useful signal across part of a switch — measure the usable fraction on
+hardware), so keep `samples_per_point` well above the settling window. The fast
+cycle rate also rejects low-frequency amplifier drift (lock-in effect).
 
 ---
 
-## Testing without hardware
+## Testing
 
-Everything except the firmware register writes can be exercised in mock mode.
-The mock server simulates modulation with a simple resonator phase model
-(inflection at `f₀`, magnitude dip), so the demod tool has ground truth, and a
-mock channel grid so bin-occupancy / recentre behave realistically.
+Mock mode exercises everything except the firmware register writes. The mock
+simulates modulation with a resonator phase model (inflection at `f₀`, magnitude
+dip) for demod ground truth, plus a mock channel grid for occupancy/recentre.
 
 ```bash
 PYTHONPATH=src python src/souk_readout_tools/client/client_scripts/test_frequency_modulation.py
 ```
 
-This end-to-end script checks the tag structure, gap-free counter, uint32
-decode, live update + revision, occupancy/recentre, index consistency,
-pause/resume, the demod tool, and `modulation_params_from_sweep`.
-
-```python
-client = ReadoutClient(mock=True)
-client.enable_modulation(center=[2.0e9, 2.1e9], offsets=[-1e3, 0, 1e3],
-                         samples_per_point=4, n_settle=1)
-data = client.parse_samples(client.get_samples(120))
-print(data['modulation_point'][:12])   # 1 1 1 1 2 2 2 2 3 3 3 3
-```
+Covers: tag structure / dwell / settling, gap-free counter, unsigned decode,
+live update + revision, occupancy + recentre, index consistency, pause/resume,
+the demod tool, and `params_from_sweep`. The `ModulationScheduler`
+ping-pong is separately unit-tested for N = 2, 3, 5 (no active-buffer
+corruption; channel maps written once).
 
 ---
 
 ## Status and limitations
 
-- The data plane (tagging, decode, scheduler bookkeeping, mock, demod,
-  parameter derivation) is implemented and verified in mock mode; the scheduler
-  ping-pong is unit-tested for N = 2, 3, 5 with no active-buffer corruption.
-- The firmware preparer and the scheduler's register writes follow the existing
-  fast-path patterns but **still need on-hardware validation** (switch timing,
-  odd-N correctness, recentre behaviour, and the actual sensitivity vs a
-  parked-tone baseline). The half-/full-channel overlap thresholds are a
-  reasonable hypothesis pending measurement.
-- **Live revision persistence** into the raw-stream sidecar / G3 metadata is a
-  follow-up; for now the server retains the full `revision_history` in
-  `get_info('tone_modulation')`, which is sufficient to map any frame's revision
-  to its config offline.
-- The **automated tracking loop** (acting on `needs_update` to re-centre) is not
-  yet built; the API above provides everything it needs.
+- Data plane (tagging, decode, scheduler bookkeeping, mock, demod, parameter
+  derivation) implemented and verified in mock mode.
+- Firmware preparer and the scheduler's register writes follow the existing
+  fast-path patterns but require **on-hardware validation**: switch timing,
+  odd-N correctness, recentre behaviour, and measured sensitivity vs a
+  parked-tone baseline. The ½/1-channel overlap thresholds are provisional
+  pending measurement.
+- **Revision persistence** into the raw-stream sidecar / G3 metadata is a
+  follow-up; `revision_history` in `tone_modulation` currently suffices to map a
+  frame's revision to its config offline.
+- The **automated tracking loop** (acting on `needs_update`) is not implemented;
+  the API provides the required inputs and the seamless `update_modulation` path.
 ```

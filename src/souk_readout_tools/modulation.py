@@ -1,27 +1,26 @@
 """
-Fast-frequency-modulation demodulation helpers.
+Fast-frequency-modulation client toolkit (setup + demodulation).
 
 These are **pure, transport-agnostic** functions: they operate on plain arrays /
 dicts (parsed stream samples + the ``tone_modulation`` state), with no
 ``ReadoutClient`` or socket dependency. That keeps them usable client-side on
 received frames today and relocatable/shareable server-side later.
 
-The pipeline a consumer follows is:
+The workflow a consumer follows is:
 
+0. :func:`params_from_sweep` -> turn a calibration sweep into a ready-to-use
+   ``enable_modulation`` config (per-tone centres + per-tone probe deltas scaled
+   to each resonator's linewidth). This is the *setup* step.
 1. Acquire modulated samples (``ReadoutClient.get_samples`` while modulation is
    armed, or a captured continuous stream) and parse them
    (``ReadoutClient.parse_samples``) -> a ``data_dict`` carrying per-tone I/Q,
    ``modulation_point`` (1..N, 0 = off), ``modulation_settling`` and
    ``modulation_revision``.
-2. :func:`group_modulation_cycles` -> per-tone complex measurements grouped by
-   probe point and cycle (settling samples dropped), plus the per-point probe
-   offsets (Hz) read from ``get_info('tone_modulation')``.
+2. :func:`group_cycles` -> per-tone complex measurements grouped by step and
+   cycle (settling samples dropped), plus the per-point probe offsets (Hz) read
+   from ``get_info('tone_modulation')``.
 3. :func:`demodulate` -> per-cycle dphi/df, d2phi/df2, frequency shift and a
    detuning estimate (with a ``needs_update`` flag for the future tracking loop).
-
-:func:`modulation_params_from_sweep` is the front of the workflow: turn a
-calibration sweep into a ready-to-use ``enable_modulation`` config (per-tone
-centres + per-tone probe deltas scaled to each resonator's linewidth).
 
 Physics caveats (kept honest):
 - The point we steer to is the **steepest part of the phase curve / inflection
@@ -59,7 +58,7 @@ def _tone_iq(data_dict, n_tones):
     return np.stack(cols, axis=1)   # (n_samples, n_tones)
 
 
-def group_modulation_cycles(data_dict, tone_modulation_state, reduce='mean'):
+def group_cycles(data_dict, tone_modulation_state, reduce='mean'):
     """
     Group modulated samples by probe point and modulation cycle.
 
@@ -162,7 +161,7 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
     Parameters
     ----------
     grouped : dict
-        Output of :func:`group_modulation_cycles` (uses ``z`` and, if ``offsets``
+        Output of :func:`group_cycles` (uses ``z`` and, if ``offsets``
         is None, ``offsets_hz`` / ``revision``). ``z`` may be ``(n_cycles, N,
         n_tones)`` (mean-reduced) or ``(n_cycles, N, n_used, n_tones)``; the
         sample axis is averaged here if present.
@@ -284,7 +283,7 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
     return out
 
 
-def modulation_params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
+def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
                                  delta_linewidths=0.25, exclude_blind=True,
                                  blind_indices=None):
     """
@@ -360,7 +359,7 @@ def modulation_params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_se
     offsets = pattern[:, None] * deltas[None, :]          # (n_points, len(mod_indices))
 
     summary_lines = [
-        f'modulation_params_from_sweep: {len(mod_indices)} modulated tones '
+        f'params_from_sweep: {len(mod_indices)} modulated tones '
         f'({n_tones - len(mod_indices)} excluded), {n_points} points, '
         f'dwell={samples_per_point}, n_settle={n_settle}, delta={delta_linewidths} linewidths',
     ]
