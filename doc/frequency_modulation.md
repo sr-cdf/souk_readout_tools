@@ -45,8 +45,8 @@ client.enable_modulation(center=cfg['center'], offsets=cfg['offsets'],
 raw  = client.get_samples(3000)                              # finite, tagged capture
 # or: client.enable_stream()                                # continuous, tagged stream
 data = client.parse_samples(raw)
-grouped = mod.group_cycles(data, client.get_modulation_state())
-result  = mod.demodulate(grouped, linewidth_hz=cfg['linewidth_hz'])
+grouped = mod.group_cycles(data, client.get_modulation_state())  # on_missing='fill' to NaN-fill dropped packets
+result  = mod.demodulate(grouped, calibration=cfg['calibration'])  # centred basis: exact freq shift + dissipation
 
 # result is a dict of (n_cycles, n_tones) arrays in user tone order:
 fshift  = result['freq_shift_hz']          # detector frequency-shift signal (Hz)
@@ -82,9 +82,18 @@ Usage notes:
   samples in analysis if required; the stream itself omits nothing intentionally.
 - **Keep the probe delta small** (near the inflection) to minimise the
   sensitivity penalty — see [Sensitivity](#sensitivity).
-- **Detuning needs a linewidth scale.** `detuning_linewidths` / `needs_update`
-  are NaN/False unless `linewidth_hz` (or `method='model'`) is supplied.
-- **Dissipation needs a circle calibration** (`circle_cal`); otherwise NaN.
+- **Prefer the calibrated (centred) basis.** Pass `calibration=cfg['calibration']`
+  (from `params_from_sweep(deembed=True)`) to `demodulate`. It de-embeds the cable
+  delay and phase-centres each resonator, so the phase is well conditioned and the
+  frequency shift + dissipation come out exactly (Möbius inversion). See
+  [De-embedding](#de-embedding-and-the-centred-basis).
+- **Model-free detuning needs a linewidth scale.** Without a `calibration`,
+  `detuning_linewidths` / `needs_update` are NaN/False unless `linewidth_hz` is
+  supplied; dissipation is unavailable (NaN). With a `calibration`, neither is needed.
+- **Dropped packets.** `group_cycles(..., on_missing='fill')` rebuilds the stream
+  with NaN placeholders for missing accumulations (cadence-inferred tags) so
+  affected cycles still appear; `'notify'` (default) just warns and drops the
+  incomplete cycles. A warning is always raised when packets are missing.
 - **Live updates are seamless while in coverage.** Small moves ride the
   filterbank overlap with no dropped data. A move that pushes a tone beyond
   coverage is rejected unless `on_map_change='recenter'`; use
@@ -184,36 +193,38 @@ Server requests: `enable_modulation`, `update_modulation`, `recenter_modulation`
 `souk_readout_tools.modulation` — pure functions (arrays/dicts in, arrays out; no
 client/socket dependency, relocatable server-side).
 
-### `params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1, delta_linewidths=0.25, exclude_blind=True, blind_indices=None)`
+### `params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1, delta_linewidths=0.25, exclude_blind=True, blind_indices=None, deembed=True, nonlinear=False)`
 Fit a sweep into an `enable_modulation` config.
 - `sweep` — dict with `f`, `z` arrays of shape `(n_sweep_points, n_tones)` (Hz, complex S21); optional `blind_indices`.
-- Per tone: centre = steepest (inflection) point; linewidth from the peak slope (`w ≈ 4/|dφ/df|_max` for an arctan phase).
+- `deembed=True` (default): fit each resonator with the full notch model (`fitting.fit_resonance`) and build a per-tone `ResonatorCalibration` — gives a model-consistent centre/linewidth **and** the de-embedding/phase-centring calibration (see [De-embedding](#de-embedding-and-the-centred-basis)). A failed fit falls back to the phase-slope estimate (no calibration for that tone). `deembed=False`: phase-slope estimate only (centre = steepest point; `w ≈ 4/|dφ/df|_max`).
 - Probe pattern: symmetric `linspace(-1, 1, n_points)` scaled by `delta_linewidths · linewidth` per tone.
-- Returns `{'center', 'offsets' (n_points, n_mod), 'mod_indices', 'samples_per_point', 'n_settle', 'linewidth_hz' (n_mod), 'summary'}`.
+- Returns `{'center', 'offsets' (n_points, n_mod), 'mod_indices', 'samples_per_point', 'n_settle', 'linewidth_hz' (n_mod), 'calibration' {tone: ResonatorCalibration}, 'summary'}`.
 
-### `group_cycles(data_dict, tone_modulation_state, reduce='mean')`
+### `group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='notify')`
 Group parsed samples by point and cycle.
-- Drops `settling` samples; aligns by the gap-free `packet_counter`; cycle boundary detected on point wrap.
-- Per-(point, tone) offsets read from `tone_modulation_state['tones'][i]['offsets_hz']`.
+- Drops `settling` samples; aligns by `packet_counter`; cycle boundary detected on point wrap.
+- Per-(point, tone) offsets and absolute frequencies read from `tone_modulation_state['tones'][i]`.
 - `reduce='mean'` → `z` shape `(n_cycles, N, n_tones)`; `reduce=None` → `(n_cycles, N, n_used, n_tones)`.
-- Returns `{'z', 'offsets_hz' (N, n_tones), 'revision' (n_cycles,), 'point_order'}`.
+- `on_missing` — gap handling on `packet_counter` (dropped accumulations). Always warns when packets are missing. `'notify'` (default): proceed (cycles straddling a gap are dropped as incomplete). `'fill'`: rebuild on a contiguous counter axis with **NaN-IQ placeholders** for the missing packets (their point/settling inferred from the deterministic cadence), so affected cycles still appear with NaN where data was lost.
+- Returns `{'z', 'offsets_hz' (N, n_tones), 'freq_hz' (N, n_tones), 'revision' (n_cycles,), 'point_order'}`.
 
-### `demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None, circle_cal=None, phase_baseline=None, threshold_linewidths=0.1)`
-Per-cycle, per-tone demodulation. Returns arrays of shape `(n_cycles, n_tones)`:
+### `demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None, calibration=None, phase_baseline=None, threshold_linewidths=0.1)`
+Per-cycle, per-tone demodulation in one of two bases (see [De-embedding](#de-embedding-and-the-centred-basis)). Returns arrays of shape `(n_cycles, n_tones)`:
 
-| key | definition |
-|-----|------------|
-| `dphi_df` | local phase slope (rad/Hz) |
-| `d2phi_df2` | local curvature (rad/Hz²); NaN if N<3 |
-| `freq_shift_hz` | `(φ_center − baseline) / dphi_df` |
-| `detuning_linewidths` | `−(d²φ/df² ÷ dφ/df)·linewidth/8` (leading order); NaN without `linewidth_hz` or N<3 |
-| `detuning_hz` | `detuning_linewidths · linewidth_hz` |
-| `needs_update` | `|detuning_linewidths| > threshold_linewidths` |
-| `dissipation` | loss coordinate from `circle_cal`; NaN otherwise |
-| `z_center` | complex value at the centre probe point |
+| key | model-free (no `calibration`) | calibrated / centred (`calibration` given) |
+|-----|------------|------------|
+| `dphi_df` / `d2phi_df2` | slope/curvature of the **raw** I/Q phase (d2 NaN if N<3) | slope/curvature of the **centred** phase (well conditioned) |
+| `freq_shift_hz` | `(φ_center − baseline) / dphi_df` | centre tone's offset from resonance (Hz), exact Möbius |
+| `detuning_linewidths` | `−(d²φ/df² ÷ dφ/df)·linewidth/8`; needs `linewidth_hz`, N≥3 | `freq_shift_hz / (fr/Ql)` from the calibration (no `linewidth_hz` needed) |
+| `detuning_hz` | `detuning_linewidths · linewidth_hz` | centre offset from resonance (Hz) |
+| `needs_update` | `|detuning_linewidths| > threshold_linewidths` | same, from the calibrated detuning |
+| `dissipation` | NaN | fractional loss shift (Möbius), per cycle |
+| `z_center` | complex value at the centre probe point | (same) |
 
-- `method`: `'fast'` (finite differences), `'accurate'` (weighted polynomial fit; handles asymmetric offsets), `'model'` (calibrated non-ideal fit; currently shares the `accurate` path).
-- `phase_baseline` — per-tone reference phase for `freq_shift_hz`; `None` uses the per-tone mean centre-point phase across cycles.
+- `method`: `'fast'` (finite differences), `'accurate'` (weighted polynomial fit; handles asymmetric offsets), `'model'` (shares the `accurate` path).
+- `calibration` — `{tone_index: ResonatorCalibration}` (from `params_from_sweep(..., deembed=True)['calibration']`). When present for a tone, that tone is de-embedded + phase-centred and the exact Möbius inversion gives `freq_shift_hz`/`dissipation` directly.
+- `linewidth_hz` — per-tone linewidth for the model-free detuning (ignored when a `calibration` is supplied).
+- `phase_baseline` — per-tone reference phase for the model-free `freq_shift_hz`; `None` uses the per-tone mean centre-point phase.
 
 ---
 
@@ -288,17 +299,40 @@ cycle. A same-maps update swaps the per-point words in place (no map rewrite, no
 reset); the new frequencies take effect within one cycle. The revision is bumped
 and the full revision→config history retained for offline analysis.
 
-### Demod definitions
-For each cycle/tone, probe-point phases `φ(fᵢ)` are fit against their offsets:
-`dφ/df` from a first-difference (`fast`) or degree-1 fit (`accurate`); `d²φ/df²`
-from a symmetric second difference (`fast`, N=3) or degree-2 fit (`accurate`,
-N≥3). `freq_shift_hz = (φ_center − baseline)/(dφ/df)`. The ratio
-`d²φ/df² ÷ dφ/df` has units 1/Hz, so detuning in linewidths requires a linewidth
-scale; the `fast` estimator uses the leading-order Lorentzian form
-`detuning_lw ≈ −(ratio·w)/8`, and `model` would calibrate it per device.
-Dissipation is not `d|S21|/df` (the operating point slides around the resonance
-circle as the tone detunes); it requires the circle calibration to refer the
-amplitude back to the on-resonance point.
+### De-embedding and the centred basis
+Demodulating the **raw** I/Q phase is poorly conditioned: the measured phase
+still contains the cable-delay ramp `−2π f τ` (which adds a spurious, non-science
+slope across the probe offsets) and the resonance circle is offset from the
+origin and rotated, so the "phase" is not referenced to resonance. The
+de-embedded/phase-centred basis fixes this.
+
+`params_from_sweep(deembed=True)` fits each resonator with the full notch model
+(`fitting.fit_resonance`) and builds a per-tone
+`resonator.ResonatorCalibration` (`from_fit`), which stores the cable delay,
+gain, circle centre/radius and rotation, plus `fr`/`Ql`. When that calibration
+is passed to `demodulate`, each probe point is transformed with
+`ResonatorCalibration.deembed_sweep(freq_hz, z)` (cable delay removed **at the
+point's absolute frequency**, then centred + rotated). In this basis:
+- the centred phase is monotonic through resonance and well conditioned, so
+  `dφ/df` / `d²φ/df²` are clean;
+- the exact **Möbius inversion** `to_frequency_dissipation` gives the frequency
+  shift and the fractional dissipation directly, valid for arbitrary detuning —
+  no small-signal or linewidth assumption, and dissipation comes for free
+  (referred correctly to the on-resonance point as the operating point slides
+  around the circle).
+
+This reuses the existing `resonator.py` / `fitting.py` machinery; the modulation
+demod just supplies the per-point IQ at known absolute frequencies.
+
+### Demod definitions (model-free fallback)
+Without a calibration, probe-point phases `φ(fᵢ)` are fit against their offsets
+on the raw I/Q: `dφ/df` from a first-difference (`fast`) or degree-1 fit
+(`accurate`); `d²φ/df²` from a symmetric second difference (`fast`, N=3) or
+degree-2 fit (`accurate`, N≥3). `freq_shift_hz = (φ_center − baseline)/(dφ/df)`.
+The ratio `d²φ/df² ÷ dφ/df` has units 1/Hz, so detuning in linewidths requires a
+linewidth scale; the estimator uses the leading-order Lorentzian form
+`detuning_lw ≈ −(ratio·w)/8`. Dissipation is unavailable in this basis (it is not
+`d|S21|/df`, since the operating point slides around the resonance circle).
 
 ---
 
