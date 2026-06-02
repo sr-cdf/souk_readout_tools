@@ -427,7 +427,7 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
 
 def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
                                  delta_linewidths=0.25, exclude_blind=True,
-                                 blind_indices=None, deembed=True, nonlinear=False):
+                                 blind_indices=None, deembed=True, fits=None):
     """
     Turn a calibration sweep into a ready-to-use ``enable_modulation`` config.
 
@@ -437,14 +437,17 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
     resonator gets a smaller delta). The returned dict splats straight into
     :meth:`ReadoutClient.enable_modulation`.
 
-    With ``deembed=True`` (default) each resonator is fit with the full notch
-    model (:func:`souk_readout_tools.fitting.fit_resonance`) and a
-    :class:`souk_readout_tools.resonator.ResonatorCalibration` is built per tone.
-    This gives a model-consistent centre/linewidth **and** the de-embedding /
-    phase-centring calibration that :func:`demodulate` can use to work in the
-    well-conditioned centred basis (and recover dissipation). Tones whose fit
-    fails fall back to the model-free phase-slope estimate and get no
-    calibration. With ``deembed=False`` only the phase-slope estimate is used.
+    This package does **not** fit resonators itself (so no fit options have to be
+    threaded through it). With ``deembed=True`` (default) you must therefore pass
+    pre-computed ``fits`` (fit the sweep yourself, e.g.
+    :func:`souk_readout_tools.fitting.fit_resonance`); a per-tone
+    :class:`souk_readout_tools.resonator.ResonatorCalibration` is built from each,
+    giving a model-consistent centre/linewidth **and** the de-embedding /
+    phase-centring calibration that :func:`demodulate` uses for the
+    well-conditioned centred basis (and dissipation). With ``deembed=False`` (or
+    for any modulated tone lacking a supplied fit) the function falls back to the
+    **model-free phase-slope estimate** from the sweep (centre = steepest point,
+    linewidth from the peak slope) and that tone gets no calibration.
 
     Parameters
     ----------
@@ -467,10 +470,15 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
     blind_indices : array-like or None, optional
         Blind-tone indices; overrides ``sweep['blind_indices']`` if given.
     deembed : bool, optional
-        Fit each resonator and build a de-embedding / phase-centring calibration
-        (recommended). Default True.
-    nonlinear : bool, optional
-        Use the nonlinear (Duffing) notch fit. Default False.
+        Build de-embedding / phase-centring calibrations (recommended). When True,
+        ``fits`` is **required**. When False, only the model-free phase-slope
+        estimate is produced (no calibration). Default True.
+    fits : sequence, dict, or None
+        Pre-computed per-tone fits. **Required when** ``deembed=True``. A list
+        (length ``n_tones``; entries ``None`` for tones to leave model-free) or
+        ``{tone_index: fit}``; each entry is a :class:`fitting.FitResult` or a
+        ready :class:`resonator.ResonatorCalibration`. Doing the fit outside this
+        package keeps the fitter's options out of the modulation API.
 
     Returns
     -------
@@ -480,8 +488,8 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
         ``mod_indices`` : modulated (resonator) tone indices;
         ``samples_per_point`` / ``n_settle`` : as requested;
         ``linewidth_hz`` : ``(len(mod_indices),)`` linewidths (for model-free demod);
-        ``calibration`` : ``{tone_index: ResonatorCalibration}`` for fitted tones
-        (empty if ``deembed=False`` or all fits failed);
+        ``calibration`` : ``{tone_index: ResonatorCalibration}`` for tones with a
+        supplied fit (empty if ``fits`` is None);
         ``summary`` : a human-readable multi-line summary string.
     """
     if n_points < 2:
@@ -498,10 +506,27 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
     blind = set(int(b) for b in blind_indices)
     mod_indices = [i for i in range(n_tones) if not (exclude_blind and i in blind)]
 
-    # Lazy import so the module loads without scipy/fitting unless deembed is used.
-    fit_resonance = ResonatorCalibration = None
-    if deembed:
-        from souk_readout_tools.fitting import fit_resonance
+    # We never fit here. deembed=True therefore requires the caller to supply fits.
+    if deembed and fits is None:
+        raise ValueError(
+            'deembed=True requires precomputed `fits` (fit the sweep yourself, '
+            'e.g. fitting.fit_resonance, and pass fits=...). Use deembed=False for '
+            'the model-free phase-slope estimate.')
+
+    def _provided_fit(t):
+        """The caller-supplied fit/calibration for tone ``t`` (or None)."""
+        if fits is None:
+            return None
+        if isinstance(fits, dict):
+            return fits.get(t)
+        try:
+            return fits[t]
+        except (IndexError, KeyError, TypeError):
+            return None
+
+    # Only need the calibration class when fits are supplied (to wrap FitResults).
+    ResonatorCalibration = None
+    if fits is not None:
         from souk_readout_tools.resonator import ResonatorCalibration
 
     center = np.zeros(n_tones, dtype=float)
@@ -509,20 +534,17 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
     calibration = {}
     for t in range(n_tones):
         ft = f[:, t]
-        fitted = False
-        if deembed:
-            try:
-                fitres = fit_resonance(ft, z[:, t], nonlinear=nonlinear)
-                cal = ResonatorCalibration.from_fit(fitres)
-                center[t] = cal.fr
-                linewidth[t] = cal.fr / cal.Ql
-                if t in mod_indices:
-                    calibration[t] = cal
-                fitted = True
-            except Exception as e:
-                print(f'params_from_sweep: fit failed for tone {t} ({e}); '
-                      f'falling back to phase-slope estimate')
-        if not fitted:
+        provided = _provided_fit(t)
+        if provided is not None:
+            # Build the calibration from the supplied fit (already a calibration,
+            # or a FitResult). No fitting happens here.
+            cal = (provided if hasattr(provided, 'deembed_sweep')
+                   else ResonatorCalibration.from_fit(provided))
+            center[t] = cal.fr
+            linewidth[t] = cal.fr / cal.Ql
+            if t in mod_indices:
+                calibration[t] = cal
+        else:
             # Model-free estimate: steepest point = inflection ~ f0; for
             # phi = -2*arctan(2(f-f0)/w) the peak slope magnitude is 4/w.
             phi = np.unwrap(np.angle(z[:, t]))
@@ -551,9 +573,9 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
     if len(mod_indices) > 8:
         summary_lines.append(f'  ... (+{len(mod_indices) - 8} more)')
 
-    if deembed:
+    if fits is not None:
         summary_lines.append(
-            f'  de-embed calibration: {len(calibration)}/{len(mod_indices)} tones fitted')
+            f'  de-embed calibration: {len(calibration)}/{len(mod_indices)} tones (from supplied fits)')
 
     return {
         'center': center,

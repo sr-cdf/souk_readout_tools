@@ -35,9 +35,12 @@ frequency-shift / dissipation demodulation and operating-point tracking.
 Canonical sequence (sweep → arm → acquire → demodulate):
 
 ```python
-from souk_readout_tools import modulation as mod
+from souk_readout_tools import modulation as mod, fitting
 
-cfg = mod.params_from_sweep(client.get_sweep_data(), n_points=3, samples_per_point=4)
+# Fit the sweep yourself (the modulation package never fits), then pass the fits.
+sweep = client.get_sweep_data()
+fits = [fitting.fit_resonance(sweep['f'][:, t], sweep['z'][:, t]) for t in range(sweep['f'].shape[1])]
+cfg = mod.params_from_sweep(sweep, n_points=3, samples_per_point=4, fits=fits)
 client.enable_modulation(center=cfg['center'], offsets=cfg['offsets'],
                          mod_indices=cfg['mod_indices'],
                          samples_per_point=cfg['samples_per_point'],
@@ -193,10 +196,12 @@ Server requests: `enable_modulation`, `update_modulation`, `recenter_modulation`
 `souk_readout_tools.modulation` — pure functions (arrays/dicts in, arrays out; no
 client/socket dependency, relocatable server-side).
 
-### `params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1, delta_linewidths=0.25, exclude_blind=True, blind_indices=None, deembed=True, nonlinear=False)`
-Fit a sweep into an `enable_modulation` config.
+### `params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1, delta_linewidths=0.25, exclude_blind=True, blind_indices=None, deembed=True, fits=None)`
+Turn a sweep + (your own) fits into an `enable_modulation` config. **This package does not fit resonators** — fit the sweep yourself so the fitter's options stay out of the modulation API.
 - `sweep` — dict with `f`, `z` arrays of shape `(n_sweep_points, n_tones)` (Hz, complex S21); optional `blind_indices`.
-- `deembed=True` (default): fit each resonator with the full notch model (`fitting.fit_resonance`) and build a per-tone `ResonatorCalibration` — gives a model-consistent centre/linewidth **and** the de-embedding/phase-centring calibration (see [De-embedding](#de-embedding-and-the-centred-basis)). A failed fit falls back to the phase-slope estimate (no calibration for that tone). `deembed=False`: phase-slope estimate only (centre = steepest point; `w ≈ 4/|dφ/df|_max`).
+- `deembed=True` (default): build a per-tone `ResonatorCalibration` for the centred basis (see [De-embedding](#de-embedding-and-the-centred-basis)). **Requires `fits`** — raises if not supplied.
+- `fits` — pre-computed per-tone fits (required when `deembed=True`). A list (length `n_tones`; `None` entries fall back to the model-free estimate) or `{tone_index: fit}`; each entry is a `fitting.FitResult` or a ready `ResonatorCalibration`. The same argument is used to *reuse* an earlier fit (no re-fitting).
+- `deembed=False` (or any modulated tone without a supplied fit): **model-free phase-slope estimate** from the sweep (centre = steepest point; `w ≈ 4/|dφ/df|_max`); no calibration for that tone.
 - Probe pattern: symmetric `linspace(-1, 1, n_points)` scaled by `delta_linewidths · linewidth` per tone.
 - Returns `{'center', 'offsets' (n_points, n_mod), 'mod_indices', 'samples_per_point', 'n_settle', 'linewidth_hz' (n_mod), 'calibration' {tone: ResonatorCalibration}, 'summary'}`.
 
@@ -306,10 +311,11 @@ slope across the probe offsets) and the resonance circle is offset from the
 origin and rotated, so the "phase" is not referenced to resonance. The
 de-embedded/phase-centred basis fixes this.
 
-`params_from_sweep(deembed=True)` fits each resonator with the full notch model
-(`fitting.fit_resonance`) and builds a per-tone
-`resonator.ResonatorCalibration` (`from_fit`), which stores the cable delay,
-gain, circle centre/radius and rotation, plus `fr`/`Ql`. When that calibration
+You fit each resonator yourself (e.g. `fitting.fit_resonance`) and pass the
+results as `params_from_sweep(..., fits=...)`; it builds a per-tone
+`resonator.ResonatorCalibration` (`from_fit`) — which stores the cable delay,
+gain, circle centre/radius and rotation, plus `fr`/`Ql` — without re-fitting.
+When that calibration
 is passed to `demodulate`, each probe point is transformed with
 `ResonatorCalibration.deembed_sweep(freq_hz, z)` (cable delay removed **at the
 point's absolute frequency**, then centred + rotated). In this basis:
