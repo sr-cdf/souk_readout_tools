@@ -145,6 +145,8 @@ def _format_request_log(message):
             'centers', 'spans', 'points', 'samples_per_point',
             'direction', 'method'),
         'refresh_adc_cal': ('adc_cal_settle_time',),
+        'enable_modulation': ('mod_indices', 'samples_per_point', 'n_settle'),
+        'update_modulation': ('on_map_change',),
     }
     fields = [
         (key, message[key])
@@ -477,6 +479,161 @@ def get_host_ips():
     return host_ips
 
 
+class ModulationScheduler:
+    """
+    Drive fast tone-frequency modulation across N points using the two firmware
+    control buffers, with correct double-buffer ping-pong for any N.
+
+    The firmware has exactly two LO control buffers. To change every tone's
+    frequency without disturbing the point currently being accumulated, we
+    write the *next* point's words into the **inactive** buffer, then flip the
+    active-buffer index and pulse sync. The just-vacated buffer is then free to
+    receive the following point during the current point's dwell, so for N > 2
+    the per-visit buffer write is hidden under the accumulation window.
+
+    Why not reuse ``apply_sweep_step_fast``: its buffer assignment is by point
+    parity (0,1,0,1,...), which is only safe for a single forward traversal (a
+    sweep). When *cycling* (…, N-1, 0, 1, …) that scheme can write the next
+    point into the buffer that is still active — corrupting live data for odd N.
+    This scheduler instead tracks which point lives in each buffer and only ever
+    writes the inactive one.
+
+    N=2 fast path: points 1 and 2 live permanently in buffers 0 and 1 and never
+    collide, so after arming each visit is just a buffer-index flip + sync with
+    **no** per-visit buffer write. This falls out naturally from the
+    "skip the write if the inactive buffer already holds the wanted point" rule.
+
+    Channel maps are applied **once** at arm and never touched afterwards — the
+    armed maps are held fixed and tones ride the ~2x filterbank overlap (see
+    :func:`firmware_lib.prepare_modulation_settings_fast`).
+
+    Parameters
+    ----------
+    r_fast : object
+        Fast firmware interface used for all control-buffer / sync writes.
+    bundle : dict
+        Output of :func:`firmware_lib.prepare_modulation_settings_fast`
+        (per-point control words + armed channel maps + tone indices).
+    samples_per_point : int
+        Number of accumulations emitted per point per cycle (the dwell).
+    n_settle : int
+        Number of leading samples per point flagged as settling/transient.
+    revision : int
+        Configuration revision stamped into each emitted frame's tag.
+    """
+
+    def __init__(self, r_fast, bundle, samples_per_point, n_settle, revision):
+        self.r_fast = r_fast
+        self.bundle = bundle
+        self.N = int(bundle['num_points'])
+        self.samples_per_point = int(samples_per_point)
+        self.n_settle = int(n_settle)
+        self.revision = int(revision)
+        # Bookkeeping: which modulation point currently lives in each buffer, and
+        # which buffer/point is live. ``None`` = unknown/empty.
+        self._buf_holds = {0: None, 1: None}
+        self._active_buf = 0
+        self._active_point = 0
+
+    def _write_point(self, buf, point):
+        """Write point ``point``'s control words into control buffer ``buf``.
+
+        ``buf`` is the target buffer index (0 or 1); ``point`` is the modulation
+        point index (0-based). Records the buffer's contents so future visits can
+        skip redundant writes (this is what gives the N=2 fast path).
+        """
+        firmware_lib.write_control_buffer_data_fast(
+            self.r_fast, buf,
+            self.bundle['control_values'][point],
+            self.bundle['control_indices'][point])
+        self._buf_holds[buf] = point
+
+    def arm(self):
+        """
+        Load the armed channel maps and prime both buffers so the first emitted
+        sample is **point 1** (index 0), already live.
+
+        Writes the chanmaps once, loads point 0 into buffer 0 and makes it
+        active (index flip + sync), then pre-loads point 1 into buffer 1 ready
+        for the first swap. Safe to call again to re-arm after a pause/update.
+        """
+        # Channel maps: written once here, never in the hot loop.
+        firmware_lib.psb_chanselect_set_channel_inmap(self.r_fast, self.bundle['chanmap_psb_inmap'])
+        firmware_lib.chanselect_set_channel_outmap(self.r_fast, self.bundle['chanmap_pfb'])
+        # Point 0 -> buffer 0, make it the live buffer.
+        self._write_point(0, 0)
+        firmware_lib.set_control_buffer_idx_fast(self.r_fast, 0)
+        firmware_lib.force_sync_fast(self.r_fast)
+        self._active_buf = 0
+        self._active_point = 0
+        # Pre-load the next point into the inactive buffer (nothing to do for N=1).
+        if self.N > 1:
+            self._write_point(1, 1 % self.N)
+
+    def install_bundle(self, bundle, revision, samples_per_point, n_settle):
+        """
+        Swap in a new per-point control bundle **without re-arming** — used for a
+        seamless live update whose channel maps are unchanged.
+
+        Parameters
+        ----------
+        bundle : dict
+            New per-point control words (same armed maps as the running config).
+        revision : int
+            New configuration revision to stamp into subsequent frames.
+        samples_per_point : int
+            Updated dwell (samples per point per cycle).
+        n_settle : int
+            Updated settling-sample count per point.
+
+        Buffer bookkeeping is invalidated so each subsequent :meth:`advance`
+        re-writes the inactive buffer with the new words; the live buffer picks up
+        the new frequencies within one cycle (no chanmap change, no reset).
+        """
+        self.bundle = bundle
+        self.N = int(bundle['num_points'])
+        self.revision = int(revision)
+        self.samples_per_point = int(samples_per_point)
+        self.n_settle = int(n_settle)
+        self._buf_holds = {0: None, 1: None}
+        if self._active_point >= self.N:
+            self._active_point = 0
+
+    def current_point(self):
+        """Return the 0-based modulation point index that is currently live."""
+        return self._active_point
+
+    def advance(self):
+        """
+        Step to the next modulation point: flip to the buffer already holding it
+        (index flip + sync), then pre-load the *following* point into the now
+        inactive buffer during this point's dwell.
+
+        For N <= 2 the pre-load is skipped whenever the inactive buffer already
+        holds the wanted point, which is always the case once armed — that is the
+        zero-extra-write fast path. No-op for N == 1.
+        """
+        if self.N <= 1:
+            return
+        nxt = (self._active_point + 1) % self.N
+        inactive = 1 - self._active_buf
+        # Normally the inactive buffer was pre-loaded with ``nxt`` last visit; only
+        # write if not (e.g. immediately after arming, or after a re-arm).
+        if self._buf_holds[inactive] != nxt:
+            self._write_point(inactive, nxt)
+        # Flip live buffer to the one holding ``nxt`` and latch with a sync.
+        firmware_lib.set_control_buffer_idx_fast(self.r_fast, inactive)
+        firmware_lib.force_sync_fast(self.r_fast)
+        self._active_buf = inactive
+        self._active_point = nxt
+        # Pre-load the following point into the freshly-vacated buffer (hidden
+        # under this point's dwell). Skipped when it already holds it (N<=2).
+        following = (nxt + 1) % self.N
+        new_inactive = 1 - self._active_buf
+        if self._buf_holds[new_inactive] != following:
+            self._write_point(new_inactive, following)
+
+
 class ReadoutServer:
     """
     This server provides an interface for external clients to interact with the RFSoC firmware.
@@ -596,6 +753,17 @@ class ReadoutServer:
         self.tasks = []
         self.fake_trigger_event = asyncio.Event()
         self.stream_flags = [asyncio.Event() for _ in range(8)]
+
+        #fast frequency modulation state
+        self.e_modulation_enabled = asyncio.Event()   # modulation armed (alongside e_stream_enabled)
+        self.modulation_params = None                 # prepared bundle (per-point freq words + shared amp/phase + armed maps)
+        self.modulation_cfg = None                    # center, offsets, mod_indices, samples_per_point, n_settle
+        self.modulation_state = None                  # per-tone observability + revision (served by get_info)
+        self.modulation_sched = None                  # ModulationScheduler owning the two control buffers
+        self._pending_modulation = None               # latest-wins command applied by the frame producer at a cycle boundary
+        self._modulation_owner = None                 # acquisition-owner lock: 'stream' | 'samples' | None
+        self._modulation_revision = 0
+        self._modulation_revision_history = {}        # revision -> {center, offsets, mod_indices, ts}
 
         #firmware interface attributes
         self.r = None
@@ -775,6 +943,17 @@ class ReadoutServer:
         self.e_triggered_stream_enabled = asyncio.Event()
         self.tasks = []
         self.stream_flags = [asyncio.Event() for _ in range(8)]
+
+        #fast frequency modulation state
+        self.e_modulation_enabled = asyncio.Event()   # modulation armed (alongside e_stream_enabled)
+        self.modulation_params = None                 # prepared bundle (per-point freq words + shared amp/phase + armed maps)
+        self.modulation_cfg = None                    # center, offsets, mod_indices, samples_per_point, n_settle
+        self.modulation_state = None                  # per-tone observability + revision (served by get_info)
+        self.modulation_sched = None                  # ModulationScheduler owning the two control buffers
+        self._pending_modulation = None               # latest-wins command applied by the frame producer at a cycle boundary
+        self._modulation_owner = None                 # acquisition-owner lock: 'stream' | 'samples' | None
+        self._modulation_revision = 0
+        self._modulation_revision_history = {}        # revision -> {center, offsets, mod_indices, ts}
 
         #firmware interface attributes
         self.r = None
@@ -1106,6 +1285,7 @@ class ReadoutServer:
     ]
     ALL_INFO_SECTIONS = DEFAULT_INFO_SECTIONS + [
         'diagnostics', 'config', 'calibrations', 'resonators', 'registers',
+        'tone_modulation',
     ]
 
     def get_info(self, sections=None):
@@ -1138,6 +1318,7 @@ class ReadoutServer:
             'calibrations': self._info_calibrations,
             'resonators':   self._info_resonators,
             'registers':    self._info_registers,
+            'tone_modulation': self._info_tone_modulation,
         }
         if sections is None:
             return {
@@ -1218,6 +1399,7 @@ class ReadoutServer:
             'timing_state': timing.get('state'),
             'streaming': self.e_stream_enabled.is_set() and self.stream_task is not None and not self.stream_task.done(),
             'triggered_streaming': self.e_triggered_stream_enabled.is_set() and self.triggered_stream_task is not None and not self.triggered_stream_task.done(),
+            'modulation_streaming': self.e_modulation_enabled.is_set(),
             'sweeping': self.sweep_task is not None and not self.sweep_task.done(),
             'rts_events': rts_any,
             'adc_saturated': adc_sat,
@@ -1289,6 +1471,7 @@ class ReadoutServer:
             'triggered_streaming': (self.e_triggered_stream_enabled.is_set()
                                     and self.triggered_stream_task is not None
                                     and not self.triggered_stream_task.done()),
+            'modulation_streaming': self.e_modulation_enabled.is_set(),
             'sweeping': self.sweep_task is not None and not self.sweep_task.done(),
             'task_count': len(self.tasks),
             'latest_sweep_data_valid': self.latest_sweep_data_valid,
@@ -1317,8 +1500,38 @@ class ReadoutServer:
         return firmware_lib.info_pipeline(self.r)
 
     def _info_tones(self):
-        return firmware_lib.info_tones(
+        info = firmware_lib.info_tones(
             self.r, self.config, rf_peripherals=self.rf_peripherals)
+        # Compact modulation hint so a get_info('tones') caller sees the state
+        # without the full per-tone detail (which lives in 'tone_modulation').
+        state = self.modulation_state
+        try:
+            info['modulation'] = {
+                'enabled': bool(self.e_modulation_enabled.is_set()),
+                'any_at_limit': bool(state.get('needs_recenter')) if state else False,
+            }
+        except Exception:
+            pass
+        return info
+
+    def _info_tone_modulation(self):
+        """
+        Return the cached fast-frequency-modulation state for
+        ``get_info('tone_modulation')``.
+
+        This is a pure read of ``self.modulation_state`` (assembled by
+        :meth:`_build_modulation_state` when a config was prepared) — it performs
+        **no hardware access**, so a client can poll it without perturbing the
+        streaming hot loop. ``enabled`` is refreshed from the live event so it
+        always reflects the current armed/paused state. Returns a minimal
+        ``{'enabled': False, ...}`` stub when modulation has never been armed.
+        """
+        state = self.modulation_state
+        if state is None:
+            return {'enabled': False, 'num_points': 0, 'tones': []}
+        # Reflect the live armed flag (state snapshot may predate a pause/resume).
+        state['enabled'] = bool(self.e_modulation_enabled.is_set())
+        return state
 
     def _info_rf_frontend(self):
         rf = getattr(self, 'rf_peripherals', None)
@@ -1883,6 +2096,113 @@ class ReadoutServer:
 
                 elif request == 'disable_stream':
                     self.e_stream_enabled.clear()
+                    await self.send_response(writer, {'status': 'success'})
+
+                elif request == 'enable_modulation':
+                    # Arm fast frequency modulation. Arms only — does NOT start
+                    # continuous output (call enable_stream) and does NOT itself
+                    # capture (call get_samples). Heavy prep runs off the hot path.
+                    try:
+                        if (message.get('offsets') is None and message.get('center') is None
+                                and self.modulation_cfg is not None):
+                            c = self.modulation_cfg          # resume a resident config
+                            center, offsets = c['center'], c['offsets']
+                            mod_indices = c['mod_indices']
+                            spp, n_settle = c['samples_per_point'], c['n_settle']
+                        else:
+                            center = message.get('center')
+                            offsets = message.get('offsets')
+                            mod_indices = message.get('mod_indices')
+                            spp = int(message.get('samples_per_point', 1))
+                            n_settle = int(message.get('n_settle', 1))
+                            if offsets is None:
+                                raise ValueError('offsets required to arm modulation')
+                        bundle, state, cfg = await self.to_thread(
+                            self._prepare_modulation, center, offsets, mod_indices, spp, n_settle)
+                        rev = self._next_modulation_revision(cfg)
+                        state['enabled'] = True
+                        state['desired_revision'] = rev
+                        state['revision_history'] = dict(self._modulation_revision_history)
+                        self._pending_modulation = {
+                            'op': 'enable', 'bundle': bundle, 'state': state, 'cfg': cfg, 'revision': rev}
+                        self.e_triggered_stream_enabled.clear()
+                        self.e_modulation_enabled.set()
+                        await self.send_response(writer, {'status': 'success', 'result': {
+                            'revision': rev, 'needs_recenter': bundle['needs_recenter']}})
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'update_modulation':
+                    # Seamless live update of centre and/or offsets. Rides the
+                    # existing armed maps; if any (tone,point) would drift beyond
+                    # bin coverage it is rejected unless on_map_change='recenter'.
+                    try:
+                        if self.modulation_cfg is None or self.modulation_params is None:
+                            raise ValueError('modulation not armed; call enable_modulation first')
+                        c = self.modulation_cfg
+                        center = message.get('center', c['center'])
+                        offsets = message.get('offsets', c['offsets'])
+                        on_map_change = message.get('on_map_change', 'continue')
+                        armed = self.modulation_params['armed']
+                        bundle, state, cfg = await self.to_thread(
+                            self._prepare_modulation, center, offsets, c['mod_indices'],
+                            c['samples_per_point'], c['n_settle'], armed)
+                        if bundle['needs_recenter'] and on_map_change != 'recenter':
+                            await self.send_response(writer, {'status': 'error',
+                                'message': 'update would push tones beyond bin coverage; '
+                                           'call recenter_modulation() or pass on_map_change="recenter"',
+                                'result': {'tones_beyond_coverage': state['tones_beyond_coverage']}})
+                        else:
+                            if bundle['needs_recenter']:
+                                # recenter: re-arm with fresh bins/maps for the new centre
+                                bundle, state, cfg = await self.to_thread(
+                                    self._prepare_modulation, center, offsets, c['mod_indices'],
+                                    c['samples_per_point'], c['n_settle'])
+                                op = 'recenter'
+                            else:
+                                op = 'update'
+                            rev = self._next_modulation_revision(cfg)
+                            state['enabled'] = True
+                            state['desired_revision'] = rev
+                            state['revision_history'] = dict(self._modulation_revision_history)
+                            self._pending_modulation = {
+                                'op': op, 'bundle': bundle, 'state': state, 'cfg': cfg, 'revision': rev}
+                            await self.send_response(writer, {'status': 'success',
+                                'result': {'revision': rev, 'op': op}})
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'recenter_modulation':
+                    # Deliberate brief break: reload chanmaps/mixer for the current
+                    # centre and recompute VACC bin-sharing, then re-arm.
+                    try:
+                        if self.modulation_cfg is None:
+                            raise ValueError('modulation not armed; call enable_modulation first')
+                        c = self.modulation_cfg
+                        bundle, state, cfg = await self.to_thread(
+                            self._prepare_modulation, c['center'], c['offsets'],
+                            c['mod_indices'], c['samples_per_point'], c['n_settle'])
+                        rev = self._next_modulation_revision(cfg)
+                        state['enabled'] = True
+                        state['desired_revision'] = rev
+                        state['revision_history'] = dict(self._modulation_revision_history)
+                        self._pending_modulation = {
+                            'op': 'recenter', 'bundle': bundle, 'state': state, 'cfg': cfg, 'revision': rev}
+                        await self.send_response(writer, {'status': 'success', 'result': {'revision': rev}})
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'disable_modulation':
+                    # Pause modulation; tones rest at their centres. Bundle stays
+                    # resident so enable_modulation() with no args re-arms quickly.
+                    self.e_modulation_enabled.clear()
+                    self._pending_modulation = {'op': 'disable'}
+                    if not self.e_stream_enabled.is_set():
+                        # No frame producer running: apply the rest-at-centre now.
+                        self._apply_pending_modulation_command()
                     await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'enable_triggered_stream':
@@ -2740,7 +3060,7 @@ class ReadoutServer:
             print(f"Warning: could not update active tone indices: {e}")
             self.active_tone_indices = None
 
-    def prepare_frame(self,fast_read_params):
+    def prepare_frame(self, fast_read_params, mod_point=0, settling=False, revision=0):
         """
         Prepare a frame for sending to a client.
 
@@ -2750,6 +3070,13 @@ class ReadoutServer:
 
         ``fast_read_params`` is the precomputed fast-read parameter bundle
         (firmware addresses/sizes) used to read the accumulator efficiently.
+
+        Fast frequency modulation packs the otherwise-unused ``flag5`` word
+        (``frame[-5]``) with the per-sample modulation tag when ``mod_point > 0``:
+        bits 0..15 = active modulation point (1..N; 0 = modulation off),
+        bit 16 = settling/transient marker, bits 17..31 = config revision.
+        Decode it as **unsigned** on the client. When not modulating the word
+        keeps its legacy ``stream_flags[5]`` boolean meaning.
         """
         num_headers = 10
 
@@ -2765,11 +3092,18 @@ class ReadoutServer:
         frame[-2] = cnt
         frame[-3] = tt_lsb
         frame[-4] = tt_msb
-        frame[-5] = int(self.stream_flags[5].is_set())
+        if mod_point > 0:
+            tag = (int(mod_point) & 0xFFFF) | (int(bool(settling)) << 16) | ((int(revision) & 0x7FFF) << 17)
+            frame[-5] = np.uint32(tag).view(np.int32)
+            # keep FLAG_SET_FREQS high during the transient window for older consumers
+            set_freqs = int(self.stream_flags[FLAG_SET_FREQS].is_set() or settling)
+        else:
+            frame[-5] = int(self.stream_flags[5].is_set())
+            set_freqs = int(self.stream_flags[FLAG_SET_FREQS].is_set())
         frame[-6] = int(self.stream_flags[FLAG_CAL_FREEZE].is_set())
         frame[-7] = int(self.stream_flags[FLAG_SET_PHASES].is_set())
         frame[-8] = int(self.stream_flags[FLAG_SET_AMPS].is_set())
-        frame[-9] = int(self.stream_flags[FLAG_SET_FREQS].is_set())
+        frame[-9] = set_freqs
         frame[-10] = int(self.stream_flags[FLAG_SERVER_REQUEST].is_set())
 
         data_bytes = frame.tobytes()
@@ -2781,42 +3115,96 @@ class ReadoutServer:
         return payload,cnt,err
     
 
-    async def get_samples(self, writer, num_samples,burst=False):
-        
+    async def get_samples(self, writer, num_samples, burst=False):
         """
-        A coroutine that gets a fixed number of samples from the firmware and sends them to a client through the request channel.
-        """
-        
-        try:
-            fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
-            
-            # warm up a bit to avoid initial delays
-            rate = firmware_lib.get_sample_rate(self.r_fast)
-            if (rate>100) and not burst:
-                prev_cnt=0
-                iter=0
-                for j in range(50):
-                    payload, cnt, err =  self.prepare_frame(fast_read_params)
-                    continue
-            
-            err_count=0
-            prev_cnt=0
-            for _ in range(num_samples):
-                #cnt,data,err = firmware_lib.read_accumulated_data_fast(self.r_fast,fast_read_params)
-                # # data_bytes = data.tobytes()
+        Get a fixed number of samples over the request channel.
 
-                payload, cnt, err =  self.prepare_frame(fast_read_params)
-                
-                writer.write(payload)
+        Plain mode (modulation disarmed) is unchanged: a short warm-up to avoid
+        initial latency, then ``num_samples`` untagged frames. Modulated mode
+        (``e_modulation_enabled`` set) drives the **same shared stepping engine**
+        as :meth:`stream_data`, so the returned frames carry the per-sample
+        modulation tag exactly as a continuous stream would.
+
+        Parameters
+        ----------
+        writer : asyncio.StreamWriter
+            Request-channel writer the framed samples are sent to.
+        num_samples : int
+            Number of accumulator samples to return.
+        burst : bool, optional
+            Single-burst transfer. Incompatible with modulation (rejected).
+        """
+        modulating = self.e_modulation_enabled.is_set() and self.modulation_params is not None
+        try:
+            if modulating:
+                # Single hardware-write owner: refuse to step while the continuous
+                # streamer is running, and refuse burst (it cannot interleave steps).
+                if burst:
+                    raise ValueError('burst=True is not supported while modulation is armed')
+                if self.e_stream_enabled.is_set():
+                    raise ValueError('continuous streaming is active; disable_stream before a '
+                                     'modulated get_samples capture')
+                self._modulation_owner = 'samples'
+
+            fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
+            rate = firmware_lib.get_sample_rate(self.r_fast)
+
+            if modulating:
+                # This coroutine owns the hardware now: apply any queued command,
+                # then (re-)arm so buffers/maps are in a known state, poised at point 1.
+                self._apply_pending_modulation_command()
+                sched = self.modulation_sched
+                if sched is None:
+                    raise ValueError('modulation armed but no scheduler available')
+                sched.arm()
+
+                # Warm-up: prime the comb/pipeline by stepping whole cycles and
+                # discarding their frames, so the first *returned* frame is settled
+                # and aligned to point 1 (index 0). Rounded up to whole cycles.
+                if rate > 100:
+                    cycle = max(1, sched.N * sched.samples_per_point)
+                    warm_cycles = max(1, (50 + cycle - 1) // cycle)
+                    for _ in range(warm_cycles):
+                        for _v in range(sched.N):
+                            for _s in range(sched.samples_per_point):
+                                self.prepare_frame(fast_read_params, mod_point=sched.current_point() + 1)
+                            sched.advance()
+                    # whole cycles -> live point back at index 0 (point 1)
+
+                # Capture: step through points, tagging every returned frame.
+                emitted = 0
+                while emitted < num_samples:
+                    p = sched.current_point()
+                    for s in range(sched.samples_per_point):
+                        if emitted >= num_samples:
+                            break
+                        settling = s < sched.n_settle
+                        payload, cnt, err = self.prepare_frame(
+                            fast_read_params, mod_point=p + 1, settling=settling,
+                            revision=sched.revision)
+                        writer.write(payload)
+                        emitted += 1
+                    sched.advance()
+                    await asyncio.sleep(0)
                 await writer.drain()
-                # await asyncio.sleep(0.0001)  
-            print('total packet counter errors:', err_count)
+            else:
+                # Plain path (unchanged): warm up a bit to avoid initial delays.
+                if (rate > 100) and not burst:
+                    for j in range(50):
+                        payload, cnt, err = self.prepare_frame(fast_read_params)
+                        continue
+                for _ in range(num_samples):
+                    payload, cnt, err = self.prepare_frame(fast_read_params)
+                    writer.write(payload)
+                    await writer.drain()
         except asyncio.CancelledError:
             pass
         except Exception as e:
             print(f"Error getting samples: {e}")
             print(traceback.format_exc())
         finally:
+            if self._modulation_owner == 'samples':
+                self._modulation_owner = None
             self.tasks.remove(asyncio.current_task())
             writer.close()
             await writer.wait_closed()
@@ -2893,35 +3281,315 @@ class ReadoutServer:
             writer.close()
             await writer.wait_closed()
 
+    def _prepare_modulation(self, center, offsets, mod_indices,
+                            samples_per_point, n_settle, armed=None):
+        """
+        Build a modulation bundle + observability state from a centre comb and
+        per-point probe offsets. Pure computation (hardware *reads* only, no
+        writes) so it is safe to run in a thread executor off the streaming hot
+        path.
+
+        Parameters
+        ----------
+        center : array-like or None
+            Per-tone centre RF frequencies (Hz), user-facing order. ``None``
+            uses the current live comb.
+        offsets : array-like
+            Probe offsets (Hz): shape ``(n_points,)`` (broadcast across the
+            modulated tones) or ``(n_points, len(mod_indices))`` (per tone).
+        mod_indices : array-like or None
+            User-facing indices of tones to modulate. ``None`` = all regular
+            (resonator) tones. Including a blind tone raises ``ValueError``.
+        samples_per_point : int
+            Dwell: accumulations emitted per point per cycle.
+        n_settle : int
+            Number of leading samples per point flagged as settling.
+        armed : dict or None
+            Existing armed bins/maps to reuse for a live update (ride the same
+            fixed maps). ``None`` arms fresh bins from ``center``.
+
+        Returns
+        -------
+        (bundle, state, cfg) : tuple of dict
+            ``bundle`` from :func:`firmware_lib.prepare_modulation_settings_fast`;
+            ``state`` the ``get_info('tone_modulation')`` payload (static parts);
+            ``cfg`` the resolved configuration (center/offsets/mod_indices/dwell).
+        """
+        freqs, amps, phases, metadata = self._live_tone_state()
+        n_tones = len(freqs)
+        regular = list(metadata.get('regular_indices', list(range(n_tones))))
+        blind = set(int(b) for b in metadata.get('blind_indices', []))
+
+        center = np.asarray(freqs if center is None else center, dtype=float)
+        if len(center) != n_tones:
+            raise ValueError(f'center length ({len(center)}) must match active tone count ({n_tones})')
+
+        # mod_indices default to the resonator tones; blind tones must never modulate.
+        if mod_indices is None:
+            mod_indices = [int(i) for i in regular]
+        else:
+            mod_indices = [int(i) for i in np.atleast_1d(mod_indices)]
+            bad = sorted(i for i in mod_indices if i in blind)
+            if bad:
+                raise ValueError(
+                    f'cannot modulate blind tones (indices {bad}); blind tones must stay fixed')
+
+        # Expand offsets to full per-tone columns (0 for tones we do not modulate).
+        offsets = np.atleast_2d(np.asarray(offsets, dtype=float))
+        num_points = offsets.shape[0]
+        point_offsets = np.zeros((num_points, n_tones), dtype=float)
+        if offsets.shape[1] == 1:
+            point_offsets[:, mod_indices] = offsets            # one offset per point, all modulated tones
+        elif offsets.shape[1] == len(mod_indices):
+            point_offsets[:, mod_indices] = offsets            # per-tone offsets
+        else:
+            raise ValueError(
+                f'offsets has {offsets.shape[1]} columns; expected 1 or '
+                f'len(mod_indices)={len(mod_indices)}')
+
+        bundle = firmware_lib.prepare_modulation_settings_fast(
+            self.r, self.config, center, point_offsets,
+            tone_amplitudes=amps, tone_phases=phases, armed=armed)
+
+        cfg = {'center': center, 'offsets': offsets, 'mod_indices': mod_indices,
+               'samples_per_point': int(samples_per_point), 'n_settle': int(n_settle)}
+        state = self._build_modulation_state(bundle, cfg)
+        return bundle, state, cfg
+
+    def _build_modulation_state(self, bundle, cfg):
+        """
+        Assemble the ``get_info('tone_modulation')`` payload from a prepared
+        ``bundle`` and resolved ``cfg``. Per-tone entries are in user-facing
+        order (matching the stream's I/Q columns); ``firmware_index`` is an
+        annotation only. ``enabled`` / revision fields are filled by the frame
+        producer when the command is actually applied.
+
+        Parameters
+        ----------
+        bundle : dict
+            Output of :func:`firmware_lib.prepare_modulation_settings_fast`.
+        cfg : dict
+            Resolved config (center/offsets/mod_indices/samples_per_point/n_settle).
+        """
+        mod_indices = cfg['mod_indices']
+        occupancy = bundle['occupancy']
+        drift = bundle['drift_bins']
+        center = np.asarray(cfg['center'], dtype=float)
+        n_tones = int(bundle['num_tones'])
+        num_points = int(bundle['num_points'])
+
+        # Annotate the internal firmware/VACC index for reference (never used as API).
+        try:
+            firmware_idx = firmware_lib.get_tone_frequencies(
+                self.r, self.config, detailed_output=True)[1]['rx']['tone_indices']
+        except Exception:
+            firmware_idx = bundle['tone_indices']
+
+        # Full per-tone offset matrix for reporting.
+        off = np.atleast_2d(np.asarray(cfg['offsets'], dtype=float))
+        point_offsets = np.zeros((num_points, n_tones), dtype=float)
+        point_offsets[:, mod_indices] = off if off.shape[1] != 1 else off
+
+        tones = []
+        for i in range(n_tones):
+            tones.append({
+                'index': i,
+                'firmware_index': int(firmware_idx[i]) if i < len(firmware_idx) else None,
+                'center_hz': float(center[i]),
+                'armed_fft_bin': int(bundle['armed_tx_bins'][i]),
+                'offsets_hz': point_offsets[:, i].tolist(),
+                'drift_bins': drift[:, i].tolist(),
+                'occupancy': [str(o) for o in occupancy[:, i]],
+            })
+        beyond = sorted({i for i in range(n_tones) if 'beyond' in set(occupancy[:, i])})
+
+        try:
+            sample_rate = float(firmware_lib.get_sample_rate(self.r_fast))
+        except Exception:
+            sample_rate = float('nan')
+        cycle_rate = sample_rate / (num_points * cfg['samples_per_point']) if num_points else float('nan')
+
+        return {
+            'enabled': False,
+            'desired_revision': 0,
+            'applied_revision': 0,
+            'revision_history': {},
+            'num_points': num_points,
+            'samples_per_point': int(cfg['samples_per_point']),
+            'n_settle': int(cfg['n_settle']),
+            'mod_indices': list(mod_indices),
+            'sample_rate_hz': sample_rate,
+            'cycle_rate_hz': cycle_rate,
+            'needs_recenter': bool(bundle['needs_recenter']),
+            'tones_beyond_coverage': beyond,
+            'tones': tones,
+        }
+
+    def _next_modulation_revision(self, cfg):
+        """
+        Bump and return the modulation configuration revision, recording the
+        config in the revision history (used to reconstruct which centre/offsets
+        applied to frames offline).
+
+        ``cfg`` is the resolved configuration dict being applied.
+        """
+        self._modulation_revision = (self._modulation_revision + 1) & 0x7FFF
+        rev = self._modulation_revision
+        self._modulation_revision_history[rev] = {
+            'center': np.asarray(cfg['center'], dtype=float).tolist(),
+            'offsets': np.asarray(cfg['offsets'], dtype=float).tolist(),
+            'mod_indices': list(cfg['mod_indices']),
+            'ts': time.time(),
+        }
+        return rev
+
+    def _invalidate_modulation(self, reason=''):
+        """
+        Drop any armed/resident modulation bundle and disarm. Called when an
+        ordinary tone / amplitude / phase / blind-tone change makes a staged
+        bundle stale (its centre/offsets/maps no longer match the comb), so the
+        user must reconfigure via ``enable_modulation``.
+
+        ``reason`` is a short human-readable note for the server log.
+        """
+        if (self.modulation_params is not None or self.e_modulation_enabled.is_set()
+                or self._pending_modulation is not None):
+            print(f'Modulation invalidated{": " + reason if reason else ""}; re-arm with enable_modulation.')
+        self.e_modulation_enabled.clear()
+        self.modulation_params = None
+        self.modulation_cfg = None
+        self.modulation_state = None
+        self.modulation_sched = None
+        self._pending_modulation = None
+
+    def _write_to_stream_clients(self, payload):
+        """
+        Write one framed ``payload`` to every connected stream client, dropping
+        any client whose socket has failed.
+
+        ``payload`` is the length-prefixed frame from :meth:`prepare_frame`.
+        Shared by the plain and modulated branches of :meth:`stream_data` so both
+        behave identically toward clients. (Drain is deferred to the caller.)
+        """
+        for client in list(self.stream_clients):
+            try:
+                client.write(payload)
+            except ConnectionResetError:
+                print(f"Stream client disconnected {getattr(client, 'addr', '?')} (ConnectionResetError)")
+                self.stream_clients.remove(client)
+            except Exception as e:
+                print(f"Error streaming data to client: {e}")
+                print(traceback.format_exc())
+                self.stream_clients.remove(client)
+
+    def _apply_pending_modulation_command(self):
+        """
+        Apply a queued modulation command at a cycle boundary. The frame producer
+        (``stream_data`` or ``get_samples``) is the **sole owner** of modulation
+        hardware writes, so all arming / buffer / chanmap / sync writes happen
+        here rather than in the request handler — avoiding races with an in-flight
+        cycle. Latest-wins: only the most recent pending command is applied.
+
+        Recognised ``op`` values on ``self._pending_modulation``:
+        ``'enable'`` / ``'recenter'`` — (re)arm with a fresh scheduler (applies
+        the channel maps); ``'update'`` — swap new per-point words into the
+        running scheduler in place (maps unchanged, seamless); ``'disable'`` —
+        rest the tones at their centres and clear the armed flag.
+        """
+        cmd = self._pending_modulation
+        if cmd is None:
+            return
+        self._pending_modulation = None
+        op = cmd['op']
+        try:
+            if op == 'disable':
+                self.e_modulation_enabled.clear()
+                # Rest the tones at their centre frequencies (re-snaps to nearest bins).
+                if self.modulation_cfg is not None:
+                    firmware_lib.set_tone_frequencies_fast(
+                        self.r, self.r_fast, self.config,
+                        np.asarray(self.modulation_cfg['center'], dtype=float),
+                        autosync=True)
+                    self.update_active_tone_indices()
+                if self.modulation_state is not None:
+                    self.modulation_state['enabled'] = False
+                return
+
+            self.modulation_params = cmd['bundle']
+            self.modulation_cfg = cmd['cfg']
+            self.modulation_state = cmd['state']
+            spp = int(cmd['cfg']['samples_per_point'])
+            n_settle = int(cmd['cfg']['n_settle'])
+            if op == 'update' and self.modulation_sched is not None:
+                # Same channel maps: swap words in place, no re-arm, no map write.
+                self.modulation_sched.install_bundle(cmd['bundle'], cmd['revision'], spp, n_settle)
+            else:
+                # enable / recenter: build a fresh scheduler and arm (applies maps).
+                self.modulation_sched = ModulationScheduler(
+                    self.r_fast, cmd['bundle'], spp, n_settle, cmd['revision'])
+                self.modulation_sched.arm()
+            # Record which revision actually landed (vs the desired one in state).
+            self.modulation_state['applied_revision'] = cmd['revision']
+        except Exception as e:
+            print(f"Error applying modulation command ({op}): {e}")
+            print(traceback.format_exc())
+
     async def stream_data(self):
         """
-        This coroutine runs as an asynchronous task and will stream data to all connected clients through the stream channel.
-        Streaming is enabled by setting self.stream_enabled to True.
+        Continuous streamer coroutine: while ``e_stream_enabled`` is set it sends
+        accumulated frames to all connected stream clients. When
+        ``e_modulation_enabled`` is also set it steps the modulation points and
+        tags each frame; otherwise it sends plain (point-0, untagged) frames.
+        This single coroutine is "one streamer to rule them all" — normal
+        streaming is just the modulation-off case.
         """
         err_count=0
         fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
-        prev_cnt=0
         while True:
             try:
-                if self.e_stream_enabled.is_set():
-                    payload, cnt, err =  self.prepare_frame(fast_read_params)
-                    if err:
-                        err_count+=1
-                        print('Packet error:',cnt, err_count)
-                    for client in self.stream_clients:
+                if not self.e_stream_enabled.is_set():
+                    await asyncio.sleep(0.1)  # idle
+                    continue
+
+                # Apply any queued enable/update/disable/recenter at the boundary.
+                self._apply_pending_modulation_command()
+
+                if self.e_modulation_enabled.is_set() and self.modulation_sched is not None:
+                    self._modulation_owner = 'stream'
+                    sched = self.modulation_sched
+                    # One full cycle through the N points; point 1 (already live
+                    # from arm/last advance) is emitted before the first swap.
+                    for _ in range(sched.N):
+                        p = sched.current_point()
+                        for s in range(sched.samples_per_point):
+                            settling = s < sched.n_settle
+                            payload, cnt, err = self.prepare_frame(
+                                fast_read_params, mod_point=p + 1,
+                                settling=settling, revision=sched.revision)
+                            self._write_to_stream_clients(payload)
+                        sched.advance()
+                        await asyncio.sleep(0)  # stay responsive to new commands
+                    # drain once per cycle to bound buffering
+                    for client in list(self.stream_clients):
                         try:
-                            client.write(payload)
+                            await client.drain()
+                        except Exception:
+                            pass
+                else:
+                    self._modulation_owner = None
+                    payload, cnt, err = self.prepare_frame(fast_read_params)
+                    if err:
+                        err_count += 1
+                        print('Packet error:', cnt, err_count)
+                    self._write_to_stream_clients(payload)
+                    for client in list(self.stream_clients):
+                        try:
                             await client.drain()
                         except ConnectionResetError:
-                            print(f"Stream client disconnected {client.addr} (ConnectionResetError)")
-                            self.stream_clients.remove(client)
-                        except Exception as e:
-                            print(f"Error streaming data to client {client.addr}: {e}")
-                            print(traceback.format_exc())
-                            self.stream_clients.remove(client)
-                    await asyncio.sleep(0) # release control to other tasks
-                else:
-                    await asyncio.sleep(0.1) # do nothing
+                            print(f"Stream client disconnected {getattr(client, 'addr', '?')} (ConnectionResetError)")
+                            if client in self.stream_clients:
+                                self.stream_clients.remove(client)
+                    await asyncio.sleep(0)  # release control to other tasks
             except asyncio.CancelledError:
                 break
             except Exception as e:
