@@ -8,10 +8,12 @@ Run with the src tree on the path so it exercises the working copy::
 
 Covers (plan verification steps 1 & 2): arm != stream, the 1..N point tag with
 dwell + settling, gap-free packet counter, uint32 flag5 decode, live update +
-revision, per-(tone,point) bin occupancy + recenter, blind/index handling,
-pause/resume, the demod tool (dphi/df, d2phi/df2 NaN for 2 points, detuning +
-needs_update, fast vs accurate, dissipation needs circle_cal), and
-modulation_params_from_sweep.
+revision, per-(tone,point) bin occupancy + recenter, index handling,
+pause/resume, the model-free demod tool (dphi/df, d2phi/df2 NaN for 2 points,
+detuning + needs_update, fast vs accurate, dissipation needs a calibration),
+params_from_sweep, the de-embedded/phase-centred demod basis
+(fit -> ResonatorCalibration -> Mobius frequency/dissipation), and packet-gap
+handling (notify / fill).
 """
 import os
 import sys
@@ -31,6 +33,15 @@ def check(name, cond):
     print(f'  [{"PASS" if cond else "FAIL"}] {name}')
     if not cond:
         _failures.append(name)
+
+
+def _raises(fn):
+    """Return True if calling ``fn`` raises any exception."""
+    try:
+        fn()
+        return False
+    except Exception:
+        return True
 
 
 def _resonator_z(f, f0, w, scale=1000.0):
@@ -147,7 +158,7 @@ check('d2phi/df2 finite for 3 points', np.isfinite(res_fast['d2phi_df2'][:, 0]).
 check('detuning ~0 when centred', np.nanmean(np.abs(res_fast['detuning_linewidths'][:, 0])) < 0.05)
 check('needs_update False when centred', not res_fast['needs_update'][:, 0].any())
 check('fast vs accurate dphi/df agree', np.isclose(np.nanmean(res_acc['dphi_df'][:, 0]), slope, rtol=0.05))
-check('dissipation NaN without circle_cal', np.isnan(res_fast['dissipation'][:, 0]).all())
+check('dissipation NaN without calibration', np.isnan(res_fast['dissipation'][:, 0]).all())
 check('grouped z shape (n_cycles, N, n_tones)', grouped['z'].ndim == 3 and grouped['z'].shape[1] == 3)
 g_axis = mod.group_cycles(d, state, reduce=None)
 check('reduce=None retains sample axis', g_axis['z'].ndim == 4)
@@ -175,23 +186,90 @@ check('detuning detected when off-resonance (>0.1 lw)', abs(det) > 0.1)
 check('needs_update trips when detuned', r3['needs_update'][:, 0].any())
 
 
-print('8) modulation_params_from_sweep -> ready-to-use config')
+print('8) params_from_sweep (model-free estimate) -> ready-to-use config')
 fw = 8.0e4
 sweep_f = np.stack([np.linspace(f - 5 * fw, f + 5 * fw, 201) for f in F0], axis=1)
 sweep_z = np.stack([_resonator_z(sweep_f[:, t], F0[t], fw) for t in range(len(F0))], axis=1)
 cfg = mod.params_from_sweep({'f': sweep_f, 'z': sweep_z},
-                                         n_points=3, samples_per_point=4, n_settle=1,
-                                         delta_linewidths=0.25)
+                            n_points=3, samples_per_point=4, n_settle=1,
+                            delta_linewidths=0.25, deembed=False)
 check('center ~ true f0', np.allclose(cfg['center'], F0, atol=2 * (sweep_f[1, 0] - sweep_f[0, 0])))
 check('linewidth estimate within 25% of truth', np.all(np.abs(cfg['linewidth_hz'] - fw) / fw < 0.25))
 check('offsets shape (n_points, n_mod)', cfg['offsets'].shape == (3, len(F0)))
 check('delta scaled ~0.25*linewidth', np.allclose(np.max(cfg['offsets'], axis=0), 0.25 * cfg['linewidth_hz'], rtol=0.05))
+check('no calibration when deembed=False', cfg['calibration'] == {})
 c, ms = make_client(F0, linewidth=fw)
 ack = c.enable_modulation(center=cfg['center'], offsets=cfg['offsets'],
                           mod_indices=cfg['mod_indices'],
                           samples_per_point=cfg['samples_per_point'], n_settle=cfg['n_settle'])
 check('sweep-derived config arms successfully', ack.get('status') == 'success')
 print(cfg['summary'])
+
+
+print('9) de-embedded / phase-centred demod (fit -> ResonatorCalibration -> centred basis)')
+from souk_readout_tools import fitting
+# Build a realistic notch sweep (cable delay + gain) so the fit + calibration round-trip.
+fr_true = np.array([2.0e9, 2.1e9]); Qi, Qc, phi_c, a, alpha, tau = 8e4, 4e4, 0.05, 1.2, 0.7, 30e-9
+sweep_f9 = np.stack([np.linspace(f - 5e5, f + 5e5, 401) for f in fr_true], axis=1)
+sweep_z9 = np.stack([fitting.s21_model(sweep_f9[:, t], fr_true[t], Qi, Qc, phi_c, a, alpha, tau)
+                     for t in range(len(fr_true))], axis=1)
+cfg9 = mod.params_from_sweep({'f': sweep_f9, 'z': sweep_z9}, n_points=3,
+                             samples_per_point=6, n_settle=2, delta_linewidths=0.2, deembed=True)
+check('calibration built for all tones', set(cfg9['calibration'].keys()) == {0, 1})
+check('fitted centre ~ true fr', np.allclose(cfg9['center'], fr_true, atol=2e3))
+
+def make_grouped(carrier):
+    """Build a one-cycle grouped dict from the notch model at carrier+offsets."""
+    N = cfg9['offsets'].shape[0]; nt = len(fr_true)
+    zc = np.zeros((1, N, nt), dtype=complex); fh = np.zeros((N, nt)); off = np.zeros((N, nt))
+    for t in range(nt):
+        off[:, t] = cfg9['offsets'][:, t]
+        fh[:, t] = carrier[t] + off[:, t]
+        zc[0, :, t] = fitting.s21_model(fh[:, t], fr_true[t], Qi, Qc, phi_c, a, alpha, tau)
+    return {'z': zc, 'offsets_hz': off, 'freq_hz': fh, 'revision': np.array([cfg9.get('revision', 1)])}
+
+# Carrier on resonance -> centred frequency offset ~ 0, dissipation finite.
+res_on = mod.demodulate(make_grouped(fr_true), calibration=cfg9['calibration'])
+lw9 = np.array([cfg9['calibration'][t].fr / cfg9['calibration'][t].Ql for t in range(2)])
+check('centred: freq_shift ~0 on resonance', np.all(np.abs(res_on['freq_shift_hz'][0]) < 0.05 * lw9))
+check('centred: dissipation finite (calibration present)', np.all(np.isfinite(res_on['dissipation'][0])))
+check('centred: detuning needs no external linewidth', np.all(np.isfinite(res_on['detuning_linewidths'][0])))
+# Carrier detuned by +0.3 linewidths -> freq_shift ~ +0.3 lw, needs_update trips.
+res_off = mod.demodulate(make_grouped(fr_true + 0.3 * lw9), calibration=cfg9['calibration'])
+check('centred: detuning tracks carrier offset (sign+scale)',
+      np.all(res_off['detuning_linewidths'][0] > 0.15) and np.all(res_off['detuning_linewidths'][0] < 0.45))
+check('centred: needs_update trips when detuned', res_off['needs_update'][0].all())
+print(cfg9['summary'])
+
+
+print('10) packet-gap handling in group_cycles (notify / fill)')
+c, ms = make_client(F0, linewidth=W)
+c.enable_modulation(center=F0, offsets=[-1e3, 0.0, 1e3], samples_per_point=3, n_settle=1)
+d_clean = c.parse_samples(c.get_samples(3 * 3 * 8))
+state = c.get_modulation_state()
+
+def drop_packets(d, sl):
+    """Return a copy of a parsed data_dict with samples ``sl`` removed (a gap)."""
+    dd = dict(d)
+    for key in ('modulation_point', 'modulation_settling', 'modulation_revision', 'packet_counter'):
+        dd[key] = np.delete(np.asarray(d[key]), sl)
+    dd['i_data'] = {k: np.delete(v, sl) for k, v in d['i_data'].items()}
+    dd['q_data'] = {k: np.delete(v, sl) for k, v in d['q_data'].items()}
+    return dd
+
+d_gap = drop_packets(d_clean, slice(13, 17))    # a 4-packet hole
+import warnings as _warnings
+with _warnings.catch_warnings(record=True) as wl:
+    _warnings.simplefilter('always')
+    g_notify = mod.group_cycles(d_gap, state, on_missing='notify')
+check('missing packets raise a warning', any('missing packet' in str(w.message) for w in wl))
+g_clean = mod.group_cycles(d_clean, state)
+g_fill = mod.group_cycles(d_gap, state, on_missing='fill')
+check('notify drops corrupted cycles (no NaNs)', not np.isnan(g_notify['z']).any())
+check('fill inserts NaN placeholders', np.isnan(g_fill['z']).any())
+check('fill recovers >= as many cycles as notify', g_fill['z'].shape[0] >= g_notify['z'].shape[0])
+check('fill restores the clean cycle count', g_fill['z'].shape[0] == g_clean['z'].shape[0])
+check('bad on_missing raises', _raises(lambda: mod.group_cycles(d_gap, state, on_missing='bogus')))
 
 
 print()
