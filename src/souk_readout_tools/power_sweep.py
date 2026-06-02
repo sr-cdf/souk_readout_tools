@@ -8,6 +8,7 @@ import pickle
 import textwrap
 import time
 import traceback
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
@@ -71,6 +72,22 @@ _CHOSEN_PARAM_ARRAY_KEYS = ("power_dbm",) + _INTERPOLATABLE_FIT_KEYS + (
     "extrapolated",
     "n_rows_used",
     "fr_source",
+)
+
+# Chosen-parameter keys that are physically non-negative. ``find_best_power``
+# interpolates/extrapolates each fit-summary field against power, and linear
+# extrapolation past the measured range can drive a positive-but-decreasing
+# quantity (e.g. a linewidth or Q) negative. ``best_power_arrays`` replaces any
+# such negative entry with the cross-tone median of the valid values for that
+# key. Signed quantities (skew, nonlinear detuning, coupling/gain phases) are
+# deliberately excluded because negatives are legitimate there.
+_NONNEGATIVE_PARAM_KEYS = tuple(
+    k for k in (
+        "Ql", "Qi", "Qc", "Qc_abs", "a", "anl",
+        "empirical_linewidth_hz", "empirical_Ql", "empirical_Qc", "empirical_Qi",
+        "empirical_dip_depth_db",
+    )
+    if k in _CHOSEN_PARAM_ARRAY_KEYS
 )
 
 # Default per-parameter validity ranges used by ``find_best_power`` to exclude
@@ -3772,6 +3789,29 @@ def best_power_arrays(best_power, tone_count=None):
                     target[i] = float(value)
                 except (TypeError, ValueError):
                     target[i] = np.nan
+
+    # Repair unphysical negatives in non-negative quantities (an artifact of
+    # linear extrapolation past the measured power range — see
+    # ``_linear_interp_extrap``). Replace each negative entry with the cross-tone
+    # median of the valid (finite, positive) values for that key; if none are
+    # available, leave it as NaN rather than a misleading negative number.
+    repaired = {}
+    for key in _NONNEGATIVE_PARAM_KEYS:
+        arr = param_arrays.get(key)
+        if arr is None:
+            continue
+        bad = np.isfinite(arr) & (arr < 0.0)
+        if not np.any(bad):
+            continue
+        valid = arr[np.isfinite(arr) & (arr > 0.0)]
+        fill = float(np.median(valid)) if valid.size else np.nan
+        arr[bad] = fill
+        repaired[key] = int(np.count_nonzero(bad))
+    if repaired:
+        warnings.warn(
+            'best_power_arrays: replaced negative (extrapolated) values with the '
+            f'cross-tone median for {repaired} (NaN where no valid median existed).',
+            stacklevel=2)
 
     out.update(param_arrays)
     out["fr_hz"] = out["fr"].copy()
