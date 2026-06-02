@@ -206,17 +206,27 @@ check('sweep-derived config arms successfully', ack.get('status') == 'success')
 print(cfg['summary'])
 
 
-print('9) de-embedded / phase-centred demod (fit -> ResonatorCalibration -> centred basis)')
+print('9) de-embedded / phase-centred demod (fit externally -> pass fits -> centred basis)')
 from souk_readout_tools import fitting
 # Build a realistic notch sweep (cable delay + gain) so the fit + calibration round-trip.
 fr_true = np.array([2.0e9, 2.1e9]); Qi, Qc, phi_c, a, alpha, tau = 8e4, 4e4, 0.05, 1.2, 0.7, 30e-9
 sweep_f9 = np.stack([np.linspace(f - 5e5, f + 5e5, 401) for f in fr_true], axis=1)
 sweep_z9 = np.stack([fitting.s21_model(sweep_f9[:, t], fr_true[t], Qi, Qc, phi_c, a, alpha, tau)
                      for t in range(len(fr_true))], axis=1)
-cfg9 = mod.params_from_sweep({'f': sweep_f9, 'z': sweep_z9}, n_points=3,
-                             samples_per_point=6, n_settle=2, delta_linewidths=0.2, deembed=True)
-check('calibration built for all tones', set(cfg9['calibration'].keys()) == {0, 1})
+sweep9 = {'f': sweep_f9, 'z': sweep_z9}
+# The package does not fit: the user fits first and passes the results.
+check('deembed=True without fits raises', _raises(lambda: mod.params_from_sweep(sweep9, deembed=True)))
+fitlist = [fitting.fit_resonance(sweep_f9[:, t], sweep_z9[:, t]) for t in range(len(fr_true))]
+cfg9 = mod.params_from_sweep(sweep9, n_points=3, samples_per_point=6, n_settle=2,
+                             delta_linewidths=0.2, deembed=True, fits=fitlist)
+check('calibration built from supplied fits', set(cfg9['calibration'].keys()) == {0, 1})
 check('fitted centre ~ true fr', np.allclose(cfg9['center'], fr_true, atol=2e3))
+
+# Reuse: pass ResonatorCalibration objects back instead of FitResults.
+cfg_reuse = mod.params_from_sweep(sweep9, n_points=3, samples_per_point=6, n_settle=2,
+                                  delta_linewidths=0.2, fits=cfg9['calibration'])
+check('reused calibrations accepted', set(cfg_reuse['calibration'].keys()) == {0, 1})
+check('reused centres match the fit', np.allclose(cfg_reuse['center'], cfg9['center']))
 
 def make_grouped(carrier):
     """Build a one-cycle grouped dict from the notch model at carrier+offsets."""
