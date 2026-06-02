@@ -22,7 +22,7 @@ warnings.filterwarnings('ignore')   # silence the all-zero-phase crest-factor no
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir)))
 
 from souk_readout_tools.client.readout_client import ReadoutClient
-from souk_readout_tools import demod
+from souk_readout_tools import modulation as mod
 
 _failures = []
 
@@ -138,9 +138,9 @@ c, ms = make_client(F0, linewidth=W)
 c.enable_modulation(center=F0, offsets=[-1e3, 0.0, 1e3], samples_per_point=8, n_settle=2)
 state = c.get_modulation_state()
 d = c.parse_samples(c.get_samples(3 * 8 * 12))
-grouped = demod.group_modulation_cycles(d, state, reduce='mean')
-res_fast = demod.demodulate(grouped, linewidth_hz=W, method='fast')
-res_acc = demod.demodulate(grouped, linewidth_hz=W, method='accurate')
+grouped = mod.group_cycles(d, state, reduce='mean')
+res_fast = mod.demodulate(grouped, linewidth_hz=W, method='fast')
+res_acc = mod.demodulate(grouped, linewidth_hz=W, method='accurate')
 slope = np.nanmean(res_fast['dphi_df'][:, 0])
 check('dphi/df matches model slope -4/w', np.isclose(slope, -4.0 / W, rtol=0.05))
 check('d2phi/df2 finite for 3 points', np.isfinite(res_fast['d2phi_df2'][:, 0]).all())
@@ -149,18 +149,18 @@ check('needs_update False when centred', not res_fast['needs_update'][:, 0].any(
 check('fast vs accurate dphi/df agree', np.isclose(np.nanmean(res_acc['dphi_df'][:, 0]), slope, rtol=0.05))
 check('dissipation NaN without circle_cal', np.isnan(res_fast['dissipation'][:, 0]).all())
 check('grouped z shape (n_cycles, N, n_tones)', grouped['z'].ndim == 3 and grouped['z'].shape[1] == 3)
-g_axis = demod.group_modulation_cycles(d, state, reduce=None)
+g_axis = mod.group_cycles(d, state, reduce=None)
 check('reduce=None retains sample axis', g_axis['z'].ndim == 4)
 
 # Two-point pattern -> curvature/detuning are NaN.
 c.enable_modulation(center=F0, offsets=[-1e3, 1e3], samples_per_point=8, n_settle=2)
 state2 = c.get_modulation_state()
 d = c.parse_samples(c.get_samples(2 * 8 * 12))
-g2 = demod.group_modulation_cycles(d, state2)
-r2 = demod.demodulate(g2, linewidth_hz=W, method='fast')
+g2 = mod.group_cycles(d, state2)
+r2 = mod.demodulate(g2, linewidth_hz=W, method='fast')
 check('d2phi/df2 NaN for 2 points', np.isnan(r2['d2phi_df2'][:, 0]).all())
 check('detuning NaN for 2 points', np.isnan(r2['detuning_linewidths'][:, 0]).all())
-r2nl = demod.demodulate(g2, linewidth_hz=None, method='fast')
+r2nl = mod.demodulate(g2, linewidth_hz=None, method='fast')
 check('detuning NaN without linewidth', np.isnan(r2nl['detuning_linewidths'][:, 0]).all())
 
 # Detune the centre -> needs_update trips.
@@ -168,8 +168,8 @@ c.enable_modulation(center=F0, offsets=[-1e3, 0.0, 1e3], samples_per_point=8, n_
 c.update_modulation(center=F0 + 0.2 * W)        # ~0.2 linewidths off resonance
 state3 = c.get_modulation_state()
 d = c.parse_samples(c.get_samples(3 * 8 * 12))
-g3 = demod.group_modulation_cycles(d, state3)
-r3 = demod.demodulate(g3, linewidth_hz=W, method='fast')
+g3 = mod.group_cycles(d, state3)
+r3 = mod.demodulate(g3, linewidth_hz=W, method='fast')
 det = np.nanmean(r3['detuning_linewidths'][:, 0])
 check('detuning detected when off-resonance (>0.1 lw)', abs(det) > 0.1)
 check('needs_update trips when detuned', r3['needs_update'][:, 0].any())
@@ -179,7 +179,7 @@ print('8) modulation_params_from_sweep -> ready-to-use config')
 fw = 8.0e4
 sweep_f = np.stack([np.linspace(f - 5 * fw, f + 5 * fw, 201) for f in F0], axis=1)
 sweep_z = np.stack([_resonator_z(sweep_f[:, t], F0[t], fw) for t in range(len(F0))], axis=1)
-cfg = demod.modulation_params_from_sweep({'f': sweep_f, 'z': sweep_z},
+cfg = mod.params_from_sweep({'f': sweep_f, 'z': sweep_z},
                                          n_points=3, samples_per_point=4, n_settle=1,
                                          delta_linewidths=0.25)
 check('center ~ true f0', np.allclose(cfg['center'], F0, atol=2 * (sweep_f[1, 0] - sweep_f[0, 0])))

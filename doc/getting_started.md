@@ -982,15 +982,15 @@ new_freqs = client.get_tone_frequencies()
 Fast frequency modulation rapidly dithers each tone across a few probe frequencies (2 or 3 points) and streams the result as ordinary, tagged data, so you can measure each resonator's local `dφ/df` (and, with calibration, dissipation) in real time and track its operating point. Derive the configuration from a sweep, arm it, capture or stream, and demodulate:
 
 ```python
-from souk_readout_tools import demod
+from souk_readout_tools import modulation as mod
 
-cfg = demod.modulation_params_from_sweep(client.get_sweep_data(), n_points=3, samples_per_point=4)
+cfg = mod.params_from_sweep(client.get_sweep_data(), n_points=3, samples_per_point=4)
 client.enable_modulation(center=cfg['center'], offsets=cfg['offsets'],
                          mod_indices=cfg['mod_indices'],
                          samples_per_point=cfg['samples_per_point'], n_settle=cfg['n_settle'])
 data = client.parse_samples(client.get_samples(3000))     # frames tagged with the active point
-grouped = demod.group_modulation_cycles(data, client.get_modulation_state())
-result = demod.demodulate(grouped, linewidth_hz=cfg['linewidth_hz'])
+grouped = mod.group_cycles(data, client.get_modulation_state())
+result = mod.demodulate(grouped, linewidth_hz=cfg['linewidth_hz'])
 client.disable_modulation()
 ```
 
