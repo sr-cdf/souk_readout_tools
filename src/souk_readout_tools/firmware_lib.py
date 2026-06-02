@@ -2788,6 +2788,266 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
         return tone_settings_dict
 
 
+def _rf_to_digital_baseband(r, config_dict, tone_frequencies):
+    """
+    Convert requested RF tone frequencies to on-chip digital-baseband (DBB)
+    frequencies, plus the filterbank bin grid needed to place them.
+
+    This reproduces the analog-up/down-conversion + Nyquist-zone + DUC/DDC
+    chain used by :func:`prepare_tone_frequency_settings_fast`, factored out so
+    the fast-modulation preparer can reuse exactly the same mapping. Keeping a
+    single source of truth avoids the two paths drifting apart.
+
+    Parameters
+    ----------
+    r : object
+        Readout firmware object (provides ``adc_clk_hz`` and ``mixer`` geometry).
+    config_dict : dict
+        Configuration dict (``rf_frontend`` UDC settings and ``firmware``
+        Nyquist-zone / DUC-DDC settings).
+    tone_frequencies : numpy.ndarray
+        Requested RF tone frequencies in Hz (1D, length = number of tones).
+
+    Returns
+    -------
+    dict
+        ``dbb_freqs_tx`` / ``dbb_freqs_rx`` : DBB frequencies (Hz) for the TX
+        (DAC) and RX (ADC) paths; ``fft_rbw_hz`` : filterbank channel spacing
+        (Hz); ``all_tx_bin_centers_hz`` / ``all_rx_bin_centers_hz`` : the full
+        TX/RX bin-centre grids the tones are snapped onto.
+    """
+    tone_frequencies = np.atleast_1d(tone_frequencies)
+
+    # --- analog up/down conversion (external mixer, if fitted) ---
+    udc_connected = config_dict['rf_frontend']['connected']
+    udc_lo_frequency = config_dict['rf_frontend']['tx_mixer_lo_frequency_hz']
+    udc_sideband = config_dict['rf_frontend']['tx_mixer_sideband']
+    udc_connected = False if not udc_connected else udc_connected
+    udc_lo_frequency = 0 if not udc_lo_frequency else float(udc_lo_frequency)
+    udc_sideband = 1 if not udc_sideband else int(udc_sideband)
+
+    # --- RFDC Nyquist zone + digital up/down converter (DUC/DDC) mixer ---
+    defaults = config_dict['firmware']['defaults']
+    dac_nyquist_zone = defaults.get('nyquist_zone')
+    adc_nyquist_zone = defaults.get('nyquist_zone')
+    _fs = 2 * r.adc_clk_hz  # RFDC sampling frequency
+    if dac_nyquist_zone is not None:
+        duc_frequency = _fs / 4 if int(dac_nyquist_zone) == 1 else -_fs * 3 / 4
+    else:
+        duc_frequency = defaults.get('dac_duc_mixer_frequency_hz', 0)
+    if adc_nyquist_zone is not None:
+        ddc_frequency = -_fs / 4 if int(adc_nyquist_zone) == 1 else _fs * 3 / 4
+    else:
+        ddc_frequency = defaults.get('adc_ddc_mixer_frequency_hz', 0)
+
+    # filterbank bin grid (channel spacing and centre frequencies)
+    fft_period_s = r.mixer._n_upstream_chans / r.mixer._upstream_oversample_factor / r.adc_clk_hz
+    fft_rbw_hz = 1. / fft_period_s
+    all_tx_bin_centers_hz = np.fft.fftfreq(2 * N_TX_FFT, 1. / r.adc_clk_hz)
+    all_rx_bin_centers_hz = np.fft.fftfreq(N_RX_FFT, 1. / r.adc_clk_hz)
+
+    # RF -> analog (DAC out / ADC in) frequencies
+    if udc_connected:
+        dac_out_freqs = (tone_frequencies - udc_lo_frequency) / udc_sideband
+        adc_in_freqs = (tone_frequencies - udc_lo_frequency) / udc_sideband
+    else:
+        dac_out_freqs = tone_frequencies
+        adc_in_freqs = tone_frequencies
+
+    # analog -> digital baseband, accounting for the Nyquist zone fold
+    if int(dac_nyquist_zone) == 1:
+        dbb_freqs_tx = dac_out_freqs - duc_frequency
+    elif int(dac_nyquist_zone) == 2:
+        dbb_freqs_tx = dac_out_freqs + duc_frequency
+    else:
+        raise ValueError(f'Invalid DAC nyquist zone ({dac_nyquist_zone})')
+    if int(adc_nyquist_zone) == 1:
+        dbb_freqs_rx = adc_in_freqs + ddc_frequency
+    elif int(adc_nyquist_zone) == 2:
+        dbb_freqs_rx = adc_in_freqs - ddc_frequency
+    else:
+        raise ValueError(f'Invalid ADC nyquist zone ({adc_nyquist_zone})')
+
+    return {
+        'dbb_freqs_tx': dbb_freqs_tx,
+        'dbb_freqs_rx': dbb_freqs_rx,
+        'fft_rbw_hz': fft_rbw_hz,
+        'all_tx_bin_centers_hz': all_tx_bin_centers_hz,
+        'all_rx_bin_centers_hz': all_rx_bin_centers_hz,
+    }
+
+
+def prepare_modulation_settings_fast(r, config_dict, center_frequencies, point_offsets,
+                                     min_tone_separation=6, tone_amplitudes=None,
+                                     tone_phases=None, armed=None):
+    """
+    Prepare a fast-frequency-modulation bundle: per-point mixer control words
+    computed **relative to a single armed set of filterbank bins**.
+
+    Why this exists (and why we don't reuse the sweep preparer): the normal
+    fast preparers snap *every* point to its own nearest FFT bin. Fast tone
+    modulation instead holds the channel maps **fixed** at the centre comb's
+    bins and dithers each tone a little around them (riding the ~2x filterbank
+    overlap). If we computed each point's mixer phase relative to its own
+    nearest bin, the phase increment would jump by a whole bin the moment a
+    tone drifted across the half-bin boundary — wrong. So here every point's
+    mixer phase increment / rotation-step is computed against the **armed**
+    bin centre, which is exactly what the (fixed) channel map selects.
+
+    Parameters
+    ----------
+    r : object
+        Readout firmware object (mixer / channel-select geometry, ``adc_clk_hz``).
+    config_dict : dict
+        Configuration dict (RF front-end + firmware settings).
+    center_frequencies : numpy.ndarray
+        Per-tone centre (operating-point) RF frequencies in Hz, in user-facing
+        tone order. Length = number of active tones.
+    point_offsets : numpy.ndarray
+        Per-point, per-tone probe offsets in Hz, shape ``(n_points, n_tones)``,
+        added to ``center_frequencies`` (0 for tones that are not modulated).
+        Built by the server from the user's ``offsets`` at ``mod_indices``.
+    min_tone_separation : int, optional
+        Minimum LO-index separation for tones sharing an FFT bin, used only when
+        computing the armed VACC tone indices. Default 6.
+    tone_amplitudes : numpy.ndarray or None, optional
+        Per-tone amplitude scalings written into every point's control words.
+        ``None`` leaves amplitudes at their current values.
+    tone_phases : numpy.ndarray or None, optional
+        Per-tone phase offsets (rad) written into every point's control words.
+        ``None`` leaves phases unchanged.
+
+    Returns
+    -------
+    dict
+        Bundle consumed by the modulation scheduler:
+        ``num_points`` / ``num_tones`` ; ``tone_indices`` (armed VACC/LO indices,
+        user order); ``chanmap_psb_inmap`` / ``chanmap_pfb`` (armed channel maps,
+        written **once** at arm); ``control_values`` / ``control_indices`` :
+        lists (len ``n_points``) of buffer-agnostic control words + sparse
+        indices for each point (write to whichever buffer is inactive);
+        ``occupancy`` : ``(n_points, n_tones)`` of ``'nearest'|'second'|'beyond'``;
+        ``drift_bins`` : ``(n_points, n_tones)`` signed drift from the armed bin
+        centre in units of channels; ``needs_recenter`` : True if any
+        (tone, point) is beyond overlap coverage.
+    """
+    center_frequencies = np.atleast_1d(np.asarray(center_frequencies, dtype=float))
+    point_offsets = np.atleast_2d(np.asarray(point_offsets, dtype=float))
+    num_points, num_tones = point_offsets.shape
+    if len(center_frequencies) != num_tones:
+        raise ValueError(
+            f'center_frequencies ({len(center_frequencies)}) must match '
+            f'point_offsets columns ({num_tones})')
+
+    # --- 1) Determine the armed bins/maps ---
+    # ``armed=None`` (enable / recenter): snap the centre comb to its nearest
+    # bins and build fresh channel maps + VACC indices. ``armed`` provided
+    # (live update): reuse the *existing* armed bins so the update rides the same
+    # fixed maps (tones may sit on the overlapping neighbour) instead of snapping
+    # to new bins — which is the whole point of overlap riding.
+    if armed is None:
+        dbb_center = _rf_to_digital_baseband(r, config_dict, center_frequencies)
+        fft_rbw_hz = dbb_center['fft_rbw_hz']
+        tx_bins = get_closest_bin_indices(dbb_center['dbb_freqs_tx'], dbb_center['all_tx_bin_centers_hz'])
+        rx_bins = get_closest_bin_indices(dbb_center['dbb_freqs_rx'], dbb_center['all_rx_bin_centers_hz'])
+        # The bin-centre frequencies the fixed channel map will select for each tone.
+        tx_bin_centers_hz = dbb_center['all_tx_bin_centers_hz'][tx_bins]
+        rx_bin_centers_hz = dbb_center['all_rx_bin_centers_hz'][rx_bins]
+        # Armed VACC/LO tone indices (handle tones sharing an FFT bin). Fixed for
+        # the whole modulation run; changing these is what a recenter is for.
+        tone_indices = compute_vacc_tone_indices(tx_bins, r.mixer.n_chans, min_tone_separation)
+        # Armed channel maps (written once at arm; never touched in the hot loop).
+        chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in,
+                                    r.psb_chanselect.DISCARD_BIN, dtype=np.uint32)
+        chanmap_psb_inmap[tone_indices] = tx_bins
+        chanmap_pfb = np.full(r.chanselect.n_chans_out, -1, dtype=int)
+        chanmap_pfb[tone_indices] = rx_bins
+        armed = {
+            'fft_rbw_hz': fft_rbw_hz,
+            'tx_bins': tx_bins, 'rx_bins': rx_bins,
+            'tx_bin_centers_hz': tx_bin_centers_hz, 'rx_bin_centers_hz': rx_bin_centers_hz,
+            'tone_indices': tone_indices,
+            'chanmap_psb_inmap': chanmap_psb_inmap, 'chanmap_pfb': chanmap_pfb,
+        }
+    else:
+        # Reuse the existing armed bins/maps (live update rides the same maps).
+        fft_rbw_hz = armed['fft_rbw_hz']
+        tx_bins = armed['tx_bins']
+        rx_bins = armed['rx_bins']
+        tx_bin_centers_hz = armed['tx_bin_centers_hz']
+        rx_bin_centers_hz = armed['rx_bin_centers_hz']
+        tone_indices = armed['tone_indices']
+        chanmap_psb_inmap = armed['chanmap_psb_inmap']
+        chanmap_pfb = armed['chanmap_pfb']
+
+    tone_amplitudes = _validate_per_tone_values(tone_amplitudes, num_tones, 'tone_amplitudes')
+    tone_phases = _validate_per_tone_values(tone_phases, num_tones, 'tone_phases')
+
+    # --- 2) Per-point mixer words, all relative to the armed bins ---
+    control_values = []
+    control_indices = []
+    drift_bins = np.zeros((num_points, num_tones), dtype=float)
+    occupancy = np.empty((num_points, num_tones), dtype=object)
+    for p in range(num_points):
+        dbb = _rf_to_digital_baseband(r, config_dict, center_frequencies + point_offsets[p])
+        # Residual offset of this point from the *armed* bin centre (NOT the
+        # point's own nearest bin) -> mixer phase increment per FFT period.
+        tx_off = dbb['dbb_freqs_tx'] - tx_bin_centers_hz
+        rx_off = dbb['dbb_freqs_rx'] - rx_bin_centers_hz
+        phase_incs_tx = tx_off / fft_rbw_hz * 2 * np.pi
+        phase_incs_rx = rx_off / fft_rbw_hz * 2 * np.pi
+        ri_steps_tx = np.cos(phase_incs_tx) + 1j * np.sin(phase_incs_tx)
+        ri_steps_rx = np.cos(phase_incs_rx) + 1j * np.sin(phase_incs_rx)
+
+        lo_control_values = {
+            'tx': {'phase_steps': phase_incs_tx, 'ri_steps': ri_steps_tx},
+            'rx': {'phase_steps': phase_incs_rx, 'ri_steps': ri_steps_rx},
+        }
+        # Amplitude/phase are identical for every point; including them here keeps
+        # each buffer self-consistent (a future optimisation could write them once
+        # and make the per-visit write frequency-only).
+        if tone_amplitudes is not None:
+            lo_control_values['tx']['scaling'] = tone_amplitudes
+            lo_control_values['rx']['scaling'] = np.ones_like(tone_amplitudes, dtype=float)
+        if tone_phases is not None:
+            lo_control_values['tx']['phase_offsets'] = tone_phases
+            lo_control_values['rx']['phase_offsets'] = tone_phases
+
+        # buf=0 here is irrelevant: the formatted values are buffer-agnostic; the
+        # scheduler writes them into whichever buffer is currently inactive.
+        v, i = prepare_control_buffer_data_fast(r, 0, lo_control_values, tone_indices=tone_indices)
+        control_values.append(v)
+        control_indices.append(i)
+
+        # Bin occupancy: how far (in channels) each tone sits from its armed bin
+        # centre. With ~2x overlap the neighbouring channel still covers a tone
+        # out to ~1 full channel, so <=0.5 = on the nearest bin, 0.5-1.0 = riding
+        # the overlapping neighbour (fine, flagged), >1.0 = no longer covered.
+        drift = np.maximum(np.abs(tx_off), np.abs(rx_off)) / fft_rbw_hz
+        # signed drift (TX path) for reporting; magnitude drives the class
+        drift_bins[p] = tx_off / fft_rbw_hz
+        occupancy[p] = np.where(drift <= 0.5, 'nearest',
+                                np.where(drift <= 1.0, 'second', 'beyond'))
+
+    needs_recenter = bool(np.any(occupancy == 'beyond'))
+
+    return {
+        'num_points': num_points,
+        'num_tones': num_tones,
+        'tone_indices': tone_indices,
+        'chanmap_psb_inmap': chanmap_psb_inmap,
+        'chanmap_pfb': chanmap_pfb,
+        'control_values': control_values,     # list len n_points (buffer-agnostic)
+        'control_indices': control_indices,   # list len n_points
+        'occupancy': occupancy,               # (n_points, n_tones) str
+        'drift_bins': drift_bins,             # (n_points, n_tones) signed, channels
+        'armed_tx_bins': tx_bins,
+        'armed_rx_bins': rx_bins,
+        'needs_recenter': needs_recenter,
+        'armed': armed,                       # reuse for in-place live updates (same maps)
+    }
+
+
 def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
                                 min_tone_separation=6, detailed_output=False,
                                 tone_amplitudes=None, tone_phases=None):
