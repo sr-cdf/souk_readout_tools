@@ -54,6 +54,7 @@ Each `ReadoutServer` uses two TCP ports - a **request port** for JSON command/re
 - **Resonance finding** - automated peak detection across multiple data formats (magnitude, phase, group delay, |dS21/df|, etc), plus an interactive PyQt5 GUI
 - **Resonance fitting** - linear and Duffing-capable complex S21 fitting (`fit_resonance`, `batch_fit`, `fit_sweep_stack`) with extracted physical parameters (`fr`, `Qi`, `Qc`, `phi`, etc.), optional uncertainty weighting, and process-parallel fitting support. `batch_fit` consumes server sweep dictionaries and preserves tone metadata; `fit_sweep_stack` consumes already-windowed arrays and fits rows independently.
 - **Retuning** - sweep-and-retune workflows to track drifting resonances using max-derivative or min-magnitude methods
+- **Fast frequency modulation** - dither each tone over a few probe points (2-3) every accumulation and stream the samples tagged per point, for **real-time IQ → frequency/dissipation conversion** (live per-resonator `dφ/df` rather than a stale start-of-obs calibration) and **inflection-point resonator tracking**. Toggle on/off at any time and update centres/offsets live with no dropped frames; the pure `souk_readout_tools.modulation` toolkit demodulates in the de-embedded/phase-centred basis (`params_from_sweep` → `group_cycles` → `demodulate`). See [Fast Frequency Modulation](doc/frequency_modulation.md).
 - **Power management** - automatic TX/RX level optimisation with saturation detection, dynamic range management, and calibrated power control in dBm at any reference plane in the signal chain
 - **ADC calibration freeze** - freeze the RFSoC's internal ADC calibration during observations to eliminate drift noise, with periodic defrost for recalibration
 - **Clock source control** - select internal (12.8 MHz) or external (10 MHz) PL reference clock with PLL lock status monitoring
@@ -158,6 +159,7 @@ For full installation details (including server setup, SD card imaging, and daem
 |----------|-------------|
 | [Installation Guide](doc/installation.md) | Full client and server installation, SD card setup, daemon configuration |
 | [Getting Started](doc/getting_started.md) | Configuration, usage guide, and worked examples for all features |
+| [Fast Frequency Modulation](doc/frequency_modulation.md) | Real-time IQ → frequency/dissipation conversion and resonator tracking via per-tone probe-point modulation |
 | [Calibration](doc/calibration.md) | Power calibration model and RF signal-chain configuration |
 | [Tone Power Notes](doc/tone_power_notes.md) | Dynamic-range, VACC, crest-factor, and blind-tone power guidance |
 | [Resonator Noise Workflow](doc/resonator_noise_workflow.md) | Drive-power tuning, blackbody-load directory layout, and on/off-resonance noise captures |
