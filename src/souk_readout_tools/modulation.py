@@ -18,7 +18,8 @@ The workflow a consumer follows is:
    ``modulation_revision``.
 2. :func:`group_cycles` -> per-tone complex measurements grouped by step and
    cycle (settling samples dropped), plus the per-point probe offsets (Hz) read
-   from ``get_info('tone_modulation')``.
+   from ``get_info('tone_modulation')`` and the grouped packet counters,
+   telescope time, packet errors and stream flags.
 3. :func:`demodulate` -> per-cycle dphi/df, d2phi/df2, frequency shift and a
    detuning estimate (with a ``needs_update`` flag for the future tracking loop).
 
@@ -62,8 +63,9 @@ def _reconstruct_contiguous(pc, points, settling, revisions, z, n_points, spp, n
 
     Returns
     -------
-    (pc2, points2, settling2, revisions2, z2) on success, or ``None`` if the
-    cadence phase could not be anchored (caller then leaves the data unfilled).
+    (pc2, points2, settling2, revisions2, z2, present2, source_indices2) on
+    success, or ``None`` if the cadence phase could not be anchored (caller then
+    leaves the data unfilled).
     """
     period = max(1, int(n_points) * int(spp))
     spp = max(1, int(spp))
@@ -89,6 +91,8 @@ def _reconstruct_contiguous(pc, points, settling, revisions, z, n_points, spp, n
     points2 = np.zeros(n_full, dtype=int)
     settling2 = np.zeros(n_full, dtype=int)
     revisions2 = np.zeros(n_full, dtype=int)
+    present2 = np.zeros(n_full, dtype=bool)
+    source_indices2 = np.full(n_full, -1, dtype=int)
     last_rev = int(revisions[0]) if len(revisions) else 0
     for j, c in enumerate(full):
         src = present.get(int(c))
@@ -98,12 +102,35 @@ def _reconstruct_contiguous(pc, points, settling, revisions, z, n_points, spp, n
             settling2[j] = int(settling[src])
             last_rev = int(revisions[src])
             revisions2[j] = last_rev
+            present2[j] = True
+            source_indices2[j] = int(src)
         else:
             idx = (int(c) - c0) % period            # modulation sub-index within the cycle
             points2[j] = (idx // spp) % int(n_points) + 1
             settling2[j] = 1 if (idx % spp) < n_settle else 0
             revisions2[j] = last_rev                # carry the last known revision
-    return full, points2, settling2, revisions2, z2
+    return full, points2, settling2, revisions2, z2, present2, source_indices2
+
+
+def _mode_int(values, default=0):
+    """Return the most common integer in ``values``."""
+    values = np.asarray(values, dtype=int)
+    if values.size == 0:
+        return int(default)
+    return int(np.bincount(values).argmax())
+
+
+def _first_or_default(values, default=0):
+    values = np.asarray(values)
+    if values.size == 0:
+        return default
+    return values[0]
+
+
+def _stack_or_empty(items, shape, dtype=float):
+    if items:
+        return np.stack(items, axis=0)
+    return np.empty(shape, dtype=dtype)
 
 
 def _tone_iq(data_dict, n_tones):
@@ -168,21 +195,37 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
         ``offsets_hz`` : ``(N, n_tones)`` per-point probe offsets (Hz);
         ``freq_hz`` : ``(N, n_tones)`` absolute probe frequencies (centre + offset);
         ``revision`` : ``(n_cycles,)`` representative config revision per cycle;
+        ``packet_counter`` / ``telescope_time`` / ``packet_error`` :
+        per-cycle, per-point metadata. For ``reduce='mean'`` these are the first
+        kept sample for timing/counters and max/OR for error-like fields; for
+        ``reduce=None`` they keep the sample axis;
+        ``stream_flags`` : dict of per-cycle, per-point flag arrays;
+        ``cycle_packet_counter`` / ``cycle_telescope_time`` / ``cycle_packet_error``
+        / ``cycle_stream_flags`` : one representative time axis per cycle, taken
+        from the point nearest zero offset;
+        ``sample_index`` / ``sample_present`` / ``packet_missing`` : provenance
+        for grouped samples, useful when ``on_missing='fill'`` inserts NaN-IQ
+        placeholders;
         ``point_order`` : the point indices ``1..N``.
     """
     n_tones = int(data_dict['num_tones'])
     N = int(tone_modulation_state['num_points'])
     if N < 1:
         raise ValueError('tone_modulation_state has num_points < 1; is modulation armed?')
+    if reduce not in ('mean', None):
+        raise ValueError(f"reduce must be 'mean' or None, got {reduce!r}")
 
     points = np.asarray(data_dict['modulation_point'], dtype=int)
     settling = np.asarray(data_dict['modulation_settling'], dtype=int)
     revisions = np.asarray(data_dict['modulation_revision'], dtype=int)
     z = _tone_iq(data_dict, n_tones)
+    sample_index = np.arange(len(points), dtype=int)
+    sample_present = np.ones(len(points), dtype=bool)
 
     # Detect dropped accumulations via the packet counter, and either notify or
     # fill the gaps with NaN placeholders (their tag inferred from the cadence).
     pc = data_dict.get('packet_counter')
+    source_indices = sample_index.copy()
     if pc is not None:
         pc = np.asarray(pc, dtype=np.int64)
         diffs = np.diff(pc)
@@ -204,9 +247,48 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
                     warnings.warn('group_cycles: could not anchor the cadence to fill '
                                   'gaps; proceeding without filling.', stacklevel=2)
                 else:
-                    pc, points, settling, revisions, z = filled
+                    pc, points, settling, revisions, z, sample_present, source_indices = filled
+                    sample_index = source_indices.copy()
             elif on_missing != 'notify':
                 raise ValueError(f"on_missing must be 'notify' or 'fill', got {on_missing!r}")
+    elif on_missing not in ('notify', 'fill'):
+        raise ValueError(f"on_missing must be 'notify' or 'fill', got {on_missing!r}")
+
+    n_samples = len(points)
+
+    def _aligned_array(name, default=0, dtype=None):
+        """Return a sample-aligned metadata array, filling inserted packets."""
+        src = data_dict.get(name)
+        if src is None:
+            if dtype is None:
+                dtype = int
+            return np.full(n_samples, default, dtype=dtype)
+        src = np.asarray(src)
+        if len(src) == n_samples and np.all(source_indices >= 0):
+            return src.astype(dtype, copy=False) if dtype is not None else src.copy()
+        if dtype is None:
+            dtype = src.dtype
+        out = np.full(n_samples, default, dtype=dtype)
+        valid = source_indices >= 0
+        if np.any(valid):
+            out[valid] = src[source_indices[valid]]
+        return out
+
+    pc_meta = (np.asarray(pc, dtype=np.int64) if pc is not None
+               else np.arange(n_samples, dtype=np.int64))
+    tt_meta = _aligned_array('telescope_time', default=0, dtype=np.uint64)
+    err_meta = _aligned_array('packet_error', default=1, dtype=int)
+    missing_meta = ~np.asarray(sample_present, dtype=bool)
+    err_meta = np.asarray(err_meta, dtype=int).copy()
+    err_meta[missing_meta] = 1
+    flag_meta = {}
+    for name, values in data_dict.get('stream_flags', {}).items():
+        values = np.asarray(values)
+        out = np.zeros(n_samples, dtype=values.dtype)
+        valid = source_indices >= 0
+        if np.any(valid):
+            out[valid] = values[source_indices[valid]]
+        flag_meta[name] = out
 
     # Per-(point,tone) probe offsets and absolute probe frequencies from the
     # modulation state (user order). The absolute frequency (centre + offset) is
@@ -222,25 +304,123 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
 
     cycles_z = []
     cycles_rev = []
+    cycles_sample_index = []
+    cycles_sample_present = []
+    cycles_packet_missing = []
+    cycles_packet_counter = []
+    cycles_telescope_time = []
+    cycles_packet_error = []
+    cycles_mod_point = []
+    cycles_mod_settling = []
+    cycles_mod_revision = []
+    cycles_flags = {name: [] for name in flag_meta}
+    cycles_used = []
     cur = {p: [] for p in range(1, N + 1)}
+    cur_meta = {p: {
+        'sample_index': [],
+        'sample_present': [],
+        'packet_missing': [],
+        'packet_counter': [],
+        'telescope_time': [],
+        'packet_error': [],
+        'modulation_point': [],
+        'modulation_settling': [],
+        'modulation_revision': [],
+        'stream_flags': {name: [] for name in flag_meta},
+    } for p in range(1, N + 1)}
     cur_rev = []
     prev_p = None
 
     def _flush():
         # Commit the current cycle only if every point was seen.
         if all(len(cur[p]) > 0 for p in range(1, N + 1)):
+            counts = np.asarray([len(cur[p]) for p in range(1, N + 1)], dtype=int)
             if reduce == 'mean':
                 arr = np.stack([np.mean(np.stack(cur[p], axis=0), axis=0)
                                 for p in range(1, N + 1)], axis=0)   # (N, n_tones)
+                meta_axis = None
             else:
                 # retain sample axis; truncate to the common minimum dwell count
                 m = min(len(cur[p]) for p in range(1, N + 1))
                 arr = np.stack([np.stack(cur[p][:m], axis=0)
                                 for p in range(1, N + 1)], axis=0)    # (N, n_used, n_tones)
+                meta_axis = m
             cycles_z.append(arr)
             cycles_rev.append(int(np.bincount(cur_rev).argmax()) if cur_rev else 0)
+
+            if meta_axis is None:
+                cycles_sample_index.append(np.asarray([
+                    int(_first_or_default(cur_meta[p]['sample_index'], -1))
+                    for p in range(1, N + 1)], dtype=int))
+                cycles_sample_present.append(np.asarray([
+                    bool(_first_or_default(cur_meta[p]['sample_present'], False))
+                    for p in range(1, N + 1)], dtype=bool))
+                cycles_packet_missing.append(np.asarray([
+                    bool(np.any(cur_meta[p]['packet_missing']))
+                    for p in range(1, N + 1)], dtype=bool))
+                cycles_packet_counter.append(np.asarray([
+                    int(_first_or_default(cur_meta[p]['packet_counter'], -1))
+                    for p in range(1, N + 1)], dtype=np.int64))
+                cycles_telescope_time.append(np.asarray([
+                    int(_first_or_default(cur_meta[p]['telescope_time'], 0))
+                    for p in range(1, N + 1)], dtype=np.uint64))
+                cycles_packet_error.append(np.asarray([
+                    int(np.max(cur_meta[p]['packet_error'])) if cur_meta[p]['packet_error'] else 0
+                    for p in range(1, N + 1)], dtype=int))
+                cycles_mod_point.append(np.arange(1, N + 1, dtype=int))
+                cycles_mod_settling.append(np.asarray([
+                    int(np.max(cur_meta[p]['modulation_settling'])) if cur_meta[p]['modulation_settling'] else 0
+                    for p in range(1, N + 1)], dtype=int))
+                cycles_mod_revision.append(np.asarray([
+                    _mode_int(cur_meta[p]['modulation_revision'])
+                    for p in range(1, N + 1)], dtype=int))
+                for name in flag_meta:
+                    cycles_flags[name].append(np.asarray([
+                        int(np.max(cur_meta[p]['stream_flags'][name]))
+                        if cur_meta[p]['stream_flags'][name] else 0
+                        for p in range(1, N + 1)], dtype=flag_meta[name].dtype))
+            else:
+                cycles_sample_index.append(np.stack([
+                    np.asarray(cur_meta[p]['sample_index'][:meta_axis], dtype=int)
+                    for p in range(1, N + 1)], axis=0))
+                cycles_sample_present.append(np.stack([
+                    np.asarray(cur_meta[p]['sample_present'][:meta_axis], dtype=bool)
+                    for p in range(1, N + 1)], axis=0))
+                cycles_packet_missing.append(np.stack([
+                    np.asarray(cur_meta[p]['packet_missing'][:meta_axis], dtype=bool)
+                    for p in range(1, N + 1)], axis=0))
+                cycles_packet_counter.append(np.stack([
+                    np.asarray(cur_meta[p]['packet_counter'][:meta_axis], dtype=np.int64)
+                    for p in range(1, N + 1)], axis=0))
+                cycles_telescope_time.append(np.stack([
+                    np.asarray(cur_meta[p]['telescope_time'][:meta_axis], dtype=np.uint64)
+                    for p in range(1, N + 1)], axis=0))
+                cycles_packet_error.append(np.stack([
+                    np.asarray(cur_meta[p]['packet_error'][:meta_axis], dtype=int)
+                    for p in range(1, N + 1)], axis=0))
+                cycles_mod_point.append(np.stack([
+                    np.asarray(cur_meta[p]['modulation_point'][:meta_axis], dtype=int)
+                    for p in range(1, N + 1)], axis=0))
+                cycles_mod_settling.append(np.stack([
+                    np.asarray(cur_meta[p]['modulation_settling'][:meta_axis], dtype=int)
+                    for p in range(1, N + 1)], axis=0))
+                cycles_mod_revision.append(np.stack([
+                    np.asarray(cur_meta[p]['modulation_revision'][:meta_axis], dtype=int)
+                    for p in range(1, N + 1)], axis=0))
+                for name in flag_meta:
+                    cycles_flags[name].append(np.stack([
+                        np.asarray(cur_meta[p]['stream_flags'][name][:meta_axis],
+                                   dtype=flag_meta[name].dtype)
+                        for p in range(1, N + 1)], axis=0))
+            cycles_used.append(counts)
         for p in range(1, N + 1):
             cur[p] = []
+            for key in cur_meta[p]:
+                if key == 'stream_flags':
+                    for name in cur_meta[p]['stream_flags']:
+                        cur_meta[p]['stream_flags'][name] = []
+                else:
+                    cur_meta[p][key] = []
         cur_rev.clear()
 
     for k in range(len(points)):
@@ -253,15 +433,100 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
         if prev_p is not None and p < prev_p:   # wrapped -> cycle boundary
             _flush()
         cur[p].append(z[k])
+        cur_meta[p]['sample_index'].append(int(sample_index[k]))
+        cur_meta[p]['sample_present'].append(bool(sample_present[k]))
+        cur_meta[p]['packet_missing'].append(bool(missing_meta[k]))
+        cur_meta[p]['packet_counter'].append(int(pc_meta[k]))
+        cur_meta[p]['telescope_time'].append(int(tt_meta[k]))
+        cur_meta[p]['packet_error'].append(int(err_meta[k]))
+        cur_meta[p]['modulation_point'].append(int(points[k]))
+        cur_meta[p]['modulation_settling'].append(int(settling[k]))
+        cur_meta[p]['modulation_revision'].append(int(revisions[k]))
+        for name in flag_meta:
+            cur_meta[p]['stream_flags'][name].append(flag_meta[name][k])
         cur_rev.append(int(revisions[k]))
         prev_p = p
     _flush()
 
+    if reduce == 'mean':
+        meta_shape = (0, N)
+    else:
+        meta_shape = (0, N, 0)
+    sample_index_out = _stack_or_empty(cycles_sample_index, meta_shape, dtype=int)
+    sample_present_out = _stack_or_empty(cycles_sample_present, meta_shape, dtype=bool)
+    packet_missing_out = _stack_or_empty(cycles_packet_missing, meta_shape, dtype=bool)
+    packet_counter_out = _stack_or_empty(cycles_packet_counter, meta_shape, dtype=np.int64)
+    telescope_time_out = _stack_or_empty(cycles_telescope_time, meta_shape, dtype=np.uint64)
+    packet_error_out = _stack_or_empty(cycles_packet_error, meta_shape, dtype=int)
+    mod_point_out = _stack_or_empty(cycles_mod_point, meta_shape, dtype=int)
+    mod_settling_out = _stack_or_empty(cycles_mod_settling, meta_shape, dtype=int)
+    mod_revision_out = _stack_or_empty(cycles_mod_revision, meta_shape, dtype=int)
+    samples_used_out = (
+        np.stack(cycles_used, axis=0) if cycles_used
+        else np.empty((0, N), dtype=int))
+    stream_flags_out = {
+        name: _stack_or_empty(items, meta_shape, dtype=flag_meta[name].dtype)
+        for name, items in cycles_flags.items()
+    }
+
+    active_offset_cols = np.any(np.abs(offsets_hz) > 0, axis=0)
+    if np.any(active_offset_cols):
+        center_point = int(np.argmin(np.mean(np.abs(offsets_hz[:, active_offset_cols]), axis=1)))
+    elif len(offsets_hz):
+        center_point = int(np.argmin(np.mean(np.abs(offsets_hz), axis=1)))
+    else:
+        center_point = 0
+
+    def _cycle_view(arr, default_shape=(0,)):
+        if arr.shape[0] == 0:
+            return np.empty(default_shape, dtype=arr.dtype)
+        if arr.ndim == 2:
+            return arr[:, center_point]
+        # retain-sample-axis output: use the first kept sample at the centre point
+        return arr[:, center_point, 0]
+
+    def _cycle_any(arr):
+        if arr.shape[0] == 0:
+            return np.empty((0,), dtype=bool)
+        axes = tuple(range(1, arr.ndim))
+        return np.any(arr, axis=axes)
+
+    def _cycle_max(arr):
+        if arr.shape[0] == 0:
+            return np.empty((0,), dtype=arr.dtype)
+        axes = tuple(range(1, arr.ndim))
+        return np.max(arr, axis=axes)
+
+    cycle_stream_flags = {
+        name: _cycle_max(arr)
+        for name, arr in stream_flags_out.items()
+    }
+    z_out_shape = (0, N, n_tones) if reduce == 'mean' else (0, N, 0, n_tones)
+
     return {
-        'z': np.stack(cycles_z, axis=0) if cycles_z else np.empty((0, N, n_tones), dtype=complex),
+        'z': np.stack(cycles_z, axis=0) if cycles_z else np.empty(z_out_shape, dtype=complex),
         'offsets_hz': offsets_hz,
         'freq_hz': freq_hz,
         'revision': np.asarray(cycles_rev, dtype=int),
+        'sample_index': sample_index_out,
+        'sample_present': sample_present_out,
+        'packet_missing': packet_missing_out,
+        'packet_counter': packet_counter_out,
+        'telescope_time': telescope_time_out,
+        'packet_error': packet_error_out,
+        'stream_flags': stream_flags_out,
+        'modulation_point': mod_point_out,
+        'modulation_settling': mod_settling_out,
+        'modulation_revision': mod_revision_out,
+        'samples_per_point_used': samples_used_out,
+        'cycle_sample_index': _cycle_view(sample_index_out),
+        'cycle_sample_present': ~_cycle_any(packet_missing_out),
+        'cycle_packet_missing': _cycle_any(packet_missing_out),
+        'cycle_packet_counter': _cycle_view(packet_counter_out),
+        'cycle_telescope_time': _cycle_view(telescope_time_out),
+        'cycle_packet_error': _cycle_max(packet_error_out),
+        'cycle_stream_flags': cycle_stream_flags,
+        'cycle_point_index': center_point,
         'point_order': np.arange(1, N + 1),
     }
 
@@ -283,9 +548,14 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
       phase-centred using a per-tone
       :class:`souk_readout_tools.resonator.ResonatorCalibration` (from
       :func:`params_from_sweep`). In this basis the phase is well conditioned,
-      and the **exact Möbius inversion** yields the frequency shift and
-      dissipation directly (no linewidth argument needed — the calibration
-      carries ``fr``/``Ql``). This is the recommended basis.
+      and the **exact Möbius inversion** yields probe detuning
+      ``f_probe - f_r`` and
+      matched-scale ``Delta(1 / (2 * Qi))`` dissipation quadrature (no
+      linewidth argument needed — the calibration carries ``fr``/``Ql``).
+      For the fitted Duffing model, an
+      analytic inverse maps the recovered circle coordinate back to probe
+      detuning. Resonator detuning relative to the probe has the opposite sign.
+      This is the recommended basis.
 
     Parameters
     ----------
@@ -308,7 +578,8 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
     calibration : dict or None, optional
         Per-tone ``{tone_index: ResonatorCalibration}`` (e.g.
         ``params_from_sweep(..., deembed=True)['calibration']``). Enables the
-        calibrated/centred basis with exact frequency-shift and dissipation.
+        calibrated/centred basis with exact linear-notch frequency shift and
+        matched-scale dissipation.
     phase_baseline : array-like or None, optional
         Per-tone reference phase (rad) for the *model-free* frequency-shift
         conversion; ``None`` uses each tone's mean centre-point phase.
@@ -322,9 +593,13 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
         Per-tone, per-cycle arrays of shape ``(n_cycles, n_tones)`` unless noted:
         ``z_center``, ``dphi_df``, ``d2phi_df2``, ``freq_shift_hz``,
         ``detuning_linewidths``, ``detuning_hz``, ``needs_update`` (bool),
-        ``dissipation``; plus ``revision`` ``(n_cycles,)``. In the calibrated
-        basis ``freq_shift_hz`` / ``detuning_hz`` are the centre tone's offset
-        from resonance (Hz) and ``dissipation`` is the fractional loss shift.
+        ``dissipation``; plus ``revision`` ``(n_cycles,)`` and cycle-aligned
+        metadata copied from :func:`group_cycles` when available:
+        ``packet_counter``, ``telescope_time``, ``packet_error``,
+        ``packet_missing``, ``sample_index``, ``stream_flags``. In the
+        calibrated basis ``freq_shift_hz`` / ``detuning_hz`` are the centre
+        tone's probe detuning ``f_probe - f_r`` (Hz) and ``dissipation`` is
+        ``Delta(1 / (2 * Qi))``.
     """
     z = np.asarray(grouped['z'])
     if z.ndim == 4:                      # (n_cycles, N, n_used, n_tones) -> average dwell
@@ -352,6 +627,20 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
         'dissipation': np.full((n_cycles, n_tones), np.nan),
         'revision': np.asarray(grouped.get('revision', np.zeros(n_cycles)), dtype=int),
     }
+    passthrough = {
+        'packet_counter': 'cycle_packet_counter',
+        'telescope_time': 'cycle_telescope_time',
+        'packet_error': 'cycle_packet_error',
+        'packet_missing': 'cycle_packet_missing',
+        'sample_present': 'cycle_sample_present',
+        'sample_index': 'cycle_sample_index',
+        'stream_flags': 'cycle_stream_flags',
+    }
+    for out_key, grouped_key in passthrough.items():
+        if grouped_key in grouped:
+            out[out_key] = grouped[grouped_key]
+    if 'cycle_point_index' in grouped:
+        out['cycle_point_index'] = grouped['cycle_point_index']
     if n_cycles == 0:
         return out
 
@@ -371,12 +660,12 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
         cal = _cal_for(t)
         if cal is not None and freq_hz is not None:
             # Calibrated basis: de-embed + phase-centre, then phase is well
-            # conditioned and the exact Möbius inversion gives df / dissipation.
-            zc = cal.deembed_sweep(freq_hz[:, t], zt)        # (n_cycles, N), centred
+            # conditioned and the Mobius inversion gives df / dissipation.
+            zc = cal.transform_raw_iq(freq_hz[:, t], zt)     # (n_cycles, N), centred
             phi = np.unwrap(np.angle(zc), axis=1)
-            df_pts, dd_pts = cal.to_frequency_dissipation(zc)  # (n_cycles, N) each
+            df_pts, dd_pts = cal.convert_centered_iq(zc)      # (n_cycles, N) each
             lw_t = cal.fr / cal.Ql                            # linewidth (Hz) from the fit
-            out['freq_shift_hz'][:, t] = df_pts[:, ci]        # centre offset from resonance
+            out['freq_shift_hz'][:, t] = df_pts[:, ci]        # centre probe detuning from fitted fr
             out['detuning_hz'][:, t] = df_pts[:, ci]
             out['detuning_linewidths'][:, t] = df_pts[:, ci] / lw_t
             out['needs_update'][:, t] = np.abs(df_pts[:, ci] / lw_t) > threshold_linewidths
@@ -425,36 +714,111 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
     return out
 
 
+def _measured_reference_freqs(f_tone, z_tone):
+    """Return measured (model-free) feature frequencies for one raw sweep trace.
+
+    Straight from the sweep, with no model: the magnitude minimum, the peak of
+    ``|dS21/df|`` and the peak of the unwrapped-phase slope. These are reported
+    for cross-checking the fitted ``fr`` and the chosen operating point; for a
+    resonator with cable delay or impedance-mismatch asymmetry they generally
+    sit at three different frequencies, none of which is ``fr``.
+
+    Returns ``(f_min_s21, f_max_dz_df, f_max_dphase_df)`` (Hz).
+    """
+    order = np.argsort(np.asarray(f_tone, dtype=float))
+    fs = np.asarray(f_tone, dtype=float)[order]
+    zs = np.asarray(z_tone, dtype=complex)[order]
+    f_min_s21 = float(fs[int(np.argmin(np.abs(zs)))])
+    f_max_dz_df = float(fs[int(np.argmax(np.abs(np.gradient(zs, fs))))])
+    phase_slope = np.gradient(np.unwrap(np.angle(zs)), fs)
+    f_max_dphase_df = float(fs[int(np.argmax(np.abs(phase_slope)))])
+    return f_min_s21, f_max_dz_df, f_max_dphase_df
+
+
+def _max_snr_operating_point(cal, n_grid=20001, y_max=8.0):
+    """Frequency (Hz) of maximum frequency-shift responsivity for one tone.
+
+    The best signal-to-noise operating point for reading a resonator frequency
+    shift is where the response moves fastest per Hz of detuning,
+    ``argmax |dS21/df|`` of the resonator's own (de-embedded) response. This is
+    the geometric steepest point of the resonance circle. It is displaced from
+    the fitted ``fr`` by the impedance-mismatch asymmetry (``phi``) and, for a
+    driven nonlinear fit, by the Duffing detuning plus the bistable-cliff skew.
+    Cable delay is deliberately excluded: it does not move with the resonator,
+    so it adds responsivity to a probe sweep but none to a detector frequency
+    shift. Gain is a constant scale and does not move the peak.
+
+    Linear (``anl == 0``): the peak is at ``min |D|`` of the notch denominator,
+    which has the closed form ``fr * (1 - frequency_origin_fraction)`` with
+    ``frequency_origin_fraction = Im(1/Qe)/2``.
+
+    Nonlinear (``anl > 0``): the driven model is parametrised by the smooth
+    Duffing drive coordinate ``y`` rather than by frequency, because the forward
+    Duffing solver's branch selection is discontinuous in ``f`` (a one-sample
+    jump a fine ``f`` grid would mistake for an infinite slope). On the circle
+    ``|dS21/dy| = 2/(1 + 4 y**2)`` and the constant ``|1/Qe|`` drops out of the
+    argmax, so ``|dS21/df| = |dS21/dy| / |df/dy|`` depends only on ``Ql`` and
+    ``anl`` (``df/dy`` via the smooth rational inverse ``invert_duffing_coordinate``).
+    Near a bifurcation ``df/dy -> 0`` and the peak rides up to the cliff, as the
+    max-SNR criterion implies.
+    """
+    foj = float(getattr(cal, 'frequency_origin_fraction', 0.0))
+    anl = float(getattr(cal, 'anl', 0.0))
+    if anl == 0.0:
+        return float(cal.fr * (1.0 - foj))
+    from .resonator import invert_duffing_coordinate
+    y = np.linspace(-y_max, y_max, int(n_grid))
+    x = invert_duffing_coordinate(y, anl) / cal.Ql        # (f - fr) / fr
+    f = cal.fr * (1.0 + x)
+    dS21_dy = 2.0 / (1.0 + 4.0 * y ** 2)
+    df_dy = np.abs(np.gradient(f, y))
+    slope = dS21_dy / np.where(df_dy > 0.0, df_dy, np.inf)
+    return float(f[int(np.argmax(slope))])
+
+
 def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
                                  delta_linewidths=0.25, exclude_blind=True,
                                  blind_indices=None, deembed=True, fits=None):
     """
     Turn a calibration sweep into a ready-to-use ``enable_modulation`` config.
 
-    For each resonator a centre (the steepest / inflection operating point) and a
-    linewidth are obtained, then a symmetric ``n_points`` probe pattern is built
-    with **each tone's probe spacing scaled to its own linewidth** (so a narrow
-    resonator gets a smaller delta). The returned dict splats straight into
-    :meth:`ReadoutClient.enable_modulation`.
+    For each resonator a centre and a linewidth are obtained, then a symmetric
+    ``n_points`` probe pattern is built with **each tone's probe spacing scaled
+    to its own linewidth** (so a narrow resonator gets a smaller delta). The
+    returned dict splats straight into :meth:`ReadoutClient.enable_modulation`.
+
+    The centre is the **geometric steepest point** — the frequency of maximum
+    frequency-shift responsivity (``argmax |dS21/df|`` of the de-embedded
+    response), i.e. the best signal-to-noise operating point for reading a
+    resonator frequency shift. This is **not** the fitted ``fr`` in general: it
+    is displaced from ``fr`` by the impedance-mismatch asymmetry (``phi``) and,
+    for a driven nonlinear fit, by the Duffing detuning plus the bistable-cliff
+    skew (cable delay is excluded — it does not move with the resonator). See
+    :func:`_max_snr_operating_point`. Because the demod's ``freq_shift_hz`` is
+    referenced to ``fr``, it reads ``center - fr`` (also returned in
+    ``reference_freqs['offset_from_fr_hz']``) as a constant baseline at the
+    operating point rather than ~0; subtract it in the tracking/``needs_update``
+    logic.
 
     This package does **not** fit resonators itself (so no fit options have to be
     threaded through it). With ``deembed=True`` (default) you must therefore pass
-    pre-computed ``fits`` (fit the sweep yourself, e.g.
-    :func:`souk_readout_tools.fitting.fit_resonance`); a per-tone
+    pre-computed ``fits`` (fit the parsed sweep yourself, normally with
+    :func:`souk_readout_tools.fitting.batch_fit`); a per-tone
     :class:`souk_readout_tools.resonator.ResonatorCalibration` is built from each,
     giving a model-consistent centre/linewidth **and** the de-embedding /
     phase-centring calibration that :func:`demodulate` uses for the
     well-conditioned centred basis (and dissipation). With ``deembed=False`` (or
-    for any modulated tone lacking a supplied fit) the function falls back to the
-    **model-free phase-slope estimate** from the sweep (centre = steepest point,
-    linewidth from the peak slope) and that tone gets no calibration.
+    for any modulated tone lacking a supplied fit) the function falls back to a
+    **model-free estimate** from the sweep (centre = measured peak ``|dS21/df|``,
+    linewidth from the magnitude-dip FWHM) and that tone gets no calibration.
 
     Parameters
     ----------
     sweep : dict
-        Sweep data with ``f`` and ``z`` arrays of shape ``(n_sweep_points,
-        n_tones)`` (frequency in Hz and complex S21). ``blind_indices`` may also
-        be carried here.
+        Parsed client sweep data with ``sweep_f``, ``sweep_i`` and ``sweep_q``
+        arrays of shape ``(n_sweep_points, n_tones)``. The compact ``f`` / ``z``
+        form is also accepted. Blind-tone indices are inferred from standard
+        parsed metadata or may be carried directly as ``blind_indices``.
     n_points : int, optional
         Number of probe points per cycle (>=2; 3 enables the curvature/detuning
         estimate). Default 3.
@@ -472,13 +836,17 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
     deembed : bool, optional
         Build de-embedding / phase-centring calibrations (recommended). When True,
         ``fits`` is **required**. When False, only the model-free phase-slope
-        estimate is produced (no calibration). Default True.
+        estimate is produced (no calibration), and ``fits`` must be omitted.
+        Default True.
     fits : sequence, dict, or None
-        Pre-computed per-tone fits. **Required when** ``deembed=True``. A list
-        (length ``n_tones``; entries ``None`` for tones to leave model-free) or
-        ``{tone_index: fit}``; each entry is a :class:`fitting.FitResult` or a
-        ready :class:`resonator.ResonatorCalibration`. Doing the fit outside this
-        package keeps the fitter's options out of the modulation API.
+        Pre-computed per-tone fits. **Required when** ``deembed=True``. Pass the
+        results of :func:`souk_readout_tools.fitting.batch_fit` directly, an
+        index-aligned sequence (entries may be ``None``), or
+        ``{tone_index: fit}``. Each entry is a :class:`fitting.FitResult` or a
+        ready :class:`resonator.ResonatorCalibration`. ``FitResult.tone_index``
+        is honoured so skipped blind tones retain the correct indices. Doing the
+        fit outside this package keeps the fitter's options out of the modulation
+        API.
 
     Returns
     -------
@@ -490,40 +858,109 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
         ``linewidth_hz`` : ``(len(mod_indices),)`` linewidths (for model-free demod);
         ``calibration`` : ``{tone_index: ResonatorCalibration}`` for tones with a
         supplied fit (empty if ``fits`` is None);
+        ``reference_freqs`` : dict of ``(n_tones,)`` arrays for cross-checking the
+        operating point — ``center_hz`` (the chosen steepest point),
+        ``fitted_fr_hz`` (fitted ``fr``; NaN where no fit), ``min_s21_hz``,
+        ``max_dz_df_hz`` and ``max_dphase_df_hz`` (measured magnitude-min and
+        peak ``|dS21/df|`` / phase-slope frequencies), and ``offset_from_fr_hz``
+        (``center - fitted_fr``, the demod ``freq_shift_hz`` baseline);
         ``summary`` : a human-readable multi-line summary string.
     """
     if n_points < 2:
         raise ValueError('n_points must be >= 2')
-    f = np.asarray(sweep['f'], dtype=float)
-    z = np.asarray(sweep['z'])
+    if 'f' in sweep and 'z' in sweep:
+        f = np.asarray(sweep['f'], dtype=float)
+        z = np.asarray(sweep['z'])
+    elif all(key in sweep for key in ('sweep_f', 'sweep_i', 'sweep_q')):
+        f = np.asarray(sweep['sweep_f'], dtype=float)
+        z = np.asarray(sweep['sweep_i']) + 1j * np.asarray(sweep['sweep_q'])
+    else:
+        raise ValueError(
+            "sweep must contain parsed sweep_f/sweep_i/sweep_q arrays "
+            "or compact f/z arrays")
     if f.ndim == 1:
         f = f[:, None]
         z = z[:, None]
+    if f.shape != z.shape:
+        raise ValueError(f'sweep frequency and IQ shapes differ: {f.shape} != {z.shape}')
     n_sweep, n_tones = f.shape
 
-    if blind_indices is None:
-        blind_indices = sweep.get('blind_indices', []) if isinstance(sweep, dict) else []
-    blind = set(int(b) for b in blind_indices)
+    infer_blinds = blind_indices is None
+    if infer_blinds:
+        def _metadata_sequence(*values):
+            """Return the first non-empty metadata sequence."""
+            for value in values:
+                if value is None:
+                    continue
+                try:
+                    if len(value) == 0:
+                        continue
+                except TypeError:
+                    pass
+                return value
+            return []
+
+        tone_metadata = sweep.get('tone_metadata', {}) or {}
+        tone_metadata = tone_metadata if isinstance(tone_metadata, dict) else {}
+        info = sweep.get('info', {}) or {}
+        tones = info.get('tones', {}) if isinstance(info, dict) else {}
+        blind_indices = _metadata_sequence(
+            sweep.get('blind_indices'),
+            tone_metadata.get('blind_indices'),
+            tones.get('blind_indices'),
+        )
+        regular_indices = _metadata_sequence(
+            tone_metadata.get('regular_indices'),
+            tones.get('regular_indices'),
+        )
+    else:
+        regular_indices = []
+
+    def _index_set(values):
+        """Normalise scalar or sequence metadata indices within the tone range."""
+        try:
+            return {int(i) for i in values if 0 <= int(i) < n_tones}
+        except TypeError:
+            index = int(values)
+            return {index} if 0 <= index < n_tones else set()
+
+    blind = _index_set(blind_indices)
+    regular = _index_set(regular_indices)
+    if infer_blinds and regular:
+        blind.update(set(range(n_tones)) - regular)
     mod_indices = [i for i in range(n_tones) if not (exclude_blind and i in blind)]
 
     # We never fit here. deembed=True therefore requires the caller to supply fits.
     if deembed and fits is None:
         raise ValueError(
             'deembed=True requires precomputed `fits` (fit the sweep yourself, '
-            'e.g. fitting.fit_resonance, and pass fits=...). Use deembed=False for '
+            'e.g. fitting.batch_fit, and pass fits=...). Use deembed=False for '
             'the model-free phase-slope estimate.')
+    if not deembed and fits is not None:
+        raise ValueError('fits cannot be supplied when deembed=False')
+
+    fit_by_tone = {}
+    if isinstance(fits, dict):
+        fit_by_tone = {int(tone_index): fit for tone_index, fit in fits.items()}
+    elif fits is not None:
+        for position, fit in enumerate(fits):
+            if fit is None:
+                continue
+            tone_index = int(getattr(fit, 'tone_index', -1))
+            tone_index = tone_index if tone_index >= 0 else position
+            if tone_index in fit_by_tone:
+                raise ValueError(f'fits contains duplicate tone index {tone_index}')
+            fit_by_tone[tone_index] = fit
 
     def _provided_fit(t):
         """The caller-supplied fit/calibration for tone ``t`` (or None)."""
-        if fits is None:
+        fit = fit_by_tone.get(t)
+        if fit is not None and hasattr(fit, 'success') and not fit.success:
             return None
-        if isinstance(fits, dict):
-            return fits.get(t)
-        try:
-            return fits[t]
-        except (IndexError, KeyError, TypeError):
-            return None
+        return fit
 
+    # Magnitude-dip FWHM for the model-free linewidth (any tone without a fit).
+    from souk_readout_tools.resonator import estimate_resonance_empirical
     # Only need the calibration class when fits are supplied (to wrap FitResults).
     ResonatorCalibration = None
     if fits is not None:
@@ -532,27 +969,37 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
     center = np.zeros(n_tones, dtype=float)
     linewidth = np.zeros(n_tones, dtype=float)
     calibration = {}
+    # Measured (model-free) reference frequencies, straight from the sweep, plus
+    # the fitted fr, returned for cross-checking the chosen operating point.
+    fitted_fr = np.full(n_tones, np.nan)
+    f_min_s21 = np.full(n_tones, np.nan)
+    f_max_dz_df = np.full(n_tones, np.nan)
+    f_max_dphase_df = np.full(n_tones, np.nan)
     for t in range(n_tones):
         ft = f[:, t]
+        f_min_s21[t], f_max_dz_df[t], f_max_dphase_df[t] = (
+            _measured_reference_freqs(ft, z[:, t]))
         provided = _provided_fit(t)
         if provided is not None:
             # Build the calibration from the supplied fit (already a calibration,
             # or a FitResult). No fitting happens here.
             cal = (provided if hasattr(provided, 'deembed_sweep')
                    else ResonatorCalibration.from_fit(provided))
-            center[t] = cal.fr
+            fitted_fr[t] = cal.fr
             linewidth[t] = cal.fr / cal.Ql
+            # Operating point = geometric steepest point (max frequency-shift
+            # SNR), not the fitted fr: see _max_snr_operating_point.
+            center[t] = _max_snr_operating_point(cal)
             if t in mod_indices:
                 calibration[t] = cal
         else:
-            # Model-free estimate: steepest point = inflection ~ f0; for
-            # phi = -2*arctan(2(f-f0)/w) the peak slope magnitude is 4/w.
-            phi = np.unwrap(np.angle(z[:, t]))
-            slope = np.gradient(phi, ft)
-            k = int(np.argmax(np.abs(slope)))
-            center[t] = ft[k]
-            smax = np.abs(slope[k])
-            linewidth[t] = (4.0 / smax) if smax > 0 else (ft[-1] - ft[0])
+            # Model-free: park on the steepest measured point (peak |dS21/df|,
+            # the best available max-SNR estimate). Linewidth from the
+            # magnitude-dip FWHM (linear power, ~ fr/Ql for a notch), matching the
+            # fitted path. The raw angle-from-origin spins up near a deep dip, so
+            # the old 4/|dphi/df| estimate badly underestimated the linewidth.
+            center[t] = f_max_dz_df[t]
+            linewidth[t] = estimate_resonance_empirical(ft, z[:, t]).linewidth_hz
 
     # Symmetric probe pattern per tone: linspace(-delta, +delta, n_points) with
     # delta scaled to each tone's linewidth.
@@ -565,11 +1012,17 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
         f'({n_tones - len(mod_indices)} excluded), {n_points} points, '
         f'dwell={samples_per_point}, n_settle={n_settle}, delta={delta_linewidths} linewidths',
     ]
+    # Operating point relative to the fitted resonance (in linewidths), so the
+    # steepest-point offset from fr is visible and can seed the demod baseline.
+    offset_from_fr = center - fitted_fr
     for j, t in enumerate(mod_indices[:8]):
+        has_fr = np.isfinite(fitted_fr[t]) and linewidth[t] > 0
+        off = (f'  center-fr={offset_from_fr[t] / linewidth[t]:+.3f} lw'
+               if has_fr else '  (model-free, no fr)')
         summary_lines.append(
             f'  tone {t:4d}: center={center[t]/1e6:.6f} MHz  '
             f'linewidth={linewidth[t]/1e3:.2f} kHz  '
-            f'delta=+/-{deltas[j]/1e3:.3f} kHz')
+            f'delta=+/-{deltas[j]/1e3:.3f} kHz{off}')
     if len(mod_indices) > 8:
         summary_lines.append(f'  ... (+{len(mod_indices) - 8} more)')
 
@@ -585,5 +1038,18 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
         'n_settle': int(n_settle),
         'linewidth_hz': linewidth[mod_indices],
         'calibration': calibration,
+        # Per-tone (n_tones,) reference frequencies for cross-checking the
+        # operating point. center is the geometric steepest point (max SNR);
+        # these show how far it sits from the fitted fr and the measured
+        # magnitude/slope features. offset_from_fr_hz = center - fitted_fr is the
+        # expected demod freq_shift_hz baseline at the operating point.
+        'reference_freqs': {
+            'center_hz': center,
+            'fitted_fr_hz': fitted_fr,
+            'min_s21_hz': f_min_s21,
+            'max_dz_df_hz': f_max_dz_df,
+            'max_dphase_df_hz': f_max_dphase_df,
+            'offset_from_fr_hz': offset_from_fr,
+        },
         'summary': '\n'.join(summary_lines),
     }

@@ -984,15 +984,15 @@ Fast frequency modulation rapidly dithers each tone across a few probe frequenci
 ```python
 from souk_readout_tools import modulation as mod, fitting
 
-sweep = client.get_sweep_data()
-fits = [fitting.fit_resonance(sweep['f'][:, t], sweep['z'][:, t]) for t in range(sweep['f'].shape[1])]
+sweep = client.parse_sweep_data(client.get_sweep_data())
+fits = fitting.batch_fit(sweep, verbose=False)
 cfg = mod.params_from_sweep(sweep, n_points=3, samples_per_point=4, fits=fits)
 client.enable_modulation(center=cfg['center'], offsets=cfg['offsets'],
                          mod_indices=cfg['mod_indices'],
                          samples_per_point=cfg['samples_per_point'], n_settle=cfg['n_settle'])
 data = client.parse_samples(client.get_samples(3000))     # frames tagged with the cycle step
 grouped = mod.group_cycles(data, client.get_modulation_state())
-result = mod.demodulate(grouped, calibration=cfg['calibration'])   # centred basis (exact freq/dissipation)
+result = mod.demodulate(grouped, calibration=cfg['calibration'])   # centred fitted-model frequency/dissipation
 client.disable_modulation()
 ```
 
@@ -1237,7 +1237,7 @@ from souk_readout_tools.plotting import plot_timestream, plot_timestream_psd
 # I and Q vs time
 fig = plot_timestream(parsed_samples, format='iq_vs_t', tones=[0, 1])
 
-# Frequency and dissipation response timestreams (requires sweep data for conversion)
+# Historical local linear estimate (default; requires sweep data)
 fig = plot_timestream(parsed_samples, format='freq_diss', sweep_data=sweep)
 
 # Power spectral density
@@ -1364,6 +1364,85 @@ For ordered repeat measurements where each trace is the same resonator, call
 previous `FitResult` as `initial_guess` if you want chained starting values.
 
 CLI: `souk-find-resonances -C config.yaml --fit -f resonances.txt -P`
+
+### Frequency and Dissipation Conversion
+
+Use the local linearized estimate for compatibility with older analysis, or
+build fitted calibrations for exact Möbius conversion. Parse the sweep once and
+use `batch_fit()` so tone indices and blind-tone metadata are preserved:
+
+> **Frequency-sign convention.** The low-level fitted `method='mobius'` and
+> diagnostic `method='circle'` conversions return probe detuning relative to
+> the fitted resonance: `f_probe - f_r`. Positive values mean that the probe is
+> above resonance. The more familiar resonator detuning relative to a fixed
+> probe is `f_r - f_probe`, with the opposite sign. The high-level timestream
+> helper below returns changes in that resonator-side convention so it can be
+> compared directly with the historical linearized noise quadrature.
+
+```python
+from souk_readout_tools import fitting
+from souk_readout_tools.noise import (
+    fractional_frequency_and_dissipation_timestreams,
+)
+from souk_readout_tools.resonator import (
+    ResonatorCalibration,
+    interpolate_complex_trace,
+)
+
+sweep = client.parse_sweep_data(client.get_sweep_data())
+fits = fitting.batch_fit(sweep, nonlinear=True, verbose=False)
+calibrations = {
+    fit.tone_index: ResonatorCalibration.from_fit(fit)
+    for fit in fits if fit.success
+}
+
+linearized = fractional_frequency_and_dissipation_timestreams(
+    parsed_samples, sweep, method='linearized')
+mobius = fractional_frequency_and_dissipation_timestreams(
+    parsed_samples, sweep, method='mobius', calibrations=calibrations)
+circle = fractional_frequency_and_dissipation_timestreams(
+    parsed_samples, sweep, method='circle', calibrations=calibrations)
+
+# The plotting helpers expose the same switch.
+fig = plot_timestream(
+    parsed_samples, format='freq_diss', sweep_data=sweep,
+    conversion_method='mobius', calibrations=calibrations)
+```
+
+For one fixed tone, the canonical low-level fitted conversion is:
+
+```python
+cal = calibrations[tone_index]
+probe_detuning_hz, matched_dissipation = cal.convert_raw_iq(
+    tone_frequency, z_ts)
+tone_sweep_f = sweep['sweep_f'][:, tone_index]
+tone_sweep_z = sweep['sweep_i'][:, tone_index] + 1j * sweep['sweep_q'][:, tone_index]
+reference_z = interpolate_complex_trace(tone_sweep_f, tone_sweep_z, tone_frequency)
+detector_df_hz, delta_matched_dissipation = cal.convert_referenced_raw_iq(
+    tone_frequency, z_ts, reference_z)
+```
+
+Here `probe_detuning_hz` is the absolute fitted `f_probe - f_r` coordinate.
+`detector_df_hz` is the reference-subtracted resonator motion with the opposite
+sign, suitable for fixed-tone noise analysis.
+
+The asymmetric linear notch inversion is exact. For fits with non-zero
+`anl`, the default path follows the circle inversion with an analytic Duffing
+inverse. Use `method='circle'` only when you explicitly want the driven-circle
+coordinate and change in signed radial proxy
+`Delta(abs(z_centered) / radius - 1)` for diagnostics. The high-level
+timestream helper references all three methods to the sweep IQ at the fixed
+probe tone, and reports detector resonance motion with the historical sign.
+The default fitted and historical linearized converters return
+the matched-scale dissipation quadrature `Delta(1 / (2 * Qi))`. Double that
+quadrature for the commonly reported physical `Delta(1 / Qi)`.
+
+The established nonlinear fit branch uses a real loaded-linewidth denominator,
+so with non-zero `phi` its `anl -> 0` limit is not identical to the asymmetric
+linear branch. Changing that convention would require a separate fit-model
+migration. For the complete derivation, plots, and loss-coordinate
+normalization, see
+[`resonator_math_derivations.ipynb`](resonator_math_derivations.ipynb).
 
 ### Targeted Resonance Finding
 

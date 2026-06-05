@@ -6,6 +6,7 @@ mode swaps socket traffic for this in-process state object.
 """
 
 import base64
+import copy
 import datetime
 import importlib.metadata
 import json
@@ -847,6 +848,9 @@ class MockReadoutServer:
 
         Phase ``-2*arctan(2*(f - f0)/w)`` has its inflection (steepest slope,
         d2phi/df2 = 0) at the resonance ``f0``; the magnitude dips at ``f0``.
+        The magnitude is the notch-power profile ``sqrt((b + x**2)/(1 + x**2))``,
+        whose half-power FWHM is ``w`` -- so the magnitude linewidth matches the
+        phase-slope linewidth ``4/w``, as for a real resonator.
 
         Parameters
         ----------
@@ -861,7 +865,7 @@ class MockReadoutServer:
         """
         x = 2.0 * (np.asarray(f, dtype=float) - np.asarray(f0, dtype=float)) / w
         phi = -2.0 * np.arctan(x)
-        mag = 1.0 - 0.9 / (1.0 + x ** 2)   # dip to 0.1 at resonance
+        mag = np.sqrt((0.01 + x ** 2) / (1.0 + x ** 2))   # dip to 0.1 at resonance
         return scale * mag * np.exp(1j * phi)
 
     def _mock_expand_offsets(self, offsets, mod_indices, n_tones):
@@ -886,7 +890,8 @@ class MockReadoutServer:
                              f'expected 1 or len(mod_indices)={len(mod_indices)}')
         return full, n_points
 
-    def _mock_modulation_state(self, center, full_offsets, mod_indices, spp, n_settle, armed_bin_center):
+    def _mock_modulation_state(self, center, full_offsets, mod_indices, spp, n_settle,
+                               armed_bin_center, autosync=True):
         """Assemble a ``tone_modulation`` state dict mirroring the server's shape,
         with per-(tone,point) bin occupancy relative to the fixed mock armed bins.
 
@@ -902,6 +907,8 @@ class MockReadoutServer:
             Dwell and settling-sample counts.
         armed_bin_center : numpy.ndarray
             Per-tone armed bin-centre frequencies (Hz), held fixed across updates.
+        autosync : bool
+            Mocked modulation sync mode, mirrored in the state payload.
         """
         n_tones = len(center)
         n_points = full_offsets.shape[0]
@@ -926,6 +933,7 @@ class MockReadoutServer:
             'applied_revision': int(self._mod_revision),
             'revision_history': dict(self._mod_revision_history),
             'num_points': int(n_points), 'samples_per_point': int(spp), 'n_settle': int(n_settle),
+            'autosync': bool(autosync),
             'mod_indices': list(mod_indices),
             'sample_rate_hz': float(self.sample_rate),
             'cycle_rate_hz': float(self.sample_rate) / (n_points * spp) if n_points else float('nan'),
@@ -934,7 +942,8 @@ class MockReadoutServer:
             'tones': tones,
         }
 
-    def _mock_arm(self, center, offsets, mod_indices, spp, n_settle, reload_bins, set_f0):
+    def _mock_arm(self, center, offsets, mod_indices, spp, n_settle, reload_bins, set_f0,
+                  autosync=None):
         """Resolve and **commit** an armed modulation config (bumps the revision).
 
         Parameters
@@ -949,6 +958,9 @@ class MockReadoutServer:
         set_f0 : bool
             Capture ``center`` as the "true" resonance frequencies (enable only),
             so later centre updates detune relative to them.
+        autosync : bool or None
+            Sync mode to store. ``None`` preserves the resident mode, defaulting
+            to ``True`` for a fresh arm.
         """
         freqs = np.asarray(self.tone_frequencies, dtype=float)
         n_tones = len(freqs)
@@ -971,15 +983,19 @@ class MockReadoutServer:
             self._mod_f0 = center.copy()
         if reload_bins or self._mod_armed_bin_center is None:
             self._mod_armed_bin_center = np.round(center / self._mod_bin_hz) * self._mod_bin_hz
+        if autosync is None:
+            autosync = self._mod.get('autosync', True) if self._mod is not None else True
+        autosync = bool(autosync)
         self._mod_revision = (self._mod_revision + 1) & 0x7FFF
         self._mod_revision_history[self._mod_revision] = {
             'center': center.tolist(), 'offsets': raw_off.tolist(),
-            'mod_indices': list(mod_indices), 'ts': time.time()}
+            'mod_indices': list(mod_indices), 'autosync': autosync, 'ts': time.time()}
         state = self._mock_modulation_state(center, full, mod_indices, spp, n_settle,
-                                            self._mod_armed_bin_center)
+                                            self._mod_armed_bin_center, autosync=autosync)
         self._mod = {'center': center, 'offsets': full, 'mod_indices': mod_indices,
                      'n_points': n_points, 'samples_per_point': int(spp),
-                     'n_settle': int(n_settle), 'revision': self._mod_revision, 'state': state}
+                     'n_settle': int(n_settle), 'autosync': autosync,
+                     'revision': self._mod_revision, 'state': state}
         return state
 
     def _info_tone_modulation(self):
@@ -1433,6 +1449,9 @@ class MockReadoutServer:
                 if (message.get('offsets') is None and message.get('center') is None
                         and self._mod is not None):
                     # Resume a resident config with no args.
+                    if 'autosync' in message:
+                        self._mod['autosync'] = bool(message['autosync'])
+                        self._mod['state']['autosync'] = bool(message['autosync'])
                     self._mod_enabled = True
                     self._mod['state']['enabled'] = True
                     return {'status': 'success', 'result': {
@@ -1440,11 +1459,28 @@ class MockReadoutServer:
                         'needs_recenter': self._mod['state']['needs_recenter']}}
                 spp = int(message.get('samples_per_point', 1))
                 n_settle = int(message.get('n_settle', 1))
+                autosync = bool(message.get('autosync', True))
                 if message.get('offsets') is None:
                     raise ValueError('offsets required to arm modulation')
+                old_mod = copy.deepcopy(self._mod)
+                old_mod_enabled = self._mod_enabled
+                old_revision = self._mod_revision
+                old_revision_history = copy.deepcopy(self._mod_revision_history)
+                old_mod_f0 = None if self._mod_f0 is None else self._mod_f0.copy()
+                old_armed_bin_center = None if self._mod_armed_bin_center is None else self._mod_armed_bin_center.copy()
                 state = self._mock_arm(message.get('center'), message.get('offsets'),
                                        message.get('mod_indices'), spp, n_settle,
-                                       reload_bins=True, set_f0=True)
+                                       reload_bins=True, set_f0=True, autosync=autosync)
+                if state['needs_recenter']:
+                    self._mod = old_mod
+                    self._mod_enabled = old_mod_enabled
+                    self._mod_revision = old_revision
+                    self._mod_revision_history = old_revision_history
+                    self._mod_f0 = old_mod_f0
+                    self._mod_armed_bin_center = old_armed_bin_center
+                    raise ValueError(
+                        'modulation offsets push at least one tone beyond fixed-bin coverage; '
+                        'reduce offsets or use a sweep/cross-bin method')
                 self._mod_enabled = True
                 state['enabled'] = True
                 return {'status': 'success', 'result': {
@@ -1467,9 +1503,13 @@ class MockReadoutServer:
                     full = self._mod['offsets'].copy()
                 else:
                     full, _ = self._mock_expand_offsets(message.get('offsets'), mod_indices, len(center))
+                autosync = (
+                    self._mod.get('autosync', True) if message.get('autosync') is None
+                    else bool(message.get('autosync')))
                 tentative = self._mock_modulation_state(
                     center, full, mod_indices, self._mod['samples_per_point'],
-                    self._mod['n_settle'], self._mod_armed_bin_center)
+                    self._mod['n_settle'], self._mod_armed_bin_center,
+                    autosync=autosync)
                 if tentative['needs_recenter'] and on_map_change != 'recenter':
                     return {'status': 'error',
                             'message': 'update would push tones beyond bin coverage; '
@@ -1478,7 +1518,7 @@ class MockReadoutServer:
                 reload_bins = bool(tentative['needs_recenter'])  # recenter path reloads bins
                 state = self._mock_arm(message.get('center'), message.get('offsets'), None,
                                        self._mod['samples_per_point'], self._mod['n_settle'],
-                                       reload_bins=reload_bins, set_f0=False)
+                                       reload_bins=reload_bins, set_f0=False, autosync=autosync)
                 self._mod_enabled = True
                 return {'status': 'success', 'result': {
                     'revision': self._mod_revision, 'op': 'recenter' if reload_bins else 'update'}}
@@ -1488,8 +1528,12 @@ class MockReadoutServer:
         if request == 'recenter_modulation':
             if self._mod is None:
                 return {'status': 'error', 'message': 'modulation not armed'}
+            autosync = (
+                self._mod.get('autosync', True) if message.get('autosync') is None
+                else bool(message.get('autosync')))
             self._mock_arm(self._mod['center'], None, None, self._mod['samples_per_point'],
-                           self._mod['n_settle'], reload_bins=True, set_f0=False)
+                           self._mod['n_settle'], reload_bins=True, set_f0=False,
+                           autosync=autosync)
             self._mod_enabled = True
             return {'status': 'success', 'result': {'revision': self._mod_revision}}
 

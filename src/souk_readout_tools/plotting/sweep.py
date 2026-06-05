@@ -86,15 +86,20 @@ def _apply_phase_ops(z, phase_center=False, phase_rotate=False,
         _, params = resonator.phase_center(z)
 
     z = np.asarray(z, dtype=complex)
-    if phase_center:
-        z = z - params['center']
-    if phase_rotate:
-        multiplier = np.exp(1j * params['rotation_angle'])
-        z = z * multiplier
-        if ei is not None and eq is not None:
-            z_err = resonator.transform_s21_error(ei + 1j * eq, multiplier)
-            ei = z_err.real
-            eq = z_err.imag
+    z_err = None if ei is None or eq is None else ei + 1j * eq
+    transformed = resonator.apply_phase_center_stages(
+        z,
+        params,
+        center=bool(phase_center),
+        rotate=bool(phase_rotate),
+        s21_err=z_err,
+    )
+    if z_err is None:
+        z = transformed
+    else:
+        z, z_err = transformed
+        ei = z_err.real
+        eq = z_err.imag
     return z, ei, eq, params
 
 
@@ -1348,50 +1353,55 @@ def _apply_fit_raw_deembed_transforms(f, fit, z_data, z_fit, ei, eq,
             or not np.isfinite(gain_phase) or not np.isfinite(tau)):
         return None
 
-    deembed_scale = (
-        np.exp(1j * 2.0 * np.pi * np.asarray(f, dtype=float) * tau)
-        * np.exp(-1j * gain_phase) / gain_amplitude
-    )
-    z_data = np.asarray(z_data, dtype=complex) * deembed_scale
-    if z_fit is not None:
-        z_fit = np.asarray(z_fit, dtype=complex) * deembed_scale
+    from .. import resonator
 
-    z_err = None
-    if ei is not None and eq is not None:
-        from .. import resonator
-        z_err = resonator.transform_s21_error(
-            np.asarray(ei, dtype=float) + 1j * np.asarray(eq, dtype=float),
-            deembed_scale)
+    z_err = None if ei is None or eq is None else (
+        np.asarray(ei, dtype=float) + 1j * np.asarray(eq, dtype=float))
+    transformed = resonator.model_deembed(
+        f, z_data, gain_amplitude, gain_phase, tau, s21_err=z_err)
+    if z_err is None:
+        z_data = transformed
+    else:
+        z_data, z_err = transformed
+    if z_fit is not None:
+        z_fit = resonator.model_deembed(
+            f, z_fit, gain_amplitude, gain_phase, tau)
 
     if phase_center:
         center = complex(getattr(fit, 'iq_center_deembed', complex(np.nan, np.nan)))
         if not (np.isfinite(center.real) and np.isfinite(center.imag)):
             return None
-        z_data = z_data - center
+        rotation_angle = float(getattr(
+            fit, 'phase_center_rotation_angle', np.nan))
+        if phase_rotate and not np.isfinite(rotation_angle):
+            return None
+        params = {
+            'center': center,
+            'radius': float(getattr(fit, 'iq_radius_deembed', np.nan)),
+            'rotation_angle': rotation_angle,
+        }
+        transformed = resonator.apply_phase_center_stages(
+            z_data, params, center=True, rotate=phase_rotate, s21_err=z_err)
+        if z_err is None:
+            z_data = transformed
+        else:
+            z_data, z_err = transformed
         if z_fit is not None:
-            z_fit = z_fit - center
-        if phase_rotate:
-            rotation_angle = float(getattr(
-                fit, 'phase_center_rotation_angle', np.nan))
-            if not np.isfinite(rotation_angle):
-                return None
-            rotation = np.exp(1j * rotation_angle)
-            z_data = z_data * rotation
-            if z_fit is not None:
-                z_fit = z_fit * rotation
-            if z_err is not None:
-                z_err = resonator.transform_s21_error(z_err, rotation)
+            z_fit = resonator.apply_phase_center_stages(
+                z_fit, params, center=True, rotate=phase_rotate)
     elif phase_rotate:
         rotation_angle = float(getattr(fit, 'deembed_rotation_angle', np.nan))
         if not np.isfinite(rotation_angle):
             return None
-        rotation = np.exp(1j * rotation_angle)
-        z_data = 1.0 + (z_data - 1.0) * rotation
+        transformed = resonator.rotate_around_point(
+            z_data, rotation_angle, point=1.0, s21_err=z_err)
+        if z_err is None:
+            z_data = transformed
+        else:
+            z_data, z_err = transformed
         if z_fit is not None:
-            z_fit = 1.0 + (z_fit - 1.0) * rotation
-        if z_err is not None:
-            from .. import resonator
-            z_err = resonator.transform_s21_error(z_err, rotation)
+            z_fit = resonator.rotate_around_point(
+                z_fit, rotation_angle, point=1.0)
 
     if z_err is None:
         ei_out = None

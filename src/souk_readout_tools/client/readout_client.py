@@ -74,7 +74,6 @@ import io
 import logging
 import so3g
 import spt3g.core
-from scipy import signal
 
 from souk_readout_tools.config_utils import copy_template_config
 
@@ -1116,7 +1115,7 @@ class ReadoutClient:
         """
         return self.sync_config_from_system(save_as=save_as)
 
-    def set_parameter(self, param_name, param_value):
+    def set_parameter(self, param_name, param_value, **kwargs):
         """Set a named server/firmware parameter.
 
         Parameters
@@ -1130,8 +1129,13 @@ class ReadoutClient:
         param_value
             New value, in the type/shape the server expects for that
             parameter (scalar, array-like, or dict as appropriate).
+        **kwargs
+            Extra fields merged into the request and interpreted by the
+            server's handler for ``param_name``. Tone-setting handlers accept
+            ``autosync``.
         """
         message = {'request': 'set', 'param': param_name, 'value': param_value}
+        message.update(kwargs)
         response = self.send_request(message)
         if response['status'] == 'success':
             return response
@@ -1175,10 +1179,11 @@ class ReadoutClient:
         """Return the latest telescope timestamp reported by the server."""
         return self.get_parameter('telescope_time')
 
-    def set_tone_frequencies(self, tone_frequencies):
+    def set_tone_frequencies(self, tone_frequencies, autosync=True):
         """Set the active ``tone_frequencies`` (array-like, Hz)."""
         tone_frequencies = np.atleast_1d(tone_frequencies).tolist()
-        return self.set_parameter('tone_frequencies',tone_frequencies)
+        return self.set_parameter(
+            'tone_frequencies', tone_frequencies, autosync=bool(autosync))
 
     def get_tone_frequencies(self,detailed_output=False):
         """Return active tone frequencies; with ``detailed_output=True`` return
@@ -1231,7 +1236,8 @@ class ReadoutClient:
                         spans=None, powers_dbm=None,
                         reference_plane='detector',
                         optimise_dynamic_range=False,
-                        rx_policy='protect'):
+                        rx_policy='protect',
+                        autosync=True):
         """Create or replace blind tones interactively.
 
         The server snapshots the currently active regular tones, appends the
@@ -1258,6 +1264,9 @@ class ReadoutClient:
         rx_policy : str, optional
             RX-path policy when applying, as in :py:meth:`set_tone_powers`
             (default ``'protect'``).
+        autosync : bool, optional
+            If True (default), trigger firmware sync after applying tone
+            frequency/amplitude changes.
         """
         message = {
             'request': 'set_blind_tones',
@@ -1265,6 +1274,7 @@ class ReadoutClient:
             'reference_plane': reference_plane,
             'optimise_dynamic_range': optimise_dynamic_range,
             'rx_policy': rx_policy,
+            'autosync': bool(autosync),
         }
         if amplitudes is not None:
             message['amplitudes'] = np.atleast_1d(amplitudes).tolist()
@@ -1281,28 +1291,33 @@ class ReadoutClient:
         self._update_tone_defaults_from_blind_result(response['result'])
         return response
 
-    def remove_blind_tones(self):
+    def remove_blind_tones(self, autosync=True):
         """Remove blind tones and leave the current regular tones active."""
-        response = self.send_request({'request': 'remove_blind_tones'})
+        response = self.send_request({
+            'request': 'remove_blind_tones',
+            'autosync': bool(autosync),
+        })
         if response.get('status') != 'success':
             print(f"Error removing blind tones: {response.get('message')}")
             return response
         self._update_tone_defaults_from_blind_result(response['result'])
         return response
 
-    def set_tone_amplitudes(self, tone_amplitudes):
+    def set_tone_amplitudes(self, tone_amplitudes, autosync=True):
         """Set the per-tone amplitude scale factors from ``tone_amplitudes``."""
         tone_amplitudes = np.atleast_1d(tone_amplitudes).tolist()
-        return self.set_parameter('tone_amplitudes',tone_amplitudes)
+        return self.set_parameter(
+            'tone_amplitudes', tone_amplitudes, autosync=bool(autosync))
 
     def get_tone_amplitudes(self):
         """Return per-tone amplitude scale factors."""
         return np.atleast_1d(self.get_parameter('tone_amplitudes'))
 
-    def set_tone_phases(self, tone_phases):
+    def set_tone_phases(self, tone_phases, autosync=True):
         """Set the per-tone phase offsets (radians) from ``tone_phases``."""
         tone_phases = np.atleast_1d(tone_phases).tolist()
-        return self.set_parameter('tone_phases',tone_phases)
+        return self.set_parameter(
+            'tone_phases', tone_phases, autosync=bool(autosync))
 
     def get_tone_phases(self):
         """Return per-tone phase offsets in radians."""
@@ -1433,7 +1448,8 @@ class ReadoutClient:
 
     def set_tone_powers(self, tone_powers_dbm, reference_plane='detector',
                         optimise_dynamic_range=True, rx_policy='protect',
-                        verbose=True, *, force_tx_amp_bypass=None,
+                        verbose=True, autosync=True, *,
+                        force_tx_amp_bypass=None,
                         force_rx_amp_bypass=None,
                         force_tx_attenuation_db=None,
                         force_rx_attenuation_db=None,
@@ -1471,6 +1487,8 @@ class ReadoutClient:
         verbose : bool
             If False, suppress client-side informational summaries.  Warnings
             and errors are still printed.
+        autosync : bool
+            If True (default), trigger firmware sync after tone-amplitude writes.
         force_tx_amp_bypass, force_rx_amp_bypass : bool or None, optional
             Pin the TX/RX amplifier bypass state instead of letting the
             optimiser choose it.
@@ -1509,7 +1527,8 @@ class ReadoutClient:
                    'value': tone_powers_dbm,
                    'reference_plane': reference_plane,
                    'optimise_dynamic_range': optimise_dynamic_range,
-                   'rx_policy': rx_policy}
+                   'rx_policy': rx_policy,
+                   'autosync': bool(autosync)}
         self._add_power_force_controls(
             message,
             force_tx_amp_bypass=force_tx_amp_bypass,
@@ -1982,7 +2001,8 @@ class ReadoutClient:
         return self.send_request(message)
 
     def enable_modulation(self, center=None, offsets=None, mod_indices=None,
-                          samples_per_point=1, n_settle=1):
+                          samples_per_point=1, n_settle=1, autosync=True,
+                          setup_sync=True):
         """
         Arm fast tone-frequency modulation. This only **arms** (loads the config
         on the server); it does not start output. Call :meth:`enable_stream` for
@@ -2005,6 +2025,15 @@ class ReadoutClient:
             Dwell: accumulations per point per cycle (default 1).
         n_settle : int, optional
             Leading samples per point flagged as settling (default 1).
+        autosync : bool, optional
+            Whether each modulation buffer flip should pulse firmware sync
+            (default ``True``). Set ``False`` to test unsynced buffer flips.
+        setup_sync : bool, optional
+            Whether to pulse one firmware sync at arm time to establish the
+            TX/RX phase reference before any buffer flips (default ``True``).
+            Independent of ``autosync``: with ``setup_sync=True, autosync=False``
+            the LO is aligned once and then rides continuous accumulation across
+            buffer flips with no per-step sync.
 
         Returns
         -------
@@ -2015,7 +2044,9 @@ class ReadoutClient:
         self._warn_zero_phases()
         message = {'request': 'enable_modulation',
                    'samples_per_point': int(samples_per_point),
-                   'n_settle': int(n_settle)}
+                   'n_settle': int(n_settle),
+                   'autosync': bool(autosync),
+                   'setup_sync': bool(setup_sync)}
         if center is not None:
             message['center'] = np.asarray(center, dtype=float).tolist()
         if offsets is not None:
@@ -2024,7 +2055,8 @@ class ReadoutClient:
             message['mod_indices'] = [int(i) for i in np.atleast_1d(mod_indices)]
         return self.send_request(message)
 
-    def update_modulation(self, center=None, offsets=None, on_map_change='continue'):
+    def update_modulation(self, center=None, offsets=None, on_map_change='continue',
+                          autosync=None):
         """
         Seamlessly update the modulation centre and/or offsets while armed, with
         no dropped frames. Rides the existing armed channel maps.
@@ -2041,6 +2073,8 @@ class ReadoutClient:
             What to do if the update would push a tone beyond the filterbank
             overlap coverage: ``'continue'`` (default) rejects with diagnostics
             and asks you to recenter; ``'recenter'`` performs the brief map reload.
+        autosync : bool or None, optional
+            Override the existing modulation sync mode. ``None`` preserves it.
 
         Returns
         -------
@@ -2053,15 +2087,21 @@ class ReadoutClient:
             message['center'] = np.asarray(center, dtype=float).tolist()
         if offsets is not None:
             message['offsets'] = np.asarray(offsets, dtype=float).tolist()
+        if autosync is not None:
+            message['autosync'] = bool(autosync)
         return self.send_request(message)
 
-    def recenter_modulation(self):
+    def recenter_modulation(self, autosync=None):
         """
         Recenter modulation: reload the channel maps / mixer frequencies for the
         current centre and recompute VACC bin-sharing (a deliberate brief break).
         Use when :meth:`update_modulation` reports tones beyond bin coverage.
+        ``autosync=None`` preserves the existing sync mode; pass a bool to change it.
         """
-        return self.send_request({'request': 'recenter_modulation'})
+        message = {'request': 'recenter_modulation'}
+        if autosync is not None:
+            message['autosync'] = bool(autosync)
+        return self.send_request(message)
 
     def disable_modulation(self):
         """
@@ -2177,6 +2217,22 @@ class ReadoutClient:
             message_data = json.dumps(message).encode()
             message_len = struct.pack('>I', len(message_data))
             s.sendall(message_len + message_data)
+
+            def recv_exact(nbytes):
+                buf = bytearray(nbytes)
+                view = memoryview(buf)
+                received = 0
+                while received < nbytes:
+                    n = s.recv_into(view[received:], nbytes - received)
+                    if n == 0:
+                        if received == 0:
+                            return None
+                        raise RuntimeError(
+                            f'get_samples socket closed mid-frame '
+                            f'({received}/{nbytes} bytes received)')
+                    received += n
+                return buf
+
             # Pre-allocate bytearray (conservative upper bound)
             max_frame_bytes = 2048*2*4 + 10*4
             data_raw = bytearray(max_frame_bytes*num_samples)
@@ -2185,24 +2241,31 @@ class ReadoutClient:
             t0=time.time()
             frame_bytes = 0
             write_offset = 0
+            frames_received = 0
             for j in range(num_samples):
                 # Read data length
-                raw_datalen = s.recv(4)
-                if not raw_datalen:
+                raw_datalen = recv_exact(4)
+                if raw_datalen is None:
                     break
                 frame_bytes = struct.unpack('>I', raw_datalen)[0]
-                received_len = 0
-                while received_len < frame_bytes:
-                    packet_len = s.recv_into(view[write_offset+received_len:], frame_bytes - received_len)
-                    if packet_len == 0:
-                        break
-                    received_len += packet_len
-                if received_len < frame_bytes:
-                    print(f"Expected {frame_bytes} bytes, but only received {received_len} bytes.")
+                frame = recv_exact(frame_bytes)
+                if frame is None:
                     break
+                if write_offset + frame_bytes > len(data_raw):
+                    raise RuntimeError(
+                        f'get_samples frame buffer too small for frame of '
+                        f'{frame_bytes} bytes')
+                view[write_offset:write_offset + frame_bytes] = frame
                 write_offset += frame_bytes
+                frames_received += 1
             t1=time.time()
-            print(f"Received {num_samples} samples in ~{t1-t0} seconds (~{num_samples/(t1-t0)} samples per second)")
+            elapsed = max(t1 - t0, 1e-12)
+            print(f"Received {frames_received}/{num_samples} samples in ~{elapsed} seconds "
+                  f"(~{frames_received/elapsed} samples per second)")
+            if frames_received != num_samples:
+                raise RuntimeError(
+                    f'get_samples received {frames_received}/{num_samples} frames. '
+                    'The server likely rejected or closed the capture; check the server log.')
             if incl_system_info:
                 info = self.get_info('all')
             else:
@@ -3356,7 +3419,10 @@ class ReadoutClient:
         else:
             raise ValueError(f"Unsupported file_format '{file_format}'. Use 'npy' or 'json'.")
 
-    def perform_sweep(self, centers, spans, points, samples_per_point,direction='up', phases=None, refresh_adc_cal=True, adc_cal_settle_time=2.0, wait=False):
+    def perform_sweep(self, centers, spans, points, samples_per_point,
+                      direction='up', phases=None, refresh_adc_cal=True,
+                      adc_cal_settle_time=2.0, wait=False, autosync=True,
+                      setup_sync=True):
         """
         Perform a frequency sweep.
 
@@ -3379,9 +3445,17 @@ class ReadoutClient:
             wait (bool): If True, print the dispatch response, then block until
                 the sweep completes and return the final completion response.
                 Default False.
+            autosync (bool): If True (default), trigger firmware sync when
+                tone frequencies are applied before/during/after the sweep
+                (the per-step sync after each buffer flip).
+            setup_sync (bool): If True (default), pulse one firmware sync at the
+                start of the sweep to establish the TX/RX phase reference before
+                stepping. Independent of ``autosync``: with
+                ``setup_sync=True, autosync=False`` the LO is aligned once and
+                rides continuous accumulation across the per-step buffer flips.
         """
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
-        response = self.set_tone_frequencies(centers)
+        response = self.set_tone_frequencies(centers, autosync=autosync)
         if response['status'] != 'success':
             print(f"Error setting tone frequencies: {response['message']}")
             return response
@@ -3389,7 +3463,7 @@ class ReadoutClient:
         spans=np.atleast_1d(spans)
 
         if phases is not None:
-            self.set_tone_phases(np.atleast_1d(phases))
+            self.set_tone_phases(np.atleast_1d(phases), autosync=autosync)
         else:
             self._warn_zero_phases()
 
@@ -3401,7 +3475,9 @@ class ReadoutClient:
             'samples_per_point': samples_per_point,
             'direction': direction,
             'refresh_adc_cal': refresh_adc_cal,
-            'adc_cal_settle_time': adc_cal_settle_time
+            'adc_cal_settle_time': adc_cal_settle_time,
+            'autosync': bool(autosync),
+            'setup_sync': bool(setup_sync),
         }
         response = self.send_request(message)
         if wait:
@@ -3410,7 +3486,11 @@ class ReadoutClient:
                 return self.wait_for_sweep(completion_message='Sweep complete')
         return response
 
-    def perform_retune(self, centers, spans, points, samples_per_point, direction='up', method='max_gradient', freq_offsets=None, phases=None, refresh_adc_cal=True, adc_cal_settle_time=2.0, wait=False):
+    def perform_retune(self, centers, spans, points, samples_per_point,
+                       direction='up', method='max_gradient',
+                       freq_offsets=None, phases=None, refresh_adc_cal=True,
+                       adc_cal_settle_time=2.0, wait=False, autosync=True,
+                       setup_sync=True):
         """
         Perform a retune sweep to find optimal tone frequencies.
 
@@ -3433,9 +3513,15 @@ class ReadoutClient:
             wait (bool): If True, print the dispatch response, then block until
                 the retune completes and return the final completion response.
                 Default False.
+            autosync (bool): If True (default), trigger firmware sync when
+                tone frequencies are applied before/during/after retune
+                (the per-step sync after each buffer flip).
+            setup_sync (bool): If True (default), pulse one firmware sync at the
+                start of the underlying sweep to establish the TX/RX phase
+                reference. Independent of ``autosync``.
         """
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
-        response = self.set_tone_frequencies(centers)
+        response = self.set_tone_frequencies(centers, autosync=autosync)
         if response['status'] != 'success':
             print(f"Error setting tone frequencies: {response['message']}")
             return response
@@ -3443,7 +3529,7 @@ class ReadoutClient:
         spans=np.atleast_1d(spans)
 
         if phases is not None:
-            self.set_tone_phases(np.atleast_1d(phases))
+            self.set_tone_phases(np.atleast_1d(phases), autosync=autosync)
         else:
             self._warn_zero_phases()
 
@@ -3474,7 +3560,9 @@ class ReadoutClient:
             'method': method,
             'freq_offsets': freq_offsets.tolist(),
             'refresh_adc_cal': refresh_adc_cal,
-            'adc_cal_settle_time': adc_cal_settle_time
+            'adc_cal_settle_time': adc_cal_settle_time,
+            'autosync': bool(autosync),
+            'setup_sync': bool(setup_sync),
         }
         response = self.send_request(message)
         if wait:
@@ -4794,6 +4882,9 @@ class ReadoutClient:
         Calculate the fractional frequency and dissipation noise timestreams from a sweep and complex timestream data.
         Valid only for small frequency and dissipation shifts close to the tone frequency.
 
+        This compatibility wrapper delegates to the canonical linearized
+        calibration in ``souk_readout_tools.resonator``.
+
         Parameters
         ----------
         sweep_frequencies : array
@@ -4807,14 +4898,15 @@ class ReadoutClient:
         smooth_window_hz : float, optional
             The window size for a Savitzky-Golay filter with poly-order=1. The default is 1000 Hz.
             The filter is applied to the sweep data to improve the estimate of the gradient.
-            Timestram data is not smoothed.        
+            Timestream data is not smoothed.
 
         Returns
         -------
         fractional_frequency_noise : array
             The fractional frequency noise timestream.
         fractional_dissipation_noise : array
-            The fractional dissipation noise timestream.
+            The matched-scale dissipation quadrature. For the symmetric
+            small-signal model this is ``Delta(1 / (2 * Qi))``.
         si0 : float
             The in-phase component of the smoothed sweep at the tone frequency.
         sq0 : float
@@ -4824,50 +4916,27 @@ class ReadoutClient:
         dqdf : float
             The gradient of the quadrature component of the smoothed sweep at the tone frequency.
         """
-        
-        # # Find the index of the tone frequency in the sweep frequencies
-        # tone_index = np.argmin(np.abs(sweep_frequencies-tone_frequency))
-        # Note: now using interpolation instead of finding the closest frequency
+        from souk_readout_tools.resonator import (
+            linearized_frequency_and_dissipation)
 
-        # Shorthands for the real and imaginary parts of the sweep and timestream data
-        si = sweep_complex_data.real
-        sq = sweep_complex_data.imag
-        ti = timestream_complex_data.real
-        tq = timestream_complex_data.imag
-
-        #smooth the sweep data
-        if smooth_window_hz:
-            window_samples = np.max([3,int(smooth_window_hz/(sweep_frequencies[1]-sweep_frequencies[0]))])
-            si = signal.savgol_filter(si, window_samples,1)
-            sq = signal.savgol_filter(sq, window_samples,1)
-            sz = si+1j*sq
-        else:
-            sz = sweep_complex_data
-        
-        # Calculate the gradient of the complex sweep data wrt the sweep frequencies 
-        grad = np.gradient(sz,sweep_frequencies)
-
-        # Calculate values at the tone frequency (with interpolation)
-        # i0 = si[tone_index]
-        # q0 = sq[tone_index]
-        # didf = grad[tone_index].real
-        # dqdf = grad[tone_index].imag
-        si0 = np.interp(timestream_tone_frequency,sweep_frequencies,sz.real)
-        sq0 = np.interp(timestream_tone_frequency,sweep_frequencies,sz.imag)
-        didf = np.interp(timestream_tone_frequency,sweep_frequencies,grad.real)
-        dqdf = np.interp(timestream_tone_frequency,sweep_frequencies,grad.imag)
-
-
-        #Compute the frequency and dissipation timestreams
-        divisor = didf**2 + dqdf**2
-        frequency_noise = ((si0 - ti) * didf + (sq0 - tq) * dqdf) / divisor
-        dissipation_noise = ((sq0 - tq) * didf - (si0 - ti) * dqdf) / divisor
-
-        #Scale by the tone frequency to get fractional frequency and fractional dissipation
-        fractional_frequency_noise = frequency_noise/timestream_tone_frequency
-        fractional_dissipation_noise = dissipation_noise/timestream_tone_frequency
-
-        return fractional_frequency_noise, fractional_dissipation_noise, si0, sq0, didf, dqdf
+        frequency, dissipation, calibration = (
+            linearized_frequency_and_dissipation(
+                sweep_frequencies,
+                sweep_complex_data,
+                timestream_tone_frequency,
+                timestream_complex_data,
+                smooth_window_hz=smooth_window_hz,
+                return_calibration=True,
+            )
+        )
+        return (
+            frequency,
+            dissipation,
+            calibration.reference_iq.real,
+            calibration.reference_iq.imag,
+            calibration.gradient.real,
+            calibration.gradient.imag,
+        )
     
     @staticmethod
     def read_resonances_file(filename):
@@ -5257,7 +5326,8 @@ class ReadoutClient:
         return s
 
 
-    def set_tones_helper(self, freqs, amps=None, phases=None, powers_dbm=None):
+    def set_tones_helper(self, freqs, amps=None, phases=None, powers_dbm=None,
+                         autosync=True):
         """
         Convenience method: set frequencies, powers/amplitudes, and phases in one call.
 
@@ -5271,6 +5341,8 @@ class ReadoutClient:
             phases: Phase offsets in radians. Defaults to Newman phases if None.
             powers_dbm: Per-tone output power in dBm. If provided, overrides amps and
                         uses set_tone_powers() to apply calibrated power levels.
+            autosync: If True (default), trigger firmware sync after tone
+                      frequency/amplitude/phase writes.
         """
         import warnings
 
@@ -5278,7 +5350,7 @@ class ReadoutClient:
             raise ValueError("Frequencies must be provided and cannot be empty.")
         freqs = np.atleast_1d(freqs)
 
-        self.set_tone_frequencies(freqs)
+        self.set_tone_frequencies(freqs, autosync=autosync)
         active_freqs = self.get_tone_frequencies()
         if phases is None:
             phases = self.generate_newman_phases(active_freqs)
@@ -5311,7 +5383,7 @@ class ReadoutClient:
                     'power per bin will be higher than requested due to '
                     'coherent addition. Consider separating these tones.'
                 )
-            self.set_tone_powers(powers_dbm)
+            self.set_tone_powers(powers_dbm, autosync=autosync)
         else:
             if amps is None:
                 amps = np.ones_like(active_freqs)
@@ -5344,8 +5416,8 @@ class ReadoutClient:
                         f'Scaled all tone amplitudes by {worst_scale:.4f} to '
                         f'keep per-bin sum <= 1.0 (worst-case bin {worst_bin})'
                     )
-            self.set_tone_amplitudes(amps)
-        self.set_tone_phases(phases)
+            self.set_tone_amplitudes(amps, autosync=autosync)
+        self.set_tone_phases(phases, autosync=autosync)
         return
 
     def measure_path_group_delay(self,

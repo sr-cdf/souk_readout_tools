@@ -174,7 +174,12 @@ for _cpu_pool_env_var in (
 import numpy as np
 from scipy.optimize import OptimizeResult, least_squares
 
-from .resonator import estimate_resonance_empirical
+from .resonator import (
+    estimate_resonance_empirical,
+    model_deembed,
+    model_phase_center_geometry,
+    rotate_around_point,
+)
 
 
 LINEAR_NAMES = ("fr", "Qi", "Qc", "phi", "a", "alpha", "tau")
@@ -409,6 +414,9 @@ def s21_model(f, fr, Qi, Qc, phi, a, alpha, tau, anl=0.0, sweep_direction="up"):
     if float(anl) == 0.0:
         res = 1.0 - (1.0 / Qe) / (1.0 / Qi + 1.0 / Qe + 2j * x)
     else:
+        # Preserve the established nonlinear fit convention. For phi != 0,
+        # this real-Qr denominator means the anl -> 0 limit is not identical
+        # to the asymmetric linear branch above.
         Qr_inv = 1.0 / Qi + np.real(1.0 / Qe)
         y = duffing_y(x / Qr_inv, anl, sweep_direction)
         res = 1.0 - (1.0 / Qe) / (Qr_inv * (1.0 + 2j * y))
@@ -1119,17 +1127,19 @@ def _make_result(f, z, z_error, optimizer_z_error, opt, sweep_direction, f0,
     Qe = complex_coupling_q(Qc, phi)
     Ql = float(loaded_q(Qi, Qc, phi))
     z_fit = s21_model(f, *p, sweep_direction=sweep_direction)
-    deembed = np.exp(2j * np.pi * f * tau) * np.exp(-1j * alpha) / a
-    z_deembed, z_fit_deembed = z * deembed, z_fit * deembed
-    center = 1.0 - 0.5 * Ql / Qe
-    radius = float(abs(Ql / Qe) / 2.0)
-    phase_rotation = float(wrap_phase(np.pi - np.angle(1.0 - center)))
-    z_pc = (z_deembed - center) * np.exp(1j * phase_rotation)
-    z_fit_pc = (z_fit_deembed - center) * np.exp(1j * phase_rotation)
+    z_deembed = model_deembed(f, z, a, alpha, tau)
+    z_fit_deembed = model_deembed(f, z_fit, a, alpha, tau)
+    phase_center_cal = model_phase_center_geometry(Ql, Qe)
+    center = phase_center_cal.center
+    radius = phase_center_cal.radius
+    phase_rotation = phase_center_cal.rotation_angle
+    z_pc = phase_center_cal.apply(z_deembed)
+    z_fit_pc = phase_center_cal.apply(z_fit_deembed)
     z_res = s21_model(np.array([fr]), fr, Qi, Qc, phi, 1.0, 0.0, 0.0, anl, sweep_direction)[0]
     deembed_rotation = float(wrap_phase(np.pi - np.angle(z_res - 1.0)))
-    z_rot = 1.0 + (z_deembed - 1.0) * np.exp(1j * deembed_rotation)
-    z_fit_rot = 1.0 + (z_fit_deembed - 1.0) * np.exp(1j * deembed_rotation)
+    z_rot = rotate_around_point(z_deembed, deembed_rotation, point=1.0)
+    z_fit_rot = rotate_around_point(
+        z_fit_deembed, deembed_rotation, point=1.0)
     raw_center, raw_radius = _circle_fit(z)
     diff = z_fit - z
     linear_nfev = (
@@ -1524,10 +1534,12 @@ def evaluate_fit(f, fit_result, deembed=False, phase_center=False):
     if not deembed and not phase_center:
         return z
     f = np.asarray(f, float)
-    de = np.exp(2j * np.pi * f * fit_result.tau) * np.exp(-1j * fit_result.alpha) / fit_result.a
-    z = z * de
+    z = model_deembed(
+        f, z, fit_result.a, fit_result.alpha, fit_result.tau)
     if phase_center:
-        z = (z - fit_result.iq_center_deembed) * np.exp(1j * fit_result.phase_center_rotation_angle)
+        phase_center_cal = model_phase_center_geometry(
+            fit_result.Ql, fit_result.Qe)
+        z = phase_center_cal.apply(z)
     return z
 
 

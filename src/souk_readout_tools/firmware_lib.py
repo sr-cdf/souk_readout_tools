@@ -48,6 +48,13 @@ autosync_time_delay = 0.001 #seconds
 adc_saturation_bits = 16 # note the adc gives 16 bit data but is a 12 or 14 bit converter
 dac_saturation_bits = 16 # note the dac takes 16 bit data but is a 12 or 14 bit converter
 
+def _sync_if_requested(r, autosync=True, wait_s=autosync_time_delay):
+    if not autosync:
+        return
+    r.sync.arm_sync(wait=False)
+    time.sleep(wait_s)
+    r.sync.sw_sync()
+
 def cplx2uint(d,nbits):
     """
     Vectorized: Convert a floating point real, imag pair
@@ -1905,6 +1912,38 @@ def write_control_buffer_data_fast(r_fast,buf,v,indices):
     return
 
 
+def write_phase_offsets_both_buffers_fast(r_fast, phase_offsets, tone_indices=None):
+    """
+    Write per-tone LO phase offsets into **both** control buffers (0 and 1).
+
+    Phase offsets (the LO start phase) do not change during a sweep or a
+    modulation run: they are set once and then left alone while only the
+    frequency words (phase_inc + ri_step) are swapped per point. Writing both
+    ping-pong buffers keeps their phase reference identical, so flipping the
+    active buffer changes only the frequency, not the absolute phase. The same
+    offset is applied to the tx and rx LOs (matching the per-tone setters).
+
+    Only the phase-offset words are written; the frequency/amplitude words
+    already in each buffer are left untouched (sparse indexed write).
+
+    Parameters:
+    r_fast: readout object (fast interface)
+    phase_offsets: per-tone LO start phases, in radians.
+    tone_indices: LO indices for the tones (may be non-contiguous with VACC).
+                  If None, contiguous indices from 0 are assumed.
+    """
+    phase_offsets = np.atleast_1d(np.asarray(phase_offsets, dtype=float))
+    lo_control_values = {
+        'tx': {'phase_offsets': phase_offsets},
+        'rx': {'phase_offsets': phase_offsets},
+    }
+    v, i = prepare_control_buffer_data_fast(
+        r_fast, 0, lo_control_values, tone_indices=tone_indices)
+    for buf in (0, 1):
+        write_control_buffer_data_fast(r_fast, buf, v, i)
+    return
+
+
 def write_to_current_control_buffer(r,formatted_lo_control_values):
     """
     Write pre-formatted values to the current lo control buffer.
@@ -2573,16 +2612,9 @@ def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True):
     #     if not ri_steps_rx is None:
     #         r.mixer.write(f'rx_lo{i}_ri_step',     ri_steps_rx[i::r.mixer._n_parallel_chans].tobytes())
 
-    # if autosync:
-    #     # time.sleep(autosync_time_delay)
-    #     r.sync.arm_sync(wait=False)
-    #     time.sleep(autosync_time_delay)
-    #     r.sync.sw_sync()
-
     write_control_buffer_data(r,buf,v)
     set_control_buffer_idx(r,buf)
-    r.sync.arm_sync(wait=False)
-    r.sync.sw_sync()
+    _sync_if_requested(r, autosync=autosync)
     return
 
 def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
@@ -2877,7 +2909,7 @@ def _rf_to_digital_baseband(r, config_dict, tone_frequencies):
     }
 
 
-def prepare_modulation_settings_fast(r, config_dict, center_frequencies, point_offsets,
+def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, point_offsets,
                                      min_tone_separation=6, tone_amplitudes=None,
                                      tone_phases=None, armed=None):
     """
@@ -2896,8 +2928,9 @@ def prepare_modulation_settings_fast(r, config_dict, center_frequencies, point_o
 
     Parameters
     ----------
-    r : object
-        Readout firmware object (mixer / channel-select geometry, ``adc_clk_hz``).
+    r_fast : object
+        Fast readout firmware object (mixer / channel-select geometry,
+        ``adc_clk_hz``, and devmem-backed ``axil_mm`` transport).
     config_dict : dict
         Configuration dict (RF front-end + firmware settings).
     center_frequencies : numpy.ndarray
@@ -2946,7 +2979,7 @@ def prepare_modulation_settings_fast(r, config_dict, center_frequencies, point_o
     # fixed maps (tones may sit on the overlapping neighbour) instead of snapping
     # to new bins — which is the whole point of overlap riding.
     if armed is None:
-        dbb_center = _rf_to_digital_baseband(r, config_dict, center_frequencies)
+        dbb_center = _rf_to_digital_baseband(r_fast, config_dict, center_frequencies)
         fft_rbw_hz = dbb_center['fft_rbw_hz']
         tx_bins = get_closest_bin_indices(dbb_center['dbb_freqs_tx'], dbb_center['all_tx_bin_centers_hz'])
         rx_bins = get_closest_bin_indices(dbb_center['dbb_freqs_rx'], dbb_center['all_rx_bin_centers_hz'])
@@ -2955,12 +2988,12 @@ def prepare_modulation_settings_fast(r, config_dict, center_frequencies, point_o
         rx_bin_centers_hz = dbb_center['all_rx_bin_centers_hz'][rx_bins]
         # Armed VACC/LO tone indices (handle tones sharing an FFT bin). Fixed for
         # the whole modulation run; changing these is what a recenter is for.
-        tone_indices = compute_vacc_tone_indices(tx_bins, r.mixer.n_chans, min_tone_separation)
+        tone_indices = compute_vacc_tone_indices(tx_bins, r_fast.mixer.n_chans, min_tone_separation)
         # Armed channel maps (written once at arm; never touched in the hot loop).
-        chanmap_psb_inmap = np.full(r.psb_chanselect.n_chans_in,
-                                    r.psb_chanselect.DISCARD_BIN, dtype=np.uint32)
+        chanmap_psb_inmap = np.full(r_fast.psb_chanselect.n_chans_in,
+                                    r_fast.psb_chanselect.DISCARD_BIN, dtype=np.uint32)
         chanmap_psb_inmap[tone_indices] = tx_bins
-        chanmap_pfb = np.full(r.chanselect.n_chans_out, -1, dtype=int)
+        chanmap_pfb = np.full(r_fast.chanselect.n_chans_out, -1, dtype=int)
         chanmap_pfb[tone_indices] = rx_bins
         armed = {
             'fft_rbw_hz': fft_rbw_hz,
@@ -2989,7 +3022,7 @@ def prepare_modulation_settings_fast(r, config_dict, center_frequencies, point_o
     drift_bins = np.zeros((num_points, num_tones), dtype=float)
     occupancy = np.empty((num_points, num_tones), dtype=object)
     for p in range(num_points):
-        dbb = _rf_to_digital_baseband(r, config_dict, center_frequencies + point_offsets[p])
+        dbb = _rf_to_digital_baseband(r_fast, config_dict, center_frequencies + point_offsets[p])
         # Residual offset of this point from the *armed* bin centre (NOT the
         # point's own nearest bin) -> mixer phase increment per FFT period.
         tx_off = dbb['dbb_freqs_tx'] - tx_bin_centers_hz
@@ -3003,19 +3036,19 @@ def prepare_modulation_settings_fast(r, config_dict, center_frequencies, point_o
             'tx': {'phase_steps': phase_incs_tx, 'ri_steps': ri_steps_tx},
             'rx': {'phase_steps': phase_incs_rx, 'ri_steps': ri_steps_rx},
         }
-        # Amplitude/phase are identical for every point; including them here keeps
-        # each buffer self-consistent (a future optimisation could write them once
-        # and make the per-visit write frequency-only).
+        # Amplitude is identical for every point; including it here keeps each
+        # buffer self-consistent. Phase offsets are deliberately *not* written
+        # per point: they never change during a run, so the scheduler writes them
+        # once into both buffers at arm (see
+        # ``write_phase_offsets_both_buffers_fast``), leaving the per-point write
+        # frequency(+amplitude)-only.
         if tone_amplitudes is not None:
             lo_control_values['tx']['scaling'] = tone_amplitudes
             lo_control_values['rx']['scaling'] = np.ones_like(tone_amplitudes, dtype=float)
-        if tone_phases is not None:
-            lo_control_values['tx']['phase_offsets'] = tone_phases
-            lo_control_values['rx']['phase_offsets'] = tone_phases
 
         # buf=0 here is irrelevant: the formatted values are buffer-agnostic; the
         # scheduler writes them into whichever buffer is currently inactive.
-        v, i = prepare_control_buffer_data_fast(r, 0, lo_control_values, tone_indices=tone_indices)
+        v, i = prepare_control_buffer_data_fast(r_fast, 0, lo_control_values, tone_indices=tone_indices)
         control_values.append(v)
         control_indices.append(i)
 
@@ -3035,6 +3068,7 @@ def prepare_modulation_settings_fast(r, config_dict, center_frequencies, point_o
         'num_points': num_points,
         'num_tones': num_tones,
         'tone_indices': tone_indices,
+        'phase_offsets': tone_phases,         # per-tone LO start phases (rad), written once into both buffers; None leaves them unchanged
         'chanmap_psb_inmap': chanmap_psb_inmap,
         'chanmap_pfb': chanmap_pfb,
         'control_values': control_values,     # list len n_points (buffer-agnostic)
@@ -3211,6 +3245,13 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
                 tx_nearest_bins[p], n_lo, min_tone_separation
             )
 
+    # Phase offsets don't change during a sweep. When the tone LO slots are
+    # stable across the whole sweep (the common narrow-sweep case) the caller
+    # writes them once into both buffers (write_phase_offsets_both_buffers_fast)
+    # and the per-point write stays frequency-only. When bins move, a tone's LO
+    # slot changes per point, so the offset must ride along in each per-point
+    # write to land in the right slot.
+    write_offsets_once = bool(tx_bins_stable) and (tone_phases is not None)
 
 
     # #format the phase increments and ri steps for the mixer LOs
@@ -3252,7 +3293,9 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
             lo_control_values['tx']['scaling'] = tone_amplitudes
             lo_control_values['rx']['scaling'] = np.ones_like(
                 tone_amplitudes, dtype=float)
-        if tone_phases is not None:
+        # Only bake offsets per point when the LO slots move across the sweep;
+        # otherwise they are written once into both buffers by the caller.
+        if tone_phases is not None and not write_offsets_once:
             lo_control_values['tx']['phase_offsets'] = tone_phases
             lo_control_values['rx']['phase_offsets'] = tone_phases
         allv[p], alli[p] = prepare_control_buffer_data_fast(
@@ -3292,6 +3335,10 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
                             'skip_chanmap_psb_inmap':skip_chanmap_psb_inmap,
                             'skip_chanmap_pfb':skip_chanmap_pfb,
                             'tone_indices':tone_indices_arr,
+                            # Constant phase offsets to write once into both buffers
+                            # (None when bins move -> offsets are baked per point instead).
+                            'phase_offsets': tone_phases if write_offsets_once else None,
+                            'phase_offset_tone_indices': tone_indices_arr[0] if write_offsets_once else None,
                             'num_tones':num_tones,
                             'max_tones_per_bin':max_tones_per_bin,
                             'amplitude_scale_factor':amplitude_scale_factor,
@@ -3340,7 +3387,8 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
     print('apply_step, set_buf',step_index,allbuf[step_index])
     set_control_buffer_idx_fast(r_fast,allbuf[step_index])
 
-    force_sync_fast(r_fast,0.00001)
+    if autosync:
+        force_sync_fast(r_fast,0.00001)
 
     # if c1 or c2:
     #     _wait_for_acc(r_fast,0,0.0001)
@@ -3351,12 +3399,6 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
     #                     phase_incs_rx_formatted[step_index],
     #                       ri_steps_tx_formatted[step_index],
     #                         ri_steps_rx_formatted[step_index])
-
-    # if autosync:
-    #     # time.sleep(autosync_time_delay)
-    #     r_fast.sync.arm_sync(wait=False)
-    #     time.sleep(autosync_time_delay)
-    #     r_fast.sync.sw_sync()
 
     return
 
@@ -3639,10 +3681,6 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
         tone_phases=tone_phases)
     apply_tone_frequency_settings(r, tone_frequency_settings, autosync=autosync)
 
-    r.sync.arm_sync(wait=False)
-    time.sleep(0.001)
-    r.sync.sw_sync()
-
     if detailed_output:
         return details
     else:
@@ -3690,7 +3728,7 @@ def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
         tone_phases=tone_phases)
     apply_tone_frequency_settings_fast(r, r_fast, tone_frequency_settings, autosync=autosync)
 
-    return
+    return tone_frequency_settings
 
 # def get_fast_write_params(r, r_fast, config_dict, frequencies):
 
@@ -3890,11 +3928,7 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
     #     r.mixer.write(f'tx_lo{i}_scale', scaling[i::r.mixer._n_parallel_chans].tobytes())
     #     r.mixer.write(f'rx_lo{i}_scale', scaling[i::r.mixer._n_parallel_chans].tobytes())
 
-    # if autosync:
-    #     # time.sleep(autosync_time_delay)
-    #     r.sync.arm_sync(wait=False)
-    #     time.sleep(autosync_time_delay)
-    #     r.sync.sw_sync()
+    _sync_if_requested(r, autosync=autosync)
 
     return
 
@@ -3957,11 +3991,7 @@ def set_tone_phases(r, config_dict, tone_phases, autosync=True):
     # for i in range(min(r.mixer._n_parallel_chans, num_tones)):
     #     r.mixer.write(f'tx_lo{i}_phase_offset', phase_offsets[i::r.mixer._n_parallel_chans].tobytes())
     #     r.mixer.write(f'rx_lo{i}_phase_offset', phase_offsets[i::r.mixer._n_parallel_chans].tobytes())
-    # if autosync:
-    #     # time.sleep(autosync_time_delay)
-    #     r.sync.arm_sync(wait=False)
-    #     time.sleep(autosync_time_delay)
-    #     r.sync.sw_sync()
+    _sync_if_requested(r, autosync=autosync)
     return
 
 
@@ -7808,10 +7838,13 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
         return start_acc_cnt, dout[:2*num_tones], err, tt
 
 
-def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_point, direction):
+def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_point,
+                  direction, autosync=True, setup_sync=True):
     """
     A blocking call to perform a frequency sweep of the RFSOC.
     An asynchronous version of this function is available in the readout_server code.
+    ``autosync`` controls the per-step sync after each sweep buffer flip.
+    ``setup_sync`` controls the one-time sync at the start of the sweep.
 
     """
     centers = np.atleast_1d(centers)
@@ -7855,8 +7888,21 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
         tone_phases=sweep_tone_phases)  # transpose to (num_points, num_tones)
     tone_indices_arr = fast_sweep_params.get('tone_indices')  # shape: (num_points, num_tones)
 
+    # Phase offsets are constant across the sweep: when LO slots are stable,
+    # write them once into both control buffers so per-point writes stay
+    # frequency-only and both buffers share the same phase reference.
+    if fast_sweep_params.get('phase_offsets') is not None:
+        write_phase_offsets_both_buffers_fast(
+            r_fast, fast_sweep_params['phase_offsets'],
+            tone_indices=fast_sweep_params.get('phase_offset_tone_indices'))
+
+    # One-time sync at sweep start establishes the TX/RX phase reference.
+    # Independent of the per-step ``autosync``.
+    if setup_sync:
+        force_sync_fast(r_fast)
+
     for p in range(num_points):
-        apply_sweep_step_fast(r, r_fast, fast_sweep_params, p, autosync=True)
+        apply_sweep_step_fast(r, r_fast, fast_sweep_params, p, autosync=autosync)
 
         # Get tone_indices for this sweep point
         tone_indices_p = tone_indices_arr[p] if tone_indices_arr is not None else np.arange(num_tones)
@@ -7869,7 +7915,7 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
             acc_errs[p,s] = err
 
     set_tone_frequencies_fast(
-        r, r_fast, config_dict, initial_freqs, autosync=True,
+        r, r_fast, config_dict, initial_freqs, autosync=autosync,
         tone_amplitudes=sweep_tone_amplitudes,
         tone_phases=sweep_tone_phases)
 
@@ -7889,12 +7935,15 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
         }
     return results
 
-def perform_retune(r, r_fast,config_dict, centers, spans, points, samples_per_point, direction, method,smooth_len=3,freq_offsets=None):
+def perform_retune(r, r_fast,config_dict, centers, spans, points,
+                   samples_per_point, direction, method, smooth_len=3,
+                   freq_offsets=None, autosync=True, setup_sync=True):
     """
     A blocking call to perform a frequency retune of the RFSOC.
     SImply performs a sweep and then retunes to the frequencies of maximum gradient or minimum magnitude.
     An asynchronous version of this function is available in the readout_server code.
     if freq_offsets is given, it is added to the retune frequencies before setting them.
+    ``autosync`` / ``setup_sync`` are forwarded to :func:`perform_sweep`.
     """
     if freq_offsets is None:
         freq_offsets = np.zeros_like(centers)
@@ -7906,7 +7955,9 @@ def perform_retune(r, r_fast,config_dict, centers, spans, points, samples_per_po
     #results = r.retune(center, span, points, samples_per_point,direction,method)
     if method not in ('max_gradient','min_mag','max_dphidf'):
         raise ValueError(f'Invalid retune method "{method}", must be "max_gradient", "min_mag", or "max_dphidf"')
-    results = perform_sweep(r,r_fast,config_dict,centers, spans, points, samples_per_point, direction)
+    results = perform_sweep(
+        r, r_fast, config_dict, centers, spans, points, samples_per_point,
+        direction, autosync=autosync, setup_sync=setup_sync)
 
     if method == 'max_gradient':
         retune_freqs = np.zeros_like(results['sweep_frequencies'])
@@ -7931,7 +7982,8 @@ def perform_retune(r, r_fast,config_dict, centers, spans, points, samples_per_po
             max_slope = np.argmax(dphidf)
             retune_freqs[t] = freqs[max_slope] + freq_offsets[t]
 
-    set_tone_frequencies_fast(r, r_fast, config_dict, retune_freqs)
+    set_tone_frequencies_fast(
+        r, r_fast, config_dict, retune_freqs, autosync=autosync)
     results['retune_freqs'] = retune_freqs
 
     return results
@@ -8306,6 +8358,7 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
 def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detector',
                     optimise_dynamic_range=False, rf_peripherals=None,
                     rx_policy='protect',
+                    autosync=True,
                     force_tx_amp_bypass=None, force_rx_amp_bypass=None,
                     force_tx_attenuation_db=None,
                     force_rx_attenuation_db=None,
@@ -8354,6 +8407,8 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         - ``'none'`` — do not check or touch the RX path.
 
         See :func:`_apply_rx_policy` for full details.
+    autosync : bool
+        If True, trigger firmware sync after tone-amplitude writes.
 
     Returns
     -------
@@ -8484,7 +8539,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
               f'reference_plane={reference_plane!r}')
         init_amps_max = float(np.max(get_tone_amplitudes(r, config_dict)))
         if not tone_amplitudes_fixed:
-            set_tone_amplitudes(r, config_dict, amps)
+            set_tone_amplitudes(r, config_dict, amps, autosync=autosync)
         new_amps_max = float(np.max(np.abs(amps)))
         if init_amps_max > 0 and new_amps_max > 0:
             amp_change_db = float(20 * np.log10(new_amps_max / init_amps_max))
@@ -8590,7 +8645,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         else:
             r.psbscale.set_scale(0)
             time.sleep(0.01)
-        set_tone_amplitudes(r, config_dict, amps)
+        set_tone_amplitudes(r, config_dict, amps, autosync=autosync)
         time.sleep(0.01)
         print(f'  step 1: maximise digital — amplitudes at max')
 
@@ -8872,7 +8927,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
             cryostat_input_s21_db=cal['cryostat_input_s21_db'],
             dac_fs_bits=cal['dac_fs_bits'])
         final_amps = np.clip(final_amps, 0, max_amp)
-        set_tone_amplitudes(r, config_dict, final_amps)
+        set_tone_amplitudes(r, config_dict, final_amps, autosync=autosync)
         time.sleep(0.01)
 
     # RX policy check for the overall TX power change
