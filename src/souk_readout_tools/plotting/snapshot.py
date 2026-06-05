@@ -32,6 +32,7 @@ def _snapshot_acc_len(snapshot_data, sweep_data):
 def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
                                n_snap, *, repetitions, sweep_data,
                                reference_tone_frequency, smooth_window_hz,
+                               conversion_method, calibrations,
                                deembed, phase_center, units, fig, label,
                                **kwargs):
     """Time-domain fractional frequency/dissipation panel for snapshots."""
@@ -46,7 +47,7 @@ def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
         raise ValueError(
             "deembed/phase_center are not applicable to format='freq_diss'.")
 
-    from .timestream import _compute_freq_diss
+    from .timestream import _compute_freq_diss, _dissipation_axis_label
     acc_len = _snapshot_acc_len(snapshot_data, sweep_data)
     ts_like = {'info': snapshot_data.get('info')}
 
@@ -55,7 +56,9 @@ def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
         return _compute_freq_diss(
             ts_like, tone_index, z.real, z.imag, sweep_data,
             reference_tone_frequency=reference_tone_frequency,
-            smooth_window_hz=smooth_window_hz)
+            smooth_window_hz=smooth_window_hz,
+            conversion_method=conversion_method,
+            calibrations=calibrations)
 
     # Snapshots are pre-accumulation; scale to match summed sweep I/Q.
     if repetitions == 'concatenate':
@@ -85,8 +88,8 @@ def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
         ax1.plot(t, ff, linewidth=0.5, label=trace_label, **kwargs)
         ax2.plot(t, fd, linewidth=0.5, label=trace_label, **kwargs)
 
-    ax1.set_ylabel('Fractional frequency shift')
-    ax2.set_ylabel('Fractional dissipation shift')
+    ax1.set_ylabel('Fractional resonator-frequency motion')
+    ax2.set_ylabel(_dissipation_axis_label(conversion_method))
     ax2.set_xlabel('Time (µs)')
     ax1.legend(fontsize='small')
     ax2.legend(fontsize='small')
@@ -100,7 +103,9 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
                    sweep_data=None, reference_tone_frequency=None,
                    fig=None, label=None,
                    units='raw', config=None, system_info=None,
-                   unwrap_phase=True, smooth_window_hz=1000, **kwargs):
+                   unwrap_phase=True, smooth_window_hz=1000,
+                   conversion_method='linearized', calibrations=None,
+                   **kwargs):
     """
     Plot snapshot data for a single tone.
 
@@ -123,10 +128,12 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             ``snapshot_data['info']['tones']['frequencies_hz'][tone_index]``.
             Pass a scalar to override.
         smooth_window_hz: Smoothing window passed to
-            ``ReadoutClient.calculate_frequency_and_dissipation_noise`` for
-            ``format='freq_diss'``.  The default, ``1000``, preserves the
-            client default.  Pass ``None`` or ``0`` to disable sweep
-            smoothing.
+            the linearized resonator conversion for ``format='freq_diss'``.
+            Pass ``None`` or ``0`` to disable sweep smoothing.
+        conversion_method: ``'linearized'`` (default), ``'mobius'``, or
+            ``'circle'`` for ``format='freq_diss'``.
+        calibrations: Per-tone resonator calibrations or fit results. Required
+            by ``conversion_method='mobius'`` and ``'circle'``.
         fig: Existing figure.
         label: Legend label. If None, uses an auto-incrementing index.
         units: Unit for I/Q normalisation.  One of:
@@ -162,6 +169,8 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             repetitions=repetitions, sweep_data=sweep_data,
             reference_tone_frequency=reference_tone_frequency,
             smooth_window_hz=smooth_window_hz,
+            conversion_method=conversion_method,
+            calibrations=calibrations,
             deembed=deembed, phase_center=phase_center,
             units=units, fig=fig, label=label, **kwargs)
 
@@ -268,7 +277,9 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
                        sweep_data=None, reference_tone_frequency=None,
                        psd_kwargs=None,
                        show_errors=True, fig=None, label=None,
-                       smooth_window_hz=1000, **kwargs):
+                       smooth_window_hz=1000,
+                       conversion_method='linearized', calibrations=None,
+                       **kwargs):
     """
     Plot PSD of snapshot data.
 
@@ -285,10 +296,12 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
             ``snapshot_data['info']['tones']['frequencies_hz'][tone_index]``.
             Pass a scalar to override.
         smooth_window_hz: Smoothing window passed to
-            ``ReadoutClient.calculate_frequency_and_dissipation_noise`` for
-            ``format='freq_diss'``.  The default, ``1000``, preserves the
-            client default.  Pass ``None`` or ``0`` to disable sweep
-            smoothing.
+            the linearized resonator conversion for ``format='freq_diss'``.
+            Pass ``None`` or ``0`` to disable sweep smoothing.
+        conversion_method: ``'linearized'`` (default), ``'mobius'``, or
+            ``'circle'`` for ``format='freq_diss'``.
+        calibrations: Per-tone resonator calibrations or fit results. Required
+            by ``conversion_method='mobius'`` and ``'circle'``.
         psd_kwargs: dict passed to compute_psd().
         show_errors: bool. For 'averaged', show std-dev error bars.
         fig: Existing figure.
@@ -317,7 +330,7 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
         data_bot = np.unwrap(np.angle(snapshots), axis=-1)
         y_top, y_bot = 'Magnitude PSD', 'Phase PSD'
     elif format == 'freq_diss':
-        from .timestream import _compute_freq_diss
+        from .timestream import _compute_freq_diss, _dissipation_axis_label
         # Snapshots are pre-accumulation; sweep I/Q are sums over acc_len
         # samples. Scale up so both are in the same units.
         acc_len = _snapshot_acc_len(snapshot_data, sweep_data)
@@ -330,13 +343,15 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
                 ts_like, tone_index,
                 scaled[i].real, scaled[i].imag, sweep_data,
                 reference_tone_frequency=reference_tone_frequency,
-                smooth_window_hz=smooth_window_hz)
+                smooth_window_hz=smooth_window_hz,
+                conversion_method=conversion_method,
+                calibrations=calibrations)
             frac_f_list.append(ff)
             frac_d_list.append(fd)
         data_top = np.array(frac_f_list)
         data_bot = np.array(frac_d_list)
-        y_top = 'Frequency noise PSD'
-        y_bot = 'Dissipation noise PSD'
+        y_top = 'Resonator-frequency noise PSD'
+        y_bot = _dissipation_axis_label(conversion_method, psd=True)
     else:
         raise ValueError(
             f"Unknown format '{format}'. "

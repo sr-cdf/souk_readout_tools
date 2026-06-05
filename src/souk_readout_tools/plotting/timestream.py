@@ -128,16 +128,19 @@ def _resolve_reference_tone_frequency(ts_data, tone_idx, sweep_f,
 
 
 def _compute_freq_diss(ts_data, tone_key, i_arr, q_arr, sweep_data,
-                       reference_tone_frequency=None, smooth_window_hz=1000):
+                       reference_tone_frequency=None, smooth_window_hz=1000,
+                       conversion_method='linearized', calibrations=None):
     """
     Compute fractional frequency and dissipation from timestream + sweep.
 
-    Uses ReadoutClient.calculate_frequency_and_dissipation_noise as a
-    static method.  ``smooth_window_hz`` is passed through to that method
-    to control the Savitzky-Golay smoothing applied to the sweep gradient
-    estimate.
+    Uses the canonical resonator conversion helpers. ``conversion_method``
+    selects the historical local linear estimate or fitted-model inversion.
     """
-    from souk_readout_tools.client.readout_client import ReadoutClient
+    from ..resonator import (
+        calibration_for_tone,
+        interpolate_complex_trace,
+        linearized_frequency_and_dissipation,
+    )
 
     z_ts = i_arr + 1j * q_arr
     tone_idx = int(tone_key)
@@ -148,10 +151,34 @@ def _compute_freq_diss(ts_data, tone_key, i_arr, q_arr, sweep_data,
     tone_freq = _resolve_reference_tone_frequency(
         ts_data, tone_idx, sweep_f, reference_tone_frequency)
 
-    frac_f, frac_d, *_ = ReadoutClient.calculate_frequency_and_dissipation_noise(
-        sweep_f, sweep_z, tone_freq, z_ts, smooth_window_hz=smooth_window_hz)
+    if conversion_method == 'linearized':
+        frac_f, frac_d = linearized_frequency_and_dissipation(
+            sweep_f, sweep_z, tone_freq, z_ts,
+            smooth_window_hz=smooth_window_hz)
+    elif conversion_method in ('mobius', 'circle'):
+        calibration = calibration_for_tone(calibrations, tone_idx)
+        if calibration is None:
+            raise ValueError(
+                f"conversion_method={conversion_method!r} requires a "
+                f"calibration for tone {tone_idx}")
+        reference_s21 = interpolate_complex_trace(sweep_f, sweep_z, tone_freq)
+        df_hz, frac_d = calibration.convert_referenced_raw_iq(
+            tone_freq, z_ts, reference_s21, method=conversion_method)
+        frac_f = df_hz / tone_freq
+    else:
+        raise ValueError(
+            "conversion_method must be 'linearized', 'mobius', or 'circle'")
 
     return frac_f, frac_d
+
+
+def _dissipation_axis_label(conversion_method, *, psd=False):
+    """Return a label that reflects the selected loss-coordinate convention."""
+    if conversion_method in ('linearized', 'mobius'):
+        label = r'Matched dissipation quadrature $\Delta(1 / 2Q_i)$'
+    else:
+        label = r'Radial loss proxy change $\Delta\rho$'
+    return f'{label} PSD' if psd else label
 
 
 def _apply_transforms(z, deembed, phase_center):
@@ -249,7 +276,8 @@ def _match_y_limits(*axes):
 def _compute_cleaned_freq_diss(
         ts_data, sweep_data, plotted_tones, decorrelate_modes,
         decorrelate_tones, blind_tone_modes, blind_tones,
-        reference_tone_frequency, smooth_window_hz):
+        reference_tone_frequency, smooth_window_hz, conversion_method,
+        calibrations):
     """Return reusable raw rows and sequentially cleaned freq/diss rows."""
     analysis_tones = plotted_tones
     if decorrelate_modes:
@@ -280,6 +308,8 @@ def _compute_cleaned_freq_diss(
         tones=analysis_tones,
         reference_tone_frequency=reference_tone_frequency,
         smooth_window_hz=smooth_window_hz,
+        method=conversion_method,
+        calibrations=calibrations,
     )
     if decorrelate_modes:
         frequency = remove_common_modes_svd(
@@ -310,7 +340,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     fig=None, label=None,
                     units='raw', config=None, reference_plane='adc_input',
                     x_axis='time', unwrap_phase=True,
-                    smooth_window_hz=1000, **kwargs):
+                    smooth_window_hz=1000, conversion_method='linearized',
+                    calibrations=None, **kwargs):
     """
     Plot timestream data in various formats.
 
@@ -342,10 +373,12 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             apply one value to every selected tone, or a ``{tone_idx: hz}``
             dict for per-tone overrides (useful for off-resonance analyses).
         smooth_window_hz: Smoothing window passed to
-            ``ReadoutClient.calculate_frequency_and_dissipation_noise`` for
-            ``format='freq_diss'``.  The default, ``1000``, preserves the
-            client default.  Pass ``None`` or ``0`` to disable sweep
-            smoothing.
+            the linearized resonator conversion for ``format='freq_diss'``.
+            Pass ``None`` or ``0`` to disable sweep smoothing.
+        conversion_method: ``'linearized'`` (default), ``'mobius'``, or
+            ``'circle'`` for ``format='freq_diss'``.
+        calibrations: Per-tone resonator calibrations or fit results. Required
+            by ``conversion_method='mobius'`` and ``'circle'``.
         fig: Existing figure. If None, create new.
         label: Legend label. If None, uses an auto-incrementing index.
         units: Unit for I/Q normalisation.  One of:
@@ -508,11 +541,13 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             frac_f, frac_d = _compute_freq_diss(
                 ts_data, key, i_arr, q_arr, sweep_data,
                 reference_tone_frequency=reference_tone_frequency,
-                smooth_window_hz=smooth_window_hz)
+                smooth_window_hz=smooth_window_hz,
+                conversion_method=conversion_method,
+                calibrations=calibrations)
             ax1.plot(x_values, frac_f, linewidth=0.5, label=trace_label, **kwargs)
             ax2.plot(x_values, frac_d, linewidth=0.5, label=trace_label, **kwargs)
-            ax1.set_ylabel('Fractional frequency shift')
-            ax2.set_ylabel('Fractional dissipation shift')
+            ax1.set_ylabel('Fractional resonator-frequency motion')
+            ax2.set_ylabel(_dissipation_axis_label(conversion_method))
 
         else:
             raise ValueError(
@@ -543,6 +578,8 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                         psd_kwargs=None,
                         precomputed_psd=None, fig=None, label=None,
                         smooth_window_hz=1000, *,
+                        conversion_method='linearized',
+                        calibrations=None,
                         include_dc_point=False,
                         decorrelate_modes=0,
                         decorrelate_plot='overlay',
@@ -566,10 +603,12 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
             for a single override, or a ``{tone_idx: hz}`` dict for per-tone
             overrides.
         smooth_window_hz: Smoothing window passed to
-            ``ReadoutClient.calculate_frequency_and_dissipation_noise`` for
-            ``format='freq_diss'``.  The default, ``1000``, preserves the
-            client default.  Pass ``None`` or ``0`` to disable sweep
-            smoothing.
+            the linearized resonator conversion for ``format='freq_diss'``.
+            Pass ``None`` or ``0`` to disable sweep smoothing.
+        conversion_method: ``'linearized'`` (default), ``'mobius'``, or
+            ``'circle'`` for ``format='freq_diss'``.
+        calibrations: Per-tone resonator calibrations or fit results. Required
+            by ``conversion_method='mobius'`` and ``'circle'``.
         psd_kwargs: dict of kwargs passed to compute_psd().
         precomputed_psd: dict mapping tone_key -> (f_psd, psd_values).
             If provided, skip computation.
@@ -680,6 +719,8 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                 blind_tones,
                 reference_tone_frequency,
                 smooth_window_hz,
+                conversion_method,
+                calibrations,
             )
 
         for key, i_arr, q_arr in selected:
@@ -696,7 +737,9 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                     frac_f, frac_d = _compute_freq_diss(
                         ts_data, key, i_arr, q_arr, sweep_data,
                         reference_tone_frequency=reference_tone_frequency,
-                        smooth_window_hz=smooth_window_hz)
+                        smooth_window_hz=smooth_window_hz,
+                        conversion_method=conversion_method,
+                        calibrations=calibrations)
                 f1, p1 = compute_psd(frac_f, sample_rate, **psd_kw)
                 f2, p2 = compute_psd(frac_d, sample_rate, **psd_kw)
 
@@ -733,8 +776,9 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                 ax2.loglog(
                     f2, p2, linewidth=0.5, label=clean_label, **clean_kwargs)
 
-        ax1.set_ylabel('Frequency noise PSD')
-        ax2.set_ylabel('Dissipation noise PSD')
+        ax1.set_ylabel('Resonator-frequency noise PSD')
+        ax2.set_ylabel(_dissipation_axis_label(
+            conversion_method, psd=True))
         _match_y_limits(ax1, ax2)
 
     else:

@@ -45,9 +45,15 @@ def _raises(fn):
 
 
 def _resonator_z(f, f0, w, scale=1000.0):
-    """Same model the mock uses (for the synthetic sweep)."""
+    """Same model the mock uses (for the synthetic sweep).
+
+    Notch-power magnitude ``sqrt((b + x**2)/(1 + x**2))`` (half-power FWHM = ``w``,
+    so the magnitude linewidth matches the ``-2*arctan`` phase slope ``4/w``, as
+    for a real resonator) times the centred phase factor used by the demod.
+    """
     x = 2.0 * (np.asarray(f, float) - np.asarray(f0, float)) / w
-    return scale * (1.0 - 0.9 / (1.0 + x ** 2)) * np.exp(1j * (-2.0 * np.arctan(x)))
+    mag = np.sqrt((0.01 + x ** 2) / (1.0 + x ** 2))
+    return scale * mag * np.exp(1j * (-2.0 * np.arctan(x)))
 
 
 def make_client(f0, sample_rate=1000.0, linewidth=1.0e5):
@@ -141,6 +147,11 @@ c.enable_modulation()   # resume resident config, no args
 check('resume re-enables', c.get_modulation_state()['enabled'] is True)
 d = c.parse_samples(c.get_samples(12))
 check('resumed stream is tagged again', int(np.max(d['modulation_point'])) >= 1)
+c.enable_stream()
+c.disable_stream()
+check('disable_stream leaves modulation armed', c.get_modulation_state()['enabled'] is True)
+d = c.parse_samples(c.get_samples(12))
+check('get_samples after disable_stream is still modulated', int(np.max(d['modulation_point'])) >= 1)
 
 
 print('7) demod tool: slope / curvature / detuning')
@@ -160,8 +171,24 @@ check('needs_update False when centred', not res_fast['needs_update'][:, 0].any(
 check('fast vs accurate dphi/df agree', np.isclose(np.nanmean(res_acc['dphi_df'][:, 0]), slope, rtol=0.05))
 check('dissipation NaN without calibration', np.isnan(res_fast['dissipation'][:, 0]).all())
 check('grouped z shape (n_cycles, N, n_tones)', grouped['z'].ndim == 3 and grouped['z'].shape[1] == 3)
+check('grouped preserves packet counters per point',
+      grouped['packet_counter'].shape == grouped['z'].shape[:2])
+check('grouped preserves telescope time per point',
+      grouped['telescope_time'].shape == grouped['z'].shape[:2])
+check('grouped preserves stream flags per point',
+      'flag5' in grouped['stream_flags']
+      and grouped['stream_flags']['flag5'].shape == grouped['z'].shape[:2])
+check('demod preserves cycle packet counter',
+      'packet_counter' in res_fast and res_fast['packet_counter'].shape == (grouped['z'].shape[0],))
+check('demod preserves cycle telescope time',
+      'telescope_time' in res_fast and res_fast['telescope_time'].shape == (grouped['z'].shape[0],))
+check('demod preserves cycle stream flags',
+      'stream_flags' in res_fast and 'flag5' in res_fast['stream_flags']
+      and res_fast['stream_flags']['flag5'].shape == (grouped['z'].shape[0],))
 g_axis = mod.group_cycles(d, state, reduce=None)
 check('reduce=None retains sample axis', g_axis['z'].ndim == 4)
+check('reduce=None metadata retains sample axis',
+      g_axis['packet_counter'].shape == g_axis['z'].shape[:3])
 
 # Two-point pattern -> curvature/detuning are NaN.
 c.enable_modulation(center=F0, offsets=[-1e3, 1e3], samples_per_point=8, n_settle=2)
@@ -213,14 +240,27 @@ fr_true = np.array([2.0e9, 2.1e9]); Qi, Qc, phi_c, a, alpha, tau = 8e4, 4e4, 0.0
 sweep_f9 = np.stack([np.linspace(f - 5e5, f + 5e5, 401) for f in fr_true], axis=1)
 sweep_z9 = np.stack([fitting.s21_model(sweep_f9[:, t], fr_true[t], Qi, Qc, phi_c, a, alpha, tau)
                      for t in range(len(fr_true))], axis=1)
-sweep9 = {'f': sweep_f9, 'z': sweep_z9}
-# The package does not fit: the user fits first and passes the results.
+sweep9 = {'sweep_f': sweep_f9, 'sweep_i': sweep_z9.real, 'sweep_q': sweep_z9.imag}
+# The package does not fit: the user runs the standard batch fitter first and
+# passes its FitResults. Reverse them to verify their saved tone_index is used.
 check('deembed=True without fits raises', _raises(lambda: mod.params_from_sweep(sweep9, deembed=True)))
-fitlist = [fitting.fit_resonance(sweep_f9[:, t], sweep_z9[:, t]) for t in range(len(fr_true))]
+fitlist = list(reversed(fitting.batch_fit(sweep9, verbose=False)))
 cfg9 = mod.params_from_sweep(sweep9, n_points=3, samples_per_point=6, n_settle=2,
                              delta_linewidths=0.2, deembed=True, fits=fitlist)
-check('calibration built from supplied fits', set(cfg9['calibration'].keys()) == {0, 1})
+check('calibration built from batch fits by tone index', set(cfg9['calibration'].keys()) == {0, 1})
 check('fitted centre ~ true fr', np.allclose(cfg9['center'], fr_true, atol=2e3))
+check('deembed=False with fits raises',
+      _raises(lambda: mod.params_from_sweep(sweep9, deembed=False, fits=fitlist)))
+cfg_blind = mod.params_from_sweep(
+    {**sweep9, 'info': {'tones': {'blind_indices': [1]}}},
+    n_points=3, fits=fitlist)
+check('parsed blind metadata excludes tone from modulation', cfg_blind['mod_indices'] == [0])
+check('parsed blind metadata excludes tone calibration', set(cfg_blind['calibration']) == {0})
+cfg_regular = mod.params_from_sweep(
+    {**sweep9, 'tone_metadata': {'blind_indices': [], 'regular_indices': [0]}},
+    n_points=3, fits=fitlist)
+check('regular metadata fallback excludes tone from modulation', cfg_regular['mod_indices'] == [0])
+check('regular metadata fallback excludes tone calibration', set(cfg_regular['calibration']) == {0})
 
 # Reuse: pass ResonatorCalibration objects back instead of FitResults.
 cfg_reuse = mod.params_from_sweep(sweep9, n_points=3, samples_per_point=6, n_settle=2,
@@ -238,16 +278,17 @@ def make_grouped(carrier):
         zc[0, :, t] = fitting.s21_model(fh[:, t], fr_true[t], Qi, Qc, phi_c, a, alpha, tau)
     return {'z': zc, 'offsets_hz': off, 'freq_hz': fh, 'revision': np.array([cfg9.get('revision', 1)])}
 
-# Carrier on resonance -> centred frequency offset ~ 0, dissipation finite.
+# Carrier on fitted resonance -> centred frequency offset ~ 0, dissipation finite.
 res_on = mod.demodulate(make_grouped(fr_true), calibration=cfg9['calibration'])
 lw9 = np.array([cfg9['calibration'][t].fr / cfg9['calibration'][t].Ql for t in range(2)])
-check('centred: freq_shift ~0 on resonance', np.all(np.abs(res_on['freq_shift_hz'][0]) < 0.05 * lw9))
+check('centred: asymmetric fit zeroes freq_shift at fr',
+      np.all(np.abs(res_on['freq_shift_hz'][0]) < 1e-6 * lw9))
 check('centred: dissipation finite (calibration present)', np.all(np.isfinite(res_on['dissipation'][0])))
 check('centred: detuning needs no external linewidth', np.all(np.isfinite(res_on['detuning_linewidths'][0])))
 # Carrier detuned by +0.3 linewidths -> freq_shift ~ +0.3 lw, needs_update trips.
 res_off = mod.demodulate(make_grouped(fr_true + 0.3 * lw9), calibration=cfg9['calibration'])
 check('centred: detuning tracks carrier offset (sign+scale)',
-      np.all(res_off['detuning_linewidths'][0] > 0.15) and np.all(res_off['detuning_linewidths'][0] < 0.45))
+      np.allclose(res_off['detuning_linewidths'][0], 0.3, atol=1e-5))
 check('centred: needs_update trips when detuned', res_off['needs_update'][0].all())
 print(cfg9['summary'])
 
@@ -261,8 +302,11 @@ state = c.get_modulation_state()
 def drop_packets(d, sl):
     """Return a copy of a parsed data_dict with samples ``sl`` removed (a gap)."""
     dd = dict(d)
-    for key in ('modulation_point', 'modulation_settling', 'modulation_revision', 'packet_counter'):
+    for key in ('modulation_point', 'modulation_settling', 'modulation_revision',
+                'packet_counter', 'telescope_time', 'packet_error'):
         dd[key] = np.delete(np.asarray(d[key]), sl)
+    dd['stream_flags'] = {
+        k: np.delete(np.asarray(v), sl) for k, v in d['stream_flags'].items()}
     dd['i_data'] = {k: np.delete(v, sl) for k, v in d['i_data'].items()}
     dd['q_data'] = {k: np.delete(v, sl) for k, v in d['q_data'].items()}
     return dd
@@ -277,6 +321,7 @@ g_clean = mod.group_cycles(d_clean, state)
 g_fill = mod.group_cycles(d_gap, state, on_missing='fill')
 check('notify drops corrupted cycles (no NaNs)', not np.isnan(g_notify['z']).any())
 check('fill inserts NaN placeholders', np.isnan(g_fill['z']).any())
+check('fill marks missing packets in metadata', np.any(g_fill['packet_missing']))
 check('fill recovers >= as many cycles as notify', g_fill['z'].shape[0] >= g_notify['z'].shape[0])
 check('fill restores the clean cycle count', g_fill['z'].shape[0] == g_clean['z'].shape[0])
 check('bad on_missing raises', _raises(lambda: mod.group_cycles(d_gap, state, on_missing='bogus')))

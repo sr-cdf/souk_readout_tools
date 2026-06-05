@@ -124,6 +124,7 @@ def _format_request_log(message):
             'reference_plane',
             'optimise_dynamic_range',
             'rx_policy',
+            'autosync',
         ):
             if key in message:
                 fields.append((key, message[key]))
@@ -140,13 +141,15 @@ def _format_request_log(message):
         'get_samples': ('num_samples', 'burst'),
         'get_accumulator_snapshots': ('tone_index', 'num_snapshots', 'fast'),
         'batch_accumulator_snapshots': ('tone_indices', 'num_snapshots'),
-        'sweep': ('centers', 'spans', 'points', 'samples_per_point', 'direction'),
+        'sweep': ('centers', 'spans', 'points', 'samples_per_point',
+                  'direction', 'autosync', 'setup_sync'),
         'retune': (
             'centers', 'spans', 'points', 'samples_per_point',
-            'direction', 'method'),
+            'direction', 'method', 'autosync', 'setup_sync'),
         'refresh_adc_cal': ('adc_cal_settle_time',),
-        'enable_modulation': ('mod_indices', 'samples_per_point', 'n_settle'),
-        'update_modulation': ('on_map_change',),
+        'enable_modulation': ('mod_indices', 'samples_per_point', 'n_settle', 'autosync', 'setup_sync'),
+        'update_modulation': ('on_map_change', 'autosync'),
+        'recenter_modulation': ('autosync',),
     }
     fields = [
         (key, message[key])
@@ -487,9 +490,10 @@ class ModulationScheduler:
     The firmware has exactly two LO control buffers. To change every tone's
     frequency without disturbing the point currently being accumulated, we
     write the *next* point's words into the **inactive** buffer, then flip the
-    active-buffer index and pulse sync. The just-vacated buffer is then free to
-    receive the following point during the current point's dwell, so for N > 2
-    the per-visit buffer write is hidden under the accumulation window.
+    active-buffer index and optionally pulse sync. The just-vacated buffer is
+    then free to receive the following point during the current point's dwell,
+    so for N > 2 the per-visit buffer write is hidden under the accumulation
+    window.
 
     Why not reuse ``apply_sweep_step_fast``: its buffer assignment is by point
     parity (0,1,0,1,...), which is only safe for a single forward traversal (a
@@ -499,8 +503,8 @@ class ModulationScheduler:
     writes the inactive one.
 
     N=2 fast path: points 1 and 2 live permanently in buffers 0 and 1 and never
-    collide, so after arming each visit is just a buffer-index flip + sync with
-    **no** per-visit buffer write. This falls out naturally from the
+    collide, so after arming each visit is just a buffer-index flip + optional
+    sync with **no** per-visit buffer write. This falls out naturally from the
     "skip the write if the inactive buffer already holds the wanted point" rule.
 
     Channel maps are applied **once** at arm and never touched afterwards — the
@@ -520,15 +524,25 @@ class ModulationScheduler:
         Number of leading samples per point flagged as settling/transient.
     revision : int
         Configuration revision stamped into each emitted frame's tag.
+    autosync : bool, optional
+        Whether each per-step buffer flip should pulse firmware sync. Defaults
+        to ``True``.
+    setup_sync : bool, optional
+        Whether to pulse one firmware sync at :meth:`arm` to establish the TX/RX
+        phase reference before any buffer flips. Defaults to ``True``.
+        Independent of ``autosync``.
     """
 
-    def __init__(self, r_fast, bundle, samples_per_point, n_settle, revision):
+    def __init__(self, r_fast, bundle, samples_per_point, n_settle, revision,
+                 autosync=True, setup_sync=True):
         self.r_fast = r_fast
         self.bundle = bundle
         self.N = int(bundle['num_points'])
         self.samples_per_point = int(samples_per_point)
         self.n_settle = int(n_settle)
         self.revision = int(revision)
+        self.autosync = bool(autosync)        # per-step sync after each buffer flip
+        self.setup_sync = bool(setup_sync)    # one sync at arm to establish the TX/RX phase reference
         # Bookkeeping: which modulation point currently lives in each buffer, and
         # which buffer/point is live. ``None`` = unknown/empty.
         self._buf_holds = {0: None, 1: None}
@@ -554,23 +568,38 @@ class ModulationScheduler:
         sample is **point 1** (index 0), already live.
 
         Writes the chanmaps once, loads point 0 into buffer 0 and makes it
-        active (index flip + sync), then pre-loads point 1 into buffer 1 ready
-        for the first swap. Safe to call again to re-arm after a pause/update.
+        active (index flip + optional sync), then pre-loads point 1 into buffer
+        1 ready for the first swap. Safe to call again to re-arm after a
+        pause/update.
         """
         # Channel maps: written once here, never in the hot loop.
         firmware_lib.psb_chanselect_set_channel_inmap(self.r_fast, self.bundle['chanmap_psb_inmap'])
         firmware_lib.chanselect_set_channel_outmap(self.r_fast, self.bundle['chanmap_pfb'])
+        # Phase offsets don't change across points, so write them once into BOTH
+        # buffers here (never in the per-point hot loop). This keeps the two
+        # ping-pong buffers' phase reference identical, so a buffer flip changes
+        # only the frequency, not the absolute phase. Armed bins are fixed, so
+        # the tone LO slots never move during a run.
+        phase_offsets = self.bundle.get('phase_offsets')
+        if phase_offsets is not None:
+            firmware_lib.write_phase_offsets_both_buffers_fast(
+                self.r_fast, phase_offsets, tone_indices=self.bundle['tone_indices'])
         # Point 0 -> buffer 0, make it the live buffer.
         self._write_point(0, 0)
         firmware_lib.set_control_buffer_idx_fast(self.r_fast, 0)
-        firmware_lib.force_sync_fast(self.r_fast)
+        # One-time sync at arm establishes the TX/RX phase reference. This is
+        # independent of the per-step (``autosync``) sync: with setup_sync=True,
+        # autosync=False the LO is aligned once here and then rides continuous
+        # accumulation across buffer flips with no per-step sync.
+        if self.setup_sync:
+            firmware_lib.force_sync_fast(self.r_fast)
         self._active_buf = 0
         self._active_point = 0
         # Pre-load the next point into the inactive buffer (nothing to do for N=1).
         if self.N > 1:
             self._write_point(1, 1 % self.N)
 
-    def install_bundle(self, bundle, revision, samples_per_point, n_settle):
+    def install_bundle(self, bundle, revision, samples_per_point, n_settle, autosync=None):
         """
         Swap in a new per-point control bundle **without re-arming** — used for a
         seamless live update whose channel maps are unchanged.
@@ -585,6 +614,8 @@ class ModulationScheduler:
             Updated dwell (samples per point per cycle).
         n_settle : int
             Updated settling-sample count per point.
+        autosync : bool or None
+            Updated sync mode. ``None`` preserves the current setting.
 
         Buffer bookkeeping is invalidated so each subsequent :meth:`advance`
         re-writes the inactive buffer with the new words; the live buffer picks up
@@ -595,6 +626,8 @@ class ModulationScheduler:
         self.revision = int(revision)
         self.samples_per_point = int(samples_per_point)
         self.n_settle = int(n_settle)
+        if autosync is not None:
+            self.autosync = bool(autosync)
         self._buf_holds = {0: None, 1: None}
         if self._active_point >= self.N:
             self._active_point = 0
@@ -606,7 +639,7 @@ class ModulationScheduler:
     def advance(self):
         """
         Step to the next modulation point: flip to the buffer already holding it
-        (index flip + sync), then pre-load the *following* point into the now
+        (index flip + optional sync), then pre-load the *following* point into the now
         inactive buffer during this point's dwell.
 
         For N <= 2 the pre-load is skipped whenever the inactive buffer already
@@ -621,9 +654,10 @@ class ModulationScheduler:
         # write if not (e.g. immediately after arming, or after a re-arm).
         if self._buf_holds[inactive] != nxt:
             self._write_point(inactive, nxt)
-        # Flip live buffer to the one holding ``nxt`` and latch with a sync.
+        # Flip live buffer to the one holding ``nxt`` and optionally latch with a sync.
         firmware_lib.set_control_buffer_idx_fast(self.r_fast, inactive)
-        firmware_lib.force_sync_fast(self.r_fast)
+        if self.autosync:
+            firmware_lib.force_sync_fast(self.r_fast)
         self._active_buf = inactive
         self._active_point = nxt
         # Pre-load the following point into the freshly-vacated buffer (hidden
@@ -762,13 +796,15 @@ class ReadoutServer:
         self.modulation_sched = None                  # ModulationScheduler owning the two control buffers
         self._pending_modulation = None               # latest-wins command applied by the frame producer at a cycle boundary
         self._modulation_owner = None                 # acquisition-owner lock: 'stream' | 'samples' | None
+        self._modulation_command_epoch = 0            # invalidates stale in-flight prepare jobs
         self._modulation_revision = 0
-        self._modulation_revision_history = {}        # revision -> {center, offsets, mod_indices, ts}
+        self._modulation_revision_history = {}        # revision -> {center, offsets, mod_indices, autosync, ts}
 
         #firmware interface attributes
         self.r = None
         self.r_fast = None
         self.active_tone_indices = None
+        self._tone_state_cache = None              # user-order freqs/amps/phases last applied by this server
         self.latest_sweep_results = {}
         self.latest_sweep_data_valid = False
         self.sweep_progress = 0.0
@@ -952,13 +988,15 @@ class ReadoutServer:
         self.modulation_sched = None                  # ModulationScheduler owning the two control buffers
         self._pending_modulation = None               # latest-wins command applied by the frame producer at a cycle boundary
         self._modulation_owner = None                 # acquisition-owner lock: 'stream' | 'samples' | None
+        self._modulation_command_epoch = 0            # invalidates stale in-flight prepare jobs
         self._modulation_revision = 0
-        self._modulation_revision_history = {}        # revision -> {center, offsets, mod_indices, ts}
+        self._modulation_revision_history = {}        # revision -> {center, offsets, mod_indices, autosync, ts}
 
         #firmware interface attributes
         self.r = None
         self.r_fast = None
         self.active_tone_indices = None
+        self._tone_state_cache = None              # user-order freqs/amps/phases last applied by this server
         self.latest_sweep_results = {}
         self.latest_sweep_data_valid = False
         self.sweep_progress = 0.0
@@ -1185,6 +1223,9 @@ class ReadoutServer:
         self.config_file = config_file
         with open(config_file, 'r') as file:
             self.config_raw_text = file.read()
+        if hasattr(self, '_tone_state_cache'):
+            self._tone_state_cache = None
+            self._seed_tone_state_cache_from_config()
 
         return config
 
@@ -1504,7 +1545,7 @@ class ReadoutServer:
             self.r, self.config, rf_peripherals=self.rf_peripherals)
         # Compact modulation hint so a get_info('tones') caller sees the state
         # without the full per-tone detail (which lives in 'tone_modulation').
-        state = self.modulation_state
+        state = self._current_modulation_info_state()
         try:
             info['modulation'] = {
                 'enabled': bool(self.e_modulation_enabled.is_set()),
@@ -1519,19 +1560,38 @@ class ReadoutServer:
         Return the cached fast-frequency-modulation state for
         ``get_info('tone_modulation')``.
 
-        This is a pure read of ``self.modulation_state`` (assembled by
-        :meth:`_build_modulation_state` when a config was prepared) — it performs
-        **no hardware access**, so a client can poll it without perturbing the
-        streaming hot loop. ``enabled`` is refreshed from the live event so it
-        always reflects the current armed/paused state. Returns a minimal
-        ``{'enabled': False, ...}`` stub when modulation has never been armed.
+        This is a pure read of the applied or pending modulation state — it
+        performs **no hardware access**, so a client can poll it without
+        perturbing the streaming hot loop. ``enabled`` is refreshed from the live
+        event so it always reflects the current armed/paused state. Returns a
+        minimal ``{'enabled': False, ...}`` stub when modulation has never been
+        armed.
         """
-        state = self.modulation_state
+        state = self._current_modulation_info_state()
         if state is None:
             return {'enabled': False, 'num_points': 0, 'tones': []}
         # Reflect the live armed flag (state snapshot may predate a pause/resume).
         state['enabled'] = bool(self.e_modulation_enabled.is_set())
         return state
+
+    def _current_modulation_info_state(self):
+        """
+        Return a copy of the best modulation state to expose through ``get_info``.
+
+        A freshly accepted ``enable_modulation`` / ``update_modulation`` command
+        may be pending until the next frame producer starts. Surface that pending
+        state so clients can see the armed configuration before the first
+        streamed/captured frame applies it to hardware.
+        """
+        cmd = self._pending_modulation
+        if cmd is not None and cmd.get('op') in ('enable', 'update', 'recenter'):
+            state = copy.deepcopy(cmd.get('state'))
+            if isinstance(state, dict):
+                state['pending_op'] = cmd.get('op')
+                return state
+        if self.modulation_state is None:
+            return None
+        return copy.deepcopy(self.modulation_state)
 
     def _info_rf_frontend(self):
         rf = getattr(self, 'rf_peripherals', None)
@@ -1875,6 +1935,7 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'set_blind_tones':
+                    self._begin_exclusive_frequency_operation('set_blind_tones')
                     self.stream_flags[FLAG_SET_FREQS].set()
                     self.stream_flags[FLAG_SET_AMPS].set()
                     self.stream_flags[FLAG_SET_PHASES].set()
@@ -1889,7 +1950,8 @@ class ReadoutServer:
                             reference_plane=message.get('reference_plane', 'detector'),
                             optimise_dynamic_range=message.get(
                                 'optimise_dynamic_range', False),
-                            rx_policy=message.get('rx_policy', 'protect'))
+                            rx_policy=message.get('rx_policy', 'protect'),
+                            autosync=message.get('autosync', True))
                     finally:
                         self.stream_flags[FLAG_SET_PHASES].clear()
                         self.stream_flags[FLAG_SET_AMPS].clear()
@@ -1898,10 +1960,12 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'remove_blind_tones':
+                    self._begin_exclusive_frequency_operation('remove_blind_tones')
                     self.stream_flags[FLAG_SET_FREQS].set()
                     await asyncio.sleep(0)
                     try:
-                        result = self.remove_blind_tones()
+                        result = self.remove_blind_tones(
+                            autosync=message.get('autosync', True))
                     finally:
                         self.stream_flags[FLAG_SET_FREQS].clear()
                     await asyncio.sleep(0)
@@ -1982,44 +2046,71 @@ class ReadoutServer:
                 elif request == 'set':
                     param_name = message.get('param')
                     param_value = message.get('value')
+                    autosync = message.get('autosync', True)
                     response = {'status': 'error', 'message': f'Invalid parameter name {param_name}'}
                     if param_name == 'sample_rate_hz':
                         firmware_lib.set_sample_rate(self.r, param_value)
                         response = {'status': 'success'}
                     
                     elif param_name == 'tone_frequencies':
+                        self._begin_exclusive_frequency_operation('set_tone_frequencies')
                         self.stream_flags[FLAG_SET_FREQS].set()
                         await asyncio.sleep(0)
                         param_value = self._expand_frequencies_for_blind(param_value)
-                        firmware_lib.set_tone_frequencies_fast(self.r, self.r_fast, self.config, param_value)
-                        self.update_active_tone_indices()
+                        param_value = np.asarray(param_value, dtype=float)
+                        amps = self._tone_value_fallback(len(param_value), 'amplitudes', 1.0)
+                        phases = self._tone_value_fallback(len(param_value), 'phases', 0.0)
+                        tone_settings = firmware_lib.set_tone_frequencies_fast(
+                            self.r, self.r_fast, self.config, param_value,
+                            tone_amplitudes=amps, tone_phases=phases,
+                            autosync=autosync)
+                        self._set_tone_state_cache(param_value, amps, phases)
+                        self._invalidate_modulation('tone frequencies changed')
+                        self._set_active_tone_indices_from_settings(tone_settings)
                         self.stream_flags[FLAG_SET_FREQS].clear()
                         await asyncio.sleep(0)
                         response = {'status': 'success'}
                     
                     elif param_name == 'tone_amplitudes':
+                        self._begin_exclusive_frequency_operation('set_tone_amplitudes')
                         self.stream_flags[FLAG_SET_AMPS].set()
                         await asyncio.sleep(0)
                         param_value = self._expand_values_for_blind(
                             param_value, firmware_lib.get_tone_amplitudes,
                             plan_values_key='amplitudes', default_value=1.0)
-                        firmware_lib.set_tone_amplitudes(self.r, self.config, param_value)
+                        firmware_lib.set_tone_amplitudes(
+                            self.r, self.config, param_value, autosync=autosync)
+                        if self._tone_state_cache is not None:
+                            self._set_tone_state_cache(
+                                self._tone_state_cache['frequencies'],
+                                amplitudes=param_value,
+                                phases=self._tone_state_cache['phases'])
+                        self._invalidate_modulation('tone amplitudes changed')
                         self.stream_flags[FLAG_SET_AMPS].clear()
                         await asyncio.sleep(0)
                         response = {'status': 'success'}
                     
                     elif param_name == 'tone_phases':
+                        self._begin_exclusive_frequency_operation('set_tone_phases')
                         self.stream_flags[FLAG_SET_PHASES].set()
                         await asyncio.sleep(0)
                         param_value = self._expand_values_for_blind(
                             param_value, firmware_lib.get_tone_phases,
                             plan_values_key='phases', default_value=0.0)
-                        firmware_lib.set_tone_phases(self.r, self.config, param_value)
+                        firmware_lib.set_tone_phases(
+                            self.r, self.config, param_value, autosync=autosync)
+                        if self._tone_state_cache is not None:
+                            self._set_tone_state_cache(
+                                self._tone_state_cache['frequencies'],
+                                amplitudes=self._tone_state_cache['amplitudes'],
+                                phases=param_value)
+                        self._invalidate_modulation('tone phases changed')
                         self.stream_flags[FLAG_SET_PHASES].clear()
                         await asyncio.sleep(0)
                         response = {'status': 'success'}
 
                     elif param_name == 'tone_powers':
+                        self._begin_exclusive_frequency_operation('set_tone_powers')
                         self.stream_flags[FLAG_SET_AMPS].set()
                         await asyncio.sleep(0)
                         ref_plane = message.get('reference_plane', 'detector')
@@ -2036,8 +2127,17 @@ class ReadoutServer:
                             optimise_dynamic_range=opt_dr,
                             rf_peripherals=self.rf_peripherals,
                             rx_policy=rx_pol,
+                            autosync=autosync,
                             **{k: message[k] for k in firmware_lib.POWER_FORCE_CONTROL_KEYS
                                if k in message})
+                        if self._tone_state_cache is not None and result is not None:
+                            amps = result.get('amplitudes')
+                            if amps is not None and len(amps) == len(self._tone_state_cache['frequencies']):
+                                self._set_tone_state_cache(
+                                    self._tone_state_cache['frequencies'],
+                                    amplitudes=amps,
+                                    phases=self._tone_state_cache['phases'])
+                        self._invalidate_modulation('tone powers changed')
                         self.stream_flags[FLAG_SET_AMPS].clear()
                         await asyncio.sleep(0)
                         response = {'status': 'success', 'result': result}
@@ -2095,6 +2195,8 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'disable_stream':
+                    if self.e_modulation_enabled.is_set():
+                        self._pending_modulation = {'op': 'rest'}
                     self.e_stream_enabled.clear()
                     await self.send_response(writer, {'status': 'success'})
 
@@ -2103,22 +2205,44 @@ class ReadoutServer:
                     # continuous output (call enable_stream) and does NOT itself
                     # capture (call get_samples). Heavy prep runs off the hot path.
                     try:
+                        if self.e_stream_enabled.is_set():
+                            raise ValueError(
+                                'disable_stream before enable_modulation; initial modulation '
+                                'arming reloads channel maps/control buffers and cannot be done '
+                                'on top of a running continuous stream')
+                        requested_autosync = message.get('autosync', None)
+                        requested_setup_sync = message.get('setup_sync', None)
                         if (message.get('offsets') is None and message.get('center') is None
                                 and self.modulation_cfg is not None):
                             c = self.modulation_cfg          # resume a resident config
                             center, offsets = c['center'], c['offsets']
                             mod_indices = c['mod_indices']
                             spp, n_settle = c['samples_per_point'], c['n_settle']
+                            autosync = (
+                                c.get('autosync', True) if requested_autosync is None
+                                else bool(requested_autosync))
+                            setup_sync = (
+                                c.get('setup_sync', True) if requested_setup_sync is None
+                                else bool(requested_setup_sync))
                         else:
                             center = message.get('center')
                             offsets = message.get('offsets')
                             mod_indices = message.get('mod_indices')
                             spp = int(message.get('samples_per_point', 1))
                             n_settle = int(message.get('n_settle', 1))
+                            autosync = True if requested_autosync is None else bool(requested_autosync)
+                            setup_sync = True if requested_setup_sync is None else bool(requested_setup_sync)
                             if offsets is None:
                                 raise ValueError('offsets required to arm modulation')
+                        epoch = self._next_modulation_command_epoch()
                         bundle, state, cfg = await self.to_thread(
-                            self._prepare_modulation, center, offsets, mod_indices, spp, n_settle)
+                            self._prepare_modulation, center, offsets, mod_indices, spp, n_settle,
+                            autosync=autosync, setup_sync=setup_sync)
+                        self._check_modulation_command_epoch(epoch)
+                        if bundle['needs_recenter']:
+                            raise ValueError(
+                                'modulation offsets push at least one tone beyond fixed-bin coverage; '
+                                'reduce offsets or use a sweep/cross-bin method')
                         rev = self._next_modulation_revision(cfg)
                         state['enabled'] = True
                         state['desired_revision'] = rev
@@ -2144,10 +2268,18 @@ class ReadoutServer:
                         center = message.get('center', c['center'])
                         offsets = message.get('offsets', c['offsets'])
                         on_map_change = message.get('on_map_change', 'continue')
+                        requested_autosync = message.get('autosync', None)
+                        autosync = (
+                            c.get('autosync', True) if requested_autosync is None
+                            else bool(requested_autosync))
+                        setup_sync = c.get('setup_sync', True)
                         armed = self.modulation_params['armed']
+                        epoch = self._next_modulation_command_epoch()
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_modulation, center, offsets, c['mod_indices'],
-                            c['samples_per_point'], c['n_settle'], armed)
+                            c['samples_per_point'], c['n_settle'],
+                            armed=armed, autosync=autosync, setup_sync=setup_sync)
+                        self._check_modulation_command_epoch(epoch)
                         if bundle['needs_recenter'] and on_map_change != 'recenter':
                             await self.send_response(writer, {'status': 'error',
                                 'message': 'update would push tones beyond bin coverage; '
@@ -2158,7 +2290,9 @@ class ReadoutServer:
                                 # recenter: re-arm with fresh bins/maps for the new centre
                                 bundle, state, cfg = await self.to_thread(
                                     self._prepare_modulation, center, offsets, c['mod_indices'],
-                                    c['samples_per_point'], c['n_settle'])
+                                    c['samples_per_point'], c['n_settle'],
+                                    autosync=autosync, setup_sync=setup_sync)
+                                self._check_modulation_command_epoch(epoch)
                                 op = 'recenter'
                             else:
                                 op = 'update'
@@ -2181,9 +2315,17 @@ class ReadoutServer:
                         if self.modulation_cfg is None:
                             raise ValueError('modulation not armed; call enable_modulation first')
                         c = self.modulation_cfg
+                        requested_autosync = message.get('autosync', None)
+                        autosync = (
+                            c.get('autosync', True) if requested_autosync is None
+                            else bool(requested_autosync))
+                        setup_sync = c.get('setup_sync', True)
+                        epoch = self._next_modulation_command_epoch()
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_modulation, c['center'], c['offsets'],
-                            c['mod_indices'], c['samples_per_point'], c['n_settle'])
+                            c['mod_indices'], c['samples_per_point'], c['n_settle'],
+                            autosync=autosync, setup_sync=setup_sync)
+                        self._check_modulation_command_epoch(epoch)
                         rev = self._next_modulation_revision(cfg)
                         state['enabled'] = True
                         state['desired_revision'] = rev
@@ -2198,6 +2340,7 @@ class ReadoutServer:
                 elif request == 'disable_modulation':
                     # Pause modulation; tones rest at their centres. Bundle stays
                     # resident so enable_modulation() with no args re-arms quickly.
+                    self._next_modulation_command_epoch()
                     self.e_modulation_enabled.clear()
                     self._pending_modulation = {'op': 'disable'}
                     if not self.e_stream_enabled.is_set():
@@ -2511,23 +2654,34 @@ class ReadoutServer:
 
                 elif request == 'sweep':
                     if self.sweep_task is None or self.sweep_task.done():
-                        centers = message.get('centers')
-                        spans = message.get('spans')
-                        points = message.get('points')
-                        samples_per_point = message.get('samples_per_point')
-                        direction = message.get('direction')
-                        refresh_adc_cal = message.get('refresh_adc_cal', True)
-                        adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
-                        self.latest_sweep_data_valid = False
-                        self.sweep_progress = 0.0
-                        self.sweep_state = {'state': 'running', 'message': 'Sweep in progress'}
-                        #print('asyncio create task, sweep task')
-                        self.sweep_task = asyncio.create_task(
-                            self.sweep(centers, spans, points, samples_per_point, direction, refresh_adc_cal=refresh_adc_cal, adc_cal_settle_time=adc_cal_settle_time)
-                        )
+                        try:
+                            self._begin_exclusive_frequency_operation('sweep')
+                            centers = message.get('centers')
+                            spans = message.get('spans')
+                            points = message.get('points')
+                            samples_per_point = message.get('samples_per_point')
+                            direction = message.get('direction')
+                            refresh_adc_cal = message.get('refresh_adc_cal', True)
+                            adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
+                            autosync = message.get('autosync', True)
+                            setup_sync = message.get('setup_sync', True)
+                            self.latest_sweep_data_valid = False
+                            self.sweep_progress = 0.0
+                            self.sweep_state = {'state': 'running', 'message': 'Sweep in progress'}
+                            #print('asyncio create task, sweep task')
+                            self.sweep_task = asyncio.create_task(
+                                self.sweep(centers, spans, points, samples_per_point,
+                                           direction, refresh_adc_cal=refresh_adc_cal,
+                                           adc_cal_settle_time=adc_cal_settle_time,
+                                           autosync=autosync, setup_sync=setup_sync)
+                            )
 
-                        #print('await send response')
-                        await self.send_response(writer, {'status': 'success', 'message': 'Sweep in progress'})
+                            #print('await send response')
+                            await self.send_response(writer, {'status': 'success', 'message': 'Sweep in progress'})
+                        except Exception as e:
+                            self.sweep_progress = 1.0
+                            self.sweep_state = {'state': 'error', 'message': str(e)}
+                            await self.send_response(writer, {'status': 'error', 'message': str(e)})
                     else:
                         await self.send_response(writer, {'status': 'error', 'message': 'Sweep already in progress'})
                 
@@ -2620,22 +2774,35 @@ class ReadoutServer:
 
                 elif request == 'retune':
                     if self.sweep_task is None or self.sweep_task.done():
-                        centers = message.get('centers')
-                        spans = message.get('spans')
-                        points = message.get('points')
-                        samples_per_point = message.get('samples_per_point')
-                        direction = message.get('direction')
-                        method = message.get('method')
-                        freq_offsets = message.get('freq_offsets', None)
-                        refresh_adc_cal = message.get('refresh_adc_cal', True)
-                        adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
-                        self.latest_sweep_data_valid = False
-                        self.sweep_progress = 0.0
-                        self.sweep_state = {'state': 'running', 'message': 'Retune in progress'}
-                        self.sweep_task = asyncio.create_task(
-                            self.retune(centers, spans, points, samples_per_point, direction, method, freq_offsets, refresh_adc_cal=refresh_adc_cal, adc_cal_settle_time=adc_cal_settle_time)
-                        )
-                        await self.send_response(writer, {'status': 'success', 'message': 'Retune in progress'})
+                        try:
+                            self._begin_exclusive_frequency_operation('retune')
+                            centers = message.get('centers')
+                            spans = message.get('spans')
+                            points = message.get('points')
+                            samples_per_point = message.get('samples_per_point')
+                            direction = message.get('direction')
+                            method = message.get('method')
+                            freq_offsets = message.get('freq_offsets', None)
+                            refresh_adc_cal = message.get('refresh_adc_cal', True)
+                            adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
+                            autosync = message.get('autosync', True)
+                            setup_sync = message.get('setup_sync', True)
+                            self.latest_sweep_data_valid = False
+                            self.sweep_progress = 0.0
+                            self.sweep_state = {'state': 'running', 'message': 'Retune in progress'}
+                            self.sweep_task = asyncio.create_task(
+                                self.retune(centers, spans, points,
+                                            samples_per_point, direction, method,
+                                            freq_offsets,
+                                            refresh_adc_cal=refresh_adc_cal,
+                                            adc_cal_settle_time=adc_cal_settle_time,
+                                            autosync=autosync, setup_sync=setup_sync)
+                            )
+                            await self.send_response(writer, {'status': 'success', 'message': 'Retune in progress'})
+                        except Exception as e:
+                            self.sweep_progress = 1.0
+                            self.sweep_state = {'state': 'error', 'message': str(e)}
+                            await self.send_response(writer, {'status': 'error', 'message': str(e)})
                     else:
                         await self.send_response(writer, {'status': 'error', 'message': 'Sweep or retune already in progress'})
 
@@ -2674,6 +2841,7 @@ class ReadoutServer:
         except asyncio.IncompleteReadError:
             print(f"request client disconnected unexpectedly: {addr} (IncompleteReadError)")
         except Exception as e:
+            self.stream_flags[FLAG_SERVER_REQUEST].clear()
             print(f"Error handling request client {addr}: {e}")
             print(traceback.format_exc())
             await self.send_response(writer, {'status': 'error', 'message': f'Error handling request: {e}'})
@@ -2741,6 +2909,60 @@ class ReadoutServer:
     def _tone_defaults(self):
         return self.config.setdefault('firmware', {}).setdefault('defaults', {})
 
+    def _tone_value_fallback(self, n_values, key, default_value):
+        """Return cached/configured per-tone values without touching hardware."""
+        if self._tone_state_cache is not None:
+            cached = self._tone_state_cache.get(key)
+            if cached is not None and len(cached) == n_values:
+                return np.asarray(cached, dtype=float).copy()
+
+        plan = self._tone_plan()
+        values = plan.get(key)
+        if values is not None and len(values) == n_values:
+            return np.asarray(values, dtype=float).copy()
+
+        return np.full(n_values, default_value, dtype=float)
+
+    def _set_tone_state_cache(self, frequencies, amplitudes=None, phases=None,
+                              metadata=None):
+        """
+        Remember the user-order tone state last applied by request-level code.
+
+        Fast modulation preparation must not depend on slow KATCP reads of the
+        current maps/control buffer.  Most server requests already know the comb
+        they are applying, so keep that as the authoritative request-side state.
+        """
+        freqs = np.asarray(frequencies, dtype=float).copy()
+        n_tones = len(freqs)
+        amps = (self._tone_value_fallback(n_tones, 'amplitudes', 1.0)
+                if amplitudes is None else np.asarray(amplitudes, dtype=float).copy())
+        phases = (self._tone_value_fallback(n_tones, 'phases', 0.0)
+                  if phases is None else np.asarray(phases, dtype=float).copy())
+        if len(amps) != n_tones:
+            raise ValueError(
+                f'amplitude cache length ({len(amps)}) must match tone count ({n_tones})')
+        if len(phases) != n_tones:
+            raise ValueError(
+                f'phase cache length ({len(phases)}) must match tone count ({n_tones})')
+        if metadata is None:
+            metadata = firmware_lib.get_configured_tone_metadata(
+                self.config, active_count=n_tones)
+        self._tone_state_cache = {
+            'frequencies': freqs,
+            'amplitudes': amps,
+            'phases': phases,
+            'metadata': copy.deepcopy(metadata),
+            'updated_unix_s': time.time(),
+        }
+        return freqs, amps, phases, metadata
+
+    def _seed_tone_state_cache_from_config(self):
+        """Initialise the tone cache from config defaults if they define a comb."""
+        plan = self._tone_plan()
+        if plan['num_tones'] > 0:
+            self._set_tone_state_cache(
+                plan['frequencies'], plan['amplitudes'], plan['phases'])
+
     @staticmethod
     def _normalise_interactive_values(values, n_values, name,
                                       default_values=None,
@@ -2762,7 +2984,43 @@ class ReadoutServer:
             f'Number of {name} values ({len(values)}) must match number of '
             f'blind tones ({n_values})')
 
-    def _live_tone_state(self):
+    def _live_tone_state(self, center=None, prefer_cache=False):
+        """
+        Return user-order frequencies/amplitudes/phases plus tone metadata.
+
+        ``center`` is already a complete user-order comb, so using it avoids a
+        slow and failure-prone KATCP read during modulation preparation.  When no
+        centre is provided, prefer the server-side cache/config plan and only
+        fall back to hardware reads if no request-level state exists.
+        """
+        if center is not None:
+            freqs = np.asarray(center, dtype=float).copy()
+            n_tones = len(freqs)
+            metadata = firmware_lib.get_configured_tone_metadata(
+                self.config, active_count=n_tones)
+            amps = self._tone_value_fallback(n_tones, 'amplitudes', 1.0)
+            phases = self._tone_value_fallback(n_tones, 'phases', 0.0)
+            return freqs, amps, phases, metadata
+
+        if self._tone_state_cache is not None:
+            cache = self._tone_state_cache
+            return (
+                np.asarray(cache['frequencies'], dtype=float).copy(),
+                np.asarray(cache['amplitudes'], dtype=float).copy(),
+                np.asarray(cache['phases'], dtype=float).copy(),
+                copy.deepcopy(cache['metadata']),
+            )
+
+        plan = self._tone_plan()
+        if prefer_cache or plan['num_tones'] > 0:
+            freqs = np.asarray(plan['frequencies'], dtype=float).copy()
+            metadata = firmware_lib.get_configured_tone_metadata(
+                self.config, active_count=len(freqs))
+            amps = self._tone_value_fallback(len(freqs), 'amplitudes', 1.0)
+            phases = self._tone_value_fallback(len(freqs), 'phases', 0.0)
+            self._set_tone_state_cache(freqs, amps, phases, metadata)
+            return freqs, amps, phases, metadata
+
         freqs = np.asarray(
             firmware_lib.get_tone_frequencies(self.r, self.config),
             dtype=float)
@@ -2774,7 +3032,7 @@ class ReadoutServer:
             dtype=float)
         metadata = firmware_lib.get_configured_tone_metadata(
             self.config, active_count=len(freqs))
-        return freqs, amps, phases, metadata
+        return self._set_tone_state_cache(freqs, amps, phases, metadata)
 
     def _tone_config_snapshot(self):
         defaults = self._tone_defaults()
@@ -2850,7 +3108,8 @@ class ReadoutServer:
                         spans=None, powers_dbm=None,
                         reference_plane='detector',
                         optimise_dynamic_range=False,
-                        rx_policy='protect'):
+                        rx_policy='protect',
+                        autosync=True):
         """Append blind tones to the active comb and apply to firmware.
 
         ``frequencies`` are the blind-tone frequencies (Hz); ``amplitudes``,
@@ -2862,7 +3121,7 @@ class ReadoutServer:
         """
         blind_freqs = np.atleast_1d(frequencies).astype(float)
         if len(blind_freqs) == 0:
-            return self.remove_blind_tones()
+            return self.remove_blind_tones(autosync=autosync)
 
         freqs, amps, current_phases, metadata = self._live_tone_state()
         regular_indices = metadata['regular_indices']
@@ -2913,10 +3172,13 @@ class ReadoutServer:
         combined_freqs = np.concatenate([regular_freqs, blind_freqs])
         combined_amps = np.concatenate([regular_amps, blind_amps])
         combined_phases = np.concatenate([regular_phases, blind_phases])
-        firmware_lib.set_tone_frequencies_fast(
+        tone_settings = firmware_lib.set_tone_frequencies_fast(
             self.r, self.r_fast, self.config, combined_freqs,
-            tone_amplitudes=combined_amps, tone_phases=combined_phases)
-        self.update_active_tone_indices()
+            tone_amplitudes=combined_amps, tone_phases=combined_phases,
+            autosync=autosync)
+        self._set_tone_state_cache(combined_freqs, combined_amps, combined_phases)
+        self._invalidate_modulation('blind tones changed')
+        self._set_active_tone_indices_from_settings(tone_settings)
 
         if powers_dbm is not None:
             blind_powers = self._normalise_interactive_values(
@@ -2928,7 +3190,8 @@ class ReadoutServer:
                 reference_plane=reference_plane,
                 optimise_dynamic_range=optimise_dynamic_range,
                 rf_peripherals=self.rf_peripherals,
-                rx_policy=rx_policy)
+                rx_policy=rx_policy,
+                autosync=autosync)
             # Capture the amplitude result after calibrated power setting.
             final_amps = firmware_lib.get_tone_amplitudes(self.r, self.config)
             defaults = self._tone_defaults()
@@ -2936,10 +3199,11 @@ class ReadoutServer:
                 final_amps[:len(regular_freqs)], dtype=float).tolist()
             defaults['blind_amplitudes'] = np.asarray(
                 final_amps[len(regular_freqs):], dtype=float).tolist()
+            self._set_tone_state_cache(combined_freqs, final_amps, combined_phases)
 
         return self.get_blind_tones(reference_plane=reference_plane)
 
-    def remove_blind_tones(self):
+    def remove_blind_tones(self, autosync=True):
         freqs, amps, phases, metadata = self._live_tone_state()
         regular_indices = metadata['regular_indices']
         regular_freqs = freqs[regular_indices]
@@ -2949,14 +3213,19 @@ class ReadoutServer:
             regular_freqs, regular_amps, regular_phases,
             [], blind_amps=[], blind_phases=[], blind_spans=[])
         if len(regular_freqs) > 0:
-            firmware_lib.set_tone_frequencies_fast(
+            tone_settings = firmware_lib.set_tone_frequencies_fast(
                 self.r, self.r_fast, self.config, regular_freqs,
                 tone_amplitudes=regular_amps,
-                tone_phases=regular_phases)
+                tone_phases=regular_phases,
+                autosync=autosync)
+            self._set_tone_state_cache(regular_freqs, regular_amps, regular_phases)
         else:
-            firmware_lib.set_tone_frequencies_fast(
-                self.r, self.r_fast, self.config, [])
-        self.update_active_tone_indices()
+            tone_settings = firmware_lib.set_tone_frequencies_fast(
+                self.r, self.r_fast, self.config, [],
+                tone_amplitudes=[], tone_phases=[], autosync=autosync)
+            self._set_tone_state_cache([], [], [])
+        self._invalidate_modulation('blind tones removed')
+        self._set_active_tone_indices_from_settings(tone_settings)
         return self.get_blind_tones()
 
     def _expand_frequencies_for_blind(self, frequencies):
@@ -3060,6 +3329,13 @@ class ReadoutServer:
             print(f"Warning: could not update active tone indices: {e}")
             self.active_tone_indices = None
 
+    def _set_active_tone_indices_from_settings(self, tone_settings):
+        """Refresh active_tone_indices from a fast-prepared settings bundle."""
+        if isinstance(tone_settings, dict) and 'tone_indices' in tone_settings:
+            self.active_tone_indices = np.asarray(tone_settings['tone_indices'])
+            return True
+        return False
+
     def prepare_frame(self, fast_read_params, mod_point=0, settling=False, revision=0):
         """
         Prepare a frame for sending to a client.
@@ -3134,16 +3410,49 @@ class ReadoutServer:
         burst : bool, optional
             Single-burst transfer. Incompatible with modulation (rejected).
         """
-        modulating = self.e_modulation_enabled.is_set() and self.modulation_params is not None
         try:
+            pending_op = None
+            if self._pending_modulation is not None:
+                pending_op = self._pending_modulation.get('op')
+            modulating = (
+                self.e_modulation_enabled.is_set()
+                and (self.modulation_params is not None
+                     or pending_op in ('enable', 'update', 'recenter'))
+            )
+
+            if modulating and self.e_stream_enabled.is_set():
+                t0 = time.time()
+                while self.e_stream_enabled.is_set():
+                    if time.time() - t0 > 2.0:
+                        raise ValueError('continuous streaming is active; disable_stream before a '
+                                         'modulated get_samples capture')
+                    await asyncio.sleep(0.01)
+
+            if modulating and self._modulation_owner == 'stream':
+                t0 = time.time()
+                while self._modulation_owner == 'stream':
+                    if time.time() - t0 > 2.0:
+                        raise TimeoutError(
+                            'timed out waiting for continuous modulation stream to stop')
+                    await asyncio.sleep(0.01)
+
+            if (self._pending_modulation is not None
+                    and self._pending_modulation.get('op') in ('disable', 'rest')):
+                self._apply_pending_modulation_command()
+            elif (self.e_modulation_enabled.is_set()
+                    and self._pending_modulation is not None
+                    and self._pending_modulation.get('op') in ('enable', 'update', 'recenter')):
+                # A finite capture is a frame producer, so it must apply a
+                # pending arm/update before deciding whether to emit tagged
+                # modulation frames.
+                self._apply_pending_modulation_command()
+
+            modulating = self.e_modulation_enabled.is_set() and self.modulation_params is not None
             if modulating:
                 # Single hardware-write owner: refuse to step while the continuous
                 # streamer is running, and refuse burst (it cannot interleave steps).
                 if burst:
                     raise ValueError('burst=True is not supported while modulation is armed')
-                if self.e_stream_enabled.is_set():
-                    raise ValueError('continuous streaming is active; disable_stream before a '
-                                     'modulated get_samples capture')
                 self._modulation_owner = 'samples'
 
             fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
@@ -3282,7 +3591,8 @@ class ReadoutServer:
             await writer.wait_closed()
 
     def _prepare_modulation(self, center, offsets, mod_indices,
-                            samples_per_point, n_settle, armed=None):
+                            samples_per_point, n_settle, armed=None,
+                            autosync=True, setup_sync=True):
         """
         Build a modulation bundle + observability state from a centre comb and
         per-point probe offsets. Pure computation (hardware *reads* only, no
@@ -3307,6 +3617,11 @@ class ReadoutServer:
         armed : dict or None
             Existing armed bins/maps to reuse for a live update (ride the same
             fixed maps). ``None`` arms fresh bins from ``center``.
+        autosync : bool, optional
+            Whether modulation buffer flips should pulse firmware sync.
+        setup_sync : bool, optional
+            Whether to pulse one firmware sync when arming fresh channel maps /
+            buffers before per-point stepping starts.
 
         Returns
         -------
@@ -3315,7 +3630,7 @@ class ReadoutServer:
             ``state`` the ``get_info('tone_modulation')`` payload (static parts);
             ``cfg`` the resolved configuration (center/offsets/mod_indices/dwell).
         """
-        freqs, amps, phases, metadata = self._live_tone_state()
+        freqs, amps, phases, metadata = self._live_tone_state(center=center)
         n_tones = len(freqs)
         regular = list(metadata.get('regular_indices', list(range(n_tones))))
         blind = set(int(b) for b in metadata.get('blind_indices', []))
@@ -3352,11 +3667,12 @@ class ReadoutServer:
                 f'len(mod_indices)={len(mod_indices)}')
 
         bundle = firmware_lib.prepare_modulation_settings_fast(
-            self.r, self.config, center, point_offsets,
+            self.r_fast, self.config, center, point_offsets,
             tone_amplitudes=amps, tone_phases=phases, armed=armed)
 
         cfg = {'center': center, 'offsets': offsets, 'mod_indices': mod_indices,
-               'samples_per_point': int(samples_per_point), 'n_settle': int(n_settle)}
+               'samples_per_point': int(samples_per_point), 'n_settle': int(n_settle),
+               'autosync': bool(autosync), 'setup_sync': bool(setup_sync)}
         state = self._build_modulation_state(bundle, cfg)
         return bundle, state, cfg
 
@@ -3373,7 +3689,8 @@ class ReadoutServer:
         bundle : dict
             Output of :func:`firmware_lib.prepare_modulation_settings_fast`.
         cfg : dict
-            Resolved config (center/offsets/mod_indices/samples_per_point/n_settle).
+            Resolved config
+            (center/offsets/mod_indices/samples_per_point/n_settle/autosync/setup_sync).
         """
         mod_indices = cfg['mod_indices']
         occupancy = bundle['occupancy']
@@ -3382,12 +3699,10 @@ class ReadoutServer:
         n_tones = int(bundle['num_tones'])
         num_points = int(bundle['num_points'])
 
-        # Annotate the internal firmware/VACC index for reference (never used as API).
-        try:
-            firmware_idx = firmware_lib.get_tone_frequencies(
-                self.r, self.config, detailed_output=True)[1]['rx']['tone_indices']
-        except Exception:
-            firmware_idx = bundle['tone_indices']
+        # Annotate the internal firmware/VACC index for reference (never used as
+        # API). The modulation bundle already owns these indices; do not perform
+        # a slow live chanmap read while preparing request-side observability.
+        firmware_idx = bundle['tone_indices']
 
         # Full per-tone offset matrix for reporting.
         off = np.atleast_2d(np.asarray(cfg['offsets'], dtype=float))
@@ -3421,6 +3736,7 @@ class ReadoutServer:
             'num_points': num_points,
             'samples_per_point': int(cfg['samples_per_point']),
             'n_settle': int(cfg['n_settle']),
+            'autosync': bool(cfg.get('autosync', True)),
             'mod_indices': list(mod_indices),
             'sample_rate_hz': sample_rate,
             'cycle_rate_hz': cycle_rate,
@@ -3443,9 +3759,19 @@ class ReadoutServer:
             'center': np.asarray(cfg['center'], dtype=float).tolist(),
             'offsets': np.asarray(cfg['offsets'], dtype=float).tolist(),
             'mod_indices': list(cfg['mod_indices']),
+            'autosync': bool(cfg.get('autosync', True)),
             'ts': time.time(),
         }
         return rev
+
+    def _next_modulation_command_epoch(self):
+        """Bump the request epoch used to discard stale prepared commands."""
+        self._modulation_command_epoch += 1
+        return self._modulation_command_epoch
+
+    def _check_modulation_command_epoch(self, epoch):
+        if epoch != self._modulation_command_epoch:
+            raise RuntimeError('modulation command superseded by a newer request')
 
     def _invalidate_modulation(self, reason=''):
         """
@@ -3459,12 +3785,42 @@ class ReadoutServer:
         if (self.modulation_params is not None or self.e_modulation_enabled.is_set()
                 or self._pending_modulation is not None):
             print(f'Modulation invalidated{": " + reason if reason else ""}; re-arm with enable_modulation.')
+        self._next_modulation_command_epoch()
         self.e_modulation_enabled.clear()
         self.modulation_params = None
         self.modulation_cfg = None
         self.modulation_state = None
         self.modulation_sched = None
         self._pending_modulation = None
+
+    def _modulation_frequency_owner_reason(self):
+        """Return why modulation currently owns/could write tone frequencies."""
+        if self._pending_modulation is not None:
+            op = self._pending_modulation.get('op', 'unknown')
+            return f'pending modulation command ({op})'
+        if self._modulation_owner is not None:
+            return f'modulation frame producer active ({self._modulation_owner})'
+        if self.e_modulation_enabled.is_set():
+            return 'modulation enabled'
+        return None
+
+    def _begin_exclusive_frequency_operation(self, operation):
+        """
+        Ensure ``operation`` can own tone-frequency writes exclusively.
+
+        Sweep/retune and fast modulation both mutate channel maps/control
+        buffers. Running them together corrupts both products, so reject active
+        modulation and invalidate only paused resident modulation configs.
+        """
+        reason = self._modulation_frequency_owner_reason()
+        if reason is not None:
+            raise RuntimeError(
+                f'{operation} cannot run while fast frequency modulation is active '
+                f'({reason}); call disable_modulation and wait for it to finish '
+                f'before starting {operation}')
+        if (self.modulation_params is not None or self.modulation_cfg is not None
+                or self.modulation_state is not None or self.modulation_sched is not None):
+            self._invalidate_modulation(f'{operation} started')
 
     def _write_to_stream_clients(self, payload):
         """
@@ -3497,8 +3853,9 @@ class ReadoutServer:
         Recognised ``op`` values on ``self._pending_modulation``:
         ``'enable'`` / ``'recenter'`` — (re)arm with a fresh scheduler (applies
         the channel maps); ``'update'`` — swap new per-point words into the
-        running scheduler in place (maps unchanged, seamless); ``'disable'`` —
-        rest the tones at their centres and clear the armed flag.
+        running scheduler in place (maps unchanged, seamless); ``'rest'`` —
+        rest the tones at their centres but keep modulation armed for the next
+        frame producer; ``'disable'`` — rest and clear the armed flag.
         """
         cmd = self._pending_modulation
         if cmd is None:
@@ -3506,32 +3863,52 @@ class ReadoutServer:
         self._pending_modulation = None
         op = cmd['op']
         try:
-            if op == 'disable':
-                self.e_modulation_enabled.clear()
+            if op in ('disable', 'rest'):
+                if op == 'disable':
+                    self.e_modulation_enabled.clear()
                 # Rest the tones at their centre frequencies (re-snaps to nearest bins).
                 if self.modulation_cfg is not None:
-                    firmware_lib.set_tone_frequencies_fast(
+                    autosync = bool(self.modulation_cfg.get('autosync', True))
+                    center = np.asarray(self.modulation_cfg['center'], dtype=float)
+                    amps = self._tone_value_fallback(len(center), 'amplitudes', 1.0)
+                    phases = self._tone_value_fallback(len(center), 'phases', 0.0)
+                    tone_indices = None
+                    if self.modulation_params is not None:
+                        tone_indices = self.modulation_params.get('tone_indices')
+                    tone_settings = firmware_lib.set_tone_frequencies_fast(
                         self.r, self.r_fast, self.config,
-                        np.asarray(self.modulation_cfg['center'], dtype=float),
-                        autosync=True)
-                    self.update_active_tone_indices()
+                        center, tone_indices=tone_indices, autosync=autosync,
+                        tone_amplitudes=amps, tone_phases=phases)
+                    self._set_tone_state_cache(center, amps, phases)
+                    self._set_active_tone_indices_from_settings(tone_settings)
                 if self.modulation_state is not None:
-                    self.modulation_state['enabled'] = False
+                    self.modulation_state['enabled'] = self.e_modulation_enabled.is_set()
+                self._modulation_owner = None
                 return
 
             self.modulation_params = cmd['bundle']
             self.modulation_cfg = cmd['cfg']
             self.modulation_state = cmd['state']
+            center = np.asarray(cmd['cfg']['center'], dtype=float)
+            self._set_tone_state_cache(
+                center,
+                self._tone_value_fallback(len(center), 'amplitudes', 1.0),
+                self._tone_value_fallback(len(center), 'phases', 0.0))
             spp = int(cmd['cfg']['samples_per_point'])
             n_settle = int(cmd['cfg']['n_settle'])
+            autosync = bool(cmd['cfg'].get('autosync', True))
+            setup_sync = bool(cmd['cfg'].get('setup_sync', True))
             if op == 'update' and self.modulation_sched is not None:
                 # Same channel maps: swap words in place, no re-arm, no map write.
-                self.modulation_sched.install_bundle(cmd['bundle'], cmd['revision'], spp, n_settle)
+                self.modulation_sched.install_bundle(
+                    cmd['bundle'], cmd['revision'], spp, n_settle, autosync=autosync)
             else:
                 # enable / recenter: build a fresh scheduler and arm (applies maps).
                 self.modulation_sched = ModulationScheduler(
-                    self.r_fast, cmd['bundle'], spp, n_settle, cmd['revision'])
+                    self.r_fast, cmd['bundle'], spp, n_settle, cmd['revision'],
+                    autosync=autosync, setup_sync=setup_sync)
                 self.modulation_sched.arm()
+                self.active_tone_indices = np.asarray(cmd['bundle']['tone_indices'])
             # Record which revision actually landed (vs the desired one in state).
             self.modulation_state['applied_revision'] = cmd['revision']
         except Exception as e:
@@ -3552,6 +3929,15 @@ class ReadoutServer:
         while True:
             try:
                 if not self.e_stream_enabled.is_set():
+                    # ``disable_stream`` can stop the frame producer while a
+                    # modulation cycle is active. Apply the queued rest-at-centre
+                    # command once the cycle has yielded back to the top of this
+                    # loop, but do not apply queued enable/update commands while
+                    # idle: arming modulation should not touch hardware until a
+                    # frame producer starts.
+                    if (self._pending_modulation is not None
+                            and self._pending_modulation.get('op') in ('disable', 'rest')):
+                        self._apply_pending_modulation_command()
                     await asyncio.sleep(0.1)  # idle
                     continue
 
@@ -3646,7 +4032,9 @@ class ReadoutServer:
                 print(traceback.format_exc())
                 await asyncio.sleep(0.1)
 
-    async def sweep(self, centers, spans, points, samples_per_point, direction, refresh_adc_cal=True, adc_cal_settle_time=2.0):
+    async def sweep(self, centers, spans, points, samples_per_point, direction,
+                    refresh_adc_cal=True, adc_cal_settle_time=2.0,
+                    autosync=True, setup_sync=True):
         """
         A coroutine that performs a frequency sweep and stores the results in self.latest_sweep_data.
 
@@ -3671,6 +4059,7 @@ class ReadoutServer:
 
         try:
 
+            self._begin_exclusive_frequency_operation('sweep')
             self.latest_sweep_data_valid = False
             self.sweep_progress = 0.0
 
@@ -3683,7 +4072,8 @@ class ReadoutServer:
             # after the sweep, the tones should be set back to their original frequencies.
             # unless the number of tones has changed, or the tones were not within the span of the sweep.
             # in which case they should be set to the center frequencies.
-            initial_freqs = firmware_lib.get_tone_frequencies(self.r, self.config)
+            initial_freqs, sweep_tone_amplitudes, sweep_tone_phases, _ = (
+                self._live_tone_state())
             if len(initial_freqs)!=len(centers):
                 initial_freqs = centers
             for i in range(len(centers)):
@@ -3695,21 +4085,18 @@ class ReadoutServer:
                 plan = self._tone_plan()
                 initial_freqs[metadata['blind_indices']] = plan['blind_frequencies']
 
-            print('Setting initial tone frequencies')
-            firmware_lib.set_tone_frequencies_fast(self.r,self.r_fast,self.config,centers,autosync=True)
-            try:
-                sweep_tone_amplitudes = firmware_lib.get_tone_amplitudes(
-                    self.r, self.config)
-                sweep_tone_phases = firmware_lib.get_tone_phases(
-                    self.r, self.config)
-            except Exception as e:
-                print(f'Warning: could not preserve sweep tone amplitudes/phases: {e}')
-                sweep_tone_amplitudes = None
-                sweep_tone_phases = None
             if sweep_tone_amplitudes is not None and len(sweep_tone_amplitudes) != len(centers):
                 sweep_tone_amplitudes = None
             if sweep_tone_phases is not None and len(sweep_tone_phases) != len(centers):
                 sweep_tone_phases = None
+
+            print('Setting initial tone frequencies')
+            tone_settings = firmware_lib.set_tone_frequencies_fast(
+                self.r,self.r_fast,self.config,centers,autosync=autosync,
+                tone_amplitudes=sweep_tone_amplitudes,
+                tone_phases=sweep_tone_phases)
+            self._set_tone_state_cache(centers, sweep_tone_amplitudes, sweep_tone_phases)
+            self._set_active_tone_indices_from_settings(tone_settings)
 
             # ADC calibration: always frozen before sweep, left frozen after
             # Note: uses inline set_cal_freeze rather than firmware_lib.refresh_adc_cal()
@@ -3778,7 +4165,23 @@ class ReadoutServer:
             # Get tone_indices array - shape (num_points, num_tones)
             # These may change at each sweep point as tones cross FFT bin boundaries
             tone_indices_arr = fast_sweep_params.get('tone_indices')
-            
+
+            # Phase offsets are constant across the sweep: when LO slots are
+            # stable, write them once into both control buffers so per-point
+            # writes stay frequency-only and both buffers share the same phase
+            # reference.
+            if fast_sweep_params.get('phase_offsets') is not None:
+                firmware_lib.write_phase_offsets_both_buffers_fast(
+                    self.r_fast, fast_sweep_params['phase_offsets'],
+                    tone_indices=fast_sweep_params.get('phase_offset_tone_indices'))
+
+            # One-time sync at sweep start establishes the TX/RX phase reference.
+            # Independent of the per-step ``autosync``: with setup_sync=True,
+            # autosync=False the LO is aligned once here and then rides continuous
+            # accumulation across the per-step buffer flips with no per-step sync.
+            if setup_sync:
+                firmware_lib.force_sync_fast(self.r_fast)
+
             print('Starting sweep')
             acc_counts = np.zeros((samples_per_point,num_points),dtype=int)
             sweep_data = np.zeros((samples_per_point,num_points,num_tones),dtype=complex)
@@ -3813,7 +4216,7 @@ class ReadoutServer:
                                                    self.r_fast,
                                                    fast_sweep_params,
                                                    p,
-                                                   autosync=True)
+                                                   autosync=autosync)
                 
                 # must wait for everything to settle.
                 # two acc is enough at 500 samps/sec
@@ -3839,12 +4242,13 @@ class ReadoutServer:
                 await asyncio.sleep(0.0001)
 
             # print('reset initial freqs:',initial_freqs)
-            firmware_lib.set_tone_frequencies_fast(
+            tone_settings = firmware_lib.set_tone_frequencies_fast(
                 self.r, self.r_fast, self.config, initial_freqs,
-                autosync=True,
+                autosync=autosync,
                 tone_amplitudes=sweep_tone_amplitudes,
                 tone_phases=sweep_tone_phases)
-            self.update_active_tone_indices()
+            self._set_tone_state_cache(initial_freqs, sweep_tone_amplitudes, sweep_tone_phases)
+            self._set_active_tone_indices_from_settings(tone_settings)
 
             if init_psb_scale is not None:
                 self.r.psbscale.set_scale(init_psb_scale)
@@ -3878,12 +4282,13 @@ class ReadoutServer:
 
         except asyncio.CancelledError:
             print('ayncio sweep cancelled')
-            firmware_lib.set_tone_frequencies_fast(
+            tone_settings = firmware_lib.set_tone_frequencies_fast(
                 self.r, self.r_fast, self.config, initial_freqs,
-                autosync=True,
+                autosync=autosync,
                 tone_amplitudes=sweep_tone_amplitudes,
                 tone_phases=sweep_tone_phases)
-            self.update_active_tone_indices()
+            self._set_tone_state_cache(initial_freqs, sweep_tone_amplitudes, sweep_tone_phases)
+            self._set_active_tone_indices_from_settings(tone_settings)
             if init_psb_scale is not None:
                 self.r.psbscale.set_scale(init_psb_scale)
                 init_psb_scale = None
@@ -3914,7 +4319,9 @@ class ReadoutServer:
                 except Exception as e:
                     print(f'Warning: could not restore psb_scale={init_psb_scale}: {e}')
 
-    async def retune(self, center, span, points, samples_per_point, direction, method,freq_offsets=None, refresh_adc_cal=True, adc_cal_settle_time=2.0):
+    async def retune(self, center, span, points, samples_per_point, direction,
+                     method, freq_offsets=None, refresh_adc_cal=True,
+                     adc_cal_settle_time=2.0, autosync=True, setup_sync=True):
         """
         A coroutine that performs a frequency sweep, finds the resonance peaks using the specified method, and sets the tones to the peak frequencies.
 
@@ -3955,7 +4362,11 @@ class ReadoutServer:
             if method not in ('max_gradient','min_mag','max_dphidf'):
                 raise ValueError(f'Invalid retune method "{method}", must be "max_gradient", "min_mag", or "max_dphidf"')
 
-            sweep_ok = await self.sweep(center, span, points, samples_per_point, direction, refresh_adc_cal=refresh_adc_cal, adc_cal_settle_time=adc_cal_settle_time)
+            sweep_ok = await self.sweep(
+                center, span, points, samples_per_point, direction,
+                refresh_adc_cal=refresh_adc_cal,
+                adc_cal_settle_time=adc_cal_settle_time,
+                autosync=autosync, setup_sync=setup_sync)
             if not sweep_ok:
                 if self.sweep_state.get('state') not in ('cancelled', 'error'):
                     self.sweep_progress = float(1.0)
@@ -4002,8 +4413,14 @@ class ReadoutServer:
 
             print('Retune freqs = found freqs + freq offsets = ',retune_freqs)
 
-            firmware_lib.set_tone_frequencies_fast(self.r,self.r_fast,self.config,retune_freqs)
-            self.update_active_tone_indices()
+            amps = self._tone_value_fallback(len(retune_freqs), 'amplitudes', 1.0)
+            phases = self._tone_value_fallback(len(retune_freqs), 'phases', 0.0)
+            tone_settings = firmware_lib.set_tone_frequencies_fast(
+                self.r,self.r_fast,self.config,retune_freqs,
+                tone_amplitudes=amps, tone_phases=phases,
+                autosync=autosync)
+            self._set_tone_state_cache(retune_freqs, amps, phases)
+            self._set_active_tone_indices_from_settings(tone_settings)
             self.sweep_progress = 1.0
             self.sweep_state = {'state': 'success', 'message': 'Retune complete'}
             # print('New frequencies:',firmware_lib.get_tone_frequencies(self.r,self.config))
