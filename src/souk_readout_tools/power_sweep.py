@@ -3680,7 +3680,7 @@ def find_best_power(
         return []
     tones = sorted({int(row["tone_index"]) for row in rows})
     param_valid_ranges = _normalise_param_valid_ranges(param_valid_ranges)
-    return [
+    best_rows = [
         _find_best_power_for_tone(
             tone,
             [r for r in rows if int(r["tone_index"]) == tone],
@@ -3698,6 +3698,69 @@ def find_best_power(
         )
         for tone in tones
     ]
+    # Repair at the source: replace negative (extrapolated) chosen_params with the
+    # cross-tone median so every consumer of these rows gets physical values.
+    _repair_negative_chosen_params(best_rows)
+    return best_rows
+
+
+def _repair_negative_chosen_params(rows, *, label="find_best_power"):
+    """Replace unphysical negative ``chosen_params`` values with a cross-tone median.
+
+    ``find_best_power`` interpolates each fit-summary field against power and
+    linearly extrapolates past the measured range (:func:`_linear_interp_extrap`),
+    which can drive a positive-but-decreasing quantity (e.g. a linewidth or Q)
+    negative at a chosen power outside the swept range. For each physically
+    non-negative key (:data:`_NONNEGATIVE_PARAM_KEYS`) this replaces any negative
+    entry with the median of the valid (finite, positive) values across all
+    ``rows`` (or ``NaN`` if none exist), repairing ``chosen_params`` **in place**.
+    Signed quantities (skew, nonlinear detuning, phases) are left untouched.
+
+    Parameters
+    ----------
+    rows : list of dict
+        Best-power rows, each with a ``chosen_params`` dict.
+    label : str, optional
+        Prefix for the warning emitted when any value is replaced.
+
+    Returns
+    -------
+    dict
+        ``{key: n_replaced}`` for the keys whose negatives were repaired.
+    """
+    # Cross-tone median of the valid (finite, positive) values for each key.
+    medians = {}
+    for key in _NONNEGATIVE_PARAM_KEYS:
+        vals = []
+        for row in rows:
+            cp = row.get("chosen_params") or {}
+            try:
+                v = float(cp.get(key, np.nan))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(v) and v > 0.0:
+                vals.append(v)
+        medians[key] = float(np.median(vals)) if vals else np.nan
+
+    repaired = {}
+    for row in rows:
+        cp = row.get("chosen_params")
+        if not isinstance(cp, dict):
+            continue
+        for key in _NONNEGATIVE_PARAM_KEYS:
+            try:
+                v = float(cp.get(key, np.nan))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(v) and v < 0.0:
+                cp[key] = medians[key]
+                repaired[key] = repaired.get(key, 0) + 1
+    if repaired:
+        warnings.warn(
+            f"{label}: replaced negative (extrapolated) chosen_params with the "
+            f"cross-tone median for {repaired} (NaN where no valid median existed).",
+            stacklevel=2)
+    return repaired
 
 
 def best_power_arrays(best_power, tone_count=None):
@@ -3736,7 +3799,14 @@ def best_power_arrays(best_power, tone_count=None):
         best_power = load_best_power(best_power)
     if isinstance(best_power, dict):
         best_power = [best_power]
-    rows = list(best_power)
+    # Copy rows (and their chosen_params) so repairing negatives here never mutates
+    # the caller's input. find_best_power already repairs at source; this also
+    # covers rows loaded from older files written before that fix.
+    rows = [dict(r) for r in best_power]
+    for r in rows:
+        if isinstance(r.get("chosen_params"), dict):
+            r["chosen_params"] = dict(r["chosen_params"])
+    _repair_negative_chosen_params(rows, label="best_power_arrays")
     indices = [int(row["tone_index"]) for row in rows]
     inferred = (max(indices) + 1) if indices else 0
     if tone_count is None:
@@ -3789,29 +3859,6 @@ def best_power_arrays(best_power, tone_count=None):
                     target[i] = float(value)
                 except (TypeError, ValueError):
                     target[i] = np.nan
-
-    # Repair unphysical negatives in non-negative quantities (an artifact of
-    # linear extrapolation past the measured power range — see
-    # ``_linear_interp_extrap``). Replace each negative entry with the cross-tone
-    # median of the valid (finite, positive) values for that key; if none are
-    # available, leave it as NaN rather than a misleading negative number.
-    repaired = {}
-    for key in _NONNEGATIVE_PARAM_KEYS:
-        arr = param_arrays.get(key)
-        if arr is None:
-            continue
-        bad = np.isfinite(arr) & (arr < 0.0)
-        if not np.any(bad):
-            continue
-        valid = arr[np.isfinite(arr) & (arr > 0.0)]
-        fill = float(np.median(valid)) if valid.size else np.nan
-        arr[bad] = fill
-        repaired[key] = int(np.count_nonzero(bad))
-    if repaired:
-        warnings.warn(
-            'best_power_arrays: replaced negative (extrapolated) values with the '
-            f'cross-tone median for {repaired} (NaN where no valid median existed).',
-            stacklevel=2)
 
     out.update(param_arrays)
     out["fr_hz"] = out["fr"].copy()
