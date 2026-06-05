@@ -1,6 +1,47 @@
 # Changelog & Feature List
 
-## v1.3.0 (Current)
+## v1.4.0 (Current)
+
+**Fast Frequency Modulation (real-time IQ conversion & resonator tracking)**
+- Modulation is now a mode of the single continuous streamer: each tone is
+  stepped through a small set of probe frequencies (typically 2-3 points) every
+  accumulation, and the samples are returned as ordinary frames tagged per
+  sample with the modulation step and a settling marker (packed into the spare
+  `flag5` word; decode as unsigned). Normal streaming is the modulation-off case.
+- New client controls: `enable_modulation()` / `update_modulation()` /
+  `recenter_modulation()` / `disable_modulation()`, plus `get_modulation_state()`
+  and a `get_info('tone_modulation')` section. Arm is independent of output —
+  start it with `enable_stream()` (continuous) or `get_samples(N)` (finite); both
+  return tagged frames while armed.
+- On/off at any time, and **seamless live updates** of per-tone centres/offsets
+  with no intentionally dropped frames (heavy preparation off the hot path, a
+  single latest-wins command applied by the streamer at a cycle boundary). Tones
+  ride the ~2x filterbank overlap; a bounded `recenter_modulation()` reloads the
+  channel maps when a tone drifts beyond coverage. Per-(tone,point) bin occupancy
+  is reported.
+- Correct double-buffer "ping-pong" scheduler (valid for any N, including odd N
+  across cycles) with an N=2 zero-rewrite fast path; per-point mixer words are
+  computed relative to the armed bins so the phase stays continuous as tones
+  dither/drift.
+- New pure `souk_readout_tools.modulation` toolkit (setup + demodulation):
+  `params_from_sweep` (build a config from your own resonator fits),
+  `group_cycles` (group by step/cycle; `on_missing='notify'|'fill'` handles
+  packet gaps), and `demodulate`. The recommended de-embedded/phase-centred basis
+  (via a per-tone `resonator.ResonatorCalibration`) yields the frequency shift
+  and dissipation directly through the exact Möbius inversion; a model-free
+  raw-phase fallback is also provided.
+- Mock mode emulates modulation (resonator phase model + bin grid) for
+  hardware-free testing; `client_scripts/test_frequency_modulation.py` exercises
+  the whole path. See [Fast Frequency Modulation](doc/frequency_modulation.md).
+
+**Power Sweep**
+- `find_best_power` now repairs unphysical negative `chosen_params` (an artifact
+  of linearly extrapolating a fit-summary field past the measured power range) by
+  substituting the cross-tone median of the valid values for that key, so every
+  consumer (including `best_power_arrays`) gets physical values. Signed
+  quantities are left untouched; affected tones remain flagged `extrapolated`.
+
+## v1.3.0
 
 Forward-ported the `jl_ocs_devel` branch (PR #10) plus follow-on hardening.
 
