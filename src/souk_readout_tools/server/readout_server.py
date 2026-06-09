@@ -125,6 +125,8 @@ def _format_request_log(message):
             'optimise_dynamic_range',
             'rx_policy',
             'autosync',
+            'mrst',
+            'setup_mrst',
         ):
             if key in message:
                 fields.append((key, message[key]))
@@ -142,14 +144,14 @@ def _format_request_log(message):
         'get_accumulator_snapshots': ('tone_index', 'num_snapshots', 'fast'),
         'batch_accumulator_snapshots': ('tone_indices', 'num_snapshots'),
         'sweep': ('centers', 'spans', 'points', 'samples_per_point',
-                  'direction', 'autosync', 'setup_sync'),
+                  'direction', 'autosync', 'setup_sync', 'mrst', 'setup_mrst'),
         'retune': (
             'centers', 'spans', 'points', 'samples_per_point',
-            'direction', 'method', 'autosync', 'setup_sync'),
+            'direction', 'method', 'autosync', 'setup_sync', 'mrst', 'setup_mrst'),
         'refresh_adc_cal': ('adc_cal_settle_time',),
-        'enable_modulation': ('mod_indices', 'samples_per_point', 'n_settle', 'autosync', 'setup_sync'),
-        'update_modulation': ('on_map_change', 'autosync'),
-        'recenter_modulation': ('autosync',),
+        'enable_modulation': ('mod_indices', 'samples_per_point', 'n_settle', 'autosync', 'setup_sync', 'mrst', 'setup_mrst'),
+        'update_modulation': ('on_map_change', 'autosync', 'mrst'),
+        'recenter_modulation': ('autosync', 'mrst'),
     }
     fields = [
         (key, message[key])
@@ -531,10 +533,16 @@ class ModulationScheduler:
         Whether to pulse one firmware sync at :meth:`arm` to establish the TX/RX
         phase reference before any buffer flips. Defaults to ``True``.
         Independent of ``autosync``.
+    mrst : bool, optional
+        Whether the per-step (``autosync``) sync also pulses master-reset (v7.10).
+        Defaults to ``False`` (light re-reference, rides continuous accumulation).
+    setup_mrst : bool, optional
+        Whether the :meth:`arm` (``setup_sync``) sync also pulses master-reset.
+        Defaults to ``True`` (full reset+start).
     """
 
     def __init__(self, r_fast, bundle, samples_per_point, n_settle, revision,
-                 autosync=True, setup_sync=True):
+                 autosync=True, setup_sync=True, mrst=False, setup_mrst=True):
         self.r_fast = r_fast
         self.bundle = bundle
         self.N = int(bundle['num_points'])
@@ -543,6 +551,8 @@ class ModulationScheduler:
         self.revision = int(revision)
         self.autosync = bool(autosync)        # per-step sync after each buffer flip
         self.setup_sync = bool(setup_sync)    # one sync at arm to establish the TX/RX phase reference
+        self.mrst = bool(mrst)                # per-step sync also pulses master-reset (v7.10)
+        self.setup_mrst = bool(setup_mrst)    # arm-time sync also pulses master-reset (v7.10)
         # Bookkeeping: which modulation point currently lives in each buffer, and
         # which buffer/point is live. ``None`` = unknown/empty.
         self._buf_holds = {0: None, 1: None}
@@ -592,14 +602,14 @@ class ModulationScheduler:
         # autosync=False the LO is aligned once here and then rides continuous
         # accumulation across buffer flips with no per-step sync.
         if self.setup_sync:
-            firmware_lib.force_sync_fast(self.r_fast)
+            firmware_lib.force_sync_fast(self.r_fast, mrst=self.setup_mrst)
         self._active_buf = 0
         self._active_point = 0
         # Pre-load the next point into the inactive buffer (nothing to do for N=1).
         if self.N > 1:
             self._write_point(1, 1 % self.N)
 
-    def install_bundle(self, bundle, revision, samples_per_point, n_settle, autosync=None):
+    def install_bundle(self, bundle, revision, samples_per_point, n_settle, autosync=None, mrst=None):
         """
         Swap in a new per-point control bundle **without re-arming** — used for a
         seamless live update whose channel maps are unchanged.
@@ -628,6 +638,8 @@ class ModulationScheduler:
         self.n_settle = int(n_settle)
         if autosync is not None:
             self.autosync = bool(autosync)
+        if mrst is not None:
+            self.mrst = bool(mrst)
         self._buf_holds = {0: None, 1: None}
         if self._active_point >= self.N:
             self._active_point = 0
@@ -657,7 +669,7 @@ class ModulationScheduler:
         # Flip live buffer to the one holding ``nxt`` and optionally latch with a sync.
         firmware_lib.set_control_buffer_idx_fast(self.r_fast, inactive)
         if self.autosync:
-            firmware_lib.force_sync_fast(self.r_fast)
+            firmware_lib.force_sync_fast(self.r_fast, mrst=self.mrst)
         self._active_buf = inactive
         self._active_point = nxt
         # Pre-load the following point into the freshly-vacated buffer (hidden
@@ -1951,7 +1963,8 @@ class ReadoutServer:
                             optimise_dynamic_range=message.get(
                                 'optimise_dynamic_range', False),
                             rx_policy=message.get('rx_policy', 'protect'),
-                            autosync=message.get('autosync', True))
+                            autosync=message.get('autosync', True),
+                            mrst=message.get('mrst', False))
                     finally:
                         self.stream_flags[FLAG_SET_PHASES].clear()
                         self.stream_flags[FLAG_SET_AMPS].clear()
@@ -1965,7 +1978,8 @@ class ReadoutServer:
                     await asyncio.sleep(0)
                     try:
                         result = self.remove_blind_tones(
-                            autosync=message.get('autosync', True))
+                            autosync=message.get('autosync', True),
+                            mrst=message.get('mrst', False))
                     finally:
                         self.stream_flags[FLAG_SET_FREQS].clear()
                     await asyncio.sleep(0)
@@ -2047,6 +2061,7 @@ class ReadoutServer:
                     param_name = message.get('param')
                     param_value = message.get('value')
                     autosync = message.get('autosync', True)
+                    mrst = message.get('mrst', False)
                     response = {'status': 'error', 'message': f'Invalid parameter name {param_name}'}
                     if param_name == 'sample_rate_hz':
                         firmware_lib.set_sample_rate(self.r, param_value)
@@ -2063,7 +2078,7 @@ class ReadoutServer:
                         tone_settings = firmware_lib.set_tone_frequencies_fast(
                             self.r, self.r_fast, self.config, param_value,
                             tone_amplitudes=amps, tone_phases=phases,
-                            autosync=autosync)
+                            autosync=autosync, mrst=mrst)
                         self._set_tone_state_cache(param_value, amps, phases)
                         self._invalidate_modulation('tone frequencies changed')
                         self._set_active_tone_indices_from_settings(tone_settings)
@@ -2079,7 +2094,7 @@ class ReadoutServer:
                             param_value, firmware_lib.get_tone_amplitudes,
                             plan_values_key='amplitudes', default_value=1.0)
                         firmware_lib.set_tone_amplitudes(
-                            self.r, self.config, param_value, autosync=autosync)
+                            self.r, self.config, param_value, autosync=autosync, mrst=mrst)
                         if self._tone_state_cache is not None:
                             self._set_tone_state_cache(
                                 self._tone_state_cache['frequencies'],
@@ -2098,7 +2113,7 @@ class ReadoutServer:
                             param_value, firmware_lib.get_tone_phases,
                             plan_values_key='phases', default_value=0.0)
                         firmware_lib.set_tone_phases(
-                            self.r, self.config, param_value, autosync=autosync)
+                            self.r, self.config, param_value, autosync=autosync, mrst=mrst)
                         if self._tone_state_cache is not None:
                             self._set_tone_state_cache(
                                 self._tone_state_cache['frequencies'],
@@ -2128,6 +2143,7 @@ class ReadoutServer:
                             rf_peripherals=self.rf_peripherals,
                             rx_policy=rx_pol,
                             autosync=autosync,
+                            mrst=mrst,
                             **{k: message[k] for k in firmware_lib.POWER_FORCE_CONTROL_KEYS
                                if k in message})
                         if self._tone_state_cache is not None and result is not None:
@@ -2212,6 +2228,8 @@ class ReadoutServer:
                                 'on top of a running continuous stream')
                         requested_autosync = message.get('autosync', None)
                         requested_setup_sync = message.get('setup_sync', None)
+                        requested_mrst = message.get('mrst', None)
+                        requested_setup_mrst = message.get('setup_mrst', None)
                         if (message.get('offsets') is None and message.get('center') is None
                                 and self.modulation_cfg is not None):
                             c = self.modulation_cfg          # resume a resident config
@@ -2224,6 +2242,12 @@ class ReadoutServer:
                             setup_sync = (
                                 c.get('setup_sync', True) if requested_setup_sync is None
                                 else bool(requested_setup_sync))
+                            mrst = (
+                                c.get('mrst', False) if requested_mrst is None
+                                else bool(requested_mrst))
+                            setup_mrst = (
+                                c.get('setup_mrst', True) if requested_setup_mrst is None
+                                else bool(requested_setup_mrst))
                         else:
                             center = message.get('center')
                             offsets = message.get('offsets')
@@ -2232,12 +2256,14 @@ class ReadoutServer:
                             n_settle = int(message.get('n_settle', 1))
                             autosync = True if requested_autosync is None else bool(requested_autosync)
                             setup_sync = True if requested_setup_sync is None else bool(requested_setup_sync)
+                            mrst = False if requested_mrst is None else bool(requested_mrst)
+                            setup_mrst = True if requested_setup_mrst is None else bool(requested_setup_mrst)
                             if offsets is None:
                                 raise ValueError('offsets required to arm modulation')
                         epoch = self._next_modulation_command_epoch()
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_modulation, center, offsets, mod_indices, spp, n_settle,
-                            autosync=autosync, setup_sync=setup_sync)
+                            autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
                         self._check_modulation_command_epoch(epoch)
                         if bundle['needs_recenter']:
                             raise ValueError(
@@ -2273,12 +2299,17 @@ class ReadoutServer:
                             c.get('autosync', True) if requested_autosync is None
                             else bool(requested_autosync))
                         setup_sync = c.get('setup_sync', True)
+                        requested_mrst = message.get('mrst', None)
+                        mrst = (
+                            c.get('mrst', False) if requested_mrst is None
+                            else bool(requested_mrst))
+                        setup_mrst = c.get('setup_mrst', True)
                         armed = self.modulation_params['armed']
                         epoch = self._next_modulation_command_epoch()
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_modulation, center, offsets, c['mod_indices'],
                             c['samples_per_point'], c['n_settle'],
-                            armed=armed, autosync=autosync, setup_sync=setup_sync)
+                            armed=armed, autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
                         self._check_modulation_command_epoch(epoch)
                         if bundle['needs_recenter'] and on_map_change != 'recenter':
                             await self.send_response(writer, {'status': 'error',
@@ -2291,7 +2322,7 @@ class ReadoutServer:
                                 bundle, state, cfg = await self.to_thread(
                                     self._prepare_modulation, center, offsets, c['mod_indices'],
                                     c['samples_per_point'], c['n_settle'],
-                                    autosync=autosync, setup_sync=setup_sync)
+                                    autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
                                 self._check_modulation_command_epoch(epoch)
                                 op = 'recenter'
                             else:
@@ -2320,11 +2351,16 @@ class ReadoutServer:
                             c.get('autosync', True) if requested_autosync is None
                             else bool(requested_autosync))
                         setup_sync = c.get('setup_sync', True)
+                        requested_mrst = message.get('mrst', None)
+                        mrst = (
+                            c.get('mrst', False) if requested_mrst is None
+                            else bool(requested_mrst))
+                        setup_mrst = c.get('setup_mrst', True)
                         epoch = self._next_modulation_command_epoch()
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_modulation, c['center'], c['offsets'],
                             c['mod_indices'], c['samples_per_point'], c['n_settle'],
-                            autosync=autosync, setup_sync=setup_sync)
+                            autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
                         self._check_modulation_command_epoch(epoch)
                         rev = self._next_modulation_revision(cfg)
                         state['enabled'] = True
@@ -2665,6 +2701,8 @@ class ReadoutServer:
                             adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
                             autosync = message.get('autosync', True)
                             setup_sync = message.get('setup_sync', True)
+                            mrst = message.get('mrst', False)
+                            setup_mrst = message.get('setup_mrst', True)
                             self.latest_sweep_data_valid = False
                             self.sweep_progress = 0.0
                             self.sweep_state = {'state': 'running', 'message': 'Sweep in progress'}
@@ -2673,7 +2711,7 @@ class ReadoutServer:
                                 self.sweep(centers, spans, points, samples_per_point,
                                            direction, refresh_adc_cal=refresh_adc_cal,
                                            adc_cal_settle_time=adc_cal_settle_time,
-                                           autosync=autosync, setup_sync=setup_sync)
+                                           autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
                             )
 
                             #print('await send response')
@@ -2787,6 +2825,8 @@ class ReadoutServer:
                             adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
                             autosync = message.get('autosync', True)
                             setup_sync = message.get('setup_sync', True)
+                            mrst = message.get('mrst', False)
+                            setup_mrst = message.get('setup_mrst', True)
                             self.latest_sweep_data_valid = False
                             self.sweep_progress = 0.0
                             self.sweep_state = {'state': 'running', 'message': 'Retune in progress'}
@@ -2796,7 +2836,7 @@ class ReadoutServer:
                                             freq_offsets,
                                             refresh_adc_cal=refresh_adc_cal,
                                             adc_cal_settle_time=adc_cal_settle_time,
-                                            autosync=autosync, setup_sync=setup_sync)
+                                            autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
                             )
                             await self.send_response(writer, {'status': 'success', 'message': 'Retune in progress'})
                         except Exception as e:
@@ -3109,7 +3149,7 @@ class ReadoutServer:
                         reference_plane='detector',
                         optimise_dynamic_range=False,
                         rx_policy='protect',
-                        autosync=True):
+                        autosync=True, mrst=False):
         """Append blind tones to the active comb and apply to firmware.
 
         ``frequencies`` are the blind-tone frequencies (Hz); ``amplitudes``,
@@ -3121,7 +3161,7 @@ class ReadoutServer:
         """
         blind_freqs = np.atleast_1d(frequencies).astype(float)
         if len(blind_freqs) == 0:
-            return self.remove_blind_tones(autosync=autosync)
+            return self.remove_blind_tones(autosync=autosync, mrst=mrst)
 
         freqs, amps, current_phases, metadata = self._live_tone_state()
         regular_indices = metadata['regular_indices']
@@ -3175,7 +3215,7 @@ class ReadoutServer:
         tone_settings = firmware_lib.set_tone_frequencies_fast(
             self.r, self.r_fast, self.config, combined_freqs,
             tone_amplitudes=combined_amps, tone_phases=combined_phases,
-            autosync=autosync)
+            autosync=autosync, mrst=mrst)
         self._set_tone_state_cache(combined_freqs, combined_amps, combined_phases)
         self._invalidate_modulation('blind tones changed')
         self._set_active_tone_indices_from_settings(tone_settings)
@@ -3191,7 +3231,7 @@ class ReadoutServer:
                 optimise_dynamic_range=optimise_dynamic_range,
                 rf_peripherals=self.rf_peripherals,
                 rx_policy=rx_policy,
-                autosync=autosync)
+                autosync=autosync, mrst=mrst)
             # Capture the amplitude result after calibrated power setting.
             final_amps = firmware_lib.get_tone_amplitudes(self.r, self.config)
             defaults = self._tone_defaults()
@@ -3203,7 +3243,7 @@ class ReadoutServer:
 
         return self.get_blind_tones(reference_plane=reference_plane)
 
-    def remove_blind_tones(self, autosync=True):
+    def remove_blind_tones(self, autosync=True, mrst=False):
         freqs, amps, phases, metadata = self._live_tone_state()
         regular_indices = metadata['regular_indices']
         regular_freqs = freqs[regular_indices]
@@ -3217,12 +3257,12 @@ class ReadoutServer:
                 self.r, self.r_fast, self.config, regular_freqs,
                 tone_amplitudes=regular_amps,
                 tone_phases=regular_phases,
-                autosync=autosync)
+                autosync=autosync, mrst=mrst)
             self._set_tone_state_cache(regular_freqs, regular_amps, regular_phases)
         else:
             tone_settings = firmware_lib.set_tone_frequencies_fast(
                 self.r, self.r_fast, self.config, [],
-                tone_amplitudes=[], tone_phases=[], autosync=autosync)
+                tone_amplitudes=[], tone_phases=[], autosync=autosync, mrst=mrst)
             self._set_tone_state_cache([], [], [])
         self._invalidate_modulation('blind tones removed')
         self._set_active_tone_indices_from_settings(tone_settings)
@@ -3592,7 +3632,7 @@ class ReadoutServer:
 
     def _prepare_modulation(self, center, offsets, mod_indices,
                             samples_per_point, n_settle, armed=None,
-                            autosync=True, setup_sync=True):
+                            autosync=True, setup_sync=True, mrst=False, setup_mrst=True):
         """
         Build a modulation bundle + observability state from a centre comb and
         per-point probe offsets. Pure computation (hardware *reads* only, no
@@ -3622,6 +3662,10 @@ class ReadoutServer:
         setup_sync : bool, optional
             Whether to pulse one firmware sync when arming fresh channel maps /
             buffers before per-point stepping starts.
+        mrst : bool, optional
+            Whether the per-step (``autosync``) sync also pulses master-reset.
+        setup_mrst : bool, optional
+            Whether the arm-time (``setup_sync``) sync also pulses master-reset.
 
         Returns
         -------
@@ -3672,7 +3716,8 @@ class ReadoutServer:
 
         cfg = {'center': center, 'offsets': offsets, 'mod_indices': mod_indices,
                'samples_per_point': int(samples_per_point), 'n_settle': int(n_settle),
-               'autosync': bool(autosync), 'setup_sync': bool(setup_sync)}
+               'autosync': bool(autosync), 'setup_sync': bool(setup_sync),
+               'mrst': bool(mrst), 'setup_mrst': bool(setup_mrst)}
         state = self._build_modulation_state(bundle, cfg)
         return bundle, state, cfg
 
@@ -3737,6 +3782,7 @@ class ReadoutServer:
             'samples_per_point': int(cfg['samples_per_point']),
             'n_settle': int(cfg['n_settle']),
             'autosync': bool(cfg.get('autosync', True)),
+            'mrst': bool(cfg.get('mrst', False)),
             'mod_indices': list(mod_indices),
             'sample_rate_hz': sample_rate,
             'cycle_rate_hz': cycle_rate,
@@ -3760,6 +3806,7 @@ class ReadoutServer:
             'offsets': np.asarray(cfg['offsets'], dtype=float).tolist(),
             'mod_indices': list(cfg['mod_indices']),
             'autosync': bool(cfg.get('autosync', True)),
+            'mrst': bool(cfg.get('mrst', False)),
             'ts': time.time(),
         }
         return rev
@@ -3869,6 +3916,7 @@ class ReadoutServer:
                 # Rest the tones at their centre frequencies (re-snaps to nearest bins).
                 if self.modulation_cfg is not None:
                     autosync = bool(self.modulation_cfg.get('autosync', True))
+                    mrst = bool(self.modulation_cfg.get('mrst', False))
                     center = np.asarray(self.modulation_cfg['center'], dtype=float)
                     amps = self._tone_value_fallback(len(center), 'amplitudes', 1.0)
                     phases = self._tone_value_fallback(len(center), 'phases', 0.0)
@@ -3877,7 +3925,7 @@ class ReadoutServer:
                         tone_indices = self.modulation_params.get('tone_indices')
                     tone_settings = firmware_lib.set_tone_frequencies_fast(
                         self.r, self.r_fast, self.config,
-                        center, tone_indices=tone_indices, autosync=autosync,
+                        center, tone_indices=tone_indices, autosync=autosync, mrst=mrst,
                         tone_amplitudes=amps, tone_phases=phases)
                     self._set_tone_state_cache(center, amps, phases)
                     self._set_active_tone_indices_from_settings(tone_settings)
@@ -3898,15 +3946,17 @@ class ReadoutServer:
             n_settle = int(cmd['cfg']['n_settle'])
             autosync = bool(cmd['cfg'].get('autosync', True))
             setup_sync = bool(cmd['cfg'].get('setup_sync', True))
+            mrst = bool(cmd['cfg'].get('mrst', False))
+            setup_mrst = bool(cmd['cfg'].get('setup_mrst', True))
             if op == 'update' and self.modulation_sched is not None:
                 # Same channel maps: swap words in place, no re-arm, no map write.
                 self.modulation_sched.install_bundle(
-                    cmd['bundle'], cmd['revision'], spp, n_settle, autosync=autosync)
+                    cmd['bundle'], cmd['revision'], spp, n_settle, autosync=autosync, mrst=mrst)
             else:
                 # enable / recenter: build a fresh scheduler and arm (applies maps).
                 self.modulation_sched = ModulationScheduler(
                     self.r_fast, cmd['bundle'], spp, n_settle, cmd['revision'],
-                    autosync=autosync, setup_sync=setup_sync)
+                    autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
                 self.modulation_sched.arm()
                 self.active_tone_indices = np.asarray(cmd['bundle']['tone_indices'])
             # Record which revision actually landed (vs the desired one in state).
@@ -4034,7 +4084,7 @@ class ReadoutServer:
 
     async def sweep(self, centers, spans, points, samples_per_point, direction,
                     refresh_adc_cal=True, adc_cal_settle_time=2.0,
-                    autosync=True, setup_sync=True):
+                    autosync=True, setup_sync=True, mrst=False, setup_mrst=True):
         """
         A coroutine that performs a frequency sweep and stores the results in self.latest_sweep_data.
 
@@ -4092,7 +4142,7 @@ class ReadoutServer:
 
             print('Setting initial tone frequencies')
             tone_settings = firmware_lib.set_tone_frequencies_fast(
-                self.r,self.r_fast,self.config,centers,autosync=autosync,
+                self.r,self.r_fast,self.config,centers,autosync=autosync, mrst=mrst,
                 tone_amplitudes=sweep_tone_amplitudes,
                 tone_phases=sweep_tone_phases)
             self._set_tone_state_cache(centers, sweep_tone_amplitudes, sweep_tone_phases)
@@ -4180,7 +4230,7 @@ class ReadoutServer:
             # autosync=False the LO is aligned once here and then rides continuous
             # accumulation across the per-step buffer flips with no per-step sync.
             if setup_sync:
-                firmware_lib.force_sync_fast(self.r_fast)
+                firmware_lib.force_sync_fast(self.r_fast, mrst=setup_mrst)
 
             print('Starting sweep')
             acc_counts = np.zeros((samples_per_point,num_points),dtype=int)
@@ -4216,7 +4266,7 @@ class ReadoutServer:
                                                    self.r_fast,
                                                    fast_sweep_params,
                                                    p,
-                                                   autosync=autosync)
+                                                   autosync=autosync, mrst=mrst)
                 
                 # must wait for everything to settle.
                 # two acc is enough at 500 samps/sec
@@ -4244,7 +4294,7 @@ class ReadoutServer:
             # print('reset initial freqs:',initial_freqs)
             tone_settings = firmware_lib.set_tone_frequencies_fast(
                 self.r, self.r_fast, self.config, initial_freqs,
-                autosync=autosync,
+                autosync=autosync, mrst=mrst,
                 tone_amplitudes=sweep_tone_amplitudes,
                 tone_phases=sweep_tone_phases)
             self._set_tone_state_cache(initial_freqs, sweep_tone_amplitudes, sweep_tone_phases)
@@ -4284,7 +4334,7 @@ class ReadoutServer:
             print('ayncio sweep cancelled')
             tone_settings = firmware_lib.set_tone_frequencies_fast(
                 self.r, self.r_fast, self.config, initial_freqs,
-                autosync=autosync,
+                autosync=autosync, mrst=mrst,
                 tone_amplitudes=sweep_tone_amplitudes,
                 tone_phases=sweep_tone_phases)
             self._set_tone_state_cache(initial_freqs, sweep_tone_amplitudes, sweep_tone_phases)
@@ -4321,7 +4371,7 @@ class ReadoutServer:
 
     async def retune(self, center, span, points, samples_per_point, direction,
                      method, freq_offsets=None, refresh_adc_cal=True,
-                     adc_cal_settle_time=2.0, autosync=True, setup_sync=True):
+                     adc_cal_settle_time=2.0, autosync=True, setup_sync=True, mrst=False, setup_mrst=True):
         """
         A coroutine that performs a frequency sweep, finds the resonance peaks using the specified method, and sets the tones to the peak frequencies.
 
@@ -4366,7 +4416,7 @@ class ReadoutServer:
                 center, span, points, samples_per_point, direction,
                 refresh_adc_cal=refresh_adc_cal,
                 adc_cal_settle_time=adc_cal_settle_time,
-                autosync=autosync, setup_sync=setup_sync)
+                autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
             if not sweep_ok:
                 if self.sweep_state.get('state') not in ('cancelled', 'error'):
                     self.sweep_progress = float(1.0)
@@ -4418,7 +4468,7 @@ class ReadoutServer:
             tone_settings = firmware_lib.set_tone_frequencies_fast(
                 self.r,self.r_fast,self.config,retune_freqs,
                 tone_amplitudes=amps, tone_phases=phases,
-                autosync=autosync)
+                autosync=autosync, mrst=mrst)
             self._set_tone_state_cache(retune_freqs, amps, phases)
             self._set_active_tone_indices_from_settings(tone_settings)
             self.sweep_progress = 1.0

@@ -45,15 +45,21 @@ SHARED_INIT_LOCK = os.path.join(USER_DIR, '.shared_init.lock')
 
 autosync_time_delay = 0.001 #seconds
 
+# v7.10 timed-sync: master-reset (MRST) is now an independent ctrl bit, decoupled from the
+# sync pulse. Per-step (``autosync``) syncs default to mrst=False (a light re-reference that
+# rides continuous accumulation across a buffer flip); init/config-time syncs use mrst=True
+# (full reset+start, the old welded behaviour). The per-call ``mrst`` flags are plumbed
+# through so reset can be toggled independently for bench testing.
+INIT_SYNC_MRST = True  # master-reset on init/config-time syncs (startup, sync_delay change)
+
 adc_saturation_bits = 16 # note the adc gives 16 bit data but is a 12 or 14 bit converter
 dac_saturation_bits = 16 # note the dac takes 16 bit data but is a 12 or 14 bit converter
 
-def _sync_if_requested(r, autosync=True, wait_s=autosync_time_delay):
+def _sync_if_requested(r, autosync=True, mrst=False):
     if not autosync:
         return
-    r.sync.arm_sync(wait=False)
-    time.sleep(wait_s)
-    r.sync.sw_sync()
+    # v7.10: sw_sync no longer needs arming; ``mrst`` toggles the (now independent) reset.
+    r.sync.sw_sync(mrst=mrst)
 
 def cplx2uint(d,nbits):
     """
@@ -610,8 +616,7 @@ def initialise_pipeline_resources(r,r_fast,config_dict):
 
     if sync_delay is not None:
         r.sync.set_delay(sync_delay)
-        r.sync.arm_sync(wait=False)
-        r.sync.sw_sync()
+        r.sync.sw_sync(mrst=INIT_SYNC_MRST)  # v7.10: drop arm_sync; full reset+start at init
     if acc_len is not None:
         r.accumulators[0].set_acc_len(acc_len)
     if dac_duc_mixer_frequency_hz is not None:
@@ -1244,8 +1249,7 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
         if sync_delay is not None:
             print(f'apply_config: setting sync_delay = {sync_delay}')
             r.sync.set_delay(sync_delay)
-            r.sync.arm_sync(wait=False)
-            r.sync.sw_sync()
+            r.sync.sw_sync(mrst=INIT_SYNC_MRST)  # v7.10: drop arm_sync; full reset+start
 
     if changed('acc_len'):
         acc_len = defaults.get('acc_len')
@@ -2570,7 +2574,7 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
     details['rx']['mixer_lo_ri_step'] = [(i,q) for i,q in zip(ri_steps_rx.real.tolist(),ri_steps_rx.imag.tolist())]
     return tone_settings_dict, details
 
-def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True):
+def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True, mrst=False):
     """
     Apply the tone frequency settings to the RFSOC.
 
@@ -2614,7 +2618,7 @@ def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True):
 
     write_control_buffer_data(r,buf,v)
     set_control_buffer_idx(r,buf)
-    _sync_if_requested(r, autosync=autosync)
+    _sync_if_requested(r, autosync=autosync, mrst=mrst)
     return
 
 def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
@@ -3346,7 +3350,7 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
 
     return sweep_settings_dict
 
-def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
+def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True, mrst=False):
     # phase_incs_tx_formatted = sweep_settings.get('phase_incs_tx_formatted')
     # phase_incs_rx_formatted = sweep_settings.get('phase_incs_rx_formatted')
     # ri_steps_tx_formatted   = sweep_settings.get('ri_steps_tx_formatted')
@@ -3388,7 +3392,7 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
     set_control_buffer_idx_fast(r_fast,allbuf[step_index])
 
     if autosync:
-        force_sync_fast(r_fast,0.00001)
+        force_sync_fast(r_fast, 0.00001, mrst=mrst)
 
     # if c1 or c2:
     #     _wait_for_acc(r_fast,0,0.0001)
@@ -3598,7 +3602,7 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True):
 
 
 
-def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, autosync=True):
+def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, autosync=True, mrst=False):
 
     v=fast_tone_frequency_settings.get('control_buffer_data_values')
     i=fast_tone_frequency_settings.get('control_buffer_data_indices')
@@ -3625,7 +3629,7 @@ def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, 
     write_control_buffer_data_fast(r_fast,buf,v,i)
     set_control_buffer_idx_fast(r_fast,buf)
     if autosync:
-        force_sync_fast(r_fast, autosync_time_delay)
+        force_sync_fast(r_fast, autosync_time_delay, mrst=mrst)
     if c1 or c2 or autosync:
         _wait_for_acc(r_fast,0,0.0001)
 
@@ -3637,7 +3641,7 @@ def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, 
 
 
 def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
-                         min_tone_separation=6, autosync=True,
+                         min_tone_separation=6, autosync=True, mrst=False,
                          detailed_output=False, tone_amplitudes=None,
                          tone_phases=None):
     """
@@ -3679,7 +3683,7 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
         min_tone_separation=min_tone_separation,
         tone_amplitudes=tone_amplitudes,
         tone_phases=tone_phases)
-    apply_tone_frequency_settings(r, tone_frequency_settings, autosync=autosync)
+    apply_tone_frequency_settings(r, tone_frequency_settings, autosync=autosync, mrst=mrst)
 
     if detailed_output:
         return details
@@ -3688,7 +3692,7 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
 
 def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
                               tone_indices=None, min_tone_separation=6,
-                              autosync=True, tone_amplitudes=None,
+                              autosync=True, mrst=False, tone_amplitudes=None,
                               tone_phases=None):
     """
     Set the tone frequencies in the RFSOC using the fast firmware interface.
@@ -3726,7 +3730,7 @@ def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
         min_tone_separation=min_tone_separation,
         tone_amplitudes=tone_amplitudes,
         tone_phases=tone_phases)
-    apply_tone_frequency_settings_fast(r, r_fast, tone_frequency_settings, autosync=autosync)
+    apply_tone_frequency_settings_fast(r, r_fast, tone_frequency_settings, autosync=autosync, mrst=mrst)
 
     return tone_frequency_settings
 
@@ -3890,7 +3894,7 @@ def get_tone_amplitudes(r,config_dict):
     # index by psb_tones_active (not :num_tones) since tone indices may be non-contiguous with VACC
     return scaling_tx[psb_tones_active]
 
-def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
+def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True, mrst=False):
     """
     Set the TX tone amplitude scale factors in the RFSOC.
 
@@ -3928,7 +3932,7 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True):
     #     r.mixer.write(f'tx_lo{i}_scale', scaling[i::r.mixer._n_parallel_chans].tobytes())
     #     r.mixer.write(f'rx_lo{i}_scale', scaling[i::r.mixer._n_parallel_chans].tobytes())
 
-    _sync_if_requested(r, autosync=autosync)
+    _sync_if_requested(r, autosync=autosync, mrst=mrst)
 
     return
 
@@ -3962,7 +3966,7 @@ def get_tone_phases(r, config_dict):
     # index by psb_tones_active (not :num_tones) since tone indices may be non-contiguous with VACC
     return phase_offsets_tx[psb_tones_active]
 
-def set_tone_phases(r, config_dict, tone_phases, autosync=True):
+def set_tone_phases(r, config_dict, tone_phases, autosync=True, mrst=False):
     """
     Set the tone phase offsets in the RFSOC.
     """
@@ -3991,7 +3995,7 @@ def set_tone_phases(r, config_dict, tone_phases, autosync=True):
     # for i in range(min(r.mixer._n_parallel_chans, num_tones)):
     #     r.mixer.write(f'tx_lo{i}_phase_offset', phase_offsets[i::r.mixer._n_parallel_chans].tobytes())
     #     r.mixer.write(f'rx_lo{i}_phase_offset', phase_offsets[i::r.mixer._n_parallel_chans].tobytes())
-    _sync_if_requested(r, autosync=autosync)
+    _sync_if_requested(r, autosync=autosync, mrst=mrst)
     return
 
 
@@ -7589,10 +7593,11 @@ def _read_accumulator_snapshot_fast(r_fast, fw_chan):
     # Set snapshot channel
     mm[addrs['snapshot_chan']:addrs['snapshot_chan']+4] = struct.pack('<I', fw_chan)
 
-    # Arm snapshot: man_trig=True, man_valid=False
-    # ctrl = 0 + (1<<1) = 2, then ctrl = 1 + (1<<1) = 3
-    mm[addrs['ctrl']:addrs['ctrl']+4] = struct.pack('<I', 2)
-    mm[addrs['ctrl']:addrs['ctrl']+4] = struct.pack('<I', 3)
+    # Let the firmware's valid gating select complete I/Q samples for this
+    # channel. As of firmware v7.10.2, forcing man_trig can start the capture
+    # between I and Q and swap them for the whole snapshot.
+    mm[addrs['ctrl']:addrs['ctrl']+4] = struct.pack('<I', 0)
+    mm[addrs['ctrl']:addrs['ctrl']+4] = struct.pack('<I', 1)
 
     # Poll status until done (bit 31 clear)
     while True:
@@ -7839,7 +7844,7 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
 
 
 def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_point,
-                  direction, autosync=True, setup_sync=True):
+                  direction, autosync=True, setup_sync=True, mrst=False, setup_mrst=True):
     """
     A blocking call to perform a frequency sweep of the RFSOC.
     An asynchronous version of this function is available in the readout_server code.
@@ -7899,10 +7904,10 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
     # One-time sync at sweep start establishes the TX/RX phase reference.
     # Independent of the per-step ``autosync``.
     if setup_sync:
-        force_sync_fast(r_fast)
+        force_sync_fast(r_fast, mrst=setup_mrst)
 
     for p in range(num_points):
-        apply_sweep_step_fast(r, r_fast, fast_sweep_params, p, autosync=autosync)
+        apply_sweep_step_fast(r, r_fast, fast_sweep_params, p, autosync=autosync, mrst=mrst)
 
         # Get tone_indices for this sweep point
         tone_indices_p = tone_indices_arr[p] if tone_indices_arr is not None else np.arange(num_tones)
@@ -7915,7 +7920,7 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
             acc_errs[p,s] = err
 
     set_tone_frequencies_fast(
-        r, r_fast, config_dict, initial_freqs, autosync=autosync,
+        r, r_fast, config_dict, initial_freqs, autosync=autosync, mrst=mrst,
         tone_amplitudes=sweep_tone_amplitudes,
         tone_phases=sweep_tone_phases)
 
@@ -7937,7 +7942,7 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
 
 def perform_retune(r, r_fast,config_dict, centers, spans, points,
                    samples_per_point, direction, method, smooth_len=3,
-                   freq_offsets=None, autosync=True, setup_sync=True):
+                   freq_offsets=None, autosync=True, setup_sync=True, mrst=False, setup_mrst=True):
     """
     A blocking call to perform a frequency retune of the RFSOC.
     SImply performs a sweep and then retunes to the frequencies of maximum gradient or minimum magnitude.
@@ -7957,7 +7962,7 @@ def perform_retune(r, r_fast,config_dict, centers, spans, points,
         raise ValueError(f'Invalid retune method "{method}", must be "max_gradient", "min_mag", or "max_dphidf"')
     results = perform_sweep(
         r, r_fast, config_dict, centers, spans, points, samples_per_point,
-        direction, autosync=autosync, setup_sync=setup_sync)
+        direction, autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
 
     if method == 'max_gradient':
         retune_freqs = np.zeros_like(results['sweep_frequencies'])
@@ -8359,6 +8364,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
                     optimise_dynamic_range=False, rf_peripherals=None,
                     rx_policy='protect',
                     autosync=True,
+                    mrst=False,
                     force_tx_amp_bypass=None, force_rx_amp_bypass=None,
                     force_tx_attenuation_db=None,
                     force_rx_attenuation_db=None,
@@ -8539,7 +8545,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
               f'reference_plane={reference_plane!r}')
         init_amps_max = float(np.max(get_tone_amplitudes(r, config_dict)))
         if not tone_amplitudes_fixed:
-            set_tone_amplitudes(r, config_dict, amps, autosync=autosync)
+            set_tone_amplitudes(r, config_dict, amps, autosync=autosync, mrst=mrst)
         new_amps_max = float(np.max(np.abs(amps)))
         if init_amps_max > 0 and new_amps_max > 0:
             amp_change_db = float(20 * np.log10(new_amps_max / init_amps_max))
@@ -8645,7 +8651,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         else:
             r.psbscale.set_scale(0)
             time.sleep(0.01)
-        set_tone_amplitudes(r, config_dict, amps, autosync=autosync)
+        set_tone_amplitudes(r, config_dict, amps, autosync=autosync, mrst=mrst)
         time.sleep(0.01)
         print(f'  step 1: maximise digital — amplitudes at max')
 
@@ -9039,53 +9045,66 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
     return result
 
 
-def force_sync_fast(r_fast,wait_s=0.0001):
+def force_sync_fast(r_fast, wait_s=0.0001, mrst=False, do_sync=True):
+    """
+    Fire a firmware sync by poking the mmap directly (bypasses the slow casperfpga
+    transport) — the fast-path equivalent of ``r.sync.sw_sync``.
+
+    v7.10 timed-sync register layout: the sync pulse lives in the ``timed_sync_ctrl``
+    register (bit ``OFFSET_TIMED_SYNC_SW_SYNC``) and no longer needs arming; master-reset
+    is a separate, independent bit in ``ctrl`` (``OFFSET_MRST``).
+
+    :param mrst: if True, pulse the master reset *before* the sync (full reset+start, the
+        old welded behaviour). If False (default, per-step), re-reference only — the LO
+        rides continuous accumulation across the buffer flip.
+    :param do_sync: if True (default), fire the sync pulse. Set do_sync=False with mrst=True
+        for a reset-only poke. The two knobs give every combination for bench testing.
+
+    NOTE (deferred capability — see [[fast-mod-sync-investigation]]): a per-step *immediate*
+    sync is still software-timed, so it can land mid-accumulation (the occasional glitch).
+    The deterministic fix is the v7.10 *timed* sync — ``set_timed_sync(tt)`` firing at an
+    accumulation-boundary telescope time — but that needs TT/PPS disciplining
+    (``update_internal_time``), which this codebase does NOT do yet (telescope_time is
+    free-running). Wiring that up is the follow-on; this port only moves the existing
+    immediate sync onto the new registers. Firmware caveats to raise with the HDL owner:
+    7.10 ``set_timed_sync`` writes ``timed_sync_msb`` + ``timed_sync_enable`` but never a
+    low word (looks incomplete), and raises if the target TT is already in the past.
+    """
     pid = r_fast.pipeline_id
-    regname = f'p{pid}_sync_ctrl'
-    cache_prefix = f'_p{pid}_sync_ctrl'
-    if not hasattr(r_fast, f'{cache_prefix}_addr'):
-        setattr(r_fast, f'{cache_prefix}_addr', r_fast.sync.host.transport._get_device_address(regname))
-        setattr(r_fast, f'{cache_prefix}_arm_bit', 1<<r_fast.sync.OFFSET_ARM_SYNC_OUT)
-        setattr(r_fast, f'{cache_prefix}_sync_bit', 1<<r_fast.sync.OFFSET_MAN_SYNC)
+    cache = f'_p{pid}_sync_fast'
+    if not hasattr(r_fast, f'{cache}_ctrl_addr'):
+        sync = r_fast.sync
+        if not hasattr(sync, 'OFFSET_TIMED_SYNC_SW_SYNC'):
+            raise RuntimeError(
+                'souk_mkid_readout predates v7.10 timed-sync (no OFFSET_TIMED_SYNC_SW_SYNC); '
+                'upgrade the server venv library to match the 7.10 firmware.')
+        tr = sync.host.transport
+        setattr(r_fast, f'{cache}_ctrl_addr', tr._get_device_address(f'p{pid}_sync_ctrl'))
+        setattr(r_fast, f'{cache}_timed_addr', tr._get_device_address(f'p{pid}_sync_timed_sync_ctrl'))
+        setattr(r_fast, f'{cache}_mrst_bit', 1 << sync.OFFSET_MRST)
+        setattr(r_fast, f'{cache}_swsync_bit', 1 << sync.OFFSET_TIMED_SYNC_SW_SYNC)
 
-    #arm_sync
-    addr = getattr(r_fast, f'{cache_prefix}_addr')
-    arm_bit = getattr(r_fast, f'{cache_prefix}_arm_bit')
-    sync_bit = getattr(r_fast, f'{cache_prefix}_sync_bit')
+    ctrl_addr = getattr(r_fast, f'{cache}_ctrl_addr')
+    timed_addr = getattr(r_fast, f'{cache}_timed_addr')
+    mrst_bit = getattr(r_fast, f'{cache}_mrst_bit')
+    swsync_bit = getattr(r_fast, f'{cache}_swsync_bit')
     mm = r_fast.sync.host.transport.axil_mm
-    (value,) = struct.unpack('<I',mm[addr:addr+4])
 
-    #set 0
-    value &= ~arm_bit
-    mm[addr:addr+4] = struct.pack('<I',value)
-    #set 1
-    value |= arm_bit
-    mm[addr:addr+4] = struct.pack('<I',value)
-    #set 0
-    value &= ~arm_bit
-    mm[addr:addr+4] = struct.pack('<I',value)
+    def _pulse(addr, bit):
+        # 0 -> 1 -> 0 on a single bit, read-modify-write so other bits in the register
+        # (e.g. the timed-sync EN bit) are preserved.
+        (value,) = struct.unpack('<I', mm[addr:addr+4])
+        for level in (0, bit, 0):
+            value = (value & ~bit) | level
+            mm[addr:addr+4] = struct.pack('<I', value)
 
-    # change_reg_bits_fast(addr, 0, r_fast.sync.OFFSET_ARM_SYNC_OUT)
-    # change_reg_bits(addr, 1, r_fast.sync.OFFSET_ARM_SYNC_OUT)
-    # change_reg_bits(addr, 0, r_fast.sync.OFFSET_ARM_SYNC_OUT)
+    if mrst:
+        _pulse(ctrl_addr, mrst_bit)   # master reset (independent ctrl bit in 7.10)
 
-    #wait
     time.sleep(wait_s)
 
-    #manual sync
-    #set0
-    value &= ~sync_bit
-    mm[addr:addr+4] = struct.pack('<I',value)
-    #set 1
-    value |= sync_bit
-    mm[addr:addr+4] = struct.pack('<I',value)
-    #set 0
-    value &= ~sync_bit
-    mm[addr:addr+4] = struct.pack('<I',value)
-
-    # change_reg_bits('ctrl', 0, r_fast.sync.OFFSET_MAN_SYNC)
-    # change_reg_bits('ctrl', 1, r_fast.sync.OFFSET_MAN_SYNC)
-    # change_reg_bits('ctrl', 0, r_fast.sync.OFFSET_MAN_SYNC)
+    if do_sync:
+        _pulse(timed_addr, swsync_bit)  # sync pulse on timed_sync_ctrl[SW_SYNC]
 
     return
 
