@@ -2062,6 +2062,9 @@ class ReadoutServer:
                     param_value = message.get('value')
                     autosync = message.get('autosync', True)
                     mrst = message.get('mrst', False)
+                    # Per-tone RX phase compensation for the RX-vs-TX path delay,
+                    # relevant when setting tones without a sync (autosync=False).
+                    compensate_rx_ticks = int(message.get('compensate_rx_ticks', 0))
                     response = {'status': 'error', 'message': f'Invalid parameter name {param_name}'}
                     if param_name == 'sample_rate_hz':
                         firmware_lib.set_sample_rate(self.r, param_value)
@@ -2078,7 +2081,8 @@ class ReadoutServer:
                         tone_settings = firmware_lib.set_tone_frequencies_fast(
                             self.r, self.r_fast, self.config, param_value,
                             tone_amplitudes=amps, tone_phases=phases,
-                            autosync=autosync, mrst=mrst)
+                            autosync=autosync, mrst=mrst,
+                            compensate_rx_ticks=compensate_rx_ticks)
                         self._set_tone_state_cache(param_value, amps, phases)
                         self._invalidate_modulation('tone frequencies changed')
                         self._set_active_tone_indices_from_settings(tone_settings)
@@ -2230,6 +2234,7 @@ class ReadoutServer:
                         requested_setup_sync = message.get('setup_sync', None)
                         requested_mrst = message.get('mrst', None)
                         requested_setup_mrst = message.get('setup_mrst', None)
+                        requested_compensate_rx_ticks = message.get('compensate_rx_ticks', None)
                         if (message.get('offsets') is None and message.get('center') is None
                                 and self.modulation_cfg is not None):
                             c = self.modulation_cfg          # resume a resident config
@@ -2248,6 +2253,9 @@ class ReadoutServer:
                             setup_mrst = (
                                 c.get('setup_mrst', True) if requested_setup_mrst is None
                                 else bool(requested_setup_mrst))
+                            compensate_rx_ticks = (
+                                c.get('compensate_rx_ticks', 0) if requested_compensate_rx_ticks is None
+                                else int(requested_compensate_rx_ticks))
                         else:
                             center = message.get('center')
                             offsets = message.get('offsets')
@@ -2258,12 +2266,16 @@ class ReadoutServer:
                             setup_sync = True if requested_setup_sync is None else bool(requested_setup_sync)
                             mrst = False if requested_mrst is None else bool(requested_mrst)
                             setup_mrst = True if requested_setup_mrst is None else bool(requested_setup_mrst)
+                            compensate_rx_ticks = (
+                                0 if requested_compensate_rx_ticks is None
+                                else int(requested_compensate_rx_ticks))
                             if offsets is None:
                                 raise ValueError('offsets required to arm modulation')
                         epoch = self._next_modulation_command_epoch()
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_modulation, center, offsets, mod_indices, spp, n_settle,
-                            autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
+                            autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
+                            compensate_rx_ticks=compensate_rx_ticks)
                         self._check_modulation_command_epoch(epoch)
                         if bundle['needs_recenter']:
                             raise ValueError(
@@ -2304,12 +2316,17 @@ class ReadoutServer:
                             c.get('mrst', False) if requested_mrst is None
                             else bool(requested_mrst))
                         setup_mrst = c.get('setup_mrst', True)
+                        requested_compensate_rx_ticks = message.get('compensate_rx_ticks', None)
+                        compensate_rx_ticks = (
+                            c.get('compensate_rx_ticks', 0) if requested_compensate_rx_ticks is None
+                            else int(requested_compensate_rx_ticks))
                         armed = self.modulation_params['armed']
                         epoch = self._next_modulation_command_epoch()
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_modulation, center, offsets, c['mod_indices'],
                             c['samples_per_point'], c['n_settle'],
-                            armed=armed, autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
+                            armed=armed, autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
+                            compensate_rx_ticks=compensate_rx_ticks)
                         self._check_modulation_command_epoch(epoch)
                         if bundle['needs_recenter'] and on_map_change != 'recenter':
                             await self.send_response(writer, {'status': 'error',
@@ -2322,7 +2339,8 @@ class ReadoutServer:
                                 bundle, state, cfg = await self.to_thread(
                                     self._prepare_modulation, center, offsets, c['mod_indices'],
                                     c['samples_per_point'], c['n_settle'],
-                                    autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
+                                    autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
+                                    compensate_rx_ticks=compensate_rx_ticks)
                                 self._check_modulation_command_epoch(epoch)
                                 op = 'recenter'
                             else:
@@ -2356,11 +2374,16 @@ class ReadoutServer:
                             c.get('mrst', False) if requested_mrst is None
                             else bool(requested_mrst))
                         setup_mrst = c.get('setup_mrst', True)
+                        requested_compensate_rx_ticks = message.get('compensate_rx_ticks', None)
+                        compensate_rx_ticks = (
+                            c.get('compensate_rx_ticks', 0) if requested_compensate_rx_ticks is None
+                            else int(requested_compensate_rx_ticks))
                         epoch = self._next_modulation_command_epoch()
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_modulation, c['center'], c['offsets'],
                             c['mod_indices'], c['samples_per_point'], c['n_settle'],
-                            autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
+                            autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
+                            compensate_rx_ticks=compensate_rx_ticks)
                         self._check_modulation_command_epoch(epoch)
                         rev = self._next_modulation_revision(cfg)
                         state['enabled'] = True
@@ -2703,6 +2726,7 @@ class ReadoutServer:
                             setup_sync = message.get('setup_sync', True)
                             mrst = message.get('mrst', False)
                             setup_mrst = message.get('setup_mrst', True)
+                            compensate_rx_ticks = int(message.get('compensate_rx_ticks', 0))
                             self.latest_sweep_data_valid = False
                             self.sweep_progress = 0.0
                             self.sweep_state = {'state': 'running', 'message': 'Sweep in progress'}
@@ -2711,7 +2735,8 @@ class ReadoutServer:
                                 self.sweep(centers, spans, points, samples_per_point,
                                            direction, refresh_adc_cal=refresh_adc_cal,
                                            adc_cal_settle_time=adc_cal_settle_time,
-                                           autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
+                                           autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
+                                           compensate_rx_ticks=compensate_rx_ticks)
                             )
 
                             #print('await send response')
@@ -2827,6 +2852,7 @@ class ReadoutServer:
                             setup_sync = message.get('setup_sync', True)
                             mrst = message.get('mrst', False)
                             setup_mrst = message.get('setup_mrst', True)
+                            compensate_rx_ticks = int(message.get('compensate_rx_ticks', 0))
                             self.latest_sweep_data_valid = False
                             self.sweep_progress = 0.0
                             self.sweep_state = {'state': 'running', 'message': 'Retune in progress'}
@@ -2836,7 +2862,8 @@ class ReadoutServer:
                                             freq_offsets,
                                             refresh_adc_cal=refresh_adc_cal,
                                             adc_cal_settle_time=adc_cal_settle_time,
-                                            autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
+                                            autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
+                                            compensate_rx_ticks=compensate_rx_ticks)
                             )
                             await self.send_response(writer, {'status': 'success', 'message': 'Retune in progress'})
                         except Exception as e:
@@ -3632,7 +3659,8 @@ class ReadoutServer:
 
     def _prepare_modulation(self, center, offsets, mod_indices,
                             samples_per_point, n_settle, armed=None,
-                            autosync=True, setup_sync=True, mrst=False, setup_mrst=True):
+                            autosync=True, setup_sync=True, mrst=False, setup_mrst=True,
+                            compensate_rx_ticks=0):
         """
         Build a modulation bundle + observability state from a centre comb and
         per-point probe offsets. Pure computation (hardware *reads* only, no
@@ -3712,12 +3740,14 @@ class ReadoutServer:
 
         bundle = firmware_lib.prepare_modulation_settings_fast(
             self.r_fast, self.config, center, point_offsets,
-            tone_amplitudes=amps, tone_phases=phases, armed=armed)
+            tone_amplitudes=amps, tone_phases=phases, armed=armed,
+            compensate_rx_ticks=compensate_rx_ticks)
 
         cfg = {'center': center, 'offsets': offsets, 'mod_indices': mod_indices,
                'samples_per_point': int(samples_per_point), 'n_settle': int(n_settle),
                'autosync': bool(autosync), 'setup_sync': bool(setup_sync),
-               'mrst': bool(mrst), 'setup_mrst': bool(setup_mrst)}
+               'mrst': bool(mrst), 'setup_mrst': bool(setup_mrst),
+               'compensate_rx_ticks': int(compensate_rx_ticks)}
         state = self._build_modulation_state(bundle, cfg)
         return bundle, state, cfg
 
@@ -3917,6 +3947,7 @@ class ReadoutServer:
                 if self.modulation_cfg is not None:
                     autosync = bool(self.modulation_cfg.get('autosync', True))
                     mrst = bool(self.modulation_cfg.get('mrst', False))
+                    compensate_rx_ticks = int(self.modulation_cfg.get('compensate_rx_ticks', 0))
                     center = np.asarray(self.modulation_cfg['center'], dtype=float)
                     amps = self._tone_value_fallback(len(center), 'amplitudes', 1.0)
                     phases = self._tone_value_fallback(len(center), 'phases', 0.0)
@@ -3926,7 +3957,8 @@ class ReadoutServer:
                     tone_settings = firmware_lib.set_tone_frequencies_fast(
                         self.r, self.r_fast, self.config,
                         center, tone_indices=tone_indices, autosync=autosync, mrst=mrst,
-                        tone_amplitudes=amps, tone_phases=phases)
+                        tone_amplitudes=amps, tone_phases=phases,
+                        compensate_rx_ticks=compensate_rx_ticks)
                     self._set_tone_state_cache(center, amps, phases)
                     self._set_active_tone_indices_from_settings(tone_settings)
                 if self.modulation_state is not None:
@@ -4084,7 +4116,8 @@ class ReadoutServer:
 
     async def sweep(self, centers, spans, points, samples_per_point, direction,
                     refresh_adc_cal=True, adc_cal_settle_time=2.0,
-                    autosync=True, setup_sync=True, mrst=False, setup_mrst=True):
+                    autosync=True, setup_sync=True, mrst=False, setup_mrst=True,
+                    compensate_rx_ticks=0):
         """
         A coroutine that performs a frequency sweep and stores the results in self.latest_sweep_data.
 
@@ -4144,7 +4177,8 @@ class ReadoutServer:
             tone_settings = firmware_lib.set_tone_frequencies_fast(
                 self.r,self.r_fast,self.config,centers,autosync=autosync, mrst=mrst,
                 tone_amplitudes=sweep_tone_amplitudes,
-                tone_phases=sweep_tone_phases)
+                tone_phases=sweep_tone_phases,
+                compensate_rx_ticks=compensate_rx_ticks)
             self._set_tone_state_cache(centers, sweep_tone_amplitudes, sweep_tone_phases)
             self._set_active_tone_indices_from_settings(tone_settings)
 
@@ -4190,7 +4224,8 @@ class ReadoutServer:
             fast_sweep_params = firmware_lib.prepare_sweep_settings_fast(
                 self.r_fast, self.config, sweepfreqs,
                 tone_amplitudes=sweep_tone_amplitudes,
-                tone_phases=sweep_tone_phases)
+                tone_phases=sweep_tone_phases,
+                compensate_rx_ticks=compensate_rx_ticks)
 
             # If tone amplitudes were globally scaled down to protect the VACC,
             # raise psb_scale by the inverse to keep absolute output power.
@@ -4296,7 +4331,8 @@ class ReadoutServer:
                 self.r, self.r_fast, self.config, initial_freqs,
                 autosync=autosync, mrst=mrst,
                 tone_amplitudes=sweep_tone_amplitudes,
-                tone_phases=sweep_tone_phases)
+                tone_phases=sweep_tone_phases,
+                compensate_rx_ticks=compensate_rx_ticks)
             self._set_tone_state_cache(initial_freqs, sweep_tone_amplitudes, sweep_tone_phases)
             self._set_active_tone_indices_from_settings(tone_settings)
 
@@ -4336,7 +4372,8 @@ class ReadoutServer:
                 self.r, self.r_fast, self.config, initial_freqs,
                 autosync=autosync, mrst=mrst,
                 tone_amplitudes=sweep_tone_amplitudes,
-                tone_phases=sweep_tone_phases)
+                tone_phases=sweep_tone_phases,
+                compensate_rx_ticks=compensate_rx_ticks)
             self._set_tone_state_cache(initial_freqs, sweep_tone_amplitudes, sweep_tone_phases)
             self._set_active_tone_indices_from_settings(tone_settings)
             if init_psb_scale is not None:
@@ -4371,7 +4408,8 @@ class ReadoutServer:
 
     async def retune(self, center, span, points, samples_per_point, direction,
                      method, freq_offsets=None, refresh_adc_cal=True,
-                     adc_cal_settle_time=2.0, autosync=True, setup_sync=True, mrst=False, setup_mrst=True):
+                     adc_cal_settle_time=2.0, autosync=True, setup_sync=True, mrst=False, setup_mrst=True,
+                     compensate_rx_ticks=0):
         """
         A coroutine that performs a frequency sweep, finds the resonance peaks using the specified method, and sets the tones to the peak frequencies.
 
@@ -4416,7 +4454,8 @@ class ReadoutServer:
                 center, span, points, samples_per_point, direction,
                 refresh_adc_cal=refresh_adc_cal,
                 adc_cal_settle_time=adc_cal_settle_time,
-                autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
+                autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
+                compensate_rx_ticks=compensate_rx_ticks)
             if not sweep_ok:
                 if self.sweep_state.get('state') not in ('cancelled', 'error'):
                     self.sweep_progress = float(1.0)
@@ -4468,7 +4507,8 @@ class ReadoutServer:
             tone_settings = firmware_lib.set_tone_frequencies_fast(
                 self.r,self.r_fast,self.config,retune_freqs,
                 tone_amplitudes=amps, tone_phases=phases,
-                autosync=autosync, mrst=mrst)
+                autosync=autosync, mrst=mrst,
+                compensate_rx_ticks=compensate_rx_ticks)
             self._set_tone_state_cache(retune_freqs, amps, phases)
             self._set_active_tone_indices_from_settings(tone_settings)
             self.sweep_progress = 1.0
