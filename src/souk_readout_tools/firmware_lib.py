@@ -145,6 +145,45 @@ def _format_phase_offsets(phase_offsets, phase_offset_bp,fmt='>i4'):
     phase_offset_int = (phase_offset_scaled * (2**phase_offset_bp))
     return phase_offset_int.astype(fmt)
 
+# Fabric clock the path-delay tick count is measured against: 307.2 MHz, the
+# fabric/FFT clock = adc_clk_hz (4915.2 MHz) / 16 (4x parallel * 2x oversample of
+# the upstream FFT). Used only to turn a tick count into a delay time; kept as a
+# constant so the compensation does not depend on the firmware mixer geometry.
+FABRIC_CLK_HZ = 307.2e6
+
+# Fixed group delay between the RX and TX paths, in FABRIC_CLK_HZ ticks. It is
+# normally hidden because every retune is followed by a software sync that
+# re-aligns both paths. When you retune *without* that sync (e.g. fast
+# sweep/modulation), the RX fine-mixer LO has run ~46.666 us (14336 ticks)
+# further than the TX LO, so each tone picks up a per-tone phase error
+# proportional to its RX baseband offset frequency. See _rx_phase_compensation.
+TX_RX_PATH_DELAY_TICKS = 14336
+
+def _rx_phase_compensation(phase_incs_rx, fft_rbw_hz, compensate_rx_ticks,
+                           tick_clk_hz=FABRIC_CLK_HZ):
+    """Per-tone RX phase offset (rad) that cancels the RX-vs-TX path delay when
+    retuning without a sync.
+
+    The delay acts on the RX fine-mixer LO, whose phase advances by
+    ``phase_incs_rx`` radians per FFT period (the residual offset of the tone
+    from its bin centre). Over a delay of ``Dt = compensate_rx_ticks /
+    tick_clk_hz`` seconds that is
+
+        phi = phase_incs_rx * (Dt / fft_period_s)
+            = phase_incs_rx * compensate_rx_ticks * fft_rbw_hz / tick_clk_hz
+
+    (since ``fft_period_s = 1 / fft_rbw_hz``). Equivalent to
+    ``2*pi * rx_freq_offset_hz * Dt``. ``compensate_rx_ticks`` is counted in
+    ``tick_clk_hz`` (307.2 MHz fabric clock) ticks, NOT adc_clk_hz. Added to the
+    RX phase offsets only; the TX path is left untouched.
+
+    Returns 0.0 (a scalar that broadcasts) when no compensation is requested, so
+    callers can add it unconditionally without changing the zero-tick result.
+    """
+    if not compensate_rx_ticks:
+        return 0.0
+    return phase_incs_rx * compensate_rx_ticks * fft_rbw_hz / tick_clk_hz
+
 def _format_ri_steps(ri_steps, ri_step_bp,fmt='>u4'):
     """
     Vectorised: Given a desired RI step, format as appropriate
@@ -2362,7 +2401,7 @@ def _protect_tone_amplitudes_for_vacc(tone_amplitudes, max_tones_per_bin):
 
 def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indices=None,
                                     min_tone_separation=6, tone_amplitudes=None,
-                                    tone_phases=None):
+                                    tone_phases=None, compensate_rx_ticks=0):
     """
     Prepare the tone frequency settings for applying to the RFSOC.
 
@@ -2382,6 +2421,9 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
                   indices using compute_vacc_tone_indices() to handle VACC constraints.
     min_tone_separation: minimum separation between LO indices feeding the same FFT bin
                          (only used when tone_indices is None). Default is 6.
+    compensate_rx_ticks: if non-zero, add a per-tone RX phase offset to cancel
+                         the RX-vs-TX path delay (in 307.2 MHz clock ticks) seen
+                         when retuning without a sync. See _rx_phase_compensation.
     """
     #config
     udc_connected = config_dict['rf_frontend']['connected']
@@ -2520,11 +2562,21 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
         scaling_rx_full[tone_indices] = 1.0
         lo_control_values['tx']['scaling'] = scaling_tx_full
         lo_control_values['rx']['scaling'] = scaling_rx_full
-    if tone_phases is not None:
-        phase_offsets_full = np.zeros(n_chans, dtype=float)
-        phase_offsets_full[tone_indices] = tone_phases
-        lo_control_values['tx']['phase_offsets'] = phase_offsets_full
-        lo_control_values['rx']['phase_offsets'] = phase_offsets_full
+    # RX picks up an extra per-tone phase offset to cancel the RX-vs-TX path
+    # delay (no-op when compensate_rx_ticks==0). TX keeps the bare tone phases,
+    # and is written only when tone_phases is given (tone_phases=None means
+    # "leave unchanged"); RX is written whenever phases or compensation apply.
+    rx_phase_comp = _rx_phase_compensation(
+        phase_incs_rx, fft_rbw_hz, compensate_rx_ticks)
+    if tone_phases is not None or compensate_rx_ticks:
+        tone_phases_arr = tone_phases if tone_phases is not None else np.zeros(num_tones)
+        phase_offsets_rx_full = np.zeros(n_chans, dtype=float)
+        phase_offsets_rx_full[tone_indices] = tone_phases_arr + rx_phase_comp
+        lo_control_values['rx']['phase_offsets'] = phase_offsets_rx_full
+        if tone_phases is not None:
+            phase_offsets_tx_full = np.zeros(n_chans, dtype=float)
+            phase_offsets_tx_full[tone_indices] = tone_phases_arr
+            lo_control_values['tx']['phase_offsets'] = phase_offsets_tx_full
 
     #prepare the formatted lo control buffer values
     buf = get_next_buffer_idx(r)
@@ -2624,7 +2676,8 @@ def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True, mrst=Fal
 def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
                                          tone_indices=None, min_tone_separation=6,
                                          detailed_output=False,
-                                         tone_amplitudes=None, tone_phases=None):
+                                         tone_amplitudes=None, tone_phases=None,
+                                         compensate_rx_ticks=0):
     """
     Prepare the tone frequency settings for applying to the RFSOC.
 
@@ -2645,6 +2698,9 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
     min_tone_separation: minimum separation between LO indices feeding the same FFT bin
                          (only used when tone_indices is None). Default is 6.
     detailed_output: if True, return detailed output dictionary
+    compensate_rx_ticks: if non-zero, add a per-tone RX phase offset to cancel
+                         the RX-vs-TX path delay (in 307.2 MHz clock ticks) seen
+                         when retuning without a sync. See _rx_phase_compensation.
     """
     #config
     udc_connected = config_dict['rf_frontend']['connected']
@@ -2771,9 +2827,16 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
         lo_control_values['tx']['scaling'] = tone_amplitudes
         lo_control_values['rx']['scaling'] = np.ones_like(
             tone_amplitudes, dtype=float)
+    # RX picks up an extra per-tone phase offset to cancel the RX-vs-TX path
+    # delay (no-op when compensate_rx_ticks==0). TX keeps the bare tone phases.
+    rx_phase_comp = _rx_phase_compensation(
+        phase_incs_rx, fft_rbw_hz, compensate_rx_ticks)
     if tone_phases is not None:
         lo_control_values['tx']['phase_offsets'] = tone_phases
-        lo_control_values['rx']['phase_offsets'] = tone_phases
+        lo_control_values['rx']['phase_offsets'] = tone_phases + rx_phase_comp
+    elif compensate_rx_ticks:
+        # No tone phases set, but still need the RX compensation on its own.
+        lo_control_values['rx']['phase_offsets'] = np.zeros(num_tones) + rx_phase_comp
     v,i = prepare_control_buffer_data_fast(r, 0, lo_control_values,
                                            tone_indices=tone_indices)
     # #format the phase increments and ri steps for the mixer LOs
@@ -2915,7 +2978,7 @@ def _rf_to_digital_baseband(r, config_dict, tone_frequencies):
 
 def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, point_offsets,
                                      min_tone_separation=6, tone_amplitudes=None,
-                                     tone_phases=None, armed=None):
+                                     tone_phases=None, armed=None, compensate_rx_ticks=0):
     """
     Prepare a fast-frequency-modulation bundle: per-point mixer control words
     computed **relative to a single armed set of filterbank bins**.
@@ -2953,6 +3016,13 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
     tone_phases : numpy.ndarray or None, optional
         Per-tone phase offsets (rad) written into every point's control words.
         ``None`` leaves phases unchanged.
+    compensate_rx_ticks : int, optional
+        If non-zero, add a per-tone, per-point RX phase offset to cancel the
+        RX-vs-TX path delay (in 307.2 MHz clock ticks) seen when modulating
+        without a per-point sync. The RX offset tracks each point's RX baseband
+        offset, so it is baked into the per-point control words rather than the
+        once-at-arm write; the returned ``phase_offsets`` is then ``None``.
+        See _rx_phase_compensation.
 
     Returns
     -------
@@ -3050,6 +3120,22 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
             lo_control_values['tx']['scaling'] = tone_amplitudes
             lo_control_values['rx']['scaling'] = np.ones_like(tone_amplitudes, dtype=float)
 
+        # Exception to the above: RX path-delay compensation tracks this point's
+        # RX baseband offset, so it varies per point and cannot be written once.
+        # The write-once helper writes the same offset to both tx and rx, which
+        # would clobber the per-point RX value, so when compensating we bake the
+        # offsets per point (and return phase_offsets=None below). The RX offset
+        # is always written (base phase + compensation); the TX offset is written
+        # per point only when tone_phases is given, otherwise TX offsets are left
+        # untouched -- matching the tone_phases=None ("leave unchanged") contract.
+        if compensate_rx_ticks:
+            rx_phase_comp = _rx_phase_compensation(
+                phase_incs_rx, fft_rbw_hz, compensate_rx_ticks)
+            base = tone_phases if tone_phases is not None else 0.0
+            if tone_phases is not None:
+                lo_control_values['tx']['phase_offsets'] = tone_phases
+            lo_control_values['rx']['phase_offsets'] = base + rx_phase_comp
+
         # buf=0 here is irrelevant: the formatted values are buffer-agnostic; the
         # scheduler writes them into whichever buffer is currently inactive.
         v, i = prepare_control_buffer_data_fast(r_fast, 0, lo_control_values, tone_indices=tone_indices)
@@ -3072,7 +3158,11 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
         'num_points': num_points,
         'num_tones': num_tones,
         'tone_indices': tone_indices,
-        'phase_offsets': tone_phases,         # per-tone LO start phases (rad), written once into both buffers; None leaves them unchanged
+        # Per-tone LO start phases (rad), written once into both buffers; None
+        # leaves them unchanged. When RX path-delay compensation is active the
+        # offsets vary per point and are baked into control_values above, so the
+        # once-write is suppressed (None) to avoid clobbering them.
+        'phase_offsets': None if compensate_rx_ticks else tone_phases,
         'chanmap_psb_inmap': chanmap_psb_inmap,
         'chanmap_pfb': chanmap_pfb,
         'control_values': control_values,     # list len n_points (buffer-agnostic)
@@ -3088,11 +3178,17 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
 
 def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
                                 min_tone_separation=6, detailed_output=False,
-                                tone_amplitudes=None, tone_phases=None):
+                                tone_amplitudes=None, tone_phases=None,
+                                compensate_rx_ticks=0):
     """
     Prepare sweep step settings with VACC-aware tone index assignment.
 
     sweep_freqs: 2D array (num_points, num_tones)
+    compensate_rx_ticks: if non-zero, add a per-tone, per-point RX phase offset to
+        cancel the RX-vs-TX path delay (in 307.2 MHz clock ticks) seen when the
+        sweep steps without a per-step sync. Because the RX offset varies per
+        point, the offsets ride in each per-point write rather than the
+        write-once path (TX still uses write-once). See _rx_phase_compensation.
     """
     sweep_frequencies = np.atleast_2d(sweep_frequencies)
     num_points,num_tones = sweep_frequencies.shape
@@ -3257,6 +3353,17 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
     # write to land in the right slot.
     write_offsets_once = bool(tx_bins_stable) and (tone_phases is not None)
 
+    # RX path-delay compensation is per-tone *and* per-point (it tracks the RX
+    # baseband offset, which moves with frequency across the sweep), so the RX
+    # offset can never be written once. The write-once helper
+    # (write_phase_offsets_both_buffers_fast) writes the *same* offset to both
+    # tx and rx, which would clobber the per-point RX compensation -- so when
+    # compensating we drop the write-once path entirely and bake both tx and rx
+    # offsets per point. A few extra offset words per point; negligible.
+    compensate_rx = bool(compensate_rx_ticks)
+    if compensate_rx:
+        write_offsets_once = False
+
 
     # #format the phase increments and ri steps for the mixer LOs
     # phase_incs_tx_formatted = _format_phase_steps(phase_incs_tx,r.mixer._phase_bp,fmt='<i4')
@@ -3297,11 +3404,18 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
             lo_control_values['tx']['scaling'] = tone_amplitudes
             lo_control_values['rx']['scaling'] = np.ones_like(
                 tone_amplitudes, dtype=float)
-        # Only bake offsets per point when the LO slots move across the sweep;
-        # otherwise they are written once into both buffers by the caller.
+        # Bake the TX offset per point only when the LO slots move across the
+        # sweep; otherwise it is written once into both buffers by the caller.
         if tone_phases is not None and not write_offsets_once:
             lo_control_values['tx']['phase_offsets'] = tone_phases
-            lo_control_values['rx']['phase_offsets'] = tone_phases
+        # The RX offset rides per point whenever it varies across points: either
+        # because the LO slots move (not write_offsets_once) or because the
+        # path-delay compensation is active (it tracks this point's RX offset).
+        if (tone_phases is not None and not write_offsets_once) or compensate_rx:
+            rx_phase_comp = _rx_phase_compensation(
+                phase_incs_rx[p], fft_rbw_hz, compensate_rx_ticks)
+            base_rx = tone_phases if tone_phases is not None else 0.0
+            lo_control_values['rx']['phase_offsets'] = base_rx + rx_phase_comp
         allv[p], alli[p] = prepare_control_buffer_data_fast(
             r_fast, allbuf[p], lo_control_values,
             tone_indices=tone_indices_arr[p])
@@ -3643,7 +3757,7 @@ def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, 
 def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
                          min_tone_separation=6, autosync=True, mrst=False,
                          detailed_output=False, tone_amplitudes=None,
-                         tone_phases=None):
+                         tone_phases=None, compensate_rx_ticks=0):
     """
     Set the tone frequencies in the RFSOC.
 
@@ -3682,7 +3796,8 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
         tone_indices=tone_indices,
         min_tone_separation=min_tone_separation,
         tone_amplitudes=tone_amplitudes,
-        tone_phases=tone_phases)
+        tone_phases=tone_phases,
+        compensate_rx_ticks=compensate_rx_ticks)
     apply_tone_frequency_settings(r, tone_frequency_settings, autosync=autosync, mrst=mrst)
 
     if detailed_output:
@@ -3693,7 +3808,7 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
 def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
                               tone_indices=None, min_tone_separation=6,
                               autosync=True, mrst=False, tone_amplitudes=None,
-                              tone_phases=None):
+                              tone_phases=None, compensate_rx_ticks=0):
     """
     Set the tone frequencies in the RFSOC using the fast firmware interface.
 
@@ -3715,6 +3830,10 @@ def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
     min_tone_separation: minimum separation between LO indices feeding the same FFT bin
                          (only used when tone_indices is None). Default is 6.
     autosync: if True, sync after setting tones
+    compensate_rx_ticks: if non-zero, add a per-tone RX phase offset to cancel the
+                         RX-vs-TX path delay (in 307.2 MHz clock ticks) seen when
+                         retuning without a sync (e.g. autosync=False). Pass
+                         firmware_lib.TX_RX_PATH_DELAY_TICKS for the measured delay.
     """
     num_tones = len(np.atleast_1d(tone_frequencies))
     if tone_amplitudes is None:
@@ -3729,7 +3848,8 @@ def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
         tone_indices=tone_indices,
         min_tone_separation=min_tone_separation,
         tone_amplitudes=tone_amplitudes,
-        tone_phases=tone_phases)
+        tone_phases=tone_phases,
+        compensate_rx_ticks=compensate_rx_ticks)
     apply_tone_frequency_settings_fast(r, r_fast, tone_frequency_settings, autosync=autosync, mrst=mrst)
 
     return tone_frequency_settings

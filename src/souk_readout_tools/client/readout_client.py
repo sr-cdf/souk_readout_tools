@@ -1179,11 +1179,19 @@ class ReadoutClient:
         """Return the latest telescope timestamp reported by the server."""
         return self.get_parameter('telescope_time')
 
-    def set_tone_frequencies(self, tone_frequencies, autosync=True, mrst=False):
-        """Set the active ``tone_frequencies`` (array-like, Hz)."""
+    def set_tone_frequencies(self, tone_frequencies, autosync=True, mrst=False,
+                             compensate_rx_ticks=0):
+        """Set the active ``tone_frequencies`` (array-like, Hz).
+
+        ``compensate_rx_ticks`` (int): if non-zero, add a per-tone RX phase
+        offset to cancel the RX-vs-TX path delay (in 307.2 MHz clock ticks)
+        seen when setting tones without a sync (``autosync=False``). Pass 14336
+        (the measured ~46.67 us delay) to enable.
+        """
         tone_frequencies = np.atleast_1d(tone_frequencies).tolist()
         return self.set_parameter(
-            'tone_frequencies', tone_frequencies, autosync=bool(autosync), mrst=bool(mrst))
+            'tone_frequencies', tone_frequencies, autosync=bool(autosync), mrst=bool(mrst),
+            compensate_rx_ticks=int(compensate_rx_ticks))
 
     def get_tone_frequencies(self,detailed_output=False):
         """Return active tone frequencies; with ``detailed_output=True`` return
@@ -2005,7 +2013,8 @@ class ReadoutClient:
 
     def enable_modulation(self, center=None, offsets=None, mod_indices=None,
                           samples_per_point=1, n_settle=1, autosync=True,
-                          setup_sync=True, mrst=False, setup_mrst=True):
+                          setup_sync=True, mrst=False, setup_mrst=True,
+                          compensate_rx_ticks=0):
         """
         Arm fast tone-frequency modulation. This only **arms** (loads the config
         on the server); it does not start output. Call :meth:`enable_stream` for
@@ -2041,6 +2050,11 @@ class ReadoutClient:
             Whether the per-step (``autosync``) sync also pulses master-reset
             (v7.10). Default ``False`` (light re-reference). ``setup_mrst``
             (default ``True``) is the same knob for the arm-time ``setup_sync``.
+        compensate_rx_ticks : int, optional
+            If non-zero, add a per-tone, per-point RX phase offset to cancel the
+            RX-vs-TX path delay (in 307.2 MHz clock ticks) seen when modulating
+            without a per-step sync (``autosync=False``). Pass 14336 (the
+            measured ~46.67 us delay) to enable. Default 0 (off).
 
         Returns
         -------
@@ -2055,7 +2069,8 @@ class ReadoutClient:
                    'autosync': bool(autosync),
                    'setup_sync': bool(setup_sync),
                    'mrst': bool(mrst),
-                   'setup_mrst': bool(setup_mrst)}
+                   'setup_mrst': bool(setup_mrst),
+                   'compensate_rx_ticks': int(compensate_rx_ticks)}
         if center is not None:
             message['center'] = np.asarray(center, dtype=float).tolist()
         if offsets is not None:
@@ -2065,7 +2080,7 @@ class ReadoutClient:
         return self.send_request(message)
 
     def update_modulation(self, center=None, offsets=None, on_map_change='continue',
-                          autosync=None, mrst=None):
+                          autosync=None, mrst=None, compensate_rx_ticks=None):
         """
         Seamlessly update the modulation centre and/or offsets while armed, with
         no dropped frames. Rides the existing armed channel maps.
@@ -2084,6 +2099,9 @@ class ReadoutClient:
             and asks you to recenter; ``'recenter'`` performs the brief map reload.
         autosync : bool or None, optional
             Override the existing modulation sync mode. ``None`` preserves it.
+        compensate_rx_ticks : int or None, optional
+            Override the RX path-delay compensation (307.2 MHz clock ticks) for
+            the update. ``None`` preserves the armed config's value.
 
         Returns
         -------
@@ -2100,20 +2118,26 @@ class ReadoutClient:
             message['autosync'] = bool(autosync)
         if mrst is not None:
             message['mrst'] = bool(mrst)
+        if compensate_rx_ticks is not None:
+            message['compensate_rx_ticks'] = int(compensate_rx_ticks)
         return self.send_request(message)
 
-    def recenter_modulation(self, autosync=None, mrst=None):
+    def recenter_modulation(self, autosync=None, mrst=None, compensate_rx_ticks=None):
         """
         Recenter modulation: reload the channel maps / mixer frequencies for the
         current centre and recompute VACC bin-sharing (a deliberate brief break).
         Use when :meth:`update_modulation` reports tones beyond bin coverage.
         ``autosync=None`` preserves the existing sync mode; pass a bool to change it.
+        ``compensate_rx_ticks=None`` likewise preserves the armed RX path-delay
+        compensation; pass an int (307.2 MHz clock ticks) to change it.
         """
         message = {'request': 'recenter_modulation'}
         if autosync is not None:
             message['autosync'] = bool(autosync)
         if mrst is not None:
             message['mrst'] = bool(mrst)
+        if compensate_rx_ticks is not None:
+            message['compensate_rx_ticks'] = int(compensate_rx_ticks)
         return self.send_request(message)
 
     def disable_modulation(self):
@@ -3435,7 +3459,8 @@ class ReadoutClient:
     def perform_sweep(self, centers, spans, points, samples_per_point,
                       direction='up', phases=None, refresh_adc_cal=True,
                       adc_cal_settle_time=2.0, wait=False, autosync=True,
-                      setup_sync=True, mrst=False, setup_mrst=True):
+                      setup_sync=True, mrst=False, setup_mrst=True,
+                      compensate_rx_ticks=0):
         """
         Perform a frequency sweep.
 
@@ -3469,9 +3494,15 @@ class ReadoutClient:
             mrst (bool): Whether the per-step (``autosync``) sync also pulses
                 master-reset (v7.10; default False). ``setup_mrst`` (default
                 True) is the same knob for the start-of-sweep ``setup_sync``.
+            compensate_rx_ticks (int): If non-zero, add a per-tone RX phase
+                offset to cancel the RX-vs-TX path delay (in 307.2 MHz clock
+                ticks) seen when retuning without a per-step sync (autosync=
+                False). Pass 14336 (the measured ~46.67 us delay) to enable.
         """
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
-        response = self.set_tone_frequencies(centers, autosync=autosync, mrst=mrst)
+        response = self.set_tone_frequencies(
+            centers, autosync=autosync, mrst=mrst,
+            compensate_rx_ticks=compensate_rx_ticks)
         if response['status'] != 'success':
             print(f"Error setting tone frequencies: {response['message']}")
             return response
@@ -3496,6 +3527,7 @@ class ReadoutClient:
             'setup_sync': bool(setup_sync),
             'mrst': bool(mrst),
             'setup_mrst': bool(setup_mrst),
+            'compensate_rx_ticks': int(compensate_rx_ticks),
         }
         response = self.send_request(message)
         if wait:
@@ -3508,7 +3540,8 @@ class ReadoutClient:
                        direction='up', method='max_gradient',
                        freq_offsets=None, phases=None, refresh_adc_cal=True,
                        adc_cal_settle_time=2.0, wait=False, autosync=True,
-                       setup_sync=True, mrst=False, setup_mrst=True):
+                       setup_sync=True, mrst=False, setup_mrst=True,
+                       compensate_rx_ticks=0):
         """
         Perform a retune sweep to find optimal tone frequencies.
 
@@ -3540,9 +3573,15 @@ class ReadoutClient:
             mrst (bool): Whether the per-step (``autosync``) sync also pulses
                 master-reset (v7.10; default False). ``setup_mrst`` (default
                 True) is the same knob for the start-of-sweep ``setup_sync``.
+            compensate_rx_ticks (int): If non-zero, add a per-tone RX phase
+                offset to cancel the RX-vs-TX path delay (in 307.2 MHz clock
+                ticks) seen when retuning without a per-step sync (autosync=
+                False). Pass 14336 (the measured ~46.67 us delay) to enable.
         """
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
-        response = self.set_tone_frequencies(centers, autosync=autosync, mrst=mrst)
+        response = self.set_tone_frequencies(
+            centers, autosync=autosync, mrst=mrst,
+            compensate_rx_ticks=compensate_rx_ticks)
         if response['status'] != 'success':
             print(f"Error setting tone frequencies: {response['message']}")
             return response
@@ -3586,6 +3625,7 @@ class ReadoutClient:
             'setup_sync': bool(setup_sync),
             'mrst': bool(mrst),
             'setup_mrst': bool(setup_mrst),
+            'compensate_rx_ticks': int(compensate_rx_ticks),
         }
         response = self.send_request(message)
         if wait:
@@ -5350,7 +5390,7 @@ class ReadoutClient:
 
 
     def set_tones_helper(self, freqs, amps=None, phases=None, powers_dbm=None,
-                         autosync=True, mrst=False):
+                         autosync=True, mrst=False, compensate_rx_ticks=0):
         """
         Convenience method: set frequencies, powers/amplitudes, and phases in one call.
 
@@ -5366,6 +5406,10 @@ class ReadoutClient:
                         uses set_tone_powers() to apply calibrated power levels.
             autosync: If True (default), trigger firmware sync after tone
                       frequency/amplitude/phase writes.
+            compensate_rx_ticks: If non-zero, add a per-tone RX phase offset to
+                      cancel the RX-vs-TX path delay (307.2 MHz clock ticks) seen
+                      when setting tones without a sync (autosync=False). Pass
+                      14336 (the measured ~46.67 us delay) to enable.
         """
         import warnings
 
@@ -5373,7 +5417,8 @@ class ReadoutClient:
             raise ValueError("Frequencies must be provided and cannot be empty.")
         freqs = np.atleast_1d(freqs)
 
-        self.set_tone_frequencies(freqs, autosync=autosync, mrst=mrst)
+        self.set_tone_frequencies(freqs, autosync=autosync, mrst=mrst,
+                                  compensate_rx_ticks=compensate_rx_ticks)
         active_freqs = self.get_tone_frequencies()
         if phases is None:
             phases = self.generate_newman_phases(active_freqs)
