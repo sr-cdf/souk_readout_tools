@@ -1,0 +1,6 @@
+# compiled C profiler — architecture-specific, always rebuild with `make`
+devmem_profile
+
+# generated profiler output / backing files
+devmem_backing*.bin
+devmem_profile_*.txt
