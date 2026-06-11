@@ -1,0 +1,19 @@
+[Unit]
+Description=SOUK TSU strobe -- 1-PPS into the RFSoC firmware off the PTP-disciplined PHC
+Documentation=man:ptp4l(8)
+# The strobe runs and re-arms regardless of PTP/chrony -- it just won't produce a
+# time-aligned PPS until the PHC is disciplined. So this is only a soft ORDERING
+# hint (start after these IF present), NOT a dependency:
+After=ptp4l.service chrony.service network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/casper/py3.12-venv/bin/souk-tsu-strobe
+Restart=always
+RestartSec=2
+User=root
+SyslogIdentifier=souk-tsu-strobe
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

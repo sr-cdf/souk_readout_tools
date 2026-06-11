@@ -323,6 +323,11 @@ class MockReadoutServer:
             'registers': self._info_registers,
             'tone_modulation': self._info_tone_modulation,
         }
+        if sections == 'list':
+            return {
+                'all': [s for s in self.ALL_INFO_SECTIONS if s in dispatchers],
+                'default': [s for s in self.DEFAULT_INFO_SECTIONS if s in dispatchers],
+            }
         if sections is None:
             return {s: dispatchers[s]() for s in self.DEFAULT_INFO_SECTIONS}
         if sections == 'all':

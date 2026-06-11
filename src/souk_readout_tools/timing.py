@@ -221,6 +221,7 @@ def timing_public_view(status: dict[str, Any]) -> dict[str, Any]:
             "condition": _state_summary(state),
             "updated_unix_s": status.get("timestamp"),
             "ready_for_firmware_sync": ready_for_firmware_sync,
+            "strobe_healthy": status.get("strobe_healthy", False),
             "absolute_time_verified": absolute_time_verified,
             "estimated_abs_error_s": estimated_abs_error_s,
             "active_source_type": source_type,
@@ -348,6 +349,17 @@ def timing_public_view(status: dict[str, Any]) -> dict[str, Any]:
             "tracking": status.get("chrony_tracking_text", ""),
             "sources": status.get("chrony_sources_text", ""),
         },
+        "strobe": {
+            # TSU 1-PPS strobe daemon status (from /run/tsu-strobe.status, read by
+            # the timing monitor). present=False -> daemon never ran.
+            "present": status.get("strobe_present", False),
+            "running": status.get("strobe_running", False),
+            "healthy": status.get("strobe_healthy", False),
+            "pid": status.get("strobe_pid"),
+            "rearms": status.get("strobe_rearms"),
+            "tsu_sec": status.get("strobe_tsu_sec"),
+            "status_age_s": status.get("strobe_status_age_s"),
+        },
     }
 
 
@@ -368,6 +380,7 @@ def get_timing_summary(
                 "condition": status.get("error", "Timing monitor unavailable."),
                 "updated_unix_s": status.get("timestamp"),
                 "ready_for_firmware_sync": False,
+                "strobe_healthy": False,
                 "absolute_time_verified": False,
                 "estimated_abs_error_s": None,
                 "active_source_type": "none",
@@ -410,5 +423,6 @@ def get_timing_summary(
             "phc": {},
             "ntp": {},
             "chrony": {},
+            "strobe": {"present": False, "running": False, "healthy": False},
         }
     return timing_public_view(status)
