@@ -113,6 +113,11 @@ def set_process_title(name: str) -> None:
 SOCKET_PATH = "/run/timing-monitor.sock"
 POLL_INTERVAL_S = 1.0
 
+# TSU strobe daemon status file (written by tsu_strobe_service.py each second).
+STROBE_STATUS_PATH = "/run/tsu-strobe.status"
+# Status older than this is considered stale -> strobe not healthy.
+STROBE_STALE_AFTER_S = 3.0
+
 # Threshold for considering PTP "well locked" (nanoseconds)
 PTP_LOCK_OFFSET_THRESHOLD_NS = 1_000  # 1 us
 LOCK_STABLE_POLLS = 5   # consecutive good polls required for "stable"
@@ -216,6 +221,18 @@ class Status:
 
     # For firmware timestamp sync decisions
     ready_for_firmware_sync: bool = False
+
+    # TSU strobe (1-PPS into firmware) -- from the strobe daemon's status file
+    # /run/tsu-strobe.status. strobe_present=False means the file is missing
+    # (daemon never ran); strobe_running reflects the daemon's own flag; the
+    # status is "healthy" only if present, running, and fresh.
+    strobe_present: bool = False
+    strobe_running: bool = False
+    strobe_healthy: bool = False
+    strobe_pid: Optional[int] = None
+    strobe_rearms: Optional[int] = None
+    strobe_tsu_sec: Optional[int] = None
+    strobe_status_age_s: Optional[float] = None
 
 
 # ----------------------------------------------------------------------------
@@ -815,6 +832,45 @@ class TimingMonitor:
 
             # Firmware timestamp sync requires sustained good PTP lock.
             s.ready_for_firmware_sync = s.ptp_quality_stable
+
+            # TSU strobe status, read from the strobe daemon's status file.
+            self._read_strobe_status(s, now)
+
+    def _read_strobe_status(self, s: "Status", now: float) -> None:
+        """Populate s.strobe_* from /run/tsu-strobe.status (best-effort).
+
+        Missing file -> strobe_present=False (daemon never ran). Stale or
+        running=False -> strobe_healthy=False.
+        """
+        try:
+            with open(STROBE_STATUS_PATH) as f:
+                st = json.load(f)
+        except FileNotFoundError:
+            s.strobe_present = False
+            s.strobe_running = False
+            s.strobe_healthy = False
+            s.strobe_pid = s.strobe_rearms = s.strobe_tsu_sec = None
+            s.strobe_status_age_s = None
+            return
+        except (OSError, ValueError):
+            # Unreadable / mid-write garbage: treat as present-but-unhealthy.
+            s.strobe_present = True
+            s.strobe_running = False
+            s.strobe_healthy = False
+            return
+
+        s.strobe_present = True
+        s.strobe_running = bool(st.get("running"))
+        s.strobe_pid = st.get("pid")
+        s.strobe_rearms = st.get("rearms")
+        s.strobe_tsu_sec = st.get("tsu_sec")
+        updated = st.get("updated_unix_s")
+        s.strobe_status_age_s = (now - updated) if updated is not None else None
+        s.strobe_healthy = bool(
+            s.strobe_running
+            and s.strobe_status_age_s is not None
+            and s.strobe_status_age_s < STROBE_STALE_AFTER_S
+        )
 
     async def get_status_dict(self) -> dict:
         async with self._lock:

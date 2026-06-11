@@ -56,7 +56,12 @@ firmware:
   adc_dbm_to_dbfs: +12
   vop_current_fullscale: 20000
   defaults:
-    sync_delay: 5714
+    # sync_delay is NOT set here. As of firmware v7.10.3 the RX/TX buffer-switch
+    # skew (which uses the sync_delay register) is measured and applied
+    # internally during firmware init (mixer.set_buffer_switch_skew). Setting it
+    # from config would overwrite that auto-alignment, so it is managed
+    # internally and intentionally omitted.
+    # sync_delay: 5714
     acc_len: 1000
     internal_loopback: false
     psb_scale: 1

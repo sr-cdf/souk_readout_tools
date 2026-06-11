@@ -878,20 +878,22 @@ class ReadoutClient:
 
         Parameters
         ----------
-        sections : str, list of str, or ``'all'``, optional
-            Which sections to include.  ``None`` returns the default set
-            (server, versions, clock, timing, fpga, rfdc, pipeline, tones,
-            rf_frontend, lna, rfsoc_sensors).  ``'all'`` includes
-            diagnostics, config, calibrations, resonators, and registers
-            as well. A string returns that section directly. A list returns
-            a list of section dictionaries in the same order.
+        sections : str, list of str, ``'all'``, or ``'list'``, optional
+            Which sections to include.  ``None`` returns the default set;
+            ``'all'`` includes the expensive sections (diagnostics, config,
+            calibrations, resonators, registers, ...) as well. Call
+            ``get_info('list')`` to discover the available section names (it
+            returns ``{'all': [...], 'default': [...]}``) rather than relying on
+            this docstring. A string returns that section directly; a list
+            returns a list of section dictionaries in the same order.
 
         Returns
         -------
         dict or list
             With ``None`` or ``'all'``, returns ``{section_name: section_dict}``.
-            With a single section string, returns that section dict. With a
-            list, returns a list of section dicts in the requested order.
+            With ``'list'``, returns the section-name catalogue. With a single
+            section string, returns that section dict. With a list, returns a
+            list of section dicts in the requested order.
         """
         message = {'request': 'get_info'}
         if sections is not None:

@@ -367,11 +367,12 @@ def _ensure_daemon_files(dirs, pipeline_id):
             os.chown(daemon_dir, TARGET_UID, TARGET_GID)
 
         for script in ('install_systemd_service.sh', 'remove_systemd_service.sh',
-                       'restart_systemd_service.sh', 'install_timing_services.sh'):
+                       'restart_systemd_service.sh', 'install_timing_services.sh',
+                       'manage_simple_service.sh'):
             dst_script = os.path.join(daemon_dir, script)
             copy_package_file(pkg_daemon_dir.joinpath(script), dst_script, 0o775)
 
-        for service in ('ptp4l.service', 'timing-monitor.service'):
+        for service in ('ptp4l.service', 'timing-monitor.service', 'tsu-strobe.service'):
             dst_service = os.path.join(daemon_dir, service)
             copy_package_file(pkg_daemon_dir.joinpath(service), dst_service, 0o664)
 
@@ -1346,11 +1347,13 @@ class ReadoutServer:
 
         Parameters
         ----------
-        sections : str, list of str, or ``'all'``, optional
+        sections : str, list of str, ``'all'``, or ``'list'``, optional
             Which sections to include.  ``None`` returns
             ``DEFAULT_INFO_SECTIONS`` (fast path — excludes diagnostics,
             config, calibrations, resonators, and registers).
             ``'all'`` returns every section including expensive ones.
+            ``'list'`` returns a catalogue of the available section names
+            (``{'all': [...], 'default': [...]}``) instead of any section data.
             A single section name returns that section dictionary directly.
             A list returns a list of section dictionaries in the same order.
         """
@@ -1373,6 +1376,13 @@ class ReadoutServer:
             'registers':    self._info_registers,
             'tone_modulation': self._info_tone_modulation,
         }
+        if sections == 'list':
+            # Catalogue of available sections (derived from what's actually
+            # dispatchable, so it can never drift from the implementation).
+            return {
+                'all': [s for s in self.ALL_INFO_SECTIONS if s in dispatchers],
+                'default': [s for s in self.DEFAULT_INFO_SECTIONS if s in dispatchers],
+            }
         if sections is None:
             return {
                 s: dispatchers[s]()
