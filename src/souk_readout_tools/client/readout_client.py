@@ -722,9 +722,16 @@ class ReadoutClient:
         if response['status'] == 'success':
             source = self.config_file or 'memory'
             print(f'Config pushed from {source} to RFSoC')
+            for warning in response.get('warnings', []):
+                print(f'  WARNING: {warning}')
             return
         else:
-            return response
+            # The server rejected the push (e.g. the config targets a different
+            # pipeline than the running server). Surface it loudly rather than
+            # silently returning so the caller cannot proceed on a config that
+            # was never applied.
+            raise ValueError(
+                f'Server rejected pushed config: {response.get("message", response)}')
 
     def _resolve_local_cal_path(self, path_str):
         """

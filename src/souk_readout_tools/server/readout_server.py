@@ -1025,7 +1025,19 @@ class ReadoutServer:
             'trigger_source_pin',
             self.config.get('rfsoc_host', {}).get('trigger_source_pin', 0)
         )
-        
+
+        # Capture the launch identity of this server process exactly once. The
+        # pipeline and the listening address/ports are fixed when the server is
+        # started; a pushed config must not redefine them (see set_config /
+        # _enforce_launch_identity).
+        if not hasattr(self, 'launch_identity'):
+            self.launch_identity = {
+                'pipeline_id': self.pipeline_id,
+                'address': self.config.get('rfsoc_host', {}).get('address'),
+                'request_port': self.request_server_port,
+                'stream_port': self.stream_server_port,
+            }
+
         #interface with firmware
         fw_config_file = self.config['firmware']['fw_config_file']
         pipeline_id = self.config['firmware']['pipeline_id']
@@ -1267,7 +1279,60 @@ class ReadoutServer:
 
         ``config_filename`` is the name to save the config under and
         ``config_contents`` is its text (e.g. uploaded by a client).
+
+        Returns a list of warning strings (e.g. ignored address/port changes)
+        for the caller to relay to the client. Raises ``ValueError`` if the
+        pushed config targets a different pipeline than the running server.
         """
+        # The pipeline and listening address/ports are fixed when the server
+        # starts; a client push can only change operational settings. Guard the
+        # launch identity before anything is written or applied.
+        launch = self.launch_identity
+        host = config_contents.get('rfsoc_host', {})
+        identity_warnings = []
+
+        # This process was set up for its launch pipeline (firmware interface,
+        # config/calibration directories and ports); those don't follow a pushed
+        # pipeline change, so switching mid-session leaves the server inconsistent
+        # (Issue #12 where the DAC/ADC tiles and user dirs stopped matching). Reject.
+        pushed_pid = config_contents.get('firmware', {}).get('pipeline_id', None)
+        if pushed_pid is not None and pushed_pid != launch['pipeline_id']:
+            raise ValueError(
+                f"This config is for pipeline {pushed_pid}, but this server is running "
+                f"pipeline {launch['pipeline_id']} (ports {launch['request_port']}/"
+                f"{launch['stream_port']}). A server is tied to one pipeline when it "
+                f"starts: it sets up the firmware interface, the config and calibration "
+                f"directories, and the network ports for that pipeline only. Switching "
+                f"the pipeline now would leave those out of step with each other. To "
+                f"work on pipeline {pushed_pid}, start a server for it. To use this "
+                f"server, set 'firmware.pipeline_id: {launch['pipeline_id']}' in your "
+                f"client config."
+            )
+
+        # Address/ports can't be rebound by the running process: warn and keep
+        # the launch value in the config that gets saved.
+        if host.get('address') is not None and host['address'] != launch['address']:
+            identity_warnings.append(
+                f"Clients cannot modify the server IP address (config requested "
+                f"{host['address']!r}, keeping {launch['address']!r}); log in to the "
+                f"board to change this.")
+            host['address'] = launch['address']
+        if host.get('request_port') is not None and host['request_port'] != launch['request_port']:
+            identity_warnings.append(
+                f"Clients cannot modify the server request port (config requested "
+                f"{host['request_port']!r}, keeping {launch['request_port']!r}); log in "
+                f"to the board to change this.")
+            host['request_port'] = launch['request_port']
+        if host.get('stream_port') is not None and host['stream_port'] != launch['stream_port']:
+            identity_warnings.append(
+                f"Clients cannot modify the server stream port (config requested "
+                f"{host['stream_port']!r}, keeping {launch['stream_port']!r}); log in to "
+                f"the board to change this.")
+            host['stream_port'] = launch['stream_port']
+
+        for w in identity_warnings:
+            _server_log(w, source='config')
+
         _server_log_fields('applying config', [
             ('config filename', config_filename),
         ], source='config')
@@ -1326,8 +1391,8 @@ class ReadoutServer:
 
 
 
-        return
-        
+        return identity_warnings
+
 
     # ------------------------------------------------------------------
     # Structured info system
@@ -1909,8 +1974,18 @@ class ReadoutServer:
                 elif request == 'push_config':
                     config_filename = message.get('config_filename')
                     config_contents = message.get('config_contents')
-                    self.set_config(config_filename, yaml.safe_load(config_contents), default=True)
-                    await self.send_response(writer, {'status': 'success'})
+                    try:
+                        cfg_warnings = self.set_config(
+                            config_filename, yaml.safe_load(config_contents), default=True)
+                    except ValueError as e:
+                        # Identity mismatch (e.g. wrong pipeline): reject the push but
+                        # keep the connection alive so the client gets a clean error.
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+                    else:
+                        response = {'status': 'success'}
+                        if cfg_warnings:
+                            response['warnings'] = cfg_warnings
+                        await self.send_response(writer, response)
 
                 elif request == 'pull_config':
                     config_text = self._render_config_text()
