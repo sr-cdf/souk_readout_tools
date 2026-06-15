@@ -5094,7 +5094,8 @@ class ReadoutClient:
         the concatenated sweep data covering the full requested bandwidth.
 
         Args:
-            bandwidth_hz (float): Total bandwidth to measure. Default is full available bandwidth.
+            bandwidth_hz (float): Total bandwidth to measure. Default is 90% of the
+                                  available bandwidth (the band edges are lossy).
             center_freq_hz (float): Center frequency of the sweep. Default is band center.
             step_size_hz (float): Step size of the sweep in Hz. Number of sweep steps =
                                   bandwidth / step_size / num_tones. Default is 10000.
