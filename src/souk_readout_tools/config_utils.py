@@ -6,18 +6,25 @@ the client and server packages.
 """
 
 import os
-import pwd
 import re
 from datetime import date
 from importlib.resources import files as importlib_files
+
+try:
+    import pwd  # POSIX-only; not available on Windows
+except ImportError:
+    pwd = None
 
 
 def _get_target_ownership():
     """
     If running as root (e.g. via sudo), return (uid, gid) of the target user
     so that created files are owned by them rather than root.
-    Returns None if not running as root.
+    Returns None if not running as root, or on platforms without POSIX
+    user/permission semantics (e.g. Windows).
     """
+    if pwd is None or not hasattr(os, 'geteuid'):
+        return None
     if os.geteuid() != 0:
         return None
     target_user = 'casper'
