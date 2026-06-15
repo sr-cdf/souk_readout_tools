@@ -1762,6 +1762,15 @@ class ReadoutClient:
             force_pfb_shift=force_pfb_shift)
         return self.send_request(msg)
 
+    def maximise_rx_dsp_gain(self):
+        """Maximise post-ADC RX DSP gain without changing RF or RFDC controls.
+
+        Optimises the PFB FFT-shift schedule against the live DSP overflow
+        flags. This is suitable for internal loopback, where ADC snapshots and
+        ADC-level controls such as DSA do not describe the active data path.
+        """
+        return self.send_request({'request': 'maximise_rx_dsp_gain'})
+
     def optimise_tx_snr(self, reference_plane='detector', headroom_db=2.0,
                         digital_only=False, rf_only=False, *,
                         force_tx_amp_bypass=None,
@@ -5126,7 +5135,10 @@ class ReadoutClient:
                 adjust the TX analog chain when setting tone powers. Default is True.
             optimise_rx_gain (bool): If True, maximise ADC power utilisation and
                 optimise the PFB FFT shift for best RX dynamic range after tones
-                are configured. Calls maximise_rx_power(). Default is True.
+                are configured. Calls maximise_rx_power() normally. With internal
+                loopback, calls maximise_rx_dsp_gain() to optimise only the
+                post-ADC PFB gain because ADC samples and ADC/RF controls are not
+                part of the active path. Default is True.
             refresh_adc_cal (bool): If True (default), refresh ADC calibration
                 before sweeping (unfreeze, settle, freeze). If False, skip
                 the refresh but still ensure the calibration is frozen.
@@ -5162,6 +5174,8 @@ class ReadoutClient:
         if not isinstance(info_list, list) or len(info_list) != len(sections):
             raise RuntimeError(f'Failed to get info: {info_list}')
         info = dict(zip(sections, info_list))
+        loopback_state = self.get_internal_loopback()
+        internal_loopback = ( isinstance(loopback_state, (bool, np.bool_)) and bool(loopback_state) )
 
         # Get RF frontend mixer configuration
         # TODO: if we have a frontend connected it might not have a mixer - needs updating.
@@ -5307,11 +5321,18 @@ class ReadoutClient:
 
         # Optimise RX gain: maximise ADC power and PFB FFT shift
         if optimise_rx_gain:
+            if internal_loopback:
+                if verbose:
+                    print('  Internal loopback enabled: optimising post-ADC DSP gain...')
+                rx_result = self.maximise_rx_dsp_gain()
+            else:
+                if verbose:
+                    print(f'  Optimising RX gain...')
+                rx_result = self.maximise_rx_power()
             if verbose:
-                print(f'  Optimising RX gain...')
-            rx_result = self.maximise_rx_power()
-            if verbose:
-                print(f'  maximise_rx_power() -> {rx_result["status"]}')
+                operation = ('maximise_rx_dsp_gain' if internal_loopback
+                             else 'maximise_rx_power')
+                print(f'  {operation}() -> {rx_result["status"]}')
 
         # ADC calibration management before sweep
         # ADC calibration: always frozen before sweep, left frozen after
@@ -5339,8 +5360,13 @@ class ReadoutClient:
 
         # Double check for saturation/overflow before sweeping and attempt to fix
         outps = self.check_output_saturation()
-        inps = self.check_input_saturation()
         dspof = self.check_dsp_overflow()
+        inps = None
+        if internal_loopback:
+            if verbose:
+                print('  Internal loopback enabled: skipping ADC saturation check')
+        else:
+            inps = self.check_input_saturation()
 
         if outps['result']:
             if verbose:
@@ -5350,7 +5376,7 @@ class ReadoutClient:
             if outps['result']:
                 raise RuntimeError(
                     f"DAC saturation persists. Reduce tone_powers_dbm or num_tones.")
-        if inps['result']:
+        if inps is not None and inps['result']:
             if verbose:
                 print(f'  ADC saturation detected — attempting fix...')
             self.fix_adc_saturation()

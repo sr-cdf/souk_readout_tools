@@ -1597,6 +1597,7 @@ class MockReadoutServer:
                                 'mock': True}}
 
         if request in ('maximise_tx_power', 'maximise_rx_power',
+                       'maximise_rx_dsp_gain',
                        'optimise_tx_snr', 'optimise_rx_snr',
                        'fix_dac_saturation', 'fix_adc_saturation',
                        'fix_dsp_overflow'):
