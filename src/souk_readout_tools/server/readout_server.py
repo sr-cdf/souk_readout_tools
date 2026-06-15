@@ -2568,6 +2568,15 @@ class ReadoutServer:
                         'rx_amp_bypass': rx_amp_bypass
                     }
                     await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'maximise_rx_dsp_gain':
+                    pfb_fft_shift, dsp = firmware_lib.maximise_rx_dsp_gain(self.r)
+                    result = {
+                        'pfb_fft_shift': pfb_fft_shift,
+                        'dsp_ovf': dsp,
+                    }
+                    await self.send_response(
+                        writer, {'status': 'success', 'result': result})
                 
                 elif request == 'optimise_tx_snr':
                     kwargs = {'rf_peripherals': self.rf_peripherals}

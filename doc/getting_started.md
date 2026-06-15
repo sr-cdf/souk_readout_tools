@@ -871,7 +871,11 @@ fig = plot_sweep(data, format='magphase', multi_tone='overlay', title='Frequency
 plt.show()
 ```
 
-The wideband sweep automatically checks for ADC/DAC saturation before proceeding. 
+The wideband sweep automatically checks for ADC/DAC saturation before proceeding.
+When internal loopback is enabled, it skips ADC/RF gain optimisation and the ADC
+saturation check because the snapshot contains the digital loopback stream
+rather than physical ADC samples. It still maximises the post-ADC PFB gain using
+DSP overflow flags. DAC saturation and DSP overflow checks remain active.
 
 A CLI tool is also available:
 
@@ -1020,6 +1024,7 @@ The client provides methods to automatically optimise power levels and fix satur
 ```python
 client.maximise_tx_power()     # Maximise transmit power without clipping
 client.maximise_rx_power()     # Maximise receive power without clipping
+client.maximise_rx_dsp_gain()  # Maximise post-ADC PFB gain only
 client.optimise_tx_snr()       # Optimise TX signal-to-noise without changing power
 client.optimise_rx_snr()       # Optimise RX signal-to-noise - minimises rx attenuation
 client.fix_dac_saturation()    # Auto-fix DAC clipping

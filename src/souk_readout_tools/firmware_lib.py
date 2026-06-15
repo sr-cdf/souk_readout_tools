@@ -7317,6 +7317,20 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
 
     return best_dsa, best_fftshift, check_dsp_overflow(r, 0.1, verbose=False)[1], levels, best_rx_atten
 
+
+def maximise_rx_dsp_gain(r):
+    """Maximise post-ADC RX DSP gain using the PFB overflow flags.
+
+    This changes only the PFB FFT-shift schedule. It deliberately avoids ADC
+    snapshots, RFDC DSA, and RF frontend controls, making it suitable when
+    internal loopback replaces the physical ADC data path.
+    """
+    print('maximise_rx_dsp_gain')
+    best_fftshift, _ = _find_best_pfb_fftshift(r)
+    dsp = check_dsp_overflow(r, 0.1, verbose=False)[1]
+    return best_fftshift, dsp
+
+
 def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
                        digital_only=False, rf_only=False,
                        force_rx_amp_bypass=None,
