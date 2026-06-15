@@ -204,11 +204,14 @@ For RFDC calibrations, full-scale output is defined under these conditions:
 2. **DUC fine mixer scale**: Set to 0P7 (not 1P0). Setting 1P0 gives ~3 dB more power but risks overflow.
 3. **QMC correction**: Disabled, or gain = 1.0 and offset = 0. Maximum gain (1.999) gives ~6 dB more power with distortion.
 4. **VOP current**: 20000 uA. This is the maximum rated value for gen3 devices with 2.5V DAC VTT. Higher values (up to 40500 uA) add nonlinearity and are explicitly not supported for RFSoC4x2 and KRM-4ZU47DR.
-5. **Inverse sinc filters**: Disabled. Enabling may add ~1 dB near band edges.
+5. **Inverse sinc filter**: On. The bundled config
+   enables it by default. A DAC calibration is valid only when used with the
+   same inverse-sinc state and Nyquist zone under which it was measured.
 
 ### Measurement procedure
 
-1. Set a single tone at a known frequency with all settings as defined above (0 dBFS signal).
+1. Set a single tone at a known frequency with all settings as defined above
+   (0 dBFS signal).
 2. Measure the output power at the DAC SMA connector with a spectrum analyser, subtracting cable losses.
 3. Record the frequency and measured power in a calibration file.
 
@@ -235,6 +238,7 @@ Example `dac0.txt`:
 # Effective sample rate: 2048 MHz
 # DUC fine mixer = 1024 MHz, Nyquist Zone = 1
 # VOP = 20000 uA, Mixer scale = 0P7
+# DAC inverse-sinc filter = enabled
 #
 # Frequency_Hz  Power_dBm
 500e6  -5.9

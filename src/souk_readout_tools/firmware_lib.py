@@ -674,7 +674,8 @@ def initialise_pipeline_resources(r,r_fast,config_dict):
     if adc_ddc_mixer_frequency_hz is not None:
         r.rfdc.core.set_fine_mixer_freq(adc_tile,adc_block,r.rfdc.core.ADC_TILE,adc_ddc_mixer_frequency_hz/1e6)
     if nyquist_zone is not None:
-        set_nyquist_zone(r,config_dict,nyquist_zone,inv_sinc=False)
+        set_nyquist_zone(r,config_dict,nyquist_zone)
+        set_dac_inverse_sinc_filter(r, config_dict, inv_sinc=None)
     if dac_mixer_scale_1p0 is not None:
         if dac_mixer_scale_1p0:
             r.rfdc.core.set_mixer_scale(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE,r.rfdc.core.MIX_SCALE_1P0)
@@ -829,12 +830,19 @@ def info_rfdc(r, config_dict):
             'dsa': 0, 'vop_dac0': 0, 'vop_dac1': 0,
             'dac_duc_mixer_frequency_hz': 0, 'adc_ddc_mixer_frequency_hz': 0,
             'nyquist_zone_adc': 1, 'nyquist_zone_dac0': 1, 'nyquist_zone_dac1': 1,
+            'inverse_sinc_fir_mode_dac0': None, 'inverse_sinc_fir_mode_dac1': None,
+            'inverse_sinc_filter_enabled_dac0': None,
+            'inverse_sinc_filter_enabled_dac1': None,
             'mixer_scale_1p0_dac0': None, 'mixer_scale_1p0_dac1': None, 'mixer_scale_1p0_adc': None,
             'qmc_settings_dac0': None, 'qmc_settings_dac1': None, 'qmc_settings_adc': None,
             'adc_cal_frozen': None, 'rts_events': {'rts_available': False},
         }
 
     rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
+    inverse_sinc_mode_dac0 = r.rfdc.core.get_invsinc_fir(
+        dac0_tile, dac0_block)
+    inverse_sinc_mode_dac1 = r.rfdc.core.get_invsinc_fir(
+        dac1_tile, dac1_block)
     return {
         'ready': True,
         'dsa': r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'],
@@ -845,6 +853,16 @@ def info_rfdc(r, config_dict):
         'nyquist_zone_adc': r.rfdc.core.get_nyquist_zone(adc_tile, adc_block, r.rfdc.core.ADC_TILE),
         'nyquist_zone_dac0': r.rfdc.core.get_nyquist_zone(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE),
         'nyquist_zone_dac1': r.rfdc.core.get_nyquist_zone(dac1_tile, dac1_block, r.rfdc.core.DAC_TILE),
+        'inverse_sinc_fir_mode_dac0': inverse_sinc_mode_dac0,
+        'inverse_sinc_fir_mode_dac1': inverse_sinc_mode_dac1,
+        'inverse_sinc_filter_enabled_dac0': (
+            None if inverse_sinc_mode_dac0 is None
+            else inverse_sinc_mode_dac0 != r.rfdc.core.INVSINC_FIR_DISABLED
+        ),
+        'inverse_sinc_filter_enabled_dac1': (
+            None if inverse_sinc_mode_dac1 is None
+            else inverse_sinc_mode_dac1 != r.rfdc.core.INVSINC_FIR_DISABLED
+        ),
         'mixer_scale_1p0_dac0': r.rfdc.core.get_mixer_settings(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0,
         'mixer_scale_1p0_dac1': r.rfdc.core.get_mixer_settings(dac1_tile, dac1_block, r.rfdc.core.DAC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0,
         'mixer_scale_1p0_adc': r.rfdc.core.get_mixer_settings(adc_tile, adc_block, r.rfdc.core.ADC_TILE)['FineMixerScale'] == r.rfdc.core.MIX_SCALE_1P0,
@@ -1329,7 +1347,12 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
         nyquist_zone = defaults.get('nyquist_zone')
         if nyquist_zone is not None:
             print(f'apply_config: setting nyquist_zone = {nyquist_zone}')
-            set_nyquist_zone(r, new_config_dict, nyquist_zone, inv_sinc=False)
+            set_nyquist_zone(r, new_config_dict, nyquist_zone)
+
+    if changed_any('nyquist_zone', 'dac_inverse_sinc_filter_enabled'):
+        inv_sinc = defaults.get('dac_inverse_sinc_filter_enabled', True)
+        print(f'apply_config: setting dac_inverse_sinc_filter_enabled = {inv_sinc}')
+        set_dac_inverse_sinc_filter(r, new_config_dict, inv_sinc=None)
 
     if changed('dac_mixer_scale_1p0'):
         dac_mixer_scale_1p0 = defaults.get('dac_mixer_scale_1p0')
@@ -1472,7 +1495,7 @@ def set_sample_rate(r,sample_rate_hz):
     return acc_freq
 
 
-def set_nyquist_zone(r,config_dict,nyquist_zone,inv_sinc=False):
+def set_nyquist_zone(r,config_dict,nyquist_zone):
     """
     Set the Nyquist zone for both DACs and the ADC in the RFSOC.
 
@@ -1501,13 +1524,6 @@ def set_nyquist_zone(r,config_dict,nyquist_zone,inv_sinc=False):
         r.rfdc.core.set_fine_mixer_freq(adc_tile,adc_block,r.rfdc.core.ADC_TILE,
                                         -2*r.adc_clk_hz*1/4/1e6)
 
-        if inv_sinc:
-            r.rfdc.core.set_invsinc_fir(dac0_tile,dac0_block,r.rfdc.core.INVSINC_FIR_NYQUIST1)
-            r.rfdc.core.set_invsinc_fir(dac1_tile,dac1_block,r.rfdc.core.INVSINC_FIR_NYQUIST1)
-        else:
-            r.rfdc.core.set_invsinc_fir(dac0_tile,dac0_block,r.rfdc.core.INVSINC_FIR_DISABLED)
-            r.rfdc.core.set_invsinc_fir(dac1_tile,dac1_block,r.rfdc.core.INVSINC_FIR_DISABLED)
-
     elif nyquist_zone == 2:
         # mix baseband to center of 2nd zone and flip (-Fs*3/4, where Fs=2*r.adc_clk_hz)
         r.rfdc.core.set_fine_mixer_freq(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE,
@@ -1520,14 +1536,46 @@ def set_nyquist_zone(r,config_dict,nyquist_zone,inv_sinc=False):
         # use high pass image reject filer. Has no effect?
         # r.rfdc.core.set_imr_mode(0,0,1)
 
-        if inv_sinc:
-            r.rfdc.core.set_invsinc_fir(dac0_tile,dac0_block,r.rfdc.core.INVSINC_FIR_NYQUIST2)
-            r.rfdc.core.set_invsinc_fir(dac1_tile,dac1_block,r.rfdc.core.INVSINC_FIR_NYQUIST2)
-        else:
-            r.rfdc.core.set_invsinc_fir(dac0_tile,dac0_block,r.rfdc.core.INVSINC_FIR_DISABLED)
-            r.rfdc.core.set_invsinc_fir(dac1_tile,dac1_block,r.rfdc.core.INVSINC_FIR_DISABLED)
-
     return
+
+
+def set_dac_inverse_sinc_filter(r, config_dict, inv_sinc=None):
+    """
+    Enable or disable the inverse-sinc FIR on both configured DACs.
+
+    When ``inv_sinc`` is None, the setting is read from
+    ``firmware.defaults.dac_inverse_sinc_filter_enabled`` and defaults to
+    enabled when the key is absent. The enabled RFDC mode follows the
+    configured Nyquist zone.
+    """
+    fwconf = config_dict['firmware']
+    defaults = fwconf.get('defaults', {})
+    dac0_tile = int(fwconf['dac0_tile'])
+    dac0_block = int(fwconf['dac0_block'])
+    dac1_tile = int(fwconf['dac1_tile'])
+    dac1_block = int(fwconf['dac1_block'])
+    nyquist_zone = defaults.get('nyquist_zone')
+
+    if nyquist_zone not in [1, 2]:
+        raise ValueError(
+            f'Invalid or missing Nyquist zone {nyquist_zone} for DAC inverse-sinc filter')
+
+    if inv_sinc is None:
+        inv_sinc = defaults.get('dac_inverse_sinc_filter_enabled', True)
+    if not isinstance(inv_sinc, (bool, np.bool_)):
+        raise ValueError('dac_inverse_sinc_filter_enabled must be a boolean')
+
+    if not inv_sinc:
+        mode = r.rfdc.core.INVSINC_FIR_DISABLED
+    elif nyquist_zone == 1:
+        mode = r.rfdc.core.INVSINC_FIR_NYQUIST1
+    else:
+        mode = r.rfdc.core.INVSINC_FIR_NYQUIST2
+
+    r.rfdc.core.set_invsinc_fir(dac0_tile, dac0_block, mode)
+    r.rfdc.core.set_invsinc_fir(dac1_tile, dac1_block, mode)
+    return bool(inv_sinc)
+
 
 def read_raw_control_buffer_data(r,buf,los=['tx','rx']):
     """

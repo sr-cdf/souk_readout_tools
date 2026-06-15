@@ -68,6 +68,7 @@ firmware:
     psb_fftshift: 0b00000011111111
     pfb_fftshift: 0b00000011111111
     nyquist_zone: 1                   # Sets DAC/ADC mixer frequencies automatically to +/-2*adc_clk_hz/4 (zone 1) or +/-2*adc_clk_hz*3/4 (zone 2)
+    dac_inverse_sinc_filter_enabled: true  # Compensate DAC sinc roll-off using the filter mode for the configured Nyquist zone (~3dB gain at high frequencies)
     dsa: 0
     vop: 20000                       # WARNING: not rated above 20000uA in gen3 with 2.5V V_dac_vtt; up to 40500uA adds nonlinearity
     # dac_duc_mixer_frequency_hz: 1228800000   # Not needed when nyquist_zone is set (it overrides these)

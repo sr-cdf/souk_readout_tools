@@ -83,10 +83,12 @@ papr_db = estimate_papr_db(freqs, amps, phases, sample_rate)
 ## DAC and RF Guardrails
 
 The DAC full-scale output depends on firmware scaling, the DUC fine-mixer
-scale, and VOP current. The recommended calibration conditions are:
+scale, VOP current and inverse-sinc filter state. The recommended calibration conditions are:
 
 - Use the `0P7` DUC fine-mixer scale rather than `1P0`.
 - Use `20000 uA` VOP current for gen3 devices with `2.5 V` DAC VTT.
+- Use the same DAC inverse-sinc filter state and Nyquist zone as the
+  frequency-dependent DAC calibration.
 - Treat DAC snapshot saturation separately from DSP overflow flags.
 
 The config template records the hardware-specific warnings for values outside
