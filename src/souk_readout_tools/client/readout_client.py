@@ -5100,6 +5100,8 @@ class ReadoutClient:
                        optimise_tx_dynamic_range=True,
                        optimise_rx_gain=True,
                        refresh_adc_cal=True,
+                       autosync=True, setup_sync=True, mrst=False, setup_mrst=True,
+                       compensate_rx_ticks=0,
                        verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
@@ -5143,6 +5145,22 @@ class ReadoutClient:
                 before sweeping (unfreeze, settle, freeze). If False, skip
                 the refresh but still ensure the calibration is frozen.
                 Calibration is always left frozen after the sweep.
+            autosync (bool): If True (default), trigger firmware sync when
+                tone frequencies are applied before/during/after the sweep
+                (the per-step sync after each buffer flip). Passed through to
+                perform_sweep.
+            setup_sync (bool): If True (default), pulse one firmware sync at the
+                start of the sweep to establish the TX/RX phase reference before
+                stepping. Independent of ``autosync``. Passed through to
+                perform_sweep.
+            mrst (bool): Whether the per-step (``autosync``) sync also pulses
+                master-reset (v7.10; default False). ``setup_mrst`` (default
+                True) is the same knob for the start-of-sweep ``setup_sync``.
+            setup_mrst (bool): See ``mrst``.
+            compensate_rx_ticks (int): If non-zero, add a per-tone RX phase
+                offset to cancel the RX-vs-TX path delay (in 307.2 MHz clock
+                ticks) seen when retuning without a per-step sync (autosync=
+                False). Pass 14336 (the measured ~46.67 us delay) to enable.
             verbose (bool): Print progress information. Default is True.
 
         Returns:
@@ -5261,8 +5279,9 @@ class ReadoutClient:
             print(f'  Total points: {num_tones * sweep_points}')
 
         # Configure tones
-        self.set_tone_frequencies(center_freqs)
-        self.set_tone_phases(tone_phases)
+        self.set_tone_frequencies(center_freqs, autosync=autosync, mrst=mrst,
+                                  compensate_rx_ticks=compensate_rx_ticks)
+        self.set_tone_phases(tone_phases, autosync=autosync, mrst=mrst)
 
         if isinstance(tone_powers_dbm, str) and tone_powers_dbm == 'auto':
             # Maximum power/dynamic-range: set unit amplitudes first, then maximise
@@ -5398,7 +5417,10 @@ class ReadoutClient:
         response = self.perform_sweep(center_freqs, sweep_span,
                                       points=sweep_points,
                                       samples_per_point=samples_per_point,
-                                      direction='up')
+                                      direction='up',
+                                      autosync=autosync, setup_sync=setup_sync,
+                                      mrst=mrst, setup_mrst=setup_mrst,
+                                      compensate_rx_ticks=compensate_rx_ticks)
         
         if response['status'] != 'success':
             raise RuntimeError(f"Sweep failed: {response['message']}")
