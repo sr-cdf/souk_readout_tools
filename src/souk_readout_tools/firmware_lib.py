@@ -8,12 +8,22 @@ import warnings
 import numpy as np
 import time
 import os
-import pwd
 import yaml
 import struct
 import subprocess
 import threading
-import fcntl
+
+# pwd and fcntl are POSIX-only (absent on Windows). They are only used by
+# on-hardware code paths (file locking, file ownership) that never run on
+# Windows, so guard the imports to keep the module importable there.
+try:
+    import pwd
+except ImportError:
+    pwd = None
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 try:
     import souk_mkid_readout
