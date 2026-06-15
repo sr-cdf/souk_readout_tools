@@ -481,6 +481,10 @@ class MockReadoutServer:
 
     def _info_rfdc(self):
         defaults = self.config.get('firmware', {}).get('defaults', {})
+        nyquist_zone = defaults.get('nyquist_zone', 1)
+        inverse_sinc_enabled = defaults.get(
+            'dac_inverse_sinc_filter_enabled', True)
+        inverse_sinc_mode = nyquist_zone if inverse_sinc_enabled else 0
         return {
             'ready': True,
             'dsa': defaults.get('dsa', 0),
@@ -490,9 +494,13 @@ class MockReadoutServer:
                 'dac_duc_mixer_frequency_hz', 0.0),
             'adc_ddc_mixer_frequency_hz': defaults.get(
                 'adc_ddc_mixer_frequency_hz', 0.0),
-            'nyquist_zone_adc': defaults.get('nyquist_zone', 1),
-            'nyquist_zone_dac0': defaults.get('nyquist_zone', 1),
-            'nyquist_zone_dac1': defaults.get('nyquist_zone', 1),
+            'nyquist_zone_adc': nyquist_zone,
+            'nyquist_zone_dac0': nyquist_zone,
+            'nyquist_zone_dac1': nyquist_zone,
+            'inverse_sinc_fir_mode_dac0': inverse_sinc_mode,
+            'inverse_sinc_fir_mode_dac1': inverse_sinc_mode,
+            'inverse_sinc_filter_enabled_dac0': bool(inverse_sinc_enabled),
+            'inverse_sinc_filter_enabled_dac1': bool(inverse_sinc_enabled),
             'mixer_scale_1p0_dac0': defaults.get('dac_mixer_scale_1p0', False),
             'mixer_scale_1p0_dac1': defaults.get('dac_mixer_scale_1p0', False),
             'mixer_scale_1p0_adc': defaults.get('adc_mixer_scale_1p0', False),

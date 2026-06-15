@@ -263,6 +263,7 @@ nano ~/.souk_readout_tools/pipeline_1/config/p1_config.yaml
 | `firmware.pipeline_id` | `0` (auto) | `1` (auto) | Auto-set |
 | `firmware.dac0_tile` / `block` | `0` / `0` (auto) | `1` / `0` (auto) | Auto-set |
 | `firmware.adc_tile` / `block` | `2` / `0` (auto) | `3` / `0` (auto) | Auto-set |
+| `firmware.defaults.nyquist_zone` | `1` | `1` | Selects the DAC/ADC Nyquist zone and mixer frequencies |
 | `rf_frontend.mixerless_module.rf_channel` | `0` (auto) | `1` (auto) | Auto-set from `pipeline_id`; selects mixerless-module attenuator/bypass channel |
 | `cryostat.lna_bias.i2c.bus` | `0` | `0` | Linux SMBus for the LNA bias board; not pipeline-specific |
 

@@ -1003,6 +1003,11 @@ class ReadoutClient:
         if rfdc.get('nyquist_zone_dac0') is not None:
             defaults['nyquist_zone'] = int(rfdc['nyquist_zone_dac0'])
 
+        # DAC inverse-sinc filter — use DAC0 value
+        if rfdc.get('inverse_sinc_filter_enabled_dac0') is not None:
+            defaults['dac_inverse_sinc_filter_enabled'] = bool(
+                rfdc['inverse_sinc_filter_enabled_dac0'])
+
         # QMC settings from DAC0
         dac_qmc = rfdc.get('qmc_settings_dac0')
         if dac_qmc is not None:

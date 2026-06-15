@@ -228,6 +228,7 @@ Edit the config file with your hardware-specific settings. The most important pa
 - `firmware.fw_config_file` - Path to the firmware config YAML on the RFSoC
 - `firmware.pipeline_id` - Pipeline index (0 or 1)
 - `firmware.defaults.nyquist_zone` - Nyquist zone (1 or 2) — set this if operating in the second Nyquist zone
+- `firmware.defaults.dac_inverse_sinc_filter_enabled` - Enable DAC sinc-roll-off compensation (default `true`)
 - `firmware.dac*_tile`, `dac*_block`, `adc_tile`, `adc_block` - RFDC channel mapping
 - `rf_frontend.*` - Analog frontend configuration for your setup
 
@@ -319,7 +320,7 @@ client.pull_config()  # updates in memory only, nothing written to disk
 
 Fields updated by `sync_config_from_system()`:
 
-- `firmware.defaults` — accumulator length, sync delay, RFDC parameters (VOP, Nyquist zone, mixer scales, QMC settings, DSA, DUC/DDC mixer frequencies)
+- `firmware.defaults` — accumulator length, sync delay, RFDC parameters (VOP, Nyquist zone, DAC inverse-sinc filter, mixer scales, QMC settings, DSA, DUC/DDC mixer frequencies)
 - `firmware.defaults.frequencies/amplitudes/phases` — current regular tone state
 - `firmware.defaults.blind_frequencies/blind_amplitudes/blind_phases/blind_spans` — current blind tone state when the active tone metadata still matches the config
 - `rf_frontend.attenuator.tx_value_db` / `rx_value_db` — current attenuator settings
