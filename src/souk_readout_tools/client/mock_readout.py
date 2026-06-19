@@ -918,7 +918,11 @@ class MockReadoutServer:
             names[num_tones*2+7] = 'cnt'
             names[num_tones*2+8] = 'err'
 
+            assumed_sample_rate_hz = 500.0
+            desired_frame_write_time = num_sample_rows_per_frame / assumed_sample_rate_hz
+            
             while rows_remaining > 0:
+                t0_frame = time.time()
                 size_of_this_frame = min(num_sample_rows_per_frame, rows_remaining)
                 rows = []
                 for _ in range(size_of_this_frame):
@@ -967,7 +971,11 @@ class MockReadoutServer:
                 fr['sostream_version'] = SOSTREAM_VERSION
                 fr['time'] = spt3g.core.G3Time(time.time() * spt3g.core.G3Units.s)
                 writer(fr)
-
+                t1_frame =  time.time()
+                this_frame_time = t1_frame-t0_frame
+                if this_frame_time < desired_frame_write_time:
+                    time.sleep(desired_frame_write_time - this_frame_time)
+                    
                 frame_count += 1
                 rows_remaining -= size_of_this_frame
 
