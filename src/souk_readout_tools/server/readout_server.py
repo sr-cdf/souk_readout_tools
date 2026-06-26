@@ -42,7 +42,7 @@ import base64
 
 from importlib.resources import files as importlib_files
 from souk_readout_tools.config_utils import copy_template_config
-from souk_readout_tools.timing import get_timing_summary, get_timing_status
+from souk_readout_tools.timing import get_timing_summary, get_timing_status, report_sync_readiness, unix_to_iso, format_duration_s, DEFAULT_ALIGN_TOL_S
 import argparse
 
 import time
@@ -144,14 +144,24 @@ def _format_request_log(message):
         'get_accumulator_snapshots': ('tone_index', 'num_snapshots', 'fast'),
         'batch_accumulator_snapshots': ('tone_indices', 'num_snapshots'),
         'sweep': ('centers', 'spans', 'points', 'samples_per_point',
+                  'settle_accumulations', 'chanmap_settle_accumulations',
                   'direction', 'autosync', 'setup_sync', 'mrst', 'setup_mrst'),
         'retune': (
             'centers', 'spans', 'points', 'samples_per_point',
-            'direction', 'method', 'autosync', 'setup_sync', 'mrst', 'setup_mrst'),
+            'settle_accumulations', 'chanmap_settle_accumulations',
+            'direction', 'method', 'autosync', 'setup_sync', 'mrst',
+            'setup_mrst'),
         'refresh_adc_cal': ('adc_cal_settle_time',),
-        'enable_modulation': ('mod_indices', 'samples_per_point', 'n_settle', 'autosync', 'setup_sync', 'mrst', 'setup_mrst'),
-        'update_modulation': ('on_map_change', 'autosync', 'mrst'),
-        'recenter_modulation': ('autosync', 'mrst'),
+        'enable_modulation': ('mod_indices', 'samples_per_point', 'n_settle',
+                              'buffer_reuse_delay_accs', 'autosync', 'setup_sync',
+                              'mrst', 'setup_mrst'),
+        'update_modulation': ('on_map_change', 'buffer_reuse_delay_accs',
+                              'autosync', 'mrst'),
+        'recenter_modulation': ('buffer_reuse_delay_accs', 'autosync', 'mrst'),
+        'timed_sync_needed': ('align_tol_s',),
+        'timed_sync_ready': ('target_unix_s', 'seconds_from_now'),
+        'timed_sync_arm': ('target_unix_s', 'seconds_from_now', 'mrst', 'reload_tt', 'wait', 'force'),
+        'timed_sync_check': ('resample_drift', 'align_tol_s'),
     }
     fields = [
         (key, message[key])
@@ -165,6 +175,21 @@ def _format_request_log(message):
         for key, value in fields
     )
     return f'{request} {details}'
+
+
+def _request_bool(value, default=False):
+    """Parse bool-like JSON request values, including common string forms."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ('false', 'no', 'off', '0', ''):
+            return False
+        if text in ('true', 'yes', 'on', '1'):
+            return True
+    return bool(value)
 
 
 def _server_log(message, source='general'):
@@ -529,7 +554,7 @@ class ModulationScheduler:
         Configuration revision stamped into each emitted frame's tag.
     autosync : bool, optional
         Whether each per-step buffer flip should pulse firmware sync. Defaults
-        to ``True``.
+        to ``False`` (v7.10 no longer needs a per-step sync).
     setup_sync : bool, optional
         Whether to pulse one firmware sync at :meth:`arm` to establish the TX/RX
         phase reference before any buffer flips. Defaults to ``True``.
@@ -539,11 +564,17 @@ class ModulationScheduler:
         Defaults to ``False`` (light re-reference, rides continuous accumulation).
     setup_mrst : bool, optional
         Whether the :meth:`arm` (``setup_sync``) sync also pulses master-reset.
-        Defaults to ``True`` (full reset+start).
+        Defaults to ``False`` (light re-reference; v7.10 no longer needs a reset).
+    buffer_reuse_delay_accs : int, optional
+        Number of emitted/read accumulations to wait after a buffer flip before
+        rewriting the just-vacated buffer with the following point. Defaults to
+        ``3`` (must stay below ``samples_per_point`` for N>2); ``0`` keeps the
+        original immediate preload behaviour.
     """
 
     def __init__(self, r_fast, bundle, samples_per_point, n_settle, revision,
-                 autosync=True, setup_sync=True, mrst=False, setup_mrst=True):
+                 autosync=False, setup_sync=True, mrst=False, setup_mrst=False,
+                 buffer_reuse_delay_accs=3):
         self.r_fast = r_fast
         self.bundle = bundle
         self.N = int(bundle['num_points'])
@@ -554,11 +585,25 @@ class ModulationScheduler:
         self.setup_sync = bool(setup_sync)    # one sync at arm to establish the TX/RX phase reference
         self.mrst = bool(mrst)                # per-step sync also pulses master-reset (v7.10)
         self.setup_mrst = bool(setup_mrst)    # arm-time sync also pulses master-reset (v7.10)
+        self.buffer_reuse_delay_accs = int(buffer_reuse_delay_accs)
+        self._validate_buffer_reuse_delay()
         # Bookkeeping: which modulation point currently lives in each buffer, and
         # which buffer/point is live. ``None`` = unknown/empty.
         self._buf_holds = {0: None, 1: None}
         self._active_buf = 0
         self._active_point = 0
+        self._pending_preload = None
+        self._preload_delay_remaining = 0
+
+    def _validate_buffer_reuse_delay(self):
+        if self.buffer_reuse_delay_accs < 0:
+            raise ValueError('buffer_reuse_delay_accs must be >= 0')
+        if (self.N > 2
+                and self.buffer_reuse_delay_accs >= self.samples_per_point):
+            raise ValueError(
+                'buffer_reuse_delay_accs must be smaller than samples_per_point '
+                'for N>2 modulation, otherwise the following point cannot be '
+                'preloaded before it is needed')
 
     def _write_point(self, buf, point):
         """Write point ``point``'s control words into control buffer ``buf``.
@@ -572,6 +617,37 @@ class ModulationScheduler:
             self.bundle['control_values'][point],
             self.bundle['control_indices'][point])
         self._buf_holds[buf] = point
+
+    def _queue_or_write_following_point(self):
+        """Preload, or schedule preloading, of the point after the live one."""
+        following = (self._active_point + 1) % self.N
+        new_inactive = 1 - self._active_buf
+        if self._buf_holds[new_inactive] == following:
+            self._pending_preload = None
+            self._preload_delay_remaining = 0
+            return
+        if self.buffer_reuse_delay_accs == 0:
+            self._write_point(new_inactive, following)
+            self._pending_preload = None
+            self._preload_delay_remaining = 0
+            return
+        self._pending_preload = (new_inactive, following)
+        self._preload_delay_remaining = self.buffer_reuse_delay_accs
+
+    def after_sample(self):
+        """
+        Notify the scheduler that one accumulation has been emitted/read for the
+        current dwell. Used to delay reuse of the just-vacated buffer by a
+        programmable number of accumulations.
+        """
+        if self._pending_preload is None:
+            return
+        if self._preload_delay_remaining > 0:
+            self._preload_delay_remaining -= 1
+        if self._preload_delay_remaining <= 0:
+            buf, point = self._pending_preload
+            self._write_point(buf, point)
+            self._pending_preload = None
 
     def arm(self):
         """
@@ -609,8 +685,11 @@ class ModulationScheduler:
         # Pre-load the next point into the inactive buffer (nothing to do for N=1).
         if self.N > 1:
             self._write_point(1, 1 % self.N)
+        self._pending_preload = None
+        self._preload_delay_remaining = 0
 
-    def install_bundle(self, bundle, revision, samples_per_point, n_settle, autosync=None, mrst=None):
+    def install_bundle(self, bundle, revision, samples_per_point, n_settle,
+                       autosync=None, mrst=None, buffer_reuse_delay_accs=None):
         """
         Swap in a new per-point control bundle **without re-arming** — used for a
         seamless live update whose channel maps are unchanged.
@@ -641,7 +720,12 @@ class ModulationScheduler:
             self.autosync = bool(autosync)
         if mrst is not None:
             self.mrst = bool(mrst)
+        if buffer_reuse_delay_accs is not None:
+            self.buffer_reuse_delay_accs = int(buffer_reuse_delay_accs)
+        self._validate_buffer_reuse_delay()
         self._buf_holds = {0: None, 1: None}
+        self._pending_preload = None
+        self._preload_delay_remaining = 0
         if self._active_point >= self.N:
             self._active_point = 0
 
@@ -661,6 +745,11 @@ class ModulationScheduler:
         """
         if self.N <= 1:
             return
+        if self._pending_preload is not None:
+            raise RuntimeError(
+                'delayed modulation preload was not serviced before the next '
+                'advance; reduce buffer_reuse_delay_accs or increase '
+                'samples_per_point')
         nxt = (self._active_point + 1) % self.N
         inactive = 1 - self._active_buf
         # Normally the inactive buffer was pre-loaded with ``nxt`` last visit; only
@@ -673,12 +762,10 @@ class ModulationScheduler:
             firmware_lib.force_sync_fast(self.r_fast, mrst=self.mrst)
         self._active_buf = inactive
         self._active_point = nxt
-        # Pre-load the following point into the freshly-vacated buffer (hidden
-        # under this point's dwell). Skipped when it already holds it (N<=2).
-        following = (nxt + 1) % self.N
-        new_inactive = 1 - self._active_buf
-        if self._buf_holds[new_inactive] != following:
-            self._write_point(new_inactive, following)
+        # Pre-load the following point into the freshly-vacated buffer. With a
+        # non-zero reuse delay this write is queued until ``after_sample`` has
+        # observed enough accumulations in the new dwell.
+        self._queue_or_write_following_point()
 
 
 class ReadoutServer:
@@ -723,6 +810,7 @@ class ReadoutServer:
         self.server_start_unix_s = time.time()
         
         # Step 1: Use pipeline_id hint to find default config if none specified
+        startup_config_was_explicit = config_file is not None
         initial_pipeline_id = pipeline_id if pipeline_id is not None else 0
         
         if config_file is None:
@@ -786,6 +874,9 @@ class ReadoutServer:
             ('calibrations', self.user_calibrations_dir),
         ], source='init')
 
+        if startup_config_was_explicit:
+            self._make_config_default(resolved_config_file, source='init')
+
         #server attributes
         self.config = None
         self.config_file = None
@@ -816,6 +907,9 @@ class ReadoutServer:
         #firmware interface attributes
         self.r = None
         self.r_fast = None
+        self._clock_fault = None        # latched clock fault (issue #14); None = healthy
+        self._last_timed_sync = None    # result dict of the last timed_sync_arm (for timed_sync_check)
+        self._last_tt_load_unix_s = None  # wall-clock of the last TT *load* (drift reference)
         self.active_tone_indices = None
         self._tone_state_cache = None              # user-order freqs/amps/phases last applied by this server
         self.latest_sweep_results = {}
@@ -826,7 +920,7 @@ class ReadoutServer:
         #rf peripheral controller
         self.rf_peripherals = None
 
-        #initialize server (this will load config again, but that's fine)
+        # initialize server with the selected config
         self.init_server(resolved_config_file, ensure_ready=True, force_ready=False)
     
     
@@ -850,32 +944,33 @@ class ReadoutServer:
         if level not in ("server", "firmware", "pipeline"):
             raise ValueError(f"Invalid ready level: {level}")
 
-        self.load_config(config_file, log_source=log_source)
-
-        #re-establish firmware interfaces in case they were initially created before programming
-        fw_config_file = self.config['firmware']['fw_config_file']
-        pipeline_id = self.config['firmware']['pipeline_id']
-        self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
-        self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
-
-
+        if config_file is not None or self.config is None:
+            self.load_config(config_file, log_source=log_source)
 
         if level == "server":
             return
 
+        # Refuse to progress while a clock fault is latched. Only an explicit
+        # recovery (hard_reset/force_ready) may run the deprogram-first reload
+        # that re-inits the clocks, and it clears the fault on success.
+        if getattr(self, '_clock_fault', None):
+            raise firmware_lib.ClockFault(
+                self._clock_fault['message'],
+                fault=self._clock_fault.get('fault'),
+            )
+
+        self._create_firmware_interfaces(source=log_source)
+
         if level == "firmware":
             # 1) Program firmware if needed
             if firmware_lib.needs_programming(self.r, self.config):
-                self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
+                self.r, self.r_fast = firmware_lib.reload_firmware(self.config, r=self.r)
             # 2) Shared resources init if needed
             if firmware_lib.needs_shared_resource_initialising(self.r, self.config):
                 firmware_lib.initialise_shared_resources(self.r, self.config)
             
             #re-establish firmware interfaces in case they were initially created before programming
-            fw_config_file = self.config['firmware']['fw_config_file']
-            pipeline_id = self.config['firmware']['pipeline_id']
-            self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
-            self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
+            self._create_firmware_interfaces(source=log_source)
 
 
             return
@@ -883,7 +978,7 @@ class ReadoutServer:
         if level == "pipeline":
             # 1) Program firmware if needed
             if firmware_lib.needs_programming(self.r, self.config):
-                self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
+                self.r, self.r_fast = firmware_lib.reload_firmware(self.config, r=self.r)
             # 2) Shared resources init if needed
             if firmware_lib.needs_shared_resource_initialising(self.r, self.config):
                 firmware_lib.initialise_shared_resources(self.r, self.config)
@@ -893,13 +988,77 @@ class ReadoutServer:
                 self.applied_config = copy.deepcopy(self.config)
 
             #re-establish firmware interfaces in case they were initially created before programming
-            fw_config_file = self.config['firmware']['fw_config_file']
-            pipeline_id = self.config['firmware']['pipeline_id']
-            self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
-            self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
+            self._create_firmware_interfaces(source=log_source)
                 
             return
 
+    def _enter_clock_fault(self, message, fault=None, source='clock'):
+        """Drop to server level (no firmware interfaces) and latch a clock fault.
+
+        The fault is sticky: until an explicit recovery (hard_reset/force_ready)
+        clears it, the ready framework refuses to progress and get_info will not
+        query the firmware. See issue #14 - touching AXI with a dead fabric clock
+        hangs the PS.
+        """
+        self.r = None
+        self.r_fast = None
+        self._clock_fault = {
+            'message': message,
+            'fault': fault,
+            'timestamp': time.time(),
+        }
+        _server_log(f'clock fault - dropping to server level: {message}', source=source)
+
+    def _require_clocks_locked(self, source='firmware', config=None):
+        """Pure clock gate - blocks firmware access unless the clock tree is healthy.
+
+        Never runs ``krc-utils init`` (that only happens in the deprogram-first
+        reload_firmware recovery). Raises ``ClockFault`` - and latches the fault
+        via :meth:`_enter_clock_fault` - if any PLL is unlocked, or if the
+        configured clock source differs from the live selection (which requires a
+        reprogram to apply safely). Safe to call anytime: the check is a PS-side
+        read that never touches the fabric/AXI bus.
+        """
+        config = self.config if config is None else config
+        cls = firmware_lib.classify_clock_status()
+
+        if cls['fault'] == 'lmk':
+            msg = ('Reference clock (LMK04208) unlocked - the PL power rail may be '
+                   'down; a power cycle is likely required. A hard_reset will attempt '
+                   'deprogram -> clock-init -> reprogram but may not recover.')
+            self._enter_clock_fault(msg, fault='lmk', source=source)
+            raise firmware_lib.ClockFault(msg, fault='lmk', status=cls)
+        if cls['fault'] == 'lmx':
+            msg = ('PLL (LMX2594) unlocked - run hard_reset to recover (reprograms '
+                   'and resets BOTH pipelines).')
+            self._enter_clock_fault(msg, fault='lmx', source=source)
+            raise firmware_lib.ClockFault(msg, fault='lmx', status=cls)
+
+        desired = firmware_lib._configured_clock_source(config) if config else None
+        live = firmware_lib.get_clock_source() if desired is not None else None
+        if desired is not None and live != desired:
+            # Clocks are locked and the firmware is safe to read - this is not a
+            # hardware fault, just a pending source change that can only be
+            # applied by a reprogram. Reject the operation but leave any running
+            # pipeline intact; do not latch a sticky fault.
+            msg = (f'Configured clock source ({desired!r}) differs from the live '
+                   f'selection ({live!r}); run hard_reset to apply it (reprograms '
+                   f'and resets BOTH pipelines).')
+            _server_log(f'clock gate: {msg}', source=source)
+            raise firmware_lib.ClockFault(msg, fault=None, status=cls)
+
+        return cls
+
+    def _create_firmware_interfaces(self, source='firmware'):
+        """Create firmware interfaces only after the PL clocks are locked."""
+        self._require_clocks_locked(source=source)
+        fw_config_file = self.config['firmware']['fw_config_file']
+        pipeline_id = self.config['firmware']['pipeline_id']
+        self.r = firmware_lib.create_standard_readout_interface(
+            fw_config_file, pipeline_id)
+        self.r_fast = firmware_lib.create_fast_readout_interface(
+            fw_config_file, pipeline_id)
+        return self.r, self.r_fast
 
     def force_ready(self, level='pipeline'):
         """
@@ -915,49 +1074,43 @@ class ReadoutServer:
         if level not in ("server", "firmware", "pipeline"):
             raise ValueError(f"Invalid ready level: {level}")
 
-        #re-establish firmware interfaces in case they were initially created before programming
-        fw_config_file = self.config['firmware']['fw_config_file']
-        pipeline_id = self.config['firmware']['pipeline_id']
-        self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
-        self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
-
-
-
-
         if level == "server":
             self.init_server(self.config_file,ensure_ready=False, force_ready=False)
             return
-        
-        if level == "firmware":
-            # 1) Program firmware 
-            self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
-            # 2) Shared resources
-            firmware_lib.initialise_shared_resources(self.r, self.config)
 
-            #re-establish firmware interfaces in case they were initially created before programming
-            fw_config_file = self.config['firmware']['fw_config_file']
-            pipeline_id = self.config['firmware']['pipeline_id']
-            self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
-            self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
+        # This is the explicit recovery path: clear any latched clock fault and
+        # attempt the deprogram-first reload (which re-inits the clocks on a
+        # blank PL). If the clocks still cannot be locked, re-latch the fault so
+        # the server stays at server level with a clear "reset required" status.
+        self._clock_fault = None
+        try:
+            if level == "firmware":
+                # 1) Program firmware
+                self.r, self.r_fast = firmware_lib.reload_firmware(self.config, r=self.r)
+                # 2) Shared resources
+                firmware_lib.initialise_shared_resources(self.r, self.config)
 
-            return
+                #re-establish firmware interfaces in case they were initially created before programming
+                self._create_firmware_interfaces(source='firmware')
 
-        if level == "pipeline":
-            # 1) Program firmware 
-            self.r, self.r_fast = firmware_lib.reload_firmware(self.config)
-            # 2) Shared resources
-            firmware_lib.initialise_shared_resources(self.r, self.config)
-            # 3) Pipeline resources
-            firmware_lib.initialise_pipeline_resources(self.r, self.r_fast, self.config)
-            self.applied_config = copy.deepcopy(self.config)
+                return
 
-            #re-establish firmware interfaces in case they were initially created before programming
-            fw_config_file = self.config['firmware']['fw_config_file']
-            pipeline_id = self.config['firmware']['pipeline_id']
-            self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
-            self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
+            if level == "pipeline":
+                # 1) Program firmware
+                self.r, self.r_fast = firmware_lib.reload_firmware(self.config, r=self.r)
+                # 2) Shared resources
+                firmware_lib.initialise_shared_resources(self.r, self.config)
+                # 3) Pipeline resources
+                firmware_lib.initialise_pipeline_resources(self.r, self.r_fast, self.config)
+                self.applied_config = copy.deepcopy(self.config)
 
-            return
+                #re-establish firmware interfaces in case they were initially created before programming
+                self._create_firmware_interfaces(source='pipeline')
+
+                return
+        except firmware_lib.ClockFault as exc:
+            self._enter_clock_fault(str(exc), fault=getattr(exc, 'fault', None))
+            raise
         return
   
 
@@ -1008,6 +1161,9 @@ class ReadoutServer:
         #firmware interface attributes
         self.r = None
         self.r_fast = None
+        self._clock_fault = None        # latched clock fault (issue #14); None = healthy
+        self._last_timed_sync = None    # result dict of the last timed_sync_arm (for timed_sync_check)
+        self._last_tt_load_unix_s = None  # wall-clock of the last TT *load* (drift reference)
         self.active_tone_indices = None
         self._tone_state_cache = None              # user-order freqs/amps/phases last applied by this server
         self.latest_sweep_results = {}
@@ -1038,56 +1194,58 @@ class ReadoutServer:
                 'stream_port': self.stream_server_port,
             }
 
-        #interface with firmware
-        fw_config_file = self.config['firmware']['fw_config_file']
-        pipeline_id = self.config['firmware']['pipeline_id']
-
-        self.r = firmware_lib.create_standard_readout_interface(fw_config_file,pipeline_id)
-        self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file,pipeline_id)
-        
-
         if ensure_ready and force_ready:
             ensure_ready=False
 
-        if ensure_ready:
+        ready_error = None
+        if force_ready:
+            self.force_ready(level='pipeline')
+        elif ensure_ready:
             try:
                 self.ensure_ready(level="pipeline", log_source='init')
             except Exception as e:
+                ready_error = e
+                self.r = None
+                self.r_fast = None
                 _server_log(f'ensure_ready failed: {e}', source='init')
                 _server_log(
-                    'server remains at server init level; use a client to diagnose '
-                    'and retry (ensure_ready / hard_reset)',
+                    'server remains at server level; firmware interfaces were '
+                    'not created. Use a client to diagnose and retry '
+                    '(ensure_ready / hard_reset)',
                     source='init',
                 )
 
-        if force_ready:
-            self.force_ready(level='pipeline')
+        if self.r is not None:
+            #see if we can succesfully load system information
+            try:
+                self.get_info()
+                self.update_active_tone_indices()
+            except Exception as e:
+                _server_log(f'warning: could not get system information from firmware: {e}', source='init')
+                _server_log('try hard reset', source='init')
 
+            firmware_needs_programming = firmware_lib.needs_programming(
+                self.r, self.config, verbose=True
+            )
+            shared_needs_initialising = firmware_lib.needs_shared_resource_initialising(
+                self.r, self.config, verbose=True
+            )
+            pipeline_needs_initialising = firmware_lib.needs_pipeline_initialising(
+                self.r, self.config, verbose=True
+            )
 
-        #see if we can succesfully load system information
-        try:
-            self.get_info()
-            self.update_active_tone_indices()
-        except Exception as e:
-            _server_log(f'warning: could not get system information from firmware: {e}', source='init')
-            _server_log('try hard reset', source='init')
-
-        firmware_needs_programming = firmware_lib.needs_programming(
-            self.r, self.config, verbose=True
-        )
-        shared_needs_initialising = firmware_lib.needs_shared_resource_initialising(
-            self.r, self.config, verbose=True
-        )
-        pipeline_needs_initialising = firmware_lib.needs_pipeline_initialising(
-            self.r, self.config, verbose=True
-        )
-
-        if firmware_needs_programming:
-            _server_log('warning: firmware needs programming', source='init')
-        if shared_needs_initialising:
-            _server_log('warning: shared resources need initialising', source='init')
-        if pipeline_needs_initialising:
-            _server_log('warning: pipeline resources need initialising', source='init')
+            if firmware_needs_programming:
+                _server_log('warning: firmware needs programming', source='init')
+            if shared_needs_initialising:
+                _server_log('warning: shared resources need initialising', source='init')
+            if pipeline_needs_initialising:
+                _server_log('warning: pipeline resources need initialising', source='init')
+        elif ready_error is None:
+            _server_log(
+                'server initialised at server level; firmware interfaces were '
+                'not requested',
+                source='init',
+            )
 
         # initialise rf peripheral controller (attenuators, amp bypass)
         try:
@@ -1170,11 +1328,6 @@ class ReadoutServer:
 
         if config_file is not None:
             self.load_config(config_file, log_source='pipeline')
-            # rebuild interfaces in case pipeline_id / fw_config_file changed
-            fw_config_file = self.config['firmware']['fw_config_file']
-            pipeline_id = self.config['firmware']['pipeline_id']
-            self.r = firmware_lib.create_standard_readout_interface(fw_config_file, pipeline_id)
-            self.r_fast = firmware_lib.create_fast_readout_interface(fw_config_file, pipeline_id)
 
         
         #ensure pipeline is ready
@@ -1253,6 +1406,42 @@ class ReadoutServer:
             self._seed_tone_state_cache_from_config()
 
         return config
+
+    def _make_config_default(self, config_file, source='config'):
+        """Persist ``config_file`` as this pipeline's reboot/default config."""
+        defaultname = self.default_config
+        prevname = os.path.join(self.user_config_dir, 'previous_default.lnk')
+        config_file = os.path.abspath(config_file)
+
+        current_default = None
+        if os.path.exists(defaultname):
+            with open(defaultname, 'r') as file:
+                current_default = file.read().strip()
+
+        if current_default == config_file:
+            _server_log(
+                f'default config already current: {defaultname} -> {config_file}',
+                source=source,
+            )
+            return False
+
+        if os.path.exists(defaultname):
+            shutil.copy(defaultname, prevname)
+            os.chmod(prevname, 0o664)
+            if SUDO:
+                os.chown(prevname, int(TARGET_UID), int(TARGET_GID))
+
+        with open(defaultname, 'w') as file:
+            file.write(config_file)
+        os.chmod(defaultname, 0o664)
+        if SUDO:
+            os.chown(defaultname, int(TARGET_UID), int(TARGET_GID))
+
+        _server_log(
+            f'default config updated: {defaultname} -> {config_file}',
+            source=source,
+        )
+        return True
 
     def _render_config_text(self):
         """YAML text for the active config file.
@@ -1347,7 +1536,7 @@ class ReadoutServer:
 
         _server_log(f'saved config: {filename}', source='config')
 
-
+        self._require_clocks_locked(source='config', config=config_contents)
         firmware_lib.apply_config(config_contents, self.r, self.r_fast, self.applied_config)
         self.applied_config = copy.deepcopy(config_contents)
         self.update_active_tone_indices()
@@ -1373,21 +1562,7 @@ class ReadoutServer:
             self.lna_controller = None
 
         if default:
-            defaultname = os.path.join(self.user_config_dir, 'default_config.lnk')
-            prevname = os.path.join(self.user_config_dir, 'previous_default.lnk')
-        
-            #make a note of the previous default config
-            if os.path.exists(defaultname):
-                shutil.copy(defaultname, prevname) 
-                if SUDO:
-                    os.chown(prevname,int(TARGET_UID),int(TARGET_GID))
-            
-            #link the new default
-            with open(defaultname,'w') as file:
-                file.write(filename)
-            os.chmod(defaultname, 0o664)
-            if SUDO:
-                os.chown(defaultname,int(TARGET_UID),int(TARGET_GID))
+            self._make_config_default(filename, source='config')
 
 
 
@@ -1399,12 +1574,20 @@ class ReadoutServer:
     # ------------------------------------------------------------------
 
     DEFAULT_INFO_SECTIONS = [
-        'server', 'versions', 'clock', 'timing', 'fpga', 'rfdc',
+        'server', 'versions', 'clock', 'timing', 'sync', 'fpga', 'rfdc',
         'pipeline', 'tones', 'rf_frontend', 'lna', 'rfsoc_sensors',
     ]
     ALL_INFO_SECTIONS = DEFAULT_INFO_SECTIONS + [
         'diagnostics', 'config', 'calibrations', 'resonators', 'registers',
         'tone_modulation',
+    ]
+
+    # Sections that only read PS-side state (clock chips over I2C/SPI, sysmon,
+    # I2C peripherals, FPGA-manager programming state) and never touch the PL
+    # fabric/AXI bus. Under an LMK (reference clock) fault, reading any other
+    # section could hang the PS, so get_info restricts itself to these (issue #14).
+    FAULT_SAFE_INFO_SECTIONS = [
+        'server', 'versions', 'clock', 'rfsoc_sensors', 'rf_frontend', 'lna', 'config',
     ]
 
     def get_info(self, sections=None):
@@ -1427,6 +1610,7 @@ class ReadoutServer:
             'versions':     self._info_versions,
             'clock':        self._info_clock,
             'timing':       self._info_timing,
+            'sync':         self._info_sync,
             'fpga':         self._info_fpga,
             'rfdc':         self._info_rfdc,
             'pipeline':     self._info_pipeline,
@@ -1448,23 +1632,35 @@ class ReadoutServer:
                 'all': [s for s in self.ALL_INFO_SECTIONS if s in dispatchers],
                 'default': [s for s in self.DEFAULT_INFO_SECTIONS if s in dispatchers],
             }
+
+        # Under an LMK fault the fabric is unsafe to read: restrict to PS-side
+        # sections and stub the rest with the reset-required message (issue #14).
+        clock_fault = getattr(self, '_clock_fault', None)
+        lmk_fault = bool(clock_fault) and clock_fault.get('fault') == 'lmk'
+
+        def _dispatch(name):
+            if lmk_fault and name not in self.FAULT_SAFE_INFO_SECTIONS:
+                return {'ready': False, 'reset_required': True,
+                        'message': clock_fault['message']}
+            return dispatchers[name]()
+
         if sections is None:
             return {
-                s: dispatchers[s]()
+                s: _dispatch(s)
                 for s in self.DEFAULT_INFO_SECTIONS
                 if s in dispatchers
             }
         if sections == 'all':
             return {
-                s: dispatchers[s]()
+                s: _dispatch(s)
                 for s in self.ALL_INFO_SECTIONS
                 if s in dispatchers
             }
         if isinstance(sections, str):
             if sections not in dispatchers:
                 return {}
-            return dispatchers[sections]()
-        return [dispatchers[s]() for s in sections if s in dispatchers]
+            return _dispatch(sections)
+        return [_dispatch(s) for s in sections if s in dispatchers]
 
     def health_check(self):
         """Compact health summary for intermittent polling."""
@@ -1516,13 +1712,16 @@ class ReadoutServer:
         tone_count = 0
         if pipeline_ready:
             try:
-                tone_count = len(firmware_lib.get_tone_frequencies(self.r, self.config))
+                tone_count = len(firmware_lib.get_tone_frequencies(self.r, self.r_fast, self.config))
             except Exception:
                 pass
 
+        clock_fault = getattr(self, '_clock_fault', None)
         return {
             'initialisation_level': init_level,
             'clock_locked': clock.get('all_locked', False),
+            'reset_required': bool(clock_fault),
+            'clock_fault_message': clock_fault['message'] if clock_fault else None,
             'timing_ready': timing.get('ready_for_firmware_sync', False),
             'timing_state': timing.get('state'),
             'streaming': self.e_stream_enabled.is_set() and self.stream_task is not None and not self.stream_task.done(),
@@ -1585,6 +1784,9 @@ class ReadoutServer:
             'server_version': importlib.metadata.version('souk_readout_tools'),
             'config_file': self.config_file,
             'initialisation_level': init_level,
+            'reset_required': bool(getattr(self, '_clock_fault', None)),
+            'clock_fault_message': (self._clock_fault['message']
+                                    if getattr(self, '_clock_fault', None) else None),
             'current_time_unix_s': now_unix_s,
             'current_time_iso': datetime.datetime.fromtimestamp(now_unix_s, datetime.timezone.utc).isoformat(),
             'server_start_unix_s': self.server_start_unix_s,
@@ -1616,7 +1818,82 @@ class ReadoutServer:
         return firmware_lib.info_clock()
 
     def _info_timing(self):
-        return get_timing_summary(timeout_s=0.2)
+        timing = get_timing_summary(timeout_s=0.2)
+        # Fold the firmware-sync readiness verdict (a pure function of the summary) into
+        # the timing view, so get_info('timing') reports ptp_ready / pps_active / can_sync
+        # directly. PS-side only -- no firmware access, stays fault-safe.
+        try:
+            timing['sync_readiness'] = report_sync_readiness(timing.get('summary', {}))
+        except Exception:
+            pass
+        return timing
+
+    def _instant_drift(self, pps_boundary_offset_s, now_unix_s):
+        """Instant TT-vs-PPS drift from the accumulated boundary offset and the time since
+        the last TT *load* (update_internal_time) -- the moment the offset was last ~0,
+        verified on hardware to be the only thing that re-zeroes it (a sync/mrst does not).
+        The PPS-aligned load second is cached in self._last_tt_load_unix_s (this session).
+        ``now_unix_s`` is the current firmware last-PPS second, so the elapsed time is a
+        clean firmware-firmware difference.
+
+        Returns (drift_ppm, tt_loaded_unix_s, tt_loaded_utc, time_since_tt_load_s). drift_ppm
+        is None when no load has happened this session or too little time has elapsed (< ~2 s,
+        ill-conditioned -- use timed_sync_check(resample_drift=True) then).
+        """
+        loaded = self._last_tt_load_unix_s
+        if loaded is None:
+            return None, None, None, None
+        elapsed = now_unix_s - loaded
+        drift_ppm = (pps_boundary_offset_s / elapsed) * 1e6 if elapsed >= 2.0 else None
+        return drift_ppm, loaded, unix_to_iso(loaded), elapsed
+
+    def _info_sync(self):
+        """Firmware timed-sync status for ``get_info('sync')``.
+
+        Alignment, instant drift, and the last firmware sync (time since, drift), plus the
+        readiness gate. Reads the fabric (r_fast) via timed_sync_alignment, so it is NOT
+        fault-safe and returns an ``available: False`` stub when the pipeline is not ready
+        or a clock fault is set. Fast -- the drift is the instant estimate (no sampling).
+        """
+        if self.r_fast is None:
+            return {'available': False,
+                    'reason': 'firmware interface not ready (pipeline not initialised)'}
+        if self._clock_fault:
+            return {'available': False, 'reason': self._clock_fault['message']}
+        align = firmware_lib.timed_sync_alignment(self.r_fast)
+        ready = report_sync_readiness(get_timing_summary(timeout_s=0.2)['summary'])
+        ever_synced = self._last_timed_sync is not None
+        aligned = bool(abs(align['pps_boundary_offset_s']) < DEFAULT_ALIGN_TOL_S)
+        # The firmware tt_sync register survives a server restart, so a board can be synced
+        # even if THIS session did not arm it; treat either as "has been synced".
+        synced = align['last_sync_tt'] is not None or ever_synced
+        state = 'never_synced' if not synced else ('aligned' if aligned else 'drifted')
+        drift_ppm, tt_loaded_unix_s, tt_loaded_utc, time_since_tt_load_s = \
+            self._instant_drift(align['pps_boundary_offset_s'], align['last_pps_unix_s'])
+        return {
+            'available': True,
+            'state': state,
+            'ever_synced': ever_synced,
+            'readiness': {'ptp_ready': ready['ptp_ready'], 'pps_active': ready['pps_active'],
+                          'can_sync': ready['can_sync']},
+            'aligned': aligned,
+            'align_tol_s': DEFAULT_ALIGN_TOL_S,
+            'pps_boundary_offset_s': align['pps_boundary_offset_s'],
+            'system_offset_s': align['system_offset_s'],
+            'last_pps_unix_s': align['last_pps_unix_s'],
+            'last_pps_utc': align['last_pps_utc'],
+            'last_sync_tt': align['last_sync_tt'],
+            'last_sync_unix_s': align['last_sync_unix_s'],
+            'last_sync_utc': align['last_sync_utc'],
+            'time_since_last_sync_s': align['time_since_last_sync_s'],
+            'time_since_last_sync': format_duration_s(align['time_since_last_sync_s']),
+            'tt_loaded_unix_s': tt_loaded_unix_s,
+            'tt_loaded_utc': tt_loaded_utc,
+            'time_since_tt_load_s': time_since_tt_load_s,
+            'drift_ppm': drift_ppm,
+            'drift_offset_s': align['pps_boundary_offset_s'],
+            'last_armed': self._last_timed_sync,
+        }
 
     def _info_fpga(self):
         return firmware_lib.info_fpga(self.r)
@@ -1629,13 +1906,14 @@ class ReadoutServer:
 
     def _info_tones(self):
         info = firmware_lib.info_tones(
-            self.r, self.config, rf_peripherals=self.rf_peripherals)
+            self.r, self.r_fast, self.config, rf_peripherals=self.rf_peripherals)
         # Compact modulation hint so a get_info('tones') caller sees the state
         # without the full per-tone detail (which lives in 'tone_modulation').
         state = self._current_modulation_info_state()
         try:
             info['modulation'] = {
                 'enabled': bool(self.e_modulation_enabled.is_set()),
+                'any_beyond_half_bin': bool(state.get('any_beyond_half_bin')) if state else False,
                 'any_at_limit': bool(state.get('needs_recenter')) if state else False,
             }
         except Exception:
@@ -1838,10 +2116,14 @@ class ReadoutServer:
             'lna_model': cryo_cfg.get('lna_model'),
         }
 
-        # Bias readings
+        # Bias readings -- only this pipeline's LNA channel. Reading all 14
+        # channels over I2C costs ~2.5s; a single channel is ~14x faster and is
+        # all that's relevant to this server's pipeline.
         if lna.is_hardware:
             try:
-                info['bias_readings'] = lna.get_lna_bias_status_all()
+                info['bias_readings'] = {
+                    lna.lna_channel: lna.get_lna_bias_status()
+                }
             except Exception:
                 info['bias_readings'] = None
         elif lna.backend == 'fixed':
@@ -1883,7 +2165,7 @@ class ReadoutServer:
         }
 
     def _info_calibrations(self):
-        return firmware_lib.info_calibrations(self.r, self.config)
+        return firmware_lib.info_calibrations(self.r, self.r_fast, self.config)
 
     def _info_resonators(self):
         """Resonator detuning tracking — placeholder until tracking module."""
@@ -1936,50 +2218,73 @@ class ReadoutServer:
                     if not config_file or not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
-                        self.ensure_ready(config_file=config_file, level=level)
-                        await self.send_response(writer, {'status': 'success'})
+                        try:
+                            self.ensure_ready(config_file=config_file, level=level)
+                        except Exception as e:
+                            await self.send_response(writer, {'status': 'error', 'message': str(e)})
+                        else:
+                            await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'hard_reset':
                     config_file = self._resolve_request_config_file(message.get('config_filename', None))
                     if not config_file or not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
-                        self.init_server(config_file,ensure_ready=False, force_ready=True)
-                        await self.send_response(writer, {'status': 'success'})
+                        try:
+                            self.init_server(config_file,ensure_ready=False, force_ready=True)
+                        except Exception as e:
+                            await self.send_response(writer, {'status': 'error', 'message': str(e)})
+                        else:
+                            await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'initialise_server':
                     config_file = self._resolve_request_config_file(message.get('config_filename'))
                     if not config_file or not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
-                        self.init_server(config_file,ensure_ready=False, force_ready=False)
-                        await self.send_response(writer, {'status': 'success'})
+                        try:
+                            self.init_server(config_file,ensure_ready=False, force_ready=False)
+                        except Exception as e:
+                            await self.send_response(writer, {'status': 'error', 'message': str(e)})
+                        else:
+                            await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'initialise_firmware':
                     config_file = self._resolve_request_config_file(message.get('config_filename'))
                     if not config_file or not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
-                        await self.send_response(writer, {'status': 'success'})
-                        self.init_firmware(config_file)
+                        try:
+                            self.init_firmware(config_file)
+                        except Exception as e:
+                            await self.send_response(writer, {'status': 'error', 'message': str(e)})
+                        else:
+                            await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'initialise_pipeline':
                     config_file = self._resolve_request_config_file(message.get('config_filename'))
                     if not config_file or not os.path.exists(config_file):
                         await self.send_response(writer, {'status': 'error', 'message': f'Config file {config_file} does not exist on RFSoC'})
                     else:
-                        self.init_pipeline(config_file)
-                        await self.send_response(writer, {'status': 'success'})
+                        try:
+                            self.init_pipeline(config_file)
+                        except Exception as e:
+                            await self.send_response(writer, {'status': 'error', 'message': str(e)})
+                        else:
+                            await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'push_config':
                     config_filename = message.get('config_filename')
                     config_contents = message.get('config_contents')
+                    make_default = _request_bool(message.get('default'), default=True)
                     try:
                         cfg_warnings = self.set_config(
-                            config_filename, yaml.safe_load(config_contents), default=True)
-                    except ValueError as e:
-                        # Identity mismatch (e.g. wrong pipeline): reject the push but
-                        # keep the connection alive so the client gets a clean error.
+                            config_filename, yaml.safe_load(config_contents),
+                            default=make_default)
+                    except (ValueError, RuntimeError) as e:
+                        # Reject bad pushes (e.g. wrong pipeline or failed
+                        # clock gate) but keep the connection alive so the
+                        # client gets a clean error.
                         await self.send_response(writer, {'status': 'error', 'message': str(e)})
                     else:
                         response = {'status': 'success'}
@@ -2026,6 +2331,234 @@ class ReadoutServer:
                     result = get_timing_status()
                     await self.send_response(writer, {'status': 'success', 'data': result})
 
+                # ---- v7.10 firmware timed sync (telescope-time-aligned) ----
+                # Four building blocks for one-board and (future) multi-board sync. The
+                # firmware work lives in firmware_lib.timed_sync_* (ports of
+                # scripts/timed_sync/03,04,07); the readiness gate is
+                # timing.report_sync_readiness (port of script 05). All touch the fabric,
+                # so each guards r_fast and the latched clock fault (issue #14).
+                elif request == 'timed_sync_needed':
+                    # "Should I sync, and can I?" -- TT alignment + PTP/strobe readiness.
+                    try:
+                        if self.r_fast is None:
+                            raise RuntimeError('firmware interface not ready (pipeline not initialised)')
+                        if self._clock_fault:
+                            raise RuntimeError(self._clock_fault['message'])
+                        align_tol_s = float(message.get('align_tol_s', DEFAULT_ALIGN_TOL_S))
+                        align = firmware_lib.timed_sync_alignment(self.r_fast)
+                        ready = report_sync_readiness(get_timing_summary(timeout_s=0.2)['summary'])
+                        # Need a sync if none has been armed this session, or the TT has
+                        # drifted off the second boundary beyond align_tol_s (default 0.1 ms;
+                        # a fresh load is ~1 us).
+                        ever_synced = self._last_timed_sync is not None
+                        off_boundary = abs(align['pps_boundary_offset_s']) > align_tol_s
+                        if not ever_synced:
+                            reason = 'no timed sync has been armed since the server started'
+                        elif off_boundary:
+                            reason = (f"telescope time is {align['pps_boundary_offset_s']*1e6:+.1f} us "
+                                      "off the second boundary")
+                        else:
+                            reason = 'telescope time is aligned on the second boundary'
+                        await self.send_response(writer, {'status': 'success', 'result': {
+                            'needs_sync': bool((not ever_synced) or off_boundary),
+                            'reason': reason,
+                            'ever_synced': ever_synced,
+                            'can_sync': ready['can_sync'],
+                            'ptp_ready': ready['ptp_ready'],
+                            'pps_active': ready['pps_active'],
+                            'readiness_reasons': ready['reasons'],
+                            'align_tol_s': align_tol_s,
+                            'pps_boundary_offset_s': align['pps_boundary_offset_s'],
+                            'system_offset_s': align['system_offset_s'],
+                            'last_pps_tt': align['last_pps_tt'],
+                            'last_pps_unix_s': align['last_pps_unix_s'],
+                            'last_pps_utc': align['last_pps_utc'],
+                        }})
+                    except Exception as e:
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'timed_sync_ready':
+                    # "Are we ready to fire at the target?" -- readiness + target is future
+                    # vs server and firmware clocks. Returns server_now_unix_s so the client
+                    # can also check the target against ITS OWN clock. No firmware change.
+                    try:
+                        if self.r_fast is None:
+                            raise RuntimeError('firmware interface not ready (pipeline not initialised)')
+                        if self._clock_fault:
+                            raise RuntimeError(self._clock_fault['message'])
+                        target_unix_s = message.get('target_unix_s')
+                        seconds_from_now = message.get('seconds_from_now')
+                        if target_unix_s is not None and seconds_from_now is not None:
+                            raise ValueError('give target_unix_s OR seconds_from_now, not both')
+                        ready = report_sync_readiness(get_timing_summary(timeout_s=0.2)['summary'])
+                        align = firmware_lib.timed_sync_alignment(self.r_fast)
+                        server_now_unix_s = time.time()
+                        # Resolve the same target second timed_sync_arm would (preview only).
+                        if target_unix_s is not None:
+                            target_sec = float(int(round(target_unix_s)))
+                        else:
+                            lead = 5 if seconds_from_now is None else int(seconds_from_now)
+                            target_sec = float(int(align['last_pps_unix_s']) + lead)
+                        target_future_server = target_sec > server_now_unix_s + 1
+                        target_future_firmware = target_sec > align['last_pps_unix_s'] + 1
+                        reasons = list(ready['reasons'])
+                        if not target_future_server:
+                            reasons.append(f"target {time.ctime(target_sec)} is not >1 s ahead of "
+                                           f"server time {time.ctime(server_now_unix_s)}")
+                        if not target_future_firmware:
+                            reasons.append(f"target {time.ctime(target_sec)} is not >1 s ahead of "
+                                           f"firmware telescope time (last PPS) "
+                                           f"{time.ctime(align['last_pps_unix_s'])}")
+                        await self.send_response(writer, {'status': 'success', 'result': {
+                            'ready': bool(ready['can_sync'] and target_future_server
+                                          and target_future_firmware),
+                            'checks': {
+                                'ptp_ready': ready['ptp_ready'],
+                                'pps_active': ready['pps_active'],
+                                'target_future_server': target_future_server,
+                                'target_future_firmware': target_future_firmware,
+                            },
+                            'reasons': reasons,
+                            'target_tt_unix_s': target_sec,
+                            'target_tt_utc': unix_to_iso(target_sec),
+                            'server_now_unix_s': server_now_unix_s,
+                            'server_now_utc': unix_to_iso(server_now_unix_s),
+                            'firmware_last_pps_unix_s': align['last_pps_unix_s'],
+                            'firmware_last_pps_utc': align['last_pps_utc'],
+                            'pps_boundary_offset_s': align['pps_boundary_offset_s'],
+                        }})
+                    except Exception as e:
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'timed_sync_arm':
+                    # Perform it: arm set_timed_sync at the target (the firmware re-aligns to
+                    # the PPS at fire), reloading the TT value only when needed, then return
+                    # (fires autonomously) unless wait=True. Gated on readiness unless
+                    # force=True -- without PTP/strobe the sync cannot align cleanly.
+                    try:
+                        if self.r_fast is None:
+                            raise RuntimeError('firmware interface not ready (pipeline not initialised)')
+                        if self._clock_fault:
+                            raise RuntimeError(self._clock_fault['message'])
+                        target_unix_s = message.get('target_unix_s')
+                        seconds_from_now = message.get('seconds_from_now')
+                        mrst = _request_bool(message.get('mrst'), default=False)
+                        wait = _request_bool(message.get('wait'), default=False)
+                        force = _request_bool(message.get('force'), default=False)
+                        # reload_tt is tri-state: 'auto' (default) or a bool.
+                        reload_tt = message.get('reload_tt', 'auto')
+                        if reload_tt != 'auto':
+                            reload_tt = _request_bool(reload_tt, default=False)
+                        proceed = True
+                        if not force:
+                            ready = report_sync_readiness(get_timing_summary(timeout_s=0.2)['summary'])
+                            if not ready['can_sync']:
+                                proceed = False
+                                await self.send_response(writer, {
+                                    'status': 'error',
+                                    'message': ('not ready for a timed sync: '
+                                                + '; '.join(ready['reasons'])
+                                                + ' -- pass force=True to try anyway'),
+                                    'readiness': ready})
+                        if proceed:
+                            # May block (~3-4 s of PPS waits if it reloads the TT, more with
+                            # wait=True): run off the event loop.
+                            result = await self.to_thread(
+                                firmware_lib.timed_sync_arm, self.r_fast,
+                                target_unix_s=target_unix_s, seconds_from_now=seconds_from_now,
+                                mrst=mrst, reload_tt=reload_tt, wait=wait)
+                            self._last_timed_sync = result
+                            # A reload re-zeroed the boundary offset -> new drift reference
+                            # (the PPS-aligned load second the firmware reports).
+                            if result.get('reloaded_tt'):
+                                self._last_tt_load_unix_s = result.get('tt_loaded_unix_s') or time.time()
+                            await self.send_response(writer, {'status': 'success', 'result': result})
+                    except Exception as e:
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'timed_sync_check':
+                    # "Did it land / how is it holding up?" -- TT alignment + drift now, FAST.
+                    # Drift is the instant estimate (boundary offset / time since last sync),
+                    # so this does not block. resample_drift=True additionally runs the slow
+                    # multi-second sampler (only useful right after a TT set, when the instant
+                    # estimate is ill-conditioned -- see firmware_lib.timed_sync_drift).
+                    try:
+                        if self.r_fast is None:
+                            raise RuntimeError('firmware interface not ready (pipeline not initialised)')
+                        if self._clock_fault:
+                            raise RuntimeError(self._clock_fault['message'])
+                        resample_drift = _request_bool(message.get('resample_drift'), default=False)
+                        # Alignment tolerance: |pps_boundary_offset_s| under this counts as
+                        # aligned. Defaults to 0.1 ms; caller-controllable (a fresh load is ~1 us).
+                        align_tol_s = float(message.get('align_tol_s', DEFAULT_ALIGN_TOL_S))
+                        align = firmware_lib.timed_sync_alignment(self.r_fast)
+                        # Instant drift = boundary offset / time since the last TT load.
+                        drift_ppm, tt_loaded_unix_s, tt_loaded_utc, time_since_tt_load_s = \
+                            self._instant_drift(align['pps_boundary_offset_s'], align['last_pps_unix_s'])
+                        # Fall back to the slow sampler when the instant drift is unavailable
+                        # (no TT load cached this session) -- or when the caller forces it.
+                        drift_resampled_ppm = None
+                        if resample_drift or drift_ppm is None:
+                            # Samples over a few seconds -> run off-loop.
+                            drift = await self.to_thread(firmware_lib.timed_sync_drift, self.r_fast)
+                            drift_resampled_ppm = drift['drift_ppm']
+                        summary = get_timing_summary(timeout_s=0.2)['summary']
+                        await self.send_response(writer, {'status': 'success', 'result': {
+                            'aligned': bool(abs(align['pps_boundary_offset_s']) < align_tol_s),
+                            'align_tol_s': align_tol_s,
+                            'pps_boundary_offset_s': align['pps_boundary_offset_s'],
+                            'system_offset_s': align['system_offset_s'],
+                            'last_pps_tt': align['last_pps_tt'],
+                            'last_pps_unix_s': align['last_pps_unix_s'],
+                            'last_pps_utc': align['last_pps_utc'],
+                            'last_sync_tt': align['last_sync_tt'],
+                            'last_sync_unix_s': align['last_sync_unix_s'],
+                            'last_sync_utc': align['last_sync_utc'],
+                            'time_since_last_sync_s': align['time_since_last_sync_s'],
+                            'tt_loaded_unix_s': tt_loaded_unix_s,
+                            'tt_loaded_utc': tt_loaded_utc,
+                            'time_since_tt_load_s': time_since_tt_load_s,
+                            'drift_offset_s': align['pps_boundary_offset_s'],
+                            'drift_ppm': drift_ppm,
+                            'drift_resampled_ppm': drift_resampled_ppm,
+                            'strobe_healthy': summary.get('strobe_healthy', False),
+                            'last_armed': self._last_timed_sync,
+                        }})
+                    except Exception as e:
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'set_telescope_time':
+                    # Load the firmware TT on this pipeline (Sync.update_internal_time):
+                    # stage the next integer second, latch it on the next PPS. BLOCKS
+                    # ~3-4 s on PPS waits -> run off the event loop. Gated on readiness
+                    # unless force=True (no PPS strobe -> the load cannot latch).
+                    try:
+                        if self.r_fast is None:
+                            raise RuntimeError('firmware interface not ready (pipeline not initialised)')
+                        if self._clock_fault:
+                            raise RuntimeError(self._clock_fault['message'])
+                        force = _request_bool(message.get('force'), default=False)
+                        proceed = True
+                        if not force:
+                            ready = report_sync_readiness(get_timing_summary(timeout_s=0.2)['summary'])
+                            if not ready['can_sync']:
+                                proceed = False
+                                await self.send_response(writer, {
+                                    'status': 'error',
+                                    'message': ('not ready to set the telescope time: '
+                                                + '; '.join(ready['reasons'])
+                                                + ' -- pass force=True to try anyway'),
+                                    'readiness': ready})
+                        if proceed:
+                            result = await self.to_thread(
+                                firmware_lib.set_telescope_time, self.r_fast)
+                            # The TT was just (re)loaded -> reset the drift reference to the
+                            # PPS-aligned load second (where the boundary offset is ~0).
+                            self._last_tt_load_unix_s = result['last_pps_unix_s']
+                            await self.send_response(writer, {'status': 'success', 'result': result})
+                    except Exception as e:
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
                 elif request == 'get_blind_tones':
                     ref_plane = message.get('reference_plane', 'detector')
                     result = self.get_blind_tones(reference_plane=ref_plane)
@@ -2048,7 +2581,7 @@ class ReadoutServer:
                             optimise_dynamic_range=message.get(
                                 'optimise_dynamic_range', False),
                             rx_policy=message.get('rx_policy', 'protect'),
-                            autosync=message.get('autosync', True),
+                            autosync=message.get('autosync', False),
                             mrst=message.get('mrst', False))
                     finally:
                         self.stream_flags[FLAG_SET_PHASES].clear()
@@ -2063,7 +2596,7 @@ class ReadoutServer:
                     await asyncio.sleep(0)
                     try:
                         result = self.remove_blind_tones(
-                            autosync=message.get('autosync', True),
+                            autosync=message.get('autosync', False),
                             mrst=message.get('mrst', False))
                     finally:
                         self.stream_flags[FLAG_SET_FREQS].clear()
@@ -2077,29 +2610,29 @@ class ReadoutServer:
                         value = firmware_lib.get_sample_rate(self.r)
                         response = {'status': 'success', 'value': value}
                     elif param_name == 'tone_frequencies':
-                        value = firmware_lib.get_tone_frequencies(self.r,self.config)
+                        value = firmware_lib.get_tone_frequencies(self.r, self.r_fast, self.config)
                         response = {'status': 'success', 'value': value.tolist()}
                     elif param_name == 'tone_frequencies_detailed':
-                        value = firmware_lib.get_tone_frequencies(self.r,self.config,detailed_output=True)[1]
+                        value = firmware_lib.get_tone_frequencies(self.r, self.r_fast, self.config,detailed_output=True)[1]
                         response = {'status': 'success', 'value': value}
                     elif param_name == 'tone_metadata':
-                        active_count = len(firmware_lib.get_tone_frequencies(self.r, self.config))
+                        active_count = len(firmware_lib.get_tone_frequencies(self.r, self.r_fast, self.config))
                         value = firmware_lib.get_configured_tone_metadata(
                             self.config, active_count=active_count)
                         response = {'status': 'success', 'value': value}
                     elif param_name == 'tone_amplitudes':
-                        value = firmware_lib.get_tone_amplitudes(self.r,self.config)
+                        value = firmware_lib.get_tone_amplitudes(self.r, self.r_fast, self.config)
                         response = {'status': 'success', 'value': value.tolist()}
                     elif param_name == 'tone_phases':
-                        value = firmware_lib.get_tone_phases(self.r,self.config)
+                        value = firmware_lib.get_tone_phases(self.r, self.r_fast, self.config)
                         response = {'status': 'success', 'value': value.tolist()}
                     elif param_name == 'tone_powers':
                         ref_plane = message.get('reference_plane', 'detector')
-                        value = firmware_lib.get_tone_powers(self.r,self.config,reference_plane=ref_plane,rf_peripherals=self.rf_peripherals)
+                        value = firmware_lib.get_tone_powers(self.r, self.r_fast, self.config,reference_plane=ref_plane,rf_peripherals=self.rf_peripherals)
                         response = {'status': 'success', 'value': value.tolist()}
                     elif param_name == 'tone_powers_detailed':
                         ref_plane = message.get('reference_plane', 'detector')
-                        value = firmware_lib.get_tone_powers(self.r,self.config,detailed_output=True,reference_plane=ref_plane,rf_peripherals=self.rf_peripherals)[1]
+                        value = firmware_lib.get_tone_powers(self.r, self.r_fast, self.config,detailed_output=True,reference_plane=ref_plane,rf_peripherals=self.rf_peripherals)[1]
                         response = {'status': 'success', 'value': value}
                     elif param_name == 'telescope_time':
                         fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
@@ -2145,7 +2678,7 @@ class ReadoutServer:
                 elif request == 'set':
                     param_name = message.get('param')
                     param_value = message.get('value')
-                    autosync = message.get('autosync', True)
+                    autosync = message.get('autosync', False)
                     mrst = message.get('mrst', False)
                     # Per-tone RX phase compensation for the RX-vs-TX path delay,
                     # relevant when setting tones without a sync (autosync=False).
@@ -2262,11 +2795,26 @@ class ReadoutServer:
                         response = {'status': 'success'}
 
                     elif param_name == 'clock_source':
-                        try:
-                            status = firmware_lib.set_clock_source(param_value)
-                            response = {'status': 'success', 'clock_status': status}
-                        except (ValueError, FileNotFoundError) as exc:
-                            response = {'status': 'error', 'message': str(exc)}
+                        # Changing the reference clock runs krc-utils init, which
+                        # is only safe on a blank PL (issue #14). Record the new
+                        # source in the live config and run the explicit
+                        # deprogram-first recovery (force_ready): it deprograms,
+                        # re-inits the clocks on a blank PL (apply_clock_config
+                        # sees the config/symlink mismatch and re-applies), then
+                        # reprograms. This resets BOTH pipelines.
+                        normalised = str(param_value).strip().lower()
+                        if normalised not in firmware_lib._CLOCK_SOURCE_FILES:
+                            response = {'status': 'error',
+                                        'message': f"clock_source must be 'internal' or "
+                                                   f"'external', got '{param_value}'"}
+                        else:
+                            try:
+                                self.config.setdefault('firmware', {})['clock_source'] = normalised
+                                self.force_ready(level='pipeline')
+                                response = {'status': 'success',
+                                            'clock_status': firmware_lib.get_clock_status()}
+                            except (ValueError, FileNotFoundError, firmware_lib.ClockFault) as exc:
+                                response = {'status': 'error', 'message': str(exc)}
 
                     elif param_name == 'sync_delay':
                         self.r.sync.set_delay(int(param_value))
@@ -2320,6 +2868,8 @@ class ReadoutServer:
                         requested_mrst = message.get('mrst', None)
                         requested_setup_mrst = message.get('setup_mrst', None)
                         requested_compensate_rx_ticks = message.get('compensate_rx_ticks', None)
+                        requested_buffer_reuse_delay_accs = message.get('buffer_reuse_delay_accs', None)
+                        force = bool(message.get('force', False))
                         if (message.get('offsets') is None and message.get('center') is None
                                 and self.modulation_cfg is not None):
                             c = self.modulation_cfg          # resume a resident config
@@ -2327,7 +2877,7 @@ class ReadoutServer:
                             mod_indices = c['mod_indices']
                             spp, n_settle = c['samples_per_point'], c['n_settle']
                             autosync = (
-                                c.get('autosync', True) if requested_autosync is None
+                                c.get('autosync', False) if requested_autosync is None
                                 else bool(requested_autosync))
                             setup_sync = (
                                 c.get('setup_sync', True) if requested_setup_sync is None
@@ -2336,36 +2886,49 @@ class ReadoutServer:
                                 c.get('mrst', False) if requested_mrst is None
                                 else bool(requested_mrst))
                             setup_mrst = (
-                                c.get('setup_mrst', True) if requested_setup_mrst is None
+                                c.get('setup_mrst', False) if requested_setup_mrst is None
                                 else bool(requested_setup_mrst))
                             compensate_rx_ticks = (
                                 c.get('compensate_rx_ticks', 0) if requested_compensate_rx_ticks is None
                                 else int(requested_compensate_rx_ticks))
+                            buffer_reuse_delay_accs = (
+                                c.get('buffer_reuse_delay_accs', 3)
+                                if requested_buffer_reuse_delay_accs is None
+                                else int(requested_buffer_reuse_delay_accs))
                         else:
                             center = message.get('center')
                             offsets = message.get('offsets')
                             mod_indices = message.get('mod_indices')
-                            spp = int(message.get('samples_per_point', 1))
+                            spp = int(message.get('samples_per_point', 4))
                             n_settle = int(message.get('n_settle', 1))
-                            autosync = True if requested_autosync is None else bool(requested_autosync)
+                            autosync = False if requested_autosync is None else bool(requested_autosync)
                             setup_sync = True if requested_setup_sync is None else bool(requested_setup_sync)
                             mrst = False if requested_mrst is None else bool(requested_mrst)
-                            setup_mrst = True if requested_setup_mrst is None else bool(requested_setup_mrst)
+                            setup_mrst = False if requested_setup_mrst is None else bool(requested_setup_mrst)
                             compensate_rx_ticks = (
                                 0 if requested_compensate_rx_ticks is None
                                 else int(requested_compensate_rx_ticks))
+                            buffer_reuse_delay_accs = (
+                                3 if requested_buffer_reuse_delay_accs is None
+                                else int(requested_buffer_reuse_delay_accs))
                             if offsets is None:
                                 raise ValueError('offsets required to arm modulation')
                         epoch = self._next_modulation_command_epoch()
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_modulation, center, offsets, mod_indices, spp, n_settle,
                             autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
-                            compensate_rx_ticks=compensate_rx_ticks)
+                            compensate_rx_ticks=compensate_rx_ticks,
+                            buffer_reuse_delay_accs=buffer_reuse_delay_accs)
                         self._check_modulation_command_epoch(epoch)
-                        if bundle['needs_recenter']:
+                        if bundle['needs_recenter'] and not force:
                             raise ValueError(
                                 'modulation offsets push at least one tone beyond fixed-bin coverage; '
-                                'reduce offsets or use a sweep/cross-bin method')
+                                'reduce offsets, use a sweep/cross-bin method, or pass force=True to '
+                                'arm anyway (those tones will wrap to the other end of the bin)')
+                        if bundle['needs_recenter']:
+                            state.setdefault('warnings', []).append(
+                                'forced: %d tone(s) beyond fixed-bin coverage will read back '
+                                'wrapped to the other end of the bin' % len(state['tones_beyond_coverage']))
                         rev = self._next_modulation_revision(cfg)
                         state['enabled'] = True
                         state['desired_revision'] = rev
@@ -2374,8 +2937,17 @@ class ReadoutServer:
                             'op': 'enable', 'bundle': bundle, 'state': state, 'cfg': cfg, 'revision': rev}
                         self.e_triggered_stream_enabled.clear()
                         self.e_modulation_enabled.set()
-                        await self.send_response(writer, {'status': 'success', 'result': {
-                            'revision': rev, 'needs_recenter': bundle['needs_recenter']}})
+                        warnings_list = list(state.get('warnings', []))
+                        await self.send_response(writer, {'status': 'success',
+                            'warnings': warnings_list,
+                            'result': {
+                                'revision': rev,
+                                'needs_recenter': bundle['needs_recenter'],
+                                'forced': bool(bundle['needs_recenter']),
+                                'any_beyond_half_bin': state['any_beyond_half_bin'],
+                                'tones_beyond_half_bin': state['tones_beyond_half_bin'],
+                                'tones_beyond_coverage': state['tones_beyond_coverage'],
+                            }})
                     except Exception as e:
                         print(traceback.format_exc())
                         await self.send_response(writer, {'status': 'error', 'message': str(e)})
@@ -2393,31 +2965,41 @@ class ReadoutServer:
                         on_map_change = message.get('on_map_change', 'continue')
                         requested_autosync = message.get('autosync', None)
                         autosync = (
-                            c.get('autosync', True) if requested_autosync is None
+                            c.get('autosync', False) if requested_autosync is None
                             else bool(requested_autosync))
                         setup_sync = c.get('setup_sync', True)
                         requested_mrst = message.get('mrst', None)
                         mrst = (
                             c.get('mrst', False) if requested_mrst is None
                             else bool(requested_mrst))
-                        setup_mrst = c.get('setup_mrst', True)
+                        setup_mrst = c.get('setup_mrst', False)
                         requested_compensate_rx_ticks = message.get('compensate_rx_ticks', None)
                         compensate_rx_ticks = (
                             c.get('compensate_rx_ticks', 0) if requested_compensate_rx_ticks is None
                             else int(requested_compensate_rx_ticks))
+                        requested_buffer_reuse_delay_accs = message.get('buffer_reuse_delay_accs', None)
+                        buffer_reuse_delay_accs = (
+                            c.get('buffer_reuse_delay_accs', 3)
+                            if requested_buffer_reuse_delay_accs is None
+                            else int(requested_buffer_reuse_delay_accs))
                         armed = self.modulation_params['armed']
                         epoch = self._next_modulation_command_epoch()
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_modulation, center, offsets, c['mod_indices'],
                             c['samples_per_point'], c['n_settle'],
                             armed=armed, autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
-                            compensate_rx_ticks=compensate_rx_ticks)
+                            compensate_rx_ticks=compensate_rx_ticks,
+                            buffer_reuse_delay_accs=buffer_reuse_delay_accs)
                         self._check_modulation_command_epoch(epoch)
                         if bundle['needs_recenter'] and on_map_change != 'recenter':
                             await self.send_response(writer, {'status': 'error',
                                 'message': 'update would push tones beyond bin coverage; '
                                            'call recenter_modulation() or pass on_map_change="recenter"',
-                                'result': {'tones_beyond_coverage': state['tones_beyond_coverage']}})
+                                'warnings': list(state.get('warnings', [])),
+                                'result': {
+                                    'tones_beyond_half_bin': state['tones_beyond_half_bin'],
+                                    'tones_beyond_coverage': state['tones_beyond_coverage'],
+                                }})
                         else:
                             if bundle['needs_recenter']:
                                 # recenter: re-arm with fresh bins/maps for the new centre
@@ -2425,7 +3007,8 @@ class ReadoutServer:
                                     self._prepare_modulation, center, offsets, c['mod_indices'],
                                     c['samples_per_point'], c['n_settle'],
                                     autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
-                                    compensate_rx_ticks=compensate_rx_ticks)
+                                    compensate_rx_ticks=compensate_rx_ticks,
+                                    buffer_reuse_delay_accs=buffer_reuse_delay_accs)
                                 self._check_modulation_command_epoch(epoch)
                                 op = 'recenter'
                             else:
@@ -2437,7 +3020,13 @@ class ReadoutServer:
                             self._pending_modulation = {
                                 'op': op, 'bundle': bundle, 'state': state, 'cfg': cfg, 'revision': rev}
                             await self.send_response(writer, {'status': 'success',
-                                'result': {'revision': rev, 'op': op}})
+                                'warnings': list(state.get('warnings', [])),
+                                'result': {
+                                    'revision': rev,
+                                    'op': op,
+                                    'any_beyond_half_bin': state['any_beyond_half_bin'],
+                                    'tones_beyond_half_bin': state['tones_beyond_half_bin'],
+                                }})
                     except Exception as e:
                         print(traceback.format_exc())
                         await self.send_response(writer, {'status': 'error', 'message': str(e)})
@@ -2451,24 +3040,30 @@ class ReadoutServer:
                         c = self.modulation_cfg
                         requested_autosync = message.get('autosync', None)
                         autosync = (
-                            c.get('autosync', True) if requested_autosync is None
+                            c.get('autosync', False) if requested_autosync is None
                             else bool(requested_autosync))
                         setup_sync = c.get('setup_sync', True)
                         requested_mrst = message.get('mrst', None)
                         mrst = (
                             c.get('mrst', False) if requested_mrst is None
                             else bool(requested_mrst))
-                        setup_mrst = c.get('setup_mrst', True)
+                        setup_mrst = c.get('setup_mrst', False)
                         requested_compensate_rx_ticks = message.get('compensate_rx_ticks', None)
                         compensate_rx_ticks = (
                             c.get('compensate_rx_ticks', 0) if requested_compensate_rx_ticks is None
                             else int(requested_compensate_rx_ticks))
+                        requested_buffer_reuse_delay_accs = message.get('buffer_reuse_delay_accs', None)
+                        buffer_reuse_delay_accs = (
+                            c.get('buffer_reuse_delay_accs', 3)
+                            if requested_buffer_reuse_delay_accs is None
+                            else int(requested_buffer_reuse_delay_accs))
                         epoch = self._next_modulation_command_epoch()
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_modulation, c['center'], c['offsets'],
                             c['mod_indices'], c['samples_per_point'], c['n_settle'],
                             autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
-                            compensate_rx_ticks=compensate_rx_ticks)
+                            compensate_rx_ticks=compensate_rx_ticks,
+                            buffer_reuse_delay_accs=buffer_reuse_delay_accs)
                         self._check_modulation_command_epoch(epoch)
                         rev = self._next_modulation_revision(cfg)
                         state['enabled'] = True
@@ -2476,7 +3071,13 @@ class ReadoutServer:
                         state['revision_history'] = dict(self._modulation_revision_history)
                         self._pending_modulation = {
                             'op': 'recenter', 'bundle': bundle, 'state': state, 'cfg': cfg, 'revision': rev}
-                        await self.send_response(writer, {'status': 'success', 'result': {'revision': rev}})
+                        await self.send_response(writer, {'status': 'success',
+                            'warnings': list(state.get('warnings', [])),
+                            'result': {
+                                'revision': rev,
+                                'any_beyond_half_bin': state['any_beyond_half_bin'],
+                                'tones_beyond_half_bin': state['tones_beyond_half_bin'],
+                            }})
                     except Exception as e:
                         print(traceback.format_exc())
                         await self.send_response(writer, {'status': 'error', 'message': str(e)})
@@ -2491,6 +3092,32 @@ class ReadoutServer:
                         # No frame producer running: apply the rest-at-centre now.
                         self._apply_pending_modulation_command()
                     await self.send_response(writer, {'status': 'success'})
+
+                elif request == 'purge_modulation_revisions':
+                    # Clear the accumulated revision->config map and reset the
+                    # revision counter to 0 for a clean slate between experiments.
+                    # The map only ever grows (one entry per enable/update/recenter)
+                    # and is shipped in every get_info('tone_modulation'); purge it
+                    # once decoding of the captured frames is done.
+                    #
+                    # Refuse while modulation is enabled: an armed/updated config
+                    # may still be pending (un-applied), carrying its own frozen
+                    # revision_history snapshot. The next frame producer applies
+                    # that snapshot and silently resurrects the purged entries, so
+                    # the purge would not stick. Require disable_modulation first.
+                    if self.e_modulation_enabled.is_set():
+                        await self.send_response(writer, {'status': 'error',
+                            'message': 'modulation is enabled; call disable_modulation() '
+                                       'before purging revisions (an armed config can carry '
+                                       'a pending snapshot that would resurrect the history)'})
+                    else:
+                        purged = len(self._modulation_revision_history)
+                        self._modulation_revision = 0
+                        self._modulation_revision_history = {}
+                        if self.modulation_state is not None:
+                            self.modulation_state['revision_history'] = {}
+                        await self.send_response(writer, {'status': 'success',
+                            'result': {'purged': purged, 'revision': 0}})
 
                 elif request == 'enable_triggered_stream':
                     self.e_stream_enabled.clear()
@@ -2545,7 +3172,12 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'maximise_rx_power':
-                    kwargs = {'rf_peripherals': self.rf_peripherals}
+                    rf_cfg = self.config.get('rf_frontend', {}) or {}
+                    rf_peripherals = (
+                        self.rf_peripherals
+                        if rf_cfg.get('connected', False) else None
+                    )
+                    kwargs = {'rf_peripherals': rf_peripherals}
                     if 'headroom_db' in message:
                         kwargs['headroom_db'] = message['headroom_db']
                     if 'digital_only' in message:
@@ -2556,9 +3188,14 @@ class ReadoutServer:
                         if key in message:
                             kwargs[key] = message[key]
                     dsa, pfb_fft_shift, dsp, adc, rx_atten = firmware_lib.maximise_rx_power(self.r, self.r_fast, self.config, **kwargs)
-                    # Get RX amp bypass state if available
-                    has_bypass_amps = hasattr(self.rf_peripherals, 'get_rx_amp_bypass')
-                    rx_amp_bypass = self.rf_peripherals.get_rx_amp_bypass() if has_bypass_amps else None
+                    # Get RX amp bypass state only when the mixerless module is active.
+                    has_bypass_amps = bool(
+                        rf_cfg.get('connected', False)
+                        and rf_peripherals is not None
+                        and getattr(rf_peripherals, 'enabled', False)
+                        and getattr(rf_peripherals, 'supports_bypass_amps', False)
+                    )
+                    rx_amp_bypass = rf_peripherals.get_rx_amp_bypass() if has_bypass_amps else None
                     result = {
                         'dsa': dsa,
                         'pfb_fft_shift': pfb_fft_shift,
@@ -2816,11 +3453,13 @@ class ReadoutServer:
                             direction = message.get('direction')
                             refresh_adc_cal = message.get('refresh_adc_cal', True)
                             adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
-                            autosync = message.get('autosync', True)
+                            autosync = message.get('autosync', False)
                             setup_sync = message.get('setup_sync', True)
                             mrst = message.get('mrst', False)
-                            setup_mrst = message.get('setup_mrst', True)
+                            setup_mrst = message.get('setup_mrst', False)
                             compensate_rx_ticks = int(message.get('compensate_rx_ticks', 0))
+                            settle_accumulations = int(message.get('settle_accumulations', 4))
+                            chanmap_settle_accumulations = int(message.get('chanmap_settle_accumulations', 4))
                             self.latest_sweep_data_valid = False
                             self.sweep_progress = 0.0
                             self.sweep_state = {'state': 'running', 'message': 'Sweep in progress'}
@@ -2830,7 +3469,9 @@ class ReadoutServer:
                                            direction, refresh_adc_cal=refresh_adc_cal,
                                            adc_cal_settle_time=adc_cal_settle_time,
                                            autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
-                                           compensate_rx_ticks=compensate_rx_ticks)
+                                           compensate_rx_ticks=compensate_rx_ticks,
+                                           settle_accumulations=settle_accumulations,
+                                           chanmap_settle_accumulations=chanmap_settle_accumulations)
                             )
 
                             #print('await send response')
@@ -2875,8 +3516,10 @@ class ReadoutServer:
                               'num_tones': len(sweep_f[0]),
                               'num_points': len(sweep_f),
                               'samples_per_point': self.latest_sweep_results['samples_per_point'],
+                              'settle_accumulations': self.latest_sweep_results.get('settle_accumulations', 4),
+                              'chanmap_settle_accumulations': self.latest_sweep_results.get('chanmap_settle_accumulations', 4),
                               'sweep': sweep,
-                              'info': self.get_info('all')}
+                              'info': self.latest_sweep_results.get('info') or self.get_info('all')}
                         
 
                         await self.send_response(writer, {'status': 'success', 'data': data})
@@ -2915,8 +3558,10 @@ class ReadoutServer:
                         data += f'# num_tones: {len(sweep_f[0])}\n'
                         data += f'# num_points: {len(sweep_f)}\n'
                         data += f'# samples_per_point: {self.latest_sweep_results["samples_per_point"]}\n'
+                        data += f'# settle_accumulations: {self.latest_sweep_results.get("settle_accumulations", 4)}\n'
+                        data += f'# chanmap_settle_accumulations: {self.latest_sweep_results.get("chanmap_settle_accumulations", 4)}\n'
                         
-                        data += '# info: '+str(self.get_info('all')) +'\n'
+                        data += '# info: '+str(self.latest_sweep_results.get('info') or self.get_info('all')) +'\n'
                         data += '#' + ' '.join([f'sweep_f_{k:04d} sweep_i_{k:04d} sweep_q_{k:04d} err_i_{k:04d} err_q_{k:04d}' for k in range(len(sweep_f))]) + '\n'
 
                         for j in range(len(sweep_f)):
@@ -2942,11 +3587,13 @@ class ReadoutServer:
                             freq_offsets = message.get('freq_offsets', None)
                             refresh_adc_cal = message.get('refresh_adc_cal', True)
                             adc_cal_settle_time = message.get('adc_cal_settle_time', 2.0)
-                            autosync = message.get('autosync', True)
+                            autosync = message.get('autosync', False)
                             setup_sync = message.get('setup_sync', True)
                             mrst = message.get('mrst', False)
-                            setup_mrst = message.get('setup_mrst', True)
+                            setup_mrst = message.get('setup_mrst', False)
                             compensate_rx_ticks = int(message.get('compensate_rx_ticks', 0))
+                            settle_accumulations = int(message.get('settle_accumulations', 4))
+                            chanmap_settle_accumulations = int(message.get('chanmap_settle_accumulations', 4))
                             self.latest_sweep_data_valid = False
                             self.sweep_progress = 0.0
                             self.sweep_state = {'state': 'running', 'message': 'Retune in progress'}
@@ -2957,7 +3604,9 @@ class ReadoutServer:
                                             refresh_adc_cal=refresh_adc_cal,
                                             adc_cal_settle_time=adc_cal_settle_time,
                                             autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
-                                            compensate_rx_ticks=compensate_rx_ticks)
+                                            compensate_rx_ticks=compensate_rx_ticks,
+                                            settle_accumulations=settle_accumulations,
+                                            chanmap_settle_accumulations=chanmap_settle_accumulations)
                             )
                             await self.send_response(writer, {'status': 'success', 'message': 'Retune in progress'})
                         except Exception as e:
@@ -3183,13 +3832,13 @@ class ReadoutServer:
             return freqs, amps, phases, metadata
 
         freqs = np.asarray(
-            firmware_lib.get_tone_frequencies(self.r, self.config),
+            firmware_lib.get_tone_frequencies(self.r, self.r_fast, self.config),
             dtype=float)
         amps = np.asarray(
-            firmware_lib.get_tone_amplitudes(self.r, self.config),
+            firmware_lib.get_tone_amplitudes(self.r, self.r_fast, self.config),
             dtype=float)
         phases = np.asarray(
-            firmware_lib.get_tone_phases(self.r, self.config),
+            firmware_lib.get_tone_phases(self.r, self.r_fast, self.config),
             dtype=float)
         metadata = firmware_lib.get_configured_tone_metadata(
             self.config, active_count=len(freqs))
@@ -3235,7 +3884,7 @@ class ReadoutServer:
         if blind_indices:
             try:
                 powers_all = firmware_lib.get_tone_powers(
-                    self.r, self.config, reference_plane=reference_plane,
+                    self.r, self.r_fast, self.config, reference_plane=reference_plane,
                     rf_peripherals=self.rf_peripherals)
                 powers = np.asarray(powers_all, dtype=float)[blind_indices].tolist()
             except Exception as e:
@@ -3270,7 +3919,7 @@ class ReadoutServer:
                         reference_plane='detector',
                         optimise_dynamic_range=False,
                         rx_policy='protect',
-                        autosync=True, mrst=False):
+                        autosync=False, mrst=False):
         """Append blind tones to the active comb and apply to firmware.
 
         ``frequencies`` are the blind-tone frequencies (Hz); ``amplitudes``,
@@ -3320,7 +3969,7 @@ class ReadoutServer:
         current_regular_powers = None
         if powers_dbm is not None:
             current_powers = firmware_lib.get_tone_powers(
-                self.r, self.config, reference_plane=reference_plane,
+                self.r, self.r_fast, self.config, reference_plane=reference_plane,
                 rf_peripherals=self.rf_peripherals)
             current_powers = np.asarray(current_powers, dtype=float)
             current_regular_powers = current_powers[regular_indices]
@@ -3354,7 +4003,7 @@ class ReadoutServer:
                 rx_policy=rx_policy,
                 autosync=autosync, mrst=mrst)
             # Capture the amplitude result after calibrated power setting.
-            final_amps = firmware_lib.get_tone_amplitudes(self.r, self.config)
+            final_amps = firmware_lib.get_tone_amplitudes(self.r, self.r_fast, self.config)
             defaults = self._tone_defaults()
             defaults['amplitudes'] = np.asarray(
                 final_amps[:len(regular_freqs)], dtype=float).tolist()
@@ -3364,7 +4013,7 @@ class ReadoutServer:
 
         return self.get_blind_tones(reference_plane=reference_plane)
 
-    def remove_blind_tones(self, autosync=True, mrst=False):
+    def remove_blind_tones(self, autosync=False, mrst=False):
         freqs, amps, phases, metadata = self._live_tone_state()
         regular_indices = metadata['regular_indices']
         regular_freqs = freqs[regular_indices]
@@ -3483,7 +4132,7 @@ class ReadoutServer:
         """
         try:
             details = firmware_lib.get_tone_frequencies(
-                self.r, self.config, detailed_output=True)[1]
+                self.r, self.r_fast, self.config, detailed_output=True)[1]
             self.active_tone_indices = np.asarray(
                 details['rx']['tone_indices'])
         except Exception as e:
@@ -3637,7 +4286,10 @@ class ReadoutServer:
                     for _ in range(warm_cycles):
                         for _v in range(sched.N):
                             for _s in range(sched.samples_per_point):
-                                self.prepare_frame(fast_read_params, mod_point=sched.current_point() + 1)
+                                self.prepare_frame(
+                                    fast_read_params,
+                                    mod_point=sched.current_point() + 1)
+                                sched.after_sample()
                             sched.advance()
                     # whole cycles -> live point back at index 0 (point 1)
 
@@ -3653,6 +4305,7 @@ class ReadoutServer:
                             fast_read_params, mod_point=p + 1, settling=settling,
                             revision=sched.revision)
                         writer.write(payload)
+                        sched.after_sample()
                         emitted += 1
                     sched.advance()
                     await asyncio.sleep(0)
@@ -3689,7 +4342,7 @@ class ReadoutServer:
         """
         try:
             details = firmware_lib.get_tone_frequencies(
-                self.r, self.config, detailed_output=True)[1]
+                self.r, self.r_fast, self.config, detailed_output=True)[1]
             firmware_indices = details['rx']['tone_indices']
             if tone_index >= len(firmware_indices):
                 raise ValueError(f'Tone index {tone_index} out of range '
@@ -3727,7 +4380,7 @@ class ReadoutServer:
         length prefix + raw complex128 data).
         """
         try:
-            details = firmware_lib.get_tone_frequencies(self.r, self.config, detailed_output=True)[1]
+            details = firmware_lib.get_tone_frequencies(self.r, self.r_fast, self.config, detailed_output=True)[1]
             firmware_indices = details['rx']['tone_indices']
 
             for tone_index in tone_indices:
@@ -3753,8 +4406,8 @@ class ReadoutServer:
 
     def _prepare_modulation(self, center, offsets, mod_indices,
                             samples_per_point, n_settle, armed=None,
-                            autosync=True, setup_sync=True, mrst=False, setup_mrst=True,
-                            compensate_rx_ticks=0):
+                            autosync=False, setup_sync=True, mrst=False, setup_mrst=False,
+                            compensate_rx_ticks=0, buffer_reuse_delay_accs=3):
         """
         Build a modulation bundle + observability state from a centre comb and
         per-point probe offsets. Pure computation (hardware *reads* only, no
@@ -3841,7 +4494,8 @@ class ReadoutServer:
                'samples_per_point': int(samples_per_point), 'n_settle': int(n_settle),
                'autosync': bool(autosync), 'setup_sync': bool(setup_sync),
                'mrst': bool(mrst), 'setup_mrst': bool(setup_mrst),
-               'compensate_rx_ticks': int(compensate_rx_ticks)}
+               'compensate_rx_ticks': int(compensate_rx_ticks),
+               'buffer_reuse_delay_accs': int(buffer_reuse_delay_accs)}
         state = self._build_modulation_state(bundle, cfg)
         return bundle, state, cfg
 
@@ -3890,6 +4544,11 @@ class ReadoutServer:
                 'occupancy': [str(o) for o in occupancy[:, i]],
             })
         beyond = sorted({i for i in range(n_tones) if 'beyond' in set(occupancy[:, i])})
+        beyond_half = sorted({
+            i for i in range(n_tones)
+            if {'second', 'beyond'} & set(occupancy[:, i])
+        })
+        warnings_list = self._modulation_warning_messages(beyond_half, beyond)
 
         try:
             sample_rate = float(firmware_lib.get_sample_rate(self.r_fast))
@@ -3905,15 +4564,40 @@ class ReadoutServer:
             'num_points': num_points,
             'samples_per_point': int(cfg['samples_per_point']),
             'n_settle': int(cfg['n_settle']),
-            'autosync': bool(cfg.get('autosync', True)),
+            'buffer_reuse_delay_accs': int(cfg.get('buffer_reuse_delay_accs', 3)),
+            'autosync': bool(cfg.get('autosync', False)),
             'mrst': bool(cfg.get('mrst', False)),
             'mod_indices': list(mod_indices),
             'sample_rate_hz': sample_rate,
             'cycle_rate_hz': cycle_rate,
             'needs_recenter': bool(bundle['needs_recenter']),
+            'any_beyond_half_bin': bool(beyond_half),
+            'tones_beyond_half_bin': beyond_half,
             'tones_beyond_coverage': beyond,
+            'warnings': warnings_list,
             'tones': tones,
         }
+
+    @staticmethod
+    def _modulation_warning_messages(tones_beyond_half_bin, tones_beyond_coverage=None):
+        tones_beyond_half_bin = [int(i) for i in (tones_beyond_half_bin or [])]
+        tones_beyond_coverage = [int(i) for i in (tones_beyond_coverage or [])]
+        if not tones_beyond_half_bin:
+            return []
+        msg = (
+            'modulation point(s) for tone(s) '
+            f'{tones_beyond_half_bin} are more than half an FFT bin from their '
+            'armed bin; channel maps remain fixed, so those points ride the '
+            'overlapping channel response (occupancy "second").'
+        )
+        if tones_beyond_coverage:
+            msg += (
+                ' Tone(s) '
+                f'{tones_beyond_coverage} are more than one FFT bin away and '
+                'will wrap to the other end of the bin unless you use '
+                'recenter_modulation() or smaller offsets.'
+            )
+        return [msg]
 
     def _next_modulation_revision(self, cfg):
         """
@@ -3929,7 +4613,8 @@ class ReadoutServer:
             'center': np.asarray(cfg['center'], dtype=float).tolist(),
             'offsets': np.asarray(cfg['offsets'], dtype=float).tolist(),
             'mod_indices': list(cfg['mod_indices']),
-            'autosync': bool(cfg.get('autosync', True)),
+            'buffer_reuse_delay_accs': int(cfg.get('buffer_reuse_delay_accs', 3)),
+            'autosync': bool(cfg.get('autosync', False)),
             'mrst': bool(cfg.get('mrst', False)),
             'ts': time.time(),
         }
@@ -4039,7 +4724,7 @@ class ReadoutServer:
                     self.e_modulation_enabled.clear()
                 # Rest the tones at their centre frequencies (re-snaps to nearest bins).
                 if self.modulation_cfg is not None:
-                    autosync = bool(self.modulation_cfg.get('autosync', True))
+                    autosync = bool(self.modulation_cfg.get('autosync', False))  # v7.10: no per-step sync by default
                     mrst = bool(self.modulation_cfg.get('mrst', False))
                     compensate_rx_ticks = int(self.modulation_cfg.get('compensate_rx_ticks', 0))
                     center = np.asarray(self.modulation_cfg['center'], dtype=float)
@@ -4070,19 +4755,24 @@ class ReadoutServer:
                 self._tone_value_fallback(len(center), 'phases', 0.0))
             spp = int(cmd['cfg']['samples_per_point'])
             n_settle = int(cmd['cfg']['n_settle'])
-            autosync = bool(cmd['cfg'].get('autosync', True))
+            autosync = bool(cmd['cfg'].get('autosync', False))
             setup_sync = bool(cmd['cfg'].get('setup_sync', True))
             mrst = bool(cmd['cfg'].get('mrst', False))
-            setup_mrst = bool(cmd['cfg'].get('setup_mrst', True))
+            setup_mrst = bool(cmd['cfg'].get('setup_mrst', False))
+            buffer_reuse_delay_accs = int(cmd['cfg'].get('buffer_reuse_delay_accs', 3))
             if op == 'update' and self.modulation_sched is not None:
                 # Same channel maps: swap words in place, no re-arm, no map write.
                 self.modulation_sched.install_bundle(
-                    cmd['bundle'], cmd['revision'], spp, n_settle, autosync=autosync, mrst=mrst)
+                    cmd['bundle'], cmd['revision'], spp, n_settle,
+                    autosync=autosync, mrst=mrst,
+                    buffer_reuse_delay_accs=buffer_reuse_delay_accs)
             else:
                 # enable / recenter: build a fresh scheduler and arm (applies maps).
                 self.modulation_sched = ModulationScheduler(
                     self.r_fast, cmd['bundle'], spp, n_settle, cmd['revision'],
-                    autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
+                    autosync=autosync, setup_sync=setup_sync, mrst=mrst,
+                    setup_mrst=setup_mrst,
+                    buffer_reuse_delay_accs=buffer_reuse_delay_accs)
                 self.modulation_sched.arm()
                 self.active_tone_indices = np.asarray(cmd['bundle']['tone_indices'])
             # Record which revision actually landed (vs the desired one in state).
@@ -4133,6 +4823,7 @@ class ReadoutServer:
                                 fast_read_params, mod_point=p + 1,
                                 settling=settling, revision=sched.revision)
                             self._write_to_stream_clients(payload)
+                            sched.after_sample()
                         sched.advance()
                         await asyncio.sleep(0)  # stay responsive to new commands
                     # drain once per cycle to bound buffering
@@ -4210,8 +4901,9 @@ class ReadoutServer:
 
     async def sweep(self, centers, spans, points, samples_per_point, direction,
                     refresh_adc_cal=True, adc_cal_settle_time=2.0,
-                    autosync=True, setup_sync=True, mrst=False, setup_mrst=True,
-                    compensate_rx_ticks=0):
+                    autosync=False, setup_sync=True, mrst=False, setup_mrst=False,
+                    compensate_rx_ticks=0, settle_accumulations=4,
+                    chanmap_settle_accumulations=4):
         """
         A coroutine that performs a frequency sweep and stores the results in self.latest_sweep_data.
 
@@ -4228,6 +4920,12 @@ class ReadoutServer:
                 frozen) but skip the full refresh.
             adc_cal_settle_time (float): Seconds to wait for ADC calibration to settle.
                 Default 2.0.
+            settle_accumulations (int): Number of accumulations to discard after
+                each sweep point buffer switch before recording samples. Default
+                2 preserves the previous behavior.
+            chanmap_settle_accumulations (int): Number of accumulations to wait
+                after a PSB/PFB channel-map update and before switching the
+                mixer control buffer. Default 0 preserves previous behavior.
         """
 
         sweep_tone_amplitudes = None
@@ -4244,6 +4942,12 @@ class ReadoutServer:
             assert len(centers) == len(spans)
             num_points=int(points)
             samples_per_point=int(samples_per_point)
+            settle_accumulations=int(settle_accumulations)
+            if settle_accumulations < 0:
+                raise ValueError('settle_accumulations must be >= 0')
+            chanmap_settle_accumulations=int(chanmap_settle_accumulations)
+            if chanmap_settle_accumulations < 0:
+                raise ValueError('chanmap_settle_accumulations must be >= 0')
             assert direction in ('up','down')
 
             # after the sweep, the tones should be set back to their original frequencies.
@@ -4267,37 +4971,6 @@ class ReadoutServer:
             if sweep_tone_phases is not None and len(sweep_tone_phases) != len(centers):
                 sweep_tone_phases = None
 
-            print('Setting initial tone frequencies')
-            tone_settings = firmware_lib.set_tone_frequencies_fast(
-                self.r,self.r_fast,self.config,centers,autosync=autosync, mrst=mrst,
-                tone_amplitudes=sweep_tone_amplitudes,
-                tone_phases=sweep_tone_phases,
-                compensate_rx_ticks=compensate_rx_ticks)
-            self._set_tone_state_cache(centers, sweep_tone_amplitudes, sweep_tone_phases)
-            self._set_active_tone_indices_from_settings(tone_settings)
-
-            # ADC calibration: always frozen before sweep, left frozen after
-            # Note: uses inline set_cal_freeze rather than firmware_lib.refresh_adc_cal()
-            # because we need async sleep to avoid blocking the event loop.
-            if refresh_adc_cal:
-                # Full refresh: unfreeze, settle, freeze
-                print('Refreshing ADC calibration...')
-                firmware_lib.set_cal_freeze(self.r, self.config, False)
-                self.stream_flags[FLAG_CAL_FREEZE].clear()
-                print(f'Waiting {adc_cal_settle_time}s for ADC calibration to settle...')
-                await asyncio.sleep(adc_cal_settle_time)
-                print('Freezing ADC calibration')
-                firmware_lib.set_cal_freeze(self.r, self.config, True)
-                self.stream_flags[FLAG_CAL_FREEZE].set()
-            else:
-                # Ensure frozen, settling first if needed
-                if not firmware_lib.get_cal_freeze(self.r, self.config):
-                    print(f'Waiting {adc_cal_settle_time}s for ADC calibration to settle...')
-                    await asyncio.sleep(adc_cal_settle_time)
-                    print('Freezing ADC calibration')
-                    firmware_lib.set_cal_freeze(self.r, self.config, True)
-                    self.stream_flags[FLAG_CAL_FREEZE].set()
-
             print('Preparing sweep')
             num_tones = len(centers) 
             channels = np.arange(num_tones,dtype=int)
@@ -4309,7 +4982,16 @@ class ReadoutServer:
                     sweepfreqs[:,t] = np.linspace(cf-sp/2.,cf+sp/2.,num_points)
                 elif direction=='down':
                     sweepfreqs[:,t] = np.linspace(cf-sp/2.,cf+sp/2.,num_points)[::-1]
-            
+
+            print('Setting initial tone frequencies')
+            tone_settings = firmware_lib.set_tone_frequencies_fast(
+                self.r,self.r_fast,self.config,centers,autosync=autosync, mrst=mrst,
+                tone_amplitudes=sweep_tone_amplitudes,
+                tone_phases=sweep_tone_phases,
+                compensate_rx_ticks=compensate_rx_ticks)
+            self._set_tone_state_cache(centers, sweep_tone_amplitudes, sweep_tone_phases)
+            self._set_active_tone_indices_from_settings(tone_settings)
+
             print('Preparing faster sweep settings')
             fast_read_params = firmware_lib.get_fast_read_params(self.r_fast) 
             # fast_write_params = []
@@ -4354,6 +5036,32 @@ class ReadoutServer:
                     self.r_fast, fast_sweep_params['phase_offsets'],
                     tone_indices=fast_sweep_params.get('phase_offset_tone_indices'))
 
+
+
+            # ADC calibration: always frozen before sweep, left frozen after
+            # Note: uses inline set_cal_freeze rather than firmware_lib.refresh_adc_cal()
+            # because we need async sleep to avoid blocking the event loop.
+            if refresh_adc_cal:
+                # Full refresh: unfreeze, settle, freeze
+                print('Refreshing ADC calibration...')
+                firmware_lib.set_cal_freeze(self.r, self.config, False)
+                self.stream_flags[FLAG_CAL_FREEZE].clear()
+                print(f'Waiting {adc_cal_settle_time}s for ADC calibration to settle...')
+                await asyncio.sleep(adc_cal_settle_time)
+                print('Freezing ADC calibration')
+                firmware_lib.set_cal_freeze(self.r, self.config, True)
+                self.stream_flags[FLAG_CAL_FREEZE].set()
+            else:
+                # Ensure frozen, settling first if needed
+                if not firmware_lib.get_cal_freeze(self.r, self.config):
+                    print(f'Waiting {adc_cal_settle_time}s for ADC calibration to settle...')
+                    await asyncio.sleep(adc_cal_settle_time)
+                    print('Freezing ADC calibration')
+                    firmware_lib.set_cal_freeze(self.r, self.config, True)
+                    self.stream_flags[FLAG_CAL_FREEZE].set()
+
+
+
             # One-time sync at sweep start establishes the TX/RX phase reference.
             # Independent of the per-step ``autosync``: with setup_sync=True,
             # autosync=False the LO is aligned once here and then rides continuous
@@ -4366,6 +5074,10 @@ class ReadoutServer:
             sweep_data = np.zeros((samples_per_point,num_points,num_tones),dtype=complex)
             acc_errs = np.zeros((samples_per_point,num_points),dtype=bool)
             sweep_tt = np.zeros(num_points,dtype=np.uint64)
+
+            for _ in range(settle_accumulations):
+                firmware_lib._wait_for_acc(self.r_fast,0,0.0001)
+
 
             for p in range(num_points):
                 # print('sweeping: setting tone frequencies',sweepfreqs[p])
@@ -4395,15 +5107,23 @@ class ReadoutServer:
                                                    self.r_fast,
                                                    fast_sweep_params,
                                                    p,
-                                                   autosync=autosync, mrst=mrst)
+                                                   autosync=autosync, mrst=mrst,
+                                                   chanmap_settle_accumulations=chanmap_settle_accumulations)
                 
-                # must wait for everything to settle.
-                # two acc is enough at 500 samps/sec
-                for _ in range(2):
+                # Settle a little extra on the first point:
+                if p == 0:
+                    await asyncio.sleep(0.01)
+                    for _ in range(4):
+                        firmware_lib._wait_for_acc(self.r_fast,0,0.0001)
+
+
+                # Discard a programmable number of accumulations after each
+                # buffer flip so the measured samples start on settled data.
+                for _ in range(settle_accumulations):
                     firmware_lib._wait_for_acc(self.r_fast,0,0.0001)
 
                 
-                print('sweeping: getting_samples')
+                # print('sweeping: getting_samples')
                 # Get tone_indices for this sweep point - may change as tones cross FFT bins
                 tone_indices_p = tone_indices_arr[p] if tone_indices_arr is not None else np.arange(num_tones)
                 for s in range(samples_per_point):
@@ -4438,16 +5158,23 @@ class ReadoutServer:
             sweep_stds = np.std(sweep_data.real,axis=0) + 1j*np.std(sweep_data.imag,axis=0)
             sweep_sems = np.std(sweep_data.real,axis=0)/np.sqrt(samples_per_point) + 1j*np.std(sweep_data.imag,axis=0)/np.sqrt(samples_per_point)
 
+            # Snapshot the system info once, now, with tones restored to their driven
+            # state. get_info('all') re-polls slow hardware (tones ~2.7s over RFDC MMIO,
+            # lna ~2.5s over I2C), so doing it here -- rather than on every get_sweep_data
+            # call -- keeps fetches instant and gives info that reflects the sweep itself.
             self.latest_sweep_results = {
                 'sweep_frequencies': sweepfreqs,
                 'sweep_responses': sweep_responses,
                 'sweep_stds': sweep_stds,
                 'sweep_sems': sweep_sems,
                 'samples_per_point': samples_per_point,
+                'settle_accumulations': settle_accumulations,
+                'chanmap_settle_accumulations': chanmap_settle_accumulations,
                 'samples_per_second': firmware_lib.get_sample_rate(self.r_fast),
                 'accumulation_counts': acc_counts,
                 'accumulation_errors': acc_errs,
-                'telescope_time': sweep_tt
+                'telescope_time': sweep_tt,
+                'info': self.get_info('all')
                 }
             self.latest_sweep_data = {
                 'sweep_data': sweep_data
@@ -4479,6 +5206,8 @@ class ReadoutServer:
                 'sweep_stds': sweep_stds,
                 'sweep_sems': sweep_sems,
                 'samples_per_point': samples_per_point,
+                'settle_accumulations': settle_accumulations,
+                'chanmap_settle_accumulations': chanmap_settle_accumulations,
                 'samples_per_second': firmware_lib.get_sample_rate(self.r_fast),
                 'accumulation_counts': acc_counts,
                 'accumulation_errors': acc_errs,
@@ -4502,8 +5231,9 @@ class ReadoutServer:
 
     async def retune(self, center, span, points, samples_per_point, direction,
                      method, freq_offsets=None, refresh_adc_cal=True,
-                     adc_cal_settle_time=2.0, autosync=True, setup_sync=True, mrst=False, setup_mrst=True,
-                     compensate_rx_ticks=0):
+                     adc_cal_settle_time=2.0, autosync=False, setup_sync=True, mrst=False, setup_mrst=False,
+                     compensate_rx_ticks=0, settle_accumulations=4,
+                     chanmap_settle_accumulations=4):
         """
         A coroutine that performs a frequency sweep, finds the resonance peaks using the specified method, and sets the tones to the peak frequencies.
 
@@ -4512,6 +5242,11 @@ class ReadoutServer:
                 before sweeping. If False, skip refresh but still ensure frozen.
             adc_cal_settle_time (float): Seconds to wait for ADC calibration to settle.
                 Default 2.0.
+            settle_accumulations (int): Number of accumulations to discard after
+                each sweep point buffer switch before recording samples.
+            chanmap_settle_accumulations (int): Number of accumulations to wait
+                after a PSB/PFB channel-map update and before switching the
+                mixer control buffer.
         """
 
         center, span = self._expand_sweep_request_for_blind(center, span)
@@ -4549,7 +5284,9 @@ class ReadoutServer:
                 refresh_adc_cal=refresh_adc_cal,
                 adc_cal_settle_time=adc_cal_settle_time,
                 autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
-                compensate_rx_ticks=compensate_rx_ticks)
+                compensate_rx_ticks=compensate_rx_ticks,
+                settle_accumulations=settle_accumulations,
+                chanmap_settle_accumulations=chanmap_settle_accumulations)
             if not sweep_ok:
                 if self.sweep_state.get('state') not in ('cancelled', 'error'):
                     self.sweep_progress = float(1.0)

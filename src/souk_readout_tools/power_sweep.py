@@ -30,20 +30,20 @@ from .plotting._common import (
     _apply_compact_scientific_ticks,
     _validate_reference_plane,
 )
-from .measurement import (
-    ArtifactKind,
-    ArtifactRole,
-    MeasurementRun,
-    MeasurementStep,
-    MeasurementStore,
-    RunStatus,
-    save_system_info,
-    timestamp,
-)
 from .resonator import estimate_resonance_empirical
+from .measurement import (
+    MANIFEST_FILE,
+    _format_duration,
+    _jsonify,
+    _load_manifest,
+    _load_npz,
+    _save_npz,
+    _timestamp,
+    _write_manifest,
+)
 
 
-MANIFEST_FILE = "measurement.json"
+SCHEMA_VERSION = 1
 FIT_SUMMARY_FILE = "analysis/fit_summary.csv"
 FIT_RESULTS_FILE = "analysis/fit_results.pkl"
 BEST_POWER_FILE = "analysis/best_power.json"
@@ -187,19 +187,6 @@ def _verbose_level(verbose):
     return int(verbose)
 
 
-def _format_duration(seconds):
-    """Format a duration compactly for progress output."""
-    if seconds is None or not np.isfinite(seconds):
-        return "n/a"
-    seconds = float(seconds)
-    if seconds < 1.0:
-        return f"{seconds * 1e3:.0f} ms"
-    if seconds < 60.0:
-        return f"{seconds:.1f} s"
-    minutes, rem = divmod(seconds, 60.0)
-    return f"{int(minutes)}m{rem:04.1f}s"
-
-
 def _print_progress_line(message, final=False):
     """Print progress without filling the terminal with one line per item."""
     print(message, end="\n" if final else "\r", flush=True)
@@ -246,21 +233,18 @@ def _format_plot_progress(
     return message
 
 
-def _find_dip_centers(
-    sweep_data,
-    centers,
-    spans,
-    follow_max_shift_fraction,
-    follow_edge_margin_fraction,
-    follow_min_depth_db,
-    follow_min_separation_hz,
-    follow_conflict_fraction,
-):
+def _find_dip_centers(sweep_data, centers, spans, follow_min_depth_db):
     """Empirical-dip recentering used by ``run_power_sweep``.
+
+    Each regular (non-blind) tone is recentered on the deepest dip in its full
+    sweep trace.  A dip shallower than ``follow_min_depth_db`` is rejected so a
+    tone never locks onto noise.  Finally, since tones are ordered by frequency,
+    any neighbouring pair whose new centers would swap order (both chasing the
+    same resonance) is reverted to its previous centers.
 
     Returns ``(next_centers, record)`` where ``record`` is the per-tone
     diagnostic dict (candidate frequencies, depths, accept flags, reasons,
-    proposed next centers, and the blind-tone indices that were skipped).
+    next centers, and the blind-tone indices that were skipped).
     """
     sweep_f = np.atleast_2d(np.asarray(sweep_data["sweep_f"], dtype=float))
     sweep_i = np.atleast_2d(np.asarray(sweep_data["sweep_i"], dtype=float))
@@ -295,26 +279,13 @@ def _find_dip_centers(
         order = np.argsort(f)
         f = f[order]
         z = z[order]
-        span = abs(spans[tone_index])
-        search = (
-            (np.abs(f - centers[tone_index]) <= follow_max_shift_fraction * span)
-            & (f >= f.min() + follow_edge_margin_fraction * span)
-            & (f <= f.max() - follow_edge_margin_fraction * span)
-        )
-        if not np.any(search):
-            continue
-        search_indices = np.flatnonzero(search)
+        # Recenter on the deepest point of the whole trace.
         log_mag = 20.0 * np.log10(np.maximum(np.abs(z), 1e-300))
-        local_index = int(search_indices[np.argmin(log_mag[search_indices])])
-        estimate = estimate_resonance_empirical(f, z, peak_index=local_index)
-        shift = estimate.fr - centers[tone_index]
+        estimate = estimate_resonance_empirical(f, z, peak_index=int(np.argmin(log_mag)))
         if not np.isfinite(estimate.fr):
             continue
         candidates[tone_index] = estimate.fr
         depths[tone_index] = estimate.dip_depth_db
-        if abs(shift) > follow_max_shift_fraction * span:
-            reasons[tone_index] = "shift_too_large"
-            continue
         if follow_min_depth_db is not None:
             min_depth = float(follow_min_depth_db)
             if (
@@ -326,22 +297,17 @@ def _find_dip_centers(
         accepted[tone_index] = True
         reasons[tone_index] = "accepted"
 
-    proposed = centers.copy()
-    proposed[accepted] = candidates[accepted]
+    next_centers = centers.copy()
+    next_centers[accepted] = candidates[accepted]
+    # Tones are ordered by frequency; if recentering swapped any neighbouring
+    # pair (both chasing the same resonance), revert both to their old centers.
     for left, right in zip(np.argsort(centers)[:-1], np.argsort(centers)[1:]):
-        min_sep = (
-            follow_conflict_fraction * min(abs(spans[left]), abs(spans[right]))
-            if follow_min_separation_hz is None
-            else follow_min_separation_hz
-        )
-        if proposed[left] >= proposed[right] or proposed[right] - proposed[left] < min_sep:
+        if next_centers[left] >= next_centers[right]:
             accepted[left] = accepted[right] = False
-            proposed[left], proposed[right] = centers[left], centers[right]
+            next_centers[left], next_centers[right] = centers[left], centers[right]
             reasons[left] = f"conflict_with_tone_{int(right)}"
             reasons[right] = f"conflict_with_tone_{int(left)}"
 
-    next_centers = centers.copy()
-    next_centers[accepted] = candidates[accepted]
     record = {
         "candidate_centers_hz": candidates.tolist(),
         "candidate_dip_depth_db": depths.tolist(),
@@ -365,6 +331,43 @@ def _normalise_power_steps(powers_dbm, tone_count):
     raise ValueError("powers_dbm must be scalar, 1D, or shaped (step, tone).")
 
 
+# --- On-disk run record ------------------------------------------------------
+# A power-sweep run is a directory holding ``measurement.json`` (a plain manifest
+# dict listing the swept parameters and one entry per step) alongside the saved
+# per-step sweep ``.npz`` files under ``data/``.  The manifest/npz helpers used
+# here (``_write_manifest``, ``_load_manifest``, ``_save_npz``, ``_load_npz``,
+# ``_timestamp``, ``_jsonify``) live in :mod:`souk_readout_tools.measurement` and
+# are imported at the top of this module; the acquisition loop lives in
+# ``run_power_sweep`` below.
+
+
+def _save_system_info(manifest, root, client, label, sections):
+    """Best-effort: save a ``client.get_info()`` snapshot as a JSON file in the
+    run directory and record it in ``manifest``.  A client without ``get_info``
+    or a failure fetching it is noted as a warning rather than raised, so it
+    never aborts a run."""
+    if client is None or not hasattr(client, "get_info"):
+        return
+    try:
+        info = client.get_info(sections)
+    except Exception as exc:  # best-effort only
+        manifest["metadata"].setdefault("warnings", []).append(
+            f"Could not capture system info {label}: {exc}"
+        )
+        return
+    rel_path = f"system_info_{label}.json"
+    with (Path(root) / rel_path).open("w", encoding="utf-8") as handle:
+        json.dump(_jsonify(info), handle, indent=2)
+    manifest["artifacts"].append({
+        "name": f"system_info_{label}",
+        "kind": "system_info",
+        "path": rel_path,
+        "format": "json",
+        "metadata": {"label": label, "sections": sections},
+        "created": _timestamp(),
+    })
+
+
 def run_power_sweep(
     client,
     centers,
@@ -383,11 +386,7 @@ def run_power_sweep(
     adc_cal_settle_time=2.0,
     file_format="npz",
     follow_dips=True,
-    follow_max_shift_fraction=0.35,
-    follow_edge_margin_fraction=0.05,
     follow_min_depth_db=0.5,
-    follow_min_separation_hz=None,
-    follow_conflict_fraction=0.02,
     search_for_center=None,
     verbose=True,
     search_span_factor=2.0,
@@ -477,35 +476,19 @@ def run_power_sweep(
         Artifact format for each saved sweep.  Sweeps are stored as ``'npz'``;
         any other value raises.
     follow_dips : bool, optional
-        If ``True``, after every sweep step refind the empirical dip in
-        each regular tone trace and use those frequencies as the next
-        step's centers.  Blind tones (per ``client.get_tone_metadata``)
+        If ``True``, after every sweep step refind the deepest empirical dip
+        in each regular tone's full trace and use those frequencies as the
+        next step's centers.  Blind tones (per ``client.get_tone_metadata``)
         are always left at their current frequency.  Default ``True``.
-    follow_max_shift_fraction : float, optional
-        Fraction of the span used by ``follow_dips`` as both the maximum
-        accepted candidate offset from the current center and the
-        within-span search window half-width (default ``0.35``).
-    follow_edge_margin_fraction : float, optional
-        Fraction of the span excluded near each sweep edge when searching
-        for dips (default ``0.05``).  Stops the edge of the window from
-        being mistaken for a dip.
     follow_min_depth_db : float or None, optional
         Minimum dip depth in dB required for a candidate to be accepted
         by ``follow_dips`` (default ``0.5`` dB, matching
         :py:func:`fit_power_sweep`'s ``min_dip_depth_db`` default).  Set to
         ``None`` to accept any depth.  Tones whose candidate falls below
         the threshold keep their previous center and are flagged with
-        ``"dip_too_shallow"`` in the saved follow-dips record.
-    follow_min_separation_hz : float or None, optional
-        Absolute minimum spacing in Hz between adjacent retuned centers.
-        Pairs that violate this constraint are both reverted to their
-        previous centers and flagged.  ``None`` (default) uses
-        ``follow_conflict_fraction`` to derive a span-fraction minimum
-        spacing instead.
-    follow_conflict_fraction : float, optional
-        Fallback minimum-spacing fraction of the smaller of the two
-        neighbour spans, applied only when ``follow_min_separation_hz``
-        is ``None`` (default ``0.02``).
+        ``"dip_too_shallow"`` in the saved follow-dips record.  Neighbouring
+        tones whose new centers would swap frequency order (both chasing the
+        same resonance) are both reverted and flagged ``"conflict_with..."``.
     search_for_center : bool or None, optional
         If ``True``, run one extra sweep at the first requested power
         before the recorded run begins, find the empirical dips, and use
@@ -522,7 +505,7 @@ def run_power_sweep(
         Print step-by-step progress (default ``True``).
     capture_system_info : bool, optional
         If ``True`` (default), save a ``client.get_info()`` snapshot as a
-        provenance artifact at the start and end of the run.
+        JSON file in the run directory at the start and end of the run.
     info_sections : optional
         Which info sections to capture, forwarded to ``client.get_info``
         (default ``"all"``).  Ignored when ``capture_system_info`` is
@@ -530,10 +513,12 @@ def run_power_sweep(
 
     Returns
     -------
-    run : MeasurementRun
-        The measurement run record.  Per-step sweep data are stored as
-        artifacts under ``data/`` and can be passed directly to
-        :py:func:`fit_power_sweep` or :py:func:`plot_power_sweep`.
+    run : dict
+        The analysis-view dict for the run (see :func:`load_power_sweep`).
+        Per-step sweep data are saved as ``.npz`` files under ``data/`` and
+        the run is described by ``measurement.json`` (:data:`MANIFEST_FILE`);
+        the returned dict can be passed directly to :py:func:`fit_power_sweep`
+        or :py:func:`plot_power_sweep`.
     """
     if str(file_format).lstrip(".") != "npz":
         raise ValueError("run_power_sweep stores sweep artifacts as npz.")
@@ -577,12 +562,16 @@ def run_power_sweep(
     output_dir = Path(output_dir).resolve()
     initial_centers = centers.copy()
 
-    store = MeasurementStore(output_dir)
-    store.ensure_layout()
-    run = MeasurementRun(
-        kind="tone_power_sweep",
-        root=output_dir,
-        parameters={
+    (output_dir / "data").mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "kind": "tone_power_sweep",
+        "schema_version": SCHEMA_VERSION,
+        "root": str(output_dir),
+        "created": _timestamp(),
+        "finished": None,
+        "status": "running",
+        "error": None,
+        "parameters": {
             "initial_centers_hz": initial_centers.tolist(),
             "spans_hz": spans.tolist(),
             "powers_dbm": [row.tolist() for row in power_steps],
@@ -601,88 +590,23 @@ def run_power_sweep(
             "search_span_factor": search_span_factor,
             "tone_count": int(initial_centers.size),
         },
-        metadata={
+        "metadata": {
             "description": "Targeted resonator sweeps across tone power.",
             "current_centers_hz": centers.tolist(),
         },
-        status=RunStatus.RUNNING,
-    )
-    run.write_manifest()
+        "artifacts": [],
+        "steps": [],
+    }
+    _write_manifest(manifest, output_dir)
     if capture_system_info:
-        save_system_info(run, store, client, "start", info_sections)
-        run.write_manifest()
-
-    # Two small steps are reused for both the center search and every saved
-    # power step, so they read the loop's current ``centers`` directly.
-    def phases_for(current_centers):
-        """Newman phases regenerated for the current centers, or the fixed set."""
-        if phase_mode == "newman":
-            return np.asarray(
-                client.generate_newman_phases(current_centers), dtype=float
-            )
-        return phase_values
-
-    def program_tones(current_centers, sweep_spans, requested, tone_phases):
-        """Park tones off-resonance, set phases, apply powers, then settle."""
-        # Park tones at the sweep low edge (off-resonance) before
-        # set_tone_powers so any rx optimisation sees the highest rx level the
-        # sweep will reach, not the on-resonance dip.  perform_sweep restores
-        # the tones to ``current_centers`` before sweeping.
-        _progress(verbose, f"  Parking {current_centers.size} tones at sweep low edge")
-        off_res = current_centers - sweep_spans / 2.0
-        _require_success(
-            client.set_tone_frequencies(off_res), "set_tone_frequencies failed"
-        )
-        if tone_phases is not None:
-            _progress(verbose, "  Setting tone phases")
-            _require_success(
-                client.set_tone_phases(tone_phases), "set_tone_phases failed"
-            )
-        _progress(
-            verbose,
-            "  Optimising dynamic range and applying tone powers"
-            if optimise_dynamic_range
-            else "  Applying tone powers",
-        )
-        _require_success(
-            client.set_tone_powers(
-                requested,
-                reference_plane=reference_plane,
-                optimise_dynamic_range=optimise_dynamic_range,
-                rx_policy=rx_policy,
-                verbose=False,
-            ),
-            "set_tone_powers failed",
-        )
-        if settle_time:
-            _progress(verbose, f"  Settling for {float(settle_time):g} s")
-            time.sleep(float(settle_time))
-
-    def targeted_sweep(current_centers, sweep_spans, tone_phases):
-        """Run one targeted sweep and return the parsed sweep dict."""
-        _progress(verbose, "  Running targeted sweep")
-        _require_success(
-            client.perform_sweep(
-                current_centers,
-                sweep_spans,
-                points=int(points),
-                samples_per_point=int(samples_per_point),
-                direction=direction,
-                phases=tone_phases,
-                refresh_adc_cal=refresh_adc_cal,
-                adc_cal_settle_time=adc_cal_settle_time,
-            ),
-            "perform_sweep failed",
-        )
-        client.wait_for_sweep(progress_bar=verbose)
-        sweep = client.parse_sweep_data(client.get_sweep_data())
-        sweep["tone_metadata"] = client.get_tone_metadata()
-        return sweep
+        _save_system_info(manifest, output_dir, client, "start", info_sections)
+        _write_manifest(manifest, output_dir)
 
     try:
         # Optional center search: one discarded sweep (at the first requested
         # power, optionally over wider spans) used only to recenter on the
-        # empirical dips before the first saved step.
+        # empirical dips before the first saved step.  The park / power / sweep
+        # sequence here is the same one each saved step runs below.
         if search_for_center:
             search_spans = spans * search_span_factor
             span_note = (
@@ -695,18 +619,59 @@ def run_power_sweep(
                 f"Searching for centers at {_format_power_summary(power_steps[0])} "
                 f"at {reference_plane}{span_note}",
             )
-            search_phases = phases_for(centers)
-            program_tones(centers, search_spans, power_steps[0], search_phases)
-            search_sweep = targeted_sweep(centers, search_spans, search_phases)
+            search_phases = (
+                np.asarray(client.generate_newman_phases(centers), dtype=float)
+                if phase_mode == "newman"
+                else phase_values
+            )
+            # Park tones off-resonance (sweep low edge) before set_tone_powers so
+            # any rx optimisation sees the highest rx level the sweep reaches, not
+            # the on-resonance dip.  perform_sweep restores them before sweeping.
+            _progress(verbose, f"  Parking {centers.size} tones at sweep low edge")
+            _require_success(
+                client.set_tone_frequencies(centers - search_spans / 2.0),
+                "set_tone_frequencies failed",
+            )
+            if search_phases is not None:
+                _progress(verbose, "  Setting tone phases")
+                _require_success(
+                    client.set_tone_phases(search_phases), "set_tone_phases failed"
+                )
+            _progress(
+                verbose,
+                "  Optimising dynamic range and applying tone powers"
+                if optimise_dynamic_range
+                else "  Applying tone powers",
+            )
+            _require_success(
+                client.set_tone_powers(
+                    power_steps[0],
+                    reference_plane=reference_plane,
+                    optimise_dynamic_range=optimise_dynamic_range,
+                    rx_policy=rx_policy,
+                    verbose=False,
+                ),
+                "set_tone_powers failed",
+            )
+            if settle_time:
+                _progress(verbose, f"  Settling for {float(settle_time):g} s")
+                time.sleep(float(settle_time))
+            _progress(verbose, "  Running targeted sweep")
+            _require_success(
+                client.perform_sweep(
+                    centers, search_spans, points=int(points),
+                    samples_per_point=int(samples_per_point), direction=direction,
+                    phases=search_phases, refresh_adc_cal=refresh_adc_cal,
+                    adc_cal_settle_time=adc_cal_settle_time,
+                ),
+                "perform_sweep failed",
+            )
+            client.wait_for_sweep(progress_bar=verbose)
+            search_sweep = client.parse_sweep_data(client.get_sweep_data())
+            search_sweep["tone_metadata"] = client.get_tone_metadata()
+
             new_centers, search_record = _find_dip_centers(
-                search_sweep,
-                centers,
-                search_spans,
-                follow_max_shift_fraction,
-                follow_edge_margin_fraction,
-                follow_min_depth_db,
-                follow_min_separation_hz,
-                follow_conflict_fraction,
+                search_sweep, centers, search_spans, follow_min_depth_db
             )
             blind_count = len(search_record["blind_indices"])
             _progress(
@@ -715,11 +680,11 @@ def run_power_sweep(
                 f"{centers.size - blind_count} tones",
             )
             centers = new_centers
-            run.metadata["search_record"] = search_record
-            run.metadata["search_spans_hz"] = search_spans.tolist()
-            run.metadata["search_centers_hz"] = centers.tolist()
-            run.metadata["current_centers_hz"] = centers.tolist()
-            run.write_manifest()
+            manifest["metadata"]["search_record"] = search_record
+            manifest["metadata"]["search_spans_hz"] = search_spans.tolist()
+            manifest["metadata"]["search_centers_hz"] = centers.tolist()
+            manifest["metadata"]["current_centers_hz"] = centers.tolist()
+            _write_manifest(manifest, output_dir)
 
         # Step through the power schedule, saving one targeted sweep per step.
         for index, requested in enumerate(power_steps):
@@ -728,10 +693,16 @@ def run_power_sweep(
                 f"[{index + 1}/{len(power_steps)}] tone powers "
                 f"{_format_power_summary(requested)} at {reference_plane}",
             )
-            step = run.add_step(MeasurementStep(
-                index=index,
-                axis={"tone_power_dbm": requested.tolist()},
-                metadata={
+            step_phases = (
+                np.asarray(client.generate_newman_phases(centers), dtype=float)
+                if phase_mode == "newman"
+                else phase_values
+            )
+            step = {
+                "index": index,
+                "axis": {"tone_power_dbm": requested.tolist()},
+                "readback": {},
+                "metadata": {
                     "reference_plane": reference_plane,
                     "points": int(points),
                     "samples_per_point": int(samples_per_point),
@@ -739,21 +710,65 @@ def run_power_sweep(
                     "centers_hz": centers.tolist(),
                     "spans_hz": spans.tolist(),
                 },
-                status=RunStatus.RUNNING,
-                started=timestamp(),
-            ))
-
-            step_phases = phases_for(centers)
+                "artifacts": [],
+                "status": "running",
+                "started": _timestamp(),
+                "finished": None,
+                "error": None,
+            }
             if step_phases is not None:
-                step.metadata["tone_phases_rad"] = step_phases.tolist()
-            program_tones(centers, spans, requested, step_phases)
+                step["metadata"]["tone_phases_rad"] = step_phases.tolist()
+            manifest["steps"].append(step)
 
-            sweep_data = targeted_sweep(centers, spans, step_phases)
+            # Park, power, settle, sweep (same sequence as the center search).
+            _progress(verbose, f"  Parking {centers.size} tones at sweep low edge")
+            _require_success(
+                client.set_tone_frequencies(centers - spans / 2.0),
+                "set_tone_frequencies failed",
+            )
+            if step_phases is not None:
+                _progress(verbose, "  Setting tone phases")
+                _require_success(
+                    client.set_tone_phases(step_phases), "set_tone_phases failed"
+                )
+            _progress(
+                verbose,
+                "  Optimising dynamic range and applying tone powers"
+                if optimise_dynamic_range
+                else "  Applying tone powers",
+            )
+            _require_success(
+                client.set_tone_powers(
+                    requested,
+                    reference_plane=reference_plane,
+                    optimise_dynamic_range=optimise_dynamic_range,
+                    rx_policy=rx_policy,
+                    verbose=False,
+                ),
+                "set_tone_powers failed",
+            )
+            if settle_time:
+                _progress(verbose, f"  Settling for {float(settle_time):g} s")
+                time.sleep(float(settle_time))
+            _progress(verbose, "  Running targeted sweep")
+            _require_success(
+                client.perform_sweep(
+                    centers, spans, points=int(points),
+                    samples_per_point=int(samples_per_point), direction=direction,
+                    phases=step_phases, refresh_adc_cal=refresh_adc_cal,
+                    adc_cal_settle_time=adc_cal_settle_time,
+                ),
+                "perform_sweep failed",
+            )
+            client.wait_for_sweep(progress_bar=verbose)
+            sweep_data = client.parse_sweep_data(client.get_sweep_data())
+            sweep_data["tone_metadata"] = client.get_tone_metadata()
+
             readback = np.asarray(
                 client.get_tone_powers(reference_plane=reference_plane),
                 dtype=float,
             ).ravel()
-            step.readback["tone_power_dbm"] = readback.tolist()
+            step["readback"]["tone_power_dbm"] = readback.tolist()
             sweep_data["requested_tone_powers_dbm"] = requested.copy()
             sweep_data["readback_tone_powers_dbm"] = readback.copy()
             sweep_data["tone_powers_reference_plane"] = reference_plane
@@ -764,14 +779,7 @@ def run_power_sweep(
             next_centers = centers.copy()
             if follow_dips:
                 next_centers, follow_record = _find_dip_centers(
-                    sweep_data,
-                    centers,
-                    spans,
-                    follow_max_shift_fraction,
-                    follow_edge_margin_fraction,
-                    follow_min_depth_db,
-                    follow_min_separation_hz,
-                    follow_conflict_fraction,
+                    sweep_data, centers, spans, follow_min_depth_db
                 )
                 sweep_data["follow_dips"] = follow_record
                 sweep_data["next_sweep_centers_hz"] = next_centers.copy()
@@ -781,17 +789,16 @@ def run_power_sweep(
                     f"  Following dips: {int(np.sum(follow_record['accepted']))}/"
                     f"{centers.size - blind_count} centers updated",
                 )
-            step.metadata["next_centers_hz"] = next_centers.tolist()
+            step["metadata"]["next_centers_hz"] = next_centers.tolist()
 
-            artifact = store.save_step_npz_artifact(
-                run,
-                step,
-                name=f"step_{index:04d}_sweep",
-                kind=ArtifactKind.SWEEP,
-                relative_path=f"data/step_{index:04d}_sweep.npz",
-                data=sweep_data,
-                role=ArtifactRole.DATA,
-                metadata={
+            rel_path = f"data/step_{index:04d}_sweep.npz"
+            _save_npz(output_dir / rel_path, sweep_data)
+            step["artifacts"].append({
+                "name": f"step_{index:04d}_sweep",
+                "kind": "sweep",
+                "path": rel_path,
+                "format": "npz",
+                "metadata": {
                     "reference_plane": reference_plane,
                     "requested_tone_powers_dbm": requested.tolist(),
                     "readback_tone_powers_dbm": readback.tolist(),
@@ -799,35 +806,36 @@ def run_power_sweep(
                     "spans_hz": spans.tolist(),
                     "system_info_source": "embedded",
                 },
-            )
-            _progress(verbose, f"  Saved {artifact.path}")
+                "created": _timestamp(),
+            })
+            _progress(verbose, f"  Saved {rel_path}")
 
-            step.status = RunStatus.SUCCESS
-            step.finished = timestamp()
+            step["status"] = "success"
+            step["finished"] = _timestamp()
             centers = next_centers
-            run.metadata["current_centers_hz"] = centers.tolist()
+            manifest["metadata"]["current_centers_hz"] = centers.tolist()
             # Rewrite the manifest after every step so an interrupted run can
             # still be inspected.
-            run.write_manifest()
+            _write_manifest(manifest, output_dir)
 
-        run.metadata["final_centers_hz"] = centers.tolist()
-        run.status = RunStatus.SUCCESS
+        manifest["metadata"]["final_centers_hz"] = centers.tolist()
+        manifest["status"] = "success"
     except Exception as exc:
-        run.status = RunStatus.FAILED
-        run.error = "".join(
+        manifest["status"] = "failed"
+        manifest["error"] = "".join(
             traceback.format_exception_only(type(exc), exc)
         ).strip()
-        if run.steps and run.steps[-1].status == RunStatus.RUNNING:
-            run.steps[-1].status = RunStatus.FAILED
-            run.steps[-1].error = run.error
-            run.steps[-1].finished = timestamp()
+        if manifest["steps"] and manifest["steps"][-1]["status"] == "running":
+            manifest["steps"][-1]["status"] = "failed"
+            manifest["steps"][-1]["error"] = manifest["error"]
+            manifest["steps"][-1]["finished"] = _timestamp()
         raise
     finally:
-        run.finished = timestamp()
+        manifest["finished"] = _timestamp()
         if capture_system_info:
-            save_system_info(run, store, client, "end", info_sections)
-        run.write_manifest()
-    return run
+            _save_system_info(manifest, output_dir, client, "end", info_sections)
+        _write_manifest(manifest, output_dir)
+    return _power_sweep_run_view(manifest)
 
 
 def _require_success(response, message):
@@ -836,27 +844,25 @@ def _require_success(response, message):
         raise RuntimeError(response.get("message", message))
 
 
-def _ensure_measurement_run(run):
-    """Return a MeasurementRun from a run object or path."""
-    if isinstance(run, MeasurementRun):
-        return run
-    return MeasurementRun.load(run)
-
-
 def _power_sweep_run_view(run):
     """Return the array view the fit/plot helpers work on.
 
-    Accepts a :class:`MeasurementRun`, a path to one, or an already-built
-    view dict (returned unchanged).  The view is cached on the run object so
-    fits attached by :func:`fit_power_sweep` are visible to a later
-    :func:`plot_power_sweep` call handed the same run.
+    Accepts an already-built view dict (returned unchanged), a run manifest
+    dict (as built by :func:`run_power_sweep`), or a path to a run directory
+    or ``measurement.json`` file.  Fits attached to the returned dict by
+    :func:`fit_power_sweep` are therefore visible to a later
+    :func:`plot_power_sweep` call handed the same dict.
     """
     if isinstance(run, dict):
-        return run
-    run = _ensure_measurement_run(run)
-    cached = getattr(run, "_analysis_view", None)
-    if cached is not None:
-        return cached
+        if "sweeps" in run:          # already a built analysis view
+            return run
+        manifest = run               # a freshly built or loaded manifest
+    else:
+        manifest = _load_manifest(run)
+
+    root = Path(manifest.get("root", "."))
+    parameters = manifest.get("parameters", {})
+    metadata = manifest.get("metadata", {})
 
     # Walk the steps once, pulling the per-step arrays the analysis code wants
     # (the loaded sweep, requested/readback powers, and centers) into parallel
@@ -864,41 +870,50 @@ def _power_sweep_run_view(run):
     sweeps, files, powers, readback, centers, next_centers, steps = (
         [], [], [], [], [], [], []
     )
-    for step in run.steps:
+    for step in manifest.get("steps", []):
+        step_meta = step.get("metadata", {})
         # Each step's sweep is stored as an npz artifact; load it (or keep a
         # None placeholder so list positions stay aligned with the steps).
-        sweep_artifact = step.artifact(ArtifactKind.SWEEP)
+        sweep_artifact = next(
+            (art for art in step.get("artifacts", []) if art.get("kind") == "sweep"),
+            None,
+        )
         if sweep_artifact is not None:
-            sweeps.append(run.store().load_artifact_data(sweep_artifact))
-            files.append(str(sweep_artifact.absolute_path(run.root)))
-            sweep_file = sweep_artifact.path
+            sweep_path = Path(sweep_artifact["path"])
+            if not sweep_path.is_absolute():
+                sweep_path = root / sweep_path
+            sweeps.append(_load_npz(sweep_path))
+            files.append(str(sweep_path))
+            sweep_file = sweep_artifact["path"]
         else:
             sweeps.append(None)
             files.append("")
             sweep_file = None
-        power = np.asarray(step.axis.get("tone_power_dbm", []), dtype=float).ravel()
+        power = np.asarray(
+            step.get("axis", {}).get("tone_power_dbm", []), dtype=float
+        ).ravel()
         power_readback = np.asarray(
-            step.readback.get("tone_power_dbm", []), dtype=float
+            step.get("readback", {}).get("tone_power_dbm", []), dtype=float
         ).ravel()
         step_centers = np.asarray(
-            step.metadata.get("centers_hz", run.parameters.get("initial_centers_hz", [])),
+            step_meta.get("centers_hz", parameters.get("initial_centers_hz", [])),
             dtype=float,
         ).ravel()
         step_next_centers = np.asarray(
-            step.metadata.get("next_centers_hz", step_centers), dtype=float
+            step_meta.get("next_centers_hz", step_centers), dtype=float
         ).ravel()
         powers.append(power)
         readback.append(power_readback)
         centers.append(step_centers)
         next_centers.append(step_next_centers)
         steps.append({
-            "index": int(step.index),
+            "index": int(step.get("index", len(steps))),
             "power_dbm": power.tolist(),
             "readback_power_dbm": power_readback.tolist(),
             "centers_hz": step_centers.tolist(),
             "next_centers_hz": step_next_centers.tolist(),
             "sweep_file": sweep_file,
-            "metadata": step.metadata,
+            "metadata": step_meta,
         })
 
     # Infer the tone count from the first real sweep (a wideband or single-row
@@ -912,30 +927,23 @@ def _power_sweep_run_view(run):
         else:
             tone_count = first_f.shape[1]
     else:
-        tone_count = int(run.parameters.get("tone_count", 0))
+        tone_count = int(parameters.get("tone_count", 0))
 
-    view = {
-        "root": str(run.root),
-        "manifest_file": str(run.manifest_path),
-        "manifest": run.to_dict(),
-        "measurement_run": run,
-        "initial_centers_hz": np.asarray(
-            run.parameters.get("initial_centers_hz", []), dtype=float
-        ),
-        "centers_hz": np.asarray(
-            run.parameters.get("initial_centers_hz", []), dtype=float
-        ),
+    initial_centers = parameters.get("initial_centers_hz", [])
+    return {
+        "root": str(root),
+        "manifest_file": str(root / MANIFEST_FILE),
+        "manifest": manifest,
+        "initial_centers_hz": np.asarray(initial_centers, dtype=float),
+        "centers_hz": np.asarray(initial_centers, dtype=float),
         "final_centers_hz": np.asarray(
-            run.metadata.get(
+            metadata.get(
                 "final_centers_hz",
-                run.metadata.get(
-                    "current_centers_hz",
-                    run.parameters.get("initial_centers_hz", []),
-                ),
+                metadata.get("current_centers_hz", initial_centers),
             ),
             dtype=float,
         ),
-        "spans_hz": np.asarray(run.parameters.get("spans_hz", []), dtype=float),
+        "spans_hz": np.asarray(parameters.get("spans_hz", []), dtype=float),
         "steps": steps,
         "sweeps": sweeps,
         "files": files,
@@ -945,31 +953,36 @@ def _power_sweep_run_view(run):
         "next_centers_by_step_hz": next_centers,
         "tone_count": int(tone_count),
     }
-    run._analysis_view = view
-    return view
 
 
 def load_power_sweep(path):
-    """Load a tone-power sweep measurement run.
+    """Load a tone-power sweep run.
 
     Parameters
     ----------
     path : str or Path
         A power-sweep run directory or its ``measurement.json`` manifest.
         Raises if the loaded run is not a ``"tone_power_sweep"``.
+
+    Returns
+    -------
+    run : dict
+        Analysis-view dict ready for :py:func:`fit_power_sweep`,
+        :py:func:`plot_power_sweep`, and :py:func:`analyse_power_sweep`.
     """
-    run = MeasurementRun.load(path)
-    if run.kind != "tone_power_sweep":
+    manifest = _load_manifest(path)
+    kind = manifest.get("kind")
+    if kind != "tone_power_sweep":
         raise ValueError(
-            f"{path} is a {run.kind!r} measurement, not a tone-power sweep."
+            f"{path} is a {kind!r} measurement, not a tone-power sweep."
         )
-    return run
+    return _power_sweep_run_view(manifest)
 
 
 def fit_power_sweep(
     run,
     tone_index=None,
-    nonlinear=False,
+    nonlinear=True,
     sweep_direction="up",
     n_jobs=1,
     verbose=True,
@@ -1008,9 +1021,15 @@ def fit_power_sweep(
     tone_index : int or None, optional
         ``None`` (default) fits every regular tone at every power.  An
         ``int`` fits only that tone across the power axis as a stack.
-    nonlinear : bool, optional
-        If ``True``, fit with the Duffing nonlinearity parameter ``anl``
-        enabled.  Default ``False`` (linear seven-parameter model).
+    nonlinear : bool or {'auto'}, optional
+        How to handle the Duffing nonlinearity parameter ``anl`` (default
+        ``True``, so ``anl`` is fitted at every power -- needed for ``anl``
+        versus power studies; see
+        :func:`souk_readout_tools.fitting.fit_resonance`). ``False`` fits the
+        linear seven-parameter model only. ``'auto'`` fits each power/tone with
+        the linear model and only refines the ones it cannot explain, which is
+        faster but drops ``anl`` for low powers whose nonlinearity is below the
+        single-sweep detection floor.
     sweep_direction : {'up', 'down'}, optional
         Direction the saved sweeps were taken in.  Affects nonlinear
         bifurcation handling (default ``'up'``).
@@ -1534,7 +1553,6 @@ def _archive_fit_data(fit_data, *, include_sweeps, include_optimizer):
 
     run = dict(fit_data["run"])
     run.pop("fits", None)
-    run.pop("measurement_run", None)
     if not include_sweeps:
         run["sweeps"] = [None] * _fit_data_step_count(fit_data)
     archived["run"] = run
@@ -1690,11 +1708,15 @@ def analyse_power_sweep(
 
     Parameters
     ----------
-    run : MeasurementRun or str or Path
+    run : dict or str or Path
         A run from :py:func:`run_power_sweep` / :py:func:`load_power_sweep`,
         or a path to a power-sweep directory or manifest.
-    nonlinear : bool, optional
-        Fit the Duffing ``anl`` nonlinearity (default ``True``).
+    nonlinear : bool or {'auto'}, optional
+        How to handle the Duffing ``anl`` nonlinearity (default ``True``, so
+        ``anl`` is fitted at every power; see :func:`fit_power_sweep`).
+        ``False`` fits the linear model only, and ``'auto'`` keeps low-power
+        tones linear and only refines the rest (faster, but drops the
+        small-``anl`` values).
     sweep_direction : {'up', 'down'}, optional
         Direction the saved sweeps were taken in (default ``'up'``).
     n_jobs : int, optional
@@ -1746,7 +1768,8 @@ def analyse_power_sweep(
         disabled stages are ``None``.
     """
 
-    measurement_run = _ensure_measurement_run(run)
+    view = _power_sweep_run_view(run)
+    root = Path(view["root"])
     fit_kwargs = dict(fit_kwargs or {})
     plot_kwargs = dict(plot_kwargs or {})
     best_power_kwargs = dict(best_power_kwargs or {})
@@ -1759,7 +1782,7 @@ def analyse_power_sweep(
     best_target_anl = best_power_kwargs.pop("target_anl", target_anl)
 
     result = {
-        "run": measurement_run,
+        "run": view,
         "fits": None,
         "fit_file": None,
         "summary_csv": None,
@@ -1771,7 +1794,7 @@ def analyse_power_sweep(
 
     if fit:
         fits = fit_power_sweep(
-            measurement_run,
+            view,
             nonlinear=nonlinear,
             sweep_direction=sweep_direction,
             n_jobs=n_jobs,
@@ -1779,13 +1802,13 @@ def analyse_power_sweep(
             **fit_kwargs,
         )
     else:
-        fits = load_fit_results(measurement_run.root, run=measurement_run)
+        fits = load_fit_results(root, run=view)
     result["fits"] = fits
 
     if save:
-        result["fit_file"] = write_fit_results(fits, measurement_run.root)
+        result["fit_file"] = write_fit_results(fits, root)
         result["summary_csv"] = write_fit_summary(
-            fits, measurement_run.root / FIT_SUMMARY_FILE
+            fits, root / FIT_SUMMARY_FILE
         )
 
     if best_power:
@@ -1796,7 +1819,7 @@ def analyse_power_sweep(
         )
         result["best_power"] = best
         if save:
-            result["best_power_file"] = str(write_best_power(best, measurement_run.root))
+            result["best_power_file"] = str(write_best_power(best, root))
     else:
         best = None
 
@@ -1806,7 +1829,7 @@ def analyse_power_sweep(
         # plot_kwargs={'n_jobs': ...}).
         plot_n_jobs = plot_kwargs.pop("n_jobs", n_jobs)
         result["plots"] = plot_power_sweep(
-            measurement_run,
+            view,
             fit_data=fits,
             show_overlay=plot_show,
             n_jobs=plot_n_jobs,

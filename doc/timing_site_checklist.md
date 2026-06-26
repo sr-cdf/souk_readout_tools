@@ -96,6 +96,13 @@ client.get_info("timing")["summary"]["ready_for_firmware_sync"]
 
 as `True` after several stable polls.
 
+For the operator-facing readiness check before a firmware timed sync, use
+`client.timed_sync_needed()` (is the telescope time aligned, and is PTP + the PPS
+strobe ready?) or `client.timed_sync_ready(seconds_from_now=10)` (the same gate for
+a specific target second). Both report `can_sync`/`ready` with human-readable
+reasons; the strobe must be healthy (`souk-tsu-strobe`). See
+[tsu_strobe_and_timed_sync.md](tsu_strobe_and_timed_sync.md).
+
 In the timing status, `ptp_data_fresh` should be `True` and
 `ptp_seconds_since_ingress_update` should stay below
 `ptp_ingress_stale_after_s`. If `TIME_STATUS_NP` shows `ingress_time 0`, treat

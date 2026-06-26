@@ -195,8 +195,8 @@ def estimate_resonance_empirical(frequencies, s21, peak_index=None):
             f_right = float(f[j - 1] + frac * (f[j] - f[j - 1]))
             break
 
-    left_width = max(fr - f_left, 0.0) if np.isfinite(f_left) else np.nan
-    right_width = max(f_right - fr, 0.0) if np.isfinite(f_right) else np.nan
+    left_width = abs(fr - f_left) if np.isfinite(f_left) else np.nan
+    right_width = abs(f_right - fr) if np.isfinite(f_right) else np.nan
     linewidth = left_width + right_width if np.isfinite(left_width + right_width) else step
     linewidth = linewidth if linewidth > 0.0 else step
     skew = (
@@ -860,6 +860,24 @@ def interpolate_complex_trace(frequencies, s21, reference_frequency):
     )
 
 
+def project_iq_tangent_normal(reference_iq, gradient, s21):
+    """Project an IQ displacement onto local tangent/normal axes.
+
+    Given a reference point ``reference_iq``, the local complex sweep gradient
+    ``dS21/df`` and a measured ``s21``, return the displacement resolved along
+    the tangent (local frequency, ``df`` in Hz) and normal (matched-loss,
+    ``dd`` in Hz) directions. Fully vectorized; div-by-zero where the gradient
+    vanishes yields NaN per element.
+    """
+    delta = np.asarray(reference_iq, dtype=complex) - np.asarray(s21, dtype=complex)
+    gradient = np.asarray(gradient, dtype=complex)
+    divisor = np.abs(gradient) ** 2
+    with np.errstate(divide='ignore', invalid='ignore'):
+        df = (delta.real * gradient.real + delta.imag * gradient.imag) / divisor
+        dd = (delta.imag * gradient.real - delta.real * gradient.imag) / divisor
+    return df, dd
+
+
 @dataclass(frozen=True)
 class LinearizedResonatorCalibration:
     """Small-signal tangent/normal projection around one probe frequency."""
@@ -909,20 +927,7 @@ class LinearizedResonatorCalibration:
 
     def convert_raw_iq(self, s21, *, fractional=True):
         """Project raw IQ displacement onto local frequency/dissipation axes."""
-        z = np.asarray(s21, dtype=complex)
-        delta = self.reference_iq - z
-        divisor = abs(self.gradient) ** 2
-        if divisor == 0.0:
-            shape = np.broadcast_shapes(z.shape, ())
-            return np.full(shape, np.nan), np.full(shape, np.nan)
-        df = (
-            delta.real * self.gradient.real
-            + delta.imag * self.gradient.imag
-        ) / divisor
-        dd_hz = (
-            delta.imag * self.gradient.real
-            - delta.real * self.gradient.imag
-        ) / divisor
+        df, dd_hz = project_iq_tangent_normal(self.reference_iq, self.gradient, s21)
         if fractional:
             return df / self.reference_frequency, dd_hz / self.reference_frequency
         return df, dd_hz

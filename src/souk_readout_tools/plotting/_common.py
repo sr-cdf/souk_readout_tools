@@ -7,6 +7,8 @@ import warnings
 
 import numpy as np
 
+from souk_readout_tools import config_utils
+
 
 # Supported units for normalisation. ``s21`` is kept as a backwards-compatible
 # alias for ``s21_log``.
@@ -40,8 +42,9 @@ _REFERENCE_PLANE_LABELS = {
 }
 
 # Directory that frequency-dependent cal files (referenced by filename in the
-# config) live in.  Must match firmware_lib.USER_DIR.
-_CAL_USER_DIR = os.path.expanduser('~/.souk_readout_tools/')
+# config) live in. Shares config_utils.get_user_dir() with firmware_lib.USER_DIR
+# so the two stay in lockstep (and both resolve the right home under sudo).
+_CAL_USER_DIR = config_utils.get_user_dir()
 _CAL_FILE_CACHE = {}
 _CONFIG_TEXT_CACHE = {}
 

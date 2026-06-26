@@ -11,6 +11,7 @@ import os
 import yaml
 import struct
 import subprocess
+import tempfile
 import threading
 
 # pwd and fcntl are POSIX-only (absent on Windows). They are only used by
@@ -32,6 +33,8 @@ except ImportError:
     print("firmware_lib.py: Warning: Importing firmware lib without souk_mkid_readout support.")
 
 from souk_readout_tools import calibration
+from souk_readout_tools import config_utils
+from souk_readout_tools.timing import unix_to_iso, DEFAULT_ALIGN_TOL_S
 
 class bcolors:
     HEADER = '\033[95m'
@@ -49,9 +52,21 @@ def _firmware_log(message, source='general'):
     print(f'firmware:{source}: {message}', flush=True)
 
 
-USER_DIR = os.path.expanduser('~/.souk_readout_tools/')
-FPGA_PROGRAM_LOCK = os.path.join(USER_DIR, '.fpga_program.lock')
-SHARED_INIT_LOCK = os.path.join(USER_DIR, '.shared_init.lock')
+# Persistent data (configs, calibration files) lives in the target user's home.
+# The server runs under sudo, so this is resolved via config_utils rather than
+# expanduser('~') (which would point at /root). On a Windows client it falls
+# back to the user's home.
+USER_DIR = config_utils.get_user_dir()
+
+# Cross-pipeline coordination locks must resolve to the same path for every
+# pipeline server on the board, regardless of which user starts it. The server
+# is launched under sudo, so a home-relative path lands in /root rather than the
+# target user's home; use the system temp dir instead (matches the rudat and
+# lna_controller lock handling). USER_DIR is left home-relative on purpose - it
+# also resolves calibration files, which live in the real user home.
+_LOCK_DIR = os.path.join(tempfile.gettempdir(), 'souk_readout_tools')
+FPGA_PROGRAM_LOCK = os.path.join(_LOCK_DIR, '.fpga_program.lock')
+SHARED_INIT_LOCK = os.path.join(_LOCK_DIR, '.shared_init.lock')
 
 autosync_time_delay = 0.001 #seconds
 
@@ -65,7 +80,7 @@ INIT_SYNC_MRST = True  # master-reset on init/config-time syncs (startup, sync_d
 adc_saturation_bits = 16 # note the adc gives 16 bit data but is a 12 or 14 bit converter
 dac_saturation_bits = 16 # note the dac takes 16 bit data but is a 12 or 14 bit converter
 
-def _sync_if_requested(r, autosync=True, mrst=False):
+def _sync_if_requested(r, autosync=False, mrst=False):
     if not autosync:
         return
     # v7.10: sw_sync no longer needs arming; ``mrst`` toggles the (now independent) reset.
@@ -193,6 +208,27 @@ def _rx_phase_compensation(phase_incs_rx, fft_rbw_hz, compensate_rx_ticks,
     if not compensate_rx_ticks:
         return 0.0
     return phase_incs_rx * compensate_rx_ticks * fft_rbw_hz / tick_clk_hz
+
+def _wrap_bin_offsets_for_nco(bin_offsets):
+    """Wrap bin offsets to the fine-mixer NCO's one-bin phase domain.
+
+    The fine-mixer phase step is sampled once per FFT period, so offsets that
+    differ by an integer FFT bin program the same NCO word. Keep diagnostics in
+    the raw drift domain, but use this wrapped residual when generating control
+    words and RX path-delay compensation.
+    """
+    return (np.asarray(bin_offsets, dtype=float) + 0.5) % 1.0 - 0.5
+
+def _bin_spacing_hz(bin_centers_hz):
+    """Return the uniform spacing of an FFT bin-centre grid in Hz."""
+    centers = np.asarray(bin_centers_hz, dtype=float).ravel()
+    if centers.size < 2:
+        raise ValueError('Need at least two FFT bin centres to determine spacing')
+    diffs = np.diff(np.sort(centers))
+    diffs = diffs[diffs > 0]
+    if diffs.size == 0:
+        raise ValueError('FFT bin-centre grid has no positive spacing')
+    return float(np.min(diffs))
 
 def _format_ri_steps(ri_steps, ri_step_bp,fmt='>u4'):
     """
@@ -364,6 +400,17 @@ def needs_programming(r,config_dict, verbose=False):
             _firmware_log('programming required: FPGA is not programmed', source='ready')
         return True
 
+    # The souk_mkid_readout constructor only builds its firmware block interfaces
+    # (sync, autocorr, accumulators, ...) when the board is running supported
+    # firmware. If that failed - e.g. the PL holds a stale/unsupported image even
+    # though is_programmed() reports True - the readout object is left with an
+    # empty blocks dict, and shared/pipeline init would later crash accessing
+    # e.g. r.sync. Treat that as "needs (re)programming" so we reprogram first.
+    if not getattr(r, 'blocks', None):
+        if verbose:
+            _firmware_log('programming required: firmware blocks not created (unprogrammed or unsupported firmware)', source='ready')
+        return True
+
     if newfpg != currentfpg:
         if verbose:
             _firmware_log('programming required: current FPG does not match config', source='ready')
@@ -433,20 +480,98 @@ def needs_initialising(r,config_dict, verbose=False):
     return needs_initialising_shared or needs_initialising_pipeline
 
 
-def ensure_clocks_locked(config_dict, max_retries=1):
-    """
-    Verify PLL clocks are locked, retrying clock init if needed.
+class ClockFault(RuntimeError):
+    """Raised when the PLL clock tree is not locked and firmware access must stop.
 
-    Reads the desired clock_source from the config (firmware section,
-    falling back to rfsoc_host for older configs).  If clocks are not
-    locked, re-applies the clock configuration and checks again.
+    Subclasses RuntimeError so existing ``except (ValueError, RuntimeError)``
+    handlers still catch it. Carries the clock classification so callers can
+    distinguish an LMK (reference) fault - which usually means the PL power rail
+    is down and a power cycle is needed - from an LMX (downstream PLL) fault,
+    which a deprogram + clock re-init + reprogram cycle can recover.
+    """
+
+    def __init__(self, message, fault=None, status=None):
+        super().__init__(message)
+        self.fault = fault      # 'lmk' | 'lmx' | None
+        self.status = status    # raw classify_clock_status() dict
+
+
+def classify_clock_status(status=None):
+    """Classify PLL lock state, separating the LMK reference from the LMX PLLs.
+
+    Pure read - shells out to ``krc-utils status`` (PS-side I2C/SPI) and never
+    touches the PL fabric / AXI bus, so it is safe to call even when the fabric
+    clock is dead.
+
+    Parameters
+    ----------
+    status : dict, optional
+        A pre-fetched :func:`get_clock_status` result. Fetched if omitted.
+
+    Returns
+    -------
+    dict
+        ``{'all_locked', 'lmk_locked', 'lmx_locked', 'fault', 'chips'}`` where
+        ``fault`` is ``'lmk'`` (reference unlocked), ``'lmx'`` (a downstream PLL
+        unlocked while the LMK is locked), or ``None`` (all locked). If no chips
+        are reported (krc-utils unavailable/timed out) everything is treated as
+        unlocked, i.e. ``fault == 'lmk'``.
+    """
+    if status is None:
+        status = get_clock_status()
+    chips = status.get('chips', [])
+    lmk_chips = [c for c in chips if str(c.get('name', '')).lower().startswith('lmk')]
+    lmx_chips = [c for c in chips if str(c.get('name', '')).lower().startswith('lmx')]
+    lmk_locked = bool(lmk_chips) and all(c.get('status') == 'locked' for c in lmk_chips)
+    lmx_locked = bool(lmx_chips) and all(c.get('status') == 'locked' for c in lmx_chips)
+    all_locked = bool(status.get('all_locked', False)) and lmk_locked and lmx_locked
+    if not lmk_locked:
+        fault = 'lmk'
+    elif not lmx_locked:
+        fault = 'lmx'
+    else:
+        fault = None
+    return {
+        'all_locked': all_locked,
+        'lmk_locked': lmk_locked,
+        'lmx_locked': lmx_locked,
+        'fault': fault,
+        'chips': chips,
+    }
+
+
+def _configured_clock_source(config_dict):
+    """Return the configured clock source, accepting the legacy location."""
+    source = config_dict.get('firmware', {}).get(
+        'clock_source',
+        config_dict.get('rfsoc_host', {}).get('clock_source')
+    )
+    if source is None:
+        return None
+    return str(source).strip().lower()
+
+
+def apply_clock_config(config_dict, max_attempts=3):
+    """
+    Check the clocks and re-init them only if necessary - MUST run on a blank PL.
+
+    Reads the desired clock_source from the config (firmware section, falling
+    back to rfsoc_host for older configs). If the selected source already
+    matches and all PLLs are locked, returns immediately without running
+    ``krc-utils init``. Otherwise it applies/re-applies the clock configuration
+    up to ``max_attempts`` times.
+
+    WARNING: running ``krc-utils init`` while the PL is programmed and loaded
+    with tones collapses the PL power rail and hangs the PS (issue #14). This
+    function is only safe to call once the PL has been deprogrammed - it is
+    invoked from :func:`reload_firmware` immediately after :func:`deprogram_fpga`.
 
     Parameters
     ----------
     config_dict : dict
         The system configuration dictionary.
-    max_retries : int
-        Number of times to re-apply clock config before giving up.
+    max_attempts : int
+        Maximum number of times to apply the clock config before giving up.
 
     Returns
     -------
@@ -455,30 +580,41 @@ def ensure_clocks_locked(config_dict, max_retries=1):
 
     Raises
     ------
-    RuntimeError
+    ClockFault
         If clocks cannot be locked after retries.
     """
-    status = get_clock_status()
-    if status.get('all_locked', False):
-        _firmware_log('clocks locked', source='clock')
-        return status
+    max_attempts = int(max_attempts)
+    if max_attempts < 1:
+        raise ValueError('max_attempts must be >= 1')
 
-    # Clocks not locked — attempt to re-apply clock source from config
-    desired_clock = config_dict.get('firmware', {}).get(
-        'clock_source',
-        config_dict.get('rfsoc_host', {}).get('clock_source')
-    )
+    desired_clock = _configured_clock_source(config_dict)
     current_clock = get_clock_source()
 
-    for attempt in range(max_retries):
+    if desired_clock is not None and current_clock != desired_clock:
         _firmware_log(
-            f'clocks not locked (attempt {attempt + 1}/{max_retries}); '
-            f're-applying clock source: {desired_clock or current_clock}',
+            f'clock source mismatch: config={desired_clock}, '
+            f'current={current_clock}; applying configured source',
+            source='clock',
+        )
+    else:
+        status = get_clock_status()
+        if status.get('all_locked', False):
+            _firmware_log('clocks locked', source='clock')
+            return status
+
+    reapply_clock = desired_clock or current_clock
+    status = None
+    last_error = None
+    for attempt in range(max_attempts):
+        _firmware_log(
+            f'clocks not locked (attempt {attempt + 1}/{max_attempts}); '
+            f're-applying clock source: {reapply_clock}',
             source='clock',
         )
         try:
-            status = set_clock_source(desired_clock or current_clock)
+            status = set_clock_source(reapply_clock)
         except (ValueError, FileNotFoundError) as exc:
+            last_error = exc
             _firmware_log(f'failed to set clock source: {exc}', source='clock')
             continue
         if status.get('all_locked', False):
@@ -493,24 +629,82 @@ def ensure_clocks_locked(config_dict, max_retries=1):
     elif desired_clock == 'internal':
         suggestion = (" Config specifies 'internal' clock — if the on-board oscillator "
                       "is not functioning, check hardware.")
-    raise RuntimeError(
-        f'Clocks failed to lock after {max_retries} attempt(s). '
-        f'Status: {status}.{suggestion}'
+    error_note = f' Last error: {last_error}.' if last_error is not None else ''
+    cls = classify_clock_status(status)
+    raise ClockFault(
+        f'Clock check failed: clocks are not locked after {max_attempts} '
+        f'attempt(s) to set clock source {reapply_clock!r}. Server remains at '
+        f'server level; firmware interfaces were not created. '
+        f'Status: {status}.{error_note}{suggestion}',
+        fault=cls['fault'],
+        status=cls,
     )
 
 
-def reload_firmware(config_dict):
+# Kernel FPGA manager - used to reset the PL to its base bitstream from the PS
+# side without constructing a casperfpga interface (and without needing the
+# fabric clock). The firmware node takes a filename only (resolved against
+# /lib/firmware); the base image is always tcpborphserver's locally stored copy.
+FPGA_MANAGER_FIRMWARE_NODE = '/sys/class/fpga_manager/fpga0/firmware'
+FPGA_MANAGER_BASE_BITSTREAM = 'tcpborphserver.bin'
+
+
+def deprogram_fpga(r=None):
+    """Reset the PL to its base image (tcpborphserver), clearing all tones.
+
+    The base image holds no souk DSP, so it draws minimal current - the safe
+    precondition for a clock re-init (issue #14: running ``krc-utils init`` while
+    the souk pipeline is loaded with tones collapses the PL power rail and hangs
+    the PS). It also keeps a PL image in place, which the clock-forwarding paths
+    need to function.
+
+    If a live readout interface ``r`` is supplied its casperfpga transport is
+    used; otherwise - or if that path is unresponsive - the kernel FPGA manager
+    is driven directly from the PS. The FPGA manager route avoids the AXI
+    register traffic of the casperfpga path (which would hang if the fabric were
+    unresponsive) and never constructs a :class:`SoukMkidReadout` (construction
+    reads registers and would hang for the same reason).
+    """
+    if r is not None:
+        try:
+            _firmware_log('resetting PL to base image via casperfpga', source='program')
+            r.fpga.host.deprogram()
+            return
+        except Exception as exc:
+            _firmware_log(
+                f'casperfpga deprogram failed ({exc}); falling back to FPGA manager',
+                source='program',
+            )
+
+    _firmware_log(
+        f'deprogramming FPGA via FPGA manager ({FPGA_MANAGER_BASE_BITSTREAM})',
+        source='program',
+    )
+    with open(FPGA_MANAGER_FIRMWARE_NODE, 'w') as node:
+        node.write(FPGA_MANAGER_BASE_BITSTREAM + '\n')
+
+
+def reload_firmware(config_dict, r=None):
     """
     Program/reprogram and return interfaces.
 
-    Verifies clocks are locked before programming.
+    Safe sequence (issue #14): reset the PL to its base image FIRST so the clock
+    re-init runs against a PL holding zero tones (minimal current), then check/
+    re-init the clocks only if necessary, then program the souk design. Running
+    ``krc-utils init`` while the souk pipeline is loaded with tones collapses the
+    PL power rail and hangs the PS, so the reset-to-base must happen before any
+    clock work.
+
+    ``r`` is the current readout interface, if any: its casperfpga transport is
+    used for the reset-to-base, falling back to the kernel FPGA manager (which
+    avoids the AXI register traffic of the casperfpga path). When ``r`` is None
+    (e.g. recovering from a latched clock fault) the FPGA manager is used
+    directly, without constructing a SoukMkidReadout (construction reads
+    registers and would hang if the fabric were unresponsive).
 
     IMPORTANT: This and any second pipeline will need initialising. Do not initialise shared or pipeline resources here.
     """
     _firmware_log('reloading firmware; shared and pipeline resources will need reinitialising', source='program')
-
-    # Ensure clocks are locked before programming the FPGA
-    ensure_clocks_locked(config_dict)
 
     fw_config_file = config_dict['firmware']['fw_config_file']
     pipeline_id = config_dict['firmware']['pipeline_id']
@@ -524,11 +718,17 @@ def reload_firmware(config_dict):
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         _firmware_log('FPGA programming lock acquired', source='program')
 
+        # 1) Reset the PL to its base image FIRST so it holds zero tones (minimal
+        #    current) before we touch the clock tree.
+        deprogram_fpga(r)
+        time.sleep(1)
+
+        # 2) Check clocks and re-init only if necessary - safe now the PL is blank.
+        apply_clock_config(config_dict)
+
+        # 3) Build interfaces and program the souk design.
         r = create_standard_readout_interface(fw_config_file,pipeline_id=pipeline_id)
         r_fast = create_fast_readout_interface(fw_config_file,pipeline_id=pipeline_id)
-        _firmware_log('deprogramming FPGA', source='program')
-        r.fpga.host.deprogram()
-        time.sleep(1)
         _firmware_log('programming FPGA', source='program')
         r.program()
         time.sleep(1)
@@ -659,6 +859,12 @@ def initialise_pipeline_resources(r,r_fast,config_dict):
 
     #initialise and setup blocks
     _firmware_log(f'initialising pipeline resources for pipeline {pipeline_id}', source='pipeline')
+    if not getattr(r, 'blocks', None):
+        raise RuntimeError(
+            'cannot initialise pipeline resources: firmware block interfaces were '
+            'not created. The board is unprogrammed or running firmware unsupported '
+            'by this souk_mkid_readout version; (re)program with matching firmware first.'
+        )
     r.initialize_pipeline_blocks()
 
     r.output.use_psb()
@@ -780,14 +986,17 @@ def info_versions():
 
 
 def info_clock():
-    """Clock source and PLL lock status."""
+    """Clock source and PLL lock status, split into LMK reference vs LMX PLLs."""
     source = get_clock_source()
-    status = get_clock_status()
+    cls = classify_clock_status()
     return {
         'ready': True,
         'source': source,
-        'all_locked': status.get('all_locked', False),
-        'chips': status.get('chips', []),
+        'all_locked': cls['all_locked'],
+        'lmk_locked': cls['lmk_locked'],
+        'lmx_locked': cls['lmx_locked'],
+        'fault': cls['fault'],
+        'chips': cls['chips'],
     }
 
 
@@ -1053,7 +1262,7 @@ def get_configured_tone_metadata(config_dict, active_count=None):
     }
 
 
-def info_tones(r, config_dict, rf_peripherals=None, reference_plane='detector'):
+def info_tones(r, r_fast, config_dict, rf_peripherals=None, reference_plane='detector'):
     """Tone frequencies, amplitudes, phases, powers, and firmware indices."""
     pipeline_ready = (r is not None and hasattr(r, 'accumulators')
                       and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0)
@@ -1064,14 +1273,14 @@ def info_tones(r, config_dict, rf_peripherals=None, reference_plane='detector'):
             'phases_rad': None, 'powers_dbm': None, 'firmware_indices': None,
             'detailed_frequency_info': None,
         }
-    freqs_detailed = get_tone_frequencies(r, config_dict, detailed_output=True)
+    freqs_detailed = get_tone_frequencies(r, r_fast, config_dict, detailed_output=True)
     freqs = freqs_detailed[0]
     details = freqs_detailed[1]
-    amps = get_tone_amplitudes(r, config_dict)
-    phases = get_tone_phases(r, config_dict)
+    amps = get_tone_amplitudes(r, r_fast, config_dict)
+    phases = get_tone_phases(r, r_fast, config_dict)
     try:
         powers = get_tone_powers(
-            r, config_dict, reference_plane=reference_plane,
+            r, r_fast, config_dict, reference_plane=reference_plane,
             rf_peripherals=rf_peripherals)
     except Exception:
         powers = np.array([])
@@ -1160,7 +1369,7 @@ def info_rfsoc_sensors(sensor_path='/sys/bus/iio/devices/iio:device0/'):
     return info
 
 
-def info_calibrations(r, config_dict):
+def info_calibrations(r, r_fast, config_dict):
     """Resolved calibration values currently in effect."""
     # Check if tones are set for per-tone interpolation
     pipeline_ready = (r is not None and hasattr(r, 'accumulators')
@@ -1185,7 +1394,7 @@ def info_calibrations(r, config_dict):
 
     if pipeline_ready:
         try:
-            freqs = get_tone_frequencies(r, config_dict)
+            freqs = get_tone_frequencies(r, r_fast, config_dict)
             freq_axis = freqs
         except Exception:
             freq_axis = None
@@ -1282,19 +1491,10 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
             print(bcolors.WARNING + 'WARNING: rfsoc_host configuration changed. These parameters cannot be applied remotely. '
                   'Log into the RFSoC directly to make these changes.' + bcolors.ENDC)
 
-    # Apply clock source (cross-pipeline shared setting).
-    # Prefer firmware section; fall back to rfsoc_host for older configs.
-    # This is always applied unconditionally.  Clock source is a board-level
-    # resource shared across pipelines — no coordination is performed between
-    # server instances, so ensure both pipeline configs specify the same value.
-    desired_clock = fwconf.get('clock_source', new_rfsoc_host.get('clock_source'))
-    if desired_clock is not None:
-        print(f'apply_config: setting clock_source = {desired_clock}  '
-              '(cross-pipeline setting — ensure both pipeline configs agree)')
-        try:
-            set_clock_source(desired_clock)
-        except (ValueError, FileNotFoundError) as exc:
-            print(bcolors.FAIL + f'Failed to set clock source: {exc}' + bcolors.ENDC)
+    # Clock source is a board-level setting shared across pipelines. Do not
+    # re-apply it here on every config push; the server gates firmware access on
+    # a pure clock check (classify_clock_status) and only ever runs krc-utils
+    # init from the deprogram-first reload_firmware sequence (issue #14).
 
     # Helper to check if a value changed
     def changed(key):
@@ -2100,7 +2300,13 @@ def read_from_current_control_buffer(r,los=['tx','rx']):
     buf = r.mixer.get_current_buffer()
     if buf is None:
         raise RuntimeError('No current buffer found in mixer, cannot read frequencies')
-    return interpret_raw_control_buffer_data(r,read_raw_control_buffer_data(r,buf,los=los))
+    # When handed a local handle (r_fast), use the memory-mapped read (~200x
+    # faster) with its matching little-endian interpreter; otherwise fall back
+    # to the katcp transport read + big-endian interpreter. The two read/interpret
+    # pairs must stay matched -- mixing them byte-swaps the values.
+    if hasattr(r.mixer.host.transport, 'axil_mm'):
+        return interpret_raw_control_buffer_data_fast(r, read_raw_control_buffer_data_fast(r, buf, los=los))
+    return interpret_raw_control_buffer_data(r, read_raw_control_buffer_data(r, buf, los=los))
 
 def read_from_next_control_buffer(r,los=['tx','rx']):
     """
@@ -2193,7 +2399,7 @@ def get_next_buffer_idx(r):
     return next_buffer
 
 
-def get_tone_frequencies(r, config_dict, detailed_output=False):
+def get_tone_frequencies(r, r_fast, config_dict, detailed_output=False):
     """
     Query the RFSOC for the current tone frequencies.
 
@@ -2258,7 +2464,11 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
     # ri_steps_rx    = uint2cplx(ri_steps_rx, r.mixer._n_ri_step_bits)
 
 
-    lo_control_values = read_from_current_control_buffer(r)
+    # Use r_fast (memory-mapped) for the slow buffer/chanmap reads when
+    # available; the RFDC reads above stay on r (they don't work via r_fast).
+    rd = r_fast if r_fast is not None else r
+
+    lo_control_values = read_from_current_control_buffer(rd)
 
     phase_inc_tx = lo_control_values['tx']['phase_steps']
     phase_inc_rx = lo_control_values['rx']['phase_steps']
@@ -2288,8 +2498,8 @@ def get_tone_frequencies(r, config_dict, detailed_output=False):
     #     psb_channels = np.copy(pfb_channels)
 
     #get the filterbank channels
-    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
-    chanmap_pfb = chanselect_get_channel_outmap(r)
+    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(rd)
+    chanmap_pfb = chanselect_get_channel_outmap(rd)
 
     # For inmap: find active input channels (tones) - those not mapping to discard bin
     # For outmap: find active output channels (tones) - those not mapping to discard chan
@@ -2684,7 +2894,7 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
     details['rx']['mixer_lo_ri_step'] = [(i,q) for i,q in zip(ri_steps_rx.real.tolist(),ri_steps_rx.imag.tolist())]
     return tone_settings_dict, details
 
-def apply_tone_frequency_settings(r, tone_settings_dict, autosync=True, mrst=False):
+def apply_tone_frequency_settings(r, tone_settings_dict, autosync=False, mrst=False):
     """
     Apply the tone frequency settings to the RFSOC.
 
@@ -2895,7 +3105,8 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
     elif compensate_rx_ticks:
         # No tone phases set, but still need the RX compensation on its own.
         lo_control_values['rx']['phase_offsets'] = np.zeros(num_tones) + rx_phase_comp
-    v,i = prepare_control_buffer_data_fast(r, 0, lo_control_values,
+    buf = get_next_buffer_idx(r)
+    v,i = prepare_control_buffer_data_fast(r, buf, lo_control_values,
                                            tone_indices=tone_indices)
     # #format the phase increments and ri steps for the mixer LOs
     # phase_incs_tx_formatted = _format_phase_steps(phase_incs_tx,r.mixer._phase_bp,fmt='<i4')
@@ -2920,7 +3131,7 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
     #                      'num_tones':num_tones}
     tone_settings_dict = {'control_buffer_data_values':v,
                             'control_buffer_data_indices':i,
-                            'control_buffer_index':0,
+                            'control_buffer_index':buf,
                             'chanmap_psb_inmap':chanmap_psb_inmap,
                             'chanmap_pfb':chanmap_pfb,
                             'tone_indices':tone_indices,
@@ -3113,6 +3324,8 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
     if armed is None:
         dbb_center = _rf_to_digital_baseband(r_fast, config_dict, center_frequencies)
         fft_rbw_hz = dbb_center['fft_rbw_hz']
+        tx_bin_width_hz = _bin_spacing_hz(dbb_center['all_tx_bin_centers_hz'])
+        rx_bin_width_hz = _bin_spacing_hz(dbb_center['all_rx_bin_centers_hz'])
         tx_bins = get_closest_bin_indices(dbb_center['dbb_freqs_tx'], dbb_center['all_tx_bin_centers_hz'])
         rx_bins = get_closest_bin_indices(dbb_center['dbb_freqs_rx'], dbb_center['all_rx_bin_centers_hz'])
         # The bin-centre frequencies the fixed channel map will select for each tone.
@@ -3129,6 +3342,8 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
         chanmap_pfb[tone_indices] = rx_bins
         armed = {
             'fft_rbw_hz': fft_rbw_hz,
+            'tx_bin_width_hz': tx_bin_width_hz,
+            'rx_bin_width_hz': rx_bin_width_hz,
             'tx_bins': tx_bins, 'rx_bins': rx_bins,
             'tx_bin_centers_hz': tx_bin_centers_hz, 'rx_bin_centers_hz': rx_bin_centers_hz,
             'tone_indices': tone_indices,
@@ -3137,6 +3352,8 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
     else:
         # Reuse the existing armed bins/maps (live update rides the same maps).
         fft_rbw_hz = armed['fft_rbw_hz']
+        tx_bin_width_hz = armed.get('tx_bin_width_hz', fft_rbw_hz)
+        rx_bin_width_hz = armed.get('rx_bin_width_hz', fft_rbw_hz)
         tx_bins = armed['tx_bins']
         rx_bins = armed['rx_bins']
         tx_bin_centers_hz = armed['tx_bin_centers_hz']
@@ -3156,11 +3373,17 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
     for p in range(num_points):
         dbb = _rf_to_digital_baseband(r_fast, config_dict, center_frequencies + point_offsets[p])
         # Residual offset of this point from the *armed* bin centre (NOT the
-        # point's own nearest bin) -> mixer phase increment per FFT period.
+        # point's own nearest bin). The raw residual is used for diagnostics
+        # (coverage/occupancy); the NCO word itself is periodic by one FFT bin,
+        # so control words and RX delay compensation use the wrapped residual.
         tx_off = dbb['dbb_freqs_tx'] - tx_bin_centers_hz
         rx_off = dbb['dbb_freqs_rx'] - rx_bin_centers_hz
-        phase_incs_tx = tx_off / fft_rbw_hz * 2 * np.pi
-        phase_incs_rx = rx_off / fft_rbw_hz * 2 * np.pi
+        tx_drift_bins = tx_off / tx_bin_width_hz
+        rx_drift_bins = rx_off / rx_bin_width_hz
+        tx_nco_bins = _wrap_bin_offsets_for_nco(tx_off / fft_rbw_hz)
+        rx_nco_bins = _wrap_bin_offsets_for_nco(rx_off / fft_rbw_hz)
+        phase_incs_tx = tx_nco_bins * 2 * np.pi
+        phase_incs_rx = rx_nco_bins * 2 * np.pi
         ri_steps_tx = np.cos(phase_incs_tx) + 1j * np.sin(phase_incs_tx)
         ri_steps_rx = np.cos(phase_incs_rx) + 1j * np.sin(phase_incs_rx)
 
@@ -3204,9 +3427,9 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
         # centre. With ~2x overlap the neighbouring channel still covers a tone
         # out to ~1 full channel, so <=0.5 = on the nearest bin, 0.5-1.0 = riding
         # the overlapping neighbour (fine, flagged), >1.0 = no longer covered.
-        drift = np.maximum(np.abs(tx_off), np.abs(rx_off)) / fft_rbw_hz
+        drift = np.maximum(np.abs(tx_drift_bins), np.abs(rx_drift_bins))
         # signed drift (TX path) for reporting; magnitude drives the class
-        drift_bins[p] = tx_off / fft_rbw_hz
+        drift_bins[p] = tx_drift_bins
         occupancy[p] = np.where(drift <= 0.5, 'nearest',
                                 np.where(drift <= 1.0, 'second', 'beyond'))
 
@@ -3378,10 +3601,10 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
     # ri_steps_tx = np.exp(1j*phase_incs_tx)
     # ri_steps_rx = np.exp(1j*phase_incs_rx)
 
-    print('phase_incs_tx',phase_incs_tx.shape,'\n',phase_incs_tx)
-    print('phase_incs_rx',phase_incs_rx.shape,'\n',phase_incs_rx)
-    print('ri_steps_tx',ri_steps_tx.shape,'\n',ri_steps_tx)
-    print('ri_steps_rx',ri_steps_rx.shape,'\n',ri_steps_rx)
+    # print('phase_incs_tx',phase_incs_tx.shape,'\n',phase_incs_tx)
+    # print('phase_incs_rx',phase_incs_rx.shape,'\n',phase_incs_rx)
+    # print('ri_steps_tx',ri_steps_tx.shape,'\n',ri_steps_tx)
+    # print('ri_steps_rx',ri_steps_rx.shape,'\n',ri_steps_rx)
 
 
     # Check if TX bin assignments are stable across all sweep points
@@ -3438,8 +3661,8 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
     # allv = np.zeros((num_points, len(v0)),dtype=v0.dtype)
     allv={}
     alli={}
-    allbuf = np.zeros((num_points,),dtype=int)
-    allbuf[1::2] = 1
+    first_buf = get_next_buffer_idx(r_fast)
+    allbuf = (first_buf + np.arange(num_points, dtype=int)) % 2
 
     for p in points:
         # #zero pad out to nchans for the fast write
@@ -3447,7 +3670,7 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
         # phase_incs_rx_formatted_padded[p,:len(phase_incs_rx_formatted[p])] = phase_incs_rx_formatted[p]
         # ri_steps_tx_formatted_padded[p,:len(ri_steps_tx_formatted[p])] = ri_steps_tx_formatted[p]
         # ri_steps_rx_formatted_padded[p,:len(ri_steps_rx_formatted[p])] = ri_steps_rx_formatted[p]
-        print('prep_sweep, prep_buf',p)
+        # print('prep_sweep, prep_buf',p)
         lo_control_values = {
             'tx': {
                 'phase_steps': phase_incs_tx[p],
@@ -3522,12 +3745,14 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
 
     return sweep_settings_dict
 
-def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True, mrst=False):
+def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index,
+                          autosync=False, mrst=False,
+                          chanmap_settle_accumulations=4):
     # phase_incs_tx_formatted = sweep_settings.get('phase_incs_tx_formatted')
     # phase_incs_rx_formatted = sweep_settings.get('phase_incs_rx_formatted')
     # ri_steps_tx_formatted   = sweep_settings.get('ri_steps_tx_formatted')
     # ri_steps_rx_formatted   = sweep_settings.get('ri_steps_rx_formatted')
-    print('apply_step', step_index)
+    # print('apply_step', step_index)
     allv= sweep_settings.get('control_buffer_data_values')
     alli= sweep_settings.get('control_buffer_data_indices')
     allbuf = sweep_settings.get('control_buffer_index')
@@ -3537,10 +3762,14 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True, 
     skip_chanmap_pfb = sweep_settings.get('skip_chanmap_pfb')
     num_tones     = sweep_settings.get('num_tones')
 
+    chanmap_settle_accumulations = int(chanmap_settle_accumulations)
+    if chanmap_settle_accumulations < 0:
+        raise ValueError('chanmap_settle_accumulations must be >= 0')
+
     c1=not skip_chanmap_psb_inmap[step_index]
     c2=not skip_chanmap_pfb[step_index]
     if c1:
-        print('set chanmap 1 (psb inmap)')
+        # print('set chanmap 1 (psb inmap)')
         # v7.9: use inmap setter for psb_chanselect
         psb_chanselect_set_channel_inmap(r_fast, chanmap_psb_inmap[step_index])
 
@@ -3549,7 +3778,7 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True, 
         #     time.sleep(0.001)
         # print('psb chanmap updated')
     if c2:
-        print('set chanmap 2 (pfb outmap)')
+        # print('set chanmap 2 (pfb outmap)')
         # r_fast.chanselect.set_channel_outmap(np.copy(chanmap_pfb[step_index]))
         chanselect_set_channel_outmap(r_fast,chanmap_pfb[step_index])
         # while not (r.chanselect.get_channel_outmap()==chanmap_pfb[step_index]).all():
@@ -3557,10 +3786,14 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True, 
         #     time.sleep(0.001)
         # print('pfb chanmap updated')
 
-    print('apply_step, write_buf',step_index, allbuf[step_index])
+    if c1 or c2:
+        for _ in range(chanmap_settle_accumulations):
+            _wait_for_acc(r_fast,0,0.0001)
+
+    # print('apply_step, write_buf',step_index, allbuf[step_index])
     write_control_buffer_data_fast(r_fast,allbuf[step_index],allv[step_index],alli[step_index])
 
-    print('apply_step, set_buf',step_index,allbuf[step_index])
+    # print('apply_step, set_buf',step_index,allbuf[step_index])
     set_control_buffer_idx_fast(r_fast,allbuf[step_index])
 
     if autosync:
@@ -3774,7 +4007,7 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index, autosync=True, 
 
 
 
-def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, autosync=True, mrst=False):
+def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, autosync=False, mrst=False):
 
     v=fast_tone_frequency_settings.get('control_buffer_data_values')
     i=fast_tone_frequency_settings.get('control_buffer_data_indices')
@@ -3813,7 +4046,7 @@ def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, 
 
 
 def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
-                         min_tone_separation=6, autosync=True, mrst=False,
+                         min_tone_separation=6, autosync=False, mrst=False,
                          detailed_output=False, tone_amplitudes=None,
                          tone_phases=None, compensate_rx_ticks=0):
     """
@@ -3865,7 +4098,7 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
 
 def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
                               tone_indices=None, min_tone_separation=6,
-                              autosync=True, mrst=False, tone_amplitudes=None,
+                              autosync=False, mrst=False, tone_amplitudes=None,
                               tone_phases=None, compensate_rx_ticks=0):
     """
     Set the tone frequencies in the RFSOC using the fast firmware interface.
@@ -4044,13 +4277,14 @@ def get_fast_sweep_params(r_fast, config_dict,tone_frequencies):
 
 
 
-def get_tone_amplitudes(r,config_dict):
+def get_tone_amplitudes(r, r_fast, config_dict):
     """
     Query the RFSOC for the current TX tone amplitude scale factors.
     """
+    rd = r_fast if r_fast is not None else r
     # moved from outmap to inmap in the v7.9 psb_chanselect
-    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
-    chanmap_pfb = chanselect_get_channel_outmap(r)
+    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(rd)
+    chanmap_pfb = chanselect_get_channel_outmap(rd)
 
     psb_discard_bit = r.psb_chanselect.DISCARD_BIT
     pfb_discard_chan = -1
@@ -4067,12 +4301,12 @@ def get_tone_amplitudes(r,config_dict):
     if num_tones_tx != num_tones_rx:
         warnings.warn(f'Number of tones in tx ({num_tones_tx}) and rx ({num_tones_rx}) do not match.')
 
-    control_buffer = read_from_current_control_buffer(r)
+    control_buffer = read_from_current_control_buffer(rd)
     scaling_tx = control_buffer['tx']['scaling']
     # index by psb_tones_active (not :num_tones) since tone indices may be non-contiguous with VACC
     return scaling_tx[psb_tones_active]
 
-def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True, mrst=False):
+def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=False, mrst=False):
     """
     Set the TX tone amplitude scale factors in the RFSOC.
 
@@ -4114,14 +4348,15 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=True, mrst=Fals
 
     return
 
-def get_tone_phases(r, config_dict):
+def get_tone_phases(r, r_fast, config_dict):
     """
     Query the RFSOC for the current tone phase offsets.
     Note that the returned values are in the range [-pi,pi] regardless of how they were set.
     """
+    rd = r_fast if r_fast is not None else r
     # moved from outmap to inmap in the v7.9 psb_chanselect
-    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
-    chanmap_pfb = chanselect_get_channel_outmap(r)
+    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(rd)
+    chanmap_pfb = chanselect_get_channel_outmap(rd)
 
     psb_discard_bit = r.psb_chanselect.DISCARD_BIT
     pfb_discard_chan = -1
@@ -4138,13 +4373,13 @@ def get_tone_phases(r, config_dict):
     if num_tones_tx != num_tones_rx:
         warnings.warn(f'Number of tones in tx ({num_tones_tx}) and rx ({num_tones_rx}) do not match.')
 
-    control_buffer = read_from_current_control_buffer(r)
+    control_buffer = read_from_current_control_buffer(rd)
     phase_offsets_tx = control_buffer['tx']['phase_offsets']
     phase_offsets_rx = control_buffer['rx']['phase_offsets']
     # index by psb_tones_active (not :num_tones) since tone indices may be non-contiguous with VACC
     return phase_offsets_tx[psb_tones_active]
 
-def set_tone_phases(r, config_dict, tone_phases, autosync=True, mrst=False):
+def set_tone_phases(r, config_dict, tone_phases, autosync=False, mrst=False):
     """
     Set the tone phase offsets in the RFSOC.
     """
@@ -5432,7 +5667,7 @@ def estimate_rf_total_gain_from_config(config_dict, rf_status, path,
     return amp_s21 - abs(float(attenuation))
 
 
-def _gather_tx_chain_params(r, config_dict, rf_peripherals=None):
+def _gather_tx_chain_params(r, r_fast, config_dict, rf_peripherals=None):
     """Read firmware state and resolve all TX chain calibration parameters.
 
     Returns a dict with everything needed by calibration.calc_tone_powers /
@@ -5444,12 +5679,12 @@ def _gather_tx_chain_params(r, config_dict, rf_peripherals=None):
     dac_tile = int(config_dict['firmware']['dac0_tile'])
     dac_block = int(config_dict['firmware']['dac0_block'])
 
-    freqs, freq_details = get_tone_frequencies(r, config_dict, detailed_output=True)
+    freqs, freq_details = get_tone_frequencies(r, r_fast, config_dict, detailed_output=True)
     analog_freq = freq_details['tx']['analog_output_freq']
     rf_freq = freq_details['tx']['rf_output_freq']
 
     # Live firmware state
-    amps = get_tone_amplitudes(r, config_dict)
+    amps = get_tone_amplitudes(r, r_fast, config_dict)
     psb_fftshift = r.psb.get_fftshift()
     psb_scale = r.psbscale.get_scale()
     mixer_settings = r.rfdc.core.get_mixer_settings(dac_tile, dac_block, r.rfdc.core.DAC_TILE)
@@ -5671,7 +5906,7 @@ def _apply_per_bin_scaling(r, config_dict, amps):
     overflows.  To avoid this while preserving relative powers across ALL
     tones, we scale everything down by the worst-case bin overlap factor.
     """
-    _, freq_details = get_tone_frequencies(r, config_dict, detailed_output=True)
+    _, freq_details = get_tone_frequencies(r, None, config_dict, detailed_output=True)
     bin_indices = np.array(freq_details['tx']['filterbank_bins'])
     _, counts = np.unique(bin_indices, return_counts=True)
     max_tones_per_bin = int(np.max(counts))
@@ -5834,7 +6069,7 @@ def _apply_forced_power_controls(
         if config_dict is None:
             raise ValueError('config_dict is required to set tone amplitudes')
         amplitudes = np.atleast_1d(force_tone_amplitudes).astype(float)
-        current_amplitudes = get_tone_amplitudes(r, config_dict)
+        current_amplitudes = get_tone_amplitudes(r, None, config_dict)
         if amplitudes.size == 1 and current_amplitudes.size > 1:
             amplitudes = np.full(current_amplitudes.size, amplitudes[0], dtype=float)
         set_tone_amplitudes(r, config_dict, amplitudes)
@@ -5897,7 +6132,7 @@ def _get_tx_input_1db_comp_dbm(rf_peripherals):
 
 def _calculate_current_tx_chain(r, config_dict, rf_peripherals=None):
     """Return current TX-chain parameters, detector powers, and stage details."""
-    p = _gather_tx_chain_params(r, config_dict, rf_peripherals=rf_peripherals)
+    p = _gather_tx_chain_params(r, None, config_dict, rf_peripherals=rf_peripherals)
     tx_powers, tx_details = calibration.calc_tone_powers(
         p['amps'], p['psb_fftshift'], p['psb_scale'],
         p['mixer_scale_is_1p0'], p['mixer_qmc_gain'], p['vop_current'],
@@ -6381,7 +6616,7 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
     psb_scale_fixed = force_psb_scale is not None
 
     init_dac_saturation, _ = check_output_saturation(r_fast, iterations=250, verbose=False)
-    init_amps = get_tone_amplitudes(r, config_dict)
+    init_amps = get_tone_amplitudes(r, r_fast, config_dict)
     init_psb_scale = r.psbscale.get_scale()
     init_psb_fftshift = r.psb.get_fftshift()
     print(f'  init: psb_scale={init_psb_scale:.4f}, '
@@ -6619,7 +6854,7 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
 
     # --- Step 5: Enforce power limit ---
     if power_limit_dbm is not None and config_dict is not None:
-        achieved_powers = get_tone_powers(r, config_dict, reference_plane=reference_plane,
+        achieved_powers = get_tone_powers(r, r_fast, config_dict, reference_plane=reference_plane,
                                           rf_peripherals=rf_peripherals)
         max_achieved = float(np.max(achieved_powers))
         excess_db = max_achieved - power_limit_dbm
@@ -6863,11 +7098,11 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
         fix_dac_saturation(r, r_fast, config_dict)
     elif init_dac_saturation:
         print('  WARNING: DAC is saturating; rf_only=True leaves digital settings unchanged')
-    init_amps = get_tone_amplitudes(r, config_dict)
+    init_amps = get_tone_amplitudes(r, r_fast, config_dict)
     init_psb_scale = r.psbscale.get_scale()
     init_psb_fftshift = r.psb.get_fftshift()
     init_tx_atten = rf_peripherals.get_tx_attenuation() if has_rf else None
-    init_powers = get_tone_powers(r, config_dict, reference_plane=reference_plane,
+    init_powers = get_tone_powers(r, r_fast, config_dict, reference_plane=reference_plane,
                                           rf_peripherals=rf_peripherals)
     scalemin = 1 / 256
     scalemax = 255
@@ -6988,7 +7223,7 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
 
         # --- Step 4: Compensate with TX attenuator ---
         print('  step 4: compensate with TX attenuator')
-        new_powers = get_tone_powers(r, config_dict, reference_plane=reference_plane,
+        new_powers = get_tone_powers(r, r_fast, config_dict, reference_plane=reference_plane,
                                           rf_peripherals=rf_peripherals)
         power_increase_db = float(np.max(new_powers)) - float(np.max(init_powers))
         print(f'    power change from digital maximisation: {power_increase_db:+.1f} dB')
@@ -7084,7 +7319,7 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
         raise ValueError('TX DSP overflow detected after optimisation')
 
     # Verify output power is preserved
-    achieved_powers = get_tone_powers(r, config_dict, reference_plane=reference_plane,
+    achieved_powers = get_tone_powers(r, r_fast, config_dict, reference_plane=reference_plane,
                                           rf_peripherals=rf_peripherals)
     power_error = float(np.max(np.abs(achieved_powers - init_powers)))
     if power_error > 0.5:
@@ -7744,7 +7979,7 @@ def get_accumulator_snapshot(r, config_dict, tone_index):
     :param tone_index: User-facing tone index (0-based)
     :return: Complex numpy array of 1024 samples
     """
-    details = get_tone_frequencies(r, config_dict, detailed_output=True)[1]
+    details = get_tone_frequencies(r, None, config_dict, detailed_output=True)[1]
     firmware_indices = details['rx']['tone_indices']
     if tone_index >= len(firmware_indices):
         raise ValueError(f'Tone index {tone_index} out of range '
@@ -7823,7 +8058,7 @@ def get_accumulator_snapshot_fast(r, r_fast, config_dict, tone_index, firmware_i
     :rtype: numpy.ndarray
     """
     if firmware_indices is None:
-        details = get_tone_frequencies(r, config_dict, detailed_output=True)[1]
+        details = get_tone_frequencies(r, r_fast, config_dict, detailed_output=True)[1]
         firmware_indices = details['rx']['tone_indices']
     if tone_index >= len(firmware_indices):
         raise ValueError(f'Tone index {tone_index} out of range '
@@ -8036,12 +8271,19 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
 
 
 def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_point,
-                  direction, autosync=True, setup_sync=True, mrst=False, setup_mrst=True):
+                  direction, autosync=False, setup_sync=True, mrst=False,
+                  setup_mrst=False, settle_accumulations=4,
+                  chanmap_settle_accumulations=4):
     """
     A blocking call to perform a frequency sweep of the RFSOC.
     An asynchronous version of this function is available in the readout_server code.
     ``autosync`` controls the per-step sync after each sweep buffer flip.
     ``setup_sync`` controls the one-time sync at the start of the sweep.
+    ``settle_accumulations`` controls how many accumulations are discarded after
+    each sweep point buffer switch before samples are recorded.
+    ``chanmap_settle_accumulations`` controls how many accumulations are waited
+    immediately after a PSB/PFB channel-map update, before the new mixer control
+    buffer is written and made active.
 
     """
     centers = np.atleast_1d(centers)
@@ -8051,6 +8293,12 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
     assert len(centers) == len(spans)
     num_points=int(points)
     samples_per_point=int(samples_per_point)
+    settle_accumulations=int(settle_accumulations)
+    if settle_accumulations < 0:
+        raise ValueError('settle_accumulations must be >= 0')
+    chanmap_settle_accumulations=int(chanmap_settle_accumulations)
+    if chanmap_settle_accumulations < 0:
+        raise ValueError('chanmap_settle_accumulations must be >= 0')
     assert direction in ('up','down')
 
     num_tones = len(centers)
@@ -8067,7 +8315,7 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
     sweep_data = np.zeros((num_tones,num_points,samples_per_point),dtype=complex)
     acc_errs = np.zeros((num_points,samples_per_point),dtype=bool)
 
-    initial_freqs = get_tone_frequencies(r, config_dict)
+    initial_freqs = get_tone_frequencies(r, r_fast, config_dict)
     if len(initial_freqs)==0:
         initial_freqs = centers
     sweep_tone_amplitudes = _get_current_per_tone_values(
@@ -8099,7 +8347,12 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
         force_sync_fast(r_fast, mrst=setup_mrst)
 
     for p in range(num_points):
-        apply_sweep_step_fast(r, r_fast, fast_sweep_params, p, autosync=autosync, mrst=mrst)
+        apply_sweep_step_fast(
+            r, r_fast, fast_sweep_params, p, autosync=autosync, mrst=mrst,
+            chanmap_settle_accumulations=chanmap_settle_accumulations)
+
+        for _ in range(settle_accumulations):
+            _wait_for_acc(r_fast,0,0.0001)
 
         # Get tone_indices for this sweep point
         tone_indices_p = tone_indices_arr[p] if tone_indices_arr is not None else np.arange(num_tones)
@@ -8110,6 +8363,9 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
             acc_counts[p,s] = cnt
             sweep_data[:,p,s] = data[::2]+1j*data[1::2]
             acc_errs[p,s] = err
+
+    for _ in range(settle_accumulations):
+            _wait_for_acc(r_fast,0,0.0001)
 
     set_tone_frequencies_fast(
         r, r_fast, config_dict, initial_freqs, autosync=autosync, mrst=mrst,
@@ -8126,6 +8382,8 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
         'sweep_stds': sweep_stds,
         'sweep_sems': sweep_sems,
         'samples_per_point': samples_per_point,
+        'settle_accumulations': settle_accumulations,
+        'chanmap_settle_accumulations': chanmap_settle_accumulations,
         'samples_per_second': get_sample_rate(r_fast),
         'accumulation_counts': acc_counts,
         'accumulation_errors': acc_errs
@@ -8134,13 +8392,17 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
 
 def perform_retune(r, r_fast,config_dict, centers, spans, points,
                    samples_per_point, direction, method, smooth_len=3,
-                   freq_offsets=None, autosync=True, setup_sync=True, mrst=False, setup_mrst=True):
+                   freq_offsets=None, autosync=False, setup_sync=True, mrst=False,
+                   setup_mrst=False, settle_accumulations=4,
+                   chanmap_settle_accumulations=4):
     """
     A blocking call to perform a frequency retune of the RFSOC.
     SImply performs a sweep and then retunes to the frequencies of maximum gradient or minimum magnitude.
     An asynchronous version of this function is available in the readout_server code.
     if freq_offsets is given, it is added to the retune frequencies before setting them.
     ``autosync`` / ``setup_sync`` are forwarded to :func:`perform_sweep`.
+    ``settle_accumulations`` is forwarded to :func:`perform_sweep`.
+    ``chanmap_settle_accumulations`` is forwarded to :func:`perform_sweep`.
     """
     if freq_offsets is None:
         freq_offsets = np.zeros_like(centers)
@@ -8154,7 +8416,9 @@ def perform_retune(r, r_fast,config_dict, centers, spans, points,
         raise ValueError(f'Invalid retune method "{method}", must be "max_gradient", "min_mag", or "max_dphidf"')
     results = perform_sweep(
         r, r_fast, config_dict, centers, spans, points, samples_per_point,
-        direction, autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst)
+        direction, autosync=autosync, setup_sync=setup_sync, mrst=mrst,
+        setup_mrst=setup_mrst, settle_accumulations=settle_accumulations,
+        chanmap_settle_accumulations=chanmap_settle_accumulations)
 
     if method == 'max_gradient':
         retune_freqs = np.zeros_like(results['sweep_frequencies'])
@@ -8316,9 +8580,70 @@ def get_clock_status():
         return {'all_locked': False, 'chips': [], 'error': str(exc)}
 
 
+def select_clock_source(source):
+    """
+    Point the LMK symlink at the requested source WITHOUT applying it.
+
+    Updates (and chowns) the active-config symlink only; it does NOT run
+    ``krc-utils init``. Use :func:`apply_clock_config` / :func:`reload_firmware`
+    to apply the selection on a blank PL. Separating selection from init keeps
+    the dangerous step (init) out of any path that could run while the PL is
+    loaded (issue #14).
+
+    Parameters
+    ----------
+    source : str
+        'internal' for the on-board 12.8 MHz oscillator, or
+        'external' for a 10 MHz reference on clk0.
+
+    Returns
+    -------
+    str
+        The resolved (normalised) source name.
+
+    Raises
+    ------
+    ValueError
+        If *source* is not 'internal' or 'external'.
+    FileNotFoundError
+        If the target clock config file is missing.
+    """
+    source = source.strip().lower()
+    if source not in _CLOCK_SOURCE_FILES:
+        raise ValueError(f"clock_source must be 'internal' or 'external', got '{source}'")
+
+    target_file = _CLOCK_SOURCE_FILES[source]
+    target_path = os.path.join(KRC_CLOCK_DIR, target_file)
+
+    # Verify the target config file exists
+    if not os.path.isfile(target_path):
+        raise FileNotFoundError(f'Clock config file not found: {target_path}')
+
+    # Update symlink — remove old, create new
+    print(f'Selecting clock source: {source} -> {target_file}')
+    if os.path.islink(KRC_LMK_SYMLINK) or os.path.exists(KRC_LMK_SYMLINK):
+        os.unlink(KRC_LMK_SYMLINK)
+    os.symlink(target_file, KRC_LMK_SYMLINK)
+
+    # Ensure casper owns the symlink (server often runs as root)
+    try:
+        pw = pwd.getpwnam('casper')
+        os.lchown(KRC_LMK_SYMLINK, pw.pw_uid, pw.pw_gid)
+    except (KeyError, OSError) as exc:
+        print(bcolors.WARNING + f'Could not chown symlink to casper: {exc}' + bcolors.ENDC)
+
+    return source
+
+
 def set_clock_source(source):
     """
-    Set the reference clock source and apply the new configuration.
+    Select the reference clock source AND apply it via ``krc-utils init``.
+
+    WARNING: this runs ``krc-utils init``, which must only happen on a blank /
+    deprogrammed PL (issue #14: running it while the PL is loaded with tones
+    collapses the PL power rail and hangs the PS). It is called from
+    :func:`apply_clock_config` inside the deprogram-first :func:`reload_firmware`
+    sequence. Do not call it directly while the PL is programmed.
 
     Parameters
     ----------
@@ -8336,34 +8661,10 @@ def set_clock_source(source):
     ValueError
         If *source* is not 'internal' or 'external'.
     """
-    source = source.strip().lower()
-    if source not in _CLOCK_SOURCE_FILES:
-        raise ValueError(f"clock_source must be 'internal' or 'external', got '{source}'")
-
-    target_file = _CLOCK_SOURCE_FILES[source]
-    target_path = os.path.join(KRC_CLOCK_DIR, target_file)
-
-    # Verify the target config file exists
-    if not os.path.isfile(target_path):
-        raise FileNotFoundError(f'Clock config file not found: {target_path}')
-
-    # Check if already set to the requested source
     current = get_clock_source()
+    source = select_clock_source(source)
     if current == source:
         print(f'Clock source already set to {source}, re-applying settings.')
-
-    # Update symlink — remove old, create new
-    print(f'Setting clock source: {source} -> {target_file}')
-    if os.path.islink(KRC_LMK_SYMLINK) or os.path.exists(KRC_LMK_SYMLINK):
-        os.unlink(KRC_LMK_SYMLINK)
-    os.symlink(target_file, KRC_LMK_SYMLINK)
-
-    # Ensure casper owns the symlink (server often runs as root)
-    try:
-        pw = pwd.getpwnam('casper')
-        os.lchown(KRC_LMK_SYMLINK, pw.pw_uid, pw.pw_gid)
-    except (KeyError, OSError) as exc:
-        print(bcolors.WARNING + f'Could not chown symlink to casper: {exc}' + bcolors.ENDC)
 
     # Apply the new clock configuration
     print('Applying clock configuration via krc-utils init ...')
@@ -8388,7 +8689,7 @@ def set_clock_source(source):
     return status
 
 
-def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='detector',
+def get_tone_powers(r, r_fast, config_dict, detailed_output=False, reference_plane='detector',
                     rf_peripherals=None):
     """
     Get current tone powers at the specified reference plane.
@@ -8427,7 +8728,7 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
     has_rf = _rf_has_readable_attenuator(rf_peripherals)
 
     # ---- TX chain ----
-    p = _gather_tx_chain_params(r, config_dict, rf_peripherals=rf_peripherals)
+    p = _gather_tx_chain_params(r, r_fast, config_dict, rf_peripherals=rf_peripherals)
     freqs = p['freqs']
     freq_details = p['freq_details']
 
@@ -8555,7 +8856,7 @@ def get_tone_powers(r, config_dict, detailed_output=False, reference_plane='dete
 def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detector',
                     optimise_dynamic_range=False, rf_peripherals=None,
                     rx_policy='protect',
-                    autosync=True,
+                    autosync=False,
                     mrst=False,
                     force_tx_amp_bypass=None, force_rx_amp_bypass=None,
                     force_tx_attenuation_db=None,
@@ -8648,7 +8949,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
     psb_scale_fixed = force_psb_scale is not None
 
     # ---- Phase 1: GATHER ----
-    p = _gather_tx_chain_params(r, config_dict, rf_peripherals=rf_peripherals)
+    p = _gather_tx_chain_params(r, r_fast, config_dict, rf_peripherals=rf_peripherals)
     cal = _mask_cal_for_reference_plane(p, reference_plane)
 
     # Bin sharing factor
@@ -8685,7 +8986,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         # Simple mode: just compute amplitudes with current settings
         max_amp = (1 - 2**-12) / max_tones_per_bin
         if tone_amplitudes_fixed:
-            amps = get_tone_amplitudes(r, config_dict)
+            amps = get_tone_amplitudes(r, r_fast, config_dict)
             print('set_tone_powers: tone amplitudes fixed — skipping amplitude calculation')
         else:
             amps = calibration.calc_tone_amplitudes(
@@ -8735,7 +9036,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
 
         print(f'set_tone_powers: setting {len(powers_dbm)} tones at '
               f'reference_plane={reference_plane!r}')
-        init_amps_max = float(np.max(get_tone_amplitudes(r, config_dict)))
+        init_amps_max = float(np.max(get_tone_amplitudes(r, r_fast, config_dict)))
         if not tone_amplitudes_fixed:
             set_tone_amplitudes(r, config_dict, amps, autosync=autosync, mrst=mrst)
         new_amps_max = float(np.max(np.abs(amps)))
@@ -8769,7 +9070,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         dac_headroom_db = float(-20 * np.log10(dac_peak_measured)) if dac_peak_measured > 0 else float('inf')
         print(f'  DAC headroom (measured): {dac_headroom_db:.1f} dB')
 
-        achieved = get_tone_powers(r, config_dict, reference_plane=reference_plane,
+        achieved = get_tone_powers(r, r_fast, config_dict, reference_plane=reference_plane,
                                           rf_peripherals=rf_peripherals)
         error = achieved - powers_dbm
         print(f'  Max power error: {np.max(np.abs(error)):.2f} dB')
@@ -8814,7 +9115,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
 
     # --- Step 1: Maximise digital gain ---
     if tone_amplitudes_fixed:
-        amps = get_tone_amplitudes(r, config_dict)
+        amps = get_tone_amplitudes(r, r_fast, config_dict)
         print('  step 1: tone amplitudes fixed')
     else:
         # Compute amplitudes that preserve relative tone powers with max = max_amp.
@@ -8934,7 +9235,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
     # --- Step 3: Measure achieved power at reference plane ---
     # Digital is now maximised.  Analog settings are unchanged from entry.
     # Measure what power we're actually producing.
-    max_digital_powers = get_tone_powers(r, config_dict,
+    max_digital_powers = get_tone_powers(r, r_fast, config_dict,
                                          reference_plane=reference_plane,
                                          rf_peripherals=rf_peripherals)
     max_achieved = float(np.max(max_digital_powers))
@@ -9106,7 +9407,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
     # absolute power level.  We just need to recompute the amplitudes
     # to exactly hit the target.
     if tone_amplitudes_fixed:
-        final_amps = get_tone_amplitudes(r, config_dict)
+        final_amps = get_tone_amplitudes(r, r_fast, config_dict)
         print('  final amplitudes fixed — skipping exact amplitude solve')
     else:
         final_amps = calibration.calc_tone_amplitudes(
@@ -9129,7 +9430,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         time.sleep(0.01)
 
     # RX policy check for the overall TX power change
-    init_powers = get_tone_powers(r, config_dict, reference_plane=reference_plane,
+    init_powers = get_tone_powers(r, r_fast, config_dict, reference_plane=reference_plane,
                                  rf_peripherals=rf_peripherals)
     # init_powers is measured after all changes; compare to entry state
     # which we captured from the gather phase.
@@ -9189,9 +9490,9 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
             f'amplitudes scaled by 1/{max_tones_per_bin}')
 
     # --- Verify ---
-    achieved = get_tone_powers(r, config_dict, reference_plane=reference_plane,
+    achieved = get_tone_powers(r, r_fast, config_dict, reference_plane=reference_plane,
                                rf_peripherals=rf_peripherals)
-    final_amps_read = get_tone_amplitudes(r, config_dict)
+    final_amps_read = get_tone_amplitudes(r, r_fast, config_dict)
     error = achieved - powers_dbm
     max_error = float(np.max(np.abs(error)))
     print(f'    verification: max power error = {max_error:.2f} dB')
@@ -9271,8 +9572,8 @@ def force_sync_fast(r_fast, wait_s=0.0001, mrst=False, do_sync=True):
                 'souk_mkid_readout predates v7.10 timed-sync (no OFFSET_TIMED_SYNC_SW_SYNC); '
                 'upgrade the server venv library to match the 7.10 firmware.')
         tr = sync.host.transport
-        setattr(r_fast, f'{cache}_ctrl_addr', tr._get_device_address(f'p{pid}_sync_ctrl'))
-        setattr(r_fast, f'{cache}_timed_addr', tr._get_device_address(f'p{pid}_sync_timed_sync_ctrl'))
+        setattr(r_fast, f'{cache}_ctrl_addr', tr._get_device_address(f'{sync.prefix}ctrl'))
+        setattr(r_fast, f'{cache}_timed_addr', tr._get_device_address(f'{sync.prefix}timed_sync_ctrl'))
         setattr(r_fast, f'{cache}_mrst_bit', 1 << sync.OFFSET_MRST)
         setattr(r_fast, f'{cache}_swsync_bit', 1 << sync.OFFSET_TIMED_SYNC_SW_SYNC)
 
@@ -9299,6 +9600,341 @@ def force_sync_fast(r_fast, wait_s=0.0001, mrst=False, do_sync=True):
         _pulse(timed_addr, swsync_bit)  # sync pulse on timed_sync_ctrl[SW_SYNC]
 
     return
+
+
+# ---------------------------------------------------------------------------
+# v7.10 firmware *timed* sync (telescope-time-aligned, deterministic)
+#
+# These three functions lift the working logic out of the standalone bring-up
+# scripts in scripts/timed_sync/ into the library, so the server can expose them.
+# Each is a near 1:1 port of one script -- the comments name the same registers
+# and souk_mkid_readout/blocks/sync.py functions the scripts use:
+#   timed_sync_alignment <- 03_set_tt.py   (read PPS-latched TT, offset from boundary)
+#   timed_sync_drift     <- 07_tt_drift.py (slope of that offset = ppm drift)
+#   timed_sync_arm       <- 04_timed_sync.py (load TT, arm set_timed_sync at a future sec)
+# The telescope-time (TT) counter runs at the fabric/DSP clock = adc_clk_hz / 8 =
+# 307.2 MHz (NOT adc_clk_hz). All three use the fast (local=True, /dev/mem)
+# interface -- ~35x lower read jitter than KATCP (see scripts 06/07).
+# ---------------------------------------------------------------------------
+
+def timed_sync_alignment(r_fast):
+    """
+    Read how well the firmware telescope time (TT) is sitting on the PPS second
+    boundary right now. Read-only -- does NOT load or move the TT.
+
+    Port of scripts/timed_sync/03_set_tt.py's read-back block. The TT counter (sync
+    block ``p{pid}_sync``) is latched into ``ext_sync_tt_*`` on every PPS edge from
+    the TSU strobe. A correctly aligned TT (freshly loaded) lands within ~1 us of the
+    integer second; that offset grows as the fabric clock drifts vs the PPS (see
+    :func:`timed_sync_drift`).
+
+    IMPORTANT: there is NO live readback of the internal TT counter. The sync block
+    exposes the TT only as values latched at an event -- ``ext_sync_tt`` (last PPS),
+    ``tt_sync`` (last system sync) -- and ``int_tt_load`` is a write/staging register,
+    not a counter readback. This function reads ``ext_sync_tt``, latched at the LAST PPS
+    edge, so the value always sits ~on an integer second; it is the *last PPS* TT, NOT
+    the instantaneous current TT. Hence the keys are named ``last_pps_*`` and
+    ``last_pps_unix_s`` reads ~N.9999/N.0000; see ``pps_boundary_offset_s`` for the
+    sub-us offset from the second boundary.
+
+    Registers (souk_mkid_readout/blocks/sync.py):
+      ext_sync_tt_msb/lsb -- internal TT latched at the last PPS. Read directly (a
+        plain register read is non-blocking), NOT via Sync.get_tt_of_ext_sync(),
+        which calls wait_for_sync() and blocks for a whole PPS period.
+
+    :param r_fast: fast (local=True, /dev/mem) readout interface.
+    :return: dict with
+        last_pps_tt          -- raw TT (fabric clocks since the UNIX epoch) at the last PPS
+        last_pps_unix_s      -- that last-PPS TT as UNIX seconds (sits ~on an integer second)
+        last_pps_utc         -- last_pps_unix_s as an ISO-8601 UTC string
+        pps_boundary_offset_s -- last-PPS TT offset from the integer second, folded to
+                             +/-0.5 s. THE precise (~us) alignment metric: how far the
+                             PPS-latched TT sits off the second boundary; both sides are
+                             firmware-internal (TT counter vs PPS edge).
+        system_offset_s      -- last_pps_unix_s - time.time(): the last-PPS TT minus the
+                             host Linux clock. COARSE, whole-second check only that the
+                             firmware TT is on the right second (used by timed_sync_arm to
+                             decide a reload). Its sub-second part is dominated by the time
+                             elapsed since that PPS + host read/bus latency, NOT a precise
+                             clock error -- use pps_boundary_offset_s for precision.
+        last_sync_tt         -- raw TT of the last firmware sync event (tt_sync register,
+                             Sync.get_tt_of_sync). 0/None if no sync has fired since program.
+        last_sync_unix_s     -- last_sync_tt as UNIX seconds (None if no sync yet).
+        last_sync_utc        -- last_sync_unix_s as an ISO-8601 UTC string (None if no sync).
+        time_since_last_sync_s -- last_pps_unix_s - last_sync_unix_s; how long since the last
+                             firmware sync FIRED (None if no sync yet). Display only -- it is
+                             NOT the drift reference: a timed sync does not reload the TT, so
+                             pps_boundary_offset_s keeps accumulating across syncs. The drift
+                             reference is the last TT *load* (update_internal_time), which this
+                             firmware-only read does not know -- the server divides
+                             pps_boundary_offset_s by the time since the last load it tracked.
+        clk_hz               -- fabric clock used (adc_clk_hz / 8).
+
+    The drift *in seconds* since the last TT load is pps_boundary_offset_s itself; converting
+    to ppm needs the load time (server-side), so drift_ppm is NOT computed here.
+    """
+    sync = r_fast.sync
+    clk_hz = int(round(r_fast.adc_clk_hz / 8))  # fabric/DSP clock, 307.2 MHz
+    # Non-blocking read of the PPS-latched TT (two 32-bit halves). This is the TT at the
+    # last PPS edge, NOT the live counter (the sync block exposes no live TT readback).
+    last_pps_tt = (sync.read_uint('ext_sync_tt_msb') << 32) + sync.read_uint('ext_sync_tt_lsb')
+    last_pps_unix_s = last_pps_tt / clk_hz
+    # Precise check: a TT latched on a PPS edge should sit on an integer second. This offset
+    # is the accumulated TT-vs-PPS drift since the last TT *load* (not since the last sync).
+    pps_boundary_offset_s = (last_pps_tt % clk_hz) / clk_hz
+    if pps_boundary_offset_s > 0.5:
+        pps_boundary_offset_s -= 1.0  # fold to +/-0.5 s so a tiny negative offset reads as such
+
+    # TT of the last firmware sync (tt_sync register; non-blocking) -- for "time since last
+    # sync" only. A sync does NOT reload the TT, so it is not the drift reference.
+    last_sync_tt = sync.get_tt_of_sync()
+    if last_sync_tt:
+        last_sync_unix_s = last_sync_tt / clk_hz
+        time_since_last_sync_s = last_pps_unix_s - last_sync_unix_s
+    else:  # 0 => no sync has fired since the FPGA was programmed
+        last_sync_unix_s = None
+        time_since_last_sync_s = None
+
+    return {
+        'last_pps_tt': last_pps_tt,
+        'last_pps_unix_s': last_pps_unix_s,
+        'last_pps_utc': unix_to_iso(last_pps_unix_s),
+        'pps_boundary_offset_s': pps_boundary_offset_s,
+        'system_offset_s': last_pps_unix_s - time.time(),
+        'last_sync_tt': last_sync_tt or None,
+        'last_sync_unix_s': last_sync_unix_s,
+        'last_sync_utc': unix_to_iso(last_sync_unix_s),
+        'time_since_last_sync_s': time_since_last_sync_s,
+        'clk_hz': clk_hz,
+    }
+
+
+def set_telescope_time(r_fast):
+    """
+    Load the firmware telescope time (TT) on this pipeline and confirm it aligns to
+    the PPS edge. The operator-facing "set the TT" call: it stages the next integer
+    second and the firmware latches it into the TT counter on the next PPS edge, so
+    ``telescope_time`` tracks real (PTP-disciplined) UNIX time.
+
+    Wraps ``Sync.update_internal_time`` (see also: scripts/timed_sync/03_set_tt.py).
+    BLOCKS ~3-4 s while it waits on PPS edges to measure the period and latch the
+    load, so a healthy TSU 1-PPS strobe must be running (it gives the firmware its
+    PPS). ``sync_period`` is forced to ``clk_hz``. This sets the TT *value*; to
+    arm a deterministic resync at a chosen future second use :func:`timed_sync_arm`.
+
+    Registers (souk_mkid_readout/blocks/sync.py): int_tt_load_msb/lsb + ctrl[ext_load]
+    (the staged load, via Sync.load_internal_time) and ext_sync_tt_msb/lsb (the
+    PPS-latched read-back).
+
+    :param r_fast: fast (local=True, /dev/mem) readout interface.
+    :return: dict -- ``loaded`` (True) and ``aligned`` (|pps_boundary_offset_s| <
+        DEFAULT_ALIGN_TOL_S, 0.1 ms) plus the :func:`timed_sync_alignment` fields
+        (last_pps_tt, last_pps_unix_s,
+        last_pps_utc, pps_boundary_offset_s, system_offset_s, clk_hz).
+    """
+    sync = r_fast.sync
+    clk_hz = int(round(r_fast.adc_clk_hz / 8))  # fabric/DSP clock, 307.2 MHz
+    # Stage the next integer second; the firmware latches it on the next PPS edge.
+    # BLOCKS ~3-4 s on PPS. sync_period=clk_hz forces a 1 s period (the auto-detect
+    # can mis-read it; the load is identical either way).
+    sync.update_internal_time(clk_hz=clk_hz, sync_period=clk_hz)
+    result = timed_sync_alignment(r_fast)
+    result['loaded'] = True
+    result['aligned'] = bool(abs(result['pps_boundary_offset_s']) < DEFAULT_ALIGN_TOL_S)
+    return result
+
+
+def timed_sync_drift(r_fast, samples=4, interval_s=1.5):
+    """
+    Measure how fast the firmware TT is currently drifting against the PPS, by
+    watching the PPS-latched boundary offset grow over a few seconds and fitting the
+    slope. Read-only -- deliberately does NOT re-load the TT, so it reports the LIVE
+    drift of the running counter rather than disturbing it.
+
+    Port of scripts/timed_sync/07_tt_drift.py (minus its up-front update_internal_time).
+    The drift is mostly this RFSoC's fabric oscillator vs the PHC-disciplined PPS
+    (~1.6 ppm in lab testing), so it is fairly independent of grandmaster quality.
+    Because offset is in microseconds and time in seconds, the slope in us/s == ppm.
+
+    NOTE: Sync.get_drift() (drift_msb/lsb) is deliberately NOT used -- on this gateware
+    it reads a frozen 0 or some very large number, so it does not track the
+    accumulating drift (see 08_arm_drift.py). The ext_sync_tt boundary-offset slope is
+    the trustworthy metric.
+
+    :param r_fast: fast (local=True) readout interface.
+    :param samples: number of boundary-offset samples (need >=3 for a fit after the
+        first is dropped).
+    :param interval_s: seconds between samples.
+    :return: dict with drift_ppm, drift_us_per_s (== drift_ppm), samples, dwell_s.
+    """
+    sync = r_fast.sync
+    clk_hz = int(round(r_fast.adc_clk_hz / 8))  # fabric/DSP clock, 307.2 MHz
+
+    def boundary_off_us():
+        tt = (sync.read_uint('ext_sync_tt_msb') << 32) + sync.read_uint('ext_sync_tt_lsb')
+        rem = (tt % clk_hz) / clk_hz
+        if rem > 0.5:
+            rem -= 1.0
+        return rem * 1e6
+
+    t0 = time.time()
+    ts, offs = [], []
+    for i in range(samples):
+        ts.append(time.time() - t0)
+        offs.append(boundary_off_us())
+        if i < samples - 1:
+            time.sleep(interval_s)
+
+    # Drop the first sample: the t=0 read can catch a stale latch (a ~100+ us outlier)
+    # before a prior load fully settled -- 07_tt_drift.py's lesson.
+    ts_fit, offs_fit = ts[1:], offs[1:]
+    n = len(ts_fit)
+    drift_ppm = float('nan')
+    if n >= 2:
+        # Least-squares slope of offset(us) vs t(s). us/s == ppm.
+        mt = sum(ts_fit) / n
+        mo = sum(offs_fit) / n
+        den = sum((t - mt) ** 2 for t in ts_fit)
+        if den:
+            drift_ppm = sum((t - mt) * (o - mo) for t, o in zip(ts_fit, offs_fit)) / den
+    return {
+        'drift_ppm': drift_ppm,
+        'drift_us_per_s': drift_ppm,
+        'samples': samples,
+        'dwell_s': ts[-1] if ts else 0.0,
+    }
+
+
+def timed_sync_arm(r_fast, target_unix_s=None, seconds_from_now=None,
+                   mrst=False, reload_tt='auto', wait=False):
+    """
+    Perform a v7.10 firmware *timed* sync: arm a reset+sync (Sync.set_timed_sync) to fire
+    when the running telescope-time (TT) counter reaches a chosen FUTURE second. This is
+    the low-overhead resync -- the firmware re-aligns the DSP timing network to the PPS
+    when it fires, which is what zeroes the timing drift. Returns as soon as the sync is
+    armed -- the firmware fires it autonomously at the target -- unless ``wait`` is set.
+
+    The TT *counter value* (Sync.update_internal_time) is reloaded ONLY WHEN NEEDED, not on
+    every arm: that call blocks ~3-4 s on PPS edges, and the value only needs reloading
+    when it is not yet loaded or has drifted onto the wrong whole second. The value
+    free-runs and drifts ~1.6 ppm, but that reaches a whole second -- the only thing that
+    changes which second the sync fires on -- after ~7 days; sub-second drift is taken out
+    by the PPS re-align at fire. So a reload every arm would just waste ~3-4 s.
+
+    Port of scripts/timed_sync/04_timed_sync.py, following the canonical Sync flow
+    (initialize -> update_internal_time -> set_timed_sync(mrst=True); ``initialize()`` and
+    the first TT load are setup, then arm repeatedly). The multi-board primitive: point
+    every board at the SAME ``target_unix_s`` and they all fire on the same TT edge.
+
+    Sequence:
+      [1] (optional) master reset -- assert/deassert ctrl[mrst], which resets the DSP
+          *timing network* (the sync/alignment distribution; NOT the sample pipeline or
+          accumulator data). Off by default: set_timed_sync already pulses mrst at the arm.
+      [2] Sync.update_internal_time() -- ONLY if ``reload_tt`` says so (see below). Stages
+          the next integer second and the firmware latches it into the TT counter on the
+          next PPS edge. BLOCKS ~3-4 s. sync_period=clk_hz forces a 1 s period.
+      [3] Sync.set_timed_sync() -- write timed_sync_time_*, arm timed_sync_ctrl[en]; when
+          the running TT reaches the target second the firmware fires the reset+sync, with
+          the release **gated on the PPS edge** (so sub-second TT drift does not shift the
+          fire instant -- which is why a reload every arm is unnecessary).
+
+    Registers (souk_mkid_readout/blocks/sync.py):
+      ctrl[mrst]                     -- reset the DSP timing network (step 1)
+      ext_sync_tt_msb/lsb            -- PPS-latched TT, read to decide on a reload
+      int_tt_load_*, ctrl[ext_load]  -- TT load (Sync.update_internal_time, step 2)
+      timed_sync_time_msb/lsb        -- target TT for the timed sync
+      timed_sync_ctrl[en]            -- arm the timed-sync trigger
+      timed_sync_countdown           -- fabric clocks remaining until it fires
+
+    NOTE: Sync.set_timed_sync() pulses mrst itself at the arm (and currently ignores its
+    own ``mrst`` argument), so the DSP timing network is reset at the arm regardless. The
+    ``mrst`` flag on THIS function is the separate, optional EARLY reset in step 1 (04's
+    addition, not in the canonical flow). Targets are quantised to a whole second.
+
+    :param r_fast: fast (local=True) readout interface.
+    :param target_unix_s: absolute UNIX second to fire on. Mutually exclusive with
+        ``seconds_from_now``.
+    :param seconds_from_now: fire this many whole seconds after the current TT. Defaults
+        to 5 if neither target is given.
+    :param mrst: also do the step-1 early master reset (see above). Default False.
+    :param reload_tt: when to reload the TT *value*. ``'auto'`` (default) reloads only if
+        the TT is not loaded / has drifted ~1 s from the system clock; ``True`` always
+        reloads (re-zero the value, ~3-4 s); ``False`` never reloads (fast; caller
+        guarantees the TT is already loaded).
+    :param wait: if True, block until the sync fires; else return once armed.
+    :return: dict with target_tt_unix_s, target_tt_utc, target_tt_value, clk_hz,
+        countdown_remaining_s, armed_at_unix_s, armed_at_utc, reloaded_tt,
+        tt_loaded_unix_s (the PPS-aligned load second when reloaded, else None), fired.
+    """
+    if target_unix_s is not None and seconds_from_now is not None:
+        raise ValueError("give target_unix_s OR seconds_from_now, not both")
+
+    sync = r_fast.sync
+    clk_hz = int(round(r_fast.adc_clk_hz / 8))  # fabric/DSP clock, 307.2 MHz
+
+    # [1] Optional reset of the DSP timing network before anything else (04 step 1).
+    if mrst:
+        sync.assert_mrst()
+        sync.deassert_mrst()
+        time.sleep(2.0)  # let the reset settle (matches 04_timed_sync.py)
+
+    # Last-PPS-latched TT (non-blocking direct read of ext_sync_tt; the sync block has no
+    # live TT readback): the second we count from, and how we decide on a slow reload.
+    last_pps_tt = (sync.read_uint('ext_sync_tt_msb') << 32) + sync.read_uint('ext_sync_tt_lsb')
+    system_offset_s = last_pps_tt / clk_hz - time.time()
+
+    # [2] Reload the TT value ONLY if needed. 'auto' reloads when the TT is unset or has
+    # drifted ~1 s from the system clock (|offset| > 0.5 s); the per-fire PPS re-align in
+    # step 3 takes out sub-second drift, so otherwise we skip the ~3-4 s update_internal_time.
+    if reload_tt == 'auto':
+        do_reload = abs(system_offset_s) > 0.5
+    else:
+        do_reload = bool(reload_tt)
+    if do_reload:
+        sync.update_internal_time(clk_hz=clk_hz, sync_period=clk_hz)  # BLOCKS ~3-4 s on PPS
+        last_pps_tt = (sync.read_uint('ext_sync_tt_msb') << 32) + sync.read_uint('ext_sync_tt_lsb')
+    now_sec = last_pps_tt / clk_hz
+
+    # [3] Resolve the target second (quantised to a whole second), in fabric clocks.
+    if target_unix_s is not None:
+        target_sec = int(round(target_unix_s))
+    else:
+        lead = 5 if seconds_from_now is None else int(seconds_from_now)
+        target_sec = int(now_sec) + lead
+    target_tt_value = int(round(target_sec * clk_hz))
+
+    # Guard the past-target case ourselves, with a clear operator message, BEFORE
+    # set_timed_sync (whose own past-TT branch hits a driver bug -- self.error does not
+    # exist). Require a comfortable lead so the live TT cannot slip past during arming.
+    if target_sec <= now_sec + 1:
+        raise RuntimeError(
+            f"timed sync target {time.ctime(target_sec)} ({target_sec}) is not far "
+            f"enough ahead of the current telescope time {time.ctime(now_sec)} "
+            f"({now_sec:.3f} s); choose a second at least ~2 s in the future.")
+
+    armed_at_unix_s = time.time()
+    # Canonical Sync flow: ...update_internal_time() -> set_timed_sync(mrst=True). (The
+    # driver currently ignores this mrst arg and always pulses it, but pass True to match
+    # the documented intent: the timed sync IS a reset+start trigger at the target.)
+    sync.set_timed_sync(target_tt_value, wait=wait, mrst=True)
+    # After wait=True this has elapsed to ~0; after wait=False it is roughly the lead.
+    countdown_remaining_s = sync.get_time_to_sync() / clk_hz
+
+    return {
+        'target_tt_unix_s': float(target_sec),
+        'target_tt_utc': unix_to_iso(target_sec),
+        'target_tt_value': target_tt_value,
+        'clk_hz': clk_hz,
+        'countdown_remaining_s': countdown_remaining_s,
+        'armed_at_unix_s': armed_at_unix_s,
+        'armed_at_utc': unix_to_iso(armed_at_unix_s),
+        'reloaded_tt': do_reload,
+        # PPS-aligned second the TT was (re)loaded to, when this call reloaded -- the drift
+        # reference the server caches. None when no reload happened (TT load unchanged).
+        'tt_loaded_unix_s': (now_sec if do_reload else None),
+        'fired': bool(wait),
+    }
+
 
 def get_closest_bin_indices(freqs_hz, bin_centers_hz):
     """

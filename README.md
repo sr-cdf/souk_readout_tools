@@ -54,16 +54,17 @@ Each `ReadoutServer` uses two TCP ports - a **request port** for JSON command/re
 - **Resonance finding** - automated peak detection across multiple data formats (magnitude, phase, group delay, |dS21/df|, etc), plus an interactive PyQt5 GUI
 - **Resonance fitting** - linear and Duffing-capable complex S21 fitting (`fit_resonance`, `batch_fit`, `fit_sweep_stack`) with extracted physical parameters (`fr`, `Qi`, `Qc`, `phi`, etc.), optional uncertainty weighting, and process-parallel fitting support. `batch_fit` consumes server sweep dictionaries and preserves tone metadata; `fit_sweep_stack` consumes already-windowed arrays and fits rows independently.
 - **Retuning** - sweep-and-retune workflows to track drifting resonances using max-derivative or min-magnitude methods
-- **Fast frequency modulation** - dither each tone over a few probe points (2-3) every accumulation and stream the samples tagged per point, for **real-time IQ → frequency/dissipation conversion** (live per-resonator `dφ/df` rather than a stale start-of-obs calibration) and **inflection-point resonator tracking**. Toggle on/off at any time and update centres/offsets live with no dropped frames; the pure `souk_readout_tools.modulation` toolkit demodulates in the de-embedded/phase-centred basis (`params_from_sweep` → `group_cycles` → `demodulate`). See [Fast Frequency Modulation](doc/frequency_modulation.md).
+- **Fast frequency modulation** - dither each tone over a few probe points (2-3) every accumulation and stream the samples tagged per point, for **real-time IQ → frequency/dissipation conversion** (live per-resonator `dφ/df` rather than a stale start-of-obs calibration) and **inflection-point resonator tracking**. Toggle on/off at any time and update centres/offsets live with no dropped frames; the `souk_readout_tools.modulation` toolkit demodulates in the de-embedded/phase-centred basis (`params_from_sweep` → `group_cycles` → `demodulate`). See [Fast Frequency Modulation](doc/frequency_modulation.md).
 - **Power management** - automatic TX/RX level optimisation with saturation detection, dynamic range management, and calibrated power control in dBm at any reference plane in the signal chain
 - **ADC calibration freeze** - freeze the RFSoC's internal ADC calibration during observations to eliminate drift noise, with periodic defrost for recalibration
 - **Clock source control** - select internal (12.8 MHz) or external (10 MHz) PL reference clock with PLL lock status monitoring
 - **PTP/NTP timing status** - packaged `ptp4l`, chrony, and timing-monitor service templates, plus `get_info("timing")` for checking GM lock, PHC/NTP source health, and firmware sync readiness
+- **Timed sync & multi-board alignment** (v7.10) - TT-targeted firmware syncs so independent boards align timestamps and accumulations to the same epoch, with on-board 1-PPS generation from the TSU strobe path. See [TSU Strobe and Timed Sync](doc/tsu_strobe_and_timed_sync.md).
 - **Dual-pipeline support** - two independent pipelines per board with three-level initialisation (program FPGA → shared resources → per-pipeline resources) to prevent cross-pipeline disruption
 - **VACC multitone** (v7.9+) - multiple tones per FFT bin with automatic LO index management and sparse tone index handling
+- **Parameter-series measurements** - repeat any measurement across an external parameter (attenuation, temperature, bias, time, ...) with run directories, resume, retries, and live summaries; power sweeps are the worked example. See [Parameter-Series Measurements](doc/measurements.md).
 - **Configuration sync** - YAML-based config with `push_config()`/`pull_config()` for client-server synchronisation, including automatic calibration file transfer
 - **Server infrastructure** - async TCP server with systemd daemon support, multi-client streaming, and remote status monitoring
-- **Measurement framework** - parameter space measurement tools and higher-level scripts for characterisation campaigns
 - **Analysis utilities** - built-in tools for parsing raw data, plotting in various formats, fitting resonance and noise models, and extracting detector parameters.
 
 ## Quick Start (Client)
@@ -87,7 +88,22 @@ pip install .
 
 On Windows, use `python -m venv` and `.\client_venv\Scripts\Activate.ps1` instead.
 
-Connect to a running server and pull its config:
+**No RFSoC hardware?** Pass `mock=True` to run against a built-in in-process mock
+server — no config or address needed — to explore the API or develop analysis
+code without a board:
+
+```python
+from souk_readout_tools.client.readout_client import ReadoutClient
+
+client = ReadoutClient(mock=True)
+client.ensure_ready()
+freqs = [0.800e9, 1.500e9]
+client.set_tone_frequencies(freqs)
+client.set_tone_phases(client.generate_newman_phases(freqs))  # Newman phases minimise the multi-tone crest factor
+data = client.parse_samples(client.get_samples(500), num_tones=2)
+```
+
+Otherwise, connect to a real running server and pull its config:
 
 ```python
 from souk_readout_tools.client.readout_client import ReadoutClient
@@ -109,8 +125,10 @@ Then connect, initialise, set tones, and acquire data:
 client = ReadoutClient(config_file='my_config.yaml')
 client.ensure_ready()
 
-client.set_tone_frequencies([0.800e9, 1.500e9]) # frequencies in Hz
-client.set_tone_powers([-50, -55], reference_plane='detector') # powers in dBm
+freqs = [0.800e9, 1.500e9]
+client.set_tone_frequencies(freqs)                            # frequencies in Hz
+client.set_tone_powers([-90, -95], reference_plane='detector') # powers in dBm
+client.set_tone_phases(client.generate_newman_phases(freqs))  # Newman phases minimise the multi-tone crest factor
 
 raw = client.get_samples(500)
 data = client.parse_samples(raw, num_tones=2)
@@ -163,12 +181,14 @@ For full installation details (including server setup, SD card imaging, and daem
 | [Calibration](doc/calibration.md) | Power calibration model and RF signal-chain configuration |
 | [Tone Power Notes](doc/tone_power_notes.md) | Dynamic-range, VACC, crest-factor, and blind-tone power guidance |
 | [Resonator Noise Workflow](doc/resonator_noise_workflow.md) | Drive-power tuning, blackbody-load directory layout, and on/off-resonance noise captures |
+| [Parameter-Series Measurements](doc/measurements.md) | Repeating any measurement across an external parameter (attenuation, temperature, time, ...) with run directories, resume, and live summaries |
 | [RF Peripherals](doc/rf_peripherals.md) | RF attenuator, bypass amplifier, and discovery tooling |
 | [LNA Bias](doc/lna_bias.md) | Cryostat LNA bias control, soft-off, and status monitoring |
 | [Dual Pipeline](doc/dual_pipeline.md) | Dual-pipeline setup, initialisation model, and multi-server operation |
 | [Clock Source](doc/clock_source.md) | PL reference clock selection (internal/external) and PLL status |
 | [Timing and PTP](doc/timing.md) | `ptp4l`, chrony, timing-monitor setup, standalone monitoring, and firmware-sync readiness |
 | [Timing Site Checklist](doc/timing_site_checklist.md) | Site commissioning checks for PTP GM, chrony, monitor state, and holdover behaviour |
+| [TSU Strobe and Timed Sync](doc/tsu_strobe_and_timed_sync.md) | 1-PPS TSU strobe, firmware timed-sync bring-up for multi-board timestamp alignment, and test scripts |
 | [v7.9 Multitone Notes](doc/v79-multitone-notes.md) | VACC multitone design notes and constraints |
 | [Changelog](CHANGELOG.md) | Version history, feature list, and roadmap |
 

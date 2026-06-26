@@ -1,6 +1,176 @@
 # Changelog & Feature List
 
-## v1.4.0 (Current)
+## v1.5.0 (Current)
+
+**v7.10-timed-sync firmware support (timed sync & multi-board alignment)**
+- Added support for the v7.10-timed-sync firmware, including TT-targeted syncs so
+  independent RFSoC boards can align timestamps and accumulations to the same epoch.
+- New client controls `timed_sync_needed()` / `timed_sync_ready()` /
+  `timed_sync_arm()` / `timed_sync_check()` and `set_telescope_time()`, backed by
+  firmware alignment/drift helpers. `set_telescope_time()` loads the current Linux
+  time into the firmware TT counter, latched on the next PPS edge so the TT lands on
+  the second boundary; `timed_sync_arm()` then schedules a future PPS-latched resync
+  and only reloads TT when it is missing or has drifted by about 1 s.
+  `timed_sync_check()` / `timed_sync_needed()` verify TT alignment against the
+  Linux clock. These flows require PTP lock and a healthy on-board PPS strobe;
+  see [tsu_strobe_and_timed_sync.md](doc/tsu_strobe_and_timed_sync.md).
+- Board PPS generation now comes from the TSU strobe path (`tsu_strobe.py`,
+  `souk-tsu-strobe`) rather than an external PPS input, with test and
+  verification scripts in `scripts/timed_sync/`.
+- `get_info('sync')` now reports timed-sync state, readiness, alignment, last
+  sync, last TT load and drift; `get_info('timing')` adds `sync_readiness`.
+  The server caches the PPS-aligned TT load second so `timed_sync_check()` is
+  instant by default and only falls back to slow resampling when needed.
+- Timed-sync results now include UTC strings for absolute UNIX times, clearer
+  key names (`last_pps_*`, `pps_boundary_offset_s`, `target_tt_*`, `armed_at_*`),
+  and a shared default alignment tolerance of 0.1 ms
+  (`timing.DEFAULT_ALIGN_TOL_S`, overridable via `align_tol_s`).
+- Added instructions for standing up a lab PTP grandmaster on a Linux workstation
+  in [timing.md](doc/timing.md): checking NIC PHC/hardware-timestamping support,
+  installing the tools, and the chrony/`phc2sys`/`ptp4l` hardware-GM flow (with the
+  deployed `ptp4l-gm`/`phc2sys-gm` services), plus the finding that software-only
+  timestamping did not work with the RFSoCs.
+
+**TX/RX phase offset fix (firmware)**
+- The v7.10 firmware fixes the TX/RX phase offset seen after mixer/tone
+  control-buffer switches, so post-switch firmware syncs are no longer required.
+  The earlier software workaround is now disabled by default:
+  `compensate_rx_ticks=0`.
+
+**Sweep & modulation stepping without per-step syncs (v7.10)**
+- With the phase-offset bug fixed, sweeps, retunes and modulation now default to
+  a single start-of-run sync (`setup_sync=True`, `setup_mrst=False`) with no
+  per-step syncs (`autosync=False`). Instead they drop a few accumulations around
+  each step; `settle_accumulations=4` / `chanmap_settle_accumulations=4` are now
+  the defaults for `perform_sweep`, `perform_retune` and `wideband_sweep`.
+- Standalone tone setters (`set_tone_frequencies`, `set_tone_amplitudes`,
+  `set_tone_phases`, `apply_tone_frequency_settings`, `set_tone_powers`) also
+  default to `autosync=False`.
+- `enable_modulation` now defaults `buffer_reuse_delay_accs=3` with
+  `samples_per_point=4` to avoid rewriting the inactive mixer-control buffer too
+  early or straddling a buffer switch. Both issues are expected to disappear in
+  a future firmware.
+
+**Clock-source safety**
+- Clock health is now checked at initialise/restart and via `get_info`; there is
+ no forced clock reconfiguration on every config push now. If a PLL is unlocked 
+ or the live source differs from config, the server refuses to touch the clock 
+ and reports `reset_required`, because we found that changing clock configuration 
+ against a loaded pipeline can stall or crash the board. The fix is to deprogram 
+ the firmware before any clock change, so seamless runtime switching between 
+ internal and external clock sources is no longer supported. Clock changes now go 
+ through a reset-to-base -> deprogram -> clock-init -> reprogram (`hard_reset`) 
+ cycle, with new helpers `classify_clock_status`, `apply_clock_config`, 
+ `deprogram_fpga`, and `select_clock_source`.
+
+**Modulation / demodulation**
+- Added `modulation.demodulate_timestream()`, which performs sample-aligned
+  demodulation without averaging away retained modulation samples. It supports
+  calibrated Mobius inversion or the model-free basis plus `raw` /
+  `interpolate` / `none` settling fill modes.
+- `group_cycles()` now supports `include_settling` and emits blind / regular /
+  modulated tone-role metadata; `params_from_sweep()` adds mutually exclusive
+  `point_sequence` and `offset_linewidths` inputs.
+- `recenter_modulation()` gains RX-tick phase compensation, client-visible
+  modulation-state warnings, and `purge_modulation_revisions()` for stale
+  revision bookkeeping.
+- `enable_modulation(..., force=True)` now arms even when some tones fall
+  beyond fixed-bin coverage; the response reports
+  `result.tones_beyond_coverage` and warns that those tones will read back
+  wrapped to the other end of the bin.
+
+**DAC inverse sync filter**
+- Added config-driven DAC inverse-sync-filter control, enabled by default unless
+  explicitly set `False`, directly controllable from the client and reported in
+  `get_info` / config sync.
+
+**Plotting & analysis**
+- Added `plotting.log_bin_psd()` for log-spaced PSD binning, timestream
+  plotting for modulated-probe frequencies and precomputed
+  frequency/dissipation columns, plus resonator-fitting uncertainty/model
+  refinements.
+
+**Resonator fitting — automatic nonlinearity estimation (`fitting.py`)**
+- Added `nonlinear='auto'` for `fit_resonance`, `batch_fit` and
+  `fit_sweep_stack`: the fitter tries the fast linear model first and only
+  escalates to the slower Duffing `anl` fit when needed. Diagnostics are stored
+  in `linear_sufficiency`; linear-only results report `anl = 0`.
+- This mode is intentionally not the default and is not suitable for power
+  sweeps or `anl`-versus-power studies, where small but real nonlinearities
+  would be suppressed. `nonlinear` therefore remains `True` by default,
+  including in `fit_power_sweep` / `analyse_power_sweep`.
+- Linear fitting is also faster via a closed-form Jacobian, and
+  `store_optimizer=False` can shrink large parallel-fit results by dropping
+  bulky optimiser objects.
+
+**Mock server sample rate**
+- The mock server now derives sample rate from `acc_len`, matching real
+  hardware in both directions (`sample_rate_hz` updates `acc_len`, and vice
+  versa).
+- Mock acquisition is now throttled to approximately real-time using the live
+  sample rate, so G3 streaming, `receive_stream`, and non-burst `get_samples`
+  take realistic wall-clock time and avoid false "streaming finished early"
+  warnings.
+
+**`get_sweep_data` and `get_info` speedup**
+- `get_sweep_data` and `get_sweep_txt` now serve a cached sweep-time system-info
+  snapshot instead of re-polling hardware on each fetch, cutting fetch time from
+  about 6 s to about 5 ms.
+- `get_info('all')` is also much faster (about 6 s to about 1 s) thanks to fast
+  control-buffer/channel-map reads and narrower LNA I2C access.
+
+**Parameter-series measurement tools**
+- Reintroduced `measurement.py` in a deliberately simple form: four tools for
+  repeating any measurement across an external parameter —
+  `ParameterSeries` (a list of values), `ParameterGrid` (nested axes),
+  `TimedMeasurement` (on a clock) and `ConditionalMeasurement` (on a condition).
+  You supply set/read callbacks and a `measure_func(client)`; the tools walk the
+  parameter and save each result plus a `measurement.json` manifest as they go.
+  All callbacks receive the active `client` (ignore it for external
+  instruments), and `run(..., client=...)` re-points one tool at another
+  board/pipeline. `ConditionalMeasurement` matches `target_values` in any order,
+  so a drifting quantity (e.g. temperature) need not reach them in sequence.
+- The `measure_func` return value drives saving: a dict is stored as `.npz`,
+  `None` stores nothing (the step is still logged); `save_func` overrides the
+  saver. Saving is opt-in via `save_dir` (relative paths, auto-created folders,
+  resolved path printed); existing run folders are never overwritten (numbered
+  suffix) unless `overwrite=True`.
+- Robust long runs: `resume=True` continues an interrupted run, `retries` /
+  `on_error="skip"` tolerate flaky points, and Ctrl-C finalizes the manifest
+  cleanly. Optional `plot_func` saves a plot per step and `summarise_func`
+  builds a live `summary.csv` digest. Read runs back with `load_run` and plot
+  their summary with `plot_run_summary`. See
+  [measurements.md](doc/measurements.md).
+- Resource guard for large runs (long timestreams, batch snapshots, many-tone
+  grids): after the first step the run projects per-step memory and disk over
+  the whole run. If memory would be exhausted it frees each step after saving
+  (data stays on disk) or warns when nothing can be offloaded; if disk would
+  fill it warns every step. Each step prints what the run is using (RAM held +
+  disk written, with the projected total). The per-run memory budget is a
+  `memory_fraction` constructor argument (default 0.8 of total system memory),
+  so several runs across boards can each be capped (e.g. 0.05). Pass
+  `estimated_step_bytes` for a pre-run check. The guard only adapts/warns - it
+  never aborts a run.
+- `load_run` caches step data only while it fits in free memory (oversized steps
+  are read without caching), so repeated access is cheap yet a run larger than
+  memory never blows up; `run.iter_data()` streams one step at a time without
+  caching, `load_run(cache=False)` / `run.clear_cache()` control it.
+  `plot_run_summary` gained an `ncols` argument to arrange the summary subplots
+  in a grid.
+- The shared manifest/npz helpers now live in `measurement.py` and are imported
+  by `power_sweep.py` (the per-step saver is renamed `_save_npz`/`_load_npz`);
+  the power-sweep run format is unchanged.
+
+**Removals & housekeeping**
+- Replaced the earlier over-complicated measurement-run framework (`MeasurementRun`
+  / `MeasurementStore` / artifact dataclasses) with the simpler tools above;
+  power-sweep directories remain the on-disk record (`run_power_sweep` /
+  `load_power_sweep`).
+- Also tightened config-push validation, added Windows guards for POSIX-only
+  imports, and introduced `config_utils.get_user_dir()` for resolving the target
+  user's data directory under `sudo`.
+
+## v1.4.0
 
 **Fast Frequency Modulation (real-time IQ conversion & resonator tracking)**
 - Modulation is now a mode of the single continuous streamer: each tone is
@@ -528,14 +698,10 @@ Forward-ported the `jl_ocs_devel` branch (PR #10) plus follow-on hardening.
 ## Future Developments
 
 Planned for upcoming releases:
-- Timing/sync management to tie together the ADC and CPU clocks
-- Quick on/off resonance switching for noise measurements.  
-- Blind tone management and common-mode noise removal.
-- Automated resonator tracking (continuous retune loop with drift correction).
-- More plots in the docs and examples.
+- Quick on/off resonance switching for noise characterisation.  
+- Automated resonator tracking (~~continuous retune loop with drift correction~~ using d2phi/df2 from frequency modulated timestreams).
 - More interactive plotting features (eg step to next resonance, flag as good/bad)
 - ADC calibration via loopback measurement.
 - Improved VACC tone backfilling for more efficient LO slot usage.
 - Dual-DAC mode support for improved dynamic range.
-- HDF5 export format support.
 - Automated version numbering and release workflow.
