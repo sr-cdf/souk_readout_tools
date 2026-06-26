@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-
-############################################################################
-#
-# This module was added in PR #10 to support the UKKIDController OCS Agent.
-# 
-# We will keep it here for now until the souk_readout_tools built-in fitting 
-# functions are fully tested and incorated into UKKIDController.
-# 
-# Then it will be deprecated and removed.
-#
-############################################################################
-
 import os
 import time
 import numpy as np
