@@ -1,7 +1,24 @@
 # RFSoC Timing and Synchronisation
 
-This note describes the timing stack used by `souk_readout_tools` v1.2 on the SOUK 
-RFSoCs.
+This note describes the timing stack used by `souk_readout_tools` from v1.2 on 
+the SOUK RFSoCs.
+
+**Contents:**
+
+- [Scope](#scope)
+- [Timing Chain](#timing-chain)
+- [Installation](#installation)
+- [Standalone Laptop Monitoring](#standalone-laptop-monitoring)
+- [RFSoC Quick Health Check](#rfsoc-quick-health-check)
+- [PTP: `ptp4l` and `pmc`](#ptp-ptp4l-and-pmc)
+- [Chrony: PHC and NTP](#chrony-phc-and-ntp)
+- [`phc2sys`](#phc2sys)
+- [Timing Monitor](#timing-monitor)
+- [Holdover Behaviour](#holdover-behaviour)
+- [Firmware Timestamp Sync Procedure](#firmware-timestamp-sync-procedure)
+- [Configuration Reference](#configuration-reference)
+- [Site Notes](#site-notes)
+- [Setting up a Local PTP Grandmaster](#setting-up-a-local-ptp-grandmaster)
 
 ## Scope
 
@@ -14,14 +31,26 @@ Implemented in v1.2:
 - `client.get_info("timing")`, the public timing view for health checks
 - `client.get_timing_status()`, the raw monitor/debug view
 
+From v1.5:
+- the firmware **timed sync** commands `client.timed_sync_needed/ready/arm/check`,
+  which align `telescope_time` to the PPS (the load latches on a PPS edge) and arm a
+  deterministic sync at a chosen second (see
+  [tsu_strobe_and_timed_sync.md](tsu_strobe_and_timed_sync.md))
+
 Not implemented yet:
 
-- the multi-board coordinator that performs a simultaneous firmware timestamp
-  sync across all participating RFSoC pipelines
+- ~~a packaged multi-board coordinator. It is a short loop over the per-board
+  `timed_sync_*` commands (sketch in
+  [tsu_strobe_and_timed_sync.md](tsu_strobe_and_timed_sync.md)); the building
+  blocks now exist.~~
+- client commands for timed-sync now exist so a "multi-board coordinator" can 
+  straightforwardly implement a multi-board sync, by looping over clients. Details to follow.
 
-The timing monitor tells us whether the board is in a suitable state to perform
-a firmware timestamp sync. It does not perform the firmware sync and it does not
-know when the firmware counter was last synced.
+The timing monitor tells us whether the board is in a suitable state to perform a
+firmware timestamp sync (`summary.ready_for_firmware_sync`, surfaced by
+`client.timed_sync_needed()` / `timed_sync_ready()`). The `timed_sync_*` commands
+then perform the sync and report its alignment and drift via
+`client.timed_sync_check()`.
 
 ## Timing Chain
 
@@ -80,7 +109,7 @@ chrony, and `timing-monitor`.
 The packaged chrony PHC refclock uses `offset 0`, which is the expected setting
 for a production grandmaster that serves UTC correctly.
 
-The current lab software grandmaster serves TAI-like PHC time and does not
+The current lab hardware (PHC) grandmaster serves TAI-like PHC time and does not
 assert a valid UTC offset. For that lab setup only:
 
 ```bash
@@ -151,7 +180,7 @@ Review `/etc/linuxptp/ptp4l.conf` for the local grandmaster profile, especially
 `domainNumber`, `network_transport`, and `delay_mechanism`. Review
 `/etc/chrony/conf.d/ptp-phc.conf` before enabling the PHC refclock; for a
 normal UTC grandmaster keep `offset 0`, and only use `offset -37` for the
-specific lab software GM described above. If the laptop has no PHC, leave the
+specific lab hardware GM described above. If the laptop has no PHC, leave the
 PHC drop-in out and let chrony use normal NTP sources.
 
 With a PHC-capable interface, run `ptp4l` in the foreground on the chosen
@@ -628,8 +657,11 @@ sudo chronyc -a online refid:PHC0
 ## Firmware Timestamp Sync Procedure
 
 The SOUK firmware `telescope_time` counter must be explicitly synced to the
-timebase. The current v1.2 timing monitor provides the readiness gate; the
-multi-board coordinator that carries out the sync is still to be implemented.
+timebase. This is now implemented as the `client.timed_sync_*` commands (ports of
+the `scripts/timed_sync/` bring-up scripts); see
+[tsu_strobe_and_timed_sync.md](tsu_strobe_and_timed_sync.md) for the command
+reference and the multi-board flow. The timing monitor provides the readiness gate
+those commands consume. The description below is firmware background.
 
 ### PPS Source and Firmware Reset Release
 
@@ -643,58 +675,45 @@ That pulse is wired into the FPGA firmware. The firmware samples/latches it on
 the next FPGA fabric clock and stretches it internally for a short period so
 the sync logic can use it reliably.
 
-When software calls `r.sync.arm_sync()`, either locally or as one step in the
-future global sync coordinator, the firmware arms the sync/reset release logic.
-The firmware then waits for the TSU/PHC PPS strobe before releasing the system
-reset and allowing the DSP pipeline to run from the aligned edge.
+The v7.10 firmware **timed sync** reloads the internal telescope time so it latches
+and aligns on a PPS edge (`r.sync.update_internal_time()`), then arms a reset+sync to
+fire when the running TT reaches a chosen target second
+(`r.sync.set_timed_sync(target_tt)`). These are two separate PPS edges: the TT load
+aligns timekeeping on the next edge; the timed sync fires the DSP reset/sync at the
+target second. `client.timed_sync_arm()` wraps this, reloading the TT value only when
+needed (it drifts ~1.6 ppm but only reaches a whole second after ~7 days; the per-fire
+PPS re-align handles sub-second drift). Because every board can be armed at the same
+target second, this is the basis for multi-board sync.
 
-`r.sync.sw_sync()` can be used to inject a pulse to mimic the PPS strobe and
-release the reset when no PPS strobe is being produced. It is useful
-for local bring-up and non-PTP testing, but it is not a substitute for a
-PTP/PPS-aligned firmware sync.
+`r.sync.sw_sync()` injects an immediate software sync pulse (no PPS alignment); it
+is useful for local bring-up and non-PTP testing, but it is not a substitute for a
+PTP/PPS-aligned timed sync.
 
-The TSU/PHC PPS strobe must be enabled before relying on `r.sync.arm_sync()`.
-At the time of writing this is done by a helper in `souk-firmware`:
+The TSU/PHC PPS strobe must be running before a timed sync. It is now a packaged
+service, `souk-tsu-strobe` (control: `souk-tsu-strobe-{install,start,status,...}`);
+its health is surfaced in `get_info("timing")` under `strobe` and
+`summary.strobe_healthy`, and `timed_sync_arm` refuses (unless `force=True`) when it
+is not healthy. See [tsu_strobe_and_timed_sync.md](tsu_strobe_and_timed_sync.md).
 
-```bash
-sudo python3 ~/souk-firmware/software/rfsoc_scripts/ptp/run_strobe.py
-```
+The per-board flow (now implemented) is:
 
-The helper programs the GEM TSU compare registers and keeps updating the
-comparison second so a pulse is emitted at each new second boundary. This
-should eventually become a packaged service or be folded into the timing
-setup.
+1. `client.timed_sync_ready(target_unix_s=T)` on every participant with a common
+   target second `T`, far enough ahead for all control messages (plus a one-time
+   ~3-4 s TT load on any board whose TT is not yet set) to complete. It checks
+   `ready_for_firmware_sync`, the PPS strobe, and that `T` is in the future versus
+   the server, firmware, and client clocks.
+2. Proceed only if every board returns `ready == True`.
+3. `client.timed_sync_arm(target_unix_s=T)` on each participant. The firmware fires
+   the reset+sync autonomously when its telescope time reaches `T`.
+4. `client.timed_sync_check()` on each participant to confirm alignment (boundary
+   offset) and drift.
 
-The intended coordinator procedure is:
-
-1. Poll every participating board and pipeline with `client.get_info("timing")`.
-2. Require `summary.state == "locked_to_gm"`,
-   `summary.ready_for_firmware_sync == True`, `summary.ptp_fresh == True`, and
-   `summary.ptp_stable == True` on every participant.
-3. Reject the sync if any board is in `ptp_holdover`, `phc_free_run`,
-   `ntp_synced`, `ntp_holdover`, `free_run`, `initializing`, or
-   `unavailable`.
-4. Choose a target PTP integer second far enough in the future for all control
-   messages to arrive before the edge.
-5. Ensure the TSU/PHC PPS strobe from `end0` is enabled and being received by
-   firmware on every participant.
-6. Load the target PTP integer second into each firmware sync interface.
-7. Call `r.sync.arm_sync()` on each participant so the firmware waits for the
-   TSU/PHC PPS strobe before releasing reset.
-8. Wait for the target integer-second PPS edge.
-9. Read back firmware sync status and `telescope_time`.
-10. Log the target second, readback, and `summary` block from every
-    participant.
-
-There may be practical issues fitting all coordinator control messages into a
-single one-second interval. The target second must be far enough in the future
-that every board has loaded the requested time and armed `r.sync.arm_sync()`
-before the same PPS edge arrives. Operating system scheduling, Python runtime
-latency, TCP/network latency, or a slow participant could otherwise leave some
-boards armed for the intended PPS edge while others miss it and release on the
-following edge. The coordinator may therefore need further development to allow
-a minimum wait longer than one second, and to verify that all boards have armed
-successfully before committing to a shared target edge.
+A packaged multi-board coordinator is just this loop over the per-board commands
+(sketch in [tsu_strobe_and_timed_sync.md](tsu_strobe_and_timed_sync.md)). The
+target second must be far enough in the future that every board has re-disciplined
+its TT and armed before the edge; operating-system scheduling, Python runtime
+latency, network latency, or a slow participant could otherwise leave some boards
+armed for the intended edge while others miss it and fire on the following second.
 
 ## Configuration Reference
 
@@ -802,7 +821,7 @@ Important unit settings:
 
 - `--phc-offset SECONDS`, `--offset SECONDS`: set the chrony PHC refclock offset
   while installing config. Default is `0`. Use `--offset=-37` only for the
-  current lab software GM.
+  current lab hardware GM.
 - `--preserve-config`: keep existing `/etc/linuxptp/ptp4l.conf` and
   `/etc/chrony/conf.d/ptp-phc.conf`, but update service units and restart
   services.
@@ -869,3 +888,181 @@ Before site work, record:
 - desired holdover policy and drift-rate assumptions
 
 See `doc/timing_site_checklist.md` for the commissioning checklist.
+
+## Setting up a Local PTP Grandmaster
+
+When there is no site or GPS grandmaster, a Linux workstation on the same network
+can act as the GM for the RFSoCs — provided its NIC supports hardware PTP
+timestamping (a PHC); software-timestamping mode did not work in our testing (see
+below). These notes call such a workstation a
+**hardware-PHC grandmaster** — an ordinary PC serving time from its NIC's PHC in
+hardware-timestamping mode, as opposed to a dedicated GPS/atomic appliance. All lab
+results in this note and in
+[tsu_strobe_and_timed_sync.md](tsu_strobe_and_timed_sync.md) were taken against this
+kind of GM.
+
+That distinction matters here: serve from a NIC with a PTP Hardware Clock (hardware
+timestamping), whose served time is stable to ~µs. Pure software timestamping (no
+PHC) is OS-jitter limited (tens of µs or worse), is not traceable, and — see the lab
+observation below — **did not work with the RFSoC at all in our testing**.
+
+### Check what the NIC supports
+
+```bash
+ip link
+sudo ethtool -T <iface>
+```
+
+For a hardware GM, `ethtool -T` should report:
+
+- `PTP Hardware Clock: 0` (any index `>= 0`; `-1` / `none` means no PHC)
+- `hardware-transmit` and `hardware-receive` under capabilities
+- `SOF_TIMESTAMPING_TX_HARDWARE`, `..._RX_HARDWARE`, `..._RAW_HARDWARE`
+- a non-empty list of Hardware Transmit/Receive Timestamp Modes
+
+Confirm the clock device node exists:
+
+```bash
+ls -l /dev/ptp*
+```
+
+Server NICs and chips such as Intel i210/i225 expose a PHC; most consumer and USB
+Ethernet adapters do not. No PHC leaves only software-timestamping mode, which did
+not work with the RFSoC in our testing (see below) — so a PHC-capable interface is
+effectively required.
+
+### Install the tools
+
+```bash
+sudo apt install linuxptp chrony ethtool
+```
+
+`linuxptp` provides `ptp4l`, `phc2sys`, `phc_ctl`, and `pmc`.
+
+### Hardware grandmaster (preferred)
+
+Three jobs: discipline the workstation's own system clock, copy that time into the
+NIC PHC, and serve the PHC out as a PTP master. The commands and outputs below are
+from a working lab grandmaster (`user`/`host`/paths masked).
+
+1. Keep the workstation's system clock sane with chrony (NTP, or a local GPS/PPS
+   source if you have one):
+
+   ```console
+   user@gm:~$ sudo systemctl enable --now chrony
+   user@gm:~$ chronyc tracking
+   Reference ID    : B97DBE3A (prod-ntp-5.ntp4.ps5.canonical.com)
+   Stratum         : 3
+   System time     : 0.000012441 seconds fast of NTP time
+   Last offset     : -0.000007160 seconds
+   Frequency       : 52.803 ppm fast
+   Leap status     : Normal
+   ```
+
+2. Copy `CLOCK_REALTIME` into the PHC with `phc2sys`. Note `-c` is the clock being
+   *set* (destination) and `-s` is the *source*. This must keep running, so
+   background it or give it its own terminal/service:
+
+   ```console
+   user@gm:~$ sudo phc2sys -s CLOCK_REALTIME -c /dev/ptp0 -O 0 -w -m
+   phc2sys[172887.397]: /dev/ptp0 sys offset 7886173603 s0 freq      -0 delay    850
+   phc2sys[172888.397]: /dev/ptp0 sys offset 7886219499 s1 freq  +45876 delay    867
+   phc2sys[172889.398]: /dev/ptp0 sys offset        31 s2 freq  +45907 delay    913
+   phc2sys[172890.398]: /dev/ptp0 sys offset        39 s2 freq  +45925 delay    946
+   phc2sys[172899.401]: /dev/ptp0 sys offset        39 s2 freq  +45923 delay    992
+   ```
+
+   The servo state goes `s0` (unlocked) → `s1` (first step) → `s2` (locked); once in
+   `s2` the offset settles to tens of nanoseconds. `-O 0` applies no offset between
+   the two clocks (so the PHC carries UTC; see the UTC-offset note below) and `-w`
+   waits for the source to be ready. Inspect or set the PHC by hand with
+   `phc_ctl /dev/ptp0 get` / `set` if needed. This is the one place `phc2sys` *is*
+   wanted — on the RFSoC slaves it is deliberately not used (see the
+   [`phc2sys`](#phc2sys) section).
+
+3. Serve PTP as master on the chosen interface. `ptp4l` becomes grandmaster via the
+   BMC algorithm when it is the best clock on the segment; force it with
+   `--serverOnly 1` (or `serverOnly 1` in the config). Use a sensible `clockClass`
+   (`248` for a free/NTP-fed GM; a low value only if genuinely locked to a primary
+   reference). This also runs continuously:
+
+   ```console
+   user@gm:~$ sudo ptp4l -i <iface> -f /etc/linuxptp/ptp4l.conf --serverOnly 1 -m
+   ptp4l[172972.970]: selected /dev/ptp0 as PTP clock
+   ptp4l[172972.974]: port 1 (<iface>): INITIALIZING to LISTENING on INIT_COMPLETE
+   ptp4l[172979.954]: port 1 (<iface>): LISTENING to MASTER on ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES
+   ptp4l[172979.954]: selected local clock 1cb72c.fffe.ef2f5d as best master
+   ptp4l[172979.954]: port 1 (<iface>): assuming the grand master role
+   ```
+
+   `domainNumber`, `network_transport` (L2 vs UDPv4), and `delay_mechanism`
+   (E2E/P2P) must match what the RFSoCs use (see
+   [Configuration Reference](#etclinuxptpptp4lconf)); a slave only follows a GM in
+   its own domain and profile. On a multi-PHC machine, confirm which `/dev/ptpN`
+   belongs to the serving interface (`ethtool -T <iface>` reports its `PTP Hardware
+   Clock:` index) and point `phc2sys` at the same one.
+
+Confirm the workstation is master:
+
+```console
+user@gm:~$ sudo pmc -u -b 0 'GET PORT_DATA_SET'
+sending: GET PORT_DATA_SET
+        1cb72c.fffe.ef2f5d-1 seq 0 RESPONSE MANAGEMENT PORT_DATA_SET
+                portIdentity            1cb72c.fffe.ef2f5d-1
+                portState               MASTER
+                ...
+```
+
+On an RFSoC the slave port should then progress to `SLAVE` and
+`souk-test-timing-monitor status` should report `locked_to_gm`.
+
+#### Deployed as systemd services (lab example)
+
+In the lab the two long-running commands are packaged as their own systemd units
+rather than left in terminals — separate from the RFSoC-side `ptp4l.service`:
+
+- **`ptp4l-gm.service`** ("PTP4L Grandmaster") runs a dedicated GM config:
+
+  ```text
+  /usr/local/sbin/ptp4l -f /etc/linuxptp/ptp4l-gm.conf -i <iface> -m
+  ```
+
+  The GM config mirrors the packaged `ptp4l.conf` with master-suitable values:
+  `clientOnly 0`, `clockClass 248`, `domainNumber 0`, `delay_mechanism E2E`,
+  `time_stamping hardware`. (`network_transport` must match the RFSoCs.)
+
+- **`phc2sys-gm.service`** runs `phc2sys` in automatic mode, following `ptp4l` and
+  keeping the PHC and system clock aligned:
+
+  ```text
+  /usr/local/sbin/phc2sys -a -r -r -m
+  ```
+
+  `-a` takes the clocks to discipline from the running `ptp4l`; `-r -r` lets the
+  system (NTP-disciplined) clock act as the reference. This is the service-mode
+  equivalent of the explicit `-s CLOCK_REALTIME -c /dev/ptp0` form shown above.
+
+**UTC offset.** With `phc2sys -O 0` the PHC carries UTC while PTP normally expects a
+TAI timescale, and this kind of GM does not assert a valid UTC offset. That is the
+lab setup described under [Installation](#installation): the RFSoCs compensate with
+`souk-enable-timing --offset=-37`. With a proper UTC grandmaster, keep `offset 0`.
+
+### Software-timestamping mode (no PHC — did not work in lab testing)
+
+If the NIC has no PHC, `ptp4l` can in principle serve PTP using software timestamps,
+with no PHC to manage (so no `phc2sys`); `ptp4l` would serve the chrony-disciplined
+system clock directly:
+
+```bash
+sudo ptp4l -i <iface> -f /etc/linuxptp/ptp4l.conf --serverOnly 1 --time_stamping software -m
+```
+
+**Lab observation (unresolved).** This did not work for us. The RFSoC never
+disciplined to a software-timestamping GM; every successful result for this system
+used the workstation NIC's **PHC in hardware mode**. We did not establish why
+software mode failed (plausibly the OS-jitter/served-clock quality, or driver
+timestamping behaviour) and did not pursue it, because the hardware PHC path worked.
+Treat the command above as documented-but-unproven and use a PHC-capable interface.
+
+To run the hardware GM persistently, wrap the chosen `ptp4l` (and `phc2sys`) command
+in a systemd unit rather than leaving a foreground process running.

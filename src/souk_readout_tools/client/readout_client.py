@@ -61,6 +61,7 @@ import socket
 import json
 import struct
 from urllib import response
+import copy
 import numpy as np
 import yaml
 import sys
@@ -76,6 +77,7 @@ import so3g
 import spt3g.core
 
 from souk_readout_tools.config_utils import copy_template_config
+from souk_readout_tools.timing import unix_to_iso, DEFAULT_ALIGN_TOL_S
 
 
 # Config keys whose string values are calibration file paths.
@@ -679,7 +681,7 @@ class ReadoutClient:
                 yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
         print(f'Config saved to {filename}')
 
-    def push_config(self, push_calibration_files=True):
+    def push_config(self, push_calibration_files=True, default=True):
         """
         Push the current config to the server.
 
@@ -690,6 +692,10 @@ class ReadoutClient:
 
         The local config is not modified — only the copy sent to the server has
         rewritten paths.
+
+        If default is True (default), make this config the server's persistent
+        default for reboot/startup. Set default=False to apply it only to the
+        currently running server.
         """
         name = os.path.basename(self.config_file) if self.config_file else 'config.yaml'
 
@@ -717,7 +723,12 @@ class ReadoutClient:
                 print(f'  {_cal_path_str(path)}: pushed {basename}, path -> {server_path}')
 
         config_contents = yaml.dump(push_config, sort_keys=False)
-        message = {'request': 'push_config', 'config_filename': name, 'config_contents': config_contents}
+        message = {
+            'request': 'push_config',
+            'config_filename': name,
+            'config_contents': config_contents,
+            'default': bool(default),
+        }
         response = self.send_request(message)
         if response['status'] == 'success':
             source = self.config_file or 'memory'
@@ -920,6 +931,269 @@ class ReadoutClient:
         else:
             print(f"Error getting timing status: {response.get('message', 'unknown error')}")
             return response
+
+    # ---- v7.10 firmware timed sync (telescope-time-aligned) ----
+    # Four building blocks for one-board and (future) multi-board synchronisation.
+    # Multi-board flow: timed_sync_ready(T) on every board with a common absolute T,
+    # then timed_sync_arm(target_unix_s=T) on each, then timed_sync_check() on each.
+
+    def timed_sync_needed(self, align_tol_s=DEFAULT_ALIGN_TOL_S):
+        """Report whether this board needs a firmware timed sync, and whether it can do one.
+
+        Reads the firmware telescope-time (TT) alignment (how far the PPS-latched TT
+        sits from the integer-second boundary) and the system readiness (PTP locked +
+        TSU 1-PPS strobe healthy). ``needs_sync`` is True if no timed sync has been
+        armed since the server started or the TT has drifted off the boundary by more
+        than ``align_tol_s``; ``can_sync`` is True only when PTP and the PPS are both
+        ready.
+
+        Parameters
+        ----------
+        align_tol_s : float
+            Off-boundary tolerance: |pps_boundary_offset_s| above this marks the TT as
+            drifted (needs_sync). Defaults to 1e-4 (0.1 ms); a fresh load is ~1 us.
+
+        Returns
+        -------
+        dict with keys:
+            needs_sync : bool -- True if no timed sync has been armed since the server
+                started, or the TT has drifted off the second boundary (> ~50 us).
+            reason : str -- human-readable explanation of needs_sync.
+            ever_synced : bool -- whether a timed sync has been armed this server session.
+            can_sync : bool -- True only when PTP is locked to a grandmaster AND the TSU
+                1-PPS strobe is healthy (i.e. ptp_ready and pps_active).
+            ptp_ready : bool -- PTP is locked to a grandmaster.
+            pps_active : bool -- the TSU 1-PPS strobe is healthy.
+            readiness_reasons : list[str] -- why can_sync is False (empty when ready).
+            align_tol_s : float -- the off-boundary tolerance used for needs_sync.
+            pps_boundary_offset_s : float -- how far the PPS-latched TT sits off the
+                integer second, folded to +/-0.5 s. The precise (~us) alignment metric.
+            system_offset_s : float -- last_pps_unix_s minus the host Linux clock. COARSE,
+                whole-second check only (its sub-second part is just time-since-PPS + read
+                latency, NOT a clock error); use pps_boundary_offset_s for precision.
+            last_pps_tt : int -- raw TT (fabric clocks since the UNIX epoch) latched at the
+                last PPS edge. The firmware exposes no live internal-TT counter, so this is
+                the most recent TT readback, not the instantaneous current TT.
+            last_pps_unix_s : float -- last_pps_tt as UNIX seconds (sits ~on an integer
+                second, so it reads ~N.9999/N.0000).
+            last_pps_utc : str -- last_pps_unix_s as an ISO-8601 UTC string.
+        """
+        response = self.send_request({'request': 'timed_sync_needed',
+                                      'align_tol_s': float(align_tol_s)})
+        if response['status'] == 'success':
+            return response['result']
+        print(f"Error checking timed-sync need: {response.get('message', 'unknown error')}")
+        return response
+
+    def timed_sync_ready(self, target_unix_s=None, seconds_from_now=None):
+        """Check whether the board is ready to fire a timed sync at a target second.
+
+        Verifies PTP is ready, the PPS strobe is active, and the target is in the future
+        relative to the server clock, the firmware telescope time, AND your own client
+        clock. Pass an absolute ``target_unix_s`` (UNIX seconds) OR a relative
+        ``seconds_from_now`` (not both). For a coordinated multi-board sync, call this on
+        every board with the SAME absolute ``target_unix_s`` and proceed only if all
+        return ready=True. No firmware state is changed.
+
+        Returns
+        -------
+        dict with keys:
+            ready : bool -- can_sync AND the target is in the future on all clocks below.
+            checks : dict -- the individual gates:
+                ptp_ready, pps_active (as in timed_sync_needed); and
+                target_future_server / target_future_firmware / target_future_client --
+                target is >1 s ahead of the server clock / firmware TT / your client clock.
+            reasons : list[str] -- why ready is False (empty when ready).
+            target_tt_unix_s : float -- the resolved target second (quantised to a whole
+                second). Default lead is 5 s past the firmware TT if no target is given.
+            target_tt_utc : str -- target_tt_unix_s as an ISO-8601 UTC string.
+            server_now_unix_s / server_now_utc : the RFSoC server clock at the check.
+            client_now_unix_s / client_now_utc : your local clock at the check (added
+                client-side so you can compare the target against both ends).
+            firmware_last_pps_unix_s / firmware_last_pps_utc : the TT latched at the last
+                PPS edge. No live internal-TT readback exists, so the future-vs-firmware
+                check has ~1 s resolution.
+            pps_boundary_offset_s : float -- PPS-latched TT offset from the integer second
+                (the precise alignment metric).
+        """
+        if target_unix_s is not None and seconds_from_now is not None:
+            raise ValueError("give target_unix_s OR seconds_from_now, not both")
+        message = {'request': 'timed_sync_ready'}
+        if target_unix_s is not None:
+            message['target_unix_s'] = target_unix_s
+        if seconds_from_now is not None:
+            message['seconds_from_now'] = seconds_from_now
+        response = self.send_request(message)
+        if response['status'] != 'success':
+            print(f"Error checking timed-sync readiness: {response.get('message', 'unknown error')}")
+            return response
+        result = response['result']
+        # Also check the target against OUR OWN clock (the user's "relative to client
+        # time"): the server returns its clock so we can compare both ends independently.
+        client_now = time.time()
+        target_future_client = result['target_tt_unix_s'] > client_now + 1
+        result['client_now_unix_s'] = client_now
+        result['client_now_utc'] = unix_to_iso(client_now)
+        result['checks']['target_future_client'] = target_future_client
+        if not target_future_client:
+            result['reasons'].append(
+                f"target {time.ctime(result['target_tt_unix_s'])} is not >1 s ahead of client "
+                f"time {time.ctime(client_now)}")
+            result['ready'] = False
+        return result
+
+    def timed_sync_arm(self, target_unix_s=None, seconds_from_now=None,
+                       mrst=False, reload_tt='auto', wait=False, force=False):
+        """Perform a firmware timed sync: arm a reset+sync at a chosen future second.
+
+        Arms the firmware to fire a reset+sync when the running telescope-time counter
+        reaches the target second; the firmware re-aligns to the PPS at fire (this is the
+        low-overhead resync). Returns as soon as it is armed -- the firmware fires
+        autonomously -- unless ``wait`` is True. Pass an absolute ``target_unix_s`` OR a
+        relative ``seconds_from_now`` (default 5 s if neither). The server refuses unless
+        PTP and the PPS strobe are ready; pass ``force=True`` to try anyway.
+
+        The TT counter *value* is reloaded only when needed: ``reload_tt='auto'`` (default)
+        reloads only if the TT is unset or has drifted ~1 s from the clock (rare -- ~7 days
+        at 1.6 ppm); ``True`` forces it; ``False`` skips it. A reload blocks ~3-4 s on PPS
+        edges, so a plain arm is fast. ``mrst=True`` adds an early reset of the DSP timing
+        network.
+
+        Returns
+        -------
+        dict with keys:
+            target_tt_unix_s : float -- the resolved target second the sync will fire on
+                (quantised to a whole second), UNIX seconds.
+            target_tt_utc : str -- target_tt_unix_s as an ISO-8601 UTC string.
+            target_tt_value : int -- the target expressed in telescope-time counter units,
+                i.e. fabric clock ticks since the UNIX epoch = round(target_tt_unix_s *
+                clk_hz). This is the actual value written to the timed_sync_time register,
+                NOT int(target_tt_unix_s) -- it is ~3.07e8x larger (clk_hz ticks per second).
+            clk_hz : int -- fabric/DSP clock rate (ticks per second), ~307.2e6.
+            countdown_remaining_s : float -- fabric clock ticks until the sync fires, as
+                seconds, read just after arming. With wait=False this is ~the lead time;
+                with wait=True it has elapsed to ~0.
+            armed_at_unix_s : float -- the host wall-clock instant the arm registers were
+                written (just `time.time()` at arm). It is NOT a second boundary -- it is
+                simply "when we armed", whereas target_tt_unix_s is the integer second we
+                aim at.
+            armed_at_utc : str -- armed_at_unix_s as an ISO-8601 UTC string.
+            reloaded_tt : bool -- whether the TT counter *value* was reloaded this call (the
+                slow ~3-4 s update_internal_time). 'auto' reloads only if the TT was unset or
+                had drifted ~1 s; True forces it; False skips it.
+            fired : bool -- whether THIS call blocked until the sync fired. It just reflects
+                ``wait``: True only when wait=True (we waited). With wait=False (default) the
+                call returns once armed and the firmware fires autonomously later, so fired
+                is False -- use timed_sync_check() afterwards to confirm it actually landed.
+        """
+        if target_unix_s is not None and seconds_from_now is not None:
+            raise ValueError("give target_unix_s OR seconds_from_now, not both")
+        message = {'request': 'timed_sync_arm', 'mrst': bool(mrst),
+                   'reload_tt': reload_tt, 'wait': bool(wait), 'force': bool(force)}
+        if target_unix_s is not None:
+            message['target_unix_s'] = target_unix_s
+        if seconds_from_now is not None:
+            message['seconds_from_now'] = seconds_from_now
+        response = self.send_request(message)
+        if response['status'] == 'success':
+            return response['result']
+        print(f"Error arming timed sync: {response.get('message', 'unknown error')}")
+        return response
+
+    def timed_sync_check(self, resample_drift=False, align_tol_s=DEFAULT_ALIGN_TOL_S):
+        """Check whether the firmware telescope time is aligned, and report its drift.
+
+        FAST and non-blocking by default. Reads how far the PPS-latched TT sits from the
+        integer-second boundary (``aligned`` if |offset| < ``align_tol_s``) and reports the
+        *instant* drift = ``pps_boundary_offset_s / time_since_tt_load_s`` (~1.6 ppm typical,
+        fabric clock vs PPS). The reference is the last TT *load* (``set_telescope_time`` or
+        an arm that reloaded), NOT the last sync -- a sync does not reload the TT, so the
+        offset keeps accumulating across syncs. The server tracks the load time this session,
+        so ``drift_ppm`` is None after a restart with no load (use ``resample_drift`` then).
+        ``last_sync_*`` (firmware tt_sync register) is reported for "time since last sync"
+        only and survives a restart. ``last_armed`` echoes the last timed sync this server armed.
+
+        Parameters
+        ----------
+        resample_drift : bool
+            If True, ALWAYS run the slow multi-second drift sampler (adds ~5 s) and return it
+            as ``drift_resampled_ppm``. Even when False, the sampler runs AUTOMATICALLY as a
+            fallback whenever the instant drift is unavailable (no TT load cached this
+            session) -- so a drift value is returned either way. Default False.
+        align_tol_s : float
+            Tolerance for the ``aligned`` verdict: |pps_boundary_offset_s| under this
+            counts as aligned. Defaults to 1e-4 (0.1 ms); a fresh load is ~1 us.
+
+        Returns
+        -------
+        dict with keys:
+            aligned : bool -- True if |pps_boundary_offset_s| < align_tol_s (a fresh load
+                is ~1 us).
+            align_tol_s : float -- the tolerance used for the aligned verdict.
+            pps_boundary_offset_s : float -- PPS-latched TT offset from the integer second,
+                folded to +/-0.5 s. The precise alignment metric; equals drift_offset_s.
+            drift_offset_s : float -- the drift in seconds accumulated since the last TT load
+                (same value as pps_boundary_offset_s, named for the drift context).
+            system_offset_s : float -- last_pps_unix_s minus the host Linux clock; a COARSE
+                whole-second sanity check, not a precise offset (see timed_sync_needed).
+            last_pps_tt / last_pps_unix_s / last_pps_utc -- the TT latched at the last PPS
+                (the firmware exposes no live internal-TT readback).
+            last_sync_tt / last_sync_unix_s / last_sync_utc -- the TT of the last firmware
+                sync (tt_sync register); None if no sync has fired since the FPGA was loaded.
+            time_since_last_sync_s : float | None -- time since the last sync fired (display).
+            tt_loaded_unix_s / tt_loaded_utc -- when the server last loaded the TT (the drift
+                reference); None if no load this session.
+            time_since_tt_load_s : float | None -- elapsed since that load (drift denominator).
+            drift_ppm : float | None -- INSTANT TT-vs-PPS drift estimate (None when no load
+                this session or too little time has elapsed, ~< 2 s -- then read
+                drift_resampled_ppm instead).
+            drift_resampled_ppm : float | None -- the slow-sampled drift, present when
+                resample_drift=True OR when the instant estimate was unavailable (auto
+                fallback); else None.
+            strobe_healthy : bool -- the TSU 1-PPS strobe is healthy.
+            last_armed : dict | None -- the result dict of the last timed_sync_arm this
+                server armed (None if none armed this session).
+        """
+        response = self.send_request({'request': 'timed_sync_check',
+                                      'resample_drift': bool(resample_drift),
+                                      'align_tol_s': float(align_tol_s)})
+        if response['status'] == 'success':
+            return response['result']
+        print(f"Error checking timed sync: {response.get('message', 'unknown error')}")
+        return response
+
+    def set_telescope_time(self, force=False):
+        """Load the firmware telescope time (TT) on the pipeline from the PPS-disciplined clock.
+
+        Stages the next integer second and lets the firmware latch it into the TT counter
+        on the next PPS edge, so ``telescope_time`` reflects real (PTP-disciplined) UNIX
+        time. BLOCKS a few seconds (it waits on PPS edges). The server refuses unless PTP is
+        locked to a grandmaster and the TSU 1-PPS strobe is healthy; pass ``force=True`` to
+        try anyway. This is the one-shot "set the clock" you run once the timing system is
+        up; to arm a deterministic (multi-board) resync at a chosen future second use
+        :meth:`timed_sync_arm`.
+
+        Returns
+        -------
+        dict with keys:
+            loaded : bool -- always True on success (the TT load was staged and latched).
+            aligned : bool -- True if the resulting PPS-latched TT is within ~50 us of the
+                second boundary.
+            pps_boundary_offset_s : float -- PPS-latched TT offset from the integer second
+                (the precise alignment metric).
+            system_offset_s : float -- last_pps_unix_s minus the host Linux clock; COARSE
+                whole-second sanity only.
+            last_pps_tt : int -- raw TT (fabric clocks since the epoch) at the last PPS.
+            last_pps_unix_s : float -- last_pps_tt as UNIX seconds (sits ~on a second
+                boundary; no live internal-TT readback exists).
+            last_pps_utc : str -- last_pps_unix_s as an ISO-8601 UTC string.
+            clk_hz : int -- fabric/DSP clock rate (ticks per second), ~307.2e6.
+        """
+        response = self.send_request({'request': 'set_telescope_time', 'force': bool(force)})
+        if response['status'] == 'success':
+            return response['result']
+        print(f"Error setting telescope time: {response.get('message', 'unknown error')}")
+        return response
 
     def health_check(self):
         """Quick system health summary for intermittent polling.
@@ -1193,7 +1467,7 @@ class ReadoutClient:
         """Return the latest telescope timestamp reported by the server."""
         return self.get_parameter('telescope_time')
 
-    def set_tone_frequencies(self, tone_frequencies, autosync=True, mrst=False,
+    def set_tone_frequencies(self, tone_frequencies, autosync=False, mrst=False,
                              compensate_rx_ticks=0):
         """Set the active ``tone_frequencies`` (array-like, Hz).
 
@@ -1259,7 +1533,7 @@ class ReadoutClient:
                         reference_plane='detector',
                         optimise_dynamic_range=False,
                         rx_policy='protect',
-                        autosync=True, mrst=False):
+                        autosync=False, mrst=False):
         """Create or replace blind tones interactively.
 
         The server snapshots the currently active regular tones, appends the
@@ -1287,7 +1561,7 @@ class ReadoutClient:
             RX-path policy when applying, as in :py:meth:`set_tone_powers`
             (default ``'protect'``).
         autosync : bool, optional
-            If True (default), trigger firmware sync after applying tone
+            If True, trigger a firmware sync (default False now under v7.10) after applying tone
             frequency/amplitude changes.
         """
         message = {
@@ -1314,7 +1588,7 @@ class ReadoutClient:
         self._update_tone_defaults_from_blind_result(response['result'])
         return response
 
-    def remove_blind_tones(self, autosync=True, mrst=False):
+    def remove_blind_tones(self, autosync=False, mrst=False):
         """Remove blind tones and leave the current regular tones active."""
         response = self.send_request({
             'request': 'remove_blind_tones',
@@ -1327,7 +1601,7 @@ class ReadoutClient:
         self._update_tone_defaults_from_blind_result(response['result'])
         return response
 
-    def set_tone_amplitudes(self, tone_amplitudes, autosync=True, mrst=False):
+    def set_tone_amplitudes(self, tone_amplitudes, autosync=False, mrst=False):
         """Set the per-tone amplitude scale factors from ``tone_amplitudes``."""
         tone_amplitudes = np.atleast_1d(tone_amplitudes).tolist()
         return self.set_parameter(
@@ -1337,7 +1611,7 @@ class ReadoutClient:
         """Return per-tone amplitude scale factors."""
         return np.atleast_1d(self.get_parameter('tone_amplitudes'))
 
-    def set_tone_phases(self, tone_phases, autosync=True, mrst=False):
+    def set_tone_phases(self, tone_phases, autosync=False, mrst=False):
         """Set the per-tone phase offsets (radians) from ``tone_phases``."""
         tone_phases = np.atleast_1d(tone_phases).tolist()
         return self.set_parameter(
@@ -1369,6 +1643,81 @@ class ReadoutClient:
                 "or generate_random_phases(freqs) before proceeding.",
                 stacklevel=3
             )
+
+    @staticmethod
+    def _modulation_warning_messages_from_state(state):
+        """Return client-side warnings for modulation points past half a bin."""
+        if not isinstance(state, dict):
+            return []
+
+        existing = state.get('warnings')
+        if existing:
+            return [str(w) for w in existing]
+
+        half = state.get('tones_beyond_half_bin')
+        beyond = state.get('tones_beyond_coverage')
+
+        # Backward-compatible fallback for older servers/mocks: derive the same
+        # flags from each tone's occupancy vector.
+        if half is None:
+            half_set = set()
+            beyond_set = set(int(i) for i in (beyond or []))
+            tones = state.get('tones', [])
+            if isinstance(tones, list):
+                for tone in tones:
+                    if not isinstance(tone, dict):
+                        continue
+                    try:
+                        idx = int(tone.get('index'))
+                    except (TypeError, ValueError):
+                        continue
+                    occ = set(str(o) for o in tone.get('occupancy', []))
+                    if {'second', 'beyond'} & occ:
+                        half_set.add(idx)
+                    if 'beyond' in occ:
+                        beyond_set.add(idx)
+            half = sorted(half_set)
+            beyond = sorted(beyond_set)
+
+        half = [int(i) for i in (half or [])]
+        beyond = [int(i) for i in (beyond or [])]
+        if not half:
+            return []
+
+        msg = (
+            'modulation point(s) for tone(s) '
+            f'{half} are more than half an FFT bin from their armed bin; '
+            'channel maps remain fixed, so those points ride the overlapping '
+            'channel response (occupancy "second").'
+        )
+        if beyond:
+            msg += (
+                ' Tone(s) '
+                f'{beyond} are more than one FFT bin away and need '
+                'recenter_modulation() or smaller offsets; otherwise they '
+                'wrap to the other end of the bin.'
+            )
+        return [msg]
+
+    @classmethod
+    def _warn_modulation_state(cls, state, stacklevel=3):
+        import warnings
+        for message in cls._modulation_warning_messages_from_state(state):
+            warnings.warn(message, stacklevel=stacklevel)
+
+    @classmethod
+    def _warn_modulation_response(cls, response, stacklevel=3):
+        if not isinstance(response, dict):
+            return
+        messages = response.get('warnings') or []
+        if not messages:
+            messages = cls._modulation_warning_messages_from_state(
+                response.get('result'))
+        if not messages:
+            return
+        import warnings
+        for message in messages:
+            warnings.warn(str(message), stacklevel=stacklevel)
 
     # -- Pipeline DSP parameters --
 
@@ -1472,7 +1821,7 @@ class ReadoutClient:
 
     def set_tone_powers(self, tone_powers_dbm, reference_plane='detector',
                         optimise_dynamic_range=True, rx_policy='protect',
-                        verbose=True, autosync=True, mrst=False, *,
+                        verbose=True, autosync=False, mrst=False, *,
                         force_tx_amp_bypass=None,
                         force_rx_amp_bypass=None,
                         force_tx_attenuation_db=None,
@@ -1512,7 +1861,7 @@ class ReadoutClient:
             If False, suppress client-side informational summaries.  Warnings
             and errors are still printed.
         autosync : bool
-            If True (default), trigger firmware sync after tone-amplitude writes.
+            If True, trigger a firmware sync (default False now under v7.10) after tone-amplitude writes.
         force_tx_amp_bypass, force_rx_amp_bypass : bool or None, optional
             Pin the TX/RX amplifier bypass state instead of letting the
             optimiser choose it.
@@ -2035,9 +2384,10 @@ class ReadoutClient:
         return self.send_request(message)
 
     def enable_modulation(self, center=None, offsets=None, mod_indices=None,
-                          samples_per_point=1, n_settle=1, autosync=True,
-                          setup_sync=True, mrst=False, setup_mrst=True,
-                          compensate_rx_ticks=0):
+                          samples_per_point=4, n_settle=1, autosync=False,
+                          setup_sync=True, mrst=False, setup_mrst=False,
+                          compensate_rx_ticks=0, buffer_reuse_delay_accs=3,
+                          force=False):
         """
         Arm fast tone-frequency modulation. This only **arms** (loads the config
         on the server); it does not start output. Call :meth:`enable_stream` for
@@ -2057,12 +2407,12 @@ class ReadoutClient:
             User-facing indices of tones to modulate. ``None`` = all regular
             (resonator) tones. Blind tones are rejected by the server.
         samples_per_point : int, optional
-            Dwell: accumulations per point per cycle (default 1).
+            Dwell: accumulations per point per cycle (default 4).
         n_settle : int, optional
             Leading samples per point flagged as settling (default 1).
         autosync : bool, optional
             Whether each modulation buffer flip should pulse firmware sync
-            (default ``True``). Set ``False`` to test unsynced buffer flips.
+            (default ``False`` under v7.10). Set ``True`` to force a per-step sync.
         setup_sync : bool, optional
             Whether to pulse one firmware sync at arm time to establish the
             TX/RX phase reference before any buffer flips (default ``True``).
@@ -2072,12 +2422,25 @@ class ReadoutClient:
         mrst : bool, optional
             Whether the per-step (``autosync``) sync also pulses master-reset
             (v7.10). Default ``False`` (light re-reference). ``setup_mrst``
-            (default ``True``) is the same knob for the arm-time ``setup_sync``.
+            (default ``False``) is the same knob for the arm-time ``setup_sync``.
         compensate_rx_ticks : int, optional
             If non-zero, add a per-tone, per-point RX phase offset to cancel the
             RX-vs-TX path delay (in 307.2 MHz clock ticks) seen when modulating
             without a per-step sync (``autosync=False``). Pass 14336 (the
             measured ~46.67 us delay) to enable. Default 0 (off).
+        buffer_reuse_delay_accs : int, optional
+            For N>2 modulation, wait this many emitted/read accumulations after
+            a buffer flip before rewriting the just-vacated control buffer with
+            the following point (a firmware double-buffer rewrite-timing
+            workaround). Default 3; must stay below ``samples_per_point`` for N>2.
+            Set 0 for the original immediate-preload behaviour.
+        force : bool, optional
+            By default arming is rejected if the offsets push any tone more than
+            one filterbank channel from its armed bin (``needs_recenter`` — the
+            tone is no longer covered and would wrap to the other end of the
+            bin).
+            Set ``True`` to arm anyway; the response still reports
+            ``result.tones_beyond_coverage`` and a warning. Default ``False``.
 
         Returns
         -------
@@ -2093,17 +2456,22 @@ class ReadoutClient:
                    'setup_sync': bool(setup_sync),
                    'mrst': bool(mrst),
                    'setup_mrst': bool(setup_mrst),
-                   'compensate_rx_ticks': int(compensate_rx_ticks)}
+                   'compensate_rx_ticks': int(compensate_rx_ticks),
+                   'buffer_reuse_delay_accs': int(buffer_reuse_delay_accs),
+                   'force': bool(force)}
         if center is not None:
             message['center'] = np.asarray(center, dtype=float).tolist()
         if offsets is not None:
             message['offsets'] = np.asarray(offsets, dtype=float).tolist()
         if mod_indices is not None:
             message['mod_indices'] = [int(i) for i in np.atleast_1d(mod_indices)]
-        return self.send_request(message)
+        response = self.send_request(message)
+        self._warn_modulation_response(response)
+        return response
 
     def update_modulation(self, center=None, offsets=None, on_map_change='continue',
-                          autosync=None, mrst=None, compensate_rx_ticks=None):
+                          autosync=None, mrst=None, compensate_rx_ticks=None,
+                          buffer_reuse_delay_accs=None):
         """
         Seamlessly update the modulation centre and/or offsets while armed, with
         no dropped frames. Rides the existing armed channel maps.
@@ -2125,6 +2493,9 @@ class ReadoutClient:
         compensate_rx_ticks : int or None, optional
             Override the RX path-delay compensation (307.2 MHz clock ticks) for
             the update. ``None`` preserves the armed config's value.
+        buffer_reuse_delay_accs : int or None, optional
+            Override the delay between a modulation buffer flip and reuse of the
+            just-vacated buffer. ``None`` preserves the armed config's value.
 
         Returns
         -------
@@ -2143,9 +2514,15 @@ class ReadoutClient:
             message['mrst'] = bool(mrst)
         if compensate_rx_ticks is not None:
             message['compensate_rx_ticks'] = int(compensate_rx_ticks)
-        return self.send_request(message)
+        if buffer_reuse_delay_accs is not None:
+            message['buffer_reuse_delay_accs'] = int(buffer_reuse_delay_accs)
+        response = self.send_request(message)
+        self._warn_modulation_response(response)
+        return response
 
-    def recenter_modulation(self, autosync=None, mrst=None, compensate_rx_ticks=None):
+    def recenter_modulation(self, autosync=None, mrst=None,
+                            compensate_rx_ticks=None,
+                            buffer_reuse_delay_accs=None):
         """
         Recenter modulation: reload the channel maps / mixer frequencies for the
         current centre and recompute VACC bin-sharing (a deliberate brief break).
@@ -2153,6 +2530,8 @@ class ReadoutClient:
         ``autosync=None`` preserves the existing sync mode; pass a bool to change it.
         ``compensate_rx_ticks=None`` likewise preserves the armed RX path-delay
         compensation; pass an int (307.2 MHz clock ticks) to change it.
+        ``buffer_reuse_delay_accs=None`` preserves the armed control-buffer reuse
+        delay; pass an int number of accumulations to change it.
         """
         message = {'request': 'recenter_modulation'}
         if autosync is not None:
@@ -2161,7 +2540,11 @@ class ReadoutClient:
             message['mrst'] = bool(mrst)
         if compensate_rx_ticks is not None:
             message['compensate_rx_ticks'] = int(compensate_rx_ticks)
-        return self.send_request(message)
+        if buffer_reuse_delay_accs is not None:
+            message['buffer_reuse_delay_accs'] = int(buffer_reuse_delay_accs)
+        response = self.send_request(message)
+        self._warn_modulation_response(response)
+        return response
 
     def disable_modulation(self):
         """
@@ -2171,12 +2554,39 @@ class ReadoutClient:
         """
         return self.send_request({'request': 'disable_modulation'})
 
+    def purge_modulation_revisions(self):
+        """
+        Clear the accumulated revision history and reset the revision counter to
+        0 for a clean slate between experiments.
+
+        Each ``enable_modulation`` / :meth:`update_modulation` /
+        :meth:`recenter_modulation` bumps the config revision and records the
+        centre/offsets under it (so captured frames can be decoded offline). That
+        map only ever grows and is shipped in every :meth:`get_modulation_state`.
+        Purge it once you have finished decoding the captured frames.
+
+        The server **refuses** this while modulation is enabled: an armed config
+        may still be pending (un-applied) and carries its own frozen copy of the
+        revision history, which the next capture/stream would re-apply, silently
+        resurrecting the purged entries. Call :meth:`disable_modulation` first,
+        then purge.
+
+        Returns
+        -------
+        dict
+            Server ack with ``result.purged`` (entries removed) and
+            ``result.revision`` (0). Returns an ``error`` status if modulation is
+            still enabled.
+        """
+        return self.send_request({'request': 'purge_modulation_revisions'})
+
     def get_modulation_state(self):
         """
         Return the per-tone modulation state (the ``get_info('tone_modulation')``
         section): armed flag, desired/applied revision, per-tone centres, offsets,
-        bin occupancy, and ``needs_recenter`` / ``tones_beyond_coverage``. A pure
-        server-side read (no hardware access), safe to poll while streaming.
+        bin occupancy, half-bin warnings, and ``needs_recenter`` /
+        ``tones_beyond_coverage``. A pure server-side read (no hardware access),
+        safe to poll while streaming.
         """
         return self.get_info('tone_modulation')
 
@@ -2221,8 +2631,18 @@ class ReadoutClient:
         """Get the current reference clock source ('internal' or 'external')."""
         return self.get_parameter('clock_source')
 
-    def set_clock_source(self, source):
-        """Set the reference clock source.
+    def _set_clock_source(self, source):
+        """Change the reference clock source. DISRUPTIVE - use sparingly.
+
+        Private on purpose: changing the clock source runs ``krc-utils init``,
+        which is only safe on a blank PL (issue #14 - running it while the PL is
+        loaded with tones collapses the PL power rail and hangs the board). The
+        server therefore applies it via a full deprogram -> clock-init ->
+        reprogram cycle, which **resets BOTH pipelines** on the shared dual-
+        pipeline firmware (all tones are dropped and resources re-initialised).
+
+        For normal use, set the desired source in the config file
+        (``firmware.clock_source``); it is applied safely at (re)program time.
 
         Parameters
         ----------
@@ -2328,6 +2748,7 @@ class ReadoutClient:
                     'The server likely rejected or closed the capture; check the server log.')
             if incl_system_info:
                 info = self.get_info('all')
+                self._warn_modulation_state(info.get('tone_modulation'), stacklevel=2)
             else:
                 info = {}
             sample_rate = self.get_sample_rate()
@@ -2337,6 +2758,70 @@ class ReadoutClient:
                            'info':info,'frame_bytes':frame_bytes}
             return sample_data
 
+
+    @staticmethod
+    def _modulation_center_frequencies_from_info(info, num_tones):
+        """Return per-tone modulation centres from a ``get_info`` payload."""
+        if not isinstance(info, dict):
+            return None
+        state = info.get('tone_modulation')
+        if not isinstance(state, dict):
+            return None
+        state_tones = state.get('tones')
+        if not isinstance(state_tones, list):
+            return None
+
+        centers = np.full(int(num_tones), np.nan, dtype=float)
+        existing = info.get('tones', {}).get('frequencies_hz')
+        if existing is not None:
+            try:
+                existing = np.asarray(existing, dtype=float)
+                centers[:min(len(existing), len(centers))] = existing[:len(centers)]
+            except (TypeError, ValueError):
+                pass
+
+        found = False
+        for tone in state_tones:
+            if not isinstance(tone, dict):
+                continue
+            try:
+                idx = int(tone.get('index'))
+                center_hz = float(tone['center_hz'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 <= idx < len(centers):
+                centers[idx] = center_hz
+                found = True
+        if not found:
+            return None
+        return centers
+
+    @staticmethod
+    def _normalise_modulated_sample_info(info, modulation_point, num_tones):
+        """
+        For modulated captures, expose centre frequencies in the standard
+        ``info['tones']['frequencies_hz']`` slot used by plotting helpers.
+        """
+        if not isinstance(info, dict):
+            return info
+        if not np.any(np.asarray(modulation_point, dtype=int) > 0):
+            return info
+
+        centers = ReadoutClient._modulation_center_frequencies_from_info(
+            info, num_tones)
+        if centers is None:
+            return info
+
+        info = copy.deepcopy(info)
+        tones = info.setdefault('tones', {})
+        if 'frequencies_hz' in tones and 'post_capture_frequencies_hz' not in tones:
+            tones['post_capture_frequencies_hz'] = copy.deepcopy(tones['frequencies_hz'])
+        centers_list = centers.tolist()
+        tones['frequencies_hz'] = centers_list
+        tones['modulation_center_frequencies_hz'] = centers_list
+        tones['frequencies_source'] = 'tone_modulation.center_hz'
+        tones['modulation_active_during_capture'] = True
+        return info
 
     @staticmethod
     def parse_samples(sample_data, num_tones=None):
@@ -2402,6 +2887,11 @@ class ReadoutClient:
         # Plain (non-modulated) streams leave flag5 = 0, so these decode to zeros
         # and remain fully backward compatible.
         f5 = flags[:, 5].astype(np.uint32)
+        modulation_point = (f5 & 0xFFFF).astype(int)
+        modulation_settling = ((f5 >> 16) & 0x1).astype(int)
+        modulation_revision = ((f5 >> 17) & 0x7FFF).astype(int)
+        info = ReadoutClient._normalise_modulated_sample_info(
+            info, modulation_point, num_tones)
         data_dict = {'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
                     'num_tones':num_tones,
                     'num_samples':num_samples,
@@ -2413,9 +2903,9 @@ class ReadoutClient:
                     'packet_error':err,
                     'telescope_time':tt,
                     'stream_flags':{f'flag{i}':flags[:,i] for i in range(6)},
-                    'modulation_point': (f5 & 0xFFFF).astype(int),
-                    'modulation_settling': ((f5 >> 16) & 0x1).astype(int),
-                    'modulation_revision': ((f5 >> 17) & 0x7FFF).astype(int),
+                    'modulation_point': modulation_point,
+                    'modulation_settling': modulation_settling,
+                    'modulation_revision': modulation_revision,
                     }
 
         return data_dict
@@ -3481,9 +3971,10 @@ class ReadoutClient:
 
     def perform_sweep(self, centers, spans, points, samples_per_point,
                       direction='up', phases=None, refresh_adc_cal=True,
-                      adc_cal_settle_time=2.0, wait=False, autosync=True,
-                      setup_sync=True, mrst=False, setup_mrst=True,
-                      compensate_rx_ticks=0):
+                      adc_cal_settle_time=2.0, wait=False, autosync=False,
+                      setup_sync=True, mrst=False, setup_mrst=False,
+                      compensate_rx_ticks=0, settle_accumulations=4,
+                      chanmap_settle_accumulations=4):
         """
         Perform a frequency sweep.
 
@@ -3503,10 +3994,16 @@ class ReadoutClient:
                 the refresh but still ensure the calibration is frozen.
             adc_cal_settle_time (float): Seconds to wait for ADC calibration
                 to settle. Default 2.0.
+            settle_accumulations (int): Number of accumulations to discard after
+                each sweep point buffer switch before recording samples. Default
+                2 preserves the previous server behavior; use 0 to disable.
+            chanmap_settle_accumulations (int): Number of accumulations to wait
+                after a PSB/PFB channel-map update and before switching the
+                mixer control buffer. Default 0 preserves previous behavior.
             wait (bool): If True, print the dispatch response, then block until
                 the sweep completes and return the final completion response.
                 Default False.
-            autosync (bool): If True (default), trigger firmware sync when
+            autosync (bool): If True, trigger a firmware sync (default False now under v7.10) when
                 tone frequencies are applied before/during/after the sweep
                 (the per-step sync after each buffer flip).
             setup_sync (bool): If True (default), pulse one firmware sync at the
@@ -3516,12 +4013,15 @@ class ReadoutClient:
                 rides continuous accumulation across the per-step buffer flips.
             mrst (bool): Whether the per-step (``autosync``) sync also pulses
                 master-reset (v7.10; default False). ``setup_mrst`` (default
-                True) is the same knob for the start-of-sweep ``setup_sync``.
+                False) is the same knob for the start-of-sweep ``setup_sync``.
             compensate_rx_ticks (int): If non-zero, add a per-tone RX phase
                 offset to cancel the RX-vs-TX path delay (in 307.2 MHz clock
                 ticks) seen when retuning without a per-step sync (autosync=
                 False). Pass 14336 (the measured ~46.67 us delay) to enable.
         """
+        centers=np.atleast_1d(centers)
+        spans=np.atleast_1d(spans)
+
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(
             centers, autosync=autosync, mrst=mrst,
@@ -3529,8 +4029,6 @@ class ReadoutClient:
         if response['status'] != 'success':
             print(f"Error setting tone frequencies: {response['message']}")
             return response
-        centers=np.atleast_1d(centers)
-        spans=np.atleast_1d(spans)
 
         if phases is not None:
             self.set_tone_phases(np.atleast_1d(phases), autosync=autosync, mrst=mrst)
@@ -3551,6 +4049,8 @@ class ReadoutClient:
             'mrst': bool(mrst),
             'setup_mrst': bool(setup_mrst),
             'compensate_rx_ticks': int(compensate_rx_ticks),
+            'settle_accumulations': int(settle_accumulations),
+            'chanmap_settle_accumulations': int(chanmap_settle_accumulations),
         }
         response = self.send_request(message)
         if wait:
@@ -3562,9 +4062,10 @@ class ReadoutClient:
     def perform_retune(self, centers, spans, points, samples_per_point,
                        direction='up', method='max_gradient',
                        freq_offsets=None, phases=None, refresh_adc_cal=True,
-                       adc_cal_settle_time=2.0, wait=False, autosync=True,
-                       setup_sync=True, mrst=False, setup_mrst=True,
-                       compensate_rx_ticks=0):
+                       adc_cal_settle_time=2.0, wait=False, autosync=False,
+                       setup_sync=True, mrst=False, setup_mrst=False,
+                       compensate_rx_ticks=0, settle_accumulations=4,
+                       chanmap_settle_accumulations=4):
         """
         Perform a retune sweep to find optimal tone frequencies.
 
@@ -3584,10 +4085,16 @@ class ReadoutClient:
                 before sweeping. If False, skip refresh but still ensure frozen.
             adc_cal_settle_time (float): Seconds to wait for ADC calibration
                 to settle. Default 2.0.
+            settle_accumulations (int): Number of accumulations to discard after
+                each sweep point buffer switch before recording samples. Default
+                2 preserves the previous server behavior; use 0 to disable.
+            chanmap_settle_accumulations (int): Number of accumulations to wait
+                after a PSB/PFB channel-map update and before switching the
+                mixer control buffer. Default 0 preserves previous behavior.
             wait (bool): If True, print the dispatch response, then block until
                 the retune completes and return the final completion response.
                 Default False.
-            autosync (bool): If True (default), trigger firmware sync when
+            autosync (bool): If True, trigger a firmware sync (default False now under v7.10) when
                 tone frequencies are applied before/during/after retune
                 (the per-step sync after each buffer flip).
             setup_sync (bool): If True (default), pulse one firmware sync at the
@@ -3595,12 +4102,15 @@ class ReadoutClient:
                 reference. Independent of ``autosync``.
             mrst (bool): Whether the per-step (``autosync``) sync also pulses
                 master-reset (v7.10; default False). ``setup_mrst`` (default
-                True) is the same knob for the start-of-sweep ``setup_sync``.
+                False) is the same knob for the start-of-sweep ``setup_sync``.
             compensate_rx_ticks (int): If non-zero, add a per-tone RX phase
                 offset to cancel the RX-vs-TX path delay (in 307.2 MHz clock
                 ticks) seen when retuning without a per-step sync (autosync=
                 False). Pass 14336 (the measured ~46.67 us delay) to enable.
         """
+        centers=np.atleast_1d(centers)
+        spans=np.atleast_1d(spans)
+
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(
             centers, autosync=autosync, mrst=mrst,
@@ -3608,8 +4118,6 @@ class ReadoutClient:
         if response['status'] != 'success':
             print(f"Error setting tone frequencies: {response['message']}")
             return response
-        centers=np.atleast_1d(centers)
-        spans=np.atleast_1d(spans)
 
         if phases is not None:
             self.set_tone_phases(np.atleast_1d(phases), autosync=autosync, mrst=mrst)
@@ -3649,6 +4157,8 @@ class ReadoutClient:
             'mrst': bool(mrst),
             'setup_mrst': bool(setup_mrst),
             'compensate_rx_ticks': int(compensate_rx_ticks),
+            'settle_accumulations': int(settle_accumulations),
+            'chanmap_settle_accumulations': int(chanmap_settle_accumulations),
         }
         response = self.send_request(message)
         if wait:
@@ -5100,8 +5610,10 @@ class ReadoutClient:
                        optimise_tx_dynamic_range=True,
                        optimise_rx_gain=True,
                        refresh_adc_cal=True,
-                       autosync=True, setup_sync=True, mrst=False, setup_mrst=True,
+                       autosync=False, setup_sync=True, mrst=False, setup_mrst=False,
                        compensate_rx_ticks=0,
+                       settle_accumulations=4,
+                       chanmap_settle_accumulations=4,
                        verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
@@ -5145,7 +5657,7 @@ class ReadoutClient:
                 before sweeping (unfreeze, settle, freeze). If False, skip
                 the refresh but still ensure the calibration is frozen.
                 Calibration is always left frozen after the sweep.
-            autosync (bool): If True (default), trigger firmware sync when
+            autosync (bool): If True, trigger a firmware sync (default False now under v7.10) when
                 tone frequencies are applied before/during/after the sweep
                 (the per-step sync after each buffer flip). Passed through to
                 perform_sweep.
@@ -5155,12 +5667,20 @@ class ReadoutClient:
                 perform_sweep.
             mrst (bool): Whether the per-step (``autosync``) sync also pulses
                 master-reset (v7.10; default False). ``setup_mrst`` (default
-                True) is the same knob for the start-of-sweep ``setup_sync``.
+                False) is the same knob for the start-of-sweep ``setup_sync``.
             setup_mrst (bool): See ``mrst``.
             compensate_rx_ticks (int): If non-zero, add a per-tone RX phase
                 offset to cancel the RX-vs-TX path delay (in 307.2 MHz clock
                 ticks) seen when retuning without a per-step sync (autosync=
                 False). Pass 14336 (the measured ~46.67 us delay) to enable.
+            settle_accumulations (int): Number of accumulations to discard after
+                each sweep point buffer switch before recording samples. Passed
+                through to perform_sweep. Default 2 preserves previous behavior;
+                use 0 to disable.
+            chanmap_settle_accumulations (int): Number of accumulations to wait
+                after a PSB/PFB channel-map update and before switching the
+                mixer control buffer. Passed through to perform_sweep. Default
+                0 preserves previous behavior.
             verbose (bool): Print progress information. Default is True.
 
         Returns:
@@ -5231,10 +5751,18 @@ class ReadoutClient:
                 raise ValueError(f"Invalid sideband value {sb}, should be +1 for USB or -1 for LSB")
 
         # Set defaults for bandwidth and center frequency
+        available_bandwidth_hz = rfmax - rfmin
         if bandwidth_hz is None:
-            bandwidth_hz = (rfmax - rfmin)*0.90 # the last few hz of bandwidth tend to screw up the tones somehow
+            bandwidth_hz = available_bandwidth_hz * 0.90
         if center_freq_hz is None:
             center_freq_hz = (rfmax + rfmin) / 2
+        if bandwidth_hz > 0.90 * available_bandwidth_hz:
+            print(
+                'Warning: wideband_sweep span is greater than 90% of the '
+                'available bandwidth. Tones near the band edges can contaminate '
+                'or corrupt the whole sweep, especially in the DAC interpolation '
+                'filter roll-off. Consider reducing bandwidth or attenuating '
+                'edge tones.')
 
         fmin = center_freq_hz - bandwidth_hz / 2
         fmax = center_freq_hz + bandwidth_hz / 2
@@ -5420,7 +5948,9 @@ class ReadoutClient:
                                       direction='up',
                                       autosync=autosync, setup_sync=setup_sync,
                                       mrst=mrst, setup_mrst=setup_mrst,
-                                      compensate_rx_ticks=compensate_rx_ticks)
+                                      compensate_rx_ticks=compensate_rx_ticks,
+                                      settle_accumulations=settle_accumulations,
+                                      chanmap_settle_accumulations=chanmap_settle_accumulations)
         
         if response['status'] != 'success':
             raise RuntimeError(f"Sweep failed: {response['message']}")
@@ -5446,6 +5976,8 @@ class ReadoutClient:
         s['step_size_hz'] = step_size_hz
         s['num_tones_used'] = num_tones
         s['sweep_points_per_tone'] = sweep_points
+        s['settle_accumulations'] = int(settle_accumulations)
+        s['chanmap_settle_accumulations'] = int(chanmap_settle_accumulations)
         s['tone_powers_dbm'] = self.get_tone_powers(reference_plane=reference_plane) if tone_powers_dbm is not None else None
         s['tone_powers_reference_plane'] = reference_plane
 
@@ -5453,7 +5985,7 @@ class ReadoutClient:
 
 
     def set_tones_helper(self, freqs, amps=None, phases=None, powers_dbm=None,
-                         autosync=True, mrst=False, compensate_rx_ticks=0):
+                         autosync=False, mrst=False, compensate_rx_ticks=0):
         """
         Convenience method: set frequencies, powers/amplitudes, and phases in one call.
 
@@ -5467,7 +5999,7 @@ class ReadoutClient:
             phases: Phase offsets in radians. Defaults to Newman phases if None.
             powers_dbm: Per-tone output power in dBm. If provided, overrides amps and
                         uses set_tone_powers() to apply calibrated power levels.
-            autosync: If True (default), trigger firmware sync after tone
+            autosync: If True, trigger a firmware sync (default False now under v7.10) after tone
                       frequency/amplitude/phase writes.
             compensate_rx_ticks: If non-zero, add a per-tone RX phase offset to
                       cancel the RX-vs-TX path delay (307.2 MHz clock ticks) seen
@@ -5979,6 +6511,55 @@ class ReadoutClient:
                             resonances. Returns per-tone results and flags tones with
                             multiple resonances (doubles/triples).
 
+        Effective defaults:
+            Targeted mode, used for per-tone sweeps, passes the raw
+            ``FilterParams()`` / ``PeakFinderParams()`` defaults unless you
+            override them:
+
+            - no filtering:
+              ``highpass_edge=0.0``, ``lowpass_edge=1.0``,
+              ``median_kernel_size=1``.
+            - dip finding in ``log_magnitude``:
+              ``peak_direction=-1`` means resonances are negative-going dips.
+            - enabled peak constraints:
+              ``prominence_min=1.0`` dB, ``prominence_max=100.0`` dB,
+              ``width_min=100.0`` Hz, ``width_max=10_000_000.0`` Hz,
+              ``distance_value=1000.0`` Hz.
+            - disabled constraints:
+              height and threshold are ignored unless their ``*_enabled``
+              fields are set true.
+
+            Wideband mode intentionally uses more conservative defaults:
+            inner 10-90% of the frequency span, lowpass 0.5, prominence
+            1-100 dB, width 1 kHz-10 MHz, and 100 kHz minimum spacing.
+
+            Useful tuning patterns for a targeted sweep that visibly contains
+            one dip per tone:
+
+            - shallow dip: lower the prominence, for example
+              ``finder_params={'prominence_min': 0.2}``.
+            - narrow or broad dip being filtered out by width: set
+              ``width_min`` / ``width_max`` in Hz, or temporarily use
+              ``finder_params={'width_enabled': False}`` to see candidates.
+            - one isolated resonance per sub-sweep: distance is rarely useful,
+              so ``finder_params={'distance_enabled': False}`` can simplify
+              debugging.
+            - if the magnitude dip is weak but phase is sharp, try
+              ``data_format='unwrapped_phase'`` or ``'group_delay'`` with
+              ``peak_direction`` adjusted for the feature sign.
+
+            Example::
+
+                client.find_resonances(
+                    sweep,
+                    mode='targeted',
+                    finder_params={
+                        'prominence_min': 0.2,
+                        'width_enabled': False,
+                        'distance_enabled': False,
+                    },
+                )
+
         Args:
             sweep_data (dict, optional): Sweep data dictionary with keys
                 'sweep_f', 'sweep_i', 'sweep_q'. If None, performs a new
@@ -5997,16 +6578,10 @@ class ReadoutClient:
                 ``height_enabled``, ``height_min``, ``height_max``,
                 ``threshold_enabled``, ``threshold_min``, ``threshold_max``,
                 ``peak_direction``, ``max_num_peaks``, ``f_low``,
-                ``f_high``. For example:
-                ``finder_params={'prominence_min': 0.5}``.
-                In wideband mode, omitted values use conservative MKID defaults:
-                inner 10-90% of the frequency span, dip finding, 1-100 dB
-                prominence, 1 kHz-10 MHz width, 100 kHz minimum spacing,
-                lowpass 0.5 and highpass 0. Dicts override individual defaults.
-                In targeted mode, omitted values use ``PeakFinderParams()``
-                defaults. Dict aliases such as ``min_height`` are not accepted;
-                use the exact field name such as ``height_min`` and set the
-                matching ``*_enabled`` field when needed.
+                ``f_high``. Dicts override individual defaults. Dict aliases
+                such as ``min_height`` are not accepted; use the exact field
+                name such as ``height_min`` and set the matching
+                ``*_enabled`` field when needed.
             **kwargs: Passed to wideband_sweep if sweep_data is None.
 
         Returns:

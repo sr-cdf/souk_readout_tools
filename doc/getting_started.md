@@ -86,7 +86,6 @@ Default ports: pipeline 0 uses 10000/20000, pipeline 1 uses 10001/20001.
 | `fitting.py` | Nonlinear resonator model fitting (Khalil notch model) |
 | `resonator.py` | Resonator S21 transforms: RF deembedding and phase centering |
 | `plotting/` | Plotting library for sweep, timestream, and snapshot data |
-| `measurement.py` | Simple repeat-measurement runner |
 | `mkid_finder_app.py` | PyQt5 GUI for interactive resonance finding |
 | `tone_list_tools.py` | Tone list file I/O utilities |
 
@@ -256,6 +255,21 @@ client = ReadoutClient(config_file='my_config.yaml')
 ```python
 client = ReadoutClient(address='10.11.11.11', request_port=10000)
 ```
+
+> **No RFSoC hardware?** Pass `mock=True` to run the client against a built-in
+> in-process mock server, so you can explore the API, develop analysis code, or
+> test OCS/controller integration without a board:
+> ```python
+> client = ReadoutClient(mock=True)   # no config or address required
+> client.ensure_ready()
+> freqs = [0.8e9, 1.5e9]
+> client.set_tone_frequencies(freqs)
+> client.set_tone_phases(client.generate_newman_phases(freqs))  # minimise crest factor
+> data = client.parse_samples(client.get_samples(500), num_tones=2)
+> ```
+> The mock emulates sweeps, snapshots, streams, and the full `get_info()`
+> surface against a synthetic resonator catalogue. See
+> [Mock Server Mode](#mock-server-mode) for the details and limitations.
 
 ### How config and calibration files are managed
 
@@ -461,6 +475,11 @@ client.get_tone_frequencies()
 # Detailed breakdown (mixer freqs, DAC output, analog output into the cryostat, etc.):
 client.get_tone_frequencies(detailed_output=True)
 ```
+
+> **Always set phases when driving multiple tones.** After setting frequencies,
+> apply Newman phases to minimise the multi-tone crest factor (see
+> [Phases](#phases)); otherwise the tones can add coherently and saturate the
+> DAC. `set_tones_helper()` does frequencies, powers, and phases in one call.
 
 ### Blind Tones
 
@@ -992,6 +1011,8 @@ from souk_readout_tools import modulation as mod, fitting
 sweep = client.parse_sweep_data(client.get_sweep_data())
 fits = fitting.batch_fit(sweep, verbose=False)
 cfg = mod.params_from_sweep(sweep, n_points=3, samples_per_point=4, fits=fits)
+# Optional repeated centre point: point_sequence=(1, 2, 3, 2)
+# Optional exact offsets in linewidths: offset_linewidths=(-0.25, 0, 0.25, 0)
 client.enable_modulation(center=cfg['center'], offsets=cfg['offsets'],
                          mod_indices=cfg['mod_indices'],
                          samples_per_point=cfg['samples_per_point'], n_settle=cfg['n_settle'])
@@ -1090,15 +1111,18 @@ The RFSoC PL clocks can be referenced to either the on-board 12.8 MHz oscillator
 # Check current source and PLL lock status
 client.get_clock_source()    # 'internal' or 'external'
 client.get_clock_status()    # per-chip lock status
-
-# Switch to external 10 MHz reference
-client.set_clock_source('external')
-
-# Switch back to internal
-client.set_clock_source('internal')
 ```
 
-The clock source is also applied automatically when pushing a config — set `firmware.clock_source` in the config file:
+Set the desired clock source in the config (recommended) — it is applied safely at the next (re)program:
+
+```python
+client.config['firmware']['clock_source'] = 'external'
+client.push_config()   # rejected with "run hard_reset" if it differs from the live source
+```
+
+Changing the reference clock requires running `krc-utils init`, which is only safe once the PL is reset to zero tones (running it while loaded with tones can hard-lock the board — see [clock_source.md](clock_source.md)). A `hard_reset` applies the change via a reset-to-base → clock-init → reprogram cycle, which **resets both pipelines**. The private `client._set_clock_source('external')` forces this at runtime if you really need it.
+
+The server checks the live source/lock state before firmware access with a pure, PS-side check (it never runs `krc-utils init` as a gate); if a PLL is unlocked it drops to `server` level and reports `reset_required`.
 
 ```yaml
 firmware:
@@ -1469,25 +1493,18 @@ for t, ress in enumerate(result['per_tone']):
 
 ## Parameter Space Measurements
 
-The `souk_readout_tools.measurement` module records a measurement as a **run
-directory**: a top-level `measurement.json` manifest plus the data, analysis,
-and plot files it points at.  The manifest is plain JSON and the data model is
-plain dataclasses:
+A power sweep is recorded as a **run directory**: a top-level `measurement.json`
+manifest plus the files it points at.  The manifest is plain JSON listing the
+swept `parameters`, run-level `metadata`, and one entry per `step` (the
+requested power axis, the hardware `readback`, free-form metadata, and a pointer
+to that step's saved sweep).  Each step's sweep is written as a `.npz` under
+`data/`, and a `client.get_info("all")` snapshot is saved as
+`system_info_start.json` / `system_info_end.json` in the run directory at the
+start and end of the run.
 
-- `MeasurementRun` — one run: its `kind`, `parameters`, `metadata`, and a list
-  of steps, plus run-level artifacts such as the `client.get_info("all")`
-  system-info captures saved at the start and end.
-- `MeasurementStep` — one point on the swept axis: the requested `axis` values,
-  the `readback` values read from the hardware, free-form `metadata`, and the
-  artifacts saved for that step.
-- `MeasurementArtifact` — a pointer to one saved file (a sweep `.npz`, a plot
-  `.png`, ...), tagged with its `kind` and `role`.
-
-`MeasurementStore` reads and writes those files; it does not drive the
-measurement.  The acquisition loop lives with the measurement itself.
 `run_power_sweep()` is the worked example: it steps tone power, saves one
-targeted sweep per step (rewriting the manifest as it goes so an interrupted
-run can still be inspected), and returns the `MeasurementRun`:
+targeted sweep per step (rewriting the manifest as it goes so an interrupted run
+can still be inspected), and returns a run dict ready for fitting and plotting:
 
 ```python
 from souk_readout_tools import power_sweep as ps
@@ -1512,17 +1529,37 @@ analysis = ps.analyse_power_sweep(
 best_power = analysis["best_power"]
 ```
 
-To add a new kind of measurement, write a plain function in the same shape as
-`run_power_sweep`: build a `MeasurementRun`, loop over your steps (writing the
-manifest as you go), save each data product with
-`MeasurementStore.save_step_npz_artifact(...)`, and return the run.  The body
-of `run_power_sweep` in `power_sweep.py` is a complete template.
+The body of `run_power_sweep` in `power_sweep.py` is a self-contained template
+for any similar stepped acquisition: build the manifest dict, loop over your
+steps writing each sweep with `_save_npz(...)` and rewriting the manifest
+as you go, then return `_power_sweep_run_view(...)`.
 
-The artifact kinds are `sweep`, `timestream`, `accumulator_snapshot`,
-`adc_snapshot`, `dac_snapshot`, `fit_results`, `summary_table`, and `plot`.
-Accumulator snapshots are treated separately from timestreams because they are
-pre-accumulation, high-rate captures for one tone at a time and are not valid
-for tone-tone correlation analysis.
+### Repeating a measurement across any parameter
+
+For the general case — repeating *any* measurement across an external parameter
+(attenuation, temperature, bias, time, ...) — use the
+`souk_readout_tools.measurement` tools. You supply small callbacks to set/read
+the parameter and a `measure_func(client)`; they walk the parameter, save each
+result and a manifest as they go, and print progress with an ETA:
+
+```python
+from souk_readout_tools.measurement import ParameterSeries
+
+series = ParameterSeries(client, "tx_attenuation_db",
+                         set_parameter=lambda c, v: c.set_tx_attenuation(v))
+results = series.run(
+    values=[0, 5, 10, 15, 20],
+    measure_func=lambda c: c.wideband_sweep(verbose=False),
+    save_dir="runs",
+)
+```
+
+There are four tools — `ParameterSeries`, `ParameterGrid` (nested axes),
+`TimedMeasurement`, and `ConditionalMeasurement` — plus `load_run` /
+`plot_run_summary` for reading runs back. They share the same run-directory and
+`measurement.json` format used above, and support resume, retries, auto-plotting
+and a live `summary.csv`. See [Parameter-Series Measurements](measurements.md)
+for the full reference with per-parameter tables and examples.
 
 For a practical blackbody-load directory convention and an end-to-end
 drive-tuning plus on/off-resonance noise workflow, see [Resonator Drive Tuning
@@ -1570,15 +1607,18 @@ DAC0 is the primary DAC used in normal operation. DAC1 is only used in dual-DAC 
 
 ## Mock Server Mode
 
-For OCS / controller integration testing without RFSoC hardware,
-`ReadoutClient` can run against an in-process mock server:
+When no RFSoC hardware is available — for trying out the tools, developing
+analysis code, or OCS / controller integration testing — `ReadoutClient` can run
+against an in-process mock server:
 
 ```python
 from souk_readout_tools.client.readout_client import ReadoutClient
 
 client = ReadoutClient(mock=True)        # no config / address required
 client.ensure_ready()
-client.set_tone_frequencies([0.8e9, 1.5e9])
+freqs = [0.8e9, 1.5e9]
+client.set_tone_frequencies(freqs)
+client.set_tone_phases(client.generate_newman_phases(freqs))  # minimise crest factor
 raw = client.get_samples(500)
 data = client.parse_samples(raw, num_tones=2)
 ```

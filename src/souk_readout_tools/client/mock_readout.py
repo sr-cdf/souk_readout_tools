@@ -22,13 +22,14 @@ import so3g
 import spt3g.core
 
 from souk_readout_tools.config_utils import get_template_config_path
+from souk_readout_tools.timing import unix_to_iso, format_duration_s
 
 
 class MockReadoutServer:
     """In-process stand-in for the RFSoC readout server."""
 
     DEFAULT_INFO_SECTIONS = [
-        'server', 'versions', 'clock', 'timing', 'fpga', 'rfdc',
+        'server', 'versions', 'clock', 'timing', 'sync', 'fpga', 'rfdc',
         'pipeline', 'tones', 'rf_frontend', 'lna', 'rfsoc_sensors',
     ]
     ALL_INFO_SECTIONS = DEFAULT_INFO_SECTIONS + [
@@ -61,6 +62,8 @@ class MockReadoutServer:
         self.is_streaming = False
         self.triggered_stream_enabled = False
         self.packet_counter = 0
+        self._last_timed_sync = None    # result of the last mock timed_sync_arm
+        self._last_tt_load_unix_s = None  # wall-clock of the last mock TT load (drift ref)
         # fast frequency modulation (mock): _mod is the armed config dict (or None);
         # _mod_enabled is the on/off switch. A simple resonator phase model gives the
         # demod tool ground truth, and a mock channel grid lets us exercise the
@@ -89,6 +92,27 @@ class MockReadoutServer:
     def config(self):
         return self.client.config
 
+    @property
+    def sample_rate(self):
+        """Streaming/accumulator sample rate (Hz), derived from ``acc_len``.
+
+        Mirrors firmware_lib.get_sample_rate so that setting either ``acc_len``
+        or ``sample_rate_hz`` keeps the two consistent, just like the real
+        server.
+        """
+        return self._fft_bw_hz / self.acc_len
+
+    def _acc_len_for_rate(self, sample_rate_hz):
+        """Nearest valid ``acc_len`` for a requested sample rate.
+
+        Matches firmware_lib.set_sample_rate: round to an integer, force a
+        multiple of 4, and clamp to the 1..2**16-1 register range.
+        """
+        acc_len = int(round(self._fft_bw_hz / sample_rate_hz))
+        if acc_len % 4 != 0:
+            acc_len = 4 * int(np.ceil(acc_len / 4))
+        return int(min(max(acc_len, 1), 2**16 - 1))
+
     def _init_tone_state(self):
         defaults = (self.config or {}).get('firmware', {}).get('defaults', {})
         freqs = (
@@ -100,11 +124,21 @@ class MockReadoutServer:
         freqs = np.atleast_1d(freqs).astype(float).tolist()
         n_tones = len(freqs)
 
-        self.sample_rate = float(
-            defaults.get('sample_rate_hz',
-                         defaults.get('acc_freq',
-                                      defaults.get('sample_rate', 500.0)))
-        )
+        # acc_len is the source of truth, exactly as on the real server: the
+        # streaming/accumulator sample rate is derived from it (see the
+        # ``sample_rate`` property and firmware_lib.get_sample_rate). The mock
+        # FFT bandwidth mirrors firmware_lib: adc_clk_hz / (N_RX_FFT /
+        # N_RX_OVERSAMPLE), with N_RX_FFT = 8192 and N_RX_OVERSAMPLE = 2.
+        self.adc_clk_hz = 2457600000.0
+        self._fft_bw_hz = self.adc_clk_hz / (8192 / 2)
+        acc_len = defaults.get('acc_len')
+        if acc_len is None:
+            requested_rate = defaults.get(
+                'sample_rate_hz',
+                defaults.get('acc_freq', defaults.get('sample_rate')))
+            acc_len = (self._acc_len_for_rate(float(requested_rate))
+                       if requested_rate is not None else 1000)
+        self.acc_len = int(acc_len)
         self.tone_frequencies = freqs
         self.tone_amplitudes = self._per_tone_list(
             defaults.get('tone_amplitudes', defaults.get('amplitudes', 1.0)),
@@ -309,6 +343,7 @@ class MockReadoutServer:
             'versions': self._info_versions,
             'clock': self._info_clock,
             'timing': self._info_timing,
+            'sync': self._info_sync,
             'fpga': self._info_fpga,
             'rfdc': self._info_rfdc,
             'pipeline': self._info_pipeline,
@@ -461,6 +496,49 @@ class MockReadoutServer:
             'phc': {},
             'ntp': {},
             'chrony': {},
+            'sync_readiness': {'ptp_ready': True, 'pps_active': True,
+                               'can_sync': True, 'reasons': []},
+        }
+
+    def _info_sync(self):
+        """Mock firmware timed-sync status for ``get_info('sync')`` (mirrors the server)."""
+        now = time.time()
+        last_pps_unix_s = round(now)
+        ever_synced = self._last_timed_sync is not None
+        last_armed = self._last_timed_sync
+        if last_armed is not None:
+            last_sync_unix_s = float(last_armed.get('target_tt_unix_s', last_pps_unix_s))
+            time_since_last_sync = max(0.0, now - last_sync_unix_s)
+        else:
+            last_sync_unix_s = None
+            time_since_last_sync = None
+        loaded = self._last_tt_load_unix_s
+        time_since_tt_load = (now - loaded) if loaded is not None else None
+        pps_boundary_offset_s = 1e-6
+        drift_ppm = (pps_boundary_offset_s / time_since_tt_load * 1e6
+                     if time_since_tt_load is not None and time_since_tt_load >= 2.0 else None)
+        return {
+            'available': True,
+            'state': 'aligned' if (ever_synced or last_sync_unix_s is not None) else 'never_synced',
+            'ever_synced': ever_synced,
+            'readiness': {'ptp_ready': True, 'pps_active': True, 'can_sync': True},
+            'aligned': True,
+            'align_tol_s': 1e-4,
+            'pps_boundary_offset_s': pps_boundary_offset_s,
+            'system_offset_s': last_pps_unix_s - now,
+            'last_pps_unix_s': float(last_pps_unix_s),
+            'last_pps_utc': unix_to_iso(last_pps_unix_s),
+            'last_sync_tt': (int(last_sync_unix_s * 307_200_000) if last_sync_unix_s else None),
+            'last_sync_unix_s': last_sync_unix_s,
+            'last_sync_utc': unix_to_iso(last_sync_unix_s),
+            'time_since_last_sync_s': time_since_last_sync,
+            'time_since_last_sync': format_duration_s(time_since_last_sync),
+            'tt_loaded_unix_s': loaded,
+            'tt_loaded_utc': unix_to_iso(loaded),
+            'time_since_tt_load_s': time_since_tt_load,
+            'drift_ppm': drift_ppm,
+            'drift_offset_s': pps_boundary_offset_s,
+            'last_armed': last_armed,
         }
 
     def _info_fpga(self):
@@ -476,7 +554,7 @@ class MockReadoutServer:
             },
             'fpg_file': self.config.get('firmware', {}).get('fw_config_file'),
             'pipeline_id': self.client.pipeline_id,
-            'adc_clk_hz': 2457600000,
+            'adc_clk_hz': int(self.adc_clk_hz),
         }
 
     def _info_rfdc(self):
@@ -521,7 +599,7 @@ class MockReadoutServer:
             'psb_scale': defaults.get('psb_scale', 1),
             'psb_fftshift': defaults.get('psb_fftshift', 0),
             'pfb_fftshift': defaults.get('pfb_fftshift', 0),
-            'acc_len': defaults.get('acc_len', 1000),
+            'acc_len': self.acc_len,
             'acc_freq_hz': self.sample_rate,
         }
 
@@ -833,7 +911,10 @@ class MockReadoutServer:
         :py:meth:`ReadoutClient.set_parameter` (the names handled below).
         """
         if param_name == 'sample_rate_hz':
-            self.sample_rate = float(param_value)
+            # Mirror the real server: store the derived acc_len, not the rate.
+            self.acc_len = self._acc_len_for_rate(float(param_value))
+        elif param_name == 'acc_len':
+            self.acc_len = int(param_value)
         elif param_name == 'tone_frequencies':
             self.tone_frequencies = np.atleast_1d(param_value).astype(float).tolist()
             self._resize_tone_state(len(self.tone_frequencies))
@@ -904,7 +985,7 @@ class MockReadoutServer:
         return full, n_points
 
     def _mock_modulation_state(self, center, full_offsets, mod_indices, spp, n_settle,
-                               armed_bin_center, autosync=True, mrst=False):
+                               armed_bin_center, autosync=False, mrst=False):
         """Assemble a ``tone_modulation`` state dict mirroring the server's shape,
         with per-(tone,point) bin occupancy relative to the fixed mock armed bins.
 
@@ -932,6 +1013,25 @@ class MockReadoutServer:
         ad = np.abs(drift)
         occ = np.where(ad <= 0.5, 'nearest', np.where(ad <= 1.0, 'second', 'beyond'))
         beyond = sorted({i for i in range(n_tones) if 'beyond' in set(occ[:, i])})
+        beyond_half = sorted({
+            i for i in range(n_tones)
+            if {'second', 'beyond'} & set(occ[:, i])
+        })
+        warnings_list = []
+        if beyond_half:
+            msg = (
+                'modulation point(s) for tone(s) '
+                f'{beyond_half} are more than half an FFT bin from their armed '
+                'bin; channel maps remain fixed, so those points ride the '
+                'overlapping channel response (occupancy "second").'
+            )
+            if beyond:
+                msg += (
+                    ' Tone(s) '
+                    f'{beyond} are more than one FFT bin away and need '
+                    'recenter_modulation() or smaller offsets.'
+                )
+            warnings_list.append(msg)
         tones = []
         for i in range(n_tones):
             tones.append({
@@ -954,7 +1054,10 @@ class MockReadoutServer:
             'sample_rate_hz': float(self.sample_rate),
             'cycle_rate_hz': float(self.sample_rate) / (n_points * spp) if n_points else float('nan'),
             'needs_recenter': bool(len(beyond) > 0),
+            'any_beyond_half_bin': bool(beyond_half),
+            'tones_beyond_half_bin': beyond_half,
             'tones_beyond_coverage': beyond,
+            'warnings': warnings_list,
             'tones': tones,
         }
 
@@ -1003,7 +1106,7 @@ class MockReadoutServer:
         if reload_bins or self._mod_armed_bin_center is None:
             self._mod_armed_bin_center = np.round(center / self._mod_bin_hz) * self._mod_bin_hz
         if autosync is None:
-            autosync = self._mod.get('autosync', True) if self._mod is not None else True
+            autosync = self._mod.get('autosync', False) if self._mod is not None else False
         autosync = bool(autosync)
         if mrst is None:
             mrst = self._mod.get('mrst', False) if self._mod is not None else False
@@ -1093,6 +1196,14 @@ class MockReadoutServer:
             frame = self.stream_frame(num_tones)
             frame_bytes = len(frame)
             data_raw.extend(frame)
+        # Throttle to the real acquisition time (num_samples / sample_rate) so
+        # the mock doesn't return far faster than hardware. burst is a single
+        # fast transfer on real hardware, so it is left unthrottled.
+        if not burst and self.sample_rate > 0:
+            desired_time = num_samples / self.sample_rate
+            elapsed = time.time() - t0
+            if elapsed < desired_time:
+                time.sleep(desired_time - elapsed)
         t1 = time.time()
         print(f"MOCK: Received {num_samples} samples in ~{t1-t0} seconds "
               f"(~{num_samples/(t1-t0)} samples per second)")
@@ -1157,8 +1268,12 @@ class MockReadoutServer:
             print(f"MOCK: Writing data to {filename}")
             t0 = time.time()
             count = 0
+            # Throttle each frame to the accumulator period so the mock writes
+            # at roughly the hardware rate rather than as fast as possible.
+            frame_period = 1.0 / self.sample_rate if self.sample_rate > 0 else 0.0
             while True:
                 try:
+                    t0_frame = time.time()
                     frame = self.stream_frame(num_tones)
                     file.write(frame)
                     count += 1
@@ -1174,6 +1289,10 @@ class MockReadoutServer:
                         iq_data = i+1j*q
                         print(f"MOCK: Received IQ data: err={err} cnt={cnt} "
                               f"tt={tt} {iq_data.tolist()}\r", end='', flush=True)
+
+                    this_frame_time = time.time() - t0_frame
+                    if this_frame_time < frame_period:
+                        time.sleep(frame_period - this_frame_time)
                 except KeyboardInterrupt:
                     break
                 except Exception as e:
@@ -1263,6 +1382,13 @@ class MockReadoutServer:
             sample_rate = metadata['sample_rate']
             total_rows = max(1, int(float(duration) * sample_rate))
             rows_remaining = total_rows
+            # Throttle the mock writer so frames are emitted at roughly the
+            # real hardware rate. ``sample_rate`` is the live accumulator
+            # rate (set by acc_len on hardware); without this the mock writes
+            # the whole file far faster than expected and the OCS agent warns
+            # that streaming finished early.
+            desired_frame_write_time = (
+                num_sample_rows_per_frame / sample_rate if sample_rate > 0 else 0.0)
             chans = np.arange(num_tones)
             names = ['_']*(2*num_tones+6+1+1+1)
             names[0:2*len(chans):2] = [f'i{ch:0>4}' for ch in chans]
@@ -1274,6 +1400,7 @@ class MockReadoutServer:
             names[num_tones*2+8] = 'err'
 
             while rows_remaining > 0:
+                t0_frame = time.time()
                 size_of_this_frame = min(num_sample_rows_per_frame, rows_remaining)
                 rows = []
                 for _ in range(size_of_this_frame):
@@ -1322,6 +1449,10 @@ class MockReadoutServer:
                 fr['sostream_version'] = SOSTREAM_VERSION
                 fr['time'] = spt3g.core.G3Time(time.time() * spt3g.core.G3Units.s)
                 writer(fr)
+
+                this_frame_time = time.time() - t0_frame
+                if this_frame_time < desired_frame_write_time:
+                    time.sleep(desired_frame_write_time - this_frame_time)
 
                 frame_count += 1
                 rows_remaining -= size_of_this_frame
@@ -1430,6 +1561,147 @@ class MockReadoutServer:
         if request == 'get_timing_status':
             return {'status': 'success', 'data': self._info_timing()}
 
+        # v7.10 firmware timed sync (mock): always "ready/aligned", small drift, and a
+        # tracked last-armed target so timed_sync_check is coherent after timed_sync_arm.
+        if request == 'timed_sync_needed':
+            now = time.time()
+            last_pps_unix_s = round(now)
+            align_tol_s = float(message.get('align_tol_s', 1e-4))
+            ever = self._last_timed_sync is not None
+            return {'status': 'success', 'result': {
+                'needs_sync': not ever,
+                'reason': ('no timed sync has been armed since the server started' if not ever
+                           else 'telescope time is aligned on the second boundary'),
+                'ever_synced': ever,
+                'can_sync': True, 'ptp_ready': True, 'pps_active': True,
+                'readiness_reasons': [],
+                'align_tol_s': align_tol_s,
+                'pps_boundary_offset_s': 1e-6,
+                'system_offset_s': last_pps_unix_s - now,
+                'last_pps_tt': int(last_pps_unix_s * 307_200_000),
+                'last_pps_unix_s': float(last_pps_unix_s),
+                'last_pps_utc': unix_to_iso(last_pps_unix_s),
+            }}
+
+        if request == 'timed_sync_ready':
+            target_unix_s = message.get('target_unix_s')
+            seconds_from_now = message.get('seconds_from_now')
+            if target_unix_s is not None and seconds_from_now is not None:
+                return {'status': 'error',
+                        'message': 'give target_unix_s OR seconds_from_now, not both'}
+            server_now = time.time()
+            if target_unix_s is not None:
+                target_sec = float(int(round(target_unix_s)))
+            else:
+                lead = 5 if seconds_from_now is None else int(seconds_from_now)
+                target_sec = float(int(server_now) + lead)
+            target_future = target_sec > server_now + 1
+            return {'status': 'success', 'result': {
+                'ready': bool(target_future),
+                'checks': {'ptp_ready': True, 'pps_active': True,
+                           'target_future_server': target_future,
+                           'target_future_firmware': target_future},
+                'reasons': ([] if target_future else
+                            [f"target {time.ctime(target_sec)} is not >1 s ahead of server time"]),
+                'target_tt_unix_s': target_sec,
+                'target_tt_utc': unix_to_iso(target_sec),
+                'server_now_unix_s': server_now,
+                'server_now_utc': unix_to_iso(server_now),
+                'firmware_last_pps_unix_s': float(int(server_now)),
+                'firmware_last_pps_utc': unix_to_iso(int(server_now)),
+                'pps_boundary_offset_s': 1e-6,
+            }}
+
+        if request == 'timed_sync_arm':
+            target_unix_s = message.get('target_unix_s')
+            seconds_from_now = message.get('seconds_from_now')
+            if target_unix_s is not None and seconds_from_now is not None:
+                return {'status': 'error',
+                        'message': 'give target_unix_s OR seconds_from_now, not both'}
+            now = time.time()
+            if target_unix_s is not None:
+                target_sec = int(round(target_unix_s))
+            else:
+                lead = 5 if seconds_from_now is None else int(seconds_from_now)
+                target_sec = int(now) + lead
+            # 'auto' reloads only on the first arm (mock proxy for "TT not yet loaded").
+            reload_tt = message.get('reload_tt', 'auto')
+            do_reload = (self._last_timed_sync is None) if reload_tt == 'auto' else bool(reload_tt)
+            result = {
+                'target_tt_unix_s': float(target_sec),
+                'target_tt_utc': unix_to_iso(target_sec),
+                'target_tt_value': int(target_sec * 307_200_000),
+                'clk_hz': 307_200_000,
+                'countdown_remaining_s': float(target_sec - now),
+                'armed_at_unix_s': now,
+                'armed_at_utc': unix_to_iso(now),
+                'reloaded_tt': do_reload,
+                'tt_loaded_unix_s': (float(int(now)) if do_reload else None),
+                'fired': bool(message.get('wait', False)),
+            }
+            self._last_timed_sync = result
+            if do_reload:  # a reload re-zeroes the boundary offset -> new drift reference
+                self._last_tt_load_unix_s = result['tt_loaded_unix_s']
+            return {'status': 'success', 'result': result}
+
+        if request == 'timed_sync_check':
+            now = time.time()
+            last_pps_unix_s = round(now)
+            align_tol_s = float(message.get('align_tol_s', 1e-4))
+            resample_drift = bool(message.get('resample_drift', False))
+            pps_boundary_offset_s = 1e-6
+            last_armed = self._last_timed_sync
+            if last_armed is not None:
+                last_sync_unix_s = float(last_armed.get('target_tt_unix_s', round(now)))
+                time_since_last_sync = max(0.0, now - last_sync_unix_s)
+            else:
+                last_sync_unix_s = None
+                time_since_last_sync = None
+            # Drift references the last TT load, not the last sync.
+            loaded = self._last_tt_load_unix_s
+            time_since_tt_load = (now - loaded) if loaded is not None else None
+            drift_ppm = (pps_boundary_offset_s / time_since_tt_load * 1e6
+                         if time_since_tt_load is not None and time_since_tt_load >= 2.0 else None)
+            # Fall back to the (mock) sampler when the instant drift is unavailable.
+            drift_resampled_ppm = 1.6 if (resample_drift or drift_ppm is None) else None
+            return {'status': 'success', 'result': {
+                'aligned': bool(abs(pps_boundary_offset_s) < align_tol_s),
+                'align_tol_s': align_tol_s,
+                'pps_boundary_offset_s': pps_boundary_offset_s,
+                'system_offset_s': last_pps_unix_s - now,
+                'last_pps_tt': int(last_pps_unix_s * 307_200_000),
+                'last_pps_unix_s': float(last_pps_unix_s),
+                'last_pps_utc': unix_to_iso(last_pps_unix_s),
+                'last_sync_tt': (int(last_sync_unix_s * 307_200_000) if last_sync_unix_s else None),
+                'last_sync_unix_s': last_sync_unix_s,
+                'last_sync_utc': unix_to_iso(last_sync_unix_s),
+                'time_since_last_sync_s': time_since_last_sync,
+                'tt_loaded_unix_s': loaded,
+                'tt_loaded_utc': unix_to_iso(loaded),
+                'time_since_tt_load_s': time_since_tt_load,
+                'drift_offset_s': pps_boundary_offset_s,
+                'drift_ppm': drift_ppm,
+                'drift_resampled_ppm': drift_resampled_ppm,
+                'strobe_healthy': True,
+                'last_armed': last_armed,
+            }}
+
+        if request == 'set_telescope_time':
+            now = time.time()
+            last_pps_unix_s = round(now)
+            # TT (re)loaded -> reset the drift reference to the PPS-aligned load second.
+            self._last_tt_load_unix_s = float(last_pps_unix_s)
+            return {'status': 'success', 'result': {
+                'loaded': True,
+                'aligned': True,
+                'pps_boundary_offset_s': 1e-6,
+                'system_offset_s': last_pps_unix_s - now,
+                'last_pps_tt': int(last_pps_unix_s * 307_200_000),
+                'last_pps_unix_s': float(last_pps_unix_s),
+                'last_pps_utc': unix_to_iso(last_pps_unix_s),
+                'clk_hz': 307_200_000,
+            }}
+
         if request == 'pull_config':
             return {'status': 'success',
                     'config_filename': self.client.config_file or 'mock_config.yaml',
@@ -1479,13 +1751,18 @@ class MockReadoutServer:
                         self._mod['state']['mrst'] = bool(message['mrst'])
                     self._mod_enabled = True
                     self._mod['state']['enabled'] = True
-                    return {'status': 'success', 'result': {
-                        'revision': self._mod['revision'],
-                        'needs_recenter': self._mod['state']['needs_recenter']}}
-                spp = int(message.get('samples_per_point', 1))
+                    return {'status': 'success',
+                            'warnings': list(self._mod['state'].get('warnings', [])),
+                            'result': {
+                                'revision': self._mod['revision'],
+                                'needs_recenter': self._mod['state']['needs_recenter'],
+                                'any_beyond_half_bin': self._mod['state']['any_beyond_half_bin'],
+                                'tones_beyond_half_bin': self._mod['state']['tones_beyond_half_bin']}}
+                spp = int(message.get('samples_per_point', 4))
                 n_settle = int(message.get('n_settle', 1))
-                autosync = bool(message.get('autosync', True))
+                autosync = bool(message.get('autosync', False))
                 mrst = bool(message.get('mrst', False))
+                force = bool(message.get('force', False))
                 if message.get('offsets') is None:
                     raise ValueError('offsets required to arm modulation')
                 old_mod = copy.deepcopy(self._mod)
@@ -1497,7 +1774,7 @@ class MockReadoutServer:
                 state = self._mock_arm(message.get('center'), message.get('offsets'),
                                        message.get('mod_indices'), spp, n_settle,
                                        reload_bins=True, set_f0=True, autosync=autosync, mrst=mrst)
-                if state['needs_recenter']:
+                if state['needs_recenter'] and not force:
                     self._mod = old_mod
                     self._mod_enabled = old_mod_enabled
                     self._mod_revision = old_revision
@@ -1506,11 +1783,19 @@ class MockReadoutServer:
                     self._mod_armed_bin_center = old_armed_bin_center
                     raise ValueError(
                         'modulation offsets push at least one tone beyond fixed-bin coverage; '
-                        'reduce offsets or use a sweep/cross-bin method')
+                        'reduce offsets, use a sweep/cross-bin method, or pass force=True to '
+                        'arm anyway (those tones will wrap to the other end of the bin)')
                 self._mod_enabled = True
                 state['enabled'] = True
-                return {'status': 'success', 'result': {
-                    'revision': self._mod_revision, 'needs_recenter': state['needs_recenter']}}
+                return {'status': 'success',
+                        'warnings': list(state.get('warnings', [])),
+                        'result': {
+                            'revision': self._mod_revision,
+                            'needs_recenter': state['needs_recenter'],
+                            'forced': bool(state['needs_recenter']),
+                            'any_beyond_half_bin': state['any_beyond_half_bin'],
+                            'tones_beyond_half_bin': state['tones_beyond_half_bin'],
+                            'tones_beyond_coverage': state['tones_beyond_coverage']}}
             except Exception as e:
                 return {'status': 'error', 'message': str(e)}
 
@@ -1530,7 +1815,7 @@ class MockReadoutServer:
                 else:
                     full, _ = self._mock_expand_offsets(message.get('offsets'), mod_indices, len(center))
                 autosync = (
-                    self._mod.get('autosync', True) if message.get('autosync') is None
+                    self._mod.get('autosync', False) if message.get('autosync') is None
                     else bool(message.get('autosync')))
                 mrst = (
                     self._mod.get('mrst', False) if message.get('mrst') is None
@@ -1543,14 +1828,22 @@ class MockReadoutServer:
                     return {'status': 'error',
                             'message': 'update would push tones beyond bin coverage; '
                                        'recenter required',
-                            'result': {'tones_beyond_coverage': tentative['tones_beyond_coverage']}}
+                            'warnings': list(tentative.get('warnings', [])),
+                            'result': {
+                                'tones_beyond_half_bin': tentative['tones_beyond_half_bin'],
+                                'tones_beyond_coverage': tentative['tones_beyond_coverage']}}
                 reload_bins = bool(tentative['needs_recenter'])  # recenter path reloads bins
                 state = self._mock_arm(message.get('center'), message.get('offsets'), None,
                                        self._mod['samples_per_point'], self._mod['n_settle'],
                                        reload_bins=reload_bins, set_f0=False, autosync=autosync, mrst=mrst)
                 self._mod_enabled = True
-                return {'status': 'success', 'result': {
-                    'revision': self._mod_revision, 'op': 'recenter' if reload_bins else 'update'}}
+                return {'status': 'success',
+                        'warnings': list(state.get('warnings', [])),
+                        'result': {
+                            'revision': self._mod_revision,
+                            'op': 'recenter' if reload_bins else 'update',
+                            'any_beyond_half_bin': state['any_beyond_half_bin'],
+                            'tones_beyond_half_bin': state['tones_beyond_half_bin']}}
             except Exception as e:
                 return {'status': 'error', 'message': str(e)}
 
@@ -1558,22 +1851,40 @@ class MockReadoutServer:
             if self._mod is None:
                 return {'status': 'error', 'message': 'modulation not armed'}
             autosync = (
-                self._mod.get('autosync', True) if message.get('autosync') is None
+                self._mod.get('autosync', False) if message.get('autosync') is None
                 else bool(message.get('autosync')))
             mrst = (
                 self._mod.get('mrst', False) if message.get('mrst') is None
                 else bool(message.get('mrst')))
-            self._mock_arm(self._mod['center'], None, None, self._mod['samples_per_point'],
-                           self._mod['n_settle'], reload_bins=True, set_f0=False,
-                           autosync=autosync, mrst=mrst)
+            state = self._mock_arm(self._mod['center'], None, None, self._mod['samples_per_point'],
+                                   self._mod['n_settle'], reload_bins=True, set_f0=False,
+                                   autosync=autosync, mrst=mrst)
             self._mod_enabled = True
-            return {'status': 'success', 'result': {'revision': self._mod_revision}}
+            return {'status': 'success',
+                    'warnings': list(state.get('warnings', [])),
+                    'result': {
+                        'revision': self._mod_revision,
+                        'any_beyond_half_bin': state['any_beyond_half_bin'],
+                        'tones_beyond_half_bin': state['tones_beyond_half_bin']}}
 
         if request == 'disable_modulation':
             self._mod_enabled = False
             if self._mod is not None:
                 self._mod['state']['enabled'] = False
             return {'status': 'success'}
+
+        if request == 'purge_modulation_revisions':
+            if self._mod_enabled:
+                return {'status': 'error',
+                        'message': 'modulation is enabled; call disable_modulation() '
+                                   'before purging revisions (an armed config can carry '
+                                   'a pending snapshot that would resurrect the history)'}
+            purged = len(self._mod_revision_history)
+            self._mod_revision = 0
+            self._mod_revision_history = {}
+            if self._mod is not None:
+                self._mod['state']['revision_history'] = {}
+            return {'status': 'success', 'result': {'purged': purged, 'revision': 0}}
 
         if request == 'enable_triggered_stream':
             self.triggered_stream_enabled = True

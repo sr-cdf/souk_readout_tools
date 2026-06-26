@@ -1,9 +1,16 @@
 __pycache__/
 
 doc/.ipynb_checkpoints/
-build/
 venv/
+.venv
 env/
+
+tests/
+.pytest_cache/
+profiling/
+
+build/
+
 
 *.egg-info/
 .eggs/

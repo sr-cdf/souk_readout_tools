@@ -4,6 +4,8 @@ The RFSoC programmable logic (PL) clocks are driven by a clock tree consisting o
 
 This is a **board-level setting** — it affects both pipelines. If running dual-pipeline servers, both pipeline configs should specify the same `clock_source` value.
 
+> **Changing the clocks requires deprogramming the firmware first, and any live state is lost.** Applying a clock source runs `krc-utils init`, which is only safe once the PL has been reset to zero tones — doing it on a loaded pipeline can hard-lock the board ([issue #14](https://github.com/sr-cdf/souk_readout_tools/issues/14)). Because the firmware image is shared, a clock change **resets both pipelines**: all tones, and live firmware settings are dropped and the pipelines must be re-initialised.
+
 ---
 
 ## Contents
@@ -24,13 +26,13 @@ This is a **board-level setting** — it affects both pipelines. If running dual
 | Source | Reference | LMK Config File | When to Use |
 |--------|-----------|-----------------|-------------|
 | `internal` | On-board 12.8 MHz oscillator | `lmk04208_in_12M8_out_122M88.txt` | Default — standalone operation, bench testing |
-| `external` | 10 MHz reference on clk0 input | `lmk04208_in_10M_clk0_out_122M88.txt` | Locked to a lab reference or site clock |
+| `external` | 10 MHz reference on clk0 input | `lmk04208_in_10M_clk0_out_122M88.txt` | Locked to a lab reference, site clock or the SOUK clock distribution board|
 
 Both configurations produce a 122.88 MHz output from the LMK, which feeds the three LMX2594 PLLs that generate the ADC and DAC sampling clocks.
 
-The clock source is set by pointing a symlink at one of the two LMK config files and running `krc-utils init` to apply it. The readout tools can do this automatically via the client API or the config file.
+The clock source is set by pointing a symlink at one of the two LMK config files and running `krc-utils init` to apply it. **Changing the clocks requires deprogramming first, and any live state is lost.** `krc-utils init` is only ever run once the PL has been reset to its base image (zero tones) — running it while the firmware is loaded with tones can collapse the PL power rail and hard-lock the board (see [issue #14](https://github.com/sr-cdf/souk_readout_tools/issues/14) and [Troubleshooting](#troubleshooting)). The readout tools therefore apply the configured source only as part of a reset-to-base → clock-init → reprogram cycle, never against a running pipeline. Because the firmware image is shared, this **resets both pipelines** — all tones, sweeps, and streaming state are dropped and the pipelines must be re-initialised.
 
-> **Important:** Manual changes to the clock symlinks are not authoritative. Any later client call to `set_clock_source()` or config push that applies `firmware.clock_source` will overwrite the symlink selection with the requested `internal` or `external` clock source.
+> **Important:** Manual changes to the clock symlinks are not authoritative — the configured `firmware.clock_source` is applied at the next (re)program. Before any firmware access the server runs a **pure, PS-side clock check** (it never runs `krc-utils init` as a gate): if a PLL is unlocked, or the live source does not match the config, it refuses to touch the firmware and reports `reset_required`. A `hard_reset` then applies the change safely (deprogram → clock-init → reprogram), which **resets both pipelines**.
 
 ---
 
@@ -41,6 +43,7 @@ The clock source is set by pointing a symlink at one of the two LMK config files
 ```python
 # Current clock source selection ('internal' or 'external')
 client.get_clock_source()
+# 'internal'
 
 # PLL lock status of all clock chips
 status = client.get_clock_status()
@@ -78,7 +81,7 @@ All chips should report `locked`:
 [ lmx2594.2] status: locked
 ```
 
-If any chip reports `unlocked` (or `unlocked high`), the clock tree is not stable — see [Troubleshooting](#troubleshooting).
+If any chip reports `unlocked` (or `unlocked high` or `unlocked low`), the clock tree is not stable — see [Troubleshooting](#troubleshooting).
 
 To check which source is currently selected:
 
@@ -94,25 +97,9 @@ The symlink target indicates the source:
 
 ## Setting the Clock Source
 
-### Via the Client API
+### Via the Config File (recommended)
 
-```python
-# Switch to external 10 MHz reference
-result = client.set_clock_source('external')
-
-# Switch to internal 12.8 MHz oscillator
-result = client.set_clock_source('internal')
-
-# Verify
-print(client.get_clock_source())
-print(client.get_clock_status())
-```
-
-`set_clock_source()` updates the symlink, runs `krc-utils init`, and returns the PLL lock status. The server handles ownership so that files remain owned by the `casper` user.
-
-### Via the Config File
-
-The config file's `firmware.clock_source` field is applied whenever the config is pushed to the server:
+The config file's `firmware.clock_source` field records the desired clock source:
 
 ```yaml
 firmware:
@@ -124,15 +111,33 @@ client.config['firmware']['clock_source'] = 'external'
 client.push_config()
 ```
 
-The clock source is applied unconditionally on every config push. Since this is a board-level setting shared across pipelines, ensure both pipeline configs specify the same value — no coordination is performed between server instances.
+Before any firmware access the server runs a pure, PS-side clock check (it never runs `krc-utils init` as a gate). If all PLLs are locked and the live source already matches the config, it proceeds normally. If the live source **differs** from `firmware.clock_source`, the push is rejected with a message telling you to apply it with a `hard_reset` — because changing the source requires running `krc-utils init`, which is only safe on a blank PL. A `hard_reset` then applies it as part of a deprogram → clock-init → reprogram cycle, which **resets both pipelines**.
+
+Since this is a board-level setting shared across pipelines, ensure both pipeline configs specify the same value — no coordination is performed between server instances.
 
 > **Note:** In earlier versions, `clock_source` was under `rfsoc_host`. The server accepts both locations for backwards compatibility, but new configs should use `firmware.clock_source`.
 
+### Programmatically (disruptive — resets both pipelines)
+
+There is a private client method `_set_clock_source()` for forcing a source change at runtime:
+
+```python
+client._set_clock_source('external')   # or 'internal'
+
+# Verify
+print(client.get_clock_source())
+print(client.get_clock_status())
+```
+
+It is deliberately private: it runs the full deprogram → clock-init → reprogram cycle on the shared dual-pipeline firmware, so **all tones are dropped and both pipelines are reset and must be re-initialised**. Prefer the config-file route above unless you specifically need to switch the reference clock on a live server.
+
 ### Manually on the RFSoC
 
-If you need to set the clock source without the readout tools (e.g. during initial board setup):
+If you need to set the clock source without the readout tools (e.g. during initial board setup or in case of failure):
 
-> **Warning:** This manual symlink selection is temporary if the readout tools are used afterwards. Client calls to `set_clock_source()` and config pushes that apply `firmware.clock_source` will rewrite the symlink and replace any manual setting.
+> **Warning:** This manual symlink selection does not override future controls afterwards. A `hard_reset` (or `_set_clock_source()`) that applies `firmware.clock_source` will rewrite the symlink and replace any manual setting.
+>
+> **Never run `krc-utils init` while the firmware is loaded.** Do this only with the PL deprogrammed (e.g. `r.fpga.host.deprogram()`, or `echo tcpborphserver.bin > /sys/class/fpga_manager/fpga0/firmware`). See [Troubleshooting](#troubleshooting).
 
 **Select external 10 MHz reference:**
 
@@ -205,6 +210,22 @@ The LMX2594 config is independent of the clock source — the LMX PLLs always ta
 
 ## Troubleshooting
 
+### Board hard-locks after a clock init (issue #14)
+
+Running `krc-utils init` while the PL is programmed and loaded with many tones can collapse the PL power rail (`vccint`/`vccaux`/`vccbram` drop to 0 V): the fabric dies and the next AXI transaction hangs the PS forever, requiring a power cycle. Once collapsed there is **no software recovery** — even the FPGA-manager write fails and `krc-utils init` times out.
+
+The readout tools prevent this by only ever running `krc-utils init` once the PL has been **reset to its base image (zero tones, minimal current)** — a PL image must stay in place for clock forwarding to work, so this is a reset-to-base, not a true blank. The recovery sequence is always **reset to base → check clocks → init clocks only if necessary → reprogram the souk design**. On detecting an unlocked PLL during operation the server drops to `server` level (no firmware interfaces) and reports `reset_required`; recover with a `hard_reset` (which resets both pipelines). If the **reference clock (LMK)** is unlocked the server additionally blocks all firmware reads/writes, since touching AXI with a dead fabric clock would hang the PS — a power cycle is usually required in that case.
+
+If you ever need to reset the PL by hand before re-initialising the clocks:
+
+```bash
+# preferred (via casperfpga): r.fpga.host.deprogram()
+# fallback (PS-side): loads the base image via the FPGA manager, avoiding the
+# AXI register traffic of the casperfpga path (which hangs if the fabric is
+# unresponsive). A reference clock must still be present for the image to run.
+sudo sh -c "echo tcpborphserver.bin > /sys/class/fpga_manager/fpga0/firmware"
+```
+
 ### Clocks report unlocked
 
 ```
@@ -237,7 +258,7 @@ ls -l /etc/krc-utils.d/clock.d/lmk04208.txt
 
 Recreate it pointing to one of the two known config files.
 
-### set_clock_source fails with FileNotFoundError
+### Clock source change fails with FileNotFoundError
 
 The target clock config file is missing from `/etc/krc-utils.d/clock.d/`. This could mean the `krc-utils` package was not fully installed on the board. Check that both LMK config files exist:
 

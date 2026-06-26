@@ -96,6 +96,20 @@ def _with_default_param_overrides(defaults, overrides, cls):
     return overrides
 
 
+def _frequency_step_hz(frequencies) -> float:
+    """Return a positive representative sweep step in Hz."""
+    f = np.asarray(frequencies, dtype=float).ravel()
+    good = np.isfinite(f)
+    if np.count_nonzero(good) < 2:
+        return 1.0
+    diffs = np.abs(np.diff(f[good]))
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0.0)]
+    if diffs.size == 0:
+        return 1.0
+    step = float(np.nanmedian(diffs))
+    return step if np.isfinite(step) and step > 0.0 else 1.0
+
+
 def wideband_resonance_search_params(frequencies, filter_params=None,
                                      finder_params=None):
     """Return conservative wideband resonance-search parameters.
@@ -248,10 +262,7 @@ class DataProcessor:
     @property
     def frequency_step(self) -> float:
         """Average frequency step size."""
-        if len(self.frequencies) < 2:
-            return 1.0
-        diffs = np.diff(self.frequencies)
-        return float(np.median(diffs))
+        return _frequency_step_hz(self.frequencies)
     
     def get_data(self, format_name: str) -> np.ndarray:
         """
@@ -347,7 +358,7 @@ def find_resonances(
     Returns:
         Tuple of (peak_indices, properties_dict)
     """
-    freq_step = np.median(np.diff(frequencies)) if len(frequencies) > 1 else 1.0
+    freq_step = _frequency_step_hz(frequencies)
     
     # Build find_peaks kwargs
     kwargs: Dict[str, Any] = {}

@@ -213,31 +213,58 @@ FIT_SUMMARY_KEYS = (
     "fit_duration_s",
 )
 FIT_UNCERTAINTY_KEYS = ("fr", "Ql", "Qi", "Qc", "phi", "a", "alpha", "tau", "anl")
+# Per-parameter normalisation floor (order: fr, Qi, Qc, phi, a, alpha, tau);
+# raising an entry makes the optimiser take coarser steps in that parameter,
+# lowering it takes finer steps (more sensitive, but slower and noisier).
 SCALE_FLOORS = np.array([1.0, 1e3, 1e3, 1.0, 1e-3, 1.0, 1e-8])
+# Per-parameter finite-difference step for the numeric-Jacobian path; larger
+# gives a coarser, more noise-robust gradient, smaller a more precise gradient
+# that can lock onto noise-induced local minima.
 DIFF_STEPS = np.array([1e-7, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4])
 
-# Lower clamp on anl before it is reparameterised as log(anl) inside the
-# optimiser. Below this the nonlinearity is well under the noise floor of any
-# realistic measurement, so the model becomes indistinguishable from anl = 0.
+# Whether linear fits use the closed-form Jacobian (faster, see
+# _s21_linear_jacobian); set False to fall back to finite differences if a
+# pathological case ever needs it. Nonlinear (Duffing) fits always use finite
+# differences -- differentiating through the bistable branch selection is not
+# worth the risk near saddle nodes.
+_USE_ANALYTIC_LINEAR_JAC = True
+
+# Lower clamp on anl before it is reparameterised as log(anl); raise it to treat
+# weaker nonlinearity as effectively linear, lower it to let the optimiser chase
+# anl values that sit below the noise floor of any real measurement.
 _ANL_MIN = 1e-8
 
-# High-anl autodetection is intentionally conservative: the cheap single-seed
-# fit is accepted unless the magnitude dip has a Duffing-like cliff/shoulder
-# shape, or a moderate cliff/shoulder shape plus a visibly poor first fit.
-_HIGH_ANL_WIDTH_RATIO = 30.0
-_HIGH_ANL_ASYMMETRY = 0.94
-_MODERATE_ANL_WIDTH_RATIO = 12.0
-_MODERATE_ANL_ASYMMETRY = 0.88
+# Dip-shape thresholds that trigger the high-anl probe. Raising a value makes the
+# probe fire less often (fewer extra fits, but more risk of missing a strongly
+# bistable resonator); lowering it fires the probe more readily.
+_HIGH_ANL_WIDTH_RATIO = 30.0      # smooth-shoulder:sharp-cliff width ratio counted as a strong cliff
+_HIGH_ANL_ASYMMETRY = 0.94        # dip asymmetry (0..1) counted as a strong cliff
+_MODERATE_ANL_WIDTH_RATIO = 12.0  # width ratio for a "moderate" cliff (probes only if the first fit is also poor)
+_MODERATE_ANL_ASYMMETRY = 0.88    # asymmetry for a "moderate" cliff
+# First-fit residual, as a fraction of the dip feature size, above which a
+# moderate-cliff fit is judged poor enough to justify the probe; raise to probe
+# less, lower to probe more.
 _AUTODETECT_HIGH_ANL_BAD_FIT_FRACTION = 0.02
 
-# Seed grids for the high-anl probe. The normal grid is small enough to run
-# automatically; the exhaustive grid is only used when try_even_harder=True.
+# Seed grids for the high-anl probe: each (anl, Qi, fr-perturbation) triple is
+# one extra fit, so adding entries widens the basin search at a linear cost in
+# time. The small grid runs automatically; the exhaustive grid only when
+# try_even_harder=True.
 _HIGH_ANL_PROBE_ANL_SEEDS = (0.5, 5.0, 20.0)
 _HIGH_ANL_PROBE_QI_SEEDS = (1e5, 5e5, 5e6)
 _HIGH_ANL_PROBE_FR_PERTURB_KHZ = (0.0,)
 _HIGH_ANL_EXHAUSTIVE_ANL_SEEDS = (0.5, 2.0, 5.0, 10.0, 20.0)
 _HIGH_ANL_EXHAUSTIVE_QI_SEEDS = (1e5, 5e5, 1e6, 5e6)
 _HIGH_ANL_EXHAUSTIVE_FR_PERTURB_KHZ = (-1.0, 0.0, 1.0)
+
+# Thresholds that let nonlinear='auto' accept the linear fit as final (see
+# _linear_fit_is_sufficient). Tuned on a real -115..-85 dBm power sweep where
+# linear-sufficient fits sat at dip_excess ~1.0 and genuinely nonlinear ones at
+# ~2.4+. Raising either threshold keeps more fits linear (faster, but risks
+# missing weak nonlinearity); lowering either runs the Duffing fit more often
+# (safer, slower).
+_AUTO_DIP_EXCESS_MAX = 1.5  # accept linear when the dip is misfit < this multiple of the baseline
+_AUTO_ASYMMETRY_MAX = 0.15  # accept linear only when the dip asymmetry (0..1) is below this
 
 @dataclass
 class FitResult:
@@ -273,6 +300,9 @@ class FitResult:
     reduced_chi2: float = np.nan
     success: bool = False
     message: str = ""
+    # Populated only by nonlinear='auto': the linear-sufficiency diagnostics
+    # (dip_excess, asymmetry, ...) and whether the Duffing fit was skipped.
+    linear_sufficiency: object = field(default=None, repr=False)
     anl: float = 0.0
     sweep_direction: str = "up"
     nonlinear_detuning_hz: float = 0.0
@@ -444,6 +474,41 @@ def s21_model_centered_delay(f, fr, Qi, Qc, phi, a, alpha0, tau,
         y = duffing_y(x / Qr_inv, anl, sweep_direction)
         res = 1.0 - (1.0 / Qe) / (Qr_inv * (1.0 + 2j * y))
     return env * res
+
+
+def _s21_linear_jacobian(f, fr, Qi, Qc, phi, a, alpha0, tau, f0=0.0):
+    """Analytic d(S21)/d(param) for the linear centred-delay model.
+
+    Returns a complex array of shape ``(len(f), 7)`` whose columns are the
+    derivatives of :func:`s21_model_centered_delay` (with ``anl = 0``) with
+    respect to ``fr, Qi, Qc, phi, a, alpha0, tau`` in that order -- the same
+    parameter order as :data:`LINEAR_NAMES`.
+
+    Writing ``u = 1/Qe``, ``c = 1/Qi + 2j*x`` and ``g = c + u`` (so the
+    resonator factor is ``res = 1 - u/g = c/g``) the derivatives are all closed
+    form; the optimiser uses this instead of finite-differencing the model.
+    """
+    f = np.asarray(f, float)
+    T = 1.0 + 1j * np.tan(phi)
+    Qe = Qc * T
+    u = 1.0 / Qe
+    x = (f - fr) / fr
+    env = a * np.exp(1j * alpha0) * np.exp(-2j * np.pi * (f - f0) * tau)
+    c = 1.0 / Qi + 2j * x
+    g = c + u
+    g2 = g * g
+    res = c / g
+    s21 = env * res
+    sec2 = 1.0 / np.cos(phi) ** 2
+    d = np.empty((f.size, 7), complex)
+    d[:, 0] = env * (2j * u / g2) * (-f / fr ** 2)   # d/d fr  (via x)
+    d[:, 1] = env * (-u / (Qi * Qi * g2))            # d/d Qi
+    d[:, 2] = env * (c * u / (Qc * g2))              # d/d Qc
+    d[:, 3] = env * (1j * sec2 * c * u / (g2 * T))   # d/d phi
+    d[:, 4] = s21 / a                                # d/d a
+    d[:, 5] = 1j * s21                               # d/d alpha0
+    d[:, 6] = s21 * (-2j * np.pi * (f - f0))         # d/d tau
+    return d
 
 
 def _parameter_dict(values):
@@ -861,6 +926,137 @@ def _autodetect_high_anl_probe_needed(asymmetry_observables, opt, f, z, f0,
     return residual > _AUTODETECT_HIGH_ANL_BAD_FIT_FRACTION * feature_scale
 
 
+def _linear_fit_is_sufficient(f, z, z_error, linear_params, sweep_direction,
+                              empirical, asymmetry_observables,
+                              dip_excess_max=_AUTO_DIP_EXCESS_MAX,
+                              asymmetry_max=_AUTO_ASYMMETRY_MAX):
+    """Decide whether the linear model already explains a sweep (``anl`` unneeded).
+
+    This backs ``nonlinear='auto'``: it inspects the *linear* fit and answers
+    "would the Duffing refinement actually change anything?" so the expensive
+    nonlinear path can be skipped when it cannot help. It is a
+    model-adequacy test on the linear residual, designed to stay robust on real
+    data where broadband systematics (cable ripple, neighbouring tones, an
+    imperfectly scaled error bar) make a plain reduced-chi-square unusable -- on
+    a real power sweep the linear fits sat at reduced-chi-square ~20 even when
+    the resonator was perfectly linear.
+
+    Two cheap signals are combined:
+
+    1. ``dip_excess`` -- how badly the linear model misfits the resonance *core*
+       relative to the off-resonance *baseline*. A Duffing distortion lives in
+       the dip, so it inflates the dip residual but not the baseline; taking the
+       ratio cancels any global mis-scaling of the noise and any broadband
+       systematics shared by both regions, which is what makes the test
+       transferable between datasets. The dip and baseline are located from the
+       *empirical* (model-free) dip centre and linewidth, because a strong cliff
+       biases the linear-fit ``fr``/``Ql`` enough to mis-place a fit-based
+       window.
+    2. ``asymmetry`` -- the cliff/shoulder magnitude asymmetry from
+       :func:`_asymmetry_observables`. It is very specific to the Duffing shape
+       but blind to weak nonlinearity, so it only ever *adds* a reason to run
+       the nonlinear fit.
+
+    The linear model is declared sufficient only when the dip residual looks
+    like noise (``dip_excess < dip_excess_max``) *and* the dip is not visibly
+    skewed (``asymmetry < asymmetry_max``). The decision deliberately errs
+    towards running the nonlinear fit: a false "insufficient" only wastes time,
+    while a false "sufficient" would return biased ``fr``/``Q``.
+
+    Parameters
+    ----------
+    f, z : ndarray
+        Full (un-subsampled) sweep frequencies (Hz) and complex S21.
+    z_error : tuple of ndarray or None
+        Prepared ``(sigma_I, sigma_Q)`` measurement uncertainties, or ``None``
+        for unweighted data (then the noise is estimated from the baseline
+        residual scatter).
+    linear_params : sequence of float
+        The seven public linear parameters ``(fr, Qi, Qc, phi, a, alpha, tau)``
+        from the linear fit, i.e. ``opt_linear.x_public``.
+    sweep_direction : {'up', 'down'}
+        Forwarded to the model evaluation (immaterial at ``anl = 0`` but kept
+        for consistency with the rest of the fitter).
+    empirical : object
+        The :func:`estimate_resonance_empirical` result, supplying the
+        model-free dip centre (``fr``) and ``linewidth_hz`` used for masking.
+    asymmetry_observables : dict or None
+        Output of :func:`_asymmetry_observables` for the same sweep (``None``
+        when the dip is too symmetric to measure, which counts as "not skewed").
+    dip_excess_max, asymmetry_max : float, optional
+        Decision thresholds (defaults :data:`_AUTO_DIP_EXCESS_MAX` and
+        :data:`_AUTO_ASYMMETRY_MAX`).
+
+    Returns
+    -------
+    sufficient : bool
+        ``True`` when the linear model is adequate and the nonlinear
+        refinement can be skipped.
+    diagnostics : dict
+        ``dip_excess``, ``asymmetry``, ``dip_chi``, ``base_chi``, the dip /
+        baseline sample counts and the boolean decision, for logging and for
+        attaching to the returned :class:`FitResult` as ``linear_sufficiency``.
+    """
+    # Residual magnitude of the linear model across the whole sweep.
+    z_fit = s21_model(f, *linear_params, sweep_direction=sweep_direction)
+    residual = np.abs(z_fit - z)
+
+    # Model-free dip centre and width. estimate_resonance_empirical follows the
+    # actual magnitude minimum, which stays put even when a Duffing cliff has
+    # pulled the linear-fit fr/Ql off the true centre and would otherwise place
+    # the dip window in the wrong spot.
+    dip_center = (float(empirical.fr) if np.isfinite(empirical.fr)
+                  else float(f[np.argmin(np.abs(z))]))
+    linewidth = float(empirical.linewidth_hz)
+    if not np.isfinite(linewidth) or linewidth <= 0.0:
+        linewidth = (float(f[-1]) - float(f[0])) / 10.0
+    offset = np.abs(f - dip_center)
+
+    # Core of the resonance vs the off-resonance baseline.
+    in_dip = offset <= 1.5 * linewidth
+    in_base = offset >= 3.0 * linewidth
+    # If the window is too narrow to populate both bands (e.g. a very tight
+    # targeted sweep), fall back to the closest sixth of the points as the dip
+    # and the farthest third as the baseline so the test still returns a value.
+    if int(in_dip.sum()) < 4 or int(in_base.sum()) < 8:
+        order = np.argsort(offset)
+        in_dip = np.zeros(len(f), bool)
+        in_dip[order[:max(6, len(f) // 6)]] = True
+        in_base = np.zeros(len(f), bool)
+        in_base[order[-max(8, len(f) // 3):]] = True
+
+    # Per-point noise sigma. Prefer the measured uncertainty (quadrature sum of
+    # the I and Q errors); otherwise estimate it from the scatter of the
+    # baseline residual so the test still works on unweighted data.
+    if z_error is not None:
+        sigma = np.sqrt(z_error[0] ** 2 + z_error[1] ** 2)
+    else:
+        sigma = np.full(len(f), max(float(np.std(residual[in_base])), 1e-30))
+
+    # RMS residual in units of noise, separately over dip and baseline.
+    dip_chi = float(np.sqrt(np.mean((residual[in_dip] / sigma[in_dip]) ** 2)))
+    base_chi = float(np.sqrt(np.mean((residual[in_base] / sigma[in_base]) ** 2)))
+    # dip_excess ~ 1: the resonance core is fit as well as the baseline, so the
+    # linear model is enough. dip_excess >> 1: unmodelled structure concentrated
+    # in the dip -- the signature of an unmodelled Duffing term -- so refine.
+    dip_excess = dip_chi / max(base_chi, 1e-9)
+
+    asymmetry = (float(abs(asymmetry_observables["asymmetry"]))
+                 if asymmetry_observables else 0.0)
+
+    sufficient = (dip_excess < dip_excess_max) and (asymmetry < asymmetry_max)
+    diagnostics = {
+        "dip_excess": dip_excess,
+        "asymmetry": asymmetry,
+        "dip_chi": dip_chi,
+        "base_chi": base_chi,
+        "n_dip": int(in_dip.sum()),
+        "n_base": int(in_base.sum()),
+        "sufficient": bool(sufficient),
+    }
+    return bool(sufficient), diagnostics
+
+
 def _high_anl_probe_grid(try_even_harder):
     """Return ``(anl_seeds, Qi_seeds, fr_perturb_kHz)`` for high-anl probing."""
     if try_even_harder:
@@ -874,6 +1070,57 @@ def _high_anl_probe_grid(try_even_harder):
         _HIGH_ANL_PROBE_QI_SEEDS,
         _HIGH_ANL_PROBE_FR_PERTURB_KHZ,
     )
+
+
+def _attach_uncertainties(opt):
+    """Compute the parameter covariance and uncertainties for one fit result.
+
+    Split out of :func:`_run_optimizer` so the expensive SVD can be deferred to
+    the single winning candidate of a nonlinear probe grid instead of being
+    paid on every discarded candidate. Reads the inputs stashed on ``opt`` by
+    :func:`_run_optimizer` (``opt._cov_inputs``) and the centred Jacobian
+    ``opt.jac``; attaches ``parameter_covariance`` and
+    ``parameter_uncertainties`` to ``opt`` and returns it.
+    """
+    optimizer_weight_vec, stat_weight_vec, reduced, fixed_mask, f0 = opt._cov_inputs
+    names = opt.parameter_names
+    param_fixed = opt.fixed_parameters
+    try:
+        model_jac = (
+            opt.jac if optimizer_weight_vec is None
+            else opt.jac * optimizer_weight_vec[:, None]
+        )
+        stat_jac = model_jac if stat_weight_vec is None else model_jac / stat_weight_vec[:, None]
+        _, s, vt = np.linalg.svd(stat_jac, full_matrices=False)
+        keep = s > np.finfo(float).eps * max(stat_jac.shape) * s[0]
+        covariance = (vt[keep].T / s[keep]**2) @ vt[keep]
+        if stat_weight_vec is None:
+            covariance *= reduced
+        transform = np.eye(len(names))
+        if "alpha" not in param_fixed:
+            transform[names.index("alpha"), names.index("tau")] = 2.0 * np.pi * f0
+        covariance = transform @ covariance @ transform.T
+    except Exception:
+        covariance = np.full((len(names), len(names)), np.nan)
+    uncertainty = {}
+    for i, name in enumerate(names):
+        if fixed_mask[i]:
+            uncertainty[name] = 0.0
+            continue
+        v = covariance[i, i]
+        uncertainty[name] = float(np.sqrt(v)) if np.isfinite(v) and v >= 0.0 else np.nan
+    fr, Qi, Qc, phi = opt.x_public[:4]
+    Ql = loaded_q(Qi, Qc, phi)
+    grad = np.zeros(len(names))
+    grad[names.index("Qi")] = Ql**2 / Qi**2
+    grad[names.index("Qc")] = Ql**2 * np.cos(phi) ** 2 / Qc**2
+    grad[names.index("phi")] = Ql**2 * np.sin(2.0 * phi) / Qc
+    vql = grad @ covariance @ grad
+    uncertainty["Ql"] = float(np.sqrt(vql)) if np.isfinite(vql) and vql >= 0.0 else np.nan
+    opt.parameter_covariance = covariance
+    opt.parameter_uncertainties = uncertainty
+    opt._cov_inputs = None  # release the weight vectors; no longer needed
+    return opt
 
 
 def _run_optimizer(f, z, z_error, optimizer_z_error, p0, nonlinear,
@@ -962,14 +1209,39 @@ def _run_optimizer(f, z, z_error, optimizer_z_error, p0, nonlinear,
         r = np.r_[d.real, d.imag]
         return r if optimizer_weight_vec is None else r / optimizer_weight_vec
 
+    # Closed-form Jacobian for the linear model, mapped into the optimiser's
+    # scaled/free/weighted coordinates so it can be handed straight to
+    # least_squares. Only used when no parameter is held fixed via the
+    # alpha<->tau coupling that physical_from_internal would introduce; the
+    # nonlinear (log-anl, Duffing) model keeps finite differences.
+    use_analytic_jac = (
+        _USE_ANALYTIC_LINEAR_JAC and not nonlinear
+        and "alpha" not in param_fixed
+    )
+
+    def jacobian(p_scaled):
+        p_internal = p0.copy()
+        p_internal[free] = p_scaled * scales[free]
+        p = physical_from_internal(p_internal)
+        dS = _s21_linear_jacobian(f, *p, f0=f0)        # (npoints, 7), per-param
+        jac_full = np.vstack([dS.real, dS.imag])       # stack like residual()
+        jac_free = jac_full[:, free] * scales[free]     # unscale + drop fixed cols
+        if optimizer_weight_vec is not None:
+            jac_free = jac_free / optimizer_weight_vec[:, None]
+        return jac_free
+
     start = time.time()
     if np.any(free):
-        opt = least_squares(
-            residual, p0[free] / scales[free],
+        least_squares_kwargs = dict(
             bounds=(lower[free] / scales[free], upper[free] / scales[free]),
-            diff_step=diff_steps[free], max_nfev=max_nfev,
-            ftol=tol, xtol=tol, gtol=tol,
+            max_nfev=max_nfev, ftol=tol, xtol=tol, gtol=tol,
         )
+        if use_analytic_jac:
+            least_squares_kwargs["jac"] = jacobian
+        else:
+            least_squares_kwargs["diff_step"] = diff_steps[free]
+        opt = least_squares(
+            residual, p0[free] / scales[free], **least_squares_kwargs)
     else:
         r = residual(np.array([], float))
         opt = OptimizeResult(
@@ -1028,47 +1300,16 @@ def _run_optimizer(f, z, z_error, optimizer_z_error, p0, nonlinear,
         reduced = float(np.sum(stat_residual**2) / dof) if dof > 0 else np.nan
         opt.reduced_chi2 = reduced
     opt.stat_residual = stat_residual
+    # Stash the inputs the covariance needs so it can be (re)computed later on
+    # the winning nonlinear candidate; see _attach_uncertainties.
+    opt._cov_inputs = (optimizer_weight_vec, stat_weight_vec, reduced,
+                       fixed_mask, f0)
 
     if not return_uncertainties:
         opt.parameter_covariance = None
         opt.parameter_uncertainties = None
         return opt
-
-    try:
-        model_jac = (
-            opt.jac if optimizer_weight_vec is None
-            else opt.jac * optimizer_weight_vec[:, None]
-        )
-        stat_jac = model_jac if stat_weight_vec is None else model_jac / stat_weight_vec[:, None]
-        _, s, vt = np.linalg.svd(stat_jac, full_matrices=False)
-        keep = s > np.finfo(float).eps * max(stat_jac.shape) * s[0]
-        covariance = (vt[keep].T / s[keep]**2) @ vt[keep]
-        if stat_weight_vec is None:
-            covariance *= reduced
-        transform = np.eye(len(names))
-        if "alpha" not in param_fixed:
-            transform[names.index("alpha"), names.index("tau")] = 2.0 * np.pi * f0
-        covariance = transform @ covariance @ transform.T
-    except Exception:
-        covariance = np.full((len(names), len(names)), np.nan)
-    uncertainty = {}
-    for i, name in enumerate(names):
-        if fixed_mask[i]:
-            uncertainty[name] = 0.0
-            continue
-        v = covariance[i, i]
-        uncertainty[name] = float(np.sqrt(v)) if np.isfinite(v) and v >= 0.0 else np.nan
-    fr, Qi, Qc, phi = opt.x_public[:4]
-    Ql = loaded_q(Qi, Qc, phi)
-    grad = np.zeros(len(names))
-    grad[names.index("Qi")] = Ql**2 / Qi**2
-    grad[names.index("Qc")] = Ql**2 * np.cos(phi) ** 2 / Qc**2
-    grad[names.index("phi")] = Ql**2 * np.sin(2.0 * phi) / Qc
-    vql = grad @ covariance @ grad
-    uncertainty["Ql"] = float(np.sqrt(vql)) if np.isfinite(vql) and vql >= 0.0 else np.nan
-    opt.parameter_covariance = covariance
-    opt.parameter_uncertainties = uncertainty
-    return opt
+    return _attach_uncertainties(opt)
 
 
 def _make_noise_result(f, z, z_error, optimizer_z_error, sweep_direction, f0,
@@ -1116,8 +1357,17 @@ def _make_noise_result(f, z, z_error, optimizer_z_error, sweep_direction, f0,
 
 def _make_result(f, z, z_error, optimizer_z_error, opt, sweep_direction, f0,
                  fit_start, empirical=None, linear_fit=None, opt_linear=None,
-                 opt_nonlinear=None):
-    """Build a FitResult from optimiser output."""
+                 opt_nonlinear=None, store_optimizer=True):
+    """Build a FitResult from optimiser output.
+
+    ``store_optimizer=False`` keeps every fitted value, derived quantity and
+    diagnostic array but drops the bulky optimiser objects (``opt``,
+    ``opt_linear``, ``opt_nonlinear`` and the nested ``linear_fit_result``,
+    each of which carries full Jacobian matrices). Those are debug-only fields
+    -- ``power_sweep`` already strips exactly these before persisting -- and
+    dropping them sharply cuts the bytes pickled back from worker processes
+    when fitting thousands of resonances with ``n_jobs > 1``.
+    """
     if empirical is None:
         empirical = estimate_resonance_empirical(f, s21=z)
     p = opt.x_public.copy()
@@ -1166,6 +1416,12 @@ def _make_result(f, z, z_error, optimizer_z_error, opt, sweep_direction, f0,
         if opt_nonlinear is not None else np.nan
     )
     detuning = nonlinear_detuning_hz(fr, Qi, Qc, anl, phi)
+    # Heavy optimiser objects are debug-only; drop them in lean mode after the
+    # scalar nfev/cost/duration accounting above has already read what it needs.
+    kept_opt = opt if store_optimizer else None
+    kept_opt_linear = opt_linear if store_optimizer else None
+    kept_opt_nonlinear = opt_nonlinear if store_optimizer else None
+    kept_linear_fit = linear_fit if store_optimizer else None
     return FitResult(
         fr=float(fr), Ql=Ql, Qi=float(Qi), Qc=float(Qc), phi=float(phi),
         a=float(a), alpha=float(alpha), tau=float(tau), Qe=Qe,
@@ -1210,10 +1466,11 @@ def _make_result(f, z, z_error, optimizer_z_error, opt, sweep_direction, f0,
         parameter_covariance=getattr(opt, "parameter_covariance", None),
         parameter_uncertainties=getattr(opt, "parameter_uncertainties", None),
         p=p, initial_guess=getattr(opt, "initial_guess_public", None),
-        opt=opt, opt_linear=opt_linear, opt_nonlinear=opt_nonlinear,
-        optimizer_result=opt, optimizer_result_linear=opt_linear,
-        optimizer_result_nonlinear=opt_nonlinear,
-        linear_fit_result=linear_fit,
+        opt=kept_opt, opt_linear=kept_opt_linear,
+        opt_nonlinear=kept_opt_nonlinear,
+        optimizer_result=kept_opt, optimizer_result_linear=kept_opt_linear,
+        optimizer_result_nonlinear=kept_opt_nonlinear,
+        linear_fit_result=kept_linear_fit,
         f_data=f, z_data=z, z_err_data=_pack_z_error(z_error),
         optimizer_z_err_data=_pack_z_error(optimizer_z_error),
         z_fit=z_fit, z_data_deembed=z_deembed, z_fit_deembed=z_fit_deembed,
@@ -1225,14 +1482,14 @@ def _make_result(f, z, z_error, optimizer_z_error, opt, sweep_direction, f0,
     )
 
 
-def fit_resonance(f, z, z_err=None, nonlinear=False, sweep_direction="up",
+def fit_resonance(f, z, z_err=None, nonlinear=True, sweep_direction="up",
                   initial_guess=None, param_bounds=None, param_fixed=None,
                   max_nfev=1000, tol=1e-8, return_uncertainties=True,
                   optimizer_z_err=None, use_error_weights=None,
                   error_weight_power=1.0, fit_tolerance=None,
                   try_harder=False, try_even_harder=False,
                   subsample=False, autodetect_high_anl=True,
-                  min_dip_depth_db=0.5):
+                  min_dip_depth_db=0.5, store_optimizer=True):
     """Fit one complex S21 sweep.
 
     ``subsample=True`` keeps every point near the dip and decimates the tails,
@@ -1262,12 +1519,19 @@ def fit_resonance(f, z, z_err=None, nonlinear=False, sweep_direction="up",
     z_err : array-like of complex or None, optional
         Per-point S21 uncertainty; propagated into
         ``parameter_uncertainties`` and (optionally) the fit weights.
-    nonlinear : bool, optional
-        Fit the Duffing ``anl`` term by delegating to
-        :func:`fit_resonance_nonlinear` (default ``False``).
-    sweep_direction : {'up', 'down'}, optional
-        Direction the sweep was taken in (default ``'up'``); only affects
-        nonlinear fits.
+    nonlinear : bool or {'auto'}, optional
+        How to handle the Duffing ``anl`` term (default ``True``). ``True``
+        always fits ``anl`` (delegating to :func:`fit_resonance_nonlinear`),
+        which is what you want whenever you need an ``anl`` estimate at every
+        point -- e.g. fitting ``anl`` versus drive power, where low-power values
+        matter even when small. ``False`` fits the linear model only. ``'auto'``
+        runs the cheap linear fit first and only continues to the Duffing fit
+        when the linear fit is judged insufficient (recording the decision on
+        the result's ``linear_sufficiency`` field, and returning a linear
+        ``FitResult`` with ``anl = 0`` when it keeps the linear fit); it is fast
+        for bulk fitting but deliberately drops ``anl`` for resonators whose
+        nonlinearity is below the single-sweep detection floor, so do not use it
+        when you rely on the small-``anl`` values.
     max_nfev : int, optional
         Maximum optimiser function evaluations (default ``1000``).
     tol : float, optional
@@ -1285,8 +1549,24 @@ def fit_resonance(f, z, z_err=None, nonlinear=False, sweep_direction="up",
         Exponent applied to the error weights (default ``1.0``).
     fit_tolerance : float or None, optional
         Alias for ``tol`` taking precedence when set (default ``None``).
+    store_optimizer : bool, optional
+        Keep the bulky optimiser objects (``opt``/``opt_linear``/
+        ``opt_nonlinear``/``linear_fit_result``) on the result (default
+        ``True``). Pass ``False`` when fitting many resonances for parameters
+        only: every fitted value and diagnostic array is still returned, but
+        the Jacobian-carrying optimiser objects are dropped, which avoids a
+        redundant intermediate result build and sharply cuts the data pickled
+        back from worker processes under ``n_jobs > 1``.
     """
-    if nonlinear:
+    # ``nonlinear`` accepts True/False or the string 'auto'. 'auto' runs the
+    # cheap linear fit first and only continues to the Duffing fit when that
+    # linear fit is judged insufficient (see fit_resonance_nonlinear's
+    # auto_select). The work all happens inside fit_resonance_nonlinear because
+    # it already computes the linear seed there, so 'auto' reuses it for free.
+    auto_select = isinstance(nonlinear, str) and nonlinear.lower() == "auto"
+    if nonlinear is not True and not auto_select and nonlinear not in (False, None):
+        raise ValueError("nonlinear must be True, False, or 'auto'")
+    if nonlinear is True or auto_select:
         return fit_resonance_nonlinear(
             f, z, z_err=z_err, sweep_direction=sweep_direction,
             initial_guess=initial_guess, param_bounds=param_bounds,
@@ -1297,7 +1577,8 @@ def fit_resonance(f, z, z_err=None, nonlinear=False, sweep_direction="up",
             fit_tolerance=fit_tolerance,
             try_harder=try_harder, try_even_harder=try_even_harder,
             subsample=subsample, autodetect_high_anl=autodetect_high_anl,
-            min_dip_depth_db=min_dip_depth_db,
+            min_dip_depth_db=min_dip_depth_db, store_optimizer=store_optimizer,
+            auto_select=auto_select,
         )
     fit_start = time.time()
     tol = fit_tolerance if fit_tolerance is not None else tol
@@ -1333,7 +1614,7 @@ def fit_resonance(f, z, z_err=None, nonlinear=False, sweep_direction="up",
     )
     return _make_result(f_full, z_full, z_error_full, opt_error_full,
                         opt, sweep_direction, f0, fit_start,
-                        empirical=empirical)
+                        empirical=empirical, store_optimizer=store_optimizer)
 
 
 def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
@@ -1345,7 +1626,8 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
                             fit_tolerance=None, try_harder=False,
                             try_even_harder=False,
                             subsample=False, autodetect_high_anl=True,
-                            min_dip_depth_db=0.5):
+                            min_dip_depth_db=0.5, store_optimizer=True,
+                            auto_select=False):
     """Fit one complex S21 sweep with a linear seed then one Duffing refinement.
 
     For heavily bistable resonators whose deepest basin has a narrow
@@ -1378,6 +1660,13 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
     ``initial_guess`` instead; that path is faster and lands in the same
     basin as the original fit. The same ``min_dip_depth_db`` pre-check used by
     ``fit_resonance`` runs before the linear seed.
+
+    ``auto_select=True`` (reached via ``fit_resonance(nonlinear='auto')``) runs
+    the linear seed and then checks :func:`_linear_fit_is_sufficient`. If the
+    linear model already explains the data, the linear result is returned
+    immediately (``anl = 0``) with the decision diagnostics attached as
+    ``linear_sufficiency``; otherwise the normal Duffing refinement proceeds and
+    the same diagnostics are attached to the nonlinear result.
 
     The data and optimiser arguments (``f``, ``z``, ``z_err``,
     ``sweep_direction``, ``max_nfev``, ``tol``, ``return_uncertainties``,
@@ -1417,10 +1706,33 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
         return_uncertainties=return_uncertainties,
         error_weight_power=error_weight_power,
     )
+    # The linear seed's full result is only ever surfaced as
+    # ``linear_fit_result``. Lean mode drops that field, so skip this redundant
+    # second result build entirely; the final result still reads nfev/cost/
+    # duration from ``opt_linear`` directly.
     linear_fit = _make_result(
         f, z, z_error, opt_error, opt_linear, sweep_direction, f0, fit_start,
         empirical=empirical,
-    )
+    ) if store_optimizer else None
+
+    # nonlinear='auto': stop here if the linear model already explains the data,
+    # returning the linear result (anl = 0) instead of paying for the Duffing
+    # refinement and any probe grid below. The decision runs on the full
+    # (pre-subsample) sweep so it sees every point of the resonance; see
+    # _linear_fit_is_sufficient for the dip_excess / asymmetry signals.
+    sufficiency = None
+    if auto_select:
+        linear_sufficient, sufficiency = _linear_fit_is_sufficient(
+            f, z, z_error, opt_linear.x_public, sweep_direction, empirical,
+            seed_obs)
+        if linear_sufficient:
+            # Reuse the linear result built above, or build it now if lean mode
+            # skipped it, then record why the nonlinear fit was not run.
+            linear_result = linear_fit if linear_fit is not None else _make_result(
+                f, z, z_error, opt_error, opt_linear, sweep_direction, f0,
+                fit_start, empirical=empirical, store_optimizer=store_optimizer)
+            linear_result.linear_sufficiency = sufficiency
+            return linear_result
 
     if subsample:
         keep = _dip_weighted_subsample(f, z)
@@ -1439,11 +1751,14 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
     def _refine(nl_guess_local):
         p0_local = np.r_[opt_linear.x, 1e-5]
         p0_local = _apply_initial_guess(p0_local, NONLINEAR_NAMES, nl_guess_local, f0)
+        # Uncertainties are deferred: a probe grid runs up to ~60 refinements
+        # but only one wins, so the SVD covariance is computed once afterwards
+        # (see _attach_uncertainties below) instead of on every candidate.
         return _run_optimizer(
             f, z, z_error, opt_error, p0_local, True, sweep_direction, f0, max_nfev, tol,
             param_bounds=_select_names(param_bounds, NONLINEAR_NAMES),
             param_fixed=param_fixed,
-            return_uncertainties=return_uncertainties,
+            return_uncertainties=False,
             error_weight_power=error_weight_power,
         )
 
@@ -1502,12 +1817,19 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
         opt = best
     opt.total_nonlinear_duration_s = total_nonlinear_duration
     opt.total_nonlinear_nfev = total_nonlinear_nfev
+    # Refinements deferred their uncertainties; compute them once on the winner.
+    if return_uncertainties:
+        _attach_uncertainties(opt)
 
-    return _make_result(f_full, z_full, z_error_full, opt_error_full,
-                        opt, sweep_direction, f0, fit_start,
-                        empirical=empirical,
-                        linear_fit=linear_fit, opt_linear=opt_linear,
-                        opt_nonlinear=opt)
+    result = _make_result(f_full, z_full, z_error_full, opt_error_full,
+                          opt, sweep_direction, f0, fit_start,
+                          empirical=empirical,
+                          linear_fit=linear_fit, opt_linear=opt_linear,
+                          opt_nonlinear=opt, store_optimizer=store_optimizer)
+    # Record why 'auto' decided to run the nonlinear fit (None for True/False).
+    if sufficiency is not None:
+        result.linear_sufficiency = sufficiency
+    return result
 
 
 def evaluate_fit(f, fit_result, deembed=False, phase_center=False):
@@ -1746,12 +2068,13 @@ def _parallel_map(func, tasks, n_jobs, verbose=False, label="fits",
 def _fit_sweep_stack_one(task):
     """Worker for one already-windowed sweep stack row."""
     f, z, e, nonlinear, sweep_direction, fit_kwargs, tone_index, is_blind = task
-    if nonlinear:
-        fit = fit_resonance_nonlinear(
-            f, z, z_err=e, sweep_direction=sweep_direction, **fit_kwargs)
-    else:
-        fit = fit_resonance(
-            f, z, z_err=e, sweep_direction=sweep_direction, **fit_kwargs)
+    # Always dispatch through fit_resonance so nonlinear True/False/'auto' is
+    # interpreted in one place. Calling fit_resonance_nonlinear directly here
+    # would treat the truthy string 'auto' as plain True and silently skip the
+    # linear-sufficiency shortcut.
+    fit = fit_resonance(
+        f, z, z_err=e, nonlinear=nonlinear, sweep_direction=sweep_direction,
+        **fit_kwargs)
     fit.tone_index = int(tone_index)
     fit.is_blind = bool(is_blind)
     return fit
@@ -1767,12 +2090,11 @@ def _batch_fit_one(task):
     guess = dict(base_guess or {})
     guess.setdefault("fr", fr_guess)
     kwargs = dict(fit_kwargs, initial_guess=guess, optimizer_z_err=ow)
-    if nonlinear:
-        fit = fit_resonance_nonlinear(
-            fw, zw, z_err=ew, sweep_direction=sweep_direction, **kwargs)
-    else:
-        fit = fit_resonance(
-            fw, zw, z_err=ew, sweep_direction=sweep_direction, **kwargs)
+    # Single dispatch point for nonlinear True/False/'auto' (see
+    # _fit_sweep_stack_one); routing through fit_resonance keeps 'auto' working.
+    fit = fit_resonance(
+        fw, zw, z_err=ew, nonlinear=nonlinear, sweep_direction=sweep_direction,
+        **kwargs)
     return fit
 
 
@@ -1854,7 +2176,7 @@ def _targeted_sweep_tone_indices(sweep_data, n_tones, skip_blind=True):
     return [i for i in indices if i not in blind], blind
 
 
-def fit_sweep_stack(f_stack, z_stack, z_err_stack=None, nonlinear=False,
+def fit_sweep_stack(f_stack, z_stack, z_err_stack=None, nonlinear=True,
                     sweep_direction="up", n_jobs=1, verbose=False,
                     **fit_kwargs):
     """Fit each row/column in a stack of already-windowed resonance sweeps.
@@ -1871,7 +2193,9 @@ def fit_sweep_stack(f_stack, z_stack, z_err_stack=None, nonlinear=False,
     processes. Pass ``verbose=True`` to print completion progress.
     Single-fit options, including ``initial_guess``, ``param_bounds`` and
     ``param_fixed`` and ``min_dip_depth_db``, are forwarded through
-    ``**fit_kwargs``.
+    ``**fit_kwargs``. For large runs pass ``store_optimizer=False`` to drop the
+    bulky per-fit optimiser objects, which markedly shrinks the result pickled
+    back from each worker process.
 
     Parameters
     ----------
@@ -1882,8 +2206,12 @@ def fit_sweep_stack(f_stack, z_stack, z_err_stack=None, nonlinear=False,
     z_err_stack : array-like of complex or None, optional
         Matching per-point S21 uncertainties forwarded as ``z_err`` to each
         row fit; ``None`` (default) fits unweighted.
-    nonlinear : bool, optional
-        Fit the Duffing ``anl`` term on every row (default ``False``).
+    nonlinear : bool or {'auto'}, optional
+        How each row handles the Duffing ``anl`` term (default ``True``; see
+        :func:`fit_resonance`). ``True`` fits ``anl`` on every row, ``False``
+        fits the linear model only, and ``'auto'`` keeps rows the linear model
+        already explains as linear (dropping their ``anl``) and only refines
+        the rest.
     sweep_direction : {'up', 'down'}, optional
         Direction the sweeps were taken in (default ``'up'``).
     """
@@ -1944,7 +2272,7 @@ def _batch_fit_finder_defaults(frequencies, filter_params=None,
 
 def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
               filter_params=None, finder_params=None, window_fwhm=10.0,
-              nonlinear=False, sweep_direction="up", verbose=True,
+              nonlinear=True, sweep_direction="up", verbose=True,
               z_err=None, optimizer_z_err=None, use_error_weights=None,
               max_points=None, n_jobs=1, find_resonances=False,
               skip_blind=True,
@@ -1960,7 +2288,9 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
     ``n_jobs`` follows the joblib convention: ``1`` is serial, ``-1`` uses all
     visible CPUs, and ``-2`` uses all but one. Parallel fitting uses separate
     processes. Single-fit options, including ``initial_guess``,
-    ``param_bounds``, ``param_fixed`` and ``min_dip_depth_db``, are forwarded through
+    ``param_bounds``, ``param_fixed``, ``min_dip_depth_db`` and
+    ``store_optimizer`` (pass ``False`` on large runs to shrink the per-fit
+    result pickled back from workers), are forwarded through
     ``**fit_kwargs``. When ``resonances`` is omitted, targeted per-tone sweeps
     fit one trace per tone by default. Pass ``find_resonances=True`` to
     auto-detect resonance windows from a concatenated sweep instead. That
@@ -1983,8 +2313,12 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
     window_fwhm : float, optional
         Half-window width, in dip FWHMs, kept around each resonance for
         auto-detected windows (default ``10.0``).
-    nonlinear : bool, optional
-        Fit the Duffing ``anl`` term (default ``False``).
+    nonlinear : bool or {'auto'}, optional
+        How to handle the Duffing ``anl`` term (default ``True``; see
+        :func:`fit_resonance`). ``True`` fits ``anl`` on every tone, ``False``
+        fits the linear model only, and ``'auto'`` fits each tone with the
+        linear model and only refines the ones it cannot explain (dropping
+        ``anl`` for the rest).
     sweep_direction : {'up', 'down'}, optional
         Direction the sweep was taken in (default ``'up'``).
     verbose : bool, optional

@@ -4,10 +4,47 @@ from __future__ import annotations
 import json
 import socket
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 
 DEFAULT_TIMING_SOCKET = "/run/timing-monitor.sock"
+
+# Default tolerance (seconds) for the firmware-TT "aligned on the second boundary"
+# verdict: |pps_boundary_offset_s| under this counts as aligned. 0.1 ms; a fresh TT
+# load lands ~1 us off. One source of truth for timed_sync_check / timed_sync_needed /
+# set_telescope_time so the threshold stays consistent across them.
+DEFAULT_ALIGN_TOL_S = 1e-4
+
+
+def unix_to_iso(unix_s: float | None) -> str | None:
+    """Format a UNIX timestamp (seconds since the epoch) as an ISO-8601 UTC string.
+
+    e.g. ``1782206913.0 -> '2026-06-23T09:28:33.000Z'``. UTC is used because these
+    timestamps are absolute epochs meant to line up across boards. Returns ``None``
+    for a ``None`` input so it can wrap optional fields directly.
+    """
+    if unix_s is None:
+        return None
+    return datetime.fromtimestamp(unix_s, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def format_duration_s(seconds: float | None) -> str | None:
+    """Human-readable duration for a span in seconds, e.g. '42 s', '5.3 min', '2.1 h',
+    '3.4 d'. Returns None for None (so it can wrap optional fields directly)."""
+    if seconds is None:
+        return None
+    s = abs(seconds)
+    if s < 90:
+        text = f"{s:.0f} s"
+    elif s < 5400:
+        text = f"{s / 60:.1f} min"
+    elif s < 172800:
+        text = f"{s / 3600:.1f} h"
+    else:
+        text = f"{s / 86400:.1f} d"
+    return ("-" + text) if seconds < 0 else text
 
 
 class TimingStatusError(RuntimeError):
@@ -426,3 +463,50 @@ def get_timing_summary(
             "strobe": {"present": False, "running": False, "healthy": False},
         }
     return timing_public_view(status)
+
+
+def report_sync_readiness(summary: dict[str, Any]) -> dict[str, Any]:
+    """Decide whether the system is ready for a firmware *timed* sync.
+
+    Pure function over the ``summary`` sub-dict from :func:`get_timing_summary`
+    (i.e. ``get_timing_summary()['summary']``). It folds the timing-monitor view
+    into the two preconditions a timed sync needs, plus an overall verdict and
+    human-readable reasons for anything not ready. This is the readout-tools port of
+    ``scripts/timed_sync/05_check_timing_system.py``'s gate, reused by the
+    ``timed_sync_*`` server handlers so the readiness logic lives in one place.
+
+    Preconditions:
+      ptp_ready  -- PTP is locked to a grandmaster (``state == 'locked_to_gm'``) and
+                    the monitor reports ``ready_for_firmware_sync``. Without it, the
+                    telescope time the firmware disciplines to may be wrong.
+      pps_active -- the TSU 1-PPS strobe is healthy. Without a PPS the firmware has
+                    nothing to align its telescope time to (the load latches on a PPS
+                    edge), and ``update_internal_time`` would block/fail.
+
+    :param summary: the ``summary`` dict from :func:`get_timing_summary`.
+    :return: dict with ``ptp_ready``, ``pps_active``, ``can_sync`` (both true), and
+        ``reasons`` (human strings; empty when ``can_sync`` is True).
+    """
+    state = summary.get("state", "unknown")
+    ptp_ready = bool(summary.get("ready_for_firmware_sync")) and state == "locked_to_gm"
+    pps_active = bool(summary.get("strobe_healthy"))
+
+    reasons = []
+    if not ptp_ready:
+        reasons.append(
+            f"PTP not ready for a firmware sync (state={state}, "
+            f"ready_for_firmware_sync={summary.get('ready_for_firmware_sync')}); "
+            "the telescope time may be wrong."
+        )
+    if not pps_active:
+        reasons.append(
+            "TSU 1-PPS strobe is not healthy (systemd: souk-tsu-strobe); the firmware "
+            "has no PPS to align telescope time to."
+        )
+
+    return {
+        "ptp_ready": ptp_ready,
+        "pps_active": pps_active,
+        "can_sync": ptp_ready and pps_active,
+        "reasons": reasons,
+    }

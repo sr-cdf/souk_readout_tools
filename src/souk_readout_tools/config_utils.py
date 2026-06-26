@@ -15,6 +15,11 @@ try:
 except ImportError:
     pwd = None
 
+# The user that owns the persistent souk_readout_tools data on the board. The
+# server runs under sudo (needed for /dev/mem), so this is resolved explicitly
+# rather than from $HOME, which would point at /root.
+TARGET_USER = 'casper'
+
 
 def _get_target_ownership():
     """
@@ -27,14 +32,33 @@ def _get_target_ownership():
         return None
     if os.geteuid() != 0:
         return None
-    target_user = 'casper'
     try:
-        pw = pwd.getpwnam(target_user)
+        pw = pwd.getpwnam(TARGET_USER)
         return pw.pw_uid, pw.pw_gid
     except KeyError:
         uid = int(os.getenv('SUDO_UID') or 0)
         gid = int(os.getenv('SUDO_GID') or 0)
         return uid, gid
+
+
+def get_user_dir():
+    """
+    Return the ``~/.souk_readout_tools`` data directory for the target user.
+
+    Persistent data - configs, calibration files - lives in the user's home.
+    The server runs under sudo, so ``expanduser('~')`` would resolve to /root;
+    when running as root, resolve the target user's home explicitly instead
+    (mirroring the server's HOME resolution).
+    """
+    home = None
+    if pwd is not None and hasattr(os, 'geteuid') and os.geteuid() == 0:
+        try:
+            home = pwd.getpwnam(TARGET_USER).pw_dir
+        except KeyError:
+            home = os.path.join('/home', TARGET_USER)
+    if home is None:
+        home = os.path.expanduser('~')
+    return os.path.join(home, '.souk_readout_tools')
 
 
 def get_template_config_path():

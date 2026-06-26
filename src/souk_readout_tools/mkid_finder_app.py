@@ -181,7 +181,7 @@ class DataLoader():
             f,z=self.load_from_fits(filename)
         elif ext == '.npy':
             f,z=self.load_from_npy(filename)
-        elif ext == '.txt':
+        elif ext in ('.txt', '.csv'):
             f,z=self.load_from_txt(filename)
         else:
             QMessageBox.warning(None, "Error", f"File type not supported: {ext}")
@@ -246,9 +246,26 @@ class DataLoader():
             raise ValueError('format of data in npy file not understood')
 
     def load_from_txt(self, filename):
-        """Load sweep data from the text/CSV file ``filename``."""
+        """Load sweep data from the text/CSV file ``filename``.
+
+        Expects three comma-separated columns: frequency, I, Q. Lines whose
+        first non-whitespace character is ``#`` are treated as comments and
+        skipped, as is an optional non-numeric header row. (We filter comments
+        ourselves rather than relying on ``np.loadtxt`` because its default
+        handling strips from the ``#`` anywhere in a line, which mangles quoted
+        metadata values that happen to contain a ``#``.)
+        """
         try:
-            data = np.loadtxt(filename, delimiter=',')
+            with open(filename, 'r') as fh:
+                rows = [line for line in fh
+                        if line.strip() and not line.lstrip().startswith('#')]
+            # Drop an optional header row of non-numeric column names.
+            if rows:
+                try:
+                    float(rows[0].split(',')[0])
+                except ValueError:
+                    rows = rows[1:]
+            data = np.loadtxt(rows, delimiter=',')
             frequencies = data[:, 0]
             s21_complex = data[:, 1] + 1j * data[:, 2]
         except Exception as e:

@@ -107,7 +107,7 @@ from souk_readout_tools.peak_finder import PeakFinder
 from souk_readout_tools.plotting import plot_sweep_magphase
 from souk_readout_tools.resonator import remove_cable_delay
 from souk_readout_tools.fitting import batch_fit
-from souk_readout_tools.measurement import MeasurementRun, MeasurementStore, save_system_info
+from souk_readout_tools.power_sweep import run_power_sweep, load_power_sweep
 print('All client imports OK')
 "
 ```
@@ -124,7 +124,7 @@ from souk_readout_tools.peak_finder import *
 from souk_readout_tools.plotting import plot_sweep_magphase
 from souk_readout_tools.resonator import remove_cable_delay
 from souk_readout_tools.fitting import batch_fit
-from souk_readout_tools.measurement import MeasurementRun, MeasurementStore, save_system_info
+from souk_readout_tools.power_sweep import run_power_sweep, load_power_sweep
 print('All client imports OK')
 "
 ```
@@ -1018,43 +1018,7 @@ print(f"Flagged: {targeted['flagged_tones']}")
 - [ ] Targeted find correctly identifies one resonance per tone
 - [ ] Any flagged tones are genuinely problematic (collisions, weak resonances)
 
-### 4.12  Measurement run-directory round-trip
-
-```python
-from pathlib import Path
-import numpy as np
-from souk_readout_tools.measurement import (
-    ArtifactKind, MeasurementRun, MeasurementStep, MeasurementStore,
-)
-
-root = Path('/tmp/souk_measurement_test')
-store = MeasurementStore(root)
-store.ensure_layout()
-
-run = MeasurementRun(kind='test_measurement', root=root,
-                     parameters={'axis': [1, 2]})
-for value in (1, 2):
-    step = run.add_step(MeasurementStep(
-        index=value - 1, axis={'axis': value}))
-    step.readback['axis_readback'] = value
-    store.save_step_npz_artifact(
-        run, step,
-        name=f'step_{value}_sweep',
-        kind=ArtifactKind.SWEEP,
-        relative_path=f'data/step_{value}_sweep.npz',
-        data={'sweep_f': np.arange(3), 'axis': value})
-run.write_manifest()
-
-loaded = MeasurementRun.load(root)
-data = loaded.store().load_artifact_data(
-    loaded.steps[0].artifact(ArtifactKind.SWEEP))
-```
-- [ ] `measurement.json` is written and reloads successfully
-- [ ] Artifact files are stored under `data/`
-- [ ] Array data and metadata round-trip through the artifact store
-- [ ] Reloaded steps preserve their requested `axis` and `readback` values
-
-### 4.13  Tone-power sweep smoke test
+### 4.12  Tone-power sweep smoke test
 
 ```python
 from souk_readout_tools import power_sweep as ps
@@ -1084,22 +1048,9 @@ analysis = ps.analyse_power_sweep(
 ```
 - [ ] Run directory contains `measurement.json`
 - [ ] Run directory contains `system_info_start.json`
-- [ ] Each step contains a `sweep` artifact
+- [ ] Each step's manifest entry points at its saved `sweep` `.npz`
 - [ ] Loaded run can be passed to `fit_power_sweep`
 - [ ] `analyse_power_sweep` can run the one-call fit/summary/best-power path
-
-### 4.14  Accumulator snapshot artifact semantics
-
-Accumulator snapshots are pre-accumulation, high-rate captures from one tone at
-a time.  They should be stored with `kind='accumulator_snapshot'` and metadata
-marking `stage='pre_accumulation'`, `simultaneous_tones=False`, and
-`correlatable=False`.
-
-- [ ] Single-tone accumulator snapshots store `sample_rate_hz`, `tone_index`,
-      `num_snapshots`, and `len_snapshot`
-- [ ] Batch accumulator snapshots store one array per tone
-- [ ] Accumulator snapshot PSD analysis is allowed
-- [ ] Tone-tone correlation analysis rejects accumulator snapshot artifacts
 
 ---
 

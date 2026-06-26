@@ -17,7 +17,7 @@ Snapshot plots:
     plot_snapshots, plot_snapshots_psd, plot_batch_snapshots
 
 PSD utilities:
-    compute_psd, compute_psd_averaged, compute_psd_concatenated
+    compute_psd, compute_psd_averaged, compute_psd_concatenated, log_bin_psd
 """
 
 from .sweep import (
@@ -44,4 +44,5 @@ from ._psd import (
     compute_psd,
     compute_psd_averaged,
     compute_psd_concatenated,
+    log_bin_psd,
 )

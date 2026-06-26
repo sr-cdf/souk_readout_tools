@@ -161,6 +161,15 @@ _SI_PREFIXES = {
 }
 
 
+def _group_delay_cal_for_resonator(group_delay_cal):
+    """Convert public plotting scalar delay seconds to resonator ns units."""
+    if group_delay_cal is None or isinstance(group_delay_cal, (str, dict)):
+        return group_delay_cal
+    if np.ndim(group_delay_cal) == 0:
+        return float(group_delay_cal) * 1e9
+    return group_delay_cal
+
+
 def _is_magphase_format(format):
     """Return True for formats with magnitude/phase axes."""
     return format in ('magphase', _MAGPHASE_IQ_FORMAT)
@@ -432,6 +441,7 @@ def _apply_transforms(f, z, deembed, phase_center, phase_rotate=False,
     Returns (z_out, ei_out, eq_out, deembed_params, phase_params).
     ei_out/eq_out are None when the input errors are None.
     """
+    group_delay_cal = _group_delay_cal_for_resonator(group_delay_cal)
     d_params = None
     pc_params = None
     if deembed:
@@ -730,10 +740,10 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             not available.  ``units='raw'`` does not use this argument beyond
             validation; use ``units='adc_units'`` for a linear ADC-unit view
             referred to ``reference_plane``.
-        group_delay_cal: Frequency-dependent group delay calibration from
-            ``measure_path_group_delay()``.  Used when ``deembed=True`` to
-            remove the measured path group delay instead of auto-estimating
-            a scalar cable delay.
+        group_delay_cal: Group-delay calibration from
+            ``measure_path_group_delay()``, or a scalar constant delay in
+            seconds.  Used when ``deembed=True`` to remove the measured path
+            group delay instead of auto-estimating a scalar cable delay.
         unwrap_phase: bool or None, optional.  ``None`` preserves the
             automatic behaviour: unwrap unrotated phase traces, including
             center-only traces, but leave explicitly rotated phase wrapped.
@@ -1815,7 +1825,8 @@ def plot_fits(fit_results, format='magphase', deembed=False,
             ``'detector'``. ``units='raw'`` is accumulator units only; use
             ``units='adc_units'`` for a linear ADC-unit view referred to a
             detector/cryostat plane.
-        group_delay_cal: Group delay calibration forwarded to sweep transforms.
+        group_delay_cal: Group-delay calibration from ``plot_sweep()``, or a
+            scalar constant delay in seconds.
         show_fit_legend: If True, add separate legend entries for fit lines.
         data_kwargs: Matplotlib keyword overrides for the data markers only.
         fit_kwargs: Matplotlib keyword overrides for the fit lines only.

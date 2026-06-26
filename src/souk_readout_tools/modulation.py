@@ -23,7 +23,7 @@ The workflow a consumer follows is:
 3. :func:`demodulate` -> per-cycle dphi/df, d2phi/df2, frequency shift and a
    detuning estimate (with a ``needs_update`` flag for the future tracking loop).
 
-Physics caveats (kept honest):
+Physics caveats:
 - The point we steer to is the **steepest part of the phase curve / inflection
   point** (d2phi/df2 = 0); for a non-ideal device this is *near*, not exactly,
   the physical f0 once asymmetry / cable delay / nonlinearity matter.
@@ -35,6 +35,7 @@ Physics caveats (kept honest):
   point slides around the resonance circle, so it needs the circle calibration.
 """
 
+import copy
 import warnings
 
 import numpy as np
@@ -154,15 +155,229 @@ def _tone_iq(data_dict, n_tones):
     return np.stack(cols, axis=1)   # (n_samples, n_tones)
 
 
-def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='notify'):
+def _wrap_phase(x):
+    """Wrap phase differences to [-pi, pi)."""
+    return (x + np.pi) % (2 * np.pi) - np.pi
+
+
+def _nanmean_quiet(a, axis=None):
+    """``nanmean`` without RuntimeWarnings for all-NaN slices."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', category=RuntimeWarning)
+        return np.nanmean(a, axis=axis)
+
+
+def _unwrap_nan_segments(phase):
+    """Unwrap finite contiguous runs without bridging NaN gaps."""
+    out = np.array(phase, dtype=float, copy=True)
+    if out.ndim == 1:
+        out = out[:, None]
+        squeeze = True
+    else:
+        squeeze = False
+    for col in range(out.shape[1]):
+        finite = np.isfinite(out[:, col])
+        if not np.any(finite):
+            continue
+        idx = np.flatnonzero(finite)
+        breaks = np.where(np.diff(idx) > 1)[0] + 1
+        for seg in np.split(idx, breaks):
+            out[seg, col] = np.unwrap(out[seg, col])
+    return out[:, 0] if squeeze else out
+
+
+def _interp_nan_targets(values, targets, valid_source):
+    """Linearly interpolate selected samples from valid source samples."""
+    out = np.array(values, copy=True)
+    targets = np.asarray(targets, dtype=bool)
+    valid_source = np.asarray(valid_source, dtype=bool)
+    if out.ndim == 1:
+        out = out[:, None]
+        squeeze = True
+    else:
+        squeeze = False
+    x = np.arange(out.shape[0], dtype=float)
+    for col in range(out.shape[1]):
+        src = valid_source & np.isfinite(out[:, col])
+        dst = targets
+        if not np.any(dst) or not np.any(src):
+            continue
+        out[dst, col] = np.interp(x[dst], x[src], out[src, col])
+    return out[:, 0] if squeeze else out
+
+
+def _clean_indices(values, n_tones):
+    """Normalise scalar, sequence or boolean-mask tone indices."""
+    if values is None:
+        return []
+    arr = np.asarray(values)
+    if arr.ndim == 0:
+        candidates = [arr.item()]
+    elif arr.dtype == bool and arr.size == n_tones:
+        candidates = np.flatnonzero(arr)
+    else:
+        candidates = arr.ravel()
+
+    out = []
+    seen = set()
+    for value in candidates:
+        try:
+            idx = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < n_tones and idx not in seen:
+            seen.add(idx)
+            out.append(idx)
+    return out
+
+
+def _indices_mask(indices, n_tones):
+    """Return a boolean mask for user-facing tone indices."""
+    mask = np.zeros(int(n_tones), dtype=bool)
+    for idx in indices:
+        if 0 <= int(idx) < n_tones:
+            mask[int(idx)] = True
+    return mask
+
+
+def _extract_tone_metadata(container):
+    """Collect tone role metadata from parsed-sample-style containers."""
+    if not isinstance(container, dict):
+        return {}
+    metadata = {}
+    top = container.get('tone_metadata')
+    if isinstance(top, dict):
+        metadata.update(copy.deepcopy(top))
+    info = container.get('info')
+    tones = info.get('tones', {}) if isinstance(info, dict) else {}
+    if isinstance(tones, dict):
+        metadata.update(copy.deepcopy(tones))
+    return metadata
+
+
+def _role_indices_from_metadata(metadata, n_tones):
+    """Resolve regular/blind tone indices, using parsed metadata conventions."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    blind_known = 'blind_indices' in metadata
+    regular_known = 'regular_indices' in metadata
+
+    blind_indices = _clean_indices(metadata.get('blind_indices'), n_tones)
+    regular_indices = _clean_indices(metadata.get('regular_indices'), n_tones)
+
+    if not blind_known and 'is_blind' in metadata:
+        blind_indices = _clean_indices(metadata.get('is_blind'), n_tones)
+        blind_known = True
+    if not (blind_known and regular_known) and 'tone_types' in metadata:
+        try:
+            tone_types = list(metadata.get('tone_types'))
+        except TypeError:
+            tone_types = []
+        if not blind_known:
+            blind_indices = [
+                i for i, tone_type in enumerate(tone_types[:n_tones])
+                if str(tone_type).lower() == 'blind']
+            blind_known = bool(tone_types)
+        if not regular_known:
+            regular_indices = [
+                i for i, tone_type in enumerate(tone_types[:n_tones])
+                if str(tone_type).lower() == 'regular']
+            regular_known = bool(tone_types)
+
+    all_indices = list(range(n_tones))
+    if blind_known and not regular_known:
+        blind = set(blind_indices)
+        regular_indices = [i for i in all_indices if i not in blind]
+    elif regular_known and not blind_known:
+        regular = set(regular_indices)
+        blind_indices = [i for i in all_indices if i not in regular]
+    elif not blind_known and not regular_known:
+        regular_indices = all_indices
+        blind_indices = []
+
+    return blind_indices, regular_indices
+
+
+def _modulated_indices_from_offsets(offsets_hz):
+    """Infer modulated tones from non-zero probe offsets when no state exists."""
+    offsets_hz = np.asarray(offsets_hz, dtype=float)
+    if offsets_hz.ndim != 2:
+        return []
+    active = np.any(np.abs(offsets_hz) > 0.0, axis=0)
+    return np.flatnonzero(active).astype(int).tolist()
+
+
+def _linearized_iq_projection(reference_iq, gradient, s21,
+                              reference_frequency_hz=None):
+    """Project IQ displacement onto local frequency and matched-loss axes.
+
+    Thin wrapper over :func:`resonator.project_iq_tangent_normal`: returns the
+    tangent displacement in Hz and the matched-loss displacement as a fractional
+    dissipation (``dd_hz / reference_frequency_hz``, NaN if no usable reference).
+    """
+    from .resonator import project_iq_tangent_normal
+    df_hz, dd_hz = project_iq_tangent_normal(reference_iq, gradient, s21)
+    if reference_frequency_hz is None:
+        dissipation = np.full(np.shape(dd_hz), np.nan, dtype=float)
+    else:
+        reference_frequency_hz = float(reference_frequency_hz)
+        if np.isfinite(reference_frequency_hz) and reference_frequency_hz != 0.0:
+            dissipation = dd_hz / reference_frequency_hz
+        else:
+            dissipation = np.full(np.shape(dd_hz), np.nan, dtype=float)
+    return df_hz, dissipation
+
+
+def _annotate_tone_metadata(metadata, n_tones, modulated_indices):
+    """Return parsed-compatible role metadata plus modulation-role fields."""
+    metadata = copy.deepcopy(metadata) if isinstance(metadata, dict) else {}
+    blind_indices, regular_indices = _role_indices_from_metadata(metadata, n_tones)
+    modulated_indices = _clean_indices(modulated_indices, n_tones)
+    modulated = set(modulated_indices)
+    unmodulated_indices = [i for i in range(n_tones) if i not in modulated]
+
+    tone_is_blind = _indices_mask(blind_indices, n_tones)
+    tone_is_regular = _indices_mask(regular_indices, n_tones)
+    tone_is_modulated = _indices_mask(modulated_indices, n_tones)
+
+    metadata.update({
+        'regular_indices': list(regular_indices),
+        'blind_indices': list(blind_indices),
+        'num_regular_tones': int(len(regular_indices)),
+        'num_blind_tones': int(len(blind_indices)),
+        'is_blind': tone_is_blind.tolist(),
+        'mod_indices': list(modulated_indices),
+        'modulated_indices': list(modulated_indices),
+        'unmodulated_indices': list(unmodulated_indices),
+        'num_modulated_tones': int(len(modulated_indices)),
+        'num_unmodulated_tones': int(len(unmodulated_indices)),
+        'is_modulated': tone_is_modulated.tolist(),
+    })
+    metadata.setdefault(
+        'tone_types',
+        ['blind' if tone_is_blind[i] else 'regular' for i in range(n_tones)])
+
+    return metadata, {
+        'regular_indices': list(regular_indices),
+        'blind_indices': list(blind_indices),
+        'mod_indices': list(modulated_indices),
+        'modulated_indices': list(modulated_indices),
+        'unmodulated_indices': list(unmodulated_indices),
+        'tone_is_blind': tone_is_blind,
+        'tone_is_regular': tone_is_regular,
+        'tone_is_modulated': tone_is_modulated,
+    }
+
+
+def group_cycles(data_dict, tone_modulation_state, reduce='mean',
+                 on_missing='notify', include_settling=False):
     """
     Group modulated samples by probe point and modulation cycle.
 
-    Walks the sample stream, drops settling samples, and collects the complex
-    I/Q at each of the N probe points into successive cycles. A new cycle is
-    detected when the point index wraps back down (e.g. N -> 1). The gap-free
-    ``packet_counter`` guarantees the samples are contiguous so the grouping is
-    unambiguous.
+    Walks the sample stream, optionally drops settling samples, and collects the
+    complex I/Q at each of the N probe points into successive cycles. A new
+    cycle is detected when the point index wraps back down (e.g. N -> 1). The
+    gap-free ``packet_counter`` guarantees the samples are contiguous so the
+    grouping is unambiguous.
 
     Parameters
     ----------
@@ -187,6 +402,12 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
         missing packets (their point/settling inferred from the deterministic
         cadence), so affected cycles still appear in the output with NaN where
         data was lost. A warning is always emitted when packets are missing.
+    include_settling : bool, optional
+        If ``False`` (default), drop samples with ``modulation_settling==1``.
+        If ``True``, keep them in the grouped ``z`` and metadata arrays while
+        preserving their ``modulation_settling`` flag. This is useful for
+        sample-aligned demodulation where settling samples should remain in the
+        output timestream.
 
     Returns
     -------
@@ -203,6 +424,9 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
         ``cycle_packet_counter`` / ``cycle_telescope_time`` / ``cycle_packet_error``
         / ``cycle_stream_flags`` : one representative time axis per cycle, taken
         from the point nearest zero offset;
+        ``tone_metadata`` plus ``blind_indices`` / ``regular_indices`` /
+        ``mod_indices`` / ``modulated_indices`` / ``unmodulated_indices`` :
+        parsed-compatible tone role metadata and explicit modulation roles;
         ``sample_index`` / ``sample_present`` / ``packet_missing`` : provenance
         for grouped samples, useful when ``on_missing='fill'`` inserts NaN-IQ
         placeholders;
@@ -302,6 +526,15 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
             offsets_hz[:, idx] = off
             freq_hz[:, idx] = float(tone.get('center_hz', 0.0)) + off
 
+    mod_indices = _clean_indices(tone_modulation_state.get('mod_indices'), n_tones)
+    if not mod_indices and 'mod_indices' not in tone_modulation_state:
+        mod_indices = _modulated_indices_from_offsets(offsets_hz)
+    tone_metadata, tone_roles = _annotate_tone_metadata(
+        _extract_tone_metadata(data_dict), n_tones, mod_indices)
+
+    # Accumulators. `cycles_*` collect one finished row per cycle (appended by
+    # `_flush`). `cur`/`cur_meta` are the in-progress cycle: per probe point
+    # (1..N) a list of the samples seen so far plus their aligned metadata.
     cycles_z = []
     cycles_rev = []
     cycles_sample_index = []
@@ -336,6 +569,7 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
         if all(len(cur[p]) > 0 for p in range(1, N + 1)):
             counts = np.asarray([len(cur[p]) for p in range(1, N + 1)], dtype=int)
             if reduce == 'mean':
+                # mean branch: collapse each point's dwell samples to one complex value
                 arr = np.stack([np.mean(np.stack(cur[p], axis=0), axis=0)
                                 for p in range(1, N + 1)], axis=0)   # (N, n_tones)
                 meta_axis = None
@@ -349,6 +583,9 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
             cycles_rev.append(int(np.bincount(cur_rev).argmax()) if cur_rev else 0)
 
             if meta_axis is None:
+                # mean branch metadata: one representative value per point --
+                # first sample for timing/counters, max/OR for error-like fields,
+                # mode for the config revision.
                 cycles_sample_index.append(np.asarray([
                     int(_first_or_default(cur_meta[p]['sample_index'], -1))
                     for p in range(1, N + 1)], dtype=int))
@@ -380,6 +617,8 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
                         if cur_meta[p]['stream_flags'][name] else 0
                         for p in range(1, N + 1)], dtype=flag_meta[name].dtype))
             else:
+                # sample-axis branch: keep every retained sample's metadata,
+                # truncated to the common dwell count `meta_axis` across points.
                 cycles_sample_index.append(np.stack([
                     np.asarray(cur_meta[p]['sample_index'][:meta_axis], dtype=int)
                     for p in range(1, N + 1)], axis=0))
@@ -413,6 +652,7 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
                                    dtype=flag_meta[name].dtype)
                         for p in range(1, N + 1)], axis=0))
             cycles_used.append(counts)
+        # Reset the in-progress buffers (whether or not the cycle was committed).
         for p in range(1, N + 1):
             cur[p] = []
             for key in cur_meta[p]:
@@ -423,15 +663,19 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
                     cur_meta[p][key] = []
         cur_rev.clear()
 
+    # Walk the stream once. The point index ramps up within a cycle (1..N) and
+    # wraps back down at the next cycle, which is how cycle boundaries are found.
     for k in range(len(points)):
         p = int(points[k])
         if p == 0:               # not modulating
             continue
-        if int(settling[k]):     # drop transient samples
-            prev_p = p
-            continue
         if prev_p is not None and p < prev_p:   # wrapped -> cycle boundary
             _flush()
+        if int(settling[k]) and not include_settling:
+            # settling transient: advance the point marker but don't accumulate
+            prev_p = p
+            continue
+        # accumulate this sample into its point bucket, with aligned metadata
         cur[p].append(z[k])
         cur_meta[p]['sample_index'].append(int(sample_index[k]))
         cur_meta[p]['sample_present'].append(bool(sample_present[k]))
@@ -448,6 +692,8 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
         prev_p = p
     _flush()
 
+    # Stack the per-cycle lists into output arrays (empty-safe): one row per
+    # completed cycle, with the metadata axis matching the chosen `reduce`.
     if reduce == 'mean':
         meta_shape = (0, N)
     else:
@@ -469,6 +715,9 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
         for name, items in cycles_flags.items()
     }
 
+    # Choose the representative "cycle time" point: the probe point sitting
+    # nearest zero offset (averaged over the actively modulated tones), used for
+    # the one-timestamp-per-cycle views below.
     active_offset_cols = np.any(np.abs(offsets_hz) > 0, axis=0)
     if np.any(active_offset_cols):
         center_point = int(np.argmin(np.mean(np.abs(offsets_hz[:, active_offset_cols]), axis=1)))
@@ -477,6 +726,9 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
     else:
         center_point = 0
 
+    # Collapse a per-(cycle, point[, sample]) array to one value per cycle:
+    # `_cycle_view` reads the centre point, `_cycle_any`/`_cycle_max` reduce
+    # over the point (and sample) axes for the boolean/error-like fields.
     def _cycle_view(arr, default_shape=(0,)):
         if arr.shape[0] == 0:
             return np.empty(default_shape, dtype=arr.dtype)
@@ -507,6 +759,15 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
         'z': np.stack(cycles_z, axis=0) if cycles_z else np.empty(z_out_shape, dtype=complex),
         'offsets_hz': offsets_hz,
         'freq_hz': freq_hz,
+        'tone_metadata': tone_metadata,
+        'blind_indices': tone_roles['blind_indices'],
+        'regular_indices': tone_roles['regular_indices'],
+        'mod_indices': tone_roles['mod_indices'],
+        'modulated_indices': tone_roles['modulated_indices'],
+        'unmodulated_indices': tone_roles['unmodulated_indices'],
+        'tone_is_blind': tone_roles['tone_is_blind'],
+        'tone_is_regular': tone_roles['tone_is_regular'],
+        'tone_is_modulated': tone_roles['tone_is_modulated'],
         'revision': np.asarray(cycles_rev, dtype=int),
         'sample_index': sample_index_out,
         'sample_present': sample_present_out,
@@ -529,6 +790,631 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean', on_missing='no
         'cycle_point_index': center_point,
         'point_order': np.arange(1, N + 1),
     }
+
+
+def demodulate_timestream(grouped, offsets=None, *, method='accurate',
+                          calibration=None, reference_z=None,
+                          data_dict=None, n_samples=None,
+                          fill_settling=True,
+                          use_settling_for_fit=False,
+                          threshold_linewidths=0.1):
+    """
+    Convert every kept modulation sample into a sample-aligned demodulated stream.
+
+    This is the "do not throw away integration time" companion to
+    :func:`demodulate`.  It uses the individual samples retained by
+    ``group_cycles(..., reduce=None)`` rather than first averaging each point in
+    a cycle.  Each modulation point is treated as a valid resonator probe:
+
+    - the static per-point response is divided out to form ``z_demod`` /
+      ``mag`` / ``phase`` as if each sample had been measured at the centre
+      point;
+    - the phase residual at that point is divided by the local phase slope to
+      give a centre-probe detuning timestream;
+    - the cycle-level ``dphi/df`` and ``d2phi/df2`` estimates are held across
+      all samples in that cycle so they line up with the original sample grid.
+
+    ``freq_shift_hz`` follows the same probe-side sign convention as
+    :func:`demodulate`: it is the centre probe detuning, approximately
+    ``f_center - f_resonance``.  ``resonance_shift_hz`` is the opposite sign,
+    useful when reading detector resonance motion.
+
+    Parameters
+    ----------
+    grouped : dict
+        Output from ``group_cycles(data, state, reduce=None)``.  Mean-reduced
+        grouped data cannot recover the original per-sample stream and raises a
+        ``ValueError``.
+    offsets : numpy.ndarray or None, optional
+        ``(N, n_tones)`` per-point probe offsets (Hz). ``None`` uses
+        ``grouped['offsets_hz']``.
+    method : {'accurate', 'model', 'fast'}, optional
+        Phase-derivative estimator.  ``'accurate'`` / ``'model'`` fit a
+        quadratic phase-vs-offset model when at least three distinct offsets are
+        present, falling back to a line.  ``'fast'`` uses the extreme offsets
+        for the centre slope and the same quadratic curvature fallback.  The
+        default is ``'accurate'`` because repeated centre points such as
+        ``[-1000, 0, +1000, 0]`` are common.
+    calibration : dict or None, optional
+        Per-tone ``{tone_index: ResonatorCalibration}``.  When supplied, raw IQ
+        is de-embedded/phase-centred before forming ``z_demod`` and each sample's
+        frequency/dissipation is computed with the calibrated Möbius inversion.
+        The known modulation offset is then subtracted so all points estimate
+        the centre-probe detuning.
+    reference_z : numpy.ndarray or None, optional
+        Optional static per-point reference response, shape ``(N, n_tones)``.
+        If omitted, the reference is the complex mean of this capture for each
+        point/tone in the selected basis (raw IQ, or centred IQ with
+        ``calibration``).  Passing an external reference gives an absolute
+        baseline; the default gives a capture-relative baseline.
+    data_dict : dict or None, optional
+        Original parsed sample dict.  If supplied, output length is
+        ``len(data_dict['modulation_point'])`` and raw per-sample metadata are
+        copied through.  Otherwise ``n_samples`` is inferred from grouped sample
+        indices unless supplied explicitly.
+    n_samples : int or None, optional
+        Explicit output length when ``data_dict`` is not supplied.
+    fill_settling : bool or {'raw', 'interpolate', 'none'}, optional
+        How to fill samples flagged with ``modulation_settling==1`` when they
+        were not retained by ``group_cycles`` or when their transient IQ should
+        be replaced. ``True`` / ``'raw'`` (default) demodulates the raw settling
+        IQ using the completed cycle's reference/slope. ``'interpolate'`` fills
+        settling samples by linear interpolation between non-settling
+        demodulated samples, leaving flags intact. ``False`` / ``'none'`` leaves
+        dropped settling samples as NaN. Incomplete cycles and missing packets
+        remain NaN.
+    use_settling_for_fit : bool, optional
+        If ``False`` (default), samples flagged with ``modulation_settling==1``
+        are included in the output but excluded from the per-point reference,
+        phase-slope and curvature estimates. Set ``True`` only when the settling
+        flag is being used diagnostically rather than to mark transient samples.
+    threshold_linewidths : float, optional
+        Calibrated ``needs_update`` threshold.  Ignored without calibration.
+
+    Returns
+    -------
+    dict
+        Sample-aligned arrays, usually shape ``(n_samples, n_tones)``:
+        ``z_demod``, ``mag``, ``phase_rad``, ``phase_unwrapped_rad``,
+        ``freq_shift_hz``, ``resonance_shift_hz``, ``dphi_df`` (local point
+        slope), ``center_dphi_df`` (cycle slope at zero/nearest-centre offset),
+        ``d2phi_df2``, ``modulation_offset_hz``, and ``dissipation``.  Without
+        calibration, ``dissipation`` is the same local linearized matched
+        quadrature used by the parsed-sample plotting path, with the modulation
+        points providing the local IQ gradient.  Metadata arrays ``cycle_index``,
+        ``modulation_point``, ``modulation_settling``, ``sample_present``,
+        ``sample_used_in_cycle`` and packet/telescope fields are included when
+        available.
+    """
+    if method not in ('accurate', 'model', 'fast'):
+        raise ValueError(f"method must be 'accurate', 'model' or 'fast', got {method!r}")
+    if isinstance(fill_settling, str):
+        fill_mode = fill_settling.lower()
+    else:
+        fill_mode = 'raw' if fill_settling else 'none'
+    fill_aliases = {
+        'true': 'raw',
+        'cycle': 'raw',
+        'raw': 'raw',
+        'false': 'none',
+        'none': 'none',
+        'nan': 'none',
+        'interpolate': 'interpolate',
+        'interp': 'interpolate',
+        'linear': 'interpolate',
+    }
+    if fill_mode not in fill_aliases:
+        raise ValueError(
+            "fill_settling must be bool or one of "
+            "'raw', 'interpolate', 'none'")
+    fill_mode = fill_aliases[fill_mode]
+
+    # Require the sample-retaining grouping (4-D z); mean-reduced data cannot
+    # recover the per-sample stream this function rebuilds.
+    z = np.asarray(grouped['z'])
+    if z.ndim != 4:
+        raise ValueError(
+            'demodulate_timestream requires group_cycles(..., reduce=None); '
+            f'grouped["z"] has {z.ndim} dimensions')
+    n_cycles, N, n_used, n_tones = z.shape
+
+    sample_index = np.asarray(grouped.get('sample_index'))
+    if sample_index.shape != (n_cycles, N, n_used):
+        raise ValueError(
+            'grouped["sample_index"] must have shape '
+            f'{(n_cycles, N, n_used)}, got {sample_index.shape}')
+
+    if offsets is None:
+        offsets = grouped['offsets_hz']
+    offsets = np.asarray(offsets, dtype=float)
+    if offsets.ndim == 1:
+        offsets = offsets[:, None]
+    if offsets.shape != (N, n_tones):
+        raise ValueError(
+            f'offsets must have shape {(N, n_tones)}, got {offsets.shape}')
+
+    freq_hz = grouped.get('freq_hz')
+    if freq_hz is not None:
+        freq_hz = np.asarray(freq_hz, dtype=float)
+
+    if data_dict is not None:
+        n_samples_out = len(data_dict['modulation_point'])
+    elif n_samples is not None:
+        n_samples_out = int(n_samples)
+    else:
+        valid_indices = sample_index[sample_index >= 0]
+        n_samples_out = int(np.max(valid_indices) + 1) if valid_indices.size else 0
+
+    # Allocate the sample-aligned output (one row per original sample, NaN until
+    # a grouped sample or raw-fill writes into it).
+    sample_shape = (n_samples_out, n_tones)
+    out = {
+        'num_tones': int(n_tones),
+        'num_samples': int(n_samples_out),
+        'z_demod': np.full(sample_shape, np.nan + 1j * np.nan, dtype=complex),
+        'mag': np.full(sample_shape, np.nan),
+        'phase_rad': np.full(sample_shape, np.nan),
+        'phase_unwrapped_rad': np.full(sample_shape, np.nan),
+        'freq_shift_hz': np.full(sample_shape, np.nan),
+        'resonance_shift_hz': np.full(sample_shape, np.nan),
+        'dphi_df': np.full(sample_shape, np.nan),
+        'center_dphi_df': np.full(sample_shape, np.nan),
+        'd2phi_df2': np.full(sample_shape, np.nan),
+        'modulation_offset_hz': np.full(sample_shape, np.nan),
+        'dissipation': np.full(sample_shape, np.nan),
+        'detuning_linewidths': np.full(sample_shape, np.nan),
+        'needs_update': np.zeros(sample_shape, dtype=bool),
+        'sample_index': np.arange(n_samples_out, dtype=int),
+        'cycle_index': np.full(n_samples_out, -1, dtype=int),
+        'modulation_point': np.zeros(n_samples_out, dtype=int),
+        'modulation_settling': np.zeros(n_samples_out, dtype=int),
+        'sample_present': np.zeros(n_samples_out, dtype=bool),
+        'sample_used_in_cycle': np.zeros(n_samples_out, dtype=bool),
+    }
+    if data_dict is not None:
+        for key in ('date', 'sample_rate'):
+            if key in data_dict:
+                out[key] = data_dict[key]
+        if 'info' in data_dict:
+            out['info'] = copy.deepcopy(data_dict['info'])
+        if 'sample_rate' not in out and 'sample_rate_hz' in data_dict:
+            out['sample_rate'] = data_dict['sample_rate_hz']
+
+    source_tone_metadata = _extract_tone_metadata(grouped)
+    if data_dict is not None:
+        source_tone_metadata.update(_extract_tone_metadata(data_dict))
+    mod_indices = _clean_indices(grouped.get('modulated_indices'), n_tones)
+    if not mod_indices:
+        mod_indices = _clean_indices(grouped.get('mod_indices'), n_tones)
+    if not mod_indices:
+        mod_indices = _modulated_indices_from_offsets(offsets)
+    tone_metadata, tone_roles = _annotate_tone_metadata(
+        source_tone_metadata, n_tones, mod_indices)
+    out['tone_metadata'] = tone_metadata
+    for key, value in tone_roles.items():
+        out[key] = value
+    if 'info' not in out or not isinstance(out['info'], dict):
+        out['info'] = {}
+    tones_info = out['info'].get('tones')
+    if not isinstance(tones_info, dict):
+        tones_info = {}
+    tones_info.update(copy.deepcopy(tone_metadata))
+    out['info']['tones'] = tones_info
+
+    # Map each grouped (cycle, point, dwell) slot back to its original sample
+    # position and stamp the cycle index / point / presence onto the grid.
+    meta_valid = (sample_index >= 0) & (sample_index < n_samples_out)
+    if np.any(meta_valid):
+        cycle_grid = np.broadcast_to(
+            np.arange(n_cycles, dtype=int)[:, None, None], sample_index.shape)
+        point_default = np.broadcast_to(
+            np.arange(1, N + 1, dtype=int)[None, :, None], sample_index.shape)
+        point_grid = np.asarray(grouped.get('modulation_point', point_default))
+        present_grid = np.asarray(grouped.get(
+            'sample_present', np.ones(sample_index.shape, dtype=bool)))
+        idx = sample_index[meta_valid]
+        out['cycle_index'][idx] = cycle_grid[meta_valid]
+        out['modulation_point'][idx] = point_grid[meta_valid]
+        out['sample_present'][idx] = present_grid[meta_valid]
+        out['sample_used_in_cycle'][idx] = True
+
+    # Scatter the grouped per-sample counters/flags onto the output sample grid.
+    for out_key, grouped_key, default, dtype in (
+            ('packet_counter', 'packet_counter', -1, np.int64),
+            ('telescope_time', 'telescope_time', 0, np.uint64),
+            ('packet_error', 'packet_error', 0, int),
+            ('packet_missing', 'packet_missing', False, bool),
+            ('modulation_revision', 'modulation_revision', 0, int)):
+        if grouped_key not in grouped:
+            continue
+        arr = np.asarray(grouped[grouped_key])
+        sample_arr = np.full(n_samples_out, default, dtype=dtype)
+        valid = meta_valid & (arr.shape == sample_index.shape)
+        if np.any(valid):
+            sample_arr[sample_index[valid]] = arr[valid]
+        out[out_key] = sample_arr
+
+    if grouped.get('stream_flags'):
+        out_flags = {}
+        for name, arr in grouped['stream_flags'].items():
+            arr = np.asarray(arr)
+            sample_arr = np.zeros(n_samples_out, dtype=arr.dtype)
+            valid = meta_valid & (arr.shape == sample_index.shape)
+            if np.any(valid):
+                sample_arr[sample_index[valid]] = arr[valid]
+            out_flags[name] = sample_arr
+        out['stream_flags'] = out_flags
+
+    raw_z = None
+    raw_points = None
+    raw_settling = None
+    raw_cycle_index = None
+    raw_point_index = None
+    if data_dict is not None:
+        raw_points = np.asarray(data_dict.get(
+            'modulation_point', np.zeros(n_samples_out)), dtype=int)
+        raw_settling = np.asarray(data_dict.get(
+            'modulation_settling', np.zeros(n_samples_out)), dtype=int)
+        n_raw = min(n_samples_out, len(raw_points), len(raw_settling))
+        out['modulation_point'][:n_raw] = raw_points[:n_raw]
+        out['modulation_settling'][:n_raw] = raw_settling[:n_raw]
+        out['sample_present'][:n_raw] = True
+
+        for out_key, data_key, default, dtype in (
+                ('packet_counter', 'packet_counter', -1, np.int64),
+                ('telescope_time', 'telescope_time', 0, np.uint64),
+                ('packet_error', 'packet_error', 0, int),
+                ('modulation_revision', 'modulation_revision', 0, int)):
+            if data_key not in data_dict:
+                continue
+            values = np.asarray(data_dict[data_key])
+            sample_arr = np.full(n_samples_out, default, dtype=dtype)
+            n_val = min(n_samples_out, len(values))
+            sample_arr[:n_val] = values[:n_val]
+            out[out_key] = sample_arr
+
+        if data_dict.get('stream_flags'):
+            out_flags = {}
+            for name, values in data_dict['stream_flags'].items():
+                values = np.asarray(values)
+                sample_arr = np.zeros(n_samples_out, dtype=values.dtype)
+                n_val = min(n_samples_out, len(values))
+                sample_arr[:n_val] = values[:n_val]
+                out_flags[name] = sample_arr
+            out['stream_flags'] = out_flags
+
+        if fill_mode == 'raw':
+            # 'raw' fill: also demodulate samples that group_cycles dropped
+            # (e.g. settling). Extend each retained point's [start, stop] run
+            # outward over adjacent same-point samples so those dropped samples
+            # inherit the completed cycle's reference/slope below.
+            raw_z = _tone_iq(data_dict, n_tones)[:n_samples_out]
+            raw_cycle_index = out['cycle_index'].copy()
+            raw_point_index = out['modulation_point'].astype(int) - 1
+            for c in range(n_cycles):
+                for p in range(N):
+                    kept = sample_index[c, p]
+                    kept = kept[(kept >= 0) & (kept < n_samples_out)]
+                    if kept.size == 0:
+                        continue
+                    start = int(np.min(kept))
+                    stop = int(np.max(kept))
+                    while start > 0 and raw_points[start - 1] == p + 1:
+                        start -= 1
+                    while stop + 1 < n_raw and raw_points[stop + 1] == p + 1:
+                        stop += 1
+                    raw_cycle_index[start:stop + 1] = c
+                    raw_point_index[start:stop + 1] = p
+            assigned = (raw_cycle_index >= 0) & (raw_point_index >= 0)
+            out['cycle_index'][assigned] = raw_cycle_index[assigned]
+
+    # Samples used to estimate the per-point reference and phase slope/curvature.
+    # By default settling transients are excluded from those fits.
+    fit_sample_mask = np.ones((n_cycles, N, n_used), dtype=bool)
+    grouped_settling = grouped.get('modulation_settling')
+    if not use_settling_for_fit and grouped_settling is not None:
+        grouped_settling = np.asarray(grouped_settling)
+        if grouped_settling.shape == fit_sample_mask.shape:
+            fit_sample_mask &= grouped_settling == 0
+
+    ref_input = None
+    if reference_z is not None:
+        ref_input = np.asarray(reference_z, dtype=complex)
+        if ref_input.ndim == 1:
+            ref_input = ref_input[:, None]
+        if ref_input.shape != (N, n_tones):
+            raise ValueError(
+                f'reference_z must have shape {(N, n_tones)}, got {ref_input.shape}')
+
+    point_reference_z = np.full((N, n_tones), np.nan + 1j * np.nan, dtype=complex)
+    center_reference_z = np.full(n_tones, np.nan + 1j * np.nan, dtype=complex)
+    center_offset_hz = np.full(n_tones, np.nan)
+    center_point_index = np.zeros(n_tones, dtype=int)
+    dissipation_reference_frequency_hz = np.full(n_tones, np.nan)
+
+    tone_frequencies_hz = None
+    info = out.get('info')
+    if isinstance(info, dict):
+        tones_info = info.get('tones', {})
+        if isinstance(tones_info, dict) and tones_info.get('frequencies_hz') is not None:
+            tone_frequencies_hz = np.asarray(tones_info.get('frequencies_hz'), dtype=float)
+
+    def _cal_for(t):
+        if calibration is None:
+            return None
+        if isinstance(calibration, dict):
+            return calibration.get(t)
+        return calibration[t] if t < len(calibration) else None
+
+    def _reference_frequency_hz(t, c_point):
+        candidates = []
+        if freq_hz is not None and freq_hz.shape == (N, n_tones):
+            candidates.append(freq_hz[c_point, t])
+            candidates.append(_nanmean_quiet(freq_hz[:, t]))
+        if tone_frequencies_hz is not None and t < len(tone_frequencies_hz):
+            candidates.append(tone_frequencies_hz[t])
+        for candidate in candidates:
+            try:
+                candidate = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(candidate) and candidate != 0.0:
+                return candidate
+        return np.nan
+
+    # Per tone: build the working basis, its per-point reference, the local
+    # phase slope/curvature, then turn every sample into a centre-probe estimate.
+    for t in range(n_tones):
+        f = offsets[:, t]
+        zt = z[:, :, :, t]
+        cal = _cal_for(t)
+
+        # Working basis: calibrated (de-embedded + phase-centred) when a
+        # calibration is supplied, otherwise the raw I/Q as captured.
+        if cal is not None and freq_hz is not None:
+            z_basis = np.full_like(zt, np.nan + 1j * np.nan, dtype=complex)
+            for p in range(N):
+                z_basis[:, p, :] = cal.transform_raw_iq(freq_hz[p, t], zt[:, p, :])
+        else:
+            z_basis = zt
+
+        # Per-point reference = external value, or the capture mean (settling
+        # samples excluded), falling back to the all-sample mean where empty.
+        z_fit_basis = np.where(fit_sample_mask, z_basis, np.nan + 1j * np.nan)
+        if ref_input is not None:
+            ref = ref_input[:, t]
+        else:
+            ref = _nanmean_quiet(z_fit_basis, axis=(0, 2))
+            ref_all = _nanmean_quiet(z_basis, axis=(0, 2))
+            ref = np.where(np.isfinite(ref), ref, ref_all)
+        point_reference_z[:, t] = ref
+
+        # Locate the centre probe point (a zero offset, else the nearest one).
+        zero = np.isclose(f, 0.0)
+        if np.any(zero):
+            ref_center = _nanmean_quiet(ref[zero])
+            c_offset = 0.0
+            c_point = int(np.flatnonzero(zero)[0])
+        else:
+            c_point = int(np.nanargmin(np.abs(f))) if len(f) else 0
+            ref_center = ref[c_point]
+            c_offset = float(f[c_point])
+        center_reference_z[t] = ref_center
+        center_offset_hz[t] = c_offset
+        center_point_index[t] = c_point
+        ref_freq_hz = _reference_frequency_hz(t, c_point)
+        dissipation_reference_frequency_hz[t] = ref_freq_hz
+
+        # Per-cycle phase-vs-offset curve -> centre slope, local slope at each
+        # point, and curvature. 'fast' takes the slope from the extreme offsets;
+        # otherwise a quadratic (>=3 distinct offsets) / linear fit is used.
+        point_z = _nanmean_quiet(z_fit_basis, axis=2)      # (n_cycles, N)
+        point_z_all = _nanmean_quiet(z_basis, axis=2)
+        point_z = np.where(np.isfinite(point_z), point_z, point_z_all)
+        order = np.argsort(f)
+        f_fit = f[order]
+        phi_fit = np.unwrap(np.angle(point_z[:, order]), axis=1)
+        n_unique = len(np.unique(f_fit))
+
+        slope_center = np.full(n_cycles, np.nan)
+        curvature = np.full(n_cycles, np.nan)
+        local_slope = np.full((n_cycles, N), np.nan)
+        complex_gradient = np.full((n_cycles, N), np.nan + 1j * np.nan, dtype=complex)
+
+        if n_unique >= 2:
+            if method == 'fast':
+                lo = int(order[0])
+                hi = int(order[-1])
+                df_span = f[hi] - f[lo]
+                if df_span != 0:
+                    phi_span = _wrap_phase(np.angle(point_z[:, hi])
+                                           - np.angle(point_z[:, lo]))
+                    slope_center = phi_span / df_span
+
+            deg = 2 if n_unique >= 3 else 1
+            coeff = np.polyfit(f_fit, phi_fit.T, deg)
+            z_coeff = np.polyfit(f_fit, point_z[:, order].T, deg)
+            if deg == 1:
+                fit_slope = coeff[0]
+                fit_curv = np.full(n_cycles, np.nan)
+                complex_gradient[:, :] = z_coeff[0][:, None]
+            else:
+                fit_slope = 2.0 * coeff[0] * c_offset + coeff[1]
+                fit_curv = 2.0 * coeff[0]
+
+            if method != 'fast':
+                slope_center = fit_slope
+            if deg == 2:
+                curvature = fit_curv
+                for p in range(N):
+                    local_slope[:, p] = 2.0 * coeff[0] * f[p] + coeff[1]
+                    complex_gradient[:, p] = 2.0 * z_coeff[0] * f[p] + z_coeff[1]
+            else:
+                local_slope[:, :] = fit_slope[:, None]
+        local_slope = np.where(np.isfinite(local_slope), local_slope, slope_center[:, None])
+
+        # z_demod: rotate/scale every sample onto the centre-point reference, so
+        # each probe point reads as if measured at the centre.
+        with np.errstate(divide='ignore', invalid='ignore'):
+            z_demod_group = z_basis / ref[None, :, None] * ref_center
+
+        # Frequency + dissipation. Calibrated: the Mobius inversion gives the
+        # probe detuning directly (subtract the known offset for centre detuning).
+        if cal is not None and freq_hz is not None:
+            df_probe, diss = cal.convert_centered_iq(z_basis)
+            freq_group = df_probe - f[None, :, None]
+            diss_group = diss
+            lw_t = cal.fr / cal.Ql
+            with np.errstate(divide='ignore', invalid='ignore'):
+                det_lw_group = freq_group / lw_t
+            needs_update_group = np.abs(det_lw_group) > threshold_linewidths
+        else:
+            # Model-free: detuning from the phase residual / local slope, and
+            # dissipation from the linearized tangent/normal IQ projection.
+            phase_resid = _wrap_phase(
+                np.angle(z_basis) - np.angle(ref)[None, :, None])
+            with np.errstate(divide='ignore', invalid='ignore'):
+                freq_group = phase_resid / local_slope[:, :, None]
+            _, diss_group = _linearized_iq_projection(
+                ref[None, :, None],
+                complex_gradient[:, :, None],
+                z_basis,
+                reference_frequency_hz=ref_freq_hz)
+            det_lw_group = np.full_like(freq_group, np.nan, dtype=float)
+            needs_update_group = np.zeros(freq_group.shape, dtype=bool)
+
+        # Scatter this tone's grouped per-sample results onto the output grid.
+        valid = meta_valid & np.isfinite(z_basis)
+        if not np.any(valid):
+            continue
+
+        idx = sample_index[valid]
+        out['z_demod'][idx, t] = z_demod_group[valid]
+        out['freq_shift_hz'][idx, t] = freq_group[valid]
+        out['resonance_shift_hz'][idx, t] = -freq_group[valid]
+        out['dissipation'][idx, t] = diss_group[valid]
+        out['detuning_linewidths'][idx, t] = det_lw_group[valid]
+        out['needs_update'][idx, t] = needs_update_group[valid]
+
+        offset_grid = np.broadcast_to(f[None, :, None], sample_index.shape)
+        local_grid = np.broadcast_to(local_slope[:, :, None], sample_index.shape)
+        center_grid = np.broadcast_to(slope_center[:, None, None], sample_index.shape)
+        curv_grid = np.broadcast_to(curvature[:, None, None], sample_index.shape)
+        out['modulation_offset_hz'][idx, t] = offset_grid[valid]
+        out['dphi_df'][idx, t] = local_grid[valid]
+        out['center_dphi_df'][idx, t] = center_grid[valid]
+        out['d2phi_df2'][idx, t] = curv_grid[valid]
+
+        # 'raw' fill: demodulate the dropped samples (those not retained in a
+        # cycle) using their owning cycle's reference and slope, computed above.
+        if raw_z is not None:
+            for p in range(N):
+                sample_mask = (
+                    (raw_point_index == p)
+                    & (raw_cycle_index >= 0)
+                    & (raw_cycle_index < n_cycles)
+                    & ~out['sample_used_in_cycle']
+                )
+                if not np.any(sample_mask):
+                    continue
+                sample_idx = np.flatnonzero(sample_mask)
+                cycle_idx = raw_cycle_index[sample_idx]
+                raw_values = raw_z[sample_idx, t]
+                if cal is not None and freq_hz is not None:
+                    sample_basis = cal.transform_raw_iq(freq_hz[p, t], raw_values)
+                else:
+                    sample_basis = raw_values
+                finite = np.isfinite(sample_basis)
+                if not np.any(finite):
+                    continue
+                sample_idx = sample_idx[finite]
+                cycle_idx = cycle_idx[finite]
+                sample_basis = sample_basis[finite]
+
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    out['z_demod'][sample_idx, t] = sample_basis / ref[p] * ref_center
+
+                if cal is not None and freq_hz is not None:
+                    df_probe, diss = cal.convert_centered_iq(sample_basis)
+                    freq_sample = df_probe - f[p]
+                    out['dissipation'][sample_idx, t] = diss
+                    lw_t = cal.fr / cal.Ql
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        det_lw = freq_sample / lw_t
+                    out['detuning_linewidths'][sample_idx, t] = det_lw
+                    out['needs_update'][sample_idx, t] = (
+                        np.abs(det_lw) > threshold_linewidths)
+                else:
+                    phase_resid = _wrap_phase(np.angle(sample_basis) - np.angle(ref[p]))
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        freq_sample = phase_resid / local_slope[cycle_idx, p]
+                    _, diss = _linearized_iq_projection(
+                        ref[p],
+                        complex_gradient[cycle_idx, p],
+                        sample_basis,
+                        reference_frequency_hz=ref_freq_hz)
+                    out['dissipation'][sample_idx, t] = diss
+
+                out['freq_shift_hz'][sample_idx, t] = freq_sample
+                out['resonance_shift_hz'][sample_idx, t] = -freq_sample
+                out['modulation_offset_hz'][sample_idx, t] = f[p]
+                out['dphi_df'][sample_idx, t] = local_slope[cycle_idx, p]
+                out['center_dphi_df'][sample_idx, t] = slope_center[cycle_idx]
+                out['d2phi_df2'][sample_idx, t] = curvature[cycle_idx]
+
+    # 'interpolate' fill: bridge settling-sample gaps by linear interpolation
+    # between the surrounding non-settling demodulated samples (flags untouched).
+    if fill_mode == 'interpolate':
+        settling_targets = (
+            (out['modulation_settling'] == 1)
+            & np.asarray(out['sample_present'], dtype=bool)
+        )
+        source = (
+            (out['modulation_settling'] == 0)
+            & np.asarray(out['sample_present'], dtype=bool)
+        )
+        out['z_demod'] = (
+            _interp_nan_targets(out['z_demod'].real, settling_targets, source)
+            + 1j * _interp_nan_targets(out['z_demod'].imag, settling_targets, source)
+        )
+        for key in (
+                'freq_shift_hz',
+                'resonance_shift_hz',
+                'dphi_df',
+                'center_dphi_df',
+                'd2phi_df2',
+                'dissipation',
+                'detuning_linewidths'):
+            out[key] = _interp_nan_targets(out[key], settling_targets, source)
+        out['needs_update'][settling_targets] = (
+            np.abs(out['detuning_linewidths'][settling_targets])
+            > threshold_linewidths)
+
+    # Derived magnitude/phase plus parsed-sample-compatible aliases so the result
+    # drops into the same plotting/analysis paths as a normal timestream.
+    out['mag'] = np.abs(out['z_demod'])
+    out['phase_rad'] = np.angle(out['z_demod'])
+    out['phase_unwrapped_rad'] = _unwrap_nan_segments(out['phase_rad'])
+    out['i_data'] = {
+        f'{t:04d}': out['z_demod'][:, t].real
+        for t in range(n_tones)
+    }
+    out['q_data'] = {
+        f'{t:04d}': out['z_demod'][:, t].imag
+        for t in range(n_tones)
+    }
+    out['frequency_hz'] = out['resonance_shift_hz']
+    out['frequency_shift_hz'] = out['resonance_shift_hz']
+    out['probe_frequency_shift_hz'] = out['freq_shift_hz']
+    out['modulation_demodulated'] = True
+    out['point_reference_z'] = point_reference_z
+    out['center_reference_z'] = center_reference_z
+    out['point_reference_phase_rad'] = np.angle(point_reference_z)
+    out['center_reference_phase_rad'] = np.angle(center_reference_z)
+    out['center_offset_hz'] = center_offset_hz
+    out['center_point_index'] = center_point_index
+    out['dissipation_reference_frequency_hz'] = dissipation_reference_frequency_hz
+    return out
 
 
 def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
@@ -665,10 +1551,14 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
             phi = np.unwrap(np.angle(zc), axis=1)
             df_pts, dd_pts = cal.convert_centered_iq(zc)      # (n_cycles, N) each
             lw_t = cal.fr / cal.Ql                            # linewidth (Hz) from the fit
-            out['freq_shift_hz'][:, t] = df_pts[:, ci]        # centre probe detuning from fitted fr
-            out['detuning_hz'][:, t] = df_pts[:, ci]
-            out['detuning_linewidths'][:, t] = df_pts[:, ci] / lw_t
-            out['needs_update'][:, t] = np.abs(df_pts[:, ci] / lw_t) > threshold_linewidths
+            # Calibrated: df_pts is the ABSOLUTE detuning of the centre probe from
+            # the fitted fr, so freq_shift and detuning are the same quantity and
+            # detuning-in-linewidths is just that over the linewidth.
+            absolute_detuning_hz = df_pts[:, ci]
+            out['freq_shift_hz'][:, t] = absolute_detuning_hz
+            out['detuning_hz'][:, t] = absolute_detuning_hz
+            out['detuning_linewidths'][:, t] = absolute_detuning_hz / lw_t
+            out['needs_update'][:, t] = np.abs(absolute_detuning_hz / lw_t) > threshold_linewidths
             out['dissipation'][:, t] = dd_pts[:, ci]
         else:
             # Model-free basis: raw I/Q phase.
@@ -696,20 +1586,31 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
         out['d2phi_df2'][:, t] = d2
 
         if cal is None or freq_hz is None:
-            # Model-free frequency shift + leading-order detuning (needs linewidth).
-            baseline = (np.mean(phi[:, ci]) if phase_baseline is None
-                        else np.asarray(phase_baseline, dtype=float)[t])
+            # Model-free: no de-embedding, so the raw phase has an unknown offset
+            # (cable delay, electronics, the unknown true fr) and we cannot read an
+            # absolute detuning directly. Two separate quantities are produced.
+
+            # 1) freq_shift_hz is RELATIVE motion: the centre-point phase referenced
+            #    to a baseline (mean over cycles, or supplied), divided by the local
+            #    slope. It tracks how the resonance moves, NOT where it sits.
+            phase_reference = (np.mean(phi[:, ci]) if phase_baseline is None
+                               else np.asarray(phase_baseline, dtype=float)[t])
             with np.errstate(divide='ignore', invalid='ignore'):
-                out['freq_shift_hz'][:, t] = (phi[:, ci] - baseline) / slope
-            # ratio d2/dphi has units 1/Hz; for an ideal Lorentzian/arctan phase
-            # the detuning in linewidths is approx -(ratio * linewidth)/8.
+                out['freq_shift_hz'][:, t] = (phi[:, ci] - phase_reference) / slope
+
+            # 2) detuning is ABSOLUTE: the curvature d2phi/df2 crosses zero at
+            #    resonance regardless of the unknown phase offset, so the ratio
+            #    curvature/slope is a self-referenced detuning estimate. The -(.)/8
+            #    factor and linewidth scaling assume a near-ideal Lorentzian/arctan
+            #    phase, so this is approximate; pass a fit (calibrated branch above)
+            #    for a model-consistent absolute detuning instead.
             if lw is not None and N >= 3:
                 with np.errstate(divide='ignore', invalid='ignore'):
-                    ratio_per_hz = d2 / slope
-                det_lw = -(ratio_per_hz * lw[t]) / 8.0
-                out['detuning_linewidths'][:, t] = det_lw
-                out['detuning_hz'][:, t] = det_lw * lw[t]
-                out['needs_update'][:, t] = np.abs(det_lw) > threshold_linewidths
+                    curvature_over_slope_per_hz = d2 / slope
+                detuning_linewidths = -(curvature_over_slope_per_hz * lw[t]) / 8.0
+                out['detuning_linewidths'][:, t] = detuning_linewidths
+                out['detuning_hz'][:, t] = detuning_linewidths * lw[t]
+                out['needs_update'][:, t] = np.abs(detuning_linewidths) > threshold_linewidths
 
     return out
 
@@ -776,16 +1677,22 @@ def _max_snr_operating_point(cal, n_grid=20001, y_max=8.0):
     return float(f[int(np.argmax(slope))])
 
 
-def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
-                                 delta_linewidths=0.25, exclude_blind=True,
+def params_from_sweep(sweep, *, n_points=None, point_sequence=None,
+                                 offset_linewidths=None,
+                                 samples_per_point=1, n_settle=1,
+                                 delta_linewidths=0.1, exclude_blind=True,
                                  blind_indices=None, deembed=True, fits=None):
     """
     Turn a calibration sweep into a ready-to-use ``enable_modulation`` config.
 
     For each resonator a centre and a linewidth are obtained, then a symmetric
-    ``n_points`` probe pattern is built with **each tone's probe spacing scaled
-    to its own linewidth** (so a narrow resonator gets a smaller delta). The
-    returned dict splats straight into :meth:`ReadoutClient.enable_modulation`.
+    probe pattern is built with **each tone's probe spacing scaled to its own
+    linewidth** (so a narrow resonator gets a smaller delta). By default this is
+    the symmetric ``n_points`` pattern. Pass ``point_sequence`` to repeat or
+    reorder those base points within each modulation cycle, e.g. ``(1, 2, 3, 2)``
+    for ``[-delta, 0, +delta, 0]``. Or pass ``offset_linewidths`` to specify the
+    expanded pattern directly in linewidth units, e.g. ``(-0.25, 0, +0.25, 0)``.
+    The returned dict splats straight into :meth:`ReadoutClient.enable_modulation`.
 
     The centre is the **geometric steepest point** — the frequency of maximum
     frequency-shift responsivity (``argmax |dS21/df|`` of the de-embedded
@@ -819,16 +1726,30 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
         arrays of shape ``(n_sweep_points, n_tones)``. The compact ``f`` / ``z``
         form is also accepted. Blind-tone indices are inferred from standard
         parsed metadata or may be carried directly as ``blind_indices``.
-    n_points : int, optional
-        Number of probe points per cycle (>=2; 3 enables the curvature/detuning
-        estimate). Default 3.
+    n_points : int or None, optional
+        Number of base probe points (>=2; 3 enables the curvature/detuning
+        estimate). Default 3 when ``point_sequence`` is omitted; when
+        ``point_sequence`` is supplied and ``n_points`` is None, inferred from
+        the maximum point index in the sequence.
+    point_sequence : array-like of int or None, optional
+        1-based sequence of base point indices to repeat each cycle. For example,
+        ``(1, 2, 3)`` is the ordinary three-point pattern and ``(1, 2, 3, 2)``
+        repeats the centre point after the high-side point. The output
+        ``offsets`` has one row per sequence entry. Mutually exclusive with
+        ``offset_linewidths``.
+    offset_linewidths : array-like of float or None, optional
+        Direct expanded probe pattern in linewidth units. For each modulated
+        tone, row ``i`` of ``offsets`` is
+        ``offset_linewidths[i] * linewidth_hz[tone]``. For example,
+        ``(-0.25, 0.0, 0.25, 0.0)`` gives ``[-0.25 lw, 0, +0.25 lw, 0]``.
+        Mutually exclusive with ``n_points`` and ``point_sequence``.
     samples_per_point : int, optional
         Dwell (samples per point per cycle). Default 1.
     n_settle : int, optional
         Settling samples per point. Default 1.
     delta_linewidths : float, optional
         Probe half-span in units of each tone's linewidth (kept small to stay
-        near the high-slope inflection). Default 0.25.
+        near the high-slope inflection). Default 0.1.
     exclude_blind : bool, optional
         Drop blind tones from ``mod_indices``. Default True.
     blind_indices : array-like or None, optional
@@ -852,8 +1773,13 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
     -------
     dict
         ``center`` : ``(n_tones,)`` per-tone centre frequencies (Hz);
-        ``offsets`` : ``(n_points, len(mod_indices))`` per-tone probe offsets (Hz);
+        ``offsets`` : ``(n_cycle_points, len(mod_indices))`` per-tone probe
+        offsets (Hz), where ``n_cycle_points`` is ``n_points`` by default or
+        ``len(point_sequence)`` / ``len(offset_linewidths)`` when supplied;
         ``mod_indices`` : modulated (resonator) tone indices;
+        ``point_sequence`` : 1-based base-point sequence used to build
+        ``offsets`` (``None`` when ``offset_linewidths`` was supplied);
+        ``offset_linewidths`` : expanded offset pattern in linewidth units;
         ``samples_per_point`` / ``n_settle`` : as requested;
         ``linewidth_hz`` : ``(len(mod_indices),)`` linewidths (for model-free demod);
         ``calibration`` : ``{tone_index: ResonatorCalibration}`` for tones with a
@@ -866,8 +1792,79 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
         (``center - fitted_fr``, the demod ``freq_shift_hz`` baseline);
         ``summary`` : a human-readable multi-line summary string.
     """
-    if n_points < 2:
-        raise ValueError('n_points must be >= 2')
+    sequence_requested = point_sequence is not None
+    direct_offsets_requested = offset_linewidths is not None
+
+    def _normalise_n_points(value):
+        """Validate an integer-valued base point count."""
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('n_points must be an integer >= 2') from exc
+        if not np.isfinite(value) or value != round(value):
+            raise ValueError('n_points must be an integer >= 2')
+        value = int(round(value))
+        if value < 2:
+            raise ValueError('n_points must be >= 2')
+        return value
+
+    def _normalise_offset_linewidths(values):
+        """Validate direct linewidth-scale offsets."""
+        arr = np.asarray(values)
+        if arr.ndim != 1 or arr.size < 2:
+            raise ValueError(
+                'offset_linewidths must be a 1D sequence with at least 2 entries')
+        try:
+            arr = arr.astype(float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('offset_linewidths entries must be finite numbers') from exc
+        if not np.all(np.isfinite(arr)):
+            raise ValueError('offset_linewidths entries must be finite numbers')
+        return arr
+
+    if direct_offsets_requested:
+        if n_points is not None or point_sequence is not None:
+            raise ValueError(
+                'offset_linewidths is mutually exclusive with n_points and '
+                'point_sequence')
+        offset_scales = _normalise_offset_linewidths(offset_linewidths)
+        point_sequence = None
+        n_points = None
+    else:
+        offset_scales = None
+
+    if not direct_offsets_requested and point_sequence is None:
+        n_points = 3 if n_points is None else _normalise_n_points(n_points)
+        point_sequence = np.arange(1, n_points + 1, dtype=int)
+    elif not direct_offsets_requested:
+        raw_sequence = np.asarray(point_sequence)
+        if raw_sequence.ndim != 1 or raw_sequence.size < 2:
+            raise ValueError('point_sequence must be a 1D sequence with at least 2 entries')
+        try:
+            seq_float = raw_sequence.astype(float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('point_sequence entries must be integer point indices') from exc
+        if not np.all(np.isfinite(seq_float)):
+            raise ValueError('point_sequence entries must be finite integer point indices')
+        if not np.array_equal(seq_float, np.rint(seq_float)):
+            raise ValueError('point_sequence entries must be integer point indices')
+        point_sequence = np.rint(seq_float).astype(int)
+        if np.any(point_sequence < 1):
+            raise ValueError('point_sequence entries must be >= 1')
+        if n_points is None:
+            n_points = int(np.max(point_sequence))
+            if n_points < 2:
+                raise ValueError(
+                    'point_sequence must reference at least two base points '
+                    'when n_points is omitted')
+        else:
+            n_points = _normalise_n_points(n_points)
+        if np.any(point_sequence > n_points):
+            raise ValueError(
+                'point_sequence entries must be in the range 1..n_points')
+
     if 'f' in sweep and 'z' in sweep:
         f = np.asarray(sweep['f'], dtype=float)
         z = np.asarray(sweep['z'])
@@ -1001,28 +1998,46 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
             center[t] = f_max_dz_df[t]
             linewidth[t] = estimate_resonance_empirical(ft, z[:, t]).linewidth_hz
 
-    # Symmetric probe pattern per tone: linspace(-delta, +delta, n_points) with
-    # delta scaled to each tone's linewidth.
-    pattern = np.linspace(-1.0, 1.0, n_points)            # e.g. [-1,1] or [-1,0,1]
-    deltas = delta_linewidths * linewidth[mod_indices]    # (len(mod_indices),)
-    offsets = pattern[:, None] * deltas[None, :]          # (n_points, len(mod_indices))
+    # Offset pattern in linewidth units. The hardware only needs the expanded
+    # Hz offsets, but preserving the scale pattern makes configs inspectable.
+    if direct_offsets_requested:
+        pattern = offset_scales
+    else:
+        base_pattern = np.linspace(
+            -delta_linewidths, delta_linewidths, n_points)
+        pattern = base_pattern[point_sequence - 1]
+    offsets = pattern[:, None] * linewidth[mod_indices][None, :]
 
+    points_desc = f'{len(pattern)} points'
+    if direct_offsets_requested:
+        points_desc += f' (offset_linewidths={pattern.tolist()})'
+    elif sequence_requested:
+        points_desc += f' (sequence={point_sequence.tolist()}, base={n_points})'
+    offset_desc = (
+        f'offsets={pattern.tolist()} linewidths'
+        if direct_offsets_requested else
+        f'delta={delta_linewidths} linewidths')
     summary_lines = [
         f'params_from_sweep: {len(mod_indices)} modulated tones '
-        f'({n_tones - len(mod_indices)} excluded), {n_points} points, '
-        f'dwell={samples_per_point}, n_settle={n_settle}, delta={delta_linewidths} linewidths',
+        f'({n_tones - len(mod_indices)} excluded), {points_desc}, '
+        f'dwell={samples_per_point}, n_settle={n_settle}, {offset_desc}',
     ]
     # Operating point relative to the fitted resonance (in linewidths), so the
     # steepest-point offset from fr is visible and can seed the demod baseline.
     offset_from_fr = center - fitted_fr
-    for j, t in enumerate(mod_indices[:8]):
+    for t in mod_indices[:8]:
         has_fr = np.isfinite(fitted_fr[t]) and linewidth[t] > 0
         off = (f'  center-fr={offset_from_fr[t] / linewidth[t]:+.3f} lw'
                if has_fr else '  (model-free, no fr)')
+        max_offset = np.nanmax(np.abs(pattern)) * linewidth[t]
+        offset_summary = (
+            f'offset span<={max_offset/1e3:.3f} kHz'
+            if direct_offsets_requested else
+            f'delta=+/-{delta_linewidths * linewidth[t]/1e3:.3f} kHz')
         summary_lines.append(
             f'  tone {t:4d}: center={center[t]/1e6:.6f} MHz  '
             f'linewidth={linewidth[t]/1e3:.2f} kHz  '
-            f'delta=+/-{deltas[j]/1e3:.3f} kHz{off}')
+            f'{offset_summary}{off}')
     if len(mod_indices) > 8:
         summary_lines.append(f'  ... (+{len(mod_indices) - 8} more)')
 
@@ -1034,6 +2049,8 @@ def params_from_sweep(sweep, *, n_points=3, samples_per_point=1, n_settle=1,
         'center': center,
         'offsets': offsets,
         'mod_indices': mod_indices,
+        'point_sequence': point_sequence,
+        'offset_linewidths': pattern,
         'samples_per_point': int(samples_per_point),
         'n_settle': int(n_settle),
         'linewidth_hz': linewidth[mod_indices],
