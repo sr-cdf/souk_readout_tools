@@ -9570,7 +9570,7 @@ def force_sync_fast(r_fast, wait_s=0.0001, mrst=False, do_sync=True):
         if not hasattr(sync, 'OFFSET_TIMED_SYNC_SW_SYNC'):
             raise RuntimeError(
                 'souk_mkid_readout predates v7.10 timed-sync (no OFFSET_TIMED_SYNC_SW_SYNC); '
-                'upgrade the server venv library to match the 7.10 firmware.')
+                'upgrade the souk-firmware package on the RFSoC to provide firmware version 7.10.')
         tr = sync.host.transport
         setattr(r_fast, f'{cache}_ctrl_addr', tr._get_device_address(f'{sync.prefix}ctrl'))
         setattr(r_fast, f'{cache}_timed_addr', tr._get_device_address(f'{sync.prefix}timed_sync_ctrl'))
