@@ -268,7 +268,11 @@ enabled and never touched in the hot path, so the phase stays continuous as a
 tone dithers or drifts. The ~2× oversampled filterbank keeps a tone covered
 across roughly a full channel of drift; the state reports per-point
 *occupancy* and a `needs_recenter` flag when coverage is exceeded, at which
-point `recenter_modulation()` reloads the maps (a brief break). See
+point `recenter_modulation()` reloads the maps (a brief break). Riding past
+the half-bin edge runs into the filterbank channel rolloff (−1 dB at ~0.70
+bin spacings); each point's control words carry an automatic TX/RX gain (and
+optionally phase) correction for it — see
+[filterbank_compensation.md](filterbank_compensation.md). See
 [Internals](#internals).
 
 Everything below is reference material — dip in as needed.
@@ -879,6 +883,10 @@ filterbank keeps a tone covered to roughly a full channel of drift; occupancy
 classification (`nearest`/`second`/`beyond`) reports this and triggers a
 recentre when coverage is exceeded. `_rf_to_digital_baseband` performs the
 RF→baseband mapping (UDC + Nyquist + DUC/DDC), shared with the fast tone setter.
+Each point's control words also carry the filterbank rolloff compensation —
+TX scaling restores the drive at that point's drift, RX scaling/phase flatten
+the readout ([filterbank_compensation.md](filterbank_compensation.md)); keep
+base tone amplitudes ~1 dB below full scale so the TX boost has headroom.
 
 ### Live update mechanism
 **(Software engine;** the firmware-slot seamless update is the inactive-buffer

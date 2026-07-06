@@ -2392,7 +2392,7 @@ class ReadoutClient:
                           samples_per_point=None, n_settle=None, engine='fw',
                           mode='auto', compensate_rx_ticks=0, force=False,
                           autosync=False, setup_sync=True, mrst=False, setup_mrst=False,
-                          buffer_reuse_delay_accs=3):
+                          buffer_reuse_delay_accs=3, compensate_filterbank=None):
         """
         Enable frequency modulation. ``engine`` selects the modulation engine and
         **defaults to** ``'fw'`` (firmware-slot: the mixer switches between LO
@@ -2411,6 +2411,13 @@ class ReadoutClient:
         ``engine='sw'`` also: ``autosync``, ``setup_sync``, ``mrst``, ``setup_mrst``,
         ``buffer_reuse_delay_accs``.
 
+        ``compensate_filterbank`` (both engines): per-request override of the
+        filterbank rolloff compensation. ``None`` (default) follows the server
+        config (``filterbank_compensation``, default on); ``False`` disables it
+        for this modulation run (e.g. to measure the raw channel response in
+        loopback); ``True`` forces it on. The choice sticks for subsequent
+        update/recenter calls until the next enable.
+
         Returns the server ack. Poll :meth:`get_modulation_state` for the unified
         state (it carries an ``engine`` field). See :meth:`_enable_sw_modulation`
         for the full software-mode detail.
@@ -2420,7 +2427,8 @@ class ReadoutClient:
                 center=center, offsets=offsets, mod_indices=mod_indices,
                 n_dwell=(4 if samples_per_point is None else samples_per_point),
                 n_settle=(0 if n_settle is None else n_settle),
-                mode=mode, compensate_rx_ticks=compensate_rx_ticks, force=force)
+                mode=mode, compensate_rx_ticks=compensate_rx_ticks, force=force,
+                compensate_filterbank=compensate_filterbank)
         if engine == 'sw':
             return self._enable_sw_modulation(
                 center=center, offsets=offsets, mod_indices=mod_indices,
@@ -2428,14 +2436,15 @@ class ReadoutClient:
                 n_settle=(1 if n_settle is None else n_settle),
                 autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
                 compensate_rx_ticks=compensate_rx_ticks,
-                buffer_reuse_delay_accs=buffer_reuse_delay_accs, force=force)
+                buffer_reuse_delay_accs=buffer_reuse_delay_accs, force=force,
+                compensate_filterbank=compensate_filterbank)
         raise ValueError(f"engine must be 'fw' or 'sw', not {engine!r}")
 
     def _enable_sw_modulation(self, center=None, offsets=None, mod_indices=None,
                               samples_per_point=4, n_settle=1, autosync=False,
                               setup_sync=True, mrst=False, setup_mrst=False,
                               compensate_rx_ticks=0, buffer_reuse_delay_accs=3,
-                              force=False):
+                              force=False, compensate_filterbank=None):
         """
         Arm software (ping-pong) tone-frequency modulation. This only **arms**
         (loads the config on the server); it does not start output. Call
@@ -2508,6 +2517,8 @@ class ReadoutClient:
                    'compensate_rx_ticks': int(compensate_rx_ticks),
                    'buffer_reuse_delay_accs': int(buffer_reuse_delay_accs),
                    'force': bool(force)}
+        if compensate_filterbank is not None:
+            message['compensate_filterbank'] = bool(compensate_filterbank)
         if center is not None:
             message['center'] = np.asarray(center, dtype=float).tolist()
         if offsets is not None:
@@ -2711,7 +2722,7 @@ class ReadoutClient:
 
     def _enable_fw_modulation(self, center=None, offsets=None, mod_indices=None,
                               n_dwell=4, n_settle=0, mode='auto', compensate_rx_ticks=0,
-                              force=False):
+                              force=False, compensate_filterbank=None):
         """
         Enable firmware-slot frequency modulation (``enable_modulation`` engine
         ``'fw'``). Loads up to ``n_slots`` combs
@@ -2774,6 +2785,8 @@ class ReadoutClient:
                    'mode': str(mode),
                    'compensate_rx_ticks': int(compensate_rx_ticks),
                    'force': bool(force)}
+        if compensate_filterbank is not None:
+            message['compensate_filterbank'] = bool(compensate_filterbank)
         if center is not None:
             message['center'] = np.asarray(center, dtype=float).tolist()
         if offsets is not None:

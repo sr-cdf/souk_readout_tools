@@ -249,6 +249,238 @@ def _bin_spacing_hz(bin_centers_hz):
         raise ValueError('FFT bin-centre grid has no positive spacing')
     return float(np.min(diffs))
 
+# ---------------------------------------------------------------------------
+# Filterbank channel-response compensation
+#
+# The PSB (synthesis) and PFB (analysis) share one prototype filter: an 8-tap
+# sinc weighted by a DPSS (NW=2) window, on the mlib_devel half-sample time
+# axis. A tone offset from its bin centre rolls off with the single-bank
+# response G (flat to ~0.005 dB over the centre half of a channel, -6 dB at one
+# bin spacing = the channel edge); the accumulator readout additionally sees
+# the synthesis Nyquist image recombine coherently in the analysis bin, so the
+# combined readout is H(d) = sum_m G(d-2m)^2 exp(4j*pi*m*B*tau) with tau the
+# analog loopback group delay (the channelized rate is two bin spacings).
+# Validated on hardware 2026-07-06: digital loopback matched |H| (tau=0) to
+# <=0.04 dB across the full channel; RF loopback (tau fitted 150 ns from the
+# passband phase slope) matched |H| and arg(H) to 0.05 dB / 2.7 mrad including
+# the edge phase turn-over. See doc/filterbank_compensation.md.
+#
+# The compensation restores flat behaviour when a tone operates away from its
+# bin centre (modulation riding the overlap; residuals after snapping):
+#   TX scaling  x 1/G(d_tx)      -- restores the physical drive on the detector
+#   RX scaling  x G(d_rx)/|H|    -- flattens the accumulator readout
+#   RX phase    - arg H(d_rx)    -- removes the image phase turn-over (only
+#                                   non-zero when a group delay is configured;
+#                                   the ordinary delay slope is left for the
+#                                   sweep calibration, which measures it)
+# RX scalings ride on FILTERBANK_RX_SCALE_BASE so the boost part of the
+# correction stays below full scale.
+#
+# The group delay comes from the standard path-delay calibration
+# (``rf_frontend.path_group_delay_ns``: a scalar or a frequency-dependent
+# calibration file, produced by ``client.measure_path_group_delay(
+# save_to_config=True)``), evaluated per tone. The firmware-defaults key
+# ``filterbank_group_delay_override_ns`` overrides it when present -- a
+# testing/loopback knob (e.g. force 0 for an amplitude-only A/B). Master
+# switch: ``filterbank_compensation`` (default True).
+# ---------------------------------------------------------------------------
+
+# The RX LO scale word is INERT in the fabric as of firmware v7.11: writing
+# it has no effect on the accumulator output (measured 2026-07-07 -- the
+# compensated response matches a TX-only prediction to ~0.02 dB; asked in
+# souk-firmware#117). Until a firmware build connects the multiplier, the
+# readout-flattening part of the correction is applied in SOFTWARE instead:
+# the preparer reports per-(tone, point) 'readout_gain_correction' factors in
+# the bundle, the server forwards them in the modulation state, and
+# modulation.group_cycles multiplies them onto the grouped IQ. Flip this to
+# True when the fabric supports it -- the hardware RX scaling switches on and
+# the software factors collapse to 1, so nothing double-corrects.
+FILTERBANK_RX_SCALE_IN_FABRIC = False
+
+# RX scale factors max out at ~1.3 (G/|H| near 0.9 bins); riding them on this
+# base keeps every correction below full scale, at the cost of a fixed,
+# calibration-neutral -2.5 dB in the reported (arbitrary) readout units.
+# (Only used when FILTERBANK_RX_SCALE_IN_FABRIC.)
+FILTERBANK_RX_SCALE_BASE = 0.75
+
+_filterbank_prototype_cache = None
+
+
+def _filterbank_prototype():
+    """
+    Single-bank DPSS+sinc prototype amplitude response (lazily built, cached).
+
+    Returns ``(offset_bins, amplitude)`` with the offset axis in **bin
+    spacings** (the drift_bins convention: +/-1.0 = channel edges), spanning
+    +/-64 with ~1e-3-bin resolution. Coefficients follow mlib_devel's
+    ``pfb_coeff_gen_calc.m`` half-sample time axis -- confirmed against the
+    firmware coefficients (souk-firmware issue #117); the symmetric-linspace
+    variant gives a visibly different passband.
+    """
+    global _filterbank_prototype_cache
+    if _filterbank_prototype_cache is None:
+        import scipy.signal
+        ntaps, nfft, pad, nw = 8, 64, 32, 2.0
+        trange = np.arange(0.5, ntaps * nfft, 1.0) / nfft - ntaps / 2.0
+        coeffs = np.sinc(trange) * scipy.signal.windows.dpss(ntaps * nfft, nw, sym=True)
+        amp = np.abs(np.fft.fftshift(np.fft.fft(coeffs, nfft * pad)))
+        amp /= np.max(amp)
+        # the prototype's natural unit is the channel width = two bin spacings
+        x = np.linspace(-nfft / 2.0, nfft / 2.0, nfft * pad, endpoint=False) * 2.0
+        _filterbank_prototype_cache = (x, amp)
+    return _filterbank_prototype_cache
+
+
+def filterbank_single_bank_gain(offset_bins):
+    """Single-bank (PSB or PFB) amplitude response at ``offset_bins`` spacings."""
+    x, amp = _filterbank_prototype()
+    return np.interp(np.asarray(offset_bins, dtype=float), x, amp)
+
+
+def filterbank_cascade_response(offset_bins, group_delay_s=0.0, bin_spacing_hz=0.0):
+    """
+    Complex combined TX+RX readout response ``H`` at ``offset_bins`` spacings.
+
+    Includes the coherently-recombining synthesis images (see the section
+    comment above); normalised to exactly 1 at the bin centre. ``group_delay_s``
+    rotates the image terms (needs ``bin_spacing_hz``) and may be per tone (an
+    array broadcastable against ``offset_bins``); 0 gives the real, zero-phase
+    digital-loopback response. The pure delay slope itself is NOT included --
+    it is ordinary cable delay, handled by sweep calibration.
+    """
+    gain = filterbank_single_bank_gain
+    offset_bins = np.asarray(offset_bins, dtype=float)
+    phi = 4.0 * np.pi * float(bin_spacing_hz) * np.asarray(group_delay_s, dtype=float)
+
+    def h(d):
+        d = np.asarray(d, dtype=float)
+        return (gain(d) ** 2
+                + gain(d - 2) ** 2 * np.exp(1j * phi)
+                + gain(d + 2) ** 2 * np.exp(-1j * phi))
+
+    return h(offset_bins) / h(np.zeros_like(offset_bins))
+
+
+def filterbank_compensation_config(config_dict):
+    """
+    Read the filterbank-compensation switches from the config.
+
+    Returns ``(enabled, override_delay_s)``: the master switch
+    (``filterbank_compensation``, firmware defaults, default True) and the
+    testing/loopback group-delay override
+    (``filterbank_group_delay_override_ns``) as seconds, or ``None`` when the
+    override is not set -- in which case callers should use the standard
+    path-delay calibration (``resolve_filterbank_group_delay``).
+    """
+    defaults = config_dict['firmware']['defaults']
+    enabled = bool(defaults.get('filterbank_compensation', True))
+    override_ns = defaults.get('filterbank_group_delay_override_ns')
+    override_s = None if override_ns is None else float(override_ns) * 1e-9
+    return enabled, override_s
+
+
+def load_group_delay_calibration(value, cal_dir=None):
+    """
+    Normalise a ``rf_frontend.path_group_delay_ns`` config entry.
+
+    ``value`` may be ``None`` (no calibration), a scalar (ns), a
+    ``{'frequencies', 'tau_ns'}`` dict / ``[[freq_hz, tau_ns], ...]`` array,
+    or a CSV filename resolved against ``cal_dir`` (the server's calibrations
+    directory; the CSV format matches ``client.measure_path_group_delay``'s
+    ``save_to_csv`` output). Returns ``None``, a float (ns) or the dict form.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        path = value
+        if not os.path.isabs(path) and cal_dir is not None:
+            candidate = os.path.join(cal_dir, os.path.basename(path))
+            if os.path.exists(candidate):
+                path = candidate
+        data = np.genfromtxt(path, delimiter=',', names=True, autostrip=True)
+        if getattr(data, 'dtype', None) is not None and data.dtype.names:
+            column_map = {name.lower(): name for name in data.dtype.names}
+            freq_key = column_map.get('freq_hz') or column_map.get('frequency_hz')
+            tau_key = column_map.get('tau_ns') or column_map.get('group_delay_ns')
+            if freq_key is not None and tau_key is not None:
+                return {'frequencies': np.asarray(data[freq_key], dtype=float).ravel(),
+                        'tau_ns': np.asarray(data[tau_key], dtype=float).ravel()}
+        raw = np.loadtxt(path, delimiter=',', ndmin=2)
+        return {'frequencies': raw[:, 0].astype(float).ravel(),
+                'tau_ns': raw[:, 1].astype(float).ravel()}
+    arr = np.asarray(value, dtype=float)
+    if arr.ndim == 0:
+        return float(arr)
+    return {'frequencies': arr[:, 0].ravel(), 'tau_ns': arr[:, 1].ravel()}
+
+
+def resolve_filterbank_group_delay(config_dict, tone_frequencies_hz, cal_dir=None):
+    """
+    Resolve the per-tone group delay (seconds) for the filterbank phase term.
+
+    Priority: the ``filterbank_group_delay_override_ns`` testing knob when
+    present; else the standard path-delay calibration
+    (``rf_frontend.path_group_delay_ns``, scalar or frequency-dependent --
+    same positive-delay convention: tau = -1/(2*pi) * dphi/df, so the values
+    written by ``measure_path_group_delay`` plug in directly); else 0
+    (amplitude-only compensation). Returns a scalar or a per-tone array.
+    """
+    _, override_s = filterbank_compensation_config(config_dict)
+    if override_s is not None:
+        return override_s
+    cal = load_group_delay_calibration(
+        config_dict.get('rf_frontend', {}).get('path_group_delay_ns'), cal_dir=cal_dir)
+    if cal is None:
+        return 0.0
+    if not isinstance(cal, dict):
+        return float(cal) * 1e-9
+    freqs = np.asarray(tone_frequencies_hz, dtype=float)
+    return np.interp(freqs, np.asarray(cal['frequencies'], dtype=float),
+                     np.asarray(cal['tau_ns'], dtype=float)) * 1e-9
+
+
+def filterbank_compensation(tx_offset_bins, rx_offset_bins, bin_spacing_hz,
+                            group_delay_s=0.0, split_tx=True):
+    """
+    Per-tone (or per-point-per-tone) filterbank correction factors.
+
+    ``tx_offset_bins`` / ``rx_offset_bins`` are the raw (unwrapped) offsets
+    from the armed/nearest bin centre in bin spacings, any matching shape.
+
+    ``split_tx=True``: TX gets ``1/G(d_tx)`` (drive restored on the detector)
+    and RX gets ``G(d_rx)/|H(d_rx)|`` so the cascade reads flat -- use when the
+    TX scaling words are being written (base amplitudes known).
+    ``split_tx=False``: the whole magnitude correction ``1/|H|`` goes on RX and
+    ``tx_scale`` is 1 -- for paths that snap to the nearest bin (|d| <= 0.5,
+    drive error <= ~0.01 dB) and may not know the base amplitudes.
+
+    Returns a dict: ``tx_scale`` (multiplies the base amplitudes),
+    ``rx_scale`` (multiplies FILTERBANK_RX_SCALE_BASE), ``rx_phase_rad``
+    (adds to the RX LO phase offsets; identically 0 when ``group_delay_s`` is
+    0), ``response_mag`` (the unclipped ``|H|``, for computing the residual
+    the software path must flatten). Factors are clipped to [0, 2]: a tone
+    beyond coverage (|d| > 1) has wrapped and cannot be compensated.
+    """
+    tx_offset_bins = np.asarray(tx_offset_bins, dtype=float)
+    rx_offset_bins = np.asarray(rx_offset_bins, dtype=float)
+    h = filterbank_cascade_response(rx_offset_bins, group_delay_s, bin_spacing_hz)
+    h_mag = np.abs(h)
+    if split_tx:
+        tx_scale = 1.0 / filterbank_single_bank_gain(tx_offset_bins)
+        rx_scale = filterbank_single_bank_gain(rx_offset_bins) / h_mag
+    else:
+        tx_scale = np.ones_like(tx_offset_bins)
+        rx_scale = 1.0 / h_mag
+    return {
+        'tx_scale': np.clip(tx_scale, 0.0, 2.0),
+        'rx_scale': np.clip(rx_scale, 0.0, 2.0),
+        'rx_phase_rad': -np.angle(h),
+        'response_mag': h_mag,
+    }
+
+
 def _format_ri_steps(ri_steps, ri_step_bp,fmt='>u4'):
     """
     Vectorised: Given a desired RI step, format as appropriate
@@ -3168,15 +3400,43 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
     # ri_steps_tx = np.pad(ri_steps_tx, (0,nc-len(ri_steps_tx)), 'constant', constant_values=(0,0))
     # ri_steps_rx = np.pad(ri_steps_rx, (0,nc-len(ri_steps_rx)), 'constant', constant_values=(0,0))
 
+    # Filterbank ripple compensation at this comb's snap residuals (|d| <= 0.5
+    # bins, where the phase term is negligible -- so only the override delay is
+    # honoured here, not the path calibration). With base amplitudes in hand
+    # the correction splits TX/RX (drive + readout); otherwise the whole
+    # magnitude correction rides the RX scaling.
+    fb_enabled, fb_override_s = filterbank_compensation_config(config_dict)
+    fb_delay_s = fb_override_s if fb_override_s is not None else 0.0
+    if fb_enabled:
+        rx_spacing = _bin_spacing_hz(all_rx_bin_centers_hz)
+        fb = filterbank_compensation(
+            tx_freq_offsets_hz / _bin_spacing_hz(all_tx_bin_centers_hz),
+            rx_freq_offsets_hz / rx_spacing, rx_spacing, fb_delay_s,
+            split_tx=tone_amplitudes is not None)
+
     # Pass tone_indices to prepare_control_buffer_data_fast for correct sparse indexing
     lo_control_values = {
         'tx': {'phase_steps': phase_incs_tx, 'ri_steps': ri_steps_tx},
         'rx': {'phase_steps': phase_incs_rx, 'ri_steps': ri_steps_rx},
     }
     if tone_amplitudes is not None:
-        lo_control_values['tx']['scaling'] = tone_amplitudes
-        lo_control_values['rx']['scaling'] = np.ones_like(
-            tone_amplitudes, dtype=float)
+        if fb_enabled:
+            lo_control_values['tx']['scaling'] = tone_amplitudes * fb['tx_scale']
+        else:
+            lo_control_values['tx']['scaling'] = tone_amplitudes
+        if fb_enabled and FILTERBANK_RX_SCALE_IN_FABRIC:
+            lo_control_values['rx']['scaling'] = (
+                FILTERBANK_RX_SCALE_BASE * fb['rx_scale'])
+        else:
+            # The RX scale word is inert in current firmware; the residual
+            # readout ripple at a snap residual is <= ~0.01 dB -- ignored.
+            lo_control_values['rx']['scaling'] = np.ones_like(
+                tone_amplitudes, dtype=float)
+    elif fb_enabled and FILTERBANK_RX_SCALE_IN_FABRIC:
+        # Amplitudes not being written: leave TX untouched (drive error at a
+        # snap residual is <= ~0.01 dB) and flatten the readout on RX alone.
+        lo_control_values['rx']['scaling'] = (
+            FILTERBANK_RX_SCALE_BASE * fb['rx_scale'])
     # RX picks up an extra per-tone phase offset to cancel the RX-vs-TX path
     # delay (no-op when compensate_rx_ticks==0). TX keeps the bare tone phases.
     rx_phase_comp = _rx_phase_compensation(
@@ -3329,7 +3589,8 @@ def _rf_to_digital_baseband(r, config_dict, tone_frequencies):
 
 def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, point_offsets,
                                      min_tone_separation=6, tone_amplitudes=None,
-                                     tone_phases=None, armed=None, compensate_rx_ticks=0):
+                                     tone_phases=None, armed=None, compensate_rx_ticks=0,
+                                     compensate_filterbank=None, group_delay_s=None):
     """
     Prepare a fast-frequency-modulation bundle: per-point mixer control words
     computed **relative to a single armed set of filterbank bins**.
@@ -3362,11 +3623,15 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
         Minimum LO-index separation for tones sharing an FFT bin, used only when
         computing the armed VACC tone indices. Default 6.
     tone_amplitudes : numpy.ndarray or None, optional
-        Per-tone amplitude scalings written into every point's control words.
-        ``None`` leaves amplitudes at their current values.
+        Per-tone base amplitude scalings written into every point's control
+        words. ``None`` leaves amplitudes at their current values -- except
+        under filterbank compensation, which must write per-point scaling and
+        so reads the bases back from the live control buffer (see
+        ``compensate_filterbank``).
     tone_phases : numpy.ndarray or None, optional
         Per-tone phase offsets (rad) written into every point's control words.
-        ``None`` leaves phases unchanged.
+        ``None`` leaves phases unchanged (same caveat when the compensation
+        phase term is active).
     compensate_rx_ticks : int, optional
         If non-zero, add a per-tone, per-point RX phase offset to cancel the
         RX-vs-TX path delay (in 307.2 MHz clock ticks) seen when modulating
@@ -3374,6 +3639,26 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
         offset, so it is baked into the per-point control words rather than the
         once-at-arm write; the returned ``phase_offsets`` is then ``None``.
         See _rx_phase_compensation.
+    compensate_filterbank : bool or None, optional
+        Filterbank rolloff compensation per point (see the compensation
+        section near the top of this module). ``None`` (default) follows the
+        config (``filterbank_compensation``, default on). When on, every
+        point's control words carry TX scaling ``base x 1/G(d_tx)`` (drive
+        restored on the detector) and RX scaling
+        ``FILTERBANK_RX_SCALE_BASE x G/|H|`` (readout flattened); when the
+        group delay is non-zero the RX phase offsets additionally remove the
+        image phase turn-over per point. Base amplitudes (and phases, when
+        the phase term is active) come from ``tone_amplitudes`` /
+        ``tone_phases`` if given, else are read back from the live control
+        buffer at enable/recenter (which must then hold a parked comb, as it
+        does after set-tones or a modulation rest) and stashed in ``armed``
+        so live updates reuse the true bases.
+    group_delay_s : float, array or None, optional
+        Path group delay (seconds, scalar or per tone) for the image phase
+        term. The server resolves this from the standard path-delay
+        calibration (``resolve_filterbank_group_delay``) and passes it in;
+        ``None`` falls back to the ``filterbank_group_delay_override_ns``
+        testing knob, else 0 (amplitude-only).
 
     Returns
     -------
@@ -3447,11 +3732,50 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
     tone_amplitudes = _validate_per_tone_values(tone_amplitudes, num_tones, 'tone_amplitudes')
     tone_phases = _validate_per_tone_values(tone_phases, num_tones, 'tone_phases')
 
+    # --- 1b) Filterbank rolloff compensation setup ---
+    # Modulation operates beyond the flat centre of a channel, so the per-point
+    # words must carry the drive-restoring TX boost -- which needs the base
+    # amplitudes. If the caller didn't supply them, read them back from the
+    # live control buffer (valid at enable/recenter, when it holds a parked
+    # comb) and stash them in ``armed`` so live updates -- whose buffers hold
+    # per-point *compensated* words -- reuse the true bases.
+    fb_enabled, fb_override_s = filterbank_compensation_config(config_dict)
+    if compensate_filterbank is not None:
+        fb_enabled = bool(compensate_filterbank)
+    if group_delay_s is None:
+        # No resolved delay from the caller (the server resolves the standard
+        # path-delay calibration per tone and passes it in): honour the
+        # testing/loopback override, else amplitude-only.
+        group_delay_s = fb_override_s if fb_override_s is not None else 0.0
+    fb_delay_s = np.asarray(group_delay_s, dtype=float)
+    fb_phase_active = fb_enabled and bool(np.any(fb_delay_s != 0.0))
+    tone_phases_base = tone_phases
+    if fb_enabled:
+        need_amplitudes = tone_amplitudes is None
+        need_phases = fb_phase_active and tone_phases is None
+        if ((need_amplitudes and 'base_amplitudes' not in armed)
+                or (need_phases and 'base_phases' not in armed)):
+            readback = read_from_current_control_buffer(r_fast, los=['tx'])
+        if need_amplitudes:
+            tone_amplitudes = (armed['base_amplitudes'] if 'base_amplitudes' in armed
+                               else np.asarray(readback['tx']['scaling'],
+                                               dtype=float)[tone_indices])
+        if need_phases:
+            tone_phases_base = (armed['base_phases'] if 'base_phases' in armed
+                                else np.asarray(readback['tx']['phase_offsets'],
+                                                dtype=float)[tone_indices])
+        armed['base_amplitudes'] = tone_amplitudes
+        if fb_phase_active:
+            armed['base_phases'] = tone_phases_base
+
     # --- 2) Per-point mixer words, all relative to the armed bins ---
     control_values = []
     control_indices = []
     drift_bins = np.zeros((num_points, num_tones), dtype=float)
     occupancy = np.empty((num_points, num_tones), dtype=object)
+    fb_response_db = np.zeros((num_points, num_tones), dtype=float)
+    fb_readout_corr = np.ones((num_points, num_tones), dtype=float)
+    fb_tx_word_max = 0.0
     for p in range(num_points):
         dbb = _rf_to_digital_baseband(r_fast, config_dict, center_frequencies + point_offsets[p])
         # Residual offset of this point from the *armed* bin centre (NOT the
@@ -3473,31 +3797,61 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
             'tx': {'phase_steps': phase_incs_tx, 'ri_steps': ri_steps_tx},
             'rx': {'phase_steps': phase_incs_rx, 'ri_steps': ri_steps_rx},
         }
-        # Amplitude is identical for every point; including it here keeps each
-        # buffer self-consistent. Phase offsets are deliberately *not* written
-        # per point: they never change during a run, so the scheduler writes them
-        # once into both buffers at arm (see
-        # ``write_phase_offsets_both_buffers_fast``), leaving the per-point write
-        # frequency(+amplitude)-only.
-        if tone_amplitudes is not None:
+        # Scaling: under filterbank compensation it varies per point -- TX
+        # restores the drive at this point's drift, RX flattens the readout
+        # (raw drifts, not the NCO-wrapped ones: a wrapped tone has physically
+        # moved and cannot be compensated). Otherwise amplitude is identical
+        # for every point; including it keeps each buffer self-consistent.
+        # Phase offsets are deliberately *not* written per point: they never
+        # change during a run, so the scheduler writes them once into both
+        # buffers at arm (see ``write_phase_offsets_both_buffers_fast``),
+        # leaving the per-point write frequency(+amplitude)-only.
+        if fb_enabled:
+            fbp = filterbank_compensation(tx_drift_bins, rx_drift_bins,
+                                          rx_bin_width_hz, fb_delay_s,
+                                          split_tx=True)
+            tx_words = tone_amplitudes * fbp['tx_scale']
+            fb_tx_word_max = max(fb_tx_word_max, float(np.max(tx_words)))
+            lo_control_values['tx']['scaling'] = tx_words
+            if FILTERBANK_RX_SCALE_IN_FABRIC:
+                lo_control_values['rx']['scaling'] = (
+                    FILTERBANK_RX_SCALE_BASE * fbp['rx_scale'])
+            else:
+                # RX scale word inert in current firmware: the readout keeps
+                # the residual |H|/G (plus any TX clip shortfall). Report the
+                # inverse for the software demod path (state
+                # 'readout_correction' -> applied by modulation.group_cycles).
+                lo_control_values['rx']['scaling'] = np.ones(num_tones, dtype=float)
+                tx_gain_applied = np.minimum(
+                    fbp['tx_scale'], 1.0 / np.maximum(tone_amplitudes, 1e-9))
+                fb_readout_corr[p] = 1.0 / np.clip(
+                    fbp['response_mag'] * tx_gain_applied, 1e-3, None)
+            fb_response_db[p] = -20.0 * np.log10(fbp['tx_scale'] * fbp['rx_scale'])
+        elif tone_amplitudes is not None:
             lo_control_values['tx']['scaling'] = tone_amplitudes
             lo_control_values['rx']['scaling'] = np.ones_like(tone_amplitudes, dtype=float)
 
-        # Exception to the above: RX path-delay compensation tracks this point's
-        # RX baseband offset, so it varies per point and cannot be written once.
-        # The write-once helper writes the same offset to both tx and rx, which
-        # would clobber the per-point RX value, so when compensating we bake the
-        # offsets per point (and return phase_offsets=None below). The RX offset
-        # is always written (base phase + compensation); the TX offset is written
-        # per point only when tone_phases is given, otherwise TX offsets are left
-        # untouched -- matching the tone_phases=None ("leave unchanged") contract.
-        if compensate_rx_ticks:
-            rx_phase_comp = _rx_phase_compensation(
-                phase_incs_rx, fft_rbw_hz, compensate_rx_ticks)
-            base = tone_phases if tone_phases is not None else 0.0
-            if tone_phases is not None:
-                lo_control_values['tx']['phase_offsets'] = tone_phases
-            lo_control_values['rx']['phase_offsets'] = base + rx_phase_comp
+        # Exceptions to the write-once phase rule: the RX path-delay
+        # compensation and the filterbank image-phase correction both track
+        # this point's offsets, so they vary per point and cannot be written
+        # once. The write-once helper writes the same offset to both tx and rx,
+        # which would clobber the per-point RX value, so when compensating we
+        # bake the offsets per point (and return phase_offsets=None below).
+        # The RX offset is always written (base phase + compensation); the TX
+        # offset is written per point only when the base phases are in hand,
+        # otherwise TX offsets are left untouched -- matching the
+        # tone_phases=None ("leave unchanged") contract.
+        if compensate_rx_ticks or fb_phase_active:
+            rx_extra = np.zeros(num_tones, dtype=float)
+            if compensate_rx_ticks:
+                rx_extra = rx_extra + _rx_phase_compensation(
+                    phase_incs_rx, fft_rbw_hz, compensate_rx_ticks)
+            if fb_phase_active:
+                rx_extra = rx_extra + fbp['rx_phase_rad']
+            base = tone_phases_base if tone_phases_base is not None else 0.0
+            if tone_phases_base is not None:
+                lo_control_values['tx']['phase_offsets'] = tone_phases_base
+            lo_control_values['rx']['phase_offsets'] = base + rx_extra
 
         # buf=0 here is irrelevant: the formatted values are buffer-agnostic; the
         # scheduler writes them into whichever buffer is currently inactive.
@@ -3517,15 +3871,42 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
 
     needs_recenter = bool(np.any(occupancy == 'beyond'))
 
+    if fb_enabled and fb_tx_word_max > 1.0:
+        warnings.warn(
+            'filterbank compensation: TX scaling clips at full scale for some '
+            f'(tone, point)s (worst wants +{20*np.log10(fb_tx_word_max):.2f} dB '
+            'over); lower the base tone amplitudes to keep drive-restoring '
+            'headroom (~1 dB covers offsets to the 1 dB rolloff point)',
+            stacklevel=2)
+
     return {
         'num_points': num_points,
         'num_tones': num_tones,
         'tone_indices': tone_indices,
         # Per-tone LO start phases (rad), written once into both buffers; None
-        # leaves them unchanged. When RX path-delay compensation is active the
-        # offsets vary per point and are baked into control_values above, so the
-        # once-write is suppressed (None) to avoid clobbering them.
-        'phase_offsets': None if compensate_rx_ticks else tone_phases,
+        # leaves them unchanged. When the RX path-delay or filterbank phase
+        # compensation is active the offsets vary per point and are baked into
+        # control_values above, so the once-write is suppressed (None) to
+        # avoid clobbering them.
+        'phase_offsets': (None if (compensate_rx_ticks or fb_phase_active)
+                          else tone_phases),
+        # Applied filterbank compensation (per point, per tone), for state
+        # reporting/diagnostics: response_db is the combined readout response
+        # being corrected (0 = flat; approximate where factors were clipped).
+        # readout_gain_correction is the linear factor the SOFTWARE demod path
+        # must multiply the IQ by (RX scale word inert in fabric; carried in
+        # the modulation state and applied by modulation.group_cycles).
+        # tx_clip_db > 0 means the drive-restoring TX boost hit full scale.
+        'compensation': {
+            'enabled': fb_enabled,
+            'group_delay_s': fb_delay_s,
+            'response_db': fb_response_db if fb_enabled else None,
+            'readout_gain_correction': (
+                fb_readout_corr if fb_enabled and not FILTERBANK_RX_SCALE_IN_FABRIC
+                else None),
+            'tx_clip_db': (20.0 * np.log10(fb_tx_word_max)
+                           if fb_enabled and fb_tx_word_max > 1.0 else 0.0),
+        },
         'chanmap_psb_inmap': chanmap_psb_inmap,
         'chanmap_pfb': chanmap_pfb,
         'control_values': control_values,     # list len n_points (buffer-agnostic)
@@ -3854,6 +4235,19 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
     # ri_steps_tx = np.exp(1j*phase_incs_tx)
     # ri_steps_rx = np.exp(1j*phase_incs_rx)
 
+    # Filterbank ripple compensation at every step's snap residual (|d| <= 0.5
+    # bins across the whole sweep, so the phase term is negligible -- only the
+    # override delay is honoured here, not the path calibration). Computed
+    # vectorised here, indexed per step in the loop below.
+    fb_enabled, fb_override_s = filterbank_compensation_config(config_dict)
+    fb_delay_s = fb_override_s if fb_override_s is not None else 0.0
+    if fb_enabled:
+        rx_spacing = _bin_spacing_hz(all_rx_bin_centers_hz)
+        fb = filterbank_compensation(
+            tx_freq_offsets_hz / _bin_spacing_hz(all_tx_bin_centers_hz),
+            rx_freq_offsets_hz / rx_spacing, rx_spacing, fb_delay_s,
+            split_tx=tone_amplitudes is not None)
+
     # print('phase_incs_tx',phase_incs_tx.shape,'\n',phase_incs_tx)
     # print('phase_incs_rx',phase_incs_rx.shape,'\n',phase_incs_rx)
     # print('ri_steps_tx',ri_steps_tx.shape,'\n',ri_steps_tx)
@@ -3935,9 +4329,23 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
             },
         }
         if tone_amplitudes is not None:
-            lo_control_values['tx']['scaling'] = tone_amplitudes
-            lo_control_values['rx']['scaling'] = np.ones_like(
-                tone_amplitudes, dtype=float)
+            if fb_enabled:
+                lo_control_values['tx']['scaling'] = tone_amplitudes * fb['tx_scale'][p]
+            else:
+                lo_control_values['tx']['scaling'] = tone_amplitudes
+            if fb_enabled and FILTERBANK_RX_SCALE_IN_FABRIC:
+                lo_control_values['rx']['scaling'] = (
+                    FILTERBANK_RX_SCALE_BASE * fb['rx_scale'][p])
+            else:
+                # RX scale word inert in current firmware; residual readout
+                # ripple at a snap residual is <= ~0.01 dB -- ignored.
+                lo_control_values['rx']['scaling'] = np.ones_like(
+                    tone_amplitudes, dtype=float)
+        elif fb_enabled and FILTERBANK_RX_SCALE_IN_FABRIC:
+            # Amplitudes not being written: flatten the readout on RX alone
+            # (TX drive error at a snap residual is <= ~0.01 dB).
+            lo_control_values['rx']['scaling'] = (
+                FILTERBANK_RX_SCALE_BASE * fb['rx_scale'][p])
         # Bake the TX offset per point only when the LO slots move across the
         # sweep; otherwise it is written once into both buffers by the caller.
         if tone_phases is not None and not write_offsets_once:

@@ -464,6 +464,23 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
     sample_index = np.arange(len(points), dtype=int)
     sample_present = np.ones(len(points), dtype=bool)
 
+    # Software readout flattening: when the filterbank compensation's RX part
+    # cannot be applied in hardware (the RX LO scale word is inert in current
+    # firmware -- see doc/filterbank_compensation.md), the server reports
+    # per-(point, tone) linear gain factors in the state ('readout_correction')
+    # and they are applied here, so downstream demod sees a flat channel. The
+    # factors are ~1 over the centre half of a channel.
+    readout_corr = None
+    for tone in tone_modulation_state.get('tones', []):
+        factors = tone.get('readout_correction')
+        if factors is not None and len(factors) == N and int(tone['index']) < n_tones:
+            if readout_corr is None:
+                readout_corr = np.ones((N, n_tones), dtype=float)
+            readout_corr[:, int(tone['index'])] = np.asarray(factors, dtype=float)
+    if readout_corr is not None:
+        modulating = (points >= 1) & (points <= N)
+        z[modulating] = z[modulating] * readout_corr[points[modulating] - 1, :]
+
     # Detect dropped accumulations via the packet counter, and either notify or
     # fill the gaps with NaN placeholders (their tag inferred from the cadence).
     pc = data_dict.get('packet_counter')
@@ -876,7 +893,10 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         How to fill samples flagged with ``modulation_settling==1`` when they
         were not retained by ``group_cycles`` or when their transient IQ should
         be replaced. ``True`` / ``'raw'`` (default) demodulates the raw settling
-        IQ using the completed cycle's reference/slope. ``'interpolate'`` fills
+        IQ using the completed cycle's reference/slope (note: raw IQ does not
+        carry the software readout flattening ``group_cycles`` applies, so
+        filled settling samples can sit up to ~0.5 dB off at extreme probe
+        offsets -- they remain flagged). ``'interpolate'`` fills
         settling samples by linear interpolation between non-settling
         demodulated samples, leaving flags intact. ``False`` / ``'none'`` leaves
         dropped settling samples as NaN. Incomplete cycles and missing packets

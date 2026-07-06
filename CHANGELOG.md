@@ -1,6 +1,56 @@
 # Changelog & Feature List
 
-## v1.6.0 (Current)
+## v1.6.1 (in development)
+
+**Filterbank channel-response compensation**
+- Tones operating away from their filterbank bin centre are now gain- (and
+  optionally phase-) compensated automatically wherever mixer control words
+  are prepared: tone setting, sweeps, and — the motivating case — frequency
+  modulation riding the channel overlap, where the combined TX+RX response
+  reaches −1 dB at 0.70 bin spacings (±211 kHz) and −6 dB at the channel edge.
+- Model: 8-tap DPSS+sinc prototype (single-bank gain `G`) plus the coherent
+  synthesis-image recombination in the analysis bin
+  (`H(δ) = Σₘ G(δ−2m)²·e^{4πjmBτ}`), hardware-validated in digital loopback
+  (≤0.04 dB across the full channel, zero phase) and RF loopback (0.05 dB /
+  2.7 mrad with the fitted 150 ns bench group delay), frequency-independent
+  across 0.6–2.1 GHz. See [filterbank_compensation.md](doc/filterbank_compensation.md).
+- Corrections: TX scaling `× 1/G` (hardware, per point) restores the physical
+  drive on the detector (the drive rolls off with the single bank even though
+  the readout only sags to |H|); the readout-flattening `× G/|H|` part is
+  applied in **software** — the RX LO scale word turned out to be inert in
+  the v7.11 fabric (hardware-verified; raised in souk-firmware#117), so the
+  server reports per-(tone, point) `readout_correction` factors in the
+  modulation state and `modulation.group_cycles` applies them (flip
+  `firmware_lib.FILTERBANK_RX_SCALE_IN_FABRIC` when a firmware connects the
+  multiplier). The RX phase offsets (which do work in hardware) remove the
+  near-edge image phase turn-over per modulation point. A clipped TX boost
+  is reported in the modulation state warnings.
+- Fixed the server `psb_scale` setter truncating fractional scales to int
+  (the block value is UFix16.8; restoring a read-back 2.77 silently wrote 2).
+- Fixed an intermittent `RuntimeError: delayed modulation preload was not
+  serviced…` killing sw-modulated finite captures near their end: when the
+  read cadence and the dwell grid are phase-shifted (the buffer_id tag lags
+  the commanded flip), the final short dwell advanced the scheduler before
+  the previous preload's reuse delay had elapsed. The scheduler now services
+  a stale preload immediately and logs it (data was never mislabelled —
+  frames are tagged from the firmware buffer_id), and captures no longer
+  advance after their final dwell.
+- The phase term's group delay comes from the standard path-delay calibration
+  (`rf_frontend.path_group_delay_ns`, scalar or frequency-dependent — measure
+  once with `client.measure_path_group_delay(save_to_config=True)`),
+  evaluated per tone; `filterbank_group_delay_override_ns` (firmware
+  defaults) overrides it for testing/loopback work. Master switch:
+  `filterbank_compensation` (default **on**);
+  `enable_modulation(..., compensate_filterbank=False)` gives a per-request
+  A/B override. Keep base tone amplitudes ~1 dB below full scale so the
+  modulation TX boost has headroom (the preparer warns when it clips).
+- Standalone measurement/verification scripts in `scripts/filterbank/`:
+  channel-response measurement, a compensation acceptance test, and an
+  LO-stepping diagnostic. They configure the system from scratch (single
+  test tone — avoids intermod/alias contamination), guard the digital-gain
+  state around internal-loopback switches, and restore what they change.
+
+## v1.6.0
 
 **v7.11 multi-LO firmware support (firmware-slot frequency modulation)**
 - Adapted to the v7.11 register map: `acc_len` moves from the accumulator to the

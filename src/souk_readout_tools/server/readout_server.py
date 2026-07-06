@@ -156,12 +156,13 @@ def _format_request_log(message):
         'refresh_adc_cal': ('adc_cal_settle_time',),
         'enable_modulation': ('mod_indices', 'samples_per_point', 'n_settle',
                               'buffer_reuse_delay_accs', 'autosync', 'setup_sync',
-                              'mrst', 'setup_mrst'),
+                              'mrst', 'setup_mrst', 'compensate_filterbank'),
         'update_modulation': ('on_map_change', 'buffer_reuse_delay_accs',
                               'autosync', 'mrst'),
         'recenter_modulation': ('buffer_reuse_delay_accs', 'autosync', 'mrst'),
         'enable_fw_modulation': ('mod_indices', 'n_dwell', 'n_settle', 'mode',
-                                 'compensate_rx_ticks', 'force'),
+                                 'compensate_rx_ticks', 'force',
+                                 'compensate_filterbank'),
         'update_fw_modulation': ('n_dwell', 'n_settle', 'mode', 'compensate_rx_ticks', 'force'),
         'recenter_fw_modulation': ('n_dwell', 'n_settle', 'mode', 'compensate_rx_ticks'),
         'set_fw_modulation_slot': ('slot',),
@@ -763,10 +764,23 @@ class ModulationScheduler:
         if self.N <= 1:
             return
         if self._pending_preload is not None:
-            raise RuntimeError(
-                'delayed modulation preload was not serviced before the next '
-                'advance; reduce buffer_reuse_delay_accs or increase '
-                'samples_per_point')
+            # A delayed preload can still be outstanding when the read cadence
+            # and the dwell grid are phase-shifted (the buffer_id tag lags the
+            # commanded flip, so a capture's final short dwell may advance
+            # after fewer than buffer_reuse_delay_accs reads). The delay guard
+            # tracks *reads* as a proxy for firmware time, and real
+            # accumulations have kept ticking regardless, so servicing the
+            # write now is safe -- and even a genuinely-late write cannot
+            # mislabel data, because frames are tagged from the firmware
+            # buffer_id read-back. Heal and log rather than kill the capture.
+            buf, point = self._pending_preload
+            _server_log(
+                f'servicing delayed modulation preload late (buffer {buf}, '
+                f'point {point + 1}); read cadence and dwell grid were '
+                'phase-shifted', source='modulation')
+            self._write_point(buf, point)
+            self._pending_preload = None
+            self._preload_delay_remaining = 0
         nxt = (self._active_point + 1) % self.N
         inactive = 1 - self._active_buf
         # Normally the inactive buffer was pre-loaded with ``nxt`` last visit; only
@@ -2976,7 +2990,9 @@ class ReadoutServer:
                             self.r.input.disable_loopback()
                         response = {'status': 'success'}
                     elif param_name == 'psb_scale':
-                        self.r.psbscale.set_scale(int(param_value))
+                        # float: the scale is a UFix16.8 hardware value (an
+                        # int() here silently truncated e.g. 2.77 -> 2).
+                        self.r.psbscale.set_scale(float(param_value))
                         response = {'status': 'success'}
                     elif param_name == 'psb_fftshift':
                         self.r.psb.set_fftshift(int(param_value))
@@ -3020,6 +3036,7 @@ class ReadoutServer:
                         requested_setup_mrst = message.get('setup_mrst', None)
                         requested_compensate_rx_ticks = message.get('compensate_rx_ticks', None)
                         requested_buffer_reuse_delay_accs = message.get('buffer_reuse_delay_accs', None)
+                        requested_compensate_filterbank = message.get('compensate_filterbank', None)
                         force = bool(message.get('force', False))
                         if (message.get('offsets') is None and message.get('center') is None
                                 and self.modulation_cfg is not None):
@@ -3046,6 +3063,10 @@ class ReadoutServer:
                                 c.get('buffer_reuse_delay_accs', 3)
                                 if requested_buffer_reuse_delay_accs is None
                                 else int(requested_buffer_reuse_delay_accs))
+                            compensate_filterbank = (
+                                c.get('compensate_filterbank')
+                                if requested_compensate_filterbank is None
+                                else bool(requested_compensate_filterbank))
                         else:
                             center = message.get('center')
                             offsets = message.get('offsets')
@@ -3062,6 +3083,9 @@ class ReadoutServer:
                             buffer_reuse_delay_accs = (
                                 3 if requested_buffer_reuse_delay_accs is None
                                 else int(requested_buffer_reuse_delay_accs))
+                            compensate_filterbank = (
+                                None if requested_compensate_filterbank is None
+                                else bool(requested_compensate_filterbank))
                             if offsets is None:
                                 raise ValueError('offsets required to arm modulation')
                         epoch = self._next_modulation_command_epoch()
@@ -3069,7 +3093,8 @@ class ReadoutServer:
                             self._prepare_modulation, center, offsets, mod_indices, spp, n_settle,
                             autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
                             compensate_rx_ticks=compensate_rx_ticks,
-                            buffer_reuse_delay_accs=buffer_reuse_delay_accs)
+                            buffer_reuse_delay_accs=buffer_reuse_delay_accs,
+                            compensate_filterbank=compensate_filterbank)
                         self._check_modulation_command_epoch(epoch)
                         if bundle['needs_recenter'] and not force:
                             raise ValueError(
@@ -3140,7 +3165,8 @@ class ReadoutServer:
                             c['samples_per_point'], c['n_settle'],
                             armed=armed, autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
                             compensate_rx_ticks=compensate_rx_ticks,
-                            buffer_reuse_delay_accs=buffer_reuse_delay_accs)
+                            buffer_reuse_delay_accs=buffer_reuse_delay_accs,
+                            compensate_filterbank=c.get('compensate_filterbank'))
                         self._check_modulation_command_epoch(epoch)
                         if bundle['needs_recenter'] and on_map_change != 'recenter':
                             await self.send_response(writer, {'status': 'error',
@@ -3159,7 +3185,8 @@ class ReadoutServer:
                                     c['samples_per_point'], c['n_settle'],
                                     autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
                                     compensate_rx_ticks=compensate_rx_ticks,
-                                    buffer_reuse_delay_accs=buffer_reuse_delay_accs)
+                                    buffer_reuse_delay_accs=buffer_reuse_delay_accs,
+                                    compensate_filterbank=c.get('compensate_filterbank'))
                                 self._check_modulation_command_epoch(epoch)
                                 op = 'recenter'
                             else:
@@ -3214,7 +3241,8 @@ class ReadoutServer:
                             c['mod_indices'], c['samples_per_point'], c['n_settle'],
                             autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
                             compensate_rx_ticks=compensate_rx_ticks,
-                            buffer_reuse_delay_accs=buffer_reuse_delay_accs)
+                            buffer_reuse_delay_accs=buffer_reuse_delay_accs,
+                            compensate_filterbank=c.get('compensate_filterbank'))
                         self._check_modulation_command_epoch(epoch)
                         rev = self._next_modulation_revision(cfg)
                         state['enabled'] = True
@@ -3273,6 +3301,8 @@ class ReadoutServer:
                             mode = message.get('mode', c['mode'])
                             compensate_rx_ticks = int(
                                 message.get('compensate_rx_ticks', c.get('compensate_rx_ticks', 0)))
+                            compensate_filterbank = message.get(
+                                'compensate_filterbank', c.get('compensate_filterbank'))
                         else:
                             center = message.get('center')
                             slot_offsets = message.get('offsets')
@@ -3281,15 +3311,19 @@ class ReadoutServer:
                             n_settle = int(message.get('n_settle', 0))
                             mode = message.get('mode', 'auto')
                             compensate_rx_ticks = int(message.get('compensate_rx_ticks', 0))
+                            compensate_filterbank = message.get('compensate_filterbank')
                             if slot_offsets is None:
                                 raise ValueError(
                                     'offsets (per-slot, shape (n_slots,) or (n_slots, n_mod_tones)) '
                                     'required to arm firmware-slot modulation')
+                        if compensate_filterbank is not None:
+                            compensate_filterbank = bool(compensate_filterbank)
                         force = bool(message.get('force', False))
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_fw_modulation, center, slot_offsets, mod_indices,
                             n_dwell, mode=mode, n_settle=n_settle,
-                            compensate_rx_ticks=compensate_rx_ticks)
+                            compensate_rx_ticks=compensate_rx_ticks,
+                            compensate_filterbank=compensate_filterbank)
                         if bundle['needs_recenter'] and not force:
                             raise ValueError(
                                 'slot offsets push at least one tone beyond fixed-bin coverage; '
@@ -3390,7 +3424,8 @@ class ReadoutServer:
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_fw_modulation, center, slot_offsets, c['mod_indices'],
                             n_dwell, mode=mode, n_settle=n_settle,
-                            compensate_rx_ticks=compensate_rx_ticks, armed=armed)
+                            compensate_rx_ticks=compensate_rx_ticks, armed=armed,
+                            compensate_filterbank=c.get('compensate_filterbank'))
                         if bundle['needs_recenter'] and not force:
                             raise ValueError(
                                 'update pushes at least one tone beyond fixed-bin coverage; '
@@ -3444,7 +3479,8 @@ class ReadoutServer:
                         bundle, state, cfg = await self.to_thread(
                             self._prepare_fw_modulation, center, slot_offsets, c['mod_indices'],
                             n_dwell, mode=mode, n_settle=n_settle,
-                            compensate_rx_ticks=compensate_rx_ticks)
+                            compensate_rx_ticks=compensate_rx_ticks,
+                            compensate_filterbank=c.get('compensate_filterbank'))
                         rev = self._next_fw_modulation_revision()
                         # Full load (writes chanmaps) + restart switching.
                         await self.to_thread(self._apply_fw_modulation, bundle, cfg)
@@ -4762,7 +4798,10 @@ class ReadoutServer:
                         writer.write(payload)
                         sched.after_sample()
                         emitted += 1
-                    sched.advance()
+                    if emitted < num_samples:
+                        # No advance after the final dwell: it would queue a
+                        # preload nothing will ever service.
+                        sched.advance()
                     await asyncio.sleep(0)
                 await writer.drain()
             elif fw_modulating:
@@ -4949,7 +4988,8 @@ class ReadoutServer:
     def _prepare_modulation(self, center, offsets, mod_indices,
                             samples_per_point, n_settle, armed=None,
                             autosync=False, setup_sync=True, mrst=False, setup_mrst=False,
-                            compensate_rx_ticks=0, buffer_reuse_delay_accs=3):
+                            compensate_rx_ticks=0, buffer_reuse_delay_accs=3,
+                            compensate_filterbank=None):
         """
         Build a modulation bundle + observability state from a centre comb and
         per-point probe offsets. Pure computation (hardware *reads* only, no
@@ -5030,16 +5070,40 @@ class ReadoutServer:
         bundle = firmware_lib.prepare_modulation_settings_fast(
             self.r_fast, self.config, center, point_offsets,
             tone_amplitudes=amps, tone_phases=phases, armed=armed,
-            compensate_rx_ticks=compensate_rx_ticks)
+            compensate_rx_ticks=compensate_rx_ticks,
+            compensate_filterbank=compensate_filterbank,
+            group_delay_s=self._filterbank_group_delay(center))
 
         cfg = {'center': center, 'offsets': offsets, 'mod_indices': mod_indices,
                'samples_per_point': int(samples_per_point), 'n_settle': int(n_settle),
                'autosync': bool(autosync), 'setup_sync': bool(setup_sync),
                'mrst': bool(mrst), 'setup_mrst': bool(setup_mrst),
                'compensate_rx_ticks': int(compensate_rx_ticks),
-               'buffer_reuse_delay_accs': int(buffer_reuse_delay_accs)}
+               'buffer_reuse_delay_accs': int(buffer_reuse_delay_accs),
+               'compensate_filterbank': compensate_filterbank}
         state = self._build_modulation_state(bundle, cfg)
         return bundle, state, cfg
+
+    def _filterbank_group_delay(self, tone_frequencies_hz):
+        """
+        Per-tone group delay for the filterbank compensation phase term.
+
+        Resolved from the ``filterbank_group_delay_override_ns`` testing knob
+        when present, else the standard path-delay calibration
+        (``rf_frontend.path_group_delay_ns``: scalar or calibration file in
+        the server's calibrations directory). A broken/missing calibration
+        file degrades to amplitude-only compensation with a warning rather
+        than blocking modulation.
+        """
+        try:
+            return firmware_lib.resolve_filterbank_group_delay(
+                self.config, tone_frequencies_hz,
+                cal_dir=self.user_calibrations_dir)
+        except Exception as e:
+            _server_log('warning: could not resolve path group delay for '
+                        f'filterbank compensation ({e}); using amplitude-only '
+                        'compensation', source='modulation')
+            return 0.0
 
     def _build_modulation_state(self, bundle, cfg):
         """
@@ -5074,9 +5138,10 @@ class ReadoutServer:
         point_offsets = np.zeros((num_points, n_tones), dtype=float)
         point_offsets[:, mod_indices] = off if off.shape[1] != 1 else off
 
+        readout_corr = bundle.get('compensation', {}).get('readout_gain_correction')
         tones = []
         for i in range(n_tones):
-            tones.append({
+            tone = {
                 'index': i,
                 'firmware_index': int(firmware_idx[i]) if i < len(firmware_idx) else None,
                 'center_hz': float(center[i]),
@@ -5084,13 +5149,25 @@ class ReadoutServer:
                 'offsets_hz': point_offsets[:, i].tolist(),
                 'drift_bins': drift[:, i].tolist(),
                 'occupancy': [str(o) for o in occupancy[:, i]],
-            })
+            }
+            if readout_corr is not None:
+                # Software readout flattening (RX scale word inert in fabric):
+                # per-point linear factors applied by modulation.group_cycles.
+                tone['readout_correction'] = readout_corr[:, i].tolist()
+            tones.append(tone)
         beyond = sorted({i for i in range(n_tones) if 'beyond' in set(occupancy[:, i])})
         beyond_half = sorted({
             i for i in range(n_tones)
             if {'second', 'beyond'} & set(occupancy[:, i])
         })
         warnings_list = self._modulation_warning_messages(beyond_half, beyond)
+        tx_clip_db = float(bundle.get('compensation', {}).get('tx_clip_db', 0.0))
+        if tx_clip_db > 0.01:
+            warnings_list.append(
+                'filterbank compensation: the drive-restoring TX boost clipped '
+                f'at full scale (up to {tx_clip_db:.2f} dB short); lower the '
+                'base tone amplitudes (~1 dB headroom covers offsets to the '
+                '1 dB rolloff point)')
 
         try:
             sample_rate = float(firmware_lib.get_sample_rate(self.r_fast))
@@ -5185,7 +5262,7 @@ class ReadoutServer:
 
     def _prepare_fw_modulation(self, center, slot_offsets, mod_indices, n_dwell,
                                mode='auto', n_settle=0, compensate_rx_ticks=0,
-                               armed=None):
+                               armed=None, compensate_filterbank=None):
         """
         Build a firmware-slot modulation bundle + observability state. The slot
         analog of :meth:`_prepare_modulation`. Pure computation (hardware reads
@@ -5275,11 +5352,14 @@ class ReadoutServer:
         bundle = firmware_lib.prepare_modulation_settings_fast(
             self.r_fast, self.config, center, slot_point_offsets,
             tone_amplitudes=amps, tone_phases=phases, armed=armed,
-            compensate_rx_ticks=compensate_rx_ticks)
+            compensate_rx_ticks=compensate_rx_ticks,
+            compensate_filterbank=compensate_filterbank,
+            group_delay_s=self._filterbank_group_delay(center))
 
         cfg = {'center': center, 'slot_offsets': slot_offsets, 'mod_indices': mod_indices,
                'n_dwell': int(n_dwell), 'n_settle': int(n_settle), 'mode': str(mode),
-               'compensate_rx_ticks': int(compensate_rx_ticks)}
+               'compensate_rx_ticks': int(compensate_rx_ticks),
+               'compensate_filterbank': compensate_filterbank}
         state = self._build_fw_modulation_state(bundle, cfg)
         return bundle, state, cfg
 
@@ -5302,9 +5382,10 @@ class ReadoutServer:
         slot_offsets = np.zeros((n_slots, n_tones), dtype=float)
         slot_offsets[:, mod_indices] = off
 
+        readout_corr = bundle.get('compensation', {}).get('readout_gain_correction')
         tones = []
         for i in range(n_tones):
-            tones.append({
+            tone = {
                 'index': i,
                 'firmware_index': int(firmware_idx[i]) if i < len(firmware_idx) else None,
                 'center_hz': float(center[i]),
@@ -5314,13 +5395,25 @@ class ReadoutServer:
                 # firmware slot is grouped exactly like a software-mod point.
                 'offsets_hz': slot_offsets[:, i].tolist(),
                 'occupancy': [str(o) for o in occupancy[:, i]],
-            })
+            }
+            if readout_corr is not None:
+                # Software readout flattening (RX scale word inert in fabric):
+                # per-slot linear factors applied by modulation.group_cycles.
+                tone['readout_correction'] = readout_corr[:, i].tolist()
+            tones.append(tone)
         beyond = sorted({i for i in range(n_tones) if 'beyond' in set(occupancy[:, i])})
         beyond_half = sorted({
             i for i in range(n_tones)
             if {'second', 'beyond'} & set(occupancy[:, i])
         })
         warnings_list = self._modulation_warning_messages(beyond_half, beyond)
+        tx_clip_db = float(bundle.get('compensation', {}).get('tx_clip_db', 0.0))
+        if tx_clip_db > 0.01:
+            warnings_list.append(
+                'filterbank compensation: the drive-restoring TX boost clipped '
+                f'at full scale (up to {tx_clip_db:.2f} dB short); lower the '
+                'base tone amplitudes (~1 dB headroom covers offsets to the '
+                '1 dB rolloff point)')
 
         try:
             sample_rate = float(firmware_lib.get_sample_rate(self.r_fast))

@@ -67,6 +67,16 @@ firmware:
     pfb_fftshift: 0b00000011111111
     nyquist_zone: 1                   # Sets DAC/ADC mixer frequencies automatically to +/-2*adc_clk_hz/4 (zone 1) or +/-2*adc_clk_hz*3/4 (zone 2)
     dac_inverse_sinc_filter_enabled: true  # Compensate DAC sinc roll-off using the filter mode for the configured Nyquist zone (~3dB gain at high frequencies)
+    # Filterbank channel-response compensation (doc/filterbank_compensation.md):
+    # corrects the DPSS+sinc rolloff/ripple for tones operating away from their
+    # bin centre (modulation riding the channel overlap; snap residuals). The
+    # phase term's group delay comes from rf_frontend.path_group_delay_ns,
+    # evaluated per tone.
+    filterbank_compensation: true
+    # filterbank_group_delay_override_ns: 0  # TESTING/LOOPBACK ONLY: overrides
+    #   the path_group_delay_ns calibration for the compensation phase term
+    #   (e.g. force 0 for an amplitude-only A/B in loopback). Leave unset for
+    #   normal operation.
     dsa: 0
     vop: 20000                       # WARNING: not rated above 20000uA in gen3 with 2.5V V_dac_vtt; up to 40500uA adds nonlinearity
     # dac_duc_mixer_frequency_hz: 1228800000   # Not needed when nyquist_zone is set (it overrides these)
@@ -172,7 +182,9 @@ rf_frontend:
   #
   # path_group_delay_ns: full TX+RX round-trip group delay (cable delay).
   #   Used by resonator fitting and deembedding to seed the phase-slope
-  #   estimate instead of relying on auto-detection from the S21 phase.
+  #   estimate instead of relying on auto-detection from the S21 phase, and
+  #   by the filterbank compensation (evaluated per tone) to correct the image
+  #   phase turn-over near channel edges when modulating.
   #   Formats accepted:
   #     scalar        — constant delay in nanoseconds, e.g. 120.5
   #     [[f, tau], …] — frequency-dependent pairs: freq in Hz, delay in ns
