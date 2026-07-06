@@ -80,6 +80,7 @@ if install_client:
     entry_points['console_scripts'].extend([
         'souk-connection-test=souk_readout_tools.client.client_scripts.souk_connection_test:main',
         'souk-wideband_sweep=souk_readout_tools.client.client_scripts.wideband_sweep:main',
+        'souk-measure-filterbank-response=souk_readout_tools.client.client_scripts.measure_filterbank_response:main',
         'souk-batch-snapshots=souk_readout_tools.client.client_scripts.batch_snapshots:main',
         'souk-find-resonances=souk_readout_tools.client.client_scripts.find_resonances:main',
         'souk-mkid-finder-app=souk_readout_tools.mkid_finder_app:main'
