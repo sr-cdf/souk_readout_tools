@@ -3793,6 +3793,8 @@ class ReadoutClient:
         Returns:
             dict with keys:
                 'snapshot': complex128 array of shape (4096,).
+                'timestamp': telescope time (FPGA ticks since UNIX epoch) of the
+                    first sample of the snapshot (v7.11+), or None if not reported.
                 'info': Structured info dict at time of capture.
         """
         response = self.send_request({'request': 'get_adc_snapshot'})
@@ -3805,6 +3807,7 @@ class ReadoutClient:
         info = self.get_info('all')
         return {
             'snapshot': snapshot,
+            'timestamp': result.get('timestamp'),
             'info': info,
             'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
         }
@@ -3817,6 +3820,8 @@ class ReadoutClient:
             dict with keys:
                 'dac0': complex128 array of shape (4096,).
                 'dac1': complex128 array of shape (4096,).
+                'timestamp': telescope time (FPGA ticks since UNIX epoch) of the
+                    first sample of the snapshot (v7.11+), or None if not reported.
                 'info': Structured info dict at time of capture.
         """
         response = self.send_request({'request': 'get_dac_snapshot'})
@@ -3833,9 +3838,102 @@ class ReadoutClient:
         return {
             'dac0': dac0,
             'dac1': dac1,
+            'timestamp': result.get('timestamp'),
             'info': info,
             'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
         }
+
+    @staticmethod
+    def _recv_exactly(sock, n):
+        """Receive exactly ``n`` bytes from a blocking socket, or raise."""
+        buf = bytearray(n)
+        view = memoryview(buf)
+        got = 0
+        while got < n:
+            k = sock.recv_into(view[got:], n - got)
+            if k == 0:
+                raise RuntimeError(
+                    f"Server closed connection (expected {n} bytes, got {got})")
+            got += k
+        return bytes(buf)
+
+    def batch_adc_snapshots(self, num_snapshots=10, verbose=False):
+        """
+        Capture ``num_snapshots`` raw ADC snapshots via the server's fast devmem
+        path, streamed over a single TCP connection.
+
+        Returns:
+            dict with keys:
+                'snapshots': complex128 array (num_snapshots, n_samples).
+                'timestamps': uint64 array (num_snapshots,) of per-snapshot
+                    telescope times (FPGA ticks since UNIX epoch; v7.11+).
+                'num_snapshots': number captured.
+        """
+        snapshots = None
+        timestamps = np.zeros(num_snapshots, dtype=np.uint64)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((self.request_server_address, self.request_server_port))
+            message = {'request': 'batch_adc_snapshots', 'num_snapshots': num_snapshots}
+            message_data = json.dumps(message).encode()
+            s.sendall(struct.pack('>I', len(message_data)) + message_data)
+            t0 = time.time()
+            for j in range(num_snapshots):
+                tt, datalen = struct.unpack('>QI', self._recv_exactly(s, 12))
+                snap = np.frombuffer(self._recv_exactly(s, datalen), dtype=np.complex128)
+                if snapshots is None:
+                    snapshots = np.zeros((num_snapshots, len(snap)), dtype=np.complex128)
+                snapshots[j] = snap
+                timestamps[j] = tt
+            if verbose:
+                dt = time.time() - t0
+                print(f"Received {num_snapshots} ADC snapshots in {dt:.3f}s "
+                      f"({num_snapshots/dt:.1f}/s)")
+        if snapshots is None:
+            snapshots = np.zeros((0, 0), dtype=np.complex128)
+        return {'snapshots': snapshots, 'timestamps': timestamps,
+                'num_snapshots': num_snapshots}
+
+    def batch_dac_snapshots(self, num_snapshots=10, verbose=False):
+        """
+        Capture ``num_snapshots`` raw DAC snapshots (dac0 + dac1) via the
+        server's fast devmem path, streamed over a single TCP connection.
+
+        Returns:
+            dict with keys:
+                'dac0': complex128 array (num_snapshots, n_samples).
+                'dac1': complex128 array (num_snapshots, n_samples).
+                'timestamps': uint64 array (num_snapshots,) of per-snapshot
+                    telescope times (FPGA ticks since UNIX epoch; v7.11+).
+                'num_snapshots': number captured.
+        """
+        dac0_all = None
+        dac1_all = None
+        timestamps = np.zeros(num_snapshots, dtype=np.uint64)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((self.request_server_address, self.request_server_port))
+            message = {'request': 'batch_dac_snapshots', 'num_snapshots': num_snapshots}
+            message_data = json.dumps(message).encode()
+            s.sendall(struct.pack('>I', len(message_data)) + message_data)
+            t0 = time.time()
+            for j in range(num_snapshots):
+                tt, len0, len1 = struct.unpack('>QII', self._recv_exactly(s, 16))
+                d0 = np.frombuffer(self._recv_exactly(s, len0), dtype=np.complex128)
+                d1 = np.frombuffer(self._recv_exactly(s, len1), dtype=np.complex128)
+                if dac0_all is None:
+                    dac0_all = np.zeros((num_snapshots, len(d0)), dtype=np.complex128)
+                    dac1_all = np.zeros((num_snapshots, len(d1)), dtype=np.complex128)
+                dac0_all[j] = d0
+                dac1_all[j] = d1
+                timestamps[j] = tt
+            if verbose:
+                dt = time.time() - t0
+                print(f"Received {num_snapshots} DAC snapshots in {dt:.3f}s "
+                      f"({num_snapshots/dt:.1f}/s)")
+        if dac0_all is None:
+            dac0_all = np.zeros((0, 0), dtype=np.complex128)
+            dac1_all = np.zeros((0, 0), dtype=np.complex128)
+        return {'dac0': dac0_all, 'dac1': dac1_all, 'timestamps': timestamps,
+                'num_snapshots': num_snapshots}
 
     @staticmethod
     def parse_adc_snapshot(snapshot_data):
@@ -3852,6 +3950,7 @@ class ReadoutClient:
         snapshot = snapshot_data['snapshot']
         return {
             'date': snapshot_data.get('date', ''),
+            'timestamp': snapshot_data.get('timestamp'),
             'info': snapshot_data.get('info', {}),
             'length': len(snapshot),
             'adc_i': snapshot.real,
@@ -3876,6 +3975,7 @@ class ReadoutClient:
         dac1 = snapshot_data['dac1']
         return {
             'date': snapshot_data.get('date', ''),
+            'timestamp': snapshot_data.get('timestamp'),
             'info': snapshot_data.get('info', {}),
             'length': len(dac0),
             'dac0_i': dac0.real,

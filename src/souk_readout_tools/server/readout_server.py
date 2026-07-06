@@ -143,6 +143,8 @@ def _format_request_log(message):
         'get_samples': ('num_samples', 'burst'),
         'get_accumulator_snapshots': ('tone_index', 'num_snapshots', 'fast'),
         'batch_accumulator_snapshots': ('tone_indices', 'num_snapshots'),
+        'batch_adc_snapshots': ('num_snapshots',),
+        'batch_dac_snapshots': ('num_snapshots',),
         'sweep': ('centers', 'spans', 'points', 'samples_per_point',
                   'settle_accumulations', 'chanmap_settle_accumulations',
                   'direction', 'autosync', 'setup_sync', 'mrst', 'setup_mrst'),
@@ -3427,21 +3429,31 @@ class ReadoutServer:
                     task = asyncio.create_task(self.batch_accumulator_snapshots(writer, tone_indices, num_snapshots))
                     self.tasks.append(task)
 
+                elif request == 'batch_adc_snapshots':
+                    num_snapshots = message.get('num_snapshots', 1)
+                    task = asyncio.create_task(self.batch_adc_snapshots(writer, num_snapshots))
+                    self.tasks.append(task)
+
+                elif request == 'batch_dac_snapshots':
+                    num_snapshots = message.get('num_snapshots', 1)
+                    task = asyncio.create_task(self.batch_dac_snapshots(writer, num_snapshots))
+                    self.tasks.append(task)
+
                 elif request == 'get_adc_snapshot':
                     try:
-                        snapshot = firmware_lib.get_adc_snapshot_fast(self.r_fast)
+                        snapshot, tt = firmware_lib.get_adc_snapshot_fast(self.r_fast, with_tt=True)
                         data = base64.b64encode(snapshot.tobytes()).decode()
-                        result = {'snapshot': data, 'length': len(snapshot)}
+                        result = {'snapshot': data, 'length': len(snapshot), 'timestamp': tt}
                         await self.send_response(writer, {'status': 'success', 'result': result})
                     except Exception as e:
                         await self.send_response(writer, {'status': 'error', 'message': str(e)})
 
                 elif request == 'get_dac_snapshot':
                     try:
-                        dac0, dac1 = firmware_lib.get_dac_snapshot_fast(self.r_fast)
+                        dac0, dac1, tt = firmware_lib.get_dac_snapshot_fast(self.r_fast, with_tt=True)
                         data0 = base64.b64encode(dac0.tobytes()).decode()
                         data1 = base64.b64encode(dac1.tobytes()).decode()
-                        result = {'dac0': data0, 'dac1': data1, 'length': len(dac0)}
+                        result = {'dac0': data0, 'dac1': data1, 'length': len(dac0), 'timestamp': tt}
                         await self.send_response(writer, {'status': 'success', 'result': result})
                     except Exception as e:
                         await self.send_response(writer, {'status': 'error', 'message': str(e)})
@@ -4402,6 +4414,60 @@ class ReadoutServer:
             pass
         except Exception as e:
             print(f"Error getting batch accumulator snapshots: {e}")
+            print(traceback.format_exc())
+        finally:
+            self.tasks.remove(asyncio.current_task())
+            writer.close()
+            await writer.wait_closed()
+
+    async def batch_adc_snapshots(self, writer, num_snapshots):
+        """
+        Acquire num_snapshots raw ADC snapshots via the fast devmem path and
+        stream them to the client.
+
+        Wire format: per snapshot, one frame of (8-byte big-endian timestamp +
+        4-byte big-endian data length + raw complex128 ADC samples). The
+        timestamp is the v7.11 telescope time of the snapshot's first sample
+        (FPGA ticks since UNIX epoch).
+        """
+        try:
+            for _ in range(num_snapshots):
+                snap, tt = firmware_lib.get_adc_snapshot_fast(self.r_fast, with_tt=True)
+                data_bytes = snap.tobytes()
+                writer.write(struct.pack('>QI', tt & 0xFFFFFFFFFFFFFFFF, len(data_bytes)) + data_bytes)
+                await writer.drain()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Error getting batch ADC snapshots: {e}")
+            print(traceback.format_exc())
+        finally:
+            self.tasks.remove(asyncio.current_task())
+            writer.close()
+            await writer.wait_closed()
+
+    async def batch_dac_snapshots(self, writer, num_snapshots):
+        """
+        Acquire num_snapshots raw DAC snapshots via the fast devmem path and
+        stream them to the client.
+
+        Wire format: per snapshot, one frame of (8-byte big-endian timestamp +
+        4-byte big-endian dac0 length + 4-byte big-endian dac1 length + raw
+        complex128 dac0 samples + raw complex128 dac1 samples). The timestamp is
+        the v7.11 telescope time of the snapshot's first sample (FPGA ticks
+        since UNIX epoch).
+        """
+        try:
+            for _ in range(num_snapshots):
+                dac0, dac1, tt = firmware_lib.get_dac_snapshot_fast(self.r_fast, with_tt=True)
+                b0 = dac0.tobytes()
+                b1 = dac1.tobytes()
+                writer.write(struct.pack('>QII', tt & 0xFFFFFFFFFFFFFFFF, len(b0), len(b1)) + b0 + b1)
+                await writer.drain()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Error getting batch DAC snapshots: {e}")
             print(traceback.format_exc())
         finally:
             self.tasks.remove(asyncio.current_task())

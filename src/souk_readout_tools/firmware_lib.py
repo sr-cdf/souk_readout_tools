@@ -8179,7 +8179,7 @@ def _set_common_input_fast(r_fast):
     mm[addr:addr+4] = struct.pack('<I', r_fast.pipeline_id)
 
 
-def get_adc_snapshot_fast(r_fast):
+def get_adc_snapshot_fast(r_fast, with_tt=False):
     """
     Capture a single ADC snapshot using the fast local memory transport (devmem).
 
@@ -8188,8 +8188,11 @@ def get_adc_snapshot_fast(r_fast):
     to prevent races between pipelines sharing the snapshot hardware.
 
     :param r_fast: Fast readout object (local=True)
-    :return: Complex numpy array of ADC samples (complex128)
-    :rtype: numpy.ndarray
+    :param with_tt: If True, also read the v7.11 snapshot timestamp (telescope
+        time of the first sample, FPGA ticks since UNIX epoch) and return
+        ``(snapshot, tt)``. Default False returns just the snapshot.
+    :return: Complex numpy array of ADC samples (complex128), or ``(snapshot, tt)``.
+    :rtype: numpy.ndarray or (numpy.ndarray, int)
     """
     ss = r_fast.adc_snapshot
     mm = ss.host.transport.axil_mm
@@ -8201,6 +8204,9 @@ def get_adc_snapshot_fast(r_fast):
             'n_bytes': ss.host.transport._get_device_address(f'{ss.prefix}n_bytes'),
             'i': ss.host.transport._get_device_address(f'{ss.prefix}i'),
             'q': ss.host.transport._get_device_address(f'{ss.prefix}q'),
+            # v7.11: telescope time of the snapshot's first sample.
+            'tt_lsb': ss.host.transport._get_device_address(f'{ss.prefix}tt_lsb'),
+            'tt_msb': ss.host.transport._get_device_address(f'{ss.prefix}tt_msb'),
         }
         ss._fast_trig_bit = 1 << ss.ADC_SS_TRIG_OFFSET
 
@@ -8226,12 +8232,21 @@ def get_adc_snapshot_fast(r_fast):
         di = bytes(mm[addrs['i']:addrs['i']+nbyte])
         dq = bytes(mm[addrs['q']:addrs['q']+nbyte])
 
+        # Read the latched snapshot timestamp (frozen at trigger; read inside the
+        # lock so it pairs with the data just captured).
+        if with_tt:
+            (tt_lsb,) = struct.unpack('<I', mm[addrs['tt_lsb']:addrs['tt_lsb']+4])
+            (tt_msb,) = struct.unpack('<I', mm[addrs['tt_msb']:addrs['tt_msb']+4])
+
     i = np.frombuffer(di, dtype='<h')
     q = np.frombuffer(dq, dtype='<h')
-    return np.asarray(i + 1j*q, dtype=np.complex128)
+    snapshot = np.asarray(i + 1j*q, dtype=np.complex128)
+    if with_tt:
+        return snapshot, (tt_msb << 32) + tt_lsb
+    return snapshot
 
 
-def get_dac_snapshot_fast(r_fast):
+def get_dac_snapshot_fast(r_fast, with_tt=False):
     """
     Capture a single DAC snapshot using the fast local memory transport (devmem).
 
@@ -8240,8 +8255,12 @@ def get_dac_snapshot_fast(r_fast):
     to prevent races between pipelines sharing the snapshot hardware.
 
     :param r_fast: Fast readout object (local=True)
-    :return: Tuple of (dac0, dac1) complex numpy arrays (complex128)
-    :rtype: tuple of numpy.ndarray
+    :param with_tt: If True, also read the v7.11 snapshot timestamp (telescope
+        time of the first sample, FPGA ticks since UNIX epoch) and return
+        ``(dac0, dac1, tt)``. Default False returns just ``(dac0, dac1)``.
+    :return: Tuple of (dac0, dac1) complex numpy arrays (complex128), or
+        ``(dac0, dac1, tt)``.
+    :rtype: tuple
     """
     ss = r_fast.dac_snapshot
     mm = ss.host.transport.axil_mm
@@ -8253,6 +8272,9 @@ def get_dac_snapshot_fast(r_fast):
             'n_bytes': ss.host.transport._get_device_address(f'{ss.prefix}n_bytes'),
             '0': ss.host.transport._get_device_address(f'{ss.prefix}0'),
             '1': ss.host.transport._get_device_address(f'{ss.prefix}1'),
+            # v7.11: telescope time of the snapshot's first sample.
+            'tt_lsb': ss.host.transport._get_device_address(f'{ss.prefix}tt_lsb'),
+            'tt_msb': ss.host.transport._get_device_address(f'{ss.prefix}tt_msb'),
         }
         ss._fast_trig_bit = 1 << ss.ADC_SS_TRIG_OFFSET
 
@@ -8278,15 +8300,25 @@ def get_dac_snapshot_fast(r_fast):
         d0_raw = bytes(mm[addrs['0']:addrs['0']+nbyte])
         d1_raw = bytes(mm[addrs['1']:addrs['1']+nbyte])
 
+        # Read the latched snapshot timestamp (frozen at trigger; read inside the
+        # lock so it pairs with the data just captured).
+        if with_tt:
+            (tt_lsb,) = struct.unpack('<I', mm[addrs['tt_lsb']:addrs['tt_lsb']+4])
+            (tt_msb,) = struct.unpack('<I', mm[addrs['tt_msb']:addrs['tt_msb']+4])
+
     d0iq = np.frombuffer(d0_raw, dtype='<h')
     d1iq = np.frombuffer(d1_raw, dtype='<h')
     d0 = d0iq[0::2] + 1j*d0iq[1::2]
     d1 = d1iq[0::2] + 1j*d1iq[1::2]
-    return (np.asarray(d0, dtype=np.complex128),
-            np.asarray(d1, dtype=np.complex128))
+    dac0 = np.asarray(d0, dtype=np.complex128)
+    dac1 = np.asarray(d1, dtype=np.complex128)
+    if with_tt:
+        return dac0, dac1, (tt_msb << 32) + tt_lsb
+    return dac0, dac1
 
 
-def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=None):
+def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=None,
+                               get_buf_id=False):
     """
     Read one sample of accumulated data from the RFSOC
     utilising the faster katcp local memory transport.
