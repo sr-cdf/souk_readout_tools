@@ -210,6 +210,47 @@ def load_response(path):
     return table
 
 
+def analytic_gain_db(offset_bins, combined=True, ntaps=8, nfft=64, pad=32, nw=2.0):
+    """
+    Analytic DPSS+sinc prototype-filter gain (dB) versus bin offset.
+
+    The souk-firmware PFB/PSB prototype is an ``ntaps``-tap sinc weighted by a
+    DPSS (NW=2) window, with the half-sample coefficient convention of
+    mlib_devel's ``pfb_coeff_gen_calc.m`` -- confirmed against the firmware
+    coefficients in souk-firmware issue #117. The single-bank power response
+    is flat to ~0.005 dB over the centre half of a channel and crosses -6 dB
+    at one bin spacing (the channel edge, where adjacent every-other-bin
+    responses meet).
+
+    ``combined=True`` (default) returns the TX+RX cascade: the banks are
+    identical, so the combined gain is twice the single-bank dB. This is an
+    idealised model -- it has no aliased-image interference, so it diverges
+    from a measured table near the channel edges; use it as a cross-check
+    and fallback, prefer a measured table for compensation.
+
+    Parameters: ``offset_bins`` in bin spacings; ``ntaps`` prototype taps;
+    ``nfft`` / ``pad`` set the internal resolution (defaults resolve the
+    response to ~5e-4 bins). Requires scipy.
+    """
+    import scipy.signal
+
+    offset_bins = np.asarray(offset_bins, dtype=float)
+    # Coefficients: sinc on the matlab pfb_coeff_gen_calc time axis (samples
+    # offset by half a step -- the convention the firmware actually uses; the
+    # symmetric linspace variant gives a visibly different passband).
+    trange = np.arange(0.5, ntaps * nfft, 1.0) / nfft - ntaps / 2.0
+    coeffs = np.sinc(trange) * scipy.signal.windows.dpss(ntaps * nfft, nw, sym=True)
+    response = np.abs(np.fft.fftshift(np.fft.fft(coeffs, nfft * pad)))
+    response /= np.max(response)
+    # The prototype's natural frequency unit is the *channel width* (one FFT
+    # bin of the critically-sampled design). The 2x-oversampled filterbank
+    # spaces channels every half channel width, and offset_bins (the
+    # drift_bins convention) counts those spacings -- so halve the axis.
+    x = np.linspace(-nfft / 2.0, nfft / 2.0, nfft * pad, endpoint=False)
+    single_db = 20.0 * np.log10(np.interp(offset_bins / 2.0, x, response))
+    return 2.0 * single_db if combined else single_db
+
+
 def evaluate_response(table, offset_bins):
     """
     Evaluate a response table: complex combined gain at the given bin offsets.

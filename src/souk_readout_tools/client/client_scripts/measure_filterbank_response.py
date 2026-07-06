@@ -166,7 +166,9 @@ def measure_filterbank_response(config_file=None, address=None, request_port=Non
     if mock:
         _validate_against_mock(client, table, bin_spacing_hz)
     if plot_data:
-        _plot_table(table, filename)
+        # The analytic overlay only means something for a real filterbank
+        # (the mock's "response" is its resonator model).
+        _plot_table(table, filename, show_model=not mock)
     return table
 
 
@@ -210,7 +212,7 @@ def _validate_against_mock(client, table, bin_spacing_hz):
         raise RuntimeError('mock validation failed')
 
 
-def _plot_table(table, filename):
+def _plot_table(table, filename, show_model=True):
     import matplotlib.pyplot as plt
     fig, (ax_g, ax_p) = plt.subplots(2, 1, sharex=True, figsize=(8, 6))
     for k, idx in enumerate(table['tone_indices']):
@@ -220,6 +222,9 @@ def _plot_table(table, filename):
                   lw=0.8, alpha=0.5)
     ax_g.plot(table['offset_bins'], table['gain_db'], 'k', lw=2, label='combined (median)')
     ax_p.plot(table['offset_bins'], table['phase_rad'], 'k', lw=2)
+    if show_model:
+        ax_g.plot(table['offset_bins'], fbr.analytic_gain_db(table['offset_bins']),
+                  'r--', lw=1.2, label='DPSS+sinc model (TX+RX)')
     for ax in (ax_g, ax_p):
         for x in (-0.5, 0.5):
             ax.axvline(x, color='grey', ls=':', lw=0.8)   # half-bin edges
