@@ -160,6 +160,11 @@ def _format_request_log(message):
         'update_modulation': ('on_map_change', 'buffer_reuse_delay_accs',
                               'autosync', 'mrst'),
         'recenter_modulation': ('buffer_reuse_delay_accs', 'autosync', 'mrst'),
+        'enable_fw_modulation': ('mod_indices', 'n_dwell', 'n_settle', 'mode',
+                                 'compensate_rx_ticks', 'force'),
+        'update_fw_modulation': ('n_dwell', 'n_settle', 'mode', 'compensate_rx_ticks', 'force'),
+        'recenter_fw_modulation': ('n_dwell', 'n_settle', 'mode', 'compensate_rx_ticks'),
+        'set_fw_modulation_slot': ('slot',),
         'timed_sync_needed': ('align_tol_s',),
         'timed_sync_ready': ('target_unix_s', 'seconds_from_now'),
         'timed_sync_arm': ('target_unix_s', 'seconds_from_now', 'mrst', 'reload_tt', 'wait', 'force'),
@@ -600,6 +605,16 @@ class ModulationScheduler:
     def _validate_buffer_reuse_delay(self):
         if self.buffer_reuse_delay_accs < 0:
             raise ValueError('buffer_reuse_delay_accs must be >= 0')
+        if self.N > 2 and self.buffer_reuse_delay_accs < 1:
+            # Frames are tagged from the firmware buffer_id: the first read after a
+            # flip returns the just-vacated buffer's accumulation (v7.11 switches
+            # on the accumulation edge). That buffer must still hold its old point
+            # when that read is tagged, so the following-point preload into it must
+            # be delayed at least one accumulation.
+            raise ValueError(
+                'buffer_reuse_delay_accs must be >= 1 for N>2 modulation so the '
+                'just-vacated control buffer keeps its point until its final '
+                'accumulation has been read back and tagged')
         if (self.N > 2
                 and self.buffer_reuse_delay_accs >= self.samples_per_point):
             raise ValueError(
@@ -906,6 +921,19 @@ class ReadoutServer:
         self._modulation_revision = 0
         self._modulation_revision_history = {}        # revision -> {center, offsets, mod_indices, autosync, ts}
 
+        #firmware-slot frequency modulation state (v7.11)
+        # The mixer holds up to n_slots full combs; the firmware (auto) or the
+        # software (manual) switches between them and stamps each accumulation
+        # with its live slot. Mutually exclusive with the software modulation
+        # above -- both ride the frame[-5] tag word, so only one runs at a time.
+        self.e_fw_modulation_enabled = asyncio.Event()  # fw-slot modulation active
+        self.fw_modulation_params = None                # prepared per-slot control bundle
+        self.fw_modulation_cfg = None                   # center, slot offsets, mod_indices, n_dwell, mode
+        self.fw_modulation_state = None                 # get_info payload
+        self._fw_modulation_revision = 0
+        self._mod_dwell_tag = -1                        # last slot seen by prepare_frame
+        self._mod_dwell_pos = 0                          # accumulations into the current dwell
+
         #firmware interface attributes
         self.r = None
         self.r_fast = None
@@ -1190,6 +1218,19 @@ class ReadoutServer:
         self._modulation_command_epoch = 0            # invalidates stale in-flight prepare jobs
         self._modulation_revision = 0
         self._modulation_revision_history = {}        # revision -> {center, offsets, mod_indices, autosync, ts}
+
+        #firmware-slot frequency modulation state (v7.11)
+        # The mixer holds up to n_slots full combs; the firmware (auto) or the
+        # software (manual) switches between them and stamps each accumulation
+        # with its live slot. Mutually exclusive with the software modulation
+        # above -- both ride the frame[-5] tag word, so only one runs at a time.
+        self.e_fw_modulation_enabled = asyncio.Event()  # fw-slot modulation active
+        self.fw_modulation_params = None                # prepared per-slot control bundle
+        self.fw_modulation_cfg = None                   # center, slot offsets, mod_indices, n_dwell, mode
+        self.fw_modulation_state = None                 # get_info payload
+        self._fw_modulation_revision = 0
+        self._mod_dwell_tag = -1                        # last slot seen by prepare_frame
+        self._mod_dwell_pos = 0                          # accumulations into the current dwell
 
         #firmware interface attributes
         self.r = None
@@ -1997,6 +2038,19 @@ class ReadoutServer:
             return {'enabled': False, 'num_points': 0, 'tones': []}
         # Reflect the live armed flag (state snapshot may predate a pause/resume).
         state['enabled'] = bool(self.e_modulation_enabled.is_set())
+        return state
+
+    def _info_fw_modulation(self):
+        """
+        Return the cached firmware-slot modulation state (the ``fw`` half of
+        ``get_info('modulation')``). Pure read (no hardware access); ``enabled``
+        is refreshed from the live event. Returns a minimal stub when firmware-slot
+        modulation has never been armed.
+        """
+        if self.fw_modulation_state is None:
+            return {'enabled': False, 'n_slots': 0, 'tones': []}
+        state = copy.deepcopy(self.fw_modulation_state)
+        state['enabled'] = bool(self.e_fw_modulation_enabled.is_set())
         return state
 
     def _current_modulation_info_state(self):
@@ -2927,6 +2981,10 @@ class ReadoutServer:
                                 'disable_stream before enable_modulation; initial modulation '
                                 'arming reloads channel maps/control buffers and cannot be done '
                                 'on top of a running continuous stream')
+                        if self.e_fw_modulation_enabled.is_set():
+                            raise ValueError(
+                                'firmware-slot modulation is active; call disable_fw_modulation '
+                                'before enable_modulation (the two share the frame[-5] tag word)')
                         requested_autosync = message.get('autosync', None)
                         requested_setup_sync = message.get('setup_sync', None)
                         requested_mrst = message.get('mrst', None)
@@ -3157,11 +3215,248 @@ class ReadoutServer:
                         self._apply_pending_modulation_command()
                     await self.send_response(writer, {'status': 'success'})
 
+                elif request == 'enable_fw_modulation':
+                    # Arm firmware-slot frequency modulation: load up to n_slots
+                    # combs (centre + per-slot offset) into the mixer LO slots and
+                    # start switching -- 'auto' (firmware round-robin every n_dwell
+                    # accumulations) or 'manual' (software picks the live slot).
+                    # Requires continuous streaming disabled (loading rewrites
+                    # channel maps / control buffers) and software modulation
+                    # disabled (both ride the frame[-5] tag word).
+                    try:
+                        if self.e_stream_enabled.is_set():
+                            raise ValueError(
+                                "disable_stream before enable_modulation(engine='fw'); loading "
+                                'the slot combs rewrites channel maps/control buffers and cannot '
+                                'be done on top of a running continuous stream')
+                        if self.e_modulation_enabled.is_set() or self._pending_modulation is not None:
+                            raise ValueError(
+                                'software modulation is active; call disable_modulation before '
+                                "enable_modulation(engine='fw') (the two share the frame[-5] tag "
+                                'word)')
+                        if (message.get('offsets') is None and message.get('center') is None
+                                and self.fw_modulation_cfg is not None):
+                            c = self.fw_modulation_cfg          # resume a resident config
+                            center, slot_offsets = c['center'], c['slot_offsets']
+                            mod_indices = c['mod_indices']
+                            n_dwell = int(message.get('n_dwell', c['n_dwell']))
+                            n_settle = int(message.get('n_settle', c.get('n_settle', 0)))
+                            mode = message.get('mode', c['mode'])
+                            compensate_rx_ticks = int(
+                                message.get('compensate_rx_ticks', c.get('compensate_rx_ticks', 0)))
+                        else:
+                            center = message.get('center')
+                            slot_offsets = message.get('offsets')
+                            mod_indices = message.get('mod_indices')
+                            n_dwell = int(message.get('n_dwell', 4))
+                            n_settle = int(message.get('n_settle', 0))
+                            mode = message.get('mode', 'auto')
+                            compensate_rx_ticks = int(message.get('compensate_rx_ticks', 0))
+                            if slot_offsets is None:
+                                raise ValueError(
+                                    'offsets (per-slot, shape (n_slots,) or (n_slots, n_mod_tones)) '
+                                    'required to arm firmware-slot modulation')
+                        force = bool(message.get('force', False))
+                        bundle, state, cfg = await self.to_thread(
+                            self._prepare_fw_modulation, center, slot_offsets, mod_indices,
+                            n_dwell, mode=mode, n_settle=n_settle,
+                            compensate_rx_ticks=compensate_rx_ticks)
+                        if bundle['needs_recenter'] and not force:
+                            raise ValueError(
+                                'slot offsets push at least one tone beyond fixed-bin coverage; '
+                                'reduce the offsets or pass force=True to arm anyway (those tones '
+                                'will wrap to the other end of the bin)')
+                        rev = self._next_fw_modulation_revision()
+                        # Load + start switching (hardware writes) off the event loop.
+                        await self.to_thread(self._apply_fw_modulation, bundle, cfg)
+                        self.fw_modulation_params = bundle
+                        self.fw_modulation_cfg = cfg
+                        state['enabled'] = True
+                        state['applied_revision'] = rev
+                        self.fw_modulation_state = state
+                        self.e_fw_modulation_enabled.set()
+                        await self.send_response(writer, {'status': 'success',
+                            'warnings': list(state.get('warnings', [])),
+                            'result': {
+                                'revision': rev,
+                                'mode': cfg['mode'],
+                                'n_slots': state['n_slots'],
+                                'n_dwell': cfg['n_dwell'],
+                                'n_settle': cfg['n_settle'],
+                                'needs_recenter': bundle['needs_recenter'],
+                                'any_beyond_half_bin': state['any_beyond_half_bin'],
+                                'tones_beyond_half_bin': state['tones_beyond_half_bin'],
+                                'tones_beyond_coverage': state['tones_beyond_coverage'],
+                            }})
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'set_fw_modulation_slot':
+                    # Manual switching: select the live LO slot. The chosen slot
+                    # goes live after the next complete accumulation.
+                    try:
+                        if not self.e_fw_modulation_enabled.is_set():
+                            raise ValueError(
+                                'firmware-slot modulation not enabled; call '
+                                "enable_modulation(engine='fw', mode='manual') first")
+                        if message.get('slot') is None:
+                            raise ValueError('slot required')
+                        slot = int(message['slot'])
+                        # Only slots actually loaded hold a valid comb; selecting an
+                        # unloaded slot would emit garbage.
+                        n_loaded = int(self.fw_modulation_state['n_slots']) if self.fw_modulation_state else 0
+                        if not 0 <= slot < n_loaded:
+                            raise ValueError(
+                                f'slot must be in 0..{n_loaded - 1} (loaded slots), got {slot}')
+                        await self.to_thread(firmware_lib.set_fw_modulation_slot, self.r_fast, slot)
+                        if self.fw_modulation_cfg is not None:
+                            self.fw_modulation_cfg['mode'] = 'manual'
+                        if self.fw_modulation_state is not None:
+                            self.fw_modulation_state['mode'] = 'manual'
+                            self.fw_modulation_state['slot'] = slot
+                        await self.send_response(writer, {'status': 'success',
+                            'result': {'slot': slot}})
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'get_fw_modulation_slot':
+                    # Report the live LO slot. Only well-defined in manual mode
+                    # (auto round-robins, so the live slot is read per-accumulation
+                    # from the frame tag). Pure state read (no hardware access).
+                    try:
+                        if not self.e_fw_modulation_enabled.is_set():
+                            raise ValueError(
+                                'firmware-slot modulation not enabled; call '
+                                "enable_modulation(engine='fw', mode='manual') first")
+                        st = self.fw_modulation_state or {}
+                        mode = st.get('mode', 'auto')
+                        slot = st.get('slot') if mode == 'manual' else None
+                        await self.send_response(writer, {'status': 'success',
+                            'result': {'slot': slot, 'mode': mode}})
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'update_fw_modulation':
+                    # Seamless live update: recompute the slot combs against the
+                    # existing armed bins and swap them in via the inactive
+                    # ping-pong buffer + flip (glitch-free, no dropped samples).
+                    try:
+                        if self.fw_modulation_cfg is None or self.fw_modulation_params is None:
+                            raise ValueError(
+                                'firmware-slot modulation not armed; call '
+                                "enable_modulation(engine='fw') first")
+                        c = self.fw_modulation_cfg
+                        center = message.get('center', c['center'])
+                        slot_offsets = message.get('offsets', c['slot_offsets'])
+                        n_dwell = int(message.get('n_dwell', c['n_dwell']))
+                        n_settle = int(message.get('n_settle', c['n_settle']))
+                        mode = message.get('mode', c['mode'])
+                        compensate_rx_ticks = int(
+                            message.get('compensate_rx_ticks', c.get('compensate_rx_ticks', 0)))
+                        force = bool(message.get('force', False))
+                        armed = self.fw_modulation_params.get('armed')
+                        bundle, state, cfg = await self.to_thread(
+                            self._prepare_fw_modulation, center, slot_offsets, c['mod_indices'],
+                            n_dwell, mode=mode, n_settle=n_settle,
+                            compensate_rx_ticks=compensate_rx_ticks, armed=armed)
+                        if bundle['needs_recenter'] and not force:
+                            raise ValueError(
+                                'update pushes at least one tone beyond fixed-bin coverage; '
+                                'reduce the offsets, disable+enable to recentre, or pass force=True')
+                        rev = self._next_fw_modulation_revision()
+                        await self.to_thread(self._update_fw_modulation, bundle, cfg)
+                        self.fw_modulation_params = bundle
+                        self.fw_modulation_cfg = cfg
+                        state['enabled'] = self.e_fw_modulation_enabled.is_set()
+                        state['applied_revision'] = rev
+                        # A seamless update rides the running slot cycle without
+                        # re-selecting, so preserve the live manual slot rather than
+                        # snapping the rebuilt state back to slot 0.
+                        if cfg['mode'] == 'manual' and self.fw_modulation_state is not None:
+                            state['slot'] = self.fw_modulation_state.get('slot', 0)
+                        self.fw_modulation_state = state
+                        await self.send_response(writer, {'status': 'success',
+                            'warnings': list(state.get('warnings', [])),
+                            'result': {
+                                'revision': rev, 'mode': cfg['mode'],
+                                'n_slots': state['n_slots'], 'n_dwell': cfg['n_dwell'],
+                                'n_settle': cfg['n_settle'],
+                                'needs_recenter': bundle['needs_recenter'],
+                                'any_beyond_half_bin': state['any_beyond_half_bin'],
+                                'tones_beyond_half_bin': state['tones_beyond_half_bin'],
+                            }})
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'recenter_fw_modulation':
+                    # Deliberate brief break: reload the channel maps with FRESH
+                    # armed bins for the current (or new) centre/offsets and re-apply
+                    # -- the case the seamless in-bin ping-pong flip cannot cover
+                    # (a tone moving out of its armed FFT bin). The mixer LO combs
+                    # are ping-pong buffered but the channel maps are not.
+                    try:
+                        if self.fw_modulation_cfg is None:
+                            raise ValueError(
+                                'firmware-slot modulation not armed; call '
+                                "enable_modulation(engine='fw') first")
+                        c = self.fw_modulation_cfg
+                        center = message.get('center', c['center'])
+                        slot_offsets = message.get('offsets', c['slot_offsets'])
+                        n_dwell = int(message.get('n_dwell', c['n_dwell']))
+                        n_settle = int(message.get('n_settle', c['n_settle']))
+                        mode = message.get('mode', c['mode'])
+                        compensate_rx_ticks = int(
+                            message.get('compensate_rx_ticks', c.get('compensate_rx_ticks', 0)))
+                        # armed=None -> snap fresh bins/maps for the centre.
+                        bundle, state, cfg = await self.to_thread(
+                            self._prepare_fw_modulation, center, slot_offsets, c['mod_indices'],
+                            n_dwell, mode=mode, n_settle=n_settle,
+                            compensate_rx_ticks=compensate_rx_ticks)
+                        rev = self._next_fw_modulation_revision()
+                        # Full load (writes chanmaps) + restart switching.
+                        await self.to_thread(self._apply_fw_modulation, bundle, cfg)
+                        self.fw_modulation_params = bundle
+                        self.fw_modulation_cfg = cfg
+                        state['enabled'] = self.e_fw_modulation_enabled.is_set()
+                        state['applied_revision'] = rev
+                        self.fw_modulation_state = state
+                        await self.send_response(writer, {'status': 'success',
+                            'warnings': list(state.get('warnings', [])),
+                            'result': {
+                                'revision': rev, 'mode': cfg['mode'],
+                                'n_slots': state['n_slots'], 'n_dwell': cfg['n_dwell'],
+                                'n_settle': cfg['n_settle'],
+                                'needs_recenter': bundle['needs_recenter'],
+                                'any_beyond_half_bin': state['any_beyond_half_bin'],
+                                'tones_beyond_half_bin': state['tones_beyond_half_bin'],
+                            }})
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'disable_fw_modulation':
+                    # Stop firmware-slot switching; tones rest at the centre comb
+                    # (slot 0). The resident config stays so enable_modulation(
+                    # engine='fw') with no args re-arms quickly.
+                    try:
+                        self.e_fw_modulation_enabled.clear()
+                        await self.to_thread(self._rest_fw_modulation)
+                        if self.fw_modulation_state is not None:
+                            self.fw_modulation_state['enabled'] = False
+                        await self.send_response(writer, {'status': 'success'})
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
                 elif request == 'purge_modulation_revisions':
                     # Clear the accumulated revision->config map and reset the
                     # revision counter to 0 for a clean slate between experiments.
                     # The map only ever grows (one entry per enable/update/recenter)
-                    # and is shipped in every get_info('tone_modulation'); purge it
+                    # and is shipped in every get_info('modulation'); purge it
                     # once decoding of the captured frames is done.
                     #
                     # Refuse while modulation is enabled: an armed/updated config
@@ -4220,7 +4515,9 @@ class ReadoutServer:
             return True
         return False
 
-    def prepare_frame(self, fast_read_params, mod_point=0, settling=False, revision=0):
+    def prepare_frame(self, fast_read_params, mod_point=0, settling=False, revision=0,
+                      fw_modulation=False, fw_n_settle=0,
+                      sw_buf_point_map=None, sw_n_settle=0):
         """
         Prepare a frame for sending to a client.
 
@@ -4231,17 +4528,54 @@ class ReadoutServer:
         ``fast_read_params`` is the precomputed fast-read parameter bundle
         (firmware addresses/sizes) used to read the accumulator efficiently.
 
-        Fast frequency modulation packs the otherwise-unused ``flag5`` word
-        (``frame[-5]``) with the per-sample modulation tag when ``mod_point > 0``:
+        Both software and firmware-slot frequency modulation pack the
+        otherwise-unused ``flag5`` word (``frame[-5]``) with a per-sample
+        modulation tag when ``mod_point > 0``:
         bits 0..15 = active modulation point (1..N; 0 = modulation off),
         bit 16 = settling/transient marker, bits 17..31 = config revision.
+        Both engines tag from the accumulator ``buffer_id`` register (read on the
+        devmem fast path, same call as the IQ): firmware-slot uses the live LO
+        slot; software modulation passes ``sw_buf_point_map`` (the scheduler's
+        ping-pong-buffer -> point map) and the live buffer identifies the point.
+        Because v7.11 latches a buffer switch on the accumulation edge, this
+        read-back is the true point of the accumulation just read (one behind the
+        scheduler's *commanded* flip), which removes the one-sample tag/data lag.
+        The two schemes share the one tag word and so are mutually exclusive.
         Decode it as **unsigned** on the client. When not modulating the word
         keeps its legacy ``stream_flags[5]`` boolean meaning.
         """
         num_headers = 10
 
-        cnt,data,err,tt = firmware_lib.read_accumulated_data_fast(
-            fast_read_params, tone_indices=self.active_tone_indices)
+        read_tag = fw_modulation or (sw_buf_point_map is not None)
+        if read_tag:
+            cnt,data,err,tt,buf_id,slot_id = firmware_lib.read_accumulated_data_fast(
+                fast_read_params, tone_indices=self.active_tone_indices, get_buf_id=True)
+            if fw_modulation:
+                tag_index = int(slot_id)                        # live LO slot
+                n_settle = int(fw_n_settle)
+            else:
+                tag_index = sw_buf_point_map.get(int(buf_id))   # live ping-pong buffer -> point
+                n_settle = int(sw_n_settle)
+            if tag_index is None:
+                mod_point = 0
+                settling = False
+            else:
+                # Report the point (1-based) in the shared tag field.
+                mod_point = int(tag_index) + 1
+                # Flag the leading n_settle accumulations after each switch, edge-
+                # detected from the tag change so it self-corrects across dropped
+                # samples. (The PSB 8-tap filter smears each switch over ~8
+                # pre-accumulation spectra -- << 1 accumulation at acc_len~1000 --
+                # so n_settle counts accumulations and is normally 0 or 1, not 8.)
+                if tag_index != self._mod_dwell_tag:
+                    self._mod_dwell_tag = tag_index
+                    self._mod_dwell_pos = 0
+                else:
+                    self._mod_dwell_pos += 1
+                settling = self._mod_dwell_pos < n_settle
+        else:
+            cnt,data,err,tt = firmware_lib.read_accumulated_data_fast(
+                fast_read_params, tone_indices=self.active_tone_indices)
 
         tt_msb = np.uint32((tt >> 32) & 0xFFFFFFFF).view(np.int32)
         tt_lsb = np.uint32(tt & 0xFFFFFFFF).view(np.int32)
@@ -4303,8 +4637,9 @@ class ReadoutServer:
                 and (self.modulation_params is not None
                      or pending_op in ('enable', 'update', 'recenter'))
             )
+            fw_modulating = self.e_fw_modulation_enabled.is_set()
 
-            if modulating and self.e_stream_enabled.is_set():
+            if (modulating or fw_modulating) and self.e_stream_enabled.is_set():
                 t0 = time.time()
                 while self.e_stream_enabled.is_set():
                     if time.time() - t0 > 2.0:
@@ -4352,8 +4687,12 @@ class ReadoutServer:
                 sched.arm()
 
                 # Warm-up: prime the comb/pipeline by stepping whole cycles and
-                # discarding their frames, so the first *returned* frame is settled
-                # and aligned to point 1 (index 0). Rounded up to whole cycles.
+                # discarding their frames. Every frame is tagged from the firmware
+                # buffer_id (see prepare_frame), so the returned stream is labelled
+                # by the point each accumulation truly came from -- the first
+                # returned sample carries the last warm-up point (v7.11 switches on
+                # the accumulation edge), which group_cycles drops as an incomplete
+                # leading cycle. Rounded up to whole cycles.
                 if rate > 100:
                     cycle = max(1, sched.N * sched.samples_per_point)
                     warm_cycles = max(1, (50 + cycle - 1) // cycle)
@@ -4361,29 +4700,75 @@ class ReadoutServer:
                         for _v in range(sched.N):
                             for _s in range(sched.samples_per_point):
                                 self.prepare_frame(
-                                    fast_read_params,
-                                    mod_point=sched.current_point() + 1)
+                                    fast_read_params, sw_buf_point_map=sched._buf_holds,
+                                    sw_n_settle=sched.n_settle, revision=sched.revision)
                                 sched.after_sample()
                             sched.advance()
-                    # whole cycles -> live point back at index 0 (point 1)
 
-                # Capture: step through points, tagging every returned frame.
+                # Capture: step through points; the tag comes from the buffer the
+                # accumulator actually used (prepare_frame). The buffer_id read-back
+                # lags the commanded flip by one accumulation, so the stream begins
+                # mid-cycle -- hold off emitting until the first sample that STARTS a
+                # point-1 run (mod_dwell_tag index 0, position 0), so the returned
+                # stream's sample 0 is point 1 of a clean cycle and every returned
+                # cycle is uniform. Bounded so a pathological stream never spins.
                 emitted = 0
+                aligned = False
+                skip_budget = 2 * sched.N * sched.samples_per_point + 2
                 while emitted < num_samples:
-                    p = sched.current_point()
                     for s in range(sched.samples_per_point):
                         if emitted >= num_samples:
                             break
-                        settling = s < sched.n_settle
                         payload, cnt, err = self.prepare_frame(
-                            fast_read_params, mod_point=p + 1, settling=settling,
-                            revision=sched.revision)
+                            fast_read_params, sw_buf_point_map=sched._buf_holds,
+                            sw_n_settle=sched.n_settle, revision=sched.revision)
+                        if not aligned:
+                            if (self._mod_dwell_tag == 0 and self._mod_dwell_pos == 0) \
+                                    or skip_budget <= 0:
+                                aligned = True
+                            else:
+                                skip_budget -= 1
+                                sched.after_sample()
+                                continue
                         writer.write(payload)
                         sched.after_sample()
                         emitted += 1
                     sched.advance()
                     await asyncio.sleep(0)
                 await writer.drain()
+            elif fw_modulating:
+                # Firmware-slot capture: the firmware is already switching the
+                # slots, so we just read num_samples accumulations and tag each
+                # with its live slot. Warm up a little to skip initial latency.
+                if burst:
+                    raise ValueError(
+                        'burst=True is not supported while firmware-slot modulation is enabled')
+                rev = (self.fw_modulation_state['applied_revision']
+                       if self.fw_modulation_state else 0)
+                n_settle = int(self.fw_modulation_cfg.get('n_settle', 0)) if self.fw_modulation_cfg else 0
+                n_slots = int(self.fw_modulation_state['n_slots']) if self.fw_modulation_state else 1
+                if rate > 100:
+                    for _ in range(50):
+                        self.prepare_frame(fast_read_params, fw_modulation=True,
+                                           revision=rev, fw_n_settle=n_settle)
+                # Align: begin emitting at the first accumulation that STARTS a
+                # slot-0 dwell (point 1), so sample 0 is the first point of a cycle.
+                emitted = 0
+                skip_budget = 2 * n_slots * max(1, n_settle + 1) + 2 * n_slots + 2
+                aligned = False
+                while emitted < num_samples:
+                    payload, cnt, err = self.prepare_frame(
+                        fast_read_params, fw_modulation=True, revision=rev, fw_n_settle=n_settle)
+                    if not aligned:
+                        if (self._mod_dwell_tag == 0 and self._mod_dwell_pos == 0) \
+                                or skip_budget <= 0:
+                            aligned = True
+                        else:
+                            skip_budget -= 1
+                            continue
+                    writer.write(payload)
+                    await writer.drain()
+                    emitted += 1
             else:
                 # Plain path (unchanged): warm up a bit to avoid initial delays.
                 if (rate > 100) and not burst:
@@ -4757,6 +5142,272 @@ class ReadoutServer:
         if epoch != self._modulation_command_epoch:
             raise RuntimeError('modulation command superseded by a newer request')
 
+    # ----- firmware-slot frequency modulation (v7.11) -----------------------
+    # The slot analog of the software-modulation engine above. Software
+    # modulation steps one comb across N points from software, swapping the two
+    # ping-pong buffers each accumulation. Firmware-slot modulation instead loads
+    # up to n_slots full combs (centre + per-slot offset) into the mixer's LO
+    # slots and lets the firmware switch between them -- either automatically
+    # (round-robin every dwell accumulations) or under manual software control.
+    # There is no per-sample hot-loop stepping: once loaded and enabled the
+    # firmware runs on its own and each accumulation is tagged with its live slot
+    # (read back in prepare_frame). Reuses prepare_modulation_settings_fast, whose
+    # "points" are reinterpreted as LO slots.
+
+    def _prepare_fw_modulation(self, center, slot_offsets, mod_indices, n_dwell,
+                               mode='auto', n_settle=0, compensate_rx_ticks=0,
+                               armed=None):
+        """
+        Build a firmware-slot modulation bundle + observability state. The slot
+        analog of :meth:`_prepare_modulation`. Pure computation (hardware reads
+        only), safe to run in a thread off the streaming hot path.
+
+        Parameters
+        ----------
+        center : array-like or None
+            Per-tone centre RF frequencies (Hz), user order. ``None`` = live comb.
+        slot_offsets : array-like
+            Per-slot probe offsets (Hz): shape ``(n_slots,)`` (broadcast across
+            the modulated tones) or ``(n_slots, len(mod_indices))`` (per tone).
+            ``n_slots`` must be 1..``mixer.n_slots``; slot ``i`` holds the comb at
+            ``centre + slot_offsets[i]``.
+        mod_indices : array-like or None
+            User-facing indices of tones to modulate. ``None`` = all regular
+            (resonator) tones. Including a blind tone raises ``ValueError``.
+        n_dwell : int
+            Accumulations per slot before the firmware advances (auto mode).
+        mode : {'auto', 'manual'}
+            'auto' = firmware round-robins the slots every ``n_dwell``
+            accumulations; 'manual' = software selects the live slot.
+        n_settle : int
+            Leading accumulations after each slot switch flagged as settling
+            (transient), so consumers can drop the switch edge. The PSB 8-tap
+            filter smears each switch over ~8 *pre-accumulation spectra* -- far
+            less than one accumulation at a typical ``acc_len`` (~1000) -- so
+            ``n_settle`` (counted in accumulations) is normally 0 or 1, not ~8.
+            Must be ``0 <= n_settle < n_dwell``.
+        """
+        if mode not in ('auto', 'manual'):
+            raise ValueError(f"mode must be 'auto' or 'manual', not {mode!r}")
+        n_dwell = int(n_dwell)
+        n_settle = int(n_settle)
+        if n_dwell < 1:
+            raise ValueError('n_dwell must be >= 1')
+        if not 0 <= n_settle < n_dwell:
+            raise ValueError(f'n_settle must satisfy 0 <= n_settle < n_dwell ({n_dwell}), got {n_settle}')
+        freqs, amps, phases, metadata = self._live_tone_state(center=center)
+        n_tones = len(freqs)
+        regular = list(metadata.get('regular_indices', list(range(n_tones))))
+        blind = set(int(b) for b in metadata.get('blind_indices', []))
+
+        center = np.asarray(freqs if center is None else center, dtype=float)
+        if len(center) != n_tones:
+            raise ValueError(f'center length ({len(center)}) must match active tone count ({n_tones})')
+
+        if mod_indices is None:
+            mod_indices = [int(i) for i in regular]
+        else:
+            mod_indices = [int(i) for i in np.atleast_1d(mod_indices)]
+            bad = sorted(i for i in mod_indices if i in blind)
+            if bad:
+                raise ValueError(
+                    f'cannot modulate blind tones (indices {bad}); blind tones must stay fixed')
+
+        # Each row of slot_offsets is one LO slot; expand to full per-tone columns
+        # (0 for tones we do not modulate), exactly like _prepare_modulation's
+        # per-point expansion.
+        slot_offsets = np.asarray(slot_offsets, dtype=float)
+        if slot_offsets.ndim == 1:
+            slot_offsets = slot_offsets[:, None]
+        n_slots = slot_offsets.shape[0]
+        max_slots = int(self.r_fast.mixer.n_slots)
+        if not 1 <= n_slots <= max_slots:
+            raise ValueError(f'need 1..{max_slots} slot-offset rows, got {n_slots}')
+        # Auto mode round-robins ALL slots (the firmware has no active-slot count),
+        # so every slot must be loaded or the unwritten ones emit stale combs.
+        # Manual mode only visits slots you select, so fewer is fine.
+        if mode == 'auto' and n_slots != max_slots:
+            raise ValueError(
+                f'auto mode round-robins all {max_slots} LO slots, so it needs exactly '
+                f'{max_slots} offset rows (repeat a value to reuse a frequency, e.g. '
+                f'[f1, f2, f3, f2]); got {n_slots}. Use mode="manual" to load fewer slots.')
+        slot_point_offsets = np.zeros((n_slots, n_tones), dtype=float)
+        if slot_offsets.shape[1] == 1:
+            slot_point_offsets[:, mod_indices] = slot_offsets
+        elif slot_offsets.shape[1] == len(mod_indices):
+            slot_point_offsets[:, mod_indices] = slot_offsets
+        else:
+            raise ValueError(
+                f'slot_offsets has {slot_offsets.shape[1]} columns; expected 1 or '
+                f'len(mod_indices)={len(mod_indices)}')
+
+        # ``armed`` (a live seamless update) reuses the existing armed bins/maps so
+        # the update rides the same channel routing; ``None`` snaps fresh bins.
+        bundle = firmware_lib.prepare_modulation_settings_fast(
+            self.r_fast, self.config, center, slot_point_offsets,
+            tone_amplitudes=amps, tone_phases=phases, armed=armed,
+            compensate_rx_ticks=compensate_rx_ticks)
+
+        cfg = {'center': center, 'slot_offsets': slot_offsets, 'mod_indices': mod_indices,
+               'n_dwell': int(n_dwell), 'n_settle': int(n_settle), 'mode': str(mode),
+               'compensate_rx_ticks': int(compensate_rx_ticks)}
+        state = self._build_fw_modulation_state(bundle, cfg)
+        return bundle, state, cfg
+
+    def _build_fw_modulation_state(self, bundle, cfg):
+        """
+        Assemble the ``get_info('modulation')`` payload (fw engine) from a prepared
+        ``bundle`` and resolved ``cfg``. Per-tone entries are in user-facing
+        order (matching the stream's I/Q columns). ``enabled``/``applied_revision``
+        are filled by the enable handler when the command actually lands.
+        """
+        mod_indices = cfg['mod_indices']
+        occupancy = bundle['occupancy']
+        center = np.asarray(cfg['center'], dtype=float)
+        n_tones = int(bundle['num_tones'])
+        n_slots = int(bundle['num_points'])
+        firmware_idx = bundle['tone_indices']
+
+        # Full per-slot, per-tone offset matrix for reporting.
+        off = np.atleast_2d(np.asarray(cfg['slot_offsets'], dtype=float))
+        slot_offsets = np.zeros((n_slots, n_tones), dtype=float)
+        slot_offsets[:, mod_indices] = off
+
+        tones = []
+        for i in range(n_tones):
+            tones.append({
+                'index': i,
+                'firmware_index': int(firmware_idx[i]) if i < len(firmware_idx) else None,
+                'center_hz': float(center[i]),
+                'slot_offsets_hz': slot_offsets[:, i].tolist(),
+                # 'offsets_hz' alias so this state is drop-in usable as the
+                # tone_modulation_state argument of modulation.group_cycles: a
+                # firmware slot is grouped exactly like a software-mod point.
+                'offsets_hz': slot_offsets[:, i].tolist(),
+                'occupancy': [str(o) for o in occupancy[:, i]],
+            })
+        beyond = sorted({i for i in range(n_tones) if 'beyond' in set(occupancy[:, i])})
+        beyond_half = sorted({
+            i for i in range(n_tones)
+            if {'second', 'beyond'} & set(occupancy[:, i])
+        })
+        warnings_list = self._modulation_warning_messages(beyond_half, beyond)
+
+        try:
+            sample_rate = float(firmware_lib.get_sample_rate(self.r_fast))
+        except Exception:
+            sample_rate = float('nan')
+        n_dwell = int(cfg['n_dwell'])
+        # One full pass over the slots (auto mode) takes n_slots * n_dwell accs.
+        cycle_rate = sample_rate / (n_slots * n_dwell) if (n_slots and n_dwell) else float('nan')
+
+        return {
+            'enabled': False,
+            'mode': str(cfg['mode']),
+            # Live LO slot: manual mode holds slot 0 until set_fw_modulation_slot
+            # moves it; None in auto mode (the slot round-robins, so the live
+            # value is read per-accumulation from the frame tag).
+            'slot': 0 if cfg['mode'] == 'manual' else None,
+            'applied_revision': 0,
+            'n_slots': n_slots,
+            'n_dwell': n_dwell,
+            # Aliases mirroring the software-mod state keys so a firmware-slot
+            # capture can be grouped/demodulated with the same modulation.py
+            # helpers (a slot plays the role of a point; the dwell is n_dwell;
+            # n_settle leading accumulations of each dwell are flagged settling).
+            'num_points': n_slots,
+            'samples_per_point': n_dwell,
+            'n_settle': int(cfg.get('n_settle', 0)),
+            'sample_rate_hz': sample_rate,
+            'cycle_rate_hz': cycle_rate,
+            'mod_indices': list(mod_indices),
+            'needs_recenter': bool(bundle['needs_recenter']),
+            'any_beyond_half_bin': bool(beyond_half),
+            'tones_beyond_half_bin': beyond_half,
+            'tones_beyond_coverage': beyond,
+            'warnings': warnings_list,
+            'tones': tones,
+        }
+
+    def _next_fw_modulation_revision(self):
+        """Bump and return the firmware-slot modulation revision (frame[-5] bits
+        17..31), so captured frames can be attributed to a config generation."""
+        self._fw_modulation_revision = (self._fw_modulation_revision + 1) & 0x7FFF
+        return self._fw_modulation_revision
+
+    def _apply_fw_modulation(self, bundle, cfg):
+        """
+        Load the slot combs and (re)start switching. Performs hardware writes, so
+        the caller runs it in a thread. Auto mode hands the slots to the firmware
+        (dwell + round-robin + sync); manual mode selects slot 0 and leaves the
+        caller to drive further switches via ``set_fw_modulation_slot``.
+        """
+        firmware_lib.load_fw_modulation(self.r_fast, bundle)
+        self.active_tone_indices = np.asarray(bundle['tone_indices'])
+        # Restart the settling tracker so the first switch after (re)arming is
+        # detected cleanly.
+        self._mod_dwell_tag = -1
+        self._mod_dwell_pos = 0
+        if cfg['mode'] == 'auto':
+            firmware_lib.enable_fw_modulation(self.r_fast, cfg['n_dwell'])
+        else:
+            firmware_lib.set_fw_modulation_slot(self.r_fast, 0)
+
+    def _update_fw_modulation(self, bundle, cfg):
+        """
+        Seamless live update (hardware writes; run in a thread). Loads the new slot
+        combs into the inactive ping-pong buffer and flips to them in one step --
+        no sync, the running slot cycle swaps combs glitch-free. Rides the same
+        armed channel maps (bundle prepared with ``armed``). Applies a changed
+        dwell in auto mode.
+        """
+        firmware_lib.modify_fw_modulation(self.r_fast, bundle)
+        self.active_tone_indices = np.asarray(bundle['tone_indices'])
+        if cfg['mode'] == 'auto':
+            self.r_fast.mixer.set_dwell_accs(int(cfg['n_dwell']))
+
+    def _rest_fw_modulation(self):
+        """
+        Stop firmware-slot switching and rewrite the centre comb so the pipeline
+        resumes a clean single-LO state at centre. Hardware writes; run in a
+        thread. Safe to call when nothing is loaded (just returns to slot 0).
+        """
+        firmware_lib.disable_fw_modulation(self.r_fast)
+        if self.fw_modulation_cfg is None:
+            return
+        center = np.asarray(self.fw_modulation_cfg['center'], dtype=float)
+        amps = self._tone_value_fallback(len(center), 'amplitudes', 1.0)
+        phases = self._tone_value_fallback(len(center), 'phases', 0.0)
+        tone_indices = None
+        if self.fw_modulation_params is not None:
+            tone_indices = self.fw_modulation_params.get('tone_indices')
+        tone_settings = firmware_lib.set_tone_frequencies_fast(
+            self.r, self.r_fast, self.config, center,
+            tone_indices=tone_indices, tone_amplitudes=amps, tone_phases=phases)
+        self._set_tone_state_cache(center, amps, phases)
+        self._set_active_tone_indices_from_settings(tone_settings)
+
+    def _invalidate_fw_modulation(self, reason=''):
+        """
+        Stop firmware-slot switching and drop the resident bundle. Called when an
+        ordinary tone / amplitude / phase change makes the loaded slot combs stale
+        (mirrors :meth:`_invalidate_modulation` for the software engine). Performs
+        a hardware write to return the mixer to slot 0.
+        """
+        if not (self.fw_modulation_params is not None
+                or self.e_fw_modulation_enabled.is_set()):
+            return
+        print(f'Firmware-slot modulation invalidated{": " + reason if reason else ""}; '
+              "re-arm with enable_modulation(engine='fw').")
+        try:
+            firmware_lib.disable_fw_modulation(self.r_fast)
+        except Exception as e:
+            print(f'Error stopping firmware-slot modulation during invalidation: {e}')
+        self.e_fw_modulation_enabled.clear()
+        self.fw_modulation_params = None
+        self.fw_modulation_cfg = None
+        self.fw_modulation_state = None
+
     def _invalidate_modulation(self, reason=''):
         """
         Drop any armed/resident modulation bundle and disarm. Called when an
@@ -4776,6 +5427,10 @@ class ReadoutServer:
         self.modulation_state = None
         self.modulation_sched = None
         self._pending_modulation = None
+        # The same comb change also staled any loaded firmware-slot combs; the two
+        # schemes are mutually exclusive so this is a no-op unless fw-slot
+        # modulation happened to be the active one.
+        self._invalidate_fw_modulation(reason)
 
     def _modulation_frequency_owner_reason(self):
         """Return why modulation currently owns/could write tone frequencies."""
@@ -4786,6 +5441,8 @@ class ReadoutServer:
             return f'modulation frame producer active ({self._modulation_owner})'
         if self.e_modulation_enabled.is_set():
             return 'modulation enabled'
+        if self.e_fw_modulation_enabled.is_set():
+            return 'firmware-slot modulation enabled'
         return None
 
     def _begin_exclusive_frequency_operation(self, operation):
@@ -4803,7 +5460,10 @@ class ReadoutServer:
                 f'({reason}); call disable_modulation and wait for it to finish '
                 f'before starting {operation}')
         if (self.modulation_params is not None or self.modulation_cfg is not None
-                or self.modulation_state is not None or self.modulation_sched is not None):
+                or self.modulation_state is not None or self.modulation_sched is not None
+                or self.fw_modulation_params is not None
+                or self.fw_modulation_cfg is not None
+                or self.fw_modulation_state is not None):
             self._invalidate_modulation(f'{operation} started')
 
     def _write_to_stream_clients(self, payload):
@@ -4903,6 +5563,10 @@ class ReadoutServer:
                     buffer_reuse_delay_accs=buffer_reuse_delay_accs)
                 self.modulation_sched.arm()
                 self.active_tone_indices = np.asarray(cmd['bundle']['tone_indices'])
+            # Restart the settling edge-tracker so the first switch after (re)arming
+            # is detected cleanly (buffer_id tagging self-syncs regardless).
+            self._mod_dwell_tag = -1
+            self._mod_dwell_pos = 0
             # Record which revision actually landed (vs the desired one in state).
             self.modulation_state['applied_revision'] = cmd['revision']
         except Exception as e:
@@ -4941,15 +5605,15 @@ class ReadoutServer:
                 if self.e_modulation_enabled.is_set() and self.modulation_sched is not None:
                     self._modulation_owner = 'stream'
                     sched = self.modulation_sched
-                    # One full cycle through the N points; point 1 (already live
-                    # from arm/last advance) is emitted before the first swap.
+                    # One full cycle through the N points. Each frame is tagged
+                    # from the firmware buffer_id (the point the accumulator
+                    # actually used), so the tag tracks the data across the
+                    # edge-aligned v7.11 buffer switch with no one-sample lag.
                     for _ in range(sched.N):
-                        p = sched.current_point()
                         for s in range(sched.samples_per_point):
-                            settling = s < sched.n_settle
                             payload, cnt, err = self.prepare_frame(
-                                fast_read_params, mod_point=p + 1,
-                                settling=settling, revision=sched.revision)
+                                fast_read_params, sw_buf_point_map=sched._buf_holds,
+                                sw_n_settle=sched.n_settle, revision=sched.revision)
                             self._write_to_stream_clients(payload)
                             sched.after_sample()
                         sched.advance()
@@ -4960,6 +5624,28 @@ class ReadoutServer:
                             await client.drain()
                         except Exception:
                             pass
+                elif self.e_fw_modulation_enabled.is_set():
+                    # Firmware-slot modulation: the firmware switches the slots on
+                    # its own, so there is no per-sample stepping here -- just read
+                    # each accumulation and tag it with its live slot (frame[-5]).
+                    self._modulation_owner = None
+                    rev = (self.fw_modulation_state['applied_revision']
+                           if self.fw_modulation_state else 0)
+                    n_settle = int(self.fw_modulation_cfg.get('n_settle', 0)) if self.fw_modulation_cfg else 0
+                    payload, cnt, err = self.prepare_frame(
+                        fast_read_params, fw_modulation=True, revision=rev, fw_n_settle=n_settle)
+                    if err:
+                        err_count += 1
+                        print('Packet error:', cnt, err_count)
+                    self._write_to_stream_clients(payload)
+                    for client in list(self.stream_clients):
+                        try:
+                            await client.drain()
+                        except ConnectionResetError:
+                            print(f"Stream client disconnected {getattr(client, 'addr', '?')} (ConnectionResetError)")
+                            if client in self.stream_clients:
+                                self.stream_clients.remove(client)
+                    await asyncio.sleep(0)
                 else:
                     self._modulation_owner = None
                     payload, cnt, err = self.prepare_frame(fast_read_params)

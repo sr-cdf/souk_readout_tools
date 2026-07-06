@@ -2302,11 +2302,17 @@ def write_phase_offsets_both_buffers_fast(r_fast, phase_offsets, tone_indices=No
     Only the phase-offset words are written; the frequency/amplitude words
     already in each buffer are left untouched (sparse indexed write).
 
+    v7.11: sweeps and software modulation use a single LO slot, so ``slots``
+    defaults to ``(0,)``. Firmware-slot modulation runs several active LO slots
+    and wants the same phase reference in each, so it passes the active slots to
+    fan the offsets out across them (in both ping-pong buffers).
+
     Parameters:
     r_fast: readout object (fast interface)
     phase_offsets: per-tone LO start phases, in radians.
     tone_indices: LO indices for the tones (may be non-contiguous with VACC).
                   If None, contiguous indices from 0 are assumed.
+    slots: iterable of LO slots to write the offsets into. Default ``(0,)``.
     """
     phase_offsets = np.atleast_1d(np.asarray(phase_offsets, dtype=float))
     lo_control_values = {
@@ -2316,7 +2322,8 @@ def write_phase_offsets_both_buffers_fast(r_fast, phase_offsets, tone_indices=No
     v, i = prepare_control_buffer_data_fast(
         r_fast, 0, lo_control_values, tone_indices=tone_indices)
     for buf in (0, 1):
-        write_control_buffer_data_fast(r_fast, buf, v, i)
+        for slot in slots:
+            write_control_buffer_data_fast(r_fast, buf, v, i, slot=slot)
     return
 
 
@@ -3530,6 +3537,177 @@ def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, po
         'needs_recenter': needs_recenter,
         'armed': armed,                       # reuse for in-place live updates (same maps)
     }
+
+
+# ---------------------------------------------------------------------------
+# Firmware-slot frequency modulation (v7.11)
+#
+# Software modulation (above) dithers one tone comb across N points by swapping
+# the two ping-pong control buffers from software, one accumulation at a time.
+# Firmware-slot modulation instead loads up to ``n_slots`` (4) full combs into
+# the mixer's LO *slots* and lets the firmware auto-cycle them every ``dwell``
+# accumulations -- no per-sample software writes, so the LO switches land on
+# accumulation edges with no software-timing jitter. Each accumulation is
+# stamped with its live slot (read back via read_buf_id_fast), so the consumer
+# can group samples by slot the same way software modulation groups by point.
+#
+# The per-slot control words are computed by reusing prepare_modulation_settings_fast
+# with the slot offsets supplied as its ``point_offsets`` (num_points == number
+# of active slots, <= n_slots): "point p" is reinterpreted as "slot p".
+# ---------------------------------------------------------------------------
+
+def load_fw_modulation(r_fast, bundle, bufs=(0, 1), write_chanmaps=True):
+    """
+    Load a firmware-slot modulation bundle into the mixer LO slots.
+
+    ``bundle`` is a :func:`prepare_modulation_settings_fast` output whose points
+    are reinterpreted as LO slots: ``num_points`` is the number of active slots
+    (<= ``r_fast.mixer.n_slots``) and slot ``i`` holds the comb at
+    ``center + offset[i]``. This writes the (fixed) channel maps once, fans the
+    per-tone phase offsets across every active slot in the given ping-pong
+    buffers, then writes each slot's frequency/amplitude words into every buffer
+    in ``bufs``.
+
+    Writing both ping-pong buffers (the default) means an unrelated buffer flip
+    cannot expose a stale slot. It does **not** switch the mixer into auto-slot
+    mode or fire a sync -- call :func:`enable_fw_modulation` for that.
+
+    Parameters
+    ----------
+    r_fast : object
+        Fast readout firmware object (devmem-backed transport).
+    bundle : dict
+        Per-slot control bundle from :func:`prepare_modulation_settings_fast`.
+    bufs : iterable of int, optional
+        Ping-pong buffers to write. Default ``(0, 1)``.
+    write_chanmaps : bool, optional
+        Write the (fixed) PSB/PFB channel maps. Default True. A seamless live
+        update rides the same armed maps, so :func:`modify_fw_modulation` passes
+        False to avoid disturbing the running channel routing.
+    """
+    n_slots = bundle['num_points']
+    if n_slots > r_fast.mixer.n_slots:
+        raise ValueError(
+            f'bundle has {n_slots} slots but the mixer only has '
+            f'{r_fast.mixer.n_slots}')
+    bufs = tuple(bufs)
+    active_slots = tuple(range(n_slots))
+
+    # Channel maps are fixed (shared by every slot); write them once.
+    if write_chanmaps:
+        psb_chanselect_set_channel_inmap(r_fast, bundle['chanmap_psb_inmap'])
+        chanselect_set_channel_outmap(r_fast, bundle['chanmap_pfb'])
+
+    # Phase offsets do not change across slots; write them into every active slot
+    # of the target buffers so all slots share one phase reference.
+    phase_offsets = bundle.get('phase_offsets')
+    if phase_offsets is not None:
+        write_phase_offsets_both_buffers_fast(
+            r_fast, phase_offsets, tone_indices=bundle['tone_indices'],
+            slots=active_slots)
+
+    # Per-slot frequency/amplitude words.
+    for slot in active_slots:
+        v = bundle['control_values'][slot]
+        idx = bundle['control_indices'][slot]
+        for buf in bufs:
+            write_control_buffer_data_fast(r_fast, buf, v, idx, slot=slot)
+    return
+
+
+def enable_fw_modulation(r_fast, n_dwell, mrst=True):
+    """
+    Start firmware-slot auto-cycling.
+
+    Sets the dwell (accumulations emitted per slot before the firmware advances
+    to the next slot), switches the mixer into auto-slot mode (round-robin over
+    all ``n_slots`` slots), and fires a sync to latch the switch onto an
+    accumulation boundary. Load the slot combs first with
+    :func:`load_fw_modulation`.
+
+    :param r_fast: Fast readout firmware object.
+    :param n_dwell: Accumulations per slot (>= 1).
+    :param mrst: Pulse master-reset with the sync (default True) to start the
+        slot sequence from a known phase reference.
+    """
+    n_dwell = int(n_dwell)
+    if n_dwell < 1:
+        raise ValueError('n_dwell must be >= 1')
+    r_fast.mixer.set_dwell_accs(n_dwell)
+    r_fast.mixer.set_slot_auto_mode()
+    force_sync_fast(r_fast, mrst=mrst)
+    return
+
+
+def set_fw_modulation_slot(r_fast, slot):
+    """
+    Manually select the live LO slot (software-timed slot switching).
+
+    The firmware-slot mixer has two switching modes:
+
+    * **auto** (:func:`enable_fw_modulation`): the firmware round-robins all slots
+      every ``dwell`` accumulations, latched by a sync. Switch timing is
+      firmware-deterministic.
+    * **manual** (this function): software picks the live slot. The mixer is put
+      into manual mode and ``slot`` becomes active after the next complete
+      accumulation, so the switch still lands cleanly on an accumulation
+      boundary (no mid-accumulation glitch), but the *timing* of each switch is
+      driven by the caller rather than the firmware.
+
+    Either way each accumulation is stamped with its live slot (read back via
+    :func:`read_buf_id_fast`). Load the slot combs first with
+    :func:`load_fw_modulation`.
+
+    :param r_fast: Fast readout firmware object.
+    :param slot: LO slot to make live (0..n_slots-1).
+    """
+    slot = int(slot)
+    if not 0 <= slot < r_fast.mixer.n_slots:
+        raise ValueError(
+            f'slot must be in 0..{r_fast.mixer.n_slots - 1}, not {slot}')
+    r_fast.mixer.set_slot_manual_mode()
+    r_fast.mixer.set_manual_slot(slot)
+    return
+
+
+def modify_fw_modulation(r_fast, bundle):
+    """
+    Seamlessly live-update the slot combs of a running firmware-slot modulation.
+
+    Loads the new combs into the **inactive** ping-pong buffer, then flips to it
+    in one operation. The firmware latches the ping-pong switch on an
+    accumulation boundary, so the running slot cycle swaps to the new combs
+    glitch-free -- no sync, the LO phase rides continuously (only the frequency
+    changes) and the live slot index is uninterrupted. The channel maps are left
+    untouched (the update must ride the same armed bins), so the offsets must stay
+    within fixed-bin coverage; a move beyond that needs disable + enable.
+
+    :param r_fast: Fast readout firmware object.
+    :param bundle: New per-slot control bundle (same armed maps as the running
+        configuration).
+    """
+    inactive = get_next_buffer_idx(r_fast)
+    # Write the new combs into the inactive buffer only, then flip to it.
+    load_fw_modulation(r_fast, bundle, bufs=(inactive,), write_chanmaps=False)
+    set_control_buffer_idx_fast(r_fast, inactive)
+    return
+
+
+def disable_fw_modulation(r_fast, mrst=True):
+    """
+    Stop firmware-slot auto-cycling and return the mixer to slot 0.
+
+    Switches the mixer back to manual-slot mode, selects slot 0, and fires a
+    sync to latch it. The slot-0 comb (the centre comb) is left loaded, so a
+    plain single-LO stream resumes from it.
+
+    :param r_fast: Fast readout firmware object.
+    :param mrst: Pulse master-reset with the sync (default True).
+    """
+    r_fast.mixer.set_slot_manual_mode()
+    r_fast.mixer.set_manual_slot(0)
+    force_sync_fast(r_fast, mrst=mrst)
+    return
 
 
 def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
@@ -8016,13 +8194,18 @@ def get_fast_read_params(r_fast):
     nbranch = len(addrs)
     tt_msb_addr = acc.host.transport._get_device_address(f'{acc.prefix}acc_tt_msb')
     tt_lsb_addr = acc.host.transport._get_device_address(f'{acc.prefix}acc_tt_lsb')
+    # v7.11: the accumulator stamps each sample with the ping-pong + LO-slot
+    # buffer IDs in a single 'buffer_id' register (slot in low byte, ping-pong
+    # buffer in byte 2). Cache its address for firmware-slot modulation reads.
+    buffer_id_addr = acc.host.transport._get_device_address(f'{acc.prefix}buffer_id')
     params = {'acc':acc,
               'addrs':addrs,
               'nbytes':nbytes,
               'nbranch':nbranch,
               'base_addr':addrs[0],
               'tt_msb_addr':tt_msb_addr,
-              'tt_lsb_addr':tt_lsb_addr}
+              'tt_lsb_addr':tt_lsb_addr,
+              'buffer_id_addr':buffer_id_addr}
 
     return params
 
@@ -8041,6 +8224,28 @@ def read_tt_fast(fast_read_params):
     (msb,) = struct.unpack('<I', mm[tt_msb_addr:tt_msb_addr+4])
     (lsb,) = struct.unpack('<I', mm[tt_lsb_addr:tt_lsb_addr+4])
     return (msb << 32) + lsb
+
+
+def read_buf_id_fast(fast_read_params):
+    """
+    Read the ping-pong and LO-slot buffer IDs of the last valid accumulator
+    sample using the fast local memory transport (devmem).
+
+    Fast-path equivalent of ``accumulator.get_buf_id()``: the firmware stamps
+    each accumulation with a single ``buffer_id`` register, slot in the low byte
+    and ping-pong buffer in byte 2.
+
+    :param fast_read_params: Parameters from get_fast_read_params()
+    :return: (buf_id, slot_id) -- ping-pong buffer ID and LO slot ID.
+    :rtype: (int, int)
+    """
+    acc = fast_read_params['acc']
+    mm = acc.host.transport.axil_mm
+    addr = fast_read_params['buffer_id_addr']
+    (x,) = struct.unpack('<I', mm[addr:addr+4])
+    buf_id = (x >> 16) & 0xff
+    slot_id = x & 0xff
+    return buf_id, slot_id
 
 
 def get_accumulator_snapshot(r, config_dict, tone_index):
@@ -8334,8 +8539,14 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
     :param tone_indices: Array of output channel indices to read. With VACC, these may be
                         non-contiguous (e.g., [0, 6, 12] instead of [0, 1, 2]).
                         If None and num_tones is given, assumes contiguous indices [0..num_tones-1].
-    :return: (acc_cnt, data, error_flag, telescope_time) where data is complex values at specified tone indices
-             and telescope_time is the 64-bit PTP timestamp.
+    :param get_buf_id: If True, also read the v7.11 ping-pong + LO-slot buffer
+        IDs of this sample (for firmware-slot modulation) and append
+        ``(buf_id, slot_id)`` to the returned tuple. Default False keeps the
+        legacy 4-tuple.
+    :return: ``(acc_cnt, data, error_flag, telescope_time)``, or
+        ``(acc_cnt, data, error_flag, telescope_time, buf_id, slot_id)`` when
+        ``get_buf_id=True``. ``data`` is complex values at the specified tone
+        indices and ``telescope_time`` is the 64-bit PTP timestamp.
     """
     acc=fast_read_params['acc']
     addrs=fast_read_params['addrs']
@@ -8356,6 +8567,9 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
             raw = acc.host.transport.axil_mm[addrs[i]:addrs[i] + nbytes]
             dout[i::nbranch] = np.frombuffer(raw, dtype='<i4')
     tt = read_tt_fast(fast_read_params)
+    # Read the slot/ping-pong tag inside the same acc_cnt window as the data so
+    # the tag belongs to the sample we just read.
+    buf_slot = read_buf_id_fast(fast_read_params) if get_buf_id else None
     stop_acc_cnt = acc.get_acc_cnt()
     if start_acc_cnt != stop_acc_cnt:
         acc.logger.warning('Accumulation counter changed while reading data!')
@@ -8371,12 +8585,16 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
         result = np.empty(2 * len(tone_indices), dtype=dout.dtype)
         result[0::2] = dout[real_indices]
         result[1::2] = dout[imag_indices]
-        return start_acc_cnt, result, err, tt
+        out = (start_acc_cnt, result, err, tt)
     elif num_tones is None:
-        return start_acc_cnt, dout, err, tt
+        out = (start_acc_cnt, dout, err, tt)
     else:
         # Legacy behavior: assume contiguous indices
-        return start_acc_cnt, dout[:2*num_tones], err, tt
+        out = (start_acc_cnt, dout[:2*num_tones], err, tt)
+
+    if get_buf_id:
+        return out + buf_slot   # (..., buf_id, slot_id)
+    return out
 
 
 def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_point,

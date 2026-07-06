@@ -76,6 +76,18 @@ class MockReadoutServer:
         self._mod_linewidth = 1.0e5     # mock resonator FWHM (Hz)
         self._mod_bin_hz = 1.0e6        # mock filterbank channel spacing (Hz)
         self._mod_armed_bin_center = None   # per-tone armed bin centre (Hz), fixed until recenter
+        # firmware-slot modulation (mock): _fw_mod is the loaded config (or None),
+        # _fw_mod_enabled the on/off switch, _fw_mod_slot the live slot in manual
+        # mode. Frames are tagged with slot+1 in the same flag5 field as software
+        # modulation (the two schemes are mutually exclusive).
+        self._fw_mod = None
+        self._fw_mod_enabled = False
+        self._fw_mod_slot = 0
+        self._fw_mod_revision = 0
+        self._fw_mod_f0 = None          # per-tone "true" resonance frequencies (Hz)
+        self._fw_n_slots = 4            # mock mixer.n_slots (auto cycles all of them)
+        self._fw_dwell_slot = -1        # last slot emitted (settling-edge tracking)
+        self._fw_dwell_pos = 0          # accumulations into the current dwell
         self.cal_freeze = True
         self.clock_source = (
             client.config.get('firmware', {}).get('clock_source', 'internal')
@@ -1126,11 +1138,75 @@ class MockReadoutServer:
         return state
 
     def _info_tone_modulation(self):
-        """Return the cached mock modulation state for ``get_info('tone_modulation')``."""
+        """Return the cached mock software-modulation state (``get_info('modulation')``, sw engine)."""
         if self._mod is None:
             return {'enabled': False, 'num_points': 0, 'tones': []}
         state = dict(self._mod['state'])
         state['enabled'] = bool(self._mod_enabled)
+        return state
+
+    def _mock_fw_state(self, center, full_offsets, mod_indices, n_dwell, n_settle, mode):
+        """Assemble a ``fw_modulation`` state dict mirroring the server's shape.
+
+        Each row of ``full_offsets`` is one LO slot; occupancy is computed against
+        the mock fixed channel grid just like the software-mod state. Includes the
+        ``num_points`` / ``samples_per_point`` / ``n_settle`` / per-tone
+        ``offsets_hz`` aliases so the state is drop-in usable with
+        ``modulation.group_cycles``.
+        """
+        center = np.asarray(center, dtype=float)
+        n_tones = len(center)
+        n_slots = full_offsets.shape[0]
+        armed = np.round(center / self._mod_bin_hz) * self._mod_bin_hz
+        drift = (center[None, :] + full_offsets - armed[None, :]) / self._mod_bin_hz
+        ad = np.abs(drift)
+        occ = np.where(ad <= 0.5, 'nearest', np.where(ad <= 1.0, 'second', 'beyond'))
+        beyond = sorted({i for i in range(n_tones) if 'beyond' in set(occ[:, i])})
+        beyond_half = sorted({
+            i for i in range(n_tones) if {'second', 'beyond'} & set(occ[:, i])})
+        tones = []
+        for i in range(n_tones):
+            tones.append({
+                'index': i, 'firmware_index': i, 'center_hz': float(center[i]),
+                'slot_offsets_hz': full_offsets[:, i].tolist(),
+                'offsets_hz': full_offsets[:, i].tolist(),
+                'occupancy': [str(o) for o in occ[:, i]],
+            })
+        return {
+            'enabled': bool(self._fw_mod_enabled), 'mode': str(mode),
+            'slot': 0 if mode == 'manual' else None,
+            'applied_revision': int(self._fw_mod_revision),
+            'n_slots': int(n_slots), 'n_dwell': int(n_dwell),
+            'num_points': int(n_slots), 'samples_per_point': int(n_dwell),
+            'n_settle': int(n_settle),
+            'sample_rate_hz': float(self.sample_rate),
+            'cycle_rate_hz': (float(self.sample_rate) / (n_slots * n_dwell)
+                              if (n_slots and n_dwell) else float('nan')),
+            'mod_indices': list(mod_indices),
+            'needs_recenter': bool(len(beyond) > 0),
+            'any_beyond_half_bin': bool(beyond_half),
+            'tones_beyond_half_bin': beyond_half, 'tones_beyond_coverage': beyond,
+            'warnings': [], 'tones': tones,
+        }
+
+    def _info_fw_modulation(self):
+        """Return the cached mock firmware-slot state (``get_info('modulation')``, fw engine)."""
+        if self._fw_mod is None:
+            return {'enabled': False, 'n_slots': 0, 'tones': []}
+        state = dict(self._fw_mod['state'])
+        state['enabled'] = bool(self._fw_mod_enabled)
+        return state
+
+    def _info_modulation(self):
+        """Unified mock modulation state ('engine' field), mirroring the server."""
+        if self._fw_mod_enabled or (self._fw_mod is not None and not self._mod_enabled):
+            engine, state = 'fw', self._info_fw_modulation()
+        elif self._mod_enabled or self._mod is not None:
+            engine, state = 'sw', self._info_tone_modulation()
+        else:
+            return {'engine': None, 'enabled': False, 'num_points': 0, 'tones': []}
+        state = dict(state)
+        state['engine'] = engine
         return state
 
     def stream_frame(self, num_tones=None):
@@ -1162,6 +1238,35 @@ class MockReadoutServer:
             flag5 = (((int(point) + 1) & 0xFFFF)
                      | (int(bool(settling)) << 16)
                      | ((int(mod['revision']) & 0x7FFF) << 17))
+        elif self._fw_mod is not None and self._fw_mod_enabled:
+            # Firmware-slot modulation: the (mock) firmware picks the live slot
+            # -- auto round-robin every n_dwell accumulations, or the manually
+            # selected slot. Evaluate the resonator model at that slot's probe
+            # and tag the frame with slot+1 in the same flag5 field.
+            fw = self._fw_mod
+            n_slots = fw['n_slots']
+            n_dwell = max(1, int(fw['n_dwell']))
+            if fw['mode'] == 'manual':
+                slot = int(self._fw_mod_slot) % n_slots
+            else:
+                slot = (self.packet_counter // n_dwell) % n_slots
+            # Flag the leading n_settle accumulations of each dwell as settling,
+            # detected by the slot tag changing (mirrors the server).
+            if slot != self._fw_dwell_slot:
+                self._fw_dwell_slot = slot
+                self._fw_dwell_pos = 0
+            else:
+                self._fw_dwell_pos += 1
+            settling = self._fw_dwell_pos < int(fw.get('n_settle', 0))
+            center = np.asarray(fw['center'], dtype=float)[:num_tones]
+            offs = np.asarray(fw['offsets'], dtype=float)[slot][:num_tones]
+            f0 = np.asarray(self._fw_mod_f0, dtype=float)[:num_tones]
+            z = self._resonator_z(center + offs, f0, self._mod_linewidth)
+            i_words = np.round(z.real).astype('<i4')
+            q_words = np.round(z.imag).astype('<i4')
+            flag5 = (((int(slot) + 1) & 0xFFFF)
+                     | (int(bool(settling)) << 16)
+                     | ((int(fw['revision']) & 0x7FFF) << 17))
         else:
             tone_idx = np.arange(num_tones, dtype=float)
             phase = 0.07 * self.packet_counter + tone_idx
@@ -1873,6 +1978,178 @@ class MockReadoutServer:
             self._mod_enabled = False
             if self._mod is not None:
                 self._mod['state']['enabled'] = False
+            return {'status': 'success'}
+
+        if request == 'enable_fw_modulation':
+            try:
+                freqs = np.asarray(self.tone_frequencies, dtype=float)
+                n_tones = len(freqs)
+                if (message.get('offsets') is None and message.get('center') is None
+                        and self._fw_mod is not None):
+                    # Resume a resident config with no args.
+                    fw = self._fw_mod
+                    center = np.asarray(fw['center'], dtype=float)
+                    full = np.asarray(fw['offsets'], dtype=float)
+                    mod_indices = list(fw['mod_indices'])
+                    n_dwell = int(message.get('n_dwell', fw['n_dwell']))
+                    n_settle = int(message.get('n_settle', fw.get('n_settle', 0)))
+                    mode = message.get('mode', fw['mode'])
+                else:
+                    if message.get('offsets') is None:
+                        raise ValueError('offsets required to arm firmware-slot modulation')
+                    center = (freqs.copy() if message.get('center') is None
+                              else np.asarray(message['center'], dtype=float))
+                    mod_indices = (list(range(n_tones)) if message.get('mod_indices') is None
+                                   else [int(i) for i in np.atleast_1d(message['mod_indices'])])
+                    full, _n = self._mock_expand_offsets(message['offsets'], mod_indices, n_tones)
+                    n_dwell = int(message.get('n_dwell', 4))
+                    n_settle = int(message.get('n_settle', 0))
+                    mode = message.get('mode', 'auto')
+                if not 0 <= n_settle < n_dwell:
+                    raise ValueError(
+                        f'n_settle must satisfy 0 <= n_settle < n_dwell ({n_dwell}), got {n_settle}')
+                if not 1 <= full.shape[0] <= self._fw_n_slots:
+                    raise ValueError(f'need 1..{self._fw_n_slots} slot-offset rows, got {full.shape[0]}')
+                if mode == 'auto' and full.shape[0] != self._fw_n_slots:
+                    raise ValueError(
+                        f'auto mode round-robins all {self._fw_n_slots} LO slots, so it needs '
+                        f'exactly {self._fw_n_slots} offset rows (repeat a value to reuse a '
+                        f'frequency); got {full.shape[0]}. Use mode="manual" to load fewer slots.')
+                force = bool(message.get('force', False))
+                self._fw_mod_revision = (self._fw_mod_revision + 1) & 0x7FFF
+                state = self._mock_fw_state(center, full, mod_indices, n_dwell, n_settle, mode)
+                if state['needs_recenter'] and not force:
+                    self._fw_mod_revision = (self._fw_mod_revision - 1) & 0x7FFF
+                    raise ValueError(
+                        'slot offsets push at least one tone beyond fixed-bin coverage; '
+                        'reduce the offsets or pass force=True to arm anyway (those tones '
+                        'will wrap to the other end of the bin)')
+                self._fw_mod_f0 = center.copy()
+                self._fw_mod = {'center': center, 'offsets': full, 'mod_indices': mod_indices,
+                                'n_dwell': int(n_dwell), 'n_settle': int(n_settle),
+                                'mode': str(mode), 'n_slots': int(full.shape[0]),
+                                'revision': int(self._fw_mod_revision), 'state': state}
+                self._fw_mod_enabled = True
+                self._fw_mod_slot = 0
+                self._fw_dwell_slot = -1
+                self._fw_dwell_pos = 0
+                state['enabled'] = True
+                return {'status': 'success', 'warnings': list(state.get('warnings', [])),
+                        'result': {'revision': self._fw_mod_revision, 'mode': str(mode),
+                                   'n_slots': int(full.shape[0]), 'n_dwell': int(n_dwell),
+                                   'n_settle': int(n_settle),
+                                   'needs_recenter': state['needs_recenter'],
+                                   'any_beyond_half_bin': state['any_beyond_half_bin'],
+                                   'tones_beyond_half_bin': state['tones_beyond_half_bin'],
+                                   'tones_beyond_coverage': state['tones_beyond_coverage']}}
+            except Exception as e:
+                return {'status': 'error', 'message': str(e)}
+
+        if request == 'set_fw_modulation_slot':
+            if not self._fw_mod_enabled:
+                return {'status': 'error',
+                        'message': 'firmware-slot modulation not enabled; call '
+                                   "enable_modulation(engine='fw', mode='manual') first"}
+            slot = int(message['slot'])
+            n_loaded = int(self._fw_mod['n_slots']) if self._fw_mod is not None else 0
+            if not 0 <= slot < n_loaded:
+                return {'status': 'error',
+                        'message': f'slot must be in 0..{n_loaded - 1} (loaded slots), got {slot}'}
+            self._fw_mod_slot = slot
+            if self._fw_mod is not None:
+                self._fw_mod['mode'] = 'manual'
+                self._fw_mod['state']['mode'] = 'manual'
+                self._fw_mod['state']['slot'] = slot
+            return {'status': 'success', 'result': {'slot': slot}}
+
+        if request == 'get_fw_modulation_slot':
+            if not self._fw_mod_enabled:
+                return {'status': 'error',
+                        'message': 'firmware-slot modulation not enabled; call '
+                                   "enable_modulation(engine='fw', mode='manual') first"}
+            mode = self._fw_mod['mode'] if self._fw_mod is not None else 'auto'
+            slot = self._fw_mod_slot if mode == 'manual' else None
+            return {'status': 'success', 'result': {'slot': slot, 'mode': mode}}
+
+        if request == 'update_fw_modulation':
+            if self._fw_mod is None:
+                return {'status': 'error', 'message': 'firmware-slot modulation not armed'}
+            try:
+                fw = self._fw_mod
+                n_tones = len(np.asarray(self.tone_frequencies))
+                center = (np.asarray(fw['center'], dtype=float) if message.get('center') is None
+                          else np.asarray(message['center'], dtype=float))
+                if message.get('offsets') is None:
+                    full = np.asarray(fw['offsets'], dtype=float)
+                else:
+                    full, _n = self._mock_expand_offsets(message['offsets'], fw['mod_indices'], n_tones)
+                n_dwell = int(message.get('n_dwell', fw['n_dwell']))
+                n_settle = int(message.get('n_settle', fw.get('n_settle', 0)))
+                mode = message.get('mode', fw['mode'])
+                if not 0 <= n_settle < n_dwell:
+                    raise ValueError(
+                        f'n_settle must satisfy 0 <= n_settle < n_dwell ({n_dwell}), got {n_settle}')
+                self._fw_mod_revision = (self._fw_mod_revision + 1) & 0x7FFF
+                state = self._mock_fw_state(center, full, fw['mod_indices'], n_dwell, n_settle, mode)
+                if state['needs_recenter'] and not bool(message.get('force', False)):
+                    self._fw_mod_revision = (self._fw_mod_revision - 1) & 0x7FFF
+                    raise ValueError('update pushes a tone beyond fixed-bin coverage; force=True to override')
+                self._fw_mod = {'center': center, 'offsets': full, 'mod_indices': fw['mod_indices'],
+                                'n_dwell': int(n_dwell), 'n_settle': int(n_settle),
+                                'mode': str(mode), 'n_slots': int(full.shape[0]),
+                                'revision': int(self._fw_mod_revision), 'state': state}
+                state['enabled'] = bool(self._fw_mod_enabled)
+                return {'status': 'success', 'warnings': list(state.get('warnings', [])),
+                        'result': {'revision': self._fw_mod_revision, 'mode': str(mode),
+                                   'n_slots': int(full.shape[0]), 'n_dwell': int(n_dwell),
+                                   'n_settle': int(n_settle),
+                                   'needs_recenter': state['needs_recenter'],
+                                   'any_beyond_half_bin': state['any_beyond_half_bin'],
+                                   'tones_beyond_half_bin': state['tones_beyond_half_bin']}}
+            except Exception as e:
+                return {'status': 'error', 'message': str(e)}
+
+        if request == 'recenter_fw_modulation':
+            if self._fw_mod is None:
+                return {'status': 'error', 'message': 'firmware-slot modulation not armed'}
+            try:
+                fw = self._fw_mod
+                n_tones = len(np.asarray(self.tone_frequencies))
+                center = (np.asarray(fw['center'], dtype=float) if message.get('center') is None
+                          else np.asarray(message['center'], dtype=float))
+                if message.get('offsets') is None:
+                    full = np.asarray(fw['offsets'], dtype=float)
+                else:
+                    full, _n = self._mock_expand_offsets(message['offsets'], fw['mod_indices'], n_tones)
+                n_dwell = int(message.get('n_dwell', fw['n_dwell']))
+                n_settle = int(message.get('n_settle', fw.get('n_settle', 0)))
+                mode = message.get('mode', fw['mode'])
+                if not 0 <= n_settle < n_dwell:
+                    raise ValueError(
+                        f'n_settle must satisfy 0 <= n_settle < n_dwell ({n_dwell}), got {n_settle}')
+                self._fw_mod_revision = (self._fw_mod_revision + 1) & 0x7FFF
+                # Recenter snaps fresh bins (the mock recomputes armed bins from the
+                # centre), so it accepts moves the seamless update would reject.
+                state = self._mock_fw_state(center, full, fw['mod_indices'], n_dwell, n_settle, mode)
+                self._fw_mod = {'center': center, 'offsets': full, 'mod_indices': fw['mod_indices'],
+                                'n_dwell': int(n_dwell), 'n_settle': int(n_settle),
+                                'mode': str(mode), 'n_slots': int(full.shape[0]),
+                                'revision': int(self._fw_mod_revision), 'state': state}
+                state['enabled'] = bool(self._fw_mod_enabled)
+                return {'status': 'success', 'warnings': list(state.get('warnings', [])),
+                        'result': {'revision': self._fw_mod_revision, 'mode': str(mode),
+                                   'n_slots': int(full.shape[0]), 'n_dwell': int(n_dwell),
+                                   'n_settle': int(n_settle),
+                                   'needs_recenter': state['needs_recenter'],
+                                   'any_beyond_half_bin': state['any_beyond_half_bin'],
+                                   'tones_beyond_half_bin': state['tones_beyond_half_bin']}}
+            except Exception as e:
+                return {'status': 'error', 'message': str(e)}
+
+        if request == 'disable_fw_modulation':
+            self._fw_mod_enabled = False
+            if self._fw_mod is not None:
+                self._fw_mod['state']['enabled'] = False
             return {'status': 'success'}
 
         if request == 'purge_modulation_revisions':
