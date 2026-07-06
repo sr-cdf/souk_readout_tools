@@ -210,45 +210,93 @@ def load_response(path):
     return table
 
 
-def analytic_gain_db(offset_bins, combined=True, ntaps=8, nfft=64, pad=32, nw=2.0):
+def _prototype_response(ntaps=8, nfft=64, pad=32, nw=2.0):
     """
-    Analytic DPSS+sinc prototype-filter gain (dB) versus bin offset.
+    Single-bank DPSS+sinc prototype amplitude response.
 
     The souk-firmware PFB/PSB prototype is an ``ntaps``-tap sinc weighted by a
     DPSS (NW=2) window, with the half-sample coefficient convention of
-    mlib_devel's ``pfb_coeff_gen_calc.m`` -- confirmed against the firmware
-    coefficients in souk-firmware issue #117. The single-bank power response
-    is flat to ~0.005 dB over the centre half of a channel and crosses -6 dB
-    at one bin spacing (the channel edge, where adjacent every-other-bin
-    responses meet).
+    mlib_devel's ``pfb_coeff_gen_calc.m`` (the symmetric linspace variant gives
+    a visibly different passband) -- confirmed against the firmware
+    coefficients in souk-firmware issue #117.
 
-    ``combined=True`` (default) returns the TX+RX cascade: the banks are
-    identical, so the combined gain is twice the single-bank dB. This is an
-    idealised model -- it has no aliased-image interference, so it diverges
-    from a measured table near the channel edges; use it as a cross-check
-    and fallback, prefer a measured table for compensation.
-
-    Parameters: ``offset_bins`` in bin spacings; ``ntaps`` prototype taps;
-    ``nfft`` / ``pad`` set the internal resolution (defaults resolve the
-    response to ~5e-4 bins). Requires scipy.
+    Returns ``(axis, amplitude)``: the axis is in units of the *channel width*
+    (one FFT bin of the critically-sampled design); the 2x-oversampled
+    filterbank spaces channels every half channel width, so an offset in bin
+    spacings (the ``drift_bins`` convention) is ``axis * 2``.
     """
     import scipy.signal
 
-    offset_bins = np.asarray(offset_bins, dtype=float)
-    # Coefficients: sinc on the matlab pfb_coeff_gen_calc time axis (samples
-    # offset by half a step -- the convention the firmware actually uses; the
-    # symmetric linspace variant gives a visibly different passband).
     trange = np.arange(0.5, ntaps * nfft, 1.0) / nfft - ntaps / 2.0
     coeffs = np.sinc(trange) * scipy.signal.windows.dpss(ntaps * nfft, nw, sym=True)
     response = np.abs(np.fft.fftshift(np.fft.fft(coeffs, nfft * pad)))
     response /= np.max(response)
-    # The prototype's natural frequency unit is the *channel width* (one FFT
-    # bin of the critically-sampled design). The 2x-oversampled filterbank
-    # spaces channels every half channel width, and offset_bins (the
-    # drift_bins convention) counts those spacings -- so halve the axis.
     x = np.linspace(-nfft / 2.0, nfft / 2.0, nfft * pad, endpoint=False)
+    return x, response
+
+
+def analytic_gain_db(offset_bins, combined=True, ntaps=8, nfft=64, pad=32, nw=2.0):
+    """
+    Naive (no-image) DPSS+sinc prototype gain (dB) versus bin offset.
+
+    ``combined=False``: the single-bank response -- flat to ~0.005 dB over the
+    centre half of a channel, -6 dB at one bin spacing (the channel edge).
+    This is the right factor for the **TX drive** seen by a detector: the main
+    synthesized tone rolls off with the single PSB bank.
+
+    ``combined=True`` (default): twice the single-bank dB -- the TX+RX cascade
+    **ignoring aliased images**. Near the channel edge this is wrong for the
+    accumulator readout: the synthesis emits a Nyquist image that re-enters
+    the analysis bin and recombines coherently, lifting the edge from -12 dB
+    to ~-6 dB. Use :func:`analytic_cascade_response` for the readout path
+    (validated to ~0.02 dB against a digital-loopback measurement).
+
+    Parameters: ``offset_bins`` in bin spacings; ``nfft`` / ``pad`` set the
+    internal resolution (defaults resolve ~5e-4 bins). Requires scipy.
+    """
+    x, response = _prototype_response(ntaps, nfft, pad, nw)
+    offset_bins = np.asarray(offset_bins, dtype=float)
     single_db = 20.0 * np.log10(np.interp(offset_bins / 2.0, x, response))
     return 2.0 * single_db if combined else single_db
+
+
+def analytic_cascade_response(offset_bins, delay_s=0.0, bin_spacing_hz=300e3,
+                              n_images=2, ntaps=8, nfft=64, pad=32, nw=2.0):
+    """
+    Complex TX+RX cascade response versus bin offset, **including images**.
+
+    A tone at offset ``d`` (bin spacings) from the armed bin centre is
+    synthesized by the PSB together with its aliases at ``d - 2m`` (the
+    channelized rate is two spacings), each weighted by the single-bank
+    response; the PFB analysis weights each by the same factor, and the RX LO
+    demodulation aliases them all onto DC, where they sum coherently:
+
+        H(d) = sum_m G(d - 2m)^2 * exp(1j * 4 pi m * bin_spacing_hz * delay_s)
+
+    normalised to exactly 1 at the bin centre. With ``delay_s = 0`` (digital
+    loopback) the sum is real: the edge sits at ~-6 dB (not the naive -12 dB)
+    with zero phase -- this matches the measured digital-loopback table to
+    ~0.02 dB across the full channel (2026-07-06). A non-zero ``delay_s``
+    (analog path) rotates the image term: magnitude ripple and a phase
+    turn-over appear near the edges, on top of the overall (compensatable)
+    delay slope which is *not* included here.
+
+    Returns a complex array shaped like ``offset_bins``. Requires scipy.
+    """
+    x, response = _prototype_response(ntaps, nfft, pad, nw)
+    offset_bins = np.asarray(offset_bins, dtype=float)
+
+    def gain(d):
+        return np.interp(np.asarray(d, dtype=float) / 2.0, x, response)
+
+    def cascade(d):
+        total = 0j * np.asarray(d, dtype=float)
+        for m in range(-n_images, n_images + 1):
+            phase = 4.0 * np.pi * m * float(bin_spacing_hz) * float(delay_s)
+            total = total + gain(d - 2 * m) ** 2 * np.exp(1j * phase)
+        return total
+
+    return cascade(offset_bins) / cascade(np.zeros(1))[0]
 
 
 def evaluate_response(table, offset_bins):

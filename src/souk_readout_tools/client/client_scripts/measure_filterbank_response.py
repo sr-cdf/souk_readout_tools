@@ -223,8 +223,9 @@ def _plot_table(table, filename, show_model=True):
     ax_g.plot(table['offset_bins'], table['gain_db'], 'k', lw=2, label='combined (median)')
     ax_p.plot(table['offset_bins'], table['phase_rad'], 'k', lw=2)
     if show_model:
-        ax_g.plot(table['offset_bins'], fbr.analytic_gain_db(table['offset_bins']),
-                  'r--', lw=1.2, label='DPSS+sinc model (TX+RX)')
+        model = fbr.analytic_cascade_response(table['offset_bins'])
+        ax_g.plot(table['offset_bins'], 20 * np.log10(np.abs(model)),
+                  'r--', lw=1.2, label='DPSS+sinc model incl. images')
     for ax in (ax_g, ax_p):
         for x in (-0.5, 0.5):
             ax.axvline(x, color='grey', ls=':', lw=0.8)   # half-bin edges
