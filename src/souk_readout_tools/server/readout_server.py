@@ -1051,6 +1051,37 @@ class ReadoutServer:
 
         return cls
 
+    def _assert_pipeline_ready(self, source='config'):
+        """Raise ``RuntimeError`` if the pipeline did not actually come up ready.
+
+        souk_mkid_readout's constructor catches its own block-init failures and
+        returns a half-built object, so ensure_ready()/force_ready() can complete
+        without raising even when the firmware never initialised (unprogrammed, a
+        firmware/register-map mismatch, or a clock problem). Re-run the readiness
+        predicates so callers that report success to a client - notably
+        set_config/push_config - fail loudly instead of persisting a config that
+        never took effect.
+        """
+        if self.r is None:
+            raise RuntimeError('firmware interface was not created (see server log)')
+
+        reason = None
+        if firmware_lib.needs_programming(self.r, self.config):
+            reason = ('firmware is not programmed with the configured image, or its '
+                      'block interfaces failed to build (unsupported firmware?)')
+        elif firmware_lib.needs_shared_resource_initialising(self.r, self.config):
+            reason = 'shared firmware resources are not initialised'
+        elif firmware_lib.needs_pipeline_initialising(self.r, self.config):
+            reason = 'pipeline firmware resources are not initialised'
+
+        if reason is not None:
+            msg = (f'pipeline did not come up ready on the pushed config: {reason}. '
+                   f'The configured .fpg may have failed to program or the board may '
+                   f'be running firmware unsupported by this software - check the '
+                   f'server log and retry (e.g. hard_reset).')
+            _server_log(f'not ready after apply: {reason}', source=source)
+            raise RuntimeError(msg)
+
     def _create_firmware_interfaces(self, source='firmware'):
         """Create firmware interfaces only after the PL clocks are locked."""
         self._require_clocks_locked(source=source)
@@ -1539,11 +1570,38 @@ class ReadoutServer:
         _server_log(f'saved config: {filename}', source='config')
 
         self._require_clocks_locked(source='config', config=config_contents)
-        firmware_lib.apply_config(config_contents, self.r, self.r_fast, self.applied_config)
-        self.applied_config = copy.deepcopy(config_contents)
-        self.update_active_tone_indices()
 
-        self.ensure_ready(config_file=filename, level="pipeline", log_source='config')
+        # A config that changes the firmware image (a different .fpg than the one
+        # currently loaded) cannot be applied as a live parameter tweak - it needs a
+        # full deprogram/reprogram. needs_programming() compares the config's fpg
+        # against what is loaded *right now* (via the existing self.r, before it is
+        # rebuilt against the new register map); it also trips if the firmware
+        # interface failed to build. Decide here, up front, so the comparison isn't
+        # corrupted by ensure_ready() rebuilding self.r against the new config first
+        # (which is why a firmware switch could previously slip through without
+        # reprogramming). On a match, drive the explicit force_ready reprogram, which
+        # deprograms first and re-applies every config value during pipeline init;
+        # applying config to the outgoing image first is pointless and, against a
+        # mismatched register map, actively misleading.
+        if firmware_lib.needs_programming(self.r, config_contents):
+            _server_log('config changes the firmware image; reprogramming', source='config')
+            self.load_config(filename, log_source='config')
+            self.force_ready(level="pipeline")
+            self.applied_config = copy.deepcopy(self.config)
+            self.update_active_tone_indices()
+        else:
+            firmware_lib.apply_config(config_contents, self.r, self.r_fast, self.applied_config)
+            self.applied_config = copy.deepcopy(config_contents)
+            self.update_active_tone_indices()
+            self.ensure_ready(config_file=filename, level="pipeline", log_source='config')
+
+        # Only report success (and persist this config as the default, below) if the
+        # pipeline actually came up on it. souk_mkid_readout's constructor swallows
+        # block-init failures - it logs a traceback but returns a half-built object -
+        # so ensure_ready()/force_ready() can return without raising even though the
+        # firmware never initialised. Re-check readiness so the client gets a clear
+        # error instead of a false success.
+        self._assert_pipeline_ready(source='config')
 
         # Rebind/rebuild RF peripheral control after ensure_ready() reloads
         # self.config, then apply the requested RF settings to that live dict.

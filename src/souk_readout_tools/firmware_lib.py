@@ -746,12 +746,18 @@ def reload_firmware(config_dict, r=None):
         # 2) Check clocks and re-init only if necessary - safe now the PL is blank.
         apply_clock_config(config_dict)
 
-        # 3) Build interfaces and program the souk design.
+        # 3) Build the standard interface and program the souk design. The board is
+        #    on the blank base image here, so only build the standard interface: its
+        #    block-init cleanly no-ops on an unprogrammed board ("not programmed ...
+        #    skipping"). The fast/local interface is deferred until AFTER programming
+        #    - built against the base image it spuriously reads a zero fabric clock
+        #    and logs a misleading "FPGA is not clocking" error on every reprogram,
+        #    and the caller rebuilds it post-program anyway.
         r = create_standard_readout_interface(fw_config_file,pipeline_id=pipeline_id)
-        r_fast = create_fast_readout_interface(fw_config_file,pipeline_id=pipeline_id)
         _firmware_log('programming FPGA', source='program')
         r.program()
         time.sleep(1)
+        r_fast = create_fast_readout_interface(fw_config_file,pipeline_id=pipeline_id)
         fw_type = r.fpga.get_firmware_type()
         if fw_type==2:
             if pipeline_id!=0:
