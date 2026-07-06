@@ -49,7 +49,8 @@ def probe_bin_geometry(client, mod_indices=None, probe_hz=1000.0):
     from its armed bin centre, and the drift step measures the bin spacing.
     Disables modulation again before returning.
 
-    Returns (bin_spacing_hz, {tone_index: residual_bins}).
+    Returns (bin_spacing_hz, {tone_index: residual_bins},
+    {tone_index: armed_fft_bin}).
     """
     ack = client.enable_modulation(offsets=[0.0, float(probe_hz)], mod_indices=mod_indices,
                                    samples_per_point=2, n_settle=0, engine='sw')
@@ -58,6 +59,7 @@ def probe_bin_geometry(client, mod_indices=None, probe_hz=1000.0):
     state = client.get_modulation_state()
     client.disable_modulation(engine='sw')
     residuals = {}
+    armed_bins = {}
     steps = []
     for tone in state.get('tones', []):
         d = np.asarray(tone.get('drift_bins', []), dtype=float)
@@ -65,11 +67,41 @@ def probe_bin_geometry(client, mod_indices=None, probe_hz=1000.0):
             raise RuntimeError(f"tone {tone.get('index')}: no drift_bins in the "
                                'modulation state; server too old?')
         residuals[int(tone['index'])] = float(d[0])
+        armed_bins[int(tone['index'])] = int(tone.get('armed_fft_bin', -1))
         steps.append(d[1] - d[0])
     if not steps:
         raise RuntimeError('no modulated tones in the probe state')
     bin_spacing_hz = float(probe_hz) / float(np.mean(steps))
-    return bin_spacing_hz, residuals
+    return bin_spacing_hz, residuals, armed_bins
+
+
+def _drop_alias_collisions(residuals, armed_bins):
+    """
+    Drop one tone of each pair whose bin-centred ladders alias-collide.
+
+    Centring every ladder on its armed bin locks each tone pair's physical
+    separation to exactly their armed-bin difference (in spacings). An **even**
+    separation aliases the neighbour exactly onto this tone's DC (the
+    channelized rate is two spacings), so pairs 2 bins apart contaminate each
+    other's outer probe points through the channel edge -- scaled by their
+    power imbalance (observed 2026-07-06: a +27 dB stronger neighbour 2 bins
+    away swamped a tone's edge points at +15 dB). Pairs 4 bins apart only
+    interact via deep response tails; they are warned about but kept.
+    """
+    keep = dict(residuals)
+    indices = sorted(armed_bins)
+    for a_pos, i in enumerate(indices):
+        for j in indices[a_pos + 1:]:
+            sep = abs(armed_bins[i] - armed_bins[j])
+            if sep == 2 and i in keep and j in keep:
+                print(f'excluding tone {j}: armed bin only {sep} spacings from '
+                      f'tone {i} -- bin-centred ladders alias-collide at the '
+                      f'channel edges. Re-run with mod_indices=[{j}] to measure it.')
+                del keep[j]
+            elif sep == 4 and sep % 2 == 0:
+                print(f'note: tones {i} and {j} are 4 spacings apart; edge '
+                      'contamination possible with a large power imbalance.')
+    return keep
 
 
 def measure_filterbank_response(config_file=None, address=None, request_port=None,
@@ -121,8 +153,11 @@ def measure_filterbank_response(config_file=None, address=None, request_port=Non
     client.disable_stream()                     # arming rewrites channel maps
 
     # Bin spacing + per-tone centre residuals, so each tone's ladder can be
-    # centred on its own armed bin centre.
-    bin_spacing_hz, residuals = probe_bin_geometry(client, mod_indices=mod_indices)
+    # centred on its own armed bin centre. Tones whose bin-centred ladders
+    # would alias-collide with a close neighbour are dropped (see
+    # _drop_alias_collisions).
+    bin_spacing_hz, residuals, armed_bins = probe_bin_geometry(client, mod_indices=mod_indices)
+    residuals = _drop_alias_collisions(residuals, armed_bins)
     print(f'bin spacing: {bin_spacing_hz/1e3:.3f} kHz; probing {len(residuals)} tone(s), '
           f'+/-{span_bins} bins, {n_points} points, residuals '
           f'{min(residuals.values()):+.3f}..{max(residuals.values()):+.3f} bins')
@@ -148,6 +183,11 @@ def measure_filterbank_response(config_file=None, address=None, request_port=Non
     print(f"measured {table['n_tones_used']} tone(s) x {table['n_cycles']} cycle(s); "
           f"gain at span edges: {table['gain_db'][0]:+.3f} / {table['gain_db'][-1]:+.3f} dB; "
           f"tone-to-tone spread <= {np.max(table['gain_db_std']):.4f} dB")
+    if not mock:    # the mock's resonator phase slope is not a loopback delay
+        delay = fbr.fit_group_delay({**table, 'meta': {'bin_spacing_hz': bin_spacing_hz}})
+        if abs(delay['slope_rad_per_bin']) > 0.01:      # digital loopback fits ~0
+            print(f"passband phase slope {delay['slope_rad_per_bin']:+.4f} rad/bin "
+                  f"-> loopback group delay {delay['delay_s']*1e9:.1f} ns")
 
     if filename is None:
         stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
