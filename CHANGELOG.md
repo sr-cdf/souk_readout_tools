@@ -1,6 +1,70 @@
 # Changelog & Feature List
 
-## v1.5.0 (Current)
+## v1.6.0 (Current)
+
+**v7.11 multi-LO firmware support (firmware-slot frequency modulation)**
+- Adapted to the v7.11 register map: `acc_len` moves from the accumulator to the
+  mixer (get/set, readiness checks and sample-rate helpers; changing it now
+  needs an mrst sync). `sync_delay` is deprecated — the mixer owns the RX/TX LO
+  delay and sets it during init; config/parameter writes warn and no-op, and
+  `info_pipeline` reports the live mixer `sync_delay`, `tx_rx_skew` and
+  `buffer_switch_skew`.
+- Mixer LO control ping-pong buffers are now separate registers
+  (`{lo}_lo{i}_control0/1`), each holding `n_slots` LO slots selected by
+  in-register offset. All slow/fast control-buffer read/write paths gain a
+  `slot` argument (`slot=0` reproduces the pre-v7.11 single-LO behaviour).
+  `accumulator.get_new_spectra` now returns a 5-tuple.
+
+**Firmware-slot modulation engine (`engine='fw'`, hardware-validated)**
+- New modulation engine using the v7.11 mixer's four LO slots: load up to four
+  full combs (centre + per-slot offset) once and let the firmware switch
+  between them — auto round-robin every `n_dwell` accumulations, or manual
+  slot selection — with no per-sample software writes and no software-timing
+  jitter. Switches land on accumulation edges; the residual transient is well
+  under one accumulation, so `n_settle` of 0 or 1 suffices.
+- Each accumulation is tagged from the firmware `buffer_id` register (live LO
+  slot for fw, ping-pong buffer → point for sw) in the same devmem call as the
+  IQ data, removing the one-sample tag/data lag of the v7.11 edge-latched
+  buffer switch. `get_samples` aligns its first returned sample to the start
+  of a point-1 dwell; settling is edge-detected from tag changes so it
+  self-corrects across dropped samples.
+- Seamless `update_modulation` rides the inactive ping-pong buffer and flips
+  in one step; `recenter_modulation` reloads fresh armed bins. The two engines
+  share the `flag5` tag word and are mutually exclusive; tone/sweep/retune
+  writes invalidate both.
+
+**Unified modulation API**
+- One client surface for both engines: `enable_modulation(center, offsets, ...,
+  engine='fw')` defaults to the firmware-slot engine;
+  `update/recenter/disable_modulation` and `get_modulation_state` auto-detect
+  the active engine (`engine=None`), with `set_modulation_slot` for fw manual
+  mode. The sw path is unchanged underneath.
+- `get_info`: the `tone_modulation` section becomes `modulation` — a single
+  payload for whichever engine is active, tagged with an `engine` field and
+  carrying `num_points` / `samples_per_point` / `offsets_hz` aliases so it is
+  drop-in for `group_cycles` / `demodulate`.
+  `modulation.active_modulation_state()` picks the state out of a `get_info`
+  payload for the analysis/plotting helpers.
+- [frequency_modulation.md](doc/frequency_modulation.md) rewritten around the
+  unified API with firmware-slot as the primary engine.
+
+**Snapshots (v7.11)**
+- Snapshot blocks latch the telescope time of the first sample;
+  `get_adc/dac_snapshot` requests return it as `timestamp`. New
+  `batch_adc_snapshots` / `batch_dac_snapshots` stream raw timestamped
+  snapshots to the client over one TCP connection via the fast devmem path.
+
+**Server robustness**
+- `set_config` now verifies pipeline readiness after a config push and fails
+  loudly instead of persisting a dead config; a pushed config that changes the
+  firmware image drives the full deprogram/reprogram path instead of a live
+  parameter tweak.
+
+**Misc**
+- Added `resonator_fitter.py` for compatibility with the ukkid_controller OCS
+  agent.
+
+## v1.5.0
 
 **v7.10-timed-sync firmware support (timed sync & multi-board alignment)**
 - Added support for the v7.10-timed-sync firmware, including TT-targeted syncs so
