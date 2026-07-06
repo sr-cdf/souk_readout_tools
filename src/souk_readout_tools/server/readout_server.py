@@ -1680,7 +1680,7 @@ class ReadoutServer:
     ]
     ALL_INFO_SECTIONS = DEFAULT_INFO_SECTIONS + [
         'diagnostics', 'config', 'calibrations', 'resonators', 'registers',
-        'tone_modulation',
+        'modulation',
     ]
 
     # Sections that only read PS-side state (clock chips over I2C/SPI, sysmon,
@@ -1724,7 +1724,7 @@ class ReadoutServer:
             'calibrations': self._info_calibrations,
             'resonators':   self._info_resonators,
             'registers':    self._info_registers,
-            'tone_modulation': self._info_tone_modulation,
+            'modulation': self._info_modulation,
         }
         if sections == 'list':
             # Catalogue of available sections (derived from what's actually
@@ -2008,23 +2008,52 @@ class ReadoutServer:
     def _info_tones(self):
         info = firmware_lib.info_tones(
             self.r, self.r_fast, self.config, rf_peripherals=self.rf_peripherals)
-        # Compact modulation hint so a get_info('tones') caller sees the state
-        # without the full per-tone detail (which lives in 'tone_modulation').
-        state = self._current_modulation_info_state()
+        # Compact unified modulation hint so a get_info('tones') caller sees which
+        # engine is active without the full per-tone detail (in 'modulation').
         try:
+            m = self._info_modulation()
             info['modulation'] = {
-                'enabled': bool(self.e_modulation_enabled.is_set()),
-                'any_beyond_half_bin': bool(state.get('any_beyond_half_bin')) if state else False,
-                'any_at_limit': bool(state.get('needs_recenter')) if state else False,
+                'engine': m.get('engine'),
+                'enabled': bool(m.get('enabled')),
+                'mode': m.get('mode'),
+                'num_points': m.get('num_points', 0),
+                'any_beyond_half_bin': bool(m.get('any_beyond_half_bin')),
+                'any_at_limit': bool(m.get('needs_recenter')),
             }
         except Exception:
             pass
         return info
 
+    def _info_modulation(self):
+        """
+        Return the unified modulation state for ``get_info('modulation')``.
+
+        Software and firmware-slot modulation are mutually exclusive; this reports
+        whichever is active as a single payload with an ``engine`` field
+        (``'fw'`` | ``'sw'`` | ``None``). When neither is enabled it reports the
+        resident (last-armed) config, or an off stub if nothing was ever armed.
+        Pure read (no hardware access).
+        """
+        fw_on = self.e_fw_modulation_enabled.is_set()
+        sw_on = self.e_modulation_enabled.is_set()
+        if fw_on:
+            engine, state = 'fw', self._info_fw_modulation()
+        elif sw_on:
+            engine, state = 'sw', self._info_tone_modulation()
+        elif self.fw_modulation_state is not None:
+            engine, state = 'fw', self._info_fw_modulation()
+        elif self.modulation_state is not None or self._pending_modulation is not None:
+            engine, state = 'sw', self._info_tone_modulation()
+        else:
+            return {'engine': None, 'enabled': False, 'num_points': 0, 'tones': []}
+        state = dict(state)
+        state['engine'] = engine
+        return state
+
     def _info_tone_modulation(self):
         """
-        Return the cached fast-frequency-modulation state for
-        ``get_info('tone_modulation')``.
+        Return the cached software-modulation state (the ``sw`` half of
+        ``get_info('modulation')``).
 
         This is a pure read of the applied or pending modulation state — it
         performs **no hardware access**, so a client can poll it without
@@ -4959,7 +4988,7 @@ class ReadoutServer:
         -------
         (bundle, state, cfg) : tuple of dict
             ``bundle`` from :func:`firmware_lib.prepare_modulation_settings_fast`;
-            ``state`` the ``get_info('tone_modulation')`` payload (static parts);
+            ``state`` the ``get_info('modulation')`` payload (static parts);
             ``cfg`` the resolved configuration (center/offsets/mod_indices/dwell).
         """
         freqs, amps, phases, metadata = self._live_tone_state(center=center)
@@ -5014,7 +5043,7 @@ class ReadoutServer:
 
     def _build_modulation_state(self, bundle, cfg):
         """
-        Assemble the ``get_info('tone_modulation')`` payload from a prepared
+        Assemble the ``get_info('modulation')`` payload (sw engine) from a prepared
         ``bundle`` and resolved ``cfg``. Per-tone entries are in user-facing
         order (matching the stream's I/Q columns); ``firmware_index`` is an
         annotation only. ``enabled`` / revision fields are filled by the frame

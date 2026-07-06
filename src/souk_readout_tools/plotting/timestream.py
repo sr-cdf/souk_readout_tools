@@ -86,7 +86,8 @@ def _get_modulated_probe_frequencies(ts_data, tone_index, fallback_frequency,
     if not isinstance(info, dict):
         return freqs
 
-    state = info.get('tone_modulation')
+    from souk_readout_tools.modulation import active_modulation_state
+    state = active_modulation_state(info)   # software OR firmware-slot state
     points = ts_data.get('modulation_point') if isinstance(ts_data, dict) else None
     if not isinstance(state, dict) or points is None:
         return freqs

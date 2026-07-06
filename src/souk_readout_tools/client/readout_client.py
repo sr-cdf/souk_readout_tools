@@ -2389,15 +2389,59 @@ class ReadoutClient:
         return self.send_request(message)
 
     def enable_modulation(self, center=None, offsets=None, mod_indices=None,
-                          samples_per_point=4, n_settle=1, autosync=False,
-                          setup_sync=True, mrst=False, setup_mrst=False,
-                          compensate_rx_ticks=0, buffer_reuse_delay_accs=3,
-                          force=False):
+                          samples_per_point=None, n_settle=None, engine='fw',
+                          mode='auto', compensate_rx_ticks=0, force=False,
+                          autosync=False, setup_sync=True, mrst=False, setup_mrst=False,
+                          buffer_reuse_delay_accs=3):
         """
-        Arm fast tone-frequency modulation. This only **arms** (loads the config
-        on the server); it does not start output. Call :meth:`enable_stream` for
-        continuous modulated streaming, or :meth:`get_samples` for a finite
-        modulated capture — both return frames tagged with the active point.
+        Enable frequency modulation. ``engine`` selects the modulation engine and
+        **defaults to** ``'fw'`` (firmware-slot: the mixer switches between LO
+        slots in hardware); pass ``engine='sw'`` for the software engine (the two
+        ping-pong control buffers stepped from software). The two are mutually
+        exclusive.
+
+        Common parameters (both engines): ``center`` (per-tone centre RF freqs
+        Hz; ``None`` = current comb), ``offsets`` (probe offsets Hz -- per LO slot
+        for fw, per point for sw), ``mod_indices``, ``samples_per_point``
+        (accumulations per slot/point; the fw ``n_dwell``; defaults 4),
+        ``n_settle`` (leading settling accumulations per slot/point; defaults 0 for
+        fw, 1 for sw), ``compensate_rx_ticks``, ``force``.
+
+        ``engine='fw'`` also: ``mode`` (``'auto'`` round-robin | ``'manual'``).
+        ``engine='sw'`` also: ``autosync``, ``setup_sync``, ``mrst``, ``setup_mrst``,
+        ``buffer_reuse_delay_accs``.
+
+        Returns the server ack. Poll :meth:`get_modulation_state` for the unified
+        state (it carries an ``engine`` field). See :meth:`_enable_sw_modulation`
+        for the full software-mode detail.
+        """
+        if engine == 'fw':
+            return self._enable_fw_modulation(
+                center=center, offsets=offsets, mod_indices=mod_indices,
+                n_dwell=(4 if samples_per_point is None else samples_per_point),
+                n_settle=(0 if n_settle is None else n_settle),
+                mode=mode, compensate_rx_ticks=compensate_rx_ticks, force=force)
+        if engine == 'sw':
+            return self._enable_sw_modulation(
+                center=center, offsets=offsets, mod_indices=mod_indices,
+                samples_per_point=(4 if samples_per_point is None else samples_per_point),
+                n_settle=(1 if n_settle is None else n_settle),
+                autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
+                compensate_rx_ticks=compensate_rx_ticks,
+                buffer_reuse_delay_accs=buffer_reuse_delay_accs, force=force)
+        raise ValueError(f"engine must be 'fw' or 'sw', not {engine!r}")
+
+    def _enable_sw_modulation(self, center=None, offsets=None, mod_indices=None,
+                              samples_per_point=4, n_settle=1, autosync=False,
+                              setup_sync=True, mrst=False, setup_mrst=False,
+                              compensate_rx_ticks=0, buffer_reuse_delay_accs=3,
+                              force=False):
+        """
+        Arm software (ping-pong) tone-frequency modulation. This only **arms**
+        (loads the config on the server); it does not start output. Call
+        :meth:`enable_stream` for continuous modulated streaming, or
+        :meth:`get_samples` for a finite modulated capture — both return frames
+        tagged with the active point.
 
         Parameters
         ----------
@@ -2474,40 +2518,46 @@ class ReadoutClient:
         self._warn_modulation_response(response)
         return response
 
-    def update_modulation(self, center=None, offsets=None, on_map_change='continue',
-                          autosync=None, mrst=None, compensate_rx_ticks=None,
-                          buffer_reuse_delay_accs=None):
+    def update_modulation(self, center=None, offsets=None, samples_per_point=None,
+                          n_settle=None, engine=None, mode=None, force=False,
+                          compensate_rx_ticks=None, on_map_change='continue',
+                          autosync=None, mrst=None, buffer_reuse_delay_accs=None):
         """
-        Seamlessly update the modulation centre and/or offsets while armed, with
-        no dropped frames. Rides the existing armed channel maps.
+        Seamlessly update the modulation centre and/or offsets while armed, with no
+        dropped frames — riding the existing armed channel maps. ``engine=None``
+        (default) updates whichever engine is active.
 
-        Parameters
-        ----------
-        center : array-like or None
-            New per-tone centre RF frequencies in Hz (user order). ``None`` keeps
-            the current centres.
-        offsets : array-like or None
-            New probe offsets in Hz (same shapes as :meth:`enable_modulation`).
-            ``None`` keeps the current offsets.
-        on_map_change : {'continue', 'recenter'}, optional
-            What to do if the update would push a tone beyond the filterbank
-            overlap coverage: ``'continue'`` (default) rejects with diagnostics
-            and asks you to recenter; ``'recenter'`` performs the brief map reload.
-        autosync : bool or None, optional
-            Override the existing modulation sync mode. ``None`` preserves it.
-        compensate_rx_ticks : int or None, optional
-            Override the RX path-delay compensation (307.2 MHz clock ticks) for
-            the update. ``None`` preserves the armed config's value.
-        buffer_reuse_delay_accs : int or None, optional
-            Override the delay between a modulation buffer flip and reuse of the
-            just-vacated buffer. ``None`` preserves the armed config's value.
+        Firmware-slot (``engine='fw'``): loads the new slot combs into the inactive
+        ping-pong buffer and flips to them in one step (glitch-free). Software
+        (``engine='sw'``): swaps the new per-point words in place.
 
-        Returns
-        -------
-        dict
-            Server ack (``result.revision`` and ``result.op``), or an error with
-            ``result.tones_beyond_coverage`` if a recenter is required.
+        Common: ``center`` / ``offsets`` (``None`` keeps current), ``force`` (arm
+        even if a tone leaves fixed-bin coverage). fw also: ``samples_per_point``
+        (n_dwell), ``n_settle``, ``mode``. sw also: ``on_map_change``, ``autosync``,
+        ``mrst``, ``buffer_reuse_delay_accs``. An update that would push a tone
+        beyond bin coverage is rejected (use ``force``/``on_map_change='recenter'``
+        or disable+enable).
         """
+        if engine is None:
+            state = self.get_modulation_state()
+            engine = state.get('engine') if isinstance(state, dict) else None
+        if engine == 'fw':
+            message = {'request': 'update_fw_modulation', 'force': bool(force)}
+            if center is not None:
+                message['center'] = np.asarray(center, dtype=float).tolist()
+            if offsets is not None:
+                message['offsets'] = np.asarray(offsets, dtype=float).tolist()
+            if samples_per_point is not None:
+                message['n_dwell'] = int(samples_per_point)
+            if n_settle is not None:
+                message['n_settle'] = int(n_settle)
+            if mode is not None:
+                message['mode'] = str(mode)
+            if compensate_rx_ticks is not None:
+                message['compensate_rx_ticks'] = int(compensate_rx_ticks)
+            response = self.send_request(message)
+            self._warn_modulation_response(response)
+            return response
         message = {'request': 'update_modulation', 'on_map_change': on_map_change}
         if center is not None:
             message['center'] = np.asarray(center, dtype=float).tolist()
@@ -2525,19 +2575,48 @@ class ReadoutClient:
         self._warn_modulation_response(response)
         return response
 
-    def recenter_modulation(self, autosync=None, mrst=None,
+    def recenter_modulation(self, center=None, offsets=None, engine=None,
+                            samples_per_point=None, n_settle=None, mode=None,
+                            autosync=None, mrst=None,
                             compensate_rx_ticks=None,
                             buffer_reuse_delay_accs=None):
         """
-        Recenter modulation: reload the channel maps / mixer frequencies for the
-        current centre and recompute VACC bin-sharing (a deliberate brief break).
-        Use when :meth:`update_modulation` reports tones beyond bin coverage.
-        ``autosync=None`` preserves the existing sync mode; pass a bool to change it.
-        ``compensate_rx_ticks=None`` likewise preserves the armed RX path-delay
-        compensation; pass an int (307.2 MHz clock ticks) to change it.
-        ``buffer_reuse_delay_accs=None`` preserves the armed control-buffer reuse
-        delay; pass an int number of accumulations to change it.
+        Recenter modulation: reload the channel maps with **fresh** armed bins for
+        the centre and re-apply (a deliberate brief break). Use when
+        :meth:`update_modulation` reports tones beyond bin coverage — the one case
+        the seamless in-bin update cannot cover, on either engine. ``engine=None``
+        (default) recenters whichever engine is active.
+
+        **Firmware-slot** (``engine='fw'``): reloads all four slot combs against
+        fresh bins and restarts switching. Optional ``center`` / ``offsets`` /
+        ``samples_per_point`` / ``n_settle`` / ``mode`` override the resident config
+        (so you can recenter straight onto the new offsets that an update rejected);
+        omitted keeps the current value.
+
+        **Software** (``engine='sw'``): recenters the current config;
+        ``autosync`` / ``mrst`` / ``compensate_rx_ticks`` /
+        ``buffer_reuse_delay_accs`` override the armed values (``None`` preserves).
         """
+        if engine is None:
+            st = self.get_modulation_state()
+            engine = st.get('engine') if isinstance(st, dict) else None
+        if engine == 'fw':
+            message = {'request': 'recenter_fw_modulation'}
+            if center is not None:
+                message['center'] = np.asarray(center, dtype=float).tolist()
+            if offsets is not None:
+                message['offsets'] = np.asarray(offsets, dtype=float).tolist()
+            if samples_per_point is not None:
+                message['n_dwell'] = int(samples_per_point)
+            if n_settle is not None:
+                message['n_settle'] = int(n_settle)
+            if mode is not None:
+                message['mode'] = str(mode)
+            if compensate_rx_ticks is not None:
+                message['compensate_rx_ticks'] = int(compensate_rx_ticks)
+            response = self.send_request(message)
+            self._warn_modulation_response(response)
+            return response
         message = {'request': 'recenter_modulation'}
         if autosync is not None:
             message['autosync'] = bool(autosync)
@@ -2551,13 +2630,46 @@ class ReadoutClient:
         self._warn_modulation_response(response)
         return response
 
-    def disable_modulation(self):
+    def disable_modulation(self, engine=None):
         """
-        Pause modulation; tones rest at their centre frequencies. The armed
-        config stays resident so :meth:`enable_modulation` with no args re-arms
-        it quickly. Use :meth:`disable_stream` to stop output entirely.
+        Disable modulation. ``engine=None`` (default) disables whichever engine is
+        active (queried from the unified state); pass ``'fw'`` or ``'sw'`` to force
+        one. Tones rest at their centre comb; the armed config stays resident so
+        :meth:`enable_modulation` re-arms it quickly. Use :meth:`disable_stream`
+        to stop output entirely.
         """
+        if engine is None:
+            state = self.get_modulation_state()
+            engine = state.get('engine') if isinstance(state, dict) else None
+        if engine == 'fw':
+            return self._disable_fw_modulation()
+        return self._disable_sw_modulation()
+
+    def _disable_sw_modulation(self):
+        """Disable software modulation; tones rest at their centres."""
         return self.send_request({'request': 'disable_modulation'})
+
+    def set_modulation_slot(self, slot):
+        """
+        Firmware-slot modulation, manual mode: select the live LO slot (active
+        after the next accumulation). Requires
+        ``enable_modulation(engine='fw', mode='manual')``.
+
+        :param slot: LO slot to make live (0..n_slots-1).
+        """
+        return self._set_fw_modulation_slot(slot)
+
+    def get_modulation_slot(self):
+        """
+        Firmware-slot modulation, manual mode: return the live LO slot.
+
+        The full server ack; ``result.slot`` is the selected slot (``None`` in
+        ``'auto'`` mode, where the firmware round-robins the slots and the live
+        slot rides in each frame's ``modulation_point`` tag instead) and
+        ``result.mode`` is the switching mode. Requires firmware-slot modulation
+        enabled (see :meth:`enable_modulation` with ``engine='fw'``).
+        """
+        return self.send_request({'request': 'get_fw_modulation_slot'})
 
     def purge_modulation_revisions(self):
         """
@@ -2587,13 +2699,98 @@ class ReadoutClient:
 
     def get_modulation_state(self):
         """
-        Return the per-tone modulation state (the ``get_info('tone_modulation')``
-        section): armed flag, desired/applied revision, per-tone centres, offsets,
-        bin occupancy, half-bin warnings, and ``needs_recenter`` /
-        ``tones_beyond_coverage``. A pure server-side read (no hardware access),
-        safe to poll while streaming.
+        Return the unified modulation state (the ``get_info('modulation')``
+        section) for whichever engine is active: an ``engine`` field
+        (``'fw'``/``'sw'``/``None``), the armed flag, per-tone centres + offsets,
+        ``num_points`` / ``samples_per_point`` / ``n_settle``, bin occupancy and
+        warnings. A pure server-side read (no hardware access), safe to poll while
+        streaming. Drop-in as the ``tone_modulation_state`` argument of
+        :func:`souk_readout_tools.modulation.group_cycles` for **either** engine.
         """
-        return self.get_info('tone_modulation')
+        return self.get_info('modulation')
+
+    def _enable_fw_modulation(self, center=None, offsets=None, mod_indices=None,
+                              n_dwell=4, n_settle=0, mode='auto', compensate_rx_ticks=0,
+                              force=False):
+        """
+        Enable firmware-slot frequency modulation (``enable_modulation`` engine
+        ``'fw'``). Loads up to ``n_slots`` combs
+        (centre + per-slot offset) into the mixer LO slots and starts switching
+        between them; the firmware stamps each accumulation with its live slot,
+        which arrives as ``modulation_point = slot + 1`` in captured/streamed
+        frames. Requires continuous streaming disabled and software modulation
+        disabled (the two schemes share the frame[-5] tag word).
+
+        Unlike :meth:`enable_modulation`, this starts switching immediately (no
+        separate arm/stream split): follow with :meth:`get_samples` for a finite
+        capture or :meth:`enable_stream` for a continuous tagged stream.
+
+        Parameters
+        ----------
+        center : array-like or None
+            Per-tone centre RF frequencies in Hz (user order). ``None`` uses the
+            current live comb. With no args (and a previously-armed config) this
+            re-enables that config.
+        offsets : array-like or None
+            Per-slot probe offsets in Hz: shape ``(n_slots,)`` (broadcast across
+            the modulated tones) or ``(n_slots, len(mod_indices))`` (per tone).
+            ``n_slots`` must be 1..mixer n_slots (4). Slot ``i`` holds the comb at
+            ``centre + offsets[i]``; repeat a value to dwell a slot twice per cycle.
+        mod_indices : array-like or None
+            User-facing indices of tones to modulate. ``None`` = all regular
+            (resonator) tones. Blind tones are rejected by the server.
+        n_dwell : int, optional
+            Accumulations per slot before the firmware advances (auto mode).
+            Default 4.
+        n_settle : int, optional
+            Leading accumulations after each slot switch flagged as settling
+            (``modulation_settling``), so consumers can drop the switch edge. The
+            PSB 8-tap filter smears the switch over ~8 *pre-accumulation spectra*
+            -- far less than one accumulation at a typical ``acc_len`` (~1000) --
+            so this counts accumulations and is normally 0 or 1, not ~8. Must
+            satisfy ``0 <= n_settle < n_dwell``. Default 0.
+            ``group_cycles(..., include_settling=False)`` drops them.
+        mode : {'auto', 'manual'}, optional
+            'auto' (default): the firmware round-robins the slots every ``n_dwell``
+            accumulations. 'manual': the firmware holds slot 0 until you call
+            :meth:`set_modulation_slot` to switch (software-timed switching).
+        compensate_rx_ticks : int, optional
+            Per-slot RX phase compensation (307.2 MHz clock ticks) for the
+            RX-vs-TX path delay, as in :meth:`enable_modulation`. Default 0.
+        force : bool, optional
+            Arm even if a slot offset pushes a tone beyond one filterbank channel
+            from its armed bin (``needs_recenter``). Default ``False``.
+
+        Returns
+        -------
+        dict
+            Server ack (``result.revision``, ``result.mode``, ``result.n_slots``,
+            ``result.n_dwell``, ``result.needs_recenter``).
+        """
+        self._warn_zero_phases()
+        message = {'request': 'enable_fw_modulation',
+                   'n_dwell': int(n_dwell),
+                   'n_settle': int(n_settle),
+                   'mode': str(mode),
+                   'compensate_rx_ticks': int(compensate_rx_ticks),
+                   'force': bool(force)}
+        if center is not None:
+            message['center'] = np.asarray(center, dtype=float).tolist()
+        if offsets is not None:
+            message['offsets'] = np.asarray(offsets, dtype=float).tolist()
+        if mod_indices is not None:
+            message['mod_indices'] = [int(i) for i in np.atleast_1d(mod_indices)]
+        response = self.send_request(message)
+        self._warn_modulation_response(response)
+        return response
+
+    def _set_fw_modulation_slot(self, slot):
+        """Firmware-slot manual switch (see :meth:`set_modulation_slot`)."""
+        return self.send_request({'request': 'set_fw_modulation_slot', 'slot': int(slot)})
+
+    def _disable_fw_modulation(self):
+        """Stop firmware-slot switching; tones rest at the centre comb (slot 0)."""
+        return self.send_request({'request': 'disable_fw_modulation'})
 
     def enable_triggered_stream(self):
         """Enable triggered sample streaming on the server."""
@@ -2753,7 +2950,7 @@ class ReadoutClient:
                     'The server likely rejected or closed the capture; check the server log.')
             if incl_system_info:
                 info = self.get_info('all')
-                self._warn_modulation_state(info.get('tone_modulation'), stacklevel=2)
+                self._warn_modulation_state(info.get('modulation'), stacklevel=2)
             else:
                 info = {}
             sample_rate = self.get_sample_rate()
@@ -2769,7 +2966,8 @@ class ReadoutClient:
         """Return per-tone modulation centres from a ``get_info`` payload."""
         if not isinstance(info, dict):
             return None
-        state = info.get('tone_modulation')
+        from souk_readout_tools.modulation import active_modulation_state
+        state = active_modulation_state(info)   # software OR firmware-slot state
         if not isinstance(state, dict):
             return None
         state_tones = state.get('tones')
@@ -2824,7 +3022,7 @@ class ReadoutClient:
         centers_list = centers.tolist()
         tones['frequencies_hz'] = centers_list
         tones['modulation_center_frequencies_hz'] = centers_list
-        tones['frequencies_source'] = 'tone_modulation.center_hz'
+        tones['frequencies_source'] = 'modulation.center_hz'
         tones['modulation_active_during_capture'] = True
         return info
 

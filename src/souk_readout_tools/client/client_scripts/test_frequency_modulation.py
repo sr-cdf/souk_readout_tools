@@ -61,7 +61,7 @@ def make_client(f0, sample_rate=1000.0, linewidth=1.0e5):
     ms = c._mock_server
     ms.tone_frequencies = list(np.asarray(f0, float))
     ms._resize_tone_state(len(f0))
-    ms.sample_rate = float(sample_rate)
+    ms.acc_len = ms._acc_len_for_rate(float(sample_rate))  # sample_rate is derived from acc_len
     ms._mod_linewidth = float(linewidth)
     return c, ms
 
@@ -72,7 +72,7 @@ W = 1.0e5
 
 print('1) arm != stream, tag structure, gap-free counter')
 c, ms = make_client(F0, linewidth=W)
-ack = c.enable_modulation(center=F0, offsets=[-1e3, 0.0, 1e3], samples_per_point=4, n_settle=1)
+ack = c.enable_modulation(center=F0, offsets=[-1e3, 0.0, 1e3], samples_per_point=4, n_settle=1, engine='sw')
 check('enable returns success', ack.get('status') == 'success')
 check('enable arms only (mock not streaming)', ms.is_streaming is False)
 st = c.get_modulation_state()
@@ -114,7 +114,7 @@ check('frames carry the new revision', int(np.unique(d2['modulation_revision'])[
 print('4) per-(tone,point) bin occupancy + recenter')
 c, ms = make_client(np.array([2.0e9]), linewidth=W)   # single tone on a bin centre
 ms._mod_bin_hz = 1.0e6
-c.enable_modulation(center=[2.0e9], offsets=[-1e3, 0.0, 1e3], samples_per_point=2, n_settle=1)
+c.enable_modulation(center=[2.0e9], offsets=[-1e3, 0.0, 1e3], samples_per_point=2, n_settle=1, engine='sw')
 # Nudge the centre ~0.6 of a bin: still covered by the overlapping neighbour.
 c.update_modulation(center=[2.0e9 + 6e5])
 occ = c.get_modulation_state()['tones'][0]['occupancy']
@@ -130,7 +130,7 @@ check('recenter clears needs_recenter', c.get_modulation_state()['needs_recenter
 
 print('5) index consistency: modulate one tone, only that column moves')
 c, ms = make_client(F0, linewidth=W)
-c.enable_modulation(center=F0, offsets=[-2e3, 0.0, 2e3], mod_indices=[0], samples_per_point=3, n_settle=1)
+c.enable_modulation(center=F0, offsets=[-2e3, 0.0, 2e3], mod_indices=[0], samples_per_point=3, n_settle=1, engine='sw')
 d = c.parse_samples(c.get_samples(60))
 z0 = d['i_data']['0000'] + 1j * d['q_data']['0000']
 z1 = d['i_data']['0001'] + 1j * d['q_data']['0001']
@@ -143,7 +143,7 @@ c.disable_modulation()
 check('disable clears enabled flag', c.get_modulation_state()['enabled'] is False)
 d = c.parse_samples(c.get_samples(12))
 check('paused stream is untagged (point 0)', int(np.max(d['modulation_point'])) == 0)
-c.enable_modulation()   # resume resident config, no args
+c.enable_modulation(engine='sw')   # resume resident config, no args
 check('resume re-enables', c.get_modulation_state()['enabled'] is True)
 d = c.parse_samples(c.get_samples(12))
 check('resumed stream is tagged again', int(np.max(d['modulation_point'])) >= 1)
@@ -157,7 +157,7 @@ check('get_samples after disable_stream is still modulated', int(np.max(d['modul
 print('7) demod tool: slope / curvature / detuning')
 c, ms = make_client(F0, linewidth=W)
 # Centred 3-point capture.
-c.enable_modulation(center=F0, offsets=[-1e3, 0.0, 1e3], samples_per_point=8, n_settle=2)
+c.enable_modulation(center=F0, offsets=[-1e3, 0.0, 1e3], samples_per_point=8, n_settle=2, engine='sw')
 state = c.get_modulation_state()
 d = c.parse_samples(c.get_samples(3 * 8 * 12))
 grouped = mod.group_cycles(d, state, reduce='mean')
@@ -191,7 +191,7 @@ check('reduce=None metadata retains sample axis',
       g_axis['packet_counter'].shape == g_axis['z'].shape[:3])
 
 # Two-point pattern -> curvature/detuning are NaN.
-c.enable_modulation(center=F0, offsets=[-1e3, 1e3], samples_per_point=8, n_settle=2)
+c.enable_modulation(center=F0, offsets=[-1e3, 1e3], samples_per_point=8, n_settle=2, engine='sw')
 state2 = c.get_modulation_state()
 d = c.parse_samples(c.get_samples(2 * 8 * 12))
 g2 = mod.group_cycles(d, state2)
@@ -202,7 +202,7 @@ r2nl = mod.demodulate(g2, linewidth_hz=None, method='fast')
 check('detuning NaN without linewidth', np.isnan(r2nl['detuning_linewidths'][:, 0]).all())
 
 # Detune the centre -> needs_update trips.
-c.enable_modulation(center=F0, offsets=[-1e3, 0.0, 1e3], samples_per_point=8, n_settle=2)
+c.enable_modulation(center=F0, offsets=[-1e3, 0.0, 1e3], samples_per_point=8, n_settle=2, engine='sw')
 c.update_modulation(center=F0 + 0.2 * W)        # ~0.2 linewidths off resonance
 state3 = c.get_modulation_state()
 d = c.parse_samples(c.get_samples(3 * 8 * 12))
@@ -228,7 +228,8 @@ check('no calibration when deembed=False', cfg['calibration'] == {})
 c, ms = make_client(F0, linewidth=fw)
 ack = c.enable_modulation(center=cfg['center'], offsets=cfg['offsets'],
                           mod_indices=cfg['mod_indices'],
-                          samples_per_point=cfg['samples_per_point'], n_settle=cfg['n_settle'])
+                          samples_per_point=cfg['samples_per_point'], n_settle=cfg['n_settle'],
+                          engine='sw')
 check('sweep-derived config arms successfully', ack.get('status') == 'success')
 print(cfg['summary'])
 
@@ -295,7 +296,7 @@ print(cfg9['summary'])
 
 print('10) packet-gap handling in group_cycles (notify / fill)')
 c, ms = make_client(F0, linewidth=W)
-c.enable_modulation(center=F0, offsets=[-1e3, 0.0, 1e3], samples_per_point=3, n_settle=1)
+c.enable_modulation(center=F0, offsets=[-1e3, 0.0, 1e3], samples_per_point=3, n_settle=1, engine='sw')
 d_clean = c.parse_samples(c.get_samples(3 * 3 * 8))
 state = c.get_modulation_state()
 

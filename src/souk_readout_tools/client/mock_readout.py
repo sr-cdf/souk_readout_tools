@@ -34,6 +34,7 @@ class MockReadoutServer:
     ]
     ALL_INFO_SECTIONS = DEFAULT_INFO_SECTIONS + [
         'diagnostics', 'config', 'calibrations', 'resonators', 'registers',
+        'modulation',
     ]
 
     @staticmethod
@@ -368,7 +369,7 @@ class MockReadoutServer:
             'calibrations': self._info_calibrations,
             'resonators': self._info_resonators,
             'registers': self._info_registers,
-            'tone_modulation': self._info_tone_modulation,
+            'modulation': self._info_modulation,
         }
         if sections == 'list':
             return {

@@ -18,7 +18,7 @@ The workflow a consumer follows is:
    ``modulation_revision``.
 2. :func:`group_cycles` -> per-tone complex measurements grouped by step and
    cycle (settling samples dropped), plus the per-point probe offsets (Hz) read
-   from ``get_info('tone_modulation')`` and the grouped packet counters,
+   from ``get_info('modulation')`` and the grouped packet counters,
    telescope time, packet errors and stream flags.
 3. :func:`demodulate` -> per-cycle dphi/df, d2phi/df2, frequency shift and a
    detuning estimate (with a ``needs_update`` flag for the future tracking loop).
@@ -240,6 +240,24 @@ def _indices_mask(indices, n_tones):
     return mask
 
 
+def active_modulation_state(info):
+    """
+    Return the modulation state describing a capture from a ``get_info`` payload.
+
+    Modulation is reported under the unified ``info['modulation']`` section (with
+    an ``engine`` field), whichever engine -- software or firmware-slot -- is
+    active (the two are mutually exclusive). The state exposes the ``num_points``
+    / per-tone ``center_hz`` / ``offsets_hz`` fields the analysis + plotting
+    helpers need.
+    """
+    if not isinstance(info, dict):
+        return None
+    state = info.get('modulation')
+    if isinstance(state, dict) and state.get('tones'):
+        return state
+    return None
+
+
 def _extract_tone_metadata(container):
     """Collect tone role metadata from parsed-sample-style containers."""
     if not isinstance(container, dict):
@@ -386,7 +404,7 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
         (1..N, 0 = off), ``modulation_settling``, ``modulation_revision`` and the
         per-tone ``i_data`` / ``q_data``.
     tone_modulation_state : dict
-        ``get_info('tone_modulation')`` payload, used for ``num_points`` and the
+        ``get_info('modulation')`` payload, used for ``num_points`` and the
         per-(point, tone) probe ``offsets_hz``.
     reduce : {'mean', None}, optional
         ``'mean'`` (default) averages the kept dwell samples per point per cycle
