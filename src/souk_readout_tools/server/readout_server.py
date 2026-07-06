@@ -1669,7 +1669,7 @@ class ReadoutServer:
         shared_ready = programmed and hasattr(self.r, 'autocorr')
         pipeline_ready = (shared_ready and hasattr(self.r, 'accumulators')
                           and len(self.r.accumulators) > 0
-                          and self.r.accumulators[0].get_acc_len() > 0)
+                          and self.r.mixer.get_acc_len() > 0)
         if pipeline_ready:
             init_level = 'pipeline'
         elif shared_ready:
@@ -1751,7 +1751,7 @@ class ReadoutServer:
         shared_ready = programmed and hasattr(self.r, 'autocorr')
         pipeline_ready = (shared_ready and hasattr(self.r, 'accumulators')
                           and len(self.r.accumulators) > 0
-                          and self.r.accumulators[0].get_acc_len() > 0)
+                          and self.r.mixer.get_acc_len() > 0)
         if pipeline_ready:
             init_level = 'pipeline'
         elif shared_ready:
@@ -2655,10 +2655,11 @@ class ReadoutServer:
                         response = {'status': 'success', 'value': value}
 
                     elif param_name == 'sync_delay':
-                        value = self.r.sync.get_delay()
+                        # v7.11: RX/TX delay moved to the mixer; report live applied value.
+                        value = self.r.mixer.read_uint('sync_delay')
                         response = {'status': 'success', 'value': value}
                     elif param_name == 'acc_len':
-                        value = self.r.accumulators[0].get_acc_len()
+                        value = self.r.mixer.get_acc_len()
                         response = {'status': 'success', 'value': value}
                     elif param_name == 'internal_loopback':
                         value = self.r.input.loopback_enabled()
@@ -2817,10 +2818,13 @@ class ReadoutServer:
                                 response = {'status': 'error', 'message': str(exc)}
 
                     elif param_name == 'sync_delay':
-                        self.r.sync.set_delay(int(param_value))
+                        # v7.11: sync_delay is deprecated; the mixer owns RX/TX delay and
+                        # sets it during init. See firmware_lib._warn_sync_delay_deprecated.
+                        firmware_lib._warn_sync_delay_deprecated(param_value)
                         response = {'status': 'success'}
                     elif param_name == 'acc_len':
-                        self.r.accumulators[0].set_acc_len(int(param_value))
+                        self.r.mixer.set_acc_len(int(param_value))  # v7.11: acc_len in mixer
+                        self.r.sync.sw_sync(mrst=True)  # acc_len change needs master-reset + sync
                         response = {'status': 'success'}
                     elif param_name == 'internal_loopback':
                         if param_value:

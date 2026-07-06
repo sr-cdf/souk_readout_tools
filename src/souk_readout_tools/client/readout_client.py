@@ -1722,11 +1722,16 @@ class ReadoutClient:
     # -- Pipeline DSP parameters --
 
     def set_sync_delay(self, value):
-        """Set the sync delay to integer ``value``."""
+        """Set the sync delay to integer ``value``.
+
+        Deprecated under firmware v7.11: the RX/TX delay moved into the mixer and
+        is configured automatically during initialisation, so this is now a no-op
+        (the server warns). Kept for backward compatibility.
+        """
         return self.set_parameter('sync_delay', int(value))
 
     def get_sync_delay(self):
-        """Get the current sync delay."""
+        """Get the current sync delay (v7.11: the mixer's live applied RX delay)."""
         return self.get_parameter('sync_delay')
 
     def set_acc_len(self, value):

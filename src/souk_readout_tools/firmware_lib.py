@@ -86,6 +86,25 @@ def _sync_if_requested(r, autosync=False, mrst=False):
     # v7.10: sw_sync no longer needs arming; ``mrst`` toggles the (now independent) reset.
     r.sync.sw_sync(mrst=mrst)
 
+def _warn_sync_delay_deprecated(value):
+    """Warn that the ``sync_delay`` config parameter is deprecated under firmware v7.11.
+
+    The RX/TX LO delay used to live in the sync block (``r.sync.set_delay``). From
+    v7.11 it is owned by the mixer and configured automatically by
+    ``initialize_pipeline_blocks()``: ``mixer.set_rx_sync_delay(SYNC_DELAY=5752)``
+    followed by an automatic RX/TX skew match. This knob is therefore ignored.
+
+    To repoint/override the RX sync delay manually after init (rarely needed)::
+
+        r.mixer.set_rx_sync_delay(n)                              # set
+        r.mixer.read_uint('sync_delay')                           # read back
+        r.sync.sw_sync(mrst=True)                                 # re-reference
+        r.mixer.set_buffer_switch_skew(r.mixer.get_tx_rx_skew())  # re-match skew
+    """
+    print(f'WARNING: sync_delay={value} is deprecated and ignored under firmware '
+          'v7.11 (the mixer owns RX/TX delay and sets it during init; '
+          'see _warn_sync_delay_deprecated for the manual-override recipe).')
+
 def cplx2uint(d,nbits):
     """
     Vectorized: Convert a floating point real, imag pair
@@ -323,6 +342,7 @@ def _invert_format_amp_scale(scale_factors_int,n_scale_bits,fmt='>u4'):
     return scale_factors
 
 
+# v7.11: the design has a single accumulator, at r.accumulators[0] (accnum defaults to 0).
 def _wait_for_acc(r,accnum=0,poll_period_s=0.1):
     return r.accumulators[accnum]._wait_for_acc(poll_period_s)
 
@@ -452,14 +472,14 @@ def needs_pipeline_initialising(r, config_dict, verbose=False):
     True if pipeline resources need initialising.
 
     checks pipeline accumulator acc_len
-      - r.accumulators[0].get_acc_len() == 0 => not initialised
+      - r.mixer.get_acc_len() == 0 => not initialised
     """
     if r is None or not hasattr(r, "accumulators") or len(r.accumulators) == 0:
         if verbose:
             _firmware_log('pipeline resources require initialisation: accumulators missing', source='ready')
         return True
 
-    acc_len = r.accumulators[0].get_acc_len()
+    acc_len = r.mixer.get_acc_len()
     if acc_len == 0:
         if verbose:
             _firmware_log('pipeline resources require initialisation: accumulator acc_len is zero', source='ready')
@@ -870,10 +890,10 @@ def initialise_pipeline_resources(r,r_fast,config_dict):
     r.output.use_psb()
 
     if sync_delay is not None:
-        r.sync.set_delay(sync_delay)
-        r.sync.sw_sync(mrst=INIT_SYNC_MRST)  # v7.10: drop arm_sync; full reset+start at init
+        _warn_sync_delay_deprecated(sync_delay)  # v7.11: mixer owns RX/TX delay (set at init)
     if acc_len is not None:
-        r.accumulators[0].set_acc_len(acc_len)
+        r.mixer.set_acc_len(acc_len)  # v7.11: acc_len lives in the mixer
+        r.sync.sw_sync(mrst=True)     # acc_len change needs a master-reset + sync
     if dac_duc_mixer_frequency_hz is not None:
         r.rfdc.core.set_fine_mixer_freq(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE,dac_duc_mixer_frequency_hz/1e6)
         r.rfdc.core.set_fine_mixer_freq(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE,dac_duc_mixer_frequency_hz/1e6)
@@ -1086,23 +1106,30 @@ def info_rfdc(r, config_dict):
 def info_pipeline(r):
     """DSP pipeline block parameters — needs pipeline init."""
     pipeline_ready = (r is not None and hasattr(r, 'accumulators')
-                      and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0)
+                      and len(r.accumulators) > 0 and r.mixer.get_acc_len() > 0)
     if not pipeline_ready:
         return {
             'ready': False,
-            'output_mode': None, 'sync_delay': None, 'internal_loopback': None,
+            'output_mode': None, 'sync_delay': None,
+            'tx_rx_skew': None, 'buffer_switch_skew': None,
+            'internal_loopback': None,
             'psb_scale': None, 'psb_fftshift': None, 'pfb_fftshift': None,
             'acc_len': None, 'acc_freq_hz': None,
         }
     return {
         'ready': True,
         'output_mode': r.output.get_status()[0]['mode'],
-        'sync_delay': r.sync.get_delay(),
+        # v7.11: the mixer manages the RX/TX sync timing. Report the RX sync delay
+        # (sync_delay), the measured TX->RX skew, and the applied RX LO buffer-switch
+        # skew (rx_delay) -- all in FPGA clock cycles.
+        'sync_delay': r.mixer.read_uint('sync_delay'),
+        'tx_rx_skew': r.mixer.get_tx_rx_skew(),
+        'buffer_switch_skew': r.mixer.read_uint('rx_delay'),
         'internal_loopback': r.input.loopback_enabled(),
         'psb_scale': r.psbscale.get_scale(),
         'psb_fftshift': r.psb.get_fftshift(),
         'pfb_fftshift': r.pfb.get_fftshift(),
-        'acc_len': r.accumulators[0].get_acc_len(),
+        'acc_len': r.mixer.get_acc_len(),
         'acc_freq_hz': get_sample_rate(r),
     }
 
@@ -1265,7 +1292,7 @@ def get_configured_tone_metadata(config_dict, active_count=None):
 def info_tones(r, r_fast, config_dict, rf_peripherals=None, reference_plane='detector'):
     """Tone frequencies, amplitudes, phases, powers, and firmware indices."""
     pipeline_ready = (r is not None and hasattr(r, 'accumulators')
-                      and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0)
+                      and len(r.accumulators) > 0 and r.mixer.get_acc_len() > 0)
     if not pipeline_ready:
         return {
             'ready': False,
@@ -1308,7 +1335,7 @@ def info_tones(r, r_fast, config_dict, rf_peripherals=None, reference_plane='det
 def info_diagnostics(r, r_fast, config_dict):
     """Saturation, overflow, and signal levels (expensive — captures snapshots)."""
     pipeline_ready = (r is not None and hasattr(r, 'accumulators')
-                      and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0)
+                      and len(r.accumulators) > 0 and r.mixer.get_acc_len() > 0)
     if not pipeline_ready:
         return {'ready': False, 'adc_saturation': None, 'dac_saturation': None, 'dsp_overflow': None}
 
@@ -1373,7 +1400,7 @@ def info_calibrations(r, r_fast, config_dict):
     """Resolved calibration values currently in effect."""
     # Check if tones are set for per-tone interpolation
     pipeline_ready = (r is not None and hasattr(r, 'accumulators')
-                      and len(r.accumulators) > 0 and r.accumulators[0].get_acc_len() > 0)
+                      and len(r.accumulators) > 0 and r.mixer.get_acc_len() > 0)
 
     info = {
         'ready': True,
@@ -1514,15 +1541,14 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
     if changed('sync_delay'):
         sync_delay = defaults.get('sync_delay')
         if sync_delay is not None:
-            print(f'apply_config: setting sync_delay = {sync_delay}')
-            r.sync.set_delay(sync_delay)
-            r.sync.sw_sync(mrst=INIT_SYNC_MRST)  # v7.10: drop arm_sync; full reset+start
+            _warn_sync_delay_deprecated(sync_delay)  # v7.11: mixer owns RX/TX delay
 
     if changed('acc_len'):
         acc_len = defaults.get('acc_len')
         if acc_len is not None:
             print(f'apply_config: setting acc_len = {acc_len}')
-            r.accumulators[0].set_acc_len(acc_len)
+            r.mixer.set_acc_len(acc_len)  # v7.11: acc_len lives in the mixer
+            r.sync.sw_sync(mrst=True)     # acc_len change needs a master-reset + sync
 
     if changed('dac_duc_mixer_frequency_hz'):
         dac_duc_mixer_frequency_hz = defaults.get('dac_duc_mixer_frequency_hz')
@@ -1667,7 +1693,7 @@ def write_parameter(r, param_name, param_value):
 
 def get_sample_rate(r):
     fft_bw = r.adc_clk_hz / (N_RX_FFT / N_RX_OVERSAMPLE)
-    acc_len = r.accumulators[0].get_acc_len()
+    acc_len = r.mixer.get_acc_len()
     return fft_bw / acc_len
 
 
@@ -1691,7 +1717,8 @@ def set_sample_rate(r,sample_rate_hz):
     acc_freq = fft_bw / float(acc_len)
     acc_len = int(acc_len)
     print(f'setting acc len {acc_len} = {acc_freq} Hz')
-    r.accumulators[0].set_acc_len(acc_len)
+    r.mixer.set_acc_len(acc_len)  # v7.11: acc_len lives in the mixer
+    r.sync.sw_sync(mrst=True)     # acc_len change needs a master-reset + sync
     return acc_freq
 
 
@@ -1777,20 +1804,26 @@ def set_dac_inverse_sinc_filter(r, config_dict, inv_sinc=None):
     return bool(inv_sinc)
 
 
-def read_raw_control_buffer_data(r,buf,los=['tx','rx']):
+def read_raw_control_buffer_data(r,buf,los=['tx','rx'],slot=0):
     """
-    From FW V7.5, all tone parameter settings are applied in one contiguous buffer and updates
-    to all tone parameters can now be written in one chunk.
+    Read all tone parameters from one mixer LO control buffer in a single chunk.
 
-    There are actually two consecutive buffers which can be switched between, so any updates
-    are applied instantly as opposed to register-by-register.
+    The ping-pong buffer layout changed in firmware v7.11:
+      - pre-v7.11: a single register ``{lo}_lo{i}_control`` held *both* ping-pong
+        buffers, selected by a ``buf * _n_serial_chans`` word offset.
+      - v7.11+: each ping-pong buffer is its *own* register
+        (``{lo}_lo{i}_control0`` / ``{lo}_lo{i}_control1``), each holding
+        ``n_slots`` LO slots. The buffer is selected by register name (``buf``)
+        and the slot is the in-register offset. ``slot=0`` reproduces the
+        pre-v7.11 single-LO behaviour.
 
-    There are still seperate buffers for tx and rx settings.
+    There are still separate buffers for tx and rx settings.
 
     Parameters:
     r: readout object
-    buf: int, index of buffer to read from, 0 or 1.
+    buf: int, index of ping-pong buffer to read from, 0 or 1.
     los: list of strings, either 'tx' or 'rx' to read the control values for the respective LO
+    slot: int, LO slot to read (0..n_slots-1). Default 0.
 
     Returns a dictionary of the lo control values with the following keys:
     - 'tx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling'
@@ -1802,6 +1835,8 @@ def read_raw_control_buffer_data(r,buf,los=['tx','rx']):
 
     if buf not in [0,1]:
         raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
+    if not 0 <= slot < r.mixer.n_slots:
+        raise ValueError(f"Slot must be in 0..{r.mixer.n_slots-1}. Not {slot}.")
 
     for lo in los:
         if lo not in ['tx','rx']:
@@ -1820,14 +1855,14 @@ def read_raw_control_buffer_data(r,buf,los=['tx','rx']):
         all_phase_offsets_int = np.empty(n_tone, dtype='>u4')
         all_scaling_int = np.empty(n_tone, dtype='>u4')
 
-        # Each parallel stream slice has been written to register: f'{lo}_lo{i}_control'
-        # at an offset of: 4 * _CONTROL_N_WORDS * (buf * _n_serial_chans + i)
-        # and with a length of: 4 * _CONTROL_N_WORDS * s bytes.
+        # v7.11: each parallel stream slice lives in register f'{lo}_lo{i}_control{buf}'
+        # at an offset of: 4 * _CONTROL_N_WORDS * (slot * _n_serial_chans + i)
+        # and with a length of: 4 * _CONTROL_N_WORDS * Ns bytes.
         slice_len_bytes = 4 * r.mixer._CONTROL_N_WORDS * Ns
 
         for i in range(Np):
-            offset = 4 * r.mixer._CONTROL_N_WORDS * (buf * r.mixer._n_serial_chans + i)
-            reg = f'{lo}_lo{i}_control'
+            offset = 4 * r.mixer._CONTROL_N_WORDS * (slot * r.mixer._n_serial_chans + i)
+            reg = f'{lo}_lo{i}_control{buf}'
             data = r.mixer.read(reg, slice_len_bytes, offset=offset)
             # Unpack as a uint32 array (big-endian). Total element count should be s * _CONTROL_N_WORDS.
             arr = np.frombuffer(data, dtype='>u4')
@@ -1863,32 +1898,47 @@ def read_raw_control_buffer_data(r,buf,los=['tx','rx']):
 
 def _get_control_buffer_addresses(r_fast):
     """
-    Get (and cache) the base addresses of the TX and RX control buffers.
+    Get (and cache) the base byte addresses of the TX/RX mixer control buffers.
 
-    Returns a dict with 'tx' and 'rx' keys containing the base byte addresses.
+    v7.11: the two ping-pong buffers are *separate registers*
+    (``{lo}_lo0_control0`` / ``{lo}_lo0_control1``), so an address is cached per
+    ``(lo, buf)``. The single-parallel-stream design (``_n_parallel_chans == 1``)
+    means one register per ``(lo, buf)`` holds every tone for all slots.
+
+    Returns a dict keyed by ``(lo, buf)`` -> base byte address.
     """
     if not hasattr(r_fast.mixer, '_control_buffer_addrs'):
-        tx_addr = r_fast.mixer.host.transport._get_device_address(
-            f'{r_fast.mixer.prefix}tx_lo0_control')
-        rx_addr = r_fast.mixer.host.transport._get_device_address(
-            f'{r_fast.mixer.prefix}rx_lo0_control')
-        r_fast.mixer._control_buffer_addrs = {'tx': tx_addr, 'rx': rx_addr}
+        # _n_parallel_chans is a firmware channel-ordering optimisation (kept at 1
+        # here); it is independent of pipeline count -- dual pipeline scales via
+        # separate p0_/p1_ prefixed mixers, not by growing this. The fast path's
+        # single-lo0-register assumption only holds while it is 1.
+        assert r_fast.mixer._n_parallel_chans == 1, (
+            'fast control-buffer path assumes _n_parallel_chans == 1; '
+            'generalise to loop over lo{i} registers if this changes')
+        addrs = {}
+        for lo in ('tx', 'rx'):
+            for buf in (0, 1):
+                addrs[(lo, buf)] = r_fast.mixer.host.transport._get_device_address(
+                    f'{r_fast.mixer.prefix}{lo}_lo0_control{buf}')
+        r_fast.mixer._control_buffer_addrs = addrs
     return r_fast.mixer._control_buffer_addrs
 
-def read_raw_control_buffer_data_fast(r_fast,buf,los=['tx','rx']):
+def read_raw_control_buffer_data_fast(r_fast,buf,los=['tx','rx'],slot=0):
     """
-    From FW V7.5, all tone parameter settings are applied in one contiguous buffer and updates
-    to all tone parameters can now be written in one chunk.
+    Memory-mapped (devmem) read of all tone parameters from one mixer LO control
+    buffer in a single chunk.
 
-    There are actually two consecutive buffers which can be switched between, so any updates
-    are applied instantly as opposed to register-by-register.
+    v7.11: the ping-pong buffer is selected by register (``control0``/``control1``)
+    and the slot is an offset within that register. ``slot=0`` reproduces the
+    pre-v7.11 single-LO behaviour.
 
-    There are still seperate buffers for tx and rx settings.
+    There are still separate buffers for tx and rx settings.
 
     Parameters:
     r: readout object
-    buf: int, index of buffer to read from, 0 or 1.
+    buf: int, index of ping-pong buffer to read from, 0 or 1.
     los: list of strings, either 'tx' or 'rx' to read the control values for the respective LO
+    slot: int, LO slot to read (0..n_slots-1). Default 0.
 
     Returns a dictionary of the lo control values with the following keys:
     - 'tx': dictionary with keys 'formatted_phase_steps', 'formatted_ri_steps', 'formatted_phase_offsets', 'formatted_scaling'
@@ -1900,17 +1950,19 @@ def read_raw_control_buffer_data_fast(r_fast,buf,los=['tx','rx']):
 
     if buf not in [0,1]:
         raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
+    if not 0 <= slot < r_fast.mixer.n_slots:
+        raise ValueError(f"Slot must be in 0..{r_fast.mixer.n_slots-1}. Not {slot}.")
 
     # Get the dynamically-looked-up base addresses for the control buffers
     addrs = _get_control_buffer_addresses(r_fast)
-    # Buffer size: n_serial_chans * _CONTROL_N_WORDS * 4 bytes
+    # One slot's worth: n_serial_chans * _CONTROL_N_WORDS * 4 bytes (also the slot stride)
     buf_size = r_fast.mixer._n_serial_chans * r_fast.mixer._CONTROL_N_WORDS * 4
 
     for lo in los:
         if lo not in ['tx','rx']:
             raise ValueError(f"Only LOs 'rx' and 'tx' are understood. Not {lo}.")
 
-        offset = addrs[lo] + buf_size * buf
+        offset = addrs[(lo, buf)] + buf_size * slot
         length = buf_size
         data = r_fast.mixer.host.transport.axil_mm[int(offset):int(offset+length)]
         arr = np.frombuffer(data, dtype='<u4')
@@ -2094,10 +2146,10 @@ def prepare_control_buffer_data_fast(r_fast, buf, lo_control_values, tone_indice
      - 'rx': numpy array of the indices for the formatted control buffer for rx
 
     """
-    # if not hasattr(r_fast.mixer,'tx_lo_control_buffer_mv'):
-    #     r_fast.mixer.tx_lo_control_buffer = np.frombuffer(memoryview(r_fast.mixer.host.transport.axil_mm[0x90000:0x100000]),dtype='<u4')
-    # if not hasattr(r_fast.mixer,'rx_lo_control_buffer_mv'):
-    #     r_fast.mixer.rx_lo_control_buffer = np.frombuffer(memoryview(r_fast.mixer.host.transport.axil_mm[0x80000:0x90000]),dtype='<u4')
+    # Flat little-endian u32 view of the whole AXI-lite map. The control buffers are
+    # addressed by absolute word index (resolved via _get_control_buffer_addresses),
+    # so this view is layout-independent across firmware versions. (v7.11 moved the
+    # control buffers; do not hardcode byte ranges here.)
     if not hasattr(r_fast.mixer,'tx_lo_control_buffer_mv'):
         r_fast.mixer.tx_lo_control_buffer = np.frombuffer(memoryview(r_fast.mixer.host.transport.axil_mm),dtype='<u4')
     if not hasattr(r_fast.mixer,'rx_lo_control_buffer_mv'):
@@ -2155,31 +2207,44 @@ def prepare_control_buffer_data_fast(r_fast, buf, lo_control_values, tone_indice
         i[lo][n_phase_steps+n_phase_offsets+n_ri_steps:n_phase_steps+n_phase_offsets+n_ri_steps+n_scaling] = idx_scaling*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._SCALE_WORD_OFFSET
     return v, i
 
-def write_control_buffer_data(r,buf,v):
+def write_control_buffer_data(r,buf,v,slot=0):
     """
     Write a formatted control buffer to the firmware.
+
+    v7.11: the ping-pong buffer is selected by register (``control0``/``control1``)
+    and the slot is an offset within the register. ``slot=0`` reproduces the
+    pre-v7.11 single-LO behaviour.
+
     Parameters:
     r: readout object
-    buf: int, index of buffer to write to, 0 or 1.
-    v: numpy array of the formatted control buffer.
+    buf: int, index of ping-pong buffer to write to, 0 or 1.
+    v: dict with 'tx'/'rx' numpy arrays of the formatted control buffer.
+    slot: int, LO slot to write (0..n_slots-1). Default 0.
 
     """
     n_tone = r.mixer.n_chans
     if buf not in [0,1]:
         raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
+    if not 0 <= slot < r.mixer.n_slots:
+        raise ValueError(f"Slot must be in 0..{r.mixer.n_slots-1}. Not {slot}.")
     for lo in ['tx','rx']:
         for i in range(min(r.mixer._n_parallel_chans, n_tone)):
-            reg = f'{lo}_lo{i}_control'
-            offset = 4 * r.mixer._CONTROL_N_WORDS * (buf * r.mixer._n_serial_chans + i)
+            reg = f'{lo}_lo{i}_control{buf}'
+            offset = 4 * r.mixer._CONTROL_N_WORDS * (slot * r.mixer._n_serial_chans + i)
             r.mixer.write(reg, v[lo].tobytes(),offset=offset)
     return
 
-def write_control_buffer_data_fast(r_fast,buf,v,indices):
+def write_control_buffer_data_fast(r_fast,buf,v,indices,slot=0):
     """
-    Write a formatted control buffer to the firmware.
+    Write a formatted control buffer to the firmware via the devmem fast path.
+
+    v7.11: the ping-pong buffer is selected by register (``control0``/``control1``)
+    and the slot is an offset within the register. ``slot=0`` reproduces the
+    pre-v7.11 single-LO behaviour.
+
     Parameters:
     r: readout object
-    buf: int, index of buffer to write to, 0 or 1.
+    buf: int, index of ping-pong buffer to write to, 0 or 1.
     v: dictionary with keys 'tx' and 'rx'
         - 'tx': numpy array of the formatted control buffer values for tx
         - 'rx': numpy array of the formatted control buffer values for rx
@@ -2187,33 +2252,37 @@ def write_control_buffer_data_fast(r_fast,buf,v,indices):
     indices: dictionary with keys 'tx' and 'rx'
         - 'tx': numpy array of the indices for the formatted control buffer for tx
         - 'rx': numpy array of the indices for the formatted control buffer for rx
+    slot: int, LO slot to write (0..n_slots-1). Default 0.
 
     """
     n_tone = r_fast.mixer.n_chans
     if buf not in [0,1]:
         raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
+    if not 0 <= slot < r_fast.mixer.n_slots:
+        raise ValueError(f"Slot must be in 0..{r_fast.mixer.n_slots-1}. Not {slot}.")
 
     # Get the dynamically-looked-up base addresses for the control buffers
     addrs = _get_control_buffer_addresses(r_fast)
-    # Buffer size in bytes: n_serial_chans * _CONTROL_N_WORDS * 4 bytes
+    # One slot's worth in bytes: n_serial_chans * _CONTROL_N_WORDS * 4 (also the slot stride)
     buf_size = r_fast.mixer._n_serial_chans * r_fast.mixer._CONTROL_N_WORDS * 4
 
     if indices is None:
         for lo in ['tx','rx']:
-            start = addrs[lo] + buf_size * buf
+            start = addrs[(lo, buf)] + buf_size * slot
             length = buf_size
             r_fast.mixer.host.transport.axil_mm[int(start):int(start+length)] = v[lo].astype('<u4').tobytes()
     else:
         # Convert byte addresses to word offsets (divide by 4)
-        start_tx = addrs['tx'] // 4 + (buf_size * buf) // 4
-        start_rx = addrs['rx'] // 4 + (buf_size * buf) // 4
+        start_tx = (addrs[('tx', buf)] + buf_size * slot) // 4
+        start_rx = (addrs[('rx', buf)] + buf_size * slot) // 4
         r_fast.mixer.tx_lo_control_buffer[start_tx+indices['tx']] = v['tx'].astype('<u4')
         r_fast.mixer.rx_lo_control_buffer[start_rx+indices['rx']] = v['rx'].astype('<u4')
 
     return
 
 
-def write_phase_offsets_both_buffers_fast(r_fast, phase_offsets, tone_indices=None):
+def write_phase_offsets_both_buffers_fast(r_fast, phase_offsets, tone_indices=None,
+                                          slots=(0,)):
     """
     Write per-tone LO phase offsets into **both** control buffers (0 and 1).
 
@@ -7915,7 +7984,9 @@ def read_accumulated_data(r, num_tones=None, tone_indices=None):
                         If None and num_tones is given, assumes contiguous indices [0..num_tones-1].
     :return: Complex data array for the specified tones
     """
-    data = np.asarray(r.accumulators[0].get_new_spectra())
+    # v7.11: get_new_spectra returns (data, gpio_counts, timestamp, buf_id, slot_id);
+    # take element 0 (the spectra). buf/slot IDs need get_buf_id=True (not used here).
+    data = np.asarray(r.accumulators[0].get_new_spectra()[0])
     if tone_indices is not None:
         # Extract data at specific output channel indices
         return data[tone_indices]
@@ -8758,7 +8829,7 @@ def get_tone_powers(r, r_fast, config_dict, detailed_output=False, reference_pla
         adc_bits = config_dict['firmware']['adc_fullscale_bits']
         adc_dbm_to_dbfs = config_dict['firmware'].get('adc_dbm_to_dbfs', 12.0)
         pfb_fftshift = r.pfb.get_fftshift()
-        acc_len = r.accumulators[0].get_acc_len()
+        acc_len = r.mixer.get_acc_len()
         rx_mix_scale = config_dict['firmware'].get('rx_mix_scale', 1.0)
 
         # ADC DSA (RFDC digital step attenuator, before ADC)

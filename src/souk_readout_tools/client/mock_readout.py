@@ -595,6 +595,8 @@ class MockReadoutServer:
             'ready': True,
             'output_mode': 'PSB',
             'sync_delay': defaults.get('sync_delay', 0),
+            'tx_rx_skew': defaults.get('tx_rx_skew', 0),
+            'buffer_switch_skew': defaults.get('buffer_switch_skew', 0),
             'internal_loopback': defaults.get('internal_loopback', False),
             'psb_scale': defaults.get('psb_scale', 1),
             'psb_fftshift': defaults.get('psb_fftshift', 0),
