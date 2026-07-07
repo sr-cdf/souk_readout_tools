@@ -5931,6 +5931,16 @@ def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation
     if r is None:
         check_rts = False
 
+    # Internal loopback replaces the ADC data path with a digital copy of the
+    # DAC output, so the snapshot reflects the DAC comb rather than the physical
+    # ADC input.  "ADC input saturation" is therefore not measurable, and the
+    # analog DSA / RX attenuator cannot change the snapshot level.  Report the
+    # levels for information but never flag saturation — otherwise callers cycle
+    # the DSA to maximum trying to clear a condition they have no control over.
+    internal_loopback = (r is not None) and bool(r.input.loopback_enabled())
+    if internal_loopback:
+        check_rts = False
+
     # Clear stale RTS sticky flags *before* capturing snapshots so that
     # any flag that re-asserts during the snapshot window reflects a
     # current condition rather than a past transient.  The snapshot
@@ -5956,6 +5966,8 @@ def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation
     q_over = qmax >= 1.0*threshold
     q_under = qmin <= -1.0*threshold
     any_saturation = bool(i_over|i_under|q_over|q_under)
+    if internal_loopback:
+        any_saturation = False
     integration_time = ss.size/r_fast.adc_clk_hz
     details = {'imax_fs':imax,'imin_fs':imin,'qmax_fs':qmax,'qmin_fs':qmin,
                'integration_time':integration_time,
@@ -5976,7 +5988,10 @@ def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation
             any_saturation = True
 
     if verbose:
-        status = 'SATURATING' if any_saturation else 'OK'
+        if internal_loopback:
+            status = 'N/A (internal loopback — snapshot is the digital DAC copy)'
+        else:
+            status = 'SATURATING' if any_saturation else 'OK'
         print(f'ADC input saturation check: {status}')
         print(f'  I range: [{imin:.3f}, {imax:.3f}] FS  |  Q range: [{qmin:.3f}, {qmax:.3f}] FS  (threshold: {threshold:.0%})')
         if check_rts and rts_available:
