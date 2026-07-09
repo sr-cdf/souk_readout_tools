@@ -9,15 +9,22 @@ text dump for inspection.
 ## What's being profiled
 
 A **sweep step** =
-1. **write** the tone control buffer into the mapped AXI-lite region, and
-2. **read** back the accumulator.
+1. **write** the tone control buffer into the mapped AXI-lite region
+   (`CONTROL_N_WORDS = 4` int32 words per tone: phase_inc, ri_step, phase_off,
+   scale), and
+2. **read** back the accumulator. The accumulator dout is a flat array of
+   interleaved complex samples, one per tone, laid out real-first as pairs of
+   **int32**: `[re0, im0, re1, im1, ...]` (firmware accumulators use
+   `dtype='>i4', is_complex=True`, read as `'<i4'` on the fast interface). So
+   one channel = 1 complex sample = 2 × int32 = 8 bytes, and the design
+   supports up to `N_TONE = 2048` complex channels.
 
 These mirror the real code:
 
 | profiled op | firmware_lib source |
 |-------------|---------------------|
 | `axil_mm[a:b] = v.tobytes()` (write) | `write_control_buffer_data_fast` (firmware_lib.py:1947) |
-| `np.frombuffer(axil_mm[a:b], '<i4')` (read) | `read_accumulated_data_fast` (firmware_lib.py:7935-7936) |
+| `np.frombuffer(axil_mm[a:b], '<i4')` (read) | `read_accumulated_data_fast` (firmware_lib.py) |
 
 The mmap parameters match casperfpga `LocalMemTransport`
 (`transport_localmem.py:13-14`): `/dev/mem`, offset `0xA0000000`, 32 MiB,
@@ -35,11 +42,22 @@ python3 devmem_profile.py --steps 10000 --tones 1000 --read-chans 1000
 
 Each writes a text file (`devmem_profile_c.txt` / `devmem_profile_py.txt`)
 with a header of summary stats followed by one row per step:
-`step_index  write_us  read_us  step_us`.
+`step_index  write_posted_us  write_sync_us  read_us  step_us`.
 
 Common flags: `--steps`, `--tones` (tones per write), `--read-chans`
 (accumulator channels read back), `--warmup` (unrecorded steps), `--dev`,
-`--out`, `--write-addr`, `--read-addr`.
+`--out`, `--write-addr`, `--read-addr`, `--sync-writes/--no-sync-writes`
+(C also has `--bulk`).
+
+### Write timing: posted vs. completion-forced
+
+MMIO writes are *posted* — the store returns once the bytes are in the CPU
+store buffer / interconnect FIFO, before the AXI slave has accepted them. So
+the profilers measure the write **twice**: `write(posted)` (stores handed off,
+can imply rates above the physical bus limit) and `write(sync)` (a same-slave
+read-back barrier forces the posted writes to drain to the endpoint first).
+The step total uses `write(sync)` by default; `--no-sync-writes` switches it to
+the (unphysical) posted time. Trust `write(sync)` for real bus cost.
 
 ## Running against real hardware (/dev/mem)
 
@@ -72,9 +90,17 @@ sudo ~/py3.12-venv/bin/python devmem_profile.py --dev /dev/mem \
 ```
 
 For the dual-pipeline krm firmware, pipeline 0 is control buffer
-`p0_mix_tx_lo0_control` (offset `0x050000`, 64 KiB → up to 4096 tones) and
-accumulator `p0_acc0_dout0` (offset `0x090000`, 16 KiB → up to 2048 complex
-channels). Defaults of 1000 fit comfortably.
+`p0_mix_tx_lo0_control` (offset `0x050000`, 64 KiB register) and accumulator
+`p0_acc0_dout0` (offset `0x090000`, 16 KiB register). Both are sized for the
+design maximum of `N_TONE = 2048` tones:
+
+- control buffer: 2048 tones × 4 int32 words/tone × 4 B = 32 KiB of live
+  control data; the 64 KiB register backs the two ping-pong buffers (2 × 32 KiB).
+- accumulator: 2048 complex channels × 2 int32 (real/imag) × 4 B = 16 KiB.
+
+Defaults of 1000 tones fit comfortably. The profilers only ever touch
+`--tones` / `--read-chans` worth of each region, so the volumes they report are
+`--tones × 16 B` written and `--read-chans × 8 B` read.
 
 > Profiling the WRITE overwrites the live TX control buffer, so it changes your
 > current tone settings. Re-apply your config afterwards if needed. To measure
@@ -118,6 +144,11 @@ read-chans, 10000 steps. Medians, reproducible to the microsecond across runs:
 | C per-word (`volatile`) | 199 µs | 421 µs | 620 µs | 211 |
 | Python bulk (`mm[a:b]`) | 207 µs | 168 µs | 375 µs | 84 |
 | **C bulk (`--bulk` memcpy)** | 196 µs | **163 µs** | **359 µs** | **82** |
+
+The `write` column here is the *posted* write (`write(posted)`); this run
+predates the posted/sync split. Re-run to also get `write(sync)`, the
+completion-forced time (posted + drain-to-slave via the read-back barrier),
+which is the honest cost of a write reaching the AXI slave.
 
 For reference, the in-RAM backing-file floor is ~17 µs/step — so hardware is
 ~20–37× slower, and that gap is **pure AXI-lite bus latency**, not CPU.

@@ -7,7 +7,6 @@ env/
 
 tests/
 .pytest_cache/
-profiling/
 
 build/
 
