@@ -1006,8 +1006,8 @@ class ReadoutServer:
         self._create_firmware_interfaces(source=log_source)
 
         if level == "firmware":
-            # 1) Program firmware if needed
-            if firmware_lib.needs_programming(self.r, self.config):
+            # 1) Program firmware if needed (verbose so the log records *why*)
+            if firmware_lib.needs_programming(self.r, self.config, verbose=True):
                 self.r, self.r_fast = firmware_lib.reload_firmware(self.config, r=self.r)
             # 2) Shared resources init if needed
             if firmware_lib.needs_shared_resource_initialising(self.r, self.config):
@@ -1020,8 +1020,8 @@ class ReadoutServer:
             return
 
         if level == "pipeline":
-            # 1) Program firmware if needed
-            if firmware_lib.needs_programming(self.r, self.config):
+            # 1) Program firmware if needed (verbose so the log records *why*)
+            if firmware_lib.needs_programming(self.r, self.config, verbose=True):
                 self.r, self.r_fast = firmware_lib.reload_firmware(self.config, r=self.r)
             # 2) Shared resources init if needed
             if firmware_lib.needs_shared_resource_initialising(self.r, self.config):
@@ -1133,6 +1133,29 @@ class ReadoutServer:
             fw_config_file, pipeline_id)
         self.r_fast = firmware_lib.create_fast_readout_interface(
             fw_config_file, pipeline_id)
+
+        # Advise when the interface did not come up against the loaded image.
+        # _require_clocks_locked above already ruled out a PLL/reference fault, so
+        # a half-built interface here means the board *is* programmed but with an
+        # image the configured .fpg register map does not fit (a manually loaded
+        # bitfile, or one whose clock routing yields get_fpga_clock()==0). Log one
+        # clear line instead of leaving only souk_mkid_readout's cryptic
+        # "FPGA is not clocking" cascade; the caller (ensure_ready/set_config)
+        # reprograms with the configured image to recover.
+        ok, reason = firmware_lib.interface_is_healthy(self.r)
+        if not ok and self.r is not None and getattr(self.r, 'fpga', None) is not None:
+            try:
+                programmed = self.r.fpga.is_programmed()
+            except Exception:
+                programmed = False
+            if programmed:
+                _server_log(
+                    f'firmware interface did not initialise against the configured '
+                    f'image ({reason}); the board is programmed and PLLs are locked, '
+                    f'so the loaded firmware does not match the config rather than a '
+                    f'clock/PLL fault',
+                    source=source,
+                )
         return self.r, self.r_fast
 
     def force_ready(self, level='pipeline'):
@@ -1627,28 +1650,42 @@ class ReadoutServer:
         self._require_clocks_locked(source='config', config=config_contents)
 
         # A config that changes the firmware image (a different .fpg than the one
-        # currently loaded) cannot be applied as a live parameter tweak - it needs a
-        # full deprogram/reprogram. needs_programming() compares the config's fpg
-        # against what is loaded *right now* (via the existing self.r, before it is
-        # rebuilt against the new register map); it also trips if the firmware
-        # interface failed to build. Decide here, up front, so the comparison isn't
-        # corrupted by ensure_ready() rebuilding self.r against the new config first
-        # (which is why a firmware switch could previously slip through without
-        # reprogramming). On a match, drive the explicit force_ready reprogram, which
-        # deprograms first and re-applies every config value during pipeline init;
-        # applying config to the outgoing image first is pointless and, against a
-        # mismatched register map, actively misleading.
-        if firmware_lib.needs_programming(self.r, config_contents):
+        # the running config named) cannot be applied as a live parameter tweak - it
+        # needs a full deprogram/reprogram. needs_programming() compares the config's
+        # fpg against the existing self.r *before* it is rebuilt against the new
+        # register map, so a config-driven image switch is still caught by name here.
+        # force_ready deprograms first and re-applies every config value during
+        # pipeline init; applying config to the outgoing image first is pointless and,
+        # against a mismatched register map, actively misleading.
+        if firmware_lib.needs_programming(self.r, config_contents, verbose=True):
             _server_log('config changes the firmware image; reprogramming', source='config')
             self.load_config(filename, log_source='config')
             self.force_ready(level="pipeline")
             self.applied_config = copy.deepcopy(self.config)
             self.update_active_tone_indices()
         else:
-            firmware_lib.apply_config(config_contents, self.r, self.r_fast, self.applied_config)
-            self.applied_config = copy.deepcopy(config_contents)
-            self.update_active_tone_indices()
-            self.ensure_ready(config_file=filename, level="pipeline", log_source='config')
+            # The fpg name matches the running config, but self.r is a cached object -
+            # it cannot see that the board was reprogrammed underneath us (e.g. an
+            # experimental .fpg loaded by hand). Rebuild the interface against the
+            # pushed config and re-read the board: if it does not come up healthy
+            # (empty block interfaces - wrong image, or one whose clock routing yields
+            # get_fpga_clock()==0), this is not a live tweak. Reprogram with the
+            # configured image, i.e. do the hard_reset for the operator.
+            self.load_config(filename, log_source='config')
+            self._create_firmware_interfaces(source='config')
+            healthy, reason = firmware_lib.interface_is_healthy(self.r)
+            if not healthy:
+                _server_log(
+                    f'loaded firmware is not usable with the configured image '
+                    f'({reason}); reprogramming', source='config')
+                self.force_ready(level="pipeline")
+                self.applied_config = copy.deepcopy(self.config)
+                self.update_active_tone_indices()
+            else:
+                firmware_lib.apply_config(config_contents, self.r, self.r_fast, self.applied_config)
+                self.applied_config = copy.deepcopy(config_contents)
+                self.update_active_tone_indices()
+                self.ensure_ready(config_file=filename, level="pipeline", log_source='config')
 
         # Only report success (and persist this config as the default, below) if the
         # pipeline actually came up on it. souk_mkid_readout's constructor swallows
