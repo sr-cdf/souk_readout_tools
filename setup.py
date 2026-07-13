@@ -41,10 +41,13 @@ gui_dependencies = [
     'pyqt5',
 ]
 
-# Define client-specific dependencies
-client_dependencies = [
-    'so3g',
-]
+# Define client-specific dependencies.
+# NOTE: so3g/spt3g (G3 stream file support) are intentionally NOT hard
+# dependencies. They have no PyPI wheels and fail to build on Windows
+# (spt3g needs a C++ toolchain / nmake). They are exposed as the optional
+# [g3] extra instead; the client imports them lazily and only receive_stream_g3()
+# requires them.
+client_dependencies = []
 
 # Define server-specific dependencies
 server_dependencies = [
@@ -138,6 +141,11 @@ setup(
         'server/souk-peripherals-control/*.py',
     ]},
     install_requires=install_requires,
+    extras_require={
+        # Optional G3 (.g3) stream file support. Not installable on Windows
+        # (no PyPI wheels; spt3g requires a C++ build toolchain).
+        'g3': ['so3g'],
+    },
     entry_points=entry_points,
     classifiers=[
         'Programming Language :: Python :: 3',
