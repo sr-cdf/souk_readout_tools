@@ -5922,9 +5922,10 @@ class ReadoutClient:
     def wideband_sweep(self, bandwidth_hz=None, center_freq_hz=None, step_size_hz=10000,
                        num_tones=1024, samples_per_point=10, tone_powers_dbm='auto',
                        reference_plane='detector',
+                       rx_policy='maximise',
                        apply_phase_correction=False,
                        optimise_tx_dynamic_range=True,
-                       optimise_rx_gain=True,
+                       optimise_rx_gain=None,
                        refresh_adc_cal=True,
                        autosync=False, setup_sync=True, mrst=False, setup_mrst=False,
                        compensate_rx_ticks=0,
@@ -5958,17 +5959,33 @@ class ReadoutClient:
                 Default is 'auto'.
             reference_plane (str): Where tone_powers_dbm is specified: 'dac',
                 'rf_output', or 'detector' (default).
+            rx_policy (str): How the RX path is managed when the tone powers are
+                set — one of 'protect', 'compensate', 'maximise', 'raise' or
+                'none' (see set_tone_powers for details of each). Passed through
+                to maximise_tx_power() / set_tone_powers(). Default is
+                'maximise': the RX chain (RX attenuator, ADC DSA, RX amp, PFB
+                FFT shift) is re-optimised as part of the tone-power call, which
+                makes the separate optimise_rx_gain pass redundant (see below).
+                Ignored when tone_powers_dbm is None (no tone-power call).
+                Under internal loopback the analog RX controls are not in the
+                signal path, so 'maximise' is not forwarded to the server; the
+                loopback branch of the RX-gain step optimises the post-ADC DSP
+                gain locally instead.
             apply_phase_correction (bool): DEPRECATED. Correct for phase jumps at filterbank
                                            channel edges. Default is False. This correction is
                                            no longer needed following firmware fixes.
             optimise_tx_dynamic_range (bool): If True, maximise DAC bit utilisation and
                 adjust the TX analog chain when setting tone powers. Default is True.
-            optimise_rx_gain (bool): If True, maximise ADC power utilisation and
-                optimise the PFB FFT shift for best RX dynamic range after tones
-                are configured. Calls maximise_rx_power() normally. With internal
-                loopback, calls maximise_rx_dsp_gain() to optimise only the
-                post-ADC PFB gain because ADC samples and ADC/RF controls are not
-                part of the active path. Default is True.
+            optimise_rx_gain (bool or None): If True, maximise ADC power utilisation
+                and optimise the PFB FFT shift for best RX dynamic range after
+                tones are configured. Calls maximise_rx_power() normally. With
+                internal loopback, calls maximise_rx_dsp_gain() to optimise only
+                the post-ADC PFB gain because ADC samples and ADC/RF controls are
+                not part of the active path. Default is None, which decides
+                automatically: the pass is skipped when rx_policy='maximise'
+                already optimised the RX chain inside the tone-power call, and
+                run otherwise (including under internal loopback, where the
+                policy is not applied).
             refresh_adc_cal (bool): If True (default), refresh ADC calibration
                 before sweeping (unfreeze, settle, freeze). If False, skip
                 the refresh but still ensure the calibration is frozen.
@@ -6030,6 +6047,16 @@ class ReadoutClient:
         info = dict(zip(sections, info_list))
         loopback_state = self.get_internal_loopback()
         internal_loopback = ( isinstance(loopback_state, (bool, np.bool_)) and bool(loopback_state) )
+
+        valid_rx_policies = ('protect', 'compensate', 'maximise', 'raise', 'none')
+        if rx_policy not in valid_rx_policies:
+            raise ValueError(f'rx_policy must be one of {valid_rx_policies}, got {rx_policy!r}')
+        # The RX policy rides on the tone-power call. Under internal loopback
+        # the analog RX controls (RX attenuator, ADC DSA, RX amp) are not in
+        # the signal path, so asking the server to 'maximise' them just cycles
+        # hardware to no effect — the loopback branch of the RX-gain step
+        # below optimises the post-ADC DSP gain instead.
+        tx_rx_policy = 'none' if (internal_loopback and rx_policy == 'maximise') else rx_policy
 
         # Get RF frontend mixer configuration
         # TODO: if we have a frontend connected it might not have a mixer - needs updating.
@@ -6130,7 +6157,7 @@ class ReadoutClient:
         if isinstance(tone_powers_dbm, str) and tone_powers_dbm == 'auto':
             # Maximum power/dynamic-range: set unit amplitudes first, then maximise
             self.set_tone_amplitudes(np.ones(num_tones))
-            result = self.maximise_tx_power()
+            result = self.maximise_tx_power(rx_policy=tx_rx_policy)
             if verbose:
                 print(f'  Auto TX power: maximise_tx_power() -> {result}')
         elif tone_powers_dbm is not None:
@@ -6141,6 +6168,7 @@ class ReadoutClient:
             stp_response = self.set_tone_powers(powers,
                                 reference_plane=reference_plane,
                                 optimise_dynamic_range=optimise_tx_dynamic_range,
+                                rx_policy=tx_rx_policy,
                                 verbose=verbose)
             if stp_response.get('status') != 'success':
                 raise RuntimeError(
@@ -6183,6 +6211,15 @@ class ReadoutClient:
         #             f"DSP overflow persists. Reduce tone_powers_dbm or num_tones.")
 
         # Optimise RX gain: maximise ADC power and PFB FFT shift
+        if optimise_rx_gain is None:
+            # rx_policy='maximise' already optimised the RX chain inside the
+            # tone-power call above — except when no tone-power call was made
+            # (tone_powers_dbm=None) or under internal loopback, where the
+            # policy is downgraded and the loopback DSP-gain pass is needed.
+            rx_done_by_policy = (tone_powers_dbm is not None
+                                 and rx_policy == 'maximise'
+                                 and not internal_loopback)
+            optimise_rx_gain = not rx_done_by_policy
         if optimise_rx_gain:
             if internal_loopback:
                 if verbose:
@@ -6815,7 +6852,9 @@ class ReadoutClient:
 
     def find_resonances(self, sweep_data=None, mode='auto',
                         data_format='log_magnitude',
-                        filter_params=None, finder_params=None, **kwargs):
+                        filter_params=None, finder_params=None,
+                        save_filename=None, save_resonances=True,
+                        save_txt=False, save_csv=False, **kwargs):
         """
         Find MKID resonances in sweep data using the peak_finder module.
 
@@ -6845,9 +6884,11 @@ class ReadoutClient:
               height and threshold are ignored unless their ``*_enabled``
               fields are set true.
 
-            Wideband mode intentionally uses more conservative defaults:
-            inner 10-90% of the frequency span, lowpass 0.5, prominence
-            1-100 dB, width 1 kHz-10 MHz, and 100 kHz minimum spacing.
+            Wideband mode intentionally uses more conservative defaults tuned
+            for SOUK wideband sweeps: log-magnitude with highpass 0.0001 /
+            lowpass 0.5, dips over the usable 400 MHz-2100 MHz band,
+            prominence 1-100 dB, width 1 kHz-500 kHz, and 1 kHz minimum
+            spacing.
 
             Useful tuning patterns for a targeted sweep that visibly contains
             one dip per tone:
@@ -6898,6 +6939,18 @@ class ReadoutClient:
                 such as ``min_height`` are not accepted; use the exact field
                 name such as ``height_min`` and set the matching
                 ``*_enabled`` field when needed.
+            save_filename (str, optional): If given, the found resonances are
+                written to file(s) using the same formats as the MKID finder
+                app's Save/Export button. The extension is replaced per format,
+                so one base name can emit several files. None (default) skips
+                saving. The same thing is available on the returned object via
+                ``result.save(filename, ...)``.
+            save_resonances (bool): Write ``<name>.resonances`` (full table:
+                ID, frequency, linewidth, Qr, Qc, Qi, dip depth). Default True.
+            save_txt (bool): Write ``<name>.txt`` KIDLAB toneslist. Default
+                False.
+            save_csv (bool): Write ``<name>.csv`` (ID, frequency). Default
+                False.
             **kwargs: Passed to wideband_sweep if sweep_data is None.
 
         Returns:
@@ -6948,7 +7001,7 @@ class ReadoutClient:
             num_tones = int(sweep_data.get(
                 'num_tones_used', sweep_data.get('num_tones', 1)))
 
-            return ResonanceSearchResult(
+            result = ResonanceSearchResult(
                 mode='wideband',
                 all_resonances=results,
                 per_tone=[results],
@@ -7007,7 +7060,7 @@ class ReadoutClient:
 
             all_resonances.sort(key=lambda r: r.frequency)
 
-            return ResonanceSearchResult(
+            result = ResonanceSearchResult(
                 mode='targeted',
                 all_resonances=all_resonances,
                 per_tone=per_tone,
@@ -7018,6 +7071,14 @@ class ReadoutClient:
         else:
             raise ValueError(
                 f"Unknown mode '{mode}'. Use 'auto', 'wideband', or 'targeted'.")
+
+        if save_filename is not None:
+            written = result.save(
+                save_filename, save_resonances=save_resonances,
+                save_txt=save_txt, save_csv=save_csv)
+            print(f"Resonances saved to: {', '.join(written)}")
+
+        return result
 
     def find_resonance_frequencies(self, sweep_data, only_first=True,**kwargs):
         """

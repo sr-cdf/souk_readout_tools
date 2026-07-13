@@ -68,23 +68,6 @@ class PeakFinderParams:
     f_high: Optional[float] = None  # Hz; drop peaks above this frequency
 
 
-def _inner_frequency_trim(frequencies, low_fraction=0.10, high_fraction=0.90):
-    """Return inner-band frequency bounds for wideband auto-detection."""
-    f = np.asarray(frequencies, dtype=float).ravel()
-    good = np.isfinite(f)
-    if np.count_nonzero(good) < 2:
-        return None, None
-    f_min = float(np.nanmin(f[good]))
-    f_max = float(np.nanmax(f[good]))
-    bandwidth = f_max - f_min
-    if not np.isfinite(bandwidth) or bandwidth <= 0.0:
-        return None, None
-    return (
-        f_min + low_fraction * bandwidth,
-        f_min + high_fraction * bandwidth,
-    )
-
-
 def _with_default_param_overrides(defaults, overrides, cls):
     """Build params from defaults plus caller-supplied dict overrides."""
     if overrides is None:
@@ -114,16 +97,19 @@ def wideband_resonance_search_params(frequencies, filter_params=None,
                                      finder_params=None):
     """Return conservative wideband resonance-search parameters.
 
-    These defaults are intended for automatic wideband MKID resonance searches:
-    ignore the noisy filter edges, look for dips, and require enough
-    prominence/width/spacing to avoid fitting every small noise fluctuation.
+    These are the log-magnitude defaults that work well for SOUK wideband
+    sweeps: a light highpass to flatten the baseline, a lowpass to suppress
+    noise, look for dips, and require enough prominence/width/spacing to avoid
+    fitting every small noise fluctuation. The search is restricted to the
+    usable 400 MHz-2100 MHz band, dropping the lossy first-Nyquist edges.
     Caller-supplied dicts override individual defaults; fully constructed
     parameter objects are used unchanged.
 
     Parameters
     ----------
     frequencies : array-like
-        Sweep frequency axis (Hz), used to set the inner frequency trim.
+        Sweep frequency axis (Hz). Retained for API compatibility; the trim
+        band is now fixed rather than derived from the sweep span.
     filter_params : dict or FilterParams or None, optional
         Overrides for the pre-filter defaults (a dict updates individual
         fields; a :class:`FilterParams` is used as-is).
@@ -131,9 +117,8 @@ def wideband_resonance_search_params(frequencies, filter_params=None,
         Overrides for the peak-finder defaults (prominence/width/spacing/dip
         settings), same dict-vs-object rule as ``filter_params``.
     """
-    f_low, f_high = _inner_frequency_trim(frequencies)
     default_filter = FilterParams(
-        highpass_edge=0.0,
+        highpass_edge=0.0001,
         lowpass_edge=0.5,
         median_kernel_size=1,
     )
@@ -143,12 +128,12 @@ def wideband_resonance_search_params(frequencies, filter_params=None,
         prominence_max=100.0,
         width_enabled=True,
         width_min=1_000.0,
-        width_max=10_000_000.0,
+        width_max=500_000.0,
         distance_enabled=True,
-        distance_value=100_000.0,
+        distance_value=1_000.0,
         peak_direction=-1,
-        f_low=f_low,
-        f_high=f_high,
+        f_low=400e6,
+        f_high=2100e6,
     )
     return (
         _with_default_param_overrides(default_filter, filter_params, FilterParams),
@@ -231,6 +216,22 @@ class ResonanceSearchResult:
 
     def as_dict(self):
         return dict(self.items())
+
+    def save(self, filename, save_resonances=True, save_txt=False,
+             save_csv=False):
+        """Write these resonances to file(s); see :func:`write_resonances`.
+
+        Emits the same formats as the MKID finder app's Save/Export button.
+        Example::
+
+            result = client.find_resonances(sweep)
+            result.save('run01', save_resonances=True, save_txt=True)
+        """
+        return write_resonances(
+            self.all_resonances, filename,
+            save_resonances=save_resonances, save_txt=save_txt,
+            save_csv=save_csv,
+        )
 
 
 class DataProcessor:
@@ -610,6 +611,99 @@ def find_mkid_resonances(
         print(f"  Resonance analysis complete: {len(results)} candidates.", flush=True)
     
     return results
+
+
+def _finite_or_zero(value) -> float:
+    """Return ``value`` as a float, mapping None/NaN to 0.0 for file output."""
+    if value is None:
+        return 0.0
+    value = float(value)
+    return value if np.isfinite(value) else 0.0
+
+
+def write_resonances(
+    resonances: List[ResonanceResult],
+    filename: str,
+    save_resonances: bool = True,
+    save_txt: bool = False,
+    save_csv: bool = False,
+) -> List[str]:
+    """Write found resonances to file(s), matching the MKID finder app export.
+
+    The formats are byte-for-byte the same as the app's Save/Export button:
+
+    - ``save_resonances`` -> ``<name>.resonances`` : full table with
+      ``#ID  Frequency(Hz)  Linewidth(Hz)  Qfactor(Qr)  Qcoupling  Qinternal
+      DipDepth(dB)`` (tab-separated).
+    - ``save_txt`` -> ``<name>.txt`` : KIDLAB toneslist
+      (``Name  Freq  Offset att  All  None``).
+    - ``save_csv`` -> ``<name>.csv`` : simple ``#ID,Frequency(Hz)``.
+
+    Any extension on ``filename`` is stripped and replaced per format, so a
+    single base name can emit several files at once. Resonances are numbered
+    sequentially in the order given (results from :func:`find_mkid_resonances`
+    are sorted by frequency).
+
+    Parameters
+    ----------
+    resonances : list of ResonanceResult
+        Resonances to write (e.g. the list returned by
+        :func:`find_mkid_resonances`, or a ``ResonanceSearchResult``).
+    filename : str
+        Output path; its extension is replaced by the per-format extension.
+    save_resonances, save_txt, save_csv : bool
+        Which file formats to emit. At least one must be True.
+
+    Returns
+    -------
+    list of str
+        The paths actually written.
+    """
+    if not (save_resonances or save_txt or save_csv):
+        raise ValueError(
+            "Nothing to save: enable at least one of save_resonances, "
+            "save_txt, save_csv."
+        )
+    import os
+
+    base = os.path.splitext(filename)[0]
+    written: List[str] = []
+
+    if save_resonances:
+        path = base + '.resonances'
+        with open(path, 'w') as f:
+            f.write("#ID\tFrequency(Hz)\tLinewidth(Hz)\tQfactor(Qr)\t"
+                    "Qcoupling\tQinternal\tDipDepth(dB)\n")
+            for i, r in enumerate(resonances):
+                f.write('%04d\t%16.6f\t%16.6f\t%16.6f\t%16.6f\t%16.6f\t%16.6f\n' % (
+                    i,
+                    _finite_or_zero(r.frequency),
+                    _finite_or_zero(r.fwhm),
+                    _finite_or_zero(r.q_factor),
+                    _finite_or_zero(r.qc),
+                    _finite_or_zero(r.qi),
+                    _finite_or_zero(r.dip_depth),
+                ))
+        written.append(path)
+
+    if save_txt:
+        path = base + '.txt'
+        with open(path, 'w') as f:
+            f.write("Name\tFreq\tOffset att\tAll\tNone\n")
+            for i, r in enumerate(resonances):
+                f.write('K%03d\t%f\t%f\t%d\t%d\n' % (
+                    i, _finite_or_zero(r.frequency), 0, 1, 0))
+        written.append(path)
+
+    if save_csv:
+        path = base + '.csv'
+        with open(path, 'w') as f:
+            f.write("#ID,Frequency(Hz)\n")
+            for i, r in enumerate(resonances):
+                f.write(f"{i},{_finite_or_zero(r.frequency)}\n")
+        written.append(path)
+
+    return written
 
 
 # Convenience function for quick use

@@ -28,7 +28,7 @@ from souk_readout_tools.client.readout_client import ReadoutClient
 def wideband_sweep(config_file=None, address=None, request_port=None,
                    bandwidth_hz=None, center_freq_hz=None,
                    step_size_hz=10000, num_tones=1024, samples_per_point=10,
-                   tone_powers_dbm=None,
+                   tone_powers_dbm=None, rx_policy='maximise',
                    ignore_phase_correction=True,
                    filename=None, filetype='npy',
                    plot_data=True):
@@ -57,6 +57,12 @@ def wideband_sweep(config_file=None, address=None, request_port=None,
             setting tones, then uses the resulting power level. If a scalar, all tones
             are set to that power. If an array, must match num_tones. Default is None
             (uses unit amplitudes).
+        rx_policy (str): How the RX path is managed when tone powers are set:
+            'maximise' (default) re-optimises the whole RX chain after the TX
+            power change; 'protect' only backs off RX gain on ADC saturation;
+            'compensate' mirrors the TX change onto the RX path; 'raise' errors
+            on ADC saturation; 'none' leaves the RX path untouched. See
+            ReadoutClient.wideband_sweep / set_tone_powers for details.
         ignore_phase_correction (bool): DEPRECATED. Phase correction is no longer needed
                                         following firmware fixes. Default is True (no correction).
         filename (str): Filename to save the data to. Default is tmp_wideband_sweep in cwd.
@@ -89,6 +95,7 @@ def wideband_sweep(config_file=None, address=None, request_port=None,
         num_tones=num_tones,
         samples_per_point=samples_per_point,
         tone_powers_dbm=tone_powers_dbm,
+        rx_policy=rx_policy,
         apply_phase_correction=not ignore_phase_correction,
         verbose=True
     )
@@ -166,6 +173,12 @@ def main():
                              'a single float to set all tones to that power, or a '
                              'comma-separated list of floats (one per tone). '
                              'Default: None (unit amplitudes).')
+    parser.add_argument('-r', '--rx_policy', type=str, default='maximise',
+                        choices=['maximise', 'protect', 'compensate', 'raise', 'none'],
+                        help="How the RX path is managed when tone powers are set. "
+                             "'maximise' re-optimises the RX chain after the TX power "
+                             "change; 'protect' only backs off RX gain on ADC "
+                             "saturation; 'none' leaves the RX path untouched.")
     parser.add_argument('-i', '--ignore_phase_correction', action='store_true',
                         help='DEPRECATED (no-op). Phase correction is disabled by default '\
                              'following firmware fixes. Kept for backward compatibility.')
@@ -244,6 +257,7 @@ def main():
             num_tones=args.num_tones,
             samples_per_point=args.samples_per_point,
             tone_powers_dbm=tone_powers_dbm,
+            rx_policy=args.rx_policy,
             ignore_phase_correction=ignore_correction,
             filename=args.filename,
             filetype=args.filetype,
