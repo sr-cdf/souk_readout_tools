@@ -1052,6 +1052,14 @@ class ReadoutServer:
         config = self.config if config is None else config
         cls = firmware_lib.classify_clock_status()
 
+        if not cls.get('available', True):
+            # krc-utils not installed (non-SOUK host, e.g. RFSoC 4x2): there is
+            # no LMK/LMX clock tree to gate on, so skip the lock and
+            # source-match checks entirely and let the operation proceed.
+            _server_log('clock gate: krc-utils unavailable; skipping clock check',
+                        source=source)
+            return cls
+
         if cls['fault'] == 'lmk':
             msg = ('Reference clock (LMK04208) unlocked - the PL power rail may be '
                    'down; a power cycle is likely required. A hard_reset will attempt '
