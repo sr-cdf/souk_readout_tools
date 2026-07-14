@@ -3985,6 +3985,8 @@ class ReadoutServer:
                         data={'date': time.strftime("%Y-%m-%d %H:%M:%S UTC%z"),
                               'num_tones': len(sweep_f[0]),
                               'num_points': len(sweep_f),
+                              'centers': self.latest_sweep_results.get('centers'),
+                              'spans': self.latest_sweep_results.get('spans'),
                               'samples_per_point': self.latest_sweep_results['samples_per_point'],
                               'settle_accumulations': self.latest_sweep_results.get('settle_accumulations', 4),
                               'chanmap_settle_accumulations': self.latest_sweep_results.get('chanmap_settle_accumulations', 4),
@@ -4027,6 +4029,8 @@ class ReadoutServer:
                         data += f'# date: {time.strftime("%Y-%m-%d %H:%M:%S %Z")}\n'
                         data += f'# num_tones: {len(sweep_f[0])}\n'
                         data += f'# num_points: {len(sweep_f)}\n'
+                        data += f'# centers: {self.latest_sweep_results.get("centers")}\n'
+                        data += f'# spans: {self.latest_sweep_results.get("spans")}\n'
                         data += f'# samples_per_point: {self.latest_sweep_results["samples_per_point"]}\n'
                         data += f'# settle_accumulations: {self.latest_sweep_results.get("settle_accumulations", 4)}\n'
                         data += f'# chanmap_settle_accumulations: {self.latest_sweep_results.get("chanmap_settle_accumulations", 4)}\n'
@@ -6139,6 +6143,8 @@ class ReadoutServer:
                 'sweep_responses': sweep_responses,
                 'sweep_stds': sweep_stds,
                 'sweep_sems': sweep_sems,
+                'centers': np.asarray(centers, dtype=float).tolist(),
+                'spans': np.asarray(spans, dtype=float).tolist(),
                 'samples_per_point': samples_per_point,
                 'settle_accumulations': settle_accumulations,
                 'chanmap_settle_accumulations': chanmap_settle_accumulations,
@@ -6177,6 +6183,8 @@ class ReadoutServer:
                 'sweep_responses': sweep_responses,
                 'sweep_stds': sweep_stds,
                 'sweep_sems': sweep_sems,
+                'centers': np.asarray(centers, dtype=float).tolist(),
+                'spans': np.asarray(spans, dtype=float).tolist(),
                 'samples_per_point': samples_per_point,
                 'settle_accumulations': settle_accumulations,
                 'chanmap_settle_accumulations': chanmap_settle_accumulations,

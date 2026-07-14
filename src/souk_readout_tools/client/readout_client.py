@@ -135,6 +135,64 @@ def _cal_path_str(path):
     return '.'.join(path)
 
 
+def _check_center_separation(centers, min_separation=1.0):
+    """Raise ValueError if any two sweep centers are closer than min_separation (Hz)."""
+    centers = np.sort(np.asarray(centers, dtype=float).ravel())
+    too_close = np.flatnonzero(np.diff(centers) < min_separation)
+    if too_close.size:
+        pairs = [(float(centers[i]), float(centers[i + 1])) for i in too_close]
+        raise ValueError(
+            f"Sweep centers closer than {min_separation:g} Hz: {pairs}. "
+            "Each sweep tone must have a distinct center frequency.")
+
+
+def clip_overlapping_spans(centers, spans, min_gap=0.0, printing=True):
+    """
+    Shrink per-tone sweep spans so that neighbouring sweep segments do not
+    overlap.
+
+    Sweep segments are centered on ``centers`` (see ``perform_sweep``), so
+    spans are clipped symmetrically about their center rather than shifted.
+    When two neighbouring segments overlap, the frequency gap between their
+    centers (less ``min_gap``) is shared in proportion to the requested
+    spans, so a broad resonance keeps proportionally more of its span than
+    a narrow neighbour. Spans are only ever reduced, never increased.
+
+    Args:
+        centers: Center frequencies (Hz). Need not be sorted.
+        spans: Per-tone spans (Hz), or a scalar applied to all tones.
+        min_gap (float): Minimum frequency gap (Hz) to leave between the
+            edges of adjacent segments after clipping. Default 0.0.
+        printing (bool): If True (default), print a summary when any spans
+            are clipped.
+
+    Returns:
+        np.ndarray of clipped spans, same length as ``centers``.
+    """
+    centers = np.asarray(centers, dtype=float).ravel()
+    spans = np.asarray(spans, dtype=float).ravel()
+    if spans.size == 1:
+        spans = np.full(centers.size, spans[0])
+    if spans.size != centers.size:
+        raise ValueError("spans must be scalar or have one value per center")
+
+    clipped = spans.copy()
+    order = np.argsort(centers)
+    for a, b in zip(order[:-1], order[1:]):
+        gap = centers[b] - centers[a] - min_gap
+        half_sum = (spans[a] + spans[b]) / 2.0
+        if half_sum > gap:
+            scale = max(gap, 0.0) / half_sum
+            clipped[a] = min(clipped[a], spans[a] * scale)
+            clipped[b] = min(clipped[b], spans[b] * scale)
+    if printing:
+        n_clipped = np.count_nonzero(clipped < spans)
+        if n_clipped:
+            print(f"Info: clipped {n_clipped} sweep spans to avoid "
+                  "overlapping segments (pass clip_spans=False to disable).")
+    return clipped
+
+
 class bcolors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
@@ -4290,7 +4348,7 @@ class ReadoutClient:
                       adc_cal_settle_time=2.0, wait=False, autosync=False,
                       setup_sync=True, mrst=False, setup_mrst=False,
                       compensate_rx_ticks=0, settle_accumulations=4,
-                      chanmap_settle_accumulations=4):
+                      chanmap_settle_accumulations=4, clip_spans=True):
         """
         Perform a frequency sweep.
 
@@ -4334,9 +4392,16 @@ class ReadoutClient:
                 offset to cancel the RX-vs-TX path delay (in 307.2 MHz clock
                 ticks) seen when retuning without a per-step sync (autosync=
                 False). Pass 14336 (the measured ~46.67 us delay) to enable.
+            clip_spans (bool): If True (default), shrink spans so that
+                neighbouring sweep segments do not overlap (see
+                ``clip_overlapping_spans``). Only alters spans when overlaps
+                are present.
         """
         centers=np.atleast_1d(centers)
         spans=np.atleast_1d(spans)
+        _check_center_separation(centers)
+        if clip_spans:
+            spans = clip_overlapping_spans(centers, spans)
 
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(
@@ -4381,7 +4446,7 @@ class ReadoutClient:
                        adc_cal_settle_time=2.0, wait=False, autosync=False,
                        setup_sync=True, mrst=False, setup_mrst=False,
                        compensate_rx_ticks=0, settle_accumulations=4,
-                       chanmap_settle_accumulations=4):
+                       chanmap_settle_accumulations=4, clip_spans=True):
         """
         Perform a retune sweep to find optimal tone frequencies.
 
@@ -4423,9 +4488,16 @@ class ReadoutClient:
                 offset to cancel the RX-vs-TX path delay (in 307.2 MHz clock
                 ticks) seen when retuning without a per-step sync (autosync=
                 False). Pass 14336 (the measured ~46.67 us delay) to enable.
+            clip_spans (bool): If True (default), shrink spans so that
+                neighbouring sweep segments do not overlap (see
+                ``clip_overlapping_spans``). Only alters spans when overlaps
+                are present.
         """
         centers=np.atleast_1d(centers)
         spans=np.atleast_1d(spans)
+        _check_center_separation(centers)
+        if clip_spans:
+            spans = clip_overlapping_spans(centers, spans)
 
         #need to check the tones can be set otherwise the sweep task in the server will fail silently
         response = self.set_tone_frequencies(
@@ -4689,6 +4761,13 @@ class ReadoutClient:
                         'sweep_eq': err_q,
                         'telescope_time': sweep_tt
                         }
+        # Centers/spans as actually swept (after any client-side span clipping
+        # and blind-tone expansion). Absent in sweeps taken before these were
+        # recorded server-side.
+        if sweep_data.get('centers') is not None:
+            data_dict['centers'] = np.asarray(sweep_data['centers'], dtype=float)
+        if sweep_data.get('spans') is not None:
+            data_dict['spans'] = np.asarray(sweep_data['spans'], dtype=float)
         return data_dict
 
     @staticmethod

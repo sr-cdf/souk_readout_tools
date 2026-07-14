@@ -1632,6 +1632,8 @@ class MockReadoutServer:
             'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
             'num_tones': int(len(centers)),
             'num_points': points,
+            'centers': centers.tolist(),
+            'spans': spans.tolist(),
             'samples_per_point': samples_per_point,
             'info': self.info('all'),
             'sweep': {
