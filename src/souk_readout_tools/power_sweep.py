@@ -368,6 +368,114 @@ def _save_system_info(manifest, root, client, label, sections):
     })
 
 
+def _nan_placeholder_sweep(centers, spans, points, samples_per_point,
+                           reference_plane, requested, reason, phases=None):
+    """Build a sweep-data dict shaped like a real targeted sweep but with NaN
+    I/Q, used to record a power step that was skipped or failed to be set.
+
+    The frequency axis is the grid the sweep would have used so plots show a
+    gap at the right frequencies; all magnitudes are NaN so the fitter returns
+    a ``noise_only`` (failed) result rather than a fabricated value.  A
+    ``skipped=True`` marker and ``skip_reason`` are carried through so the run
+    view and any reloaded run can tell real data from a placeholder."""
+    centers = np.asarray(centers, dtype=float).ravel()
+    spans = np.asarray(spans, dtype=float).ravel()
+    tones = centers.size
+    pts = int(points)
+    sweep_f = np.empty((pts, tones), dtype=float)
+    for t in range(tones):
+        sweep_f[:, t] = np.linspace(
+            centers[t] - spans[t] / 2.0, centers[t] + spans[t] / 2.0, pts
+        )
+    nan = np.full((pts, tones), np.nan, dtype=float)
+    data = {
+        "date": _timestamp(),
+        "num_tones": int(tones),
+        "num_points": pts,
+        "samples_per_point": int(samples_per_point),
+        "info": {},
+        "sweep_f": sweep_f,
+        "sweep_i": nan.copy(),
+        "sweep_q": nan.copy(),
+        "sweep_ei": nan.copy(),
+        "sweep_eq": nan.copy(),
+        "telescope_time": np.zeros(pts, dtype=np.uint64),
+        "skipped": True,
+        "skip_reason": str(reason),
+        "requested_tone_powers_dbm": np.asarray(requested, dtype=float).ravel().copy(),
+        "readback_tone_powers_dbm": np.full(tones, np.nan),
+        "tone_powers_reference_plane": reference_plane,
+        "sweep_centers_hz": centers.copy(),
+    }
+    if phases is not None:
+        data["tone_phases_rad"] = np.asarray(phases, dtype=float).ravel()
+    return data
+
+
+def _preflight_feasible_steps(client, power_steps, reference_plane,
+                              optimise_dynamic_range, rx_policy, verbose):
+    """Find which power steps the hardware can actually reach.
+
+    Probes the most demanding step (highest peak tone power) and, if it cannot
+    be set, the next most demanding, and so on, until one succeeds — that step
+    fixes the maximum achievable power.  Every step whose peak power is at or
+    below that ceiling is marked feasible; the rest are marked infeasible so
+    :func:`run_power_sweep` can skip them (as NaN) instead of aborting.
+
+    There is no dry-run, so each probe physically applies that step's powers to
+    the hardware; the tones must already be configured (so the achievability
+    check sees the right tone count).  Returns ``(feasible_mask, record)`` where
+    ``feasible_mask`` has one bool per step and ``record`` captures the probe
+    outcome for the manifest.  If no step is achievable, every entry is
+    ``False`` (the run then records NaN for every step rather than raising)."""
+    step_peak = np.array([float(np.max(step)) for step in power_steps])
+    order = np.argsort(step_peak)[::-1]        # most demanding first
+    feasible = np.ones(len(power_steps), dtype=bool)
+    ceiling_index = None
+    failures = []
+    probed = set()
+    for idx in order:
+        peak = float(step_peak[idx])
+        # Skip re-probing a peak we've already resolved (steps can share a peak).
+        if any(abs(peak - step_peak[i]) <= 1e-6 for i in probed):
+            continue
+        probed.add(int(idx))
+        _progress(
+            verbose,
+            f"  Pre-flight probe: peak {peak:.1f} dBm at {reference_plane}",
+        )
+        response = client.set_tone_powers(
+            power_steps[idx], reference_plane=reference_plane,
+            optimise_dynamic_range=optimise_dynamic_range,
+            rx_policy=rx_policy, verbose=False,
+        )
+        failed = isinstance(response, dict) and response.get("status") != "success"
+        if not failed:
+            ceiling_index = int(idx)
+            break
+        message = (
+            response.get("message", "set_tone_powers failed")
+            if isinstance(response, dict) else "set_tone_powers failed"
+        )
+        failures.append({"step_index": int(idx), "peak_dbm": peak, "message": message})
+        _progress(verbose, f"    infeasible: {message}")
+
+    if ceiling_index is None:
+        feasible[:] = False
+        ceiling_peak = None
+    else:
+        ceiling_peak = float(step_peak[ceiling_index])
+        feasible = step_peak <= ceiling_peak + 1e-6
+    record = {
+        "reference_plane": reference_plane,
+        "step_peak_dbm": step_peak.tolist(),
+        "feasible": feasible.tolist(),
+        "ceiling_peak_dbm": ceiling_peak,
+        "probe_failures": failures,
+    }
+    return feasible, record
+
+
 def run_power_sweep(
     client,
     centers,
@@ -381,6 +489,7 @@ def run_power_sweep(
     reference_plane="detector",
     optimise_dynamic_range=False,
     rx_policy="protect",
+    preflight=True,
     settle_time=0.5,
     refresh_adc_cal=True,
     adc_cal_settle_time=2.0,
@@ -461,6 +570,19 @@ def run_power_sweep(
           shift.
         - ``'raise'`` — raise an error if the ADC saturates.
         - ``'none'`` — do not touch the RX path.
+    preflight : bool, optional
+        If ``True`` (default), before any sweeps probe the most demanding
+        power step against the hardware and, if it cannot be set, the next
+        most demanding, and so on, until one succeeds — establishing the
+        maximum achievable power.  Steps whose peak tone power exceeds that
+        ceiling are skipped during the run and recorded as NaN-filled
+        placeholders instead of aborting.  Each probe physically applies that
+        step's powers (there is no dry-run), so the highest feasible power is
+        momentarily set before the run proper begins.  Set ``False`` to skip
+        the probe and rely solely on the per-step graceful skip below (any
+        step that fails to set is still warned and recorded as NaN).  Either
+        way, ``run_power_sweep`` never raises on an infeasible or failed step
+        and always returns whatever data it collected.
     settle_time : float, optional
         Seconds to sleep after applying a power step, before the sweep
         starts (default ``0.5``).  Set to ``0`` to skip.
@@ -602,12 +724,97 @@ def run_power_sweep(
         _save_system_info(manifest, output_dir, client, "start", info_sections)
         _write_manifest(manifest, output_dir)
 
+    # Feasibility pre-flight: probe the hardware to learn which power steps are
+    # achievable, so infeasible ones are skipped (recorded as NaN) rather than
+    # aborting the whole run.  Best-effort — any unexpected failure here just
+    # leaves every step marked feasible and lets the per-step graceful skip in
+    # the loop below handle it.
+    step_feasible = np.ones(len(power_steps), dtype=bool)
+    if preflight:
+        _progress(verbose, "Pre-flight: checking power feasibility")
+        try:
+            _require_success(
+                client.set_tone_frequencies(centers - spans / 2.0),
+                "set_tone_frequencies failed",
+            )
+            step_feasible, feasibility_record = _preflight_feasible_steps(
+                client, power_steps, reference_plane, optimise_dynamic_range,
+                rx_policy, verbose,
+            )
+            manifest["metadata"]["feasibility"] = feasibility_record
+            n_skip = int(np.sum(~step_feasible))
+            if n_skip:
+                peaks = np.round(
+                    np.asarray(feasibility_record["step_peak_dbm"])[~step_feasible],
+                    1,
+                ).tolist()
+                ceiling = feasibility_record["ceiling_peak_dbm"]
+                ceiling_note = (
+                    f"maximum achievable peak is {ceiling:.1f} dBm; "
+                    if ceiling is not None
+                    else "no power step is achievable; "
+                )
+                msg = (
+                    f"{n_skip}/{len(power_steps)} power step(s) exceed the maximum "
+                    f"achievable power at reference_plane={reference_plane!r} and "
+                    f"will be skipped (recorded as NaN). {ceiling_note}"
+                    f"skipped peaks: {peaks} dBm. Reduce powers_dbm to measure them."
+                )
+                warnings.warn(msg, stacklevel=2)
+                _progress(verbose, f"  WARNING: {msg}")
+            _write_manifest(manifest, output_dir)
+        except Exception as exc:  # never let the pre-flight abort the run
+            step_feasible = np.ones(len(power_steps), dtype=bool)
+            warn_msg = (
+                "Pre-flight feasibility check failed; proceeding and skipping "
+                f"any step that cannot be set at run time: {exc}"
+            )
+            warnings.warn(warn_msg, stacklevel=2)
+            _progress(verbose, f"  WARNING: {warn_msg}")
+
+    def _record_skip(step, index, requested, reason, step_centers, phases):
+        """Fill a step with a NaN placeholder sweep so the loop never breaks and
+        downstream analyses see one NaN-filled row for the missing power."""
+        placeholder = _nan_placeholder_sweep(
+            step_centers, spans, points, samples_per_point,
+            reference_plane, requested, reason, phases=phases,
+        )
+        rel_path = f"data/step_{index:04d}_sweep.npz"
+        _save_npz(output_dir / rel_path, placeholder)
+        centers_list = np.asarray(step_centers, dtype=float).ravel().tolist()
+        readback_list = placeholder["readback_tone_powers_dbm"].tolist()
+        step["readback"]["tone_power_dbm"] = readback_list
+        step["metadata"]["next_centers_hz"] = centers_list
+        step["metadata"]["skipped"] = True
+        step["metadata"]["skip_reason"] = str(reason)
+        step["artifacts"] = [{
+            "name": f"step_{index:04d}_sweep",
+            "kind": "sweep",
+            "path": rel_path,
+            "format": "npz",
+            "metadata": {
+                "reference_plane": reference_plane,
+                "requested_tone_powers_dbm": np.asarray(
+                    requested, dtype=float).ravel().tolist(),
+                "readback_tone_powers_dbm": readback_list,
+                "centers_hz": centers_list,
+                "spans_hz": spans.tolist(),
+                "skipped": True,
+                "skip_reason": str(reason),
+            },
+            "created": _timestamp(),
+        }]
+        step["status"] = "skipped"
+        step["error"] = str(reason)
+        step["finished"] = _timestamp()
+
     try:
         # Optional center search: one discarded sweep (at the first requested
         # power, optionally over wider spans) used only to recenter on the
         # empirical dips before the first saved step.  The park / power / sweep
         # sequence here is the same one each saved step runs below.
         if search_for_center:
+          try:
             search_spans = spans * search_span_factor
             span_note = (
                 ""
@@ -685,18 +892,27 @@ def run_power_sweep(
             manifest["metadata"]["search_centers_hz"] = centers.tolist()
             manifest["metadata"]["current_centers_hz"] = centers.tolist()
             _write_manifest(manifest, output_dir)
+          except Exception as exc:
+            # A failed center search must not abort the run: fall back to the
+            # requested centers and continue to the recorded power steps.
+            warn_msg = (
+                f"Center search failed ({exc}); using the requested centers."
+            )
+            warnings.warn(warn_msg, stacklevel=2)
+            _progress(verbose, f"  WARNING: {warn_msg}")
+            manifest["metadata"].setdefault("warnings", []).append(warn_msg)
 
         # Step through the power schedule, saving one targeted sweep per step.
+        # A step the pre-flight flagged infeasible, or one that fails to set /
+        # sweep at run time, is recorded as a NaN placeholder and the loop
+        # continues — the run never aborts on a single bad power level.
         for index, requested in enumerate(power_steps):
+            feasible = bool(step_feasible[index])
             _progress(
                 verbose,
                 f"[{index + 1}/{len(power_steps)}] tone powers "
-                f"{_format_power_summary(requested)} at {reference_plane}",
-            )
-            step_phases = (
-                np.asarray(client.generate_newman_phases(centers), dtype=float)
-                if phase_mode == "newman"
-                else phase_values
+                f"{_format_power_summary(requested)} at {reference_plane}"
+                + ("" if feasible else "  [SKIPPED: exceeds max achievable power]"),
             )
             step = {
                 "index": index,
@@ -716,111 +932,155 @@ def run_power_sweep(
                 "finished": None,
                 "error": None,
             }
-            if step_phases is not None:
-                step["metadata"]["tone_phases_rad"] = step_phases.tolist()
             manifest["steps"].append(step)
 
-            # Park, power, settle, sweep (same sequence as the center search).
-            _progress(verbose, f"  Parking {centers.size} tones at sweep low edge")
-            _require_success(
-                client.set_tone_frequencies(centers - spans / 2.0),
-                "set_tone_frequencies failed",
-            )
-            if step_phases is not None:
-                _progress(verbose, "  Setting tone phases")
+            if not feasible:
+                reason = (
+                    "requested power exceeds maximum achievable power "
+                    "(pre-flight); recorded as NaN"
+                )
+                _record_skip(step, index, requested, reason, centers, None)
+                _progress(verbose, "  Recorded NaN placeholder (skipped)")
+                manifest["metadata"]["current_centers_hz"] = centers.tolist()
+                _write_manifest(manifest, output_dir)
+                continue
+
+            try:
+                step_phases = (
+                    np.asarray(client.generate_newman_phases(centers), dtype=float)
+                    if phase_mode == "newman"
+                    else phase_values
+                )
+                if step_phases is not None:
+                    step["metadata"]["tone_phases_rad"] = step_phases.tolist()
+
+                # Park, power, settle, sweep (same sequence as the center search).
+                _progress(
+                    verbose, f"  Parking {centers.size} tones at sweep low edge"
+                )
                 _require_success(
-                    client.set_tone_phases(step_phases), "set_tone_phases failed"
+                    client.set_tone_frequencies(centers - spans / 2.0),
+                    "set_tone_frequencies failed",
                 )
-            _progress(
-                verbose,
-                "  Optimising dynamic range and applying tone powers"
-                if optimise_dynamic_range
-                else "  Applying tone powers",
-            )
-            _require_success(
-                client.set_tone_powers(
-                    requested,
-                    reference_plane=reference_plane,
-                    optimise_dynamic_range=optimise_dynamic_range,
-                    rx_policy=rx_policy,
-                    verbose=False,
-                ),
-                "set_tone_powers failed",
-            )
-            if settle_time:
-                _progress(verbose, f"  Settling for {float(settle_time):g} s")
-                time.sleep(float(settle_time))
-            _progress(verbose, "  Running targeted sweep")
-            _require_success(
-                client.perform_sweep(
-                    centers, spans, points=int(points),
-                    samples_per_point=int(samples_per_point), direction=direction,
-                    phases=step_phases, refresh_adc_cal=refresh_adc_cal,
-                    adc_cal_settle_time=adc_cal_settle_time,
-                ),
-                "perform_sweep failed",
-            )
-            client.wait_for_sweep(progress_bar=verbose)
-            sweep_data = client.parse_sweep_data(client.get_sweep_data())
-            sweep_data["tone_metadata"] = client.get_tone_metadata()
-
-            readback = np.asarray(
-                client.get_tone_powers(reference_plane=reference_plane),
-                dtype=float,
-            ).ravel()
-            step["readback"]["tone_power_dbm"] = readback.tolist()
-            sweep_data["requested_tone_powers_dbm"] = requested.copy()
-            sweep_data["readback_tone_powers_dbm"] = readback.copy()
-            sweep_data["tone_powers_reference_plane"] = reference_plane
-            sweep_data["sweep_centers_hz"] = centers.copy()
-
-            # If requested, find the measured dip in each regular trace and use
-            # it as the next step's center.  Blind tones are left fixed.
-            next_centers = centers.copy()
-            if follow_dips:
-                next_centers, follow_record = _find_dip_centers(
-                    sweep_data, centers, spans, follow_min_depth_db
-                )
-                sweep_data["follow_dips"] = follow_record
-                sweep_data["next_sweep_centers_hz"] = next_centers.copy()
-                blind_count = len(follow_record["blind_indices"])
+                if step_phases is not None:
+                    _progress(verbose, "  Setting tone phases")
+                    _require_success(
+                        client.set_tone_phases(step_phases),
+                        "set_tone_phases failed",
+                    )
                 _progress(
                     verbose,
-                    f"  Following dips: {int(np.sum(follow_record['accepted']))}/"
-                    f"{centers.size - blind_count} centers updated",
+                    "  Optimising dynamic range and applying tone powers"
+                    if optimise_dynamic_range
+                    else "  Applying tone powers",
                 )
-            step["metadata"]["next_centers_hz"] = next_centers.tolist()
+                _require_success(
+                    client.set_tone_powers(
+                        requested,
+                        reference_plane=reference_plane,
+                        optimise_dynamic_range=optimise_dynamic_range,
+                        rx_policy=rx_policy,
+                        verbose=False,
+                    ),
+                    "set_tone_powers failed",
+                )
+                if settle_time:
+                    _progress(verbose, f"  Settling for {float(settle_time):g} s")
+                    time.sleep(float(settle_time))
+                _progress(verbose, "  Running targeted sweep")
+                _require_success(
+                    client.perform_sweep(
+                        centers, spans, points=int(points),
+                        samples_per_point=int(samples_per_point),
+                        direction=direction,
+                        phases=step_phases, refresh_adc_cal=refresh_adc_cal,
+                        adc_cal_settle_time=adc_cal_settle_time,
+                    ),
+                    "perform_sweep failed",
+                )
+                client.wait_for_sweep(progress_bar=verbose)
+                sweep_data = client.parse_sweep_data(client.get_sweep_data())
+                sweep_data["tone_metadata"] = client.get_tone_metadata()
 
-            rel_path = f"data/step_{index:04d}_sweep.npz"
-            _save_npz(output_dir / rel_path, sweep_data)
-            step["artifacts"].append({
-                "name": f"step_{index:04d}_sweep",
-                "kind": "sweep",
-                "path": rel_path,
-                "format": "npz",
-                "metadata": {
-                    "reference_plane": reference_plane,
-                    "requested_tone_powers_dbm": requested.tolist(),
-                    "readback_tone_powers_dbm": readback.tolist(),
-                    "centers_hz": centers.tolist(),
-                    "spans_hz": spans.tolist(),
-                    "system_info_source": "embedded",
-                },
-                "created": _timestamp(),
-            })
-            _progress(verbose, f"  Saved {rel_path}")
+                readback = np.asarray(
+                    client.get_tone_powers(reference_plane=reference_plane),
+                    dtype=float,
+                ).ravel()
+                step["readback"]["tone_power_dbm"] = readback.tolist()
+                sweep_data["requested_tone_powers_dbm"] = requested.copy()
+                sweep_data["readback_tone_powers_dbm"] = readback.copy()
+                sweep_data["tone_powers_reference_plane"] = reference_plane
+                sweep_data["sweep_centers_hz"] = centers.copy()
 
-            step["status"] = "success"
-            step["finished"] = _timestamp()
-            centers = next_centers
+                # If requested, find the measured dip in each regular trace and
+                # use it as the next step's center.  Blind tones are left fixed.
+                next_centers = centers.copy()
+                if follow_dips:
+                    next_centers, follow_record = _find_dip_centers(
+                        sweep_data, centers, spans, follow_min_depth_db
+                    )
+                    sweep_data["follow_dips"] = follow_record
+                    sweep_data["next_sweep_centers_hz"] = next_centers.copy()
+                    blind_count = len(follow_record["blind_indices"])
+                    _progress(
+                        verbose,
+                        f"  Following dips: {int(np.sum(follow_record['accepted']))}/"
+                        f"{centers.size - blind_count} centers updated",
+                    )
+                step["metadata"]["next_centers_hz"] = next_centers.tolist()
+
+                rel_path = f"data/step_{index:04d}_sweep.npz"
+                _save_npz(output_dir / rel_path, sweep_data)
+                step["artifacts"].append({
+                    "name": f"step_{index:04d}_sweep",
+                    "kind": "sweep",
+                    "path": rel_path,
+                    "format": "npz",
+                    "metadata": {
+                        "reference_plane": reference_plane,
+                        "requested_tone_powers_dbm": requested.tolist(),
+                        "readback_tone_powers_dbm": readback.tolist(),
+                        "centers_hz": centers.tolist(),
+                        "spans_hz": spans.tolist(),
+                        "system_info_source": "embedded",
+                    },
+                    "created": _timestamp(),
+                })
+                _progress(verbose, f"  Saved {rel_path}")
+
+                step["status"] = "success"
+                step["finished"] = _timestamp()
+                centers = next_centers
+            except Exception as exc:
+                # A power level that can't be set (or a sweep that fails) must
+                # not break the loop: warn loudly, record a NaN placeholder, and
+                # keep the current centers for the next step.
+                reason = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                warn_msg = (
+                    f"Power step {index} "
+                    f"({_format_power_summary(requested)} at {reference_plane}) "
+                    f"failed and was recorded as NaN: {reason}"
+                )
+                warnings.warn(warn_msg, stacklevel=2)
+                _progress(verbose, f"  WARNING: {warn_msg}")
+                _record_skip(step, index, requested, reason, centers, None)
+
             manifest["metadata"]["current_centers_hz"] = centers.tolist()
             # Rewrite the manifest after every step so an interrupted run can
             # still be inspected.
             _write_manifest(manifest, output_dir)
 
         manifest["metadata"]["final_centers_hz"] = centers.tolist()
-        manifest["status"] = "success"
+        n_skipped = sum(
+            1 for s in manifest["steps"] if s.get("status") == "skipped"
+        )
+        manifest["metadata"]["skipped_step_count"] = int(n_skipped)
+        manifest["status"] = "success" if n_skipped == 0 else "partial"
     except Exception as exc:
+        # Never raise: record the error and fall through so the caller still
+        # receives the partial run (whatever steps completed before the fault).
         manifest["status"] = "failed"
         manifest["error"] = "".join(
             traceback.format_exception_only(type(exc), exc)
@@ -829,7 +1089,12 @@ def run_power_sweep(
             manifest["steps"][-1]["status"] = "failed"
             manifest["steps"][-1]["error"] = manifest["error"]
             manifest["steps"][-1]["finished"] = _timestamp()
-        raise
+        warnings.warn(
+            f"run_power_sweep stopped early and returned partial data: "
+            f"{manifest['error']}",
+            stacklevel=2,
+        )
+        print(traceback.format_exc(), flush=True)
     finally:
         manifest["finished"] = _timestamp()
         if capture_system_info:

@@ -609,6 +609,18 @@ def _weighted_rms(diff, z_error, power=1.0):
     return float(np.sqrt(np.mean(r * r)))
 
 
+class InsufficientSamplesError(ValueError):
+    """Raised when a sweep trace has too few finite samples to fit.
+
+    Subclasses ``ValueError`` so existing ``except ValueError`` callers keep
+    working, while :func:`fit_resonance` / :func:`fit_resonance_nonlinear`
+    catch this specific case and return a ``noise_only`` result instead of
+    propagating -- so a mostly-NaN or deliberately skipped trace (e.g. a
+    power-sweep step that could not be set) degrades to a failed fit rather
+    than aborting a whole batch.
+    """
+
+
 def _prepare_arrays(f, z, z_err=None, optimizer_z_err=None):
     """Mask non-finite samples, sort by frequency, and carry errors along."""
     f = np.asarray(f, float).ravel()
@@ -624,7 +636,8 @@ def _prepare_arrays(f, z, z_err=None, optimizer_z_err=None):
         good &= np.isfinite(opt_error[0]) & np.isfinite(opt_error[1])
     f, z = f[good], z[good]
     if f.size < 5:
-        raise ValueError("at least five finite samples are required for a resonator fit")
+        raise InsufficientSamplesError(
+            "at least five finite samples are required for a resonator fit")
     order = np.argsort(f)
     f, z = f[order], z[order]
     if z_error is not None:
@@ -1355,6 +1368,35 @@ def _make_noise_result(f, z, z_error, optimizer_z_error, sweep_direction, f0,
     )
 
 
+def _make_insufficient_data_result(f, z, sweep_direction, fit_start, nonlinear):
+    """Build a failed, ``noise_only`` FitResult for a trace with too few finite
+    samples to attempt a fit (e.g. a skipped or NaN-filled power-sweep step).
+
+    Mirrors :func:`_make_noise_result`'s ``success=False`` / ``noise_only=True``
+    contract so batch and power-sweep tools exclude it exactly like a
+    below-threshold dip, but carries no empirical estimate (there is not enough
+    data to compute one)."""
+    f_arr = np.asarray(f, float).ravel()
+    z_arr = np.asarray(z, complex).ravel()
+    n_finite = int(np.count_nonzero(
+        np.isfinite(f_arr) & np.isfinite(z_arr.real) & np.isfinite(z_arr.imag)
+    ))
+    reason = f"insufficient finite samples ({n_finite} < 5)"
+    parameter_names = NONLINEAR_NAMES if nonlinear else LINEAR_NAMES
+    return FitResult(
+        success=False,
+        message=f"noise-only sweep: {reason}",
+        noise_only=True,
+        noise_reason=reason,
+        anl=np.nan,
+        sweep_direction=sweep_direction,
+        fit_duration_s=float(time.time() - fit_start),
+        parameter_names=parameter_names,
+        f_data=f_arr,
+        z_data=z_arr,
+    )
+
+
 def _make_result(f, z, z_error, optimizer_z_error, opt, sweep_direction, f0,
                  fit_start, empirical=None, linear_fit=None, opt_linear=None,
                  opt_nonlinear=None, store_optimizer=True):
@@ -1585,7 +1627,11 @@ def fit_resonance(f, z, z_err=None, nonlinear=True, sweep_direction="up",
     guess = {} if initial_guess is None else dict(_parameter_dict(initial_guess))
     if use_error_weights is not None:
         optimizer_z_err = True if use_error_weights else None
-    f, z, z_error, opt_error = _prepare_arrays(f, z, z_err, optimizer_z_err)
+    try:
+        f, z, z_error, opt_error = _prepare_arrays(f, z, z_err, optimizer_z_err)
+    except InsufficientSamplesError:
+        return _make_insufficient_data_result(
+            f, z, sweep_direction, fit_start, nonlinear=False)
     empirical = estimate_resonance_empirical(f, s21=z)
     f0_full = float(np.mean(f))
     if (
@@ -1678,7 +1724,11 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
     guess = {} if initial_guess is None else dict(_parameter_dict(initial_guess))
     if use_error_weights is not None:
         optimizer_z_err = True if use_error_weights else None
-    f, z, z_error, opt_error = _prepare_arrays(f, z, z_err, optimizer_z_err)
+    try:
+        f, z, z_error, opt_error = _prepare_arrays(f, z, z_err, optimizer_z_err)
+    except InsufficientSamplesError:
+        return _make_insufficient_data_result(
+            f, z, sweep_direction, fit_start, nonlinear=True)
     empirical = estimate_resonance_empirical(f, s21=z)
     f0 = float(np.mean(f))
     if (
