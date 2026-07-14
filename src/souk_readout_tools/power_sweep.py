@@ -107,87 +107,6 @@ BALANCED_POWER_FILE = "analysis/balanced_power.json"
 SUMMARY_KEYS = FIT_SUMMARY_KEYS
 UNCERTAINTY_KEYS = FIT_UNCERTAINTY_KEYS
 
-# Fit-summary keys that ``find_best_power`` interpolates against power_dbm
-# to estimate parameter-like values at the chosen readout power. Booleans,
-# solver diagnostics, timing, and fit-quality diagnostics are excluded because
-# interpolating them is not meaningful.
-_INTERPOLATABLE_FIT_KEYS = tuple(
-    k for k in FIT_SUMMARY_KEYS
-    if k not in {
-        "success",
-        "nfev",
-        "fit_duration_s",
-        "noise_only",
-        "residual_rms",
-        "weighted_rms",
-        "reduced_chi2",
-    }
-)
-_CHOSEN_PARAM_ARRAY_KEYS = ("power_dbm",) + _INTERPOLATABLE_FIT_KEYS + (
-    "extrapolated",
-    "n_rows_used",
-    "fr_source",
-)
-
-# Chosen-parameter keys that are physically non-negative. ``find_best_power``
-# interpolates/extrapolates each fit-summary field against power, and linear
-# extrapolation past the measured range can drive a positive-but-decreasing
-# quantity (e.g. a linewidth or Q) negative. ``best_power_arrays`` replaces any
-# such negative entry with the cross-tone median of the valid values for that
-# key. Signed quantities (skew, nonlinear detuning, coupling/gain phases) are
-# deliberately excluded because negatives are legitimate there.
-_NONNEGATIVE_PARAM_KEYS = tuple(
-    k for k in (
-        "Ql", "Qi", "Qc", "Qc_abs", "a", "anl",
-        "empirical_linewidth_hz", "empirical_Ql", "empirical_Qc", "empirical_Qi",
-        "empirical_dip_depth_db",
-    )
-    if k in _CHOSEN_PARAM_ARRAY_KEYS
-)
-
-# Default per-parameter validity ranges used by ``find_best_power`` to exclude
-# rows whose fit pegged a parameter at (or outside) a fitter bound. Mirrors the
-# static parts of the broad physical defaults in :mod:`souk_readout_tools.fitting`.
-# Data-dependent fitter bounds (``fr``, ``a``, ``tau``) are intentionally omitted
-# — callers can supply their own (low, high) entries for those if needed. ``phi``
-# and ``alpha`` are tightened by 1e-4 so values pinned at the fitter's
-# ``±π/2 - eps`` / ``±π`` clamps are caught. ``anl``'s lower bound (1e-6) is
-# loose-by-design: anything that many orders of magnitude below the fitter's
-# 1e-8 log clamp is indistinguishable from zero in practice.
-DEFAULT_PARAM_VALID_RANGES = {
-    "Qi": (10.0, 1e8),
-    "Qc": (10.0, 1e8),
-    "phi": (-np.pi / 2.0 + 1e-4, np.pi / 2.0 - 1e-4),
-    "alpha": (-np.pi + 1e-4, np.pi - 1e-4),
-    "anl": (1e-6, 90.0),
-}
-
-
-def _normalise_param_valid_ranges(param_valid_ranges):
-    """Validate and normalise a param-range dict from the public API."""
-    if param_valid_ranges is None:
-        return dict(DEFAULT_PARAM_VALID_RANGES)
-    if not isinstance(param_valid_ranges, dict):
-        raise TypeError("param_valid_ranges must be a dict of {name: (low, high)}")
-    out = {}
-    for name, pair in param_valid_ranges.items():
-        if pair is None:
-            continue
-        try:
-            lo, hi = pair
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"param_valid_ranges[{name!r}] must be a (low, high) pair"
-            ) from exc
-        lo = -np.inf if lo is None else float(lo)
-        hi = np.inf if hi is None else float(hi)
-        if not (lo < hi):
-            raise ValueError(
-                f"param_valid_ranges[{name!r}] must satisfy low < high"
-            )
-        out[str(name)] = (lo, hi)
-    return out
-
 __all__ = [
     # On-disk artifact locations
     "MANIFEST_FILE",
@@ -225,16 +144,7 @@ __all__ = [
 ]
 
 
-def _format_power_summary(powers):
-    powers = np.asarray(powers, dtype=float).ravel()
-    tone_word = "tone" if powers.size == 1 else "tones"
-    if powers.size == 1 or np.allclose(powers, powers[0], atol=1e-9, rtol=0.0):
-        return f"{powers[0]:.1f} dBm ({powers.size} {tone_word})"
-    return (
-        f"{np.nanmin(powers):.1f} to {np.nanmax(powers):.1f} dBm "
-        f"({powers.size} {tone_word})"
-    )
-
+# --- Small shared helpers: progress reporting and label formatting -----------
 
 def _progress(verbose, message):
     if verbose:
@@ -295,6 +205,56 @@ def _format_plot_progress(
         message += f", {detail}"
     return message
 
+
+def _format_power_summary(powers):
+    powers = np.asarray(powers, dtype=float).ravel()
+    tone_word = "tone" if powers.size == 1 else "tones"
+    if powers.size == 1 or np.allclose(powers, powers[0], atol=1e-9, rtol=0.0):
+        return f"{powers[0]:.1f} dBm ({powers.size} {tone_word})"
+    return (
+        f"{np.nanmin(powers):.1f} to {np.nanmax(powers):.1f} dBm "
+        f"({powers.size} {tone_word})"
+    )
+
+
+def _format_power_label(power, sweep_index):
+    """Return a compact legend label for one power value."""
+    if np.isfinite(power):
+        return f"{power:.1f} dBm"
+    return f"step {sweep_index}"
+
+
+def _format_power_row_label(powers, sweep_index):
+    """Return a compact legend label for one possibly-multitone power row."""
+    powers = np.asarray(powers, dtype=float).ravel()
+    finite = powers[np.isfinite(powers)]
+    if finite.size == 0:
+        return f"step {sweep_index}"
+    if finite.size == 1 or np.allclose(finite, finite[0], atol=1e-9, rtol=0.0):
+        return f"{finite[0]:.1f} dBm"
+    return f"{np.nanmin(finite):.1f} to {np.nanmax(finite):.1f} dBm"
+
+
+def _normalise_tone_indices(tone_indices, tone_count):
+    """Return validated tone indices as a list of ints."""
+    if tone_indices is None:
+        tones = list(range(int(tone_count)))
+    elif np.isscalar(tone_indices):
+        tones = [int(tone_indices)]
+    else:
+        tones = [int(tone) for tone in tone_indices]
+    if not tones:
+        raise ValueError("tone_indices must select at least one tone.")
+    invalid = [tone for tone in tones if tone < 0 or tone >= int(tone_count)]
+    if invalid:
+        raise ValueError(
+            f"tone_indices contains out-of-range tones {invalid}; "
+            f"valid range is 0 to {int(tone_count) - 1}."
+        )
+    return tones
+
+
+# --- Acquisition: run a stepped tone-power sweep -----------------------------
 
 def _find_dip_centers(sweep_data, centers, spans, follow_min_depth_db):
     """Empirical-dip recentering used by ``run_power_sweep``.
@@ -394,7 +354,6 @@ def _normalise_power_steps(powers_dbm, tone_count):
     raise ValueError("powers_dbm must be scalar, 1D, or shaped (step, tone).")
 
 
-# --- On-disk run record ------------------------------------------------------
 # A power-sweep run is a directory holding ``measurement.json`` (a plain manifest
 # dict listing the swept parameters and one entry per step) alongside the saved
 # per-step sweep ``.npz`` files under ``data/``.  The manifest/npz helpers used
@@ -537,6 +496,12 @@ def _preflight_feasible_steps(client, power_steps, reference_plane,
         "probe_failures": failures,
     }
     return feasible, record
+
+
+def _require_success(response, message):
+    """Raise if a client call returned a ``{'status': ...}`` failure dict."""
+    if isinstance(response, dict) and response.get("status") != "success":
+        raise RuntimeError(response.get("message", message))
 
 
 def run_power_sweep(
@@ -1166,11 +1131,7 @@ def run_power_sweep(
     return _power_sweep_run_view(manifest)
 
 
-def _require_success(response, message):
-    """Raise if a client call returned a ``{'status': ...}`` failure dict."""
-    if isinstance(response, dict) and response.get("status") != "success":
-        raise RuntimeError(response.get("message", message))
-
+# --- Run records on disk: load a sweep back as the analysis view -------------
 
 def _power_sweep_run_view(run):
     """Return the array view the fit/plot helpers work on.
@@ -1306,6 +1267,32 @@ def load_power_sweep(path):
         )
     return _power_sweep_run_view(manifest)
 
+
+def _power_row_for_step(run, sweep_index, use_readback=True):
+    """Return the requested/readback power row for one sweep step."""
+    keys = (
+        ("readback_powers_dbm", "powers_dbm")
+        if use_readback
+        else ("powers_dbm", "readback_powers_dbm")
+    )
+    for key in keys:
+        rows = run.get(key, [])
+        if sweep_index < len(rows):
+            row = np.asarray(rows[sweep_index], dtype=float).ravel()
+            if row.size:
+                return row
+    return np.array([], dtype=float)
+
+
+def _power_for_tone(run, sweep_index, tone_index, use_readback=True):
+    """Return the selected power for one sweep/tone pair, or NaN."""
+    row = _power_row_for_step(run, sweep_index, use_readback=use_readback)
+    if tone_index < row.size:
+        return float(row[tone_index])
+    return np.nan
+
+
+# --- Fitting -----------------------------------------------------------------
 
 def fit_power_sweep(
     run,
@@ -1612,6 +1599,54 @@ def parameter_series(
     return series
 
 
+def _fits_for_tone(fit_data, tone_index):
+    """Return a per-power list of fits for one tone, with None for misses."""
+    if fit_data is None:
+        return []
+    if "fits_by_power" in fit_data:
+        fits_for_tone = []
+        for fits_at_power in fit_data["fits_by_power"]:
+            fit = None
+            for fallback_index, candidate in enumerate(fits_at_power):
+                if int(getattr(candidate, "tone_index", fallback_index)) == tone_index:
+                    fit = candidate
+                    break
+            fits_for_tone.append(fit)
+        return fits_for_tone
+    if int(fit_data["tone_index"]) == int(tone_index):
+        return list(fit_data["fits"])
+    return []
+
+
+def _fits_for_power(fit_data, sweep_index, tone_indices):
+    """Return fits at one power step matching the selected tone indices."""
+    if fit_data is None:
+        return []
+    tone_set = {int(tone) for tone in tone_indices}
+    if "fits_by_power" in fit_data:
+        if sweep_index >= len(fit_data["fits_by_power"]):
+            return []
+        fits = []
+        for fallback_index, fit in enumerate(
+            fit_data["fits_by_power"][sweep_index]
+        ):
+            tone_index = int(getattr(fit, "tone_index", fallback_index))
+            if tone_index in tone_set:
+                fits.append(fit)
+        return fits
+    if sweep_index >= len(fit_data.get("fits", [])):
+        return []
+    tone_index = int(fit_data["tone_index"])
+    return [fit_data["fits"][sweep_index]] if tone_index in tone_set else []
+
+
+# --- The fit-summary table (one row per power step and tone) -----------------
+
+_FIT_SUMMARY_INDEX_KEYS = {"sweep_index", "tone_index"}
+_FIT_SUMMARY_BOOL_KEYS = {"success", "noise_only"}
+_FIT_SUMMARY_STRING_KEYS = {"message"}
+
+
 def _fit_summary_rows(fit_data):
     """Flatten fit results into one CSV-friendly row per sweep/tone fit.
 
@@ -1683,11 +1718,6 @@ def _fit_summary_rows(fit_data):
     return rows
 
 
-_FIT_SUMMARY_INDEX_KEYS = {"sweep_index", "tone_index"}
-_FIT_SUMMARY_BOOL_KEYS = {"success", "noise_only"}
-_FIT_SUMMARY_STRING_KEYS = {"message"}
-
-
 def _fit_summary_column_names():
     """Return the canonical fit-summary column order."""
     columns = [
@@ -1755,6 +1785,19 @@ def _coerce_summary_value(value, dtype):
         return np.nan
 
 
+def _rows_to_summary_array(rows):
+    """Pack fit-summary rows (list of dicts) into a structured array."""
+    columns = list(rows[0]) if rows else list(_fit_summary_column_names())
+    array = np.empty(len(rows), dtype=_fit_summary_array_dtype(rows, columns))
+    for row_index, row in enumerate(rows):
+        for name in columns:
+            array[name][row_index] = _coerce_summary_value(
+                row.get(name, np.nan),
+                array.dtype.fields[name][0],
+            )
+    return array
+
+
 def fit_summary_array(fit_data):
     """Return fit-summary rows as a structured NumPy array.
 
@@ -1776,19 +1819,6 @@ def fit_summary_array(fit_data):
         :py:func:`write_fit_summary`).
     """
     return _rows_to_summary_array(_fit_summary_rows(fit_data))
-
-
-def _rows_to_summary_array(rows):
-    """Pack fit-summary rows (list of dicts) into a structured array."""
-    columns = list(rows[0]) if rows else list(_fit_summary_column_names())
-    array = np.empty(len(rows), dtype=_fit_summary_array_dtype(rows, columns))
-    for row_index, row in enumerate(rows):
-        for name in columns:
-            array[name][row_index] = _coerce_summary_value(
-                row.get(name, np.nan),
-                array.dtype.fields[name][0],
-            )
-    return array
 
 
 def _fit_summary_path(path):
@@ -1864,6 +1894,76 @@ def load_fit_summary(path):
     source = _fit_summary_path(path)
     return _rows_to_summary_array(_coerce_summary_rows(source))
 
+
+def _is_fit_data(summary):
+    """Return True for dictionaries produced by ``fit_power_sweep``."""
+    return (
+        isinstance(summary, dict)
+        and "run" in summary
+        and ("fits_by_power" in summary or "fits" in summary)
+    )
+
+
+def _coerce_summary_rows(summary):
+    """Return summary rows as a list of dicts with numeric columns floated.
+
+    Accepts a ``fit_power_sweep`` result dict, a structured summary array
+    (:py:func:`fit_summary_array` / :py:func:`load_fit_summary`), an iterable
+    of dicts (as produced by :py:func:`_fit_summary_rows`), a single row
+    dict, or a path to a CSV written by :py:func:`write_fit_summary`.
+    String columns that look numeric are converted to ``float`` (with empty
+    strings becoming ``NaN``); ``"true"``/``"false"`` become ``bool``; other
+    strings are left alone so the ``message`` field still parses.
+    """
+    if _is_fit_data(summary):
+        raw_rows = _fit_summary_rows(summary)
+    elif isinstance(summary, (str, Path)):
+        with Path(summary).open("r", newline="", encoding="utf-8") as handle:
+            raw_rows = list(csv.DictReader(handle))
+    elif isinstance(summary, dict):
+        if "tone_index" in summary and "sweep_index" in summary:
+            raw_rows = [summary]
+        else:
+            raise TypeError(
+                "summary dict must be a fit_power_sweep result or one summary row"
+            )
+    elif isinstance(summary, np.ndarray) and summary.dtype.names is not None:
+        raw_rows = []
+        for record in summary:
+            row = {}
+            for name in summary.dtype.names:
+                value = record[name]
+                if isinstance(value, np.generic):
+                    value = value.item()
+                row[name] = value
+            raw_rows.append(row)
+    else:
+        raw_rows = [dict(row) for row in summary]
+
+    coerced = []
+    for row in raw_rows:
+        new_row = {}
+        for key, value in row.items():
+            if not isinstance(value, str):
+                new_row[key] = value
+                continue
+            stripped = value.strip()
+            if stripped == "":
+                new_row[key] = np.nan
+            elif stripped.lower() == "true":
+                new_row[key] = True
+            elif stripped.lower() == "false":
+                new_row[key] = False
+            else:
+                try:
+                    new_row[key] = float(stripped)
+                except ValueError:
+                    new_row[key] = stripped
+        coerced.append(new_row)
+    return coerced
+
+
+# --- The fit archive (pickled FitResult objects) -----------------------------
 
 _FIT_ARCHIVE_KIND = "souk_readout_tools.power_sweep.fit_results"
 _FIT_ARCHIVE_VERSION = 1
@@ -2056,6 +2156,8 @@ def load_fit_results(path, run=None):
     fit_data["run"]["fits"] = fit_data
     return fit_data
 
+
+# --- Whole-run analysis: fit + summarise + choose + plot in one call ---------
 
 def analyse_power_sweep(
     run,
@@ -2303,47 +2405,2374 @@ def load_analysis(path):
     return result
 
 
-def _normalise_tone_indices(tone_indices, tone_count):
-    """Return validated tone indices as a list of ints."""
-    if tone_indices is None:
-        tones = list(range(int(tone_count)))
-    elif np.isscalar(tone_indices):
-        tones = [int(tone_indices)]
-    else:
-        tones = [int(tone) for tone in tone_indices]
-    if not tones:
-        raise ValueError("tone_indices must select at least one tone.")
-    invalid = [tone for tone in tones if tone < 0 or tone >= int(tone_count)]
-    if invalid:
-        raise ValueError(
-            f"tone_indices contains out-of-range tones {invalid}; "
-            f"valid range is 0 to {int(tone_count) - 1}."
-        )
-    return tones
+# --- Best readout power per tone ---------------------------------------------
+
+# -- find_best_power and helpers ---------------------------------------------
+
+# 1.4826 = 1 / Phi^{-1}(0.75); scales MAD to the equivalent Gaussian σ so the
+# σ-clip thresholds below are interpretable as "k standard deviations" even
+# when the data are non-Gaussian.
+_MAD_TO_SIGMA = 1.4826
+DEFAULT_BIFURCATION_ANL = 4.0 / (3.0 * np.sqrt(3.0))
+DEFAULT_BIFURCATION_BACKOFF_DB = 3.0
 
 
-def _power_row_for_step(run, sweep_index, use_readback=True):
-    """Return the requested/readback power row for one sweep step."""
-    keys = (
-        ("readback_powers_dbm", "powers_dbm")
-        if use_readback
-        else ("powers_dbm", "readback_powers_dbm")
+# Fit-summary keys that ``find_best_power`` interpolates against power_dbm
+# to estimate parameter-like values at the chosen readout power. Booleans,
+# solver diagnostics, timing, and fit-quality diagnostics are excluded because
+# interpolating them is not meaningful.
+_INTERPOLATABLE_FIT_KEYS = tuple(
+    k for k in FIT_SUMMARY_KEYS
+    if k not in {
+        "success",
+        "nfev",
+        "fit_duration_s",
+        "noise_only",
+        "residual_rms",
+        "weighted_rms",
+        "reduced_chi2",
+    }
+)
+
+
+_CHOSEN_PARAM_ARRAY_KEYS = ("power_dbm",) + _INTERPOLATABLE_FIT_KEYS + (
+    "extrapolated",
+    "n_rows_used",
+    "fr_source",
+)
+
+
+# Chosen-parameter keys that are physically non-negative. ``find_best_power``
+# interpolates/extrapolates each fit-summary field against power, and linear
+# extrapolation past the measured range can drive a positive-but-decreasing
+# quantity (e.g. a linewidth or Q) negative. ``best_power_arrays`` replaces any
+# such negative entry with the cross-tone median of the valid values for that
+# key. Signed quantities (skew, nonlinear detuning, coupling/gain phases) are
+# deliberately excluded because negatives are legitimate there.
+_NONNEGATIVE_PARAM_KEYS = tuple(
+    k for k in (
+        "Ql", "Qi", "Qc", "Qc_abs", "a", "anl",
+        "empirical_linewidth_hz", "empirical_Ql", "empirical_Qc", "empirical_Qi",
+        "empirical_dip_depth_db",
     )
-    for key in keys:
-        rows = run.get(key, [])
-        if sweep_index < len(rows):
-            row = np.asarray(rows[sweep_index], dtype=float).ravel()
-            if row.size:
-                return row
-    return np.array([], dtype=float)
+    if k in _CHOSEN_PARAM_ARRAY_KEYS
+)
 
 
-def _power_for_tone(run, sweep_index, tone_index, use_readback=True):
-    """Return the selected power for one sweep/tone pair, or NaN."""
-    row = _power_row_for_step(run, sweep_index, use_readback=use_readback)
-    if tone_index < row.size:
-        return float(row[tone_index])
-    return np.nan
+# Default per-parameter validity ranges used by ``find_best_power`` to exclude
+# rows whose fit pegged a parameter at (or outside) a fitter bound. Mirrors the
+# static parts of the broad physical defaults in :mod:`souk_readout_tools.fitting`.
+# Data-dependent fitter bounds (``fr``, ``a``, ``tau``) are intentionally omitted
+# — callers can supply their own (low, high) entries for those if needed. ``phi``
+# and ``alpha`` are tightened by 1e-4 so values pinned at the fitter's
+# ``±π/2 - eps`` / ``±π`` clamps are caught. ``anl``'s lower bound (1e-6) is
+# loose-by-design: anything that many orders of magnitude below the fitter's
+# 1e-8 log clamp is indistinguishable from zero in practice.
+DEFAULT_PARAM_VALID_RANGES = {
+    "Qi": (10.0, 1e8),
+    "Qc": (10.0, 1e8),
+    "phi": (-np.pi / 2.0 + 1e-4, np.pi / 2.0 - 1e-4),
+    "alpha": (-np.pi + 1e-4, np.pi - 1e-4),
+    "anl": (1e-6, 90.0),
+}
+
+
+def _normalise_param_valid_ranges(param_valid_ranges):
+    """Validate and normalise a param-range dict from the public API."""
+    if param_valid_ranges is None:
+        return dict(DEFAULT_PARAM_VALID_RANGES)
+    if not isinstance(param_valid_ranges, dict):
+        raise TypeError("param_valid_ranges must be a dict of {name: (low, high)}")
+    out = {}
+    for name, pair in param_valid_ranges.items():
+        if pair is None:
+            continue
+        try:
+            lo, hi = pair
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"param_valid_ranges[{name!r}] must be a (low, high) pair"
+            ) from exc
+        lo = -np.inf if lo is None else float(lo)
+        hi = np.inf if hi is None else float(hi)
+        if not (lo < hi):
+            raise ValueError(
+                f"param_valid_ranges[{name!r}] must satisfy low < high"
+            )
+        out[str(name)] = (lo, hi)
+    return out
+
+
+def _robust_sigma(values):
+    """Return a MAD-based Gaussian-equivalent sigma, with std fallback."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan")
+    if values.size == 1:
+        return 0.0
+    centre = float(np.median(values))
+    sigma = _MAD_TO_SIGMA * float(np.median(np.abs(values - centre)))
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        sigma = float(np.std(values, ddof=1))
+    return sigma
+
+
+def _line_fit(x, y, weights=None):
+    """Least-squares fit of ``y = slope*x + intercept``."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if weights is None:
+        good = np.isfinite(x) & np.isfinite(y)
+        x = x[good]
+        y = y[good]
+        if x.size < 2 or np.nanmax(x) <= np.nanmin(x):
+            return float("nan"), float("nan")
+        design = np.column_stack([x, np.ones_like(x)])
+        slope, intercept = np.linalg.lstsq(design, y, rcond=None)[0]
+        return float(slope), float(intercept)
+
+    weights = np.asarray(weights, dtype=float)
+    good = np.isfinite(x) & np.isfinite(y) & np.isfinite(weights) & (weights > 0.0)
+    x = x[good]
+    y = y[good]
+    weights = weights[good]
+    if x.size < 2 or np.nanmax(x) <= np.nanmin(x):
+        return float("nan"), float("nan")
+    design = np.column_stack([x, np.ones_like(x)])
+    scale = np.sqrt(weights / np.nanmedian(weights))
+    slope, intercept = np.linalg.lstsq(
+        design * scale[:, None],
+        y * scale,
+        rcond=None,
+    )[0]
+    return float(slope), float(intercept)
+
+
+def _log_anl_sigma(anl, anl_err):
+    """Propagate linear ANL uncertainty to log(ANL) uncertainty."""
+    anl = np.asarray(anl, dtype=float)
+    if anl_err is None:
+        return np.full(anl.shape, np.nan, dtype=float)
+    anl_err = np.asarray(anl_err, dtype=float)
+    if anl_err.shape != anl.shape:
+        try:
+            anl_err = np.broadcast_to(anl_err, anl.shape)
+        except ValueError:
+            return np.full(anl.shape, np.nan, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sigma = anl_err / anl
+    sigma = np.asarray(sigma, dtype=float)
+    sigma[~np.isfinite(sigma) | (sigma <= 0.0)] = np.nan
+    return sigma
+
+
+def _log_anl_fit_weights(anl, anl_err, min_points):
+    """Return inverse-variance weights for log(ANL), or ``None``."""
+    sigma = _log_anl_sigma(anl, anl_err)
+    finite = np.isfinite(sigma) & (sigma > 0.0)
+    if np.count_nonzero(finite) < max(int(min_points), 2):
+        return None, "unweighted"
+    # Keep points whose uncertainty failed by assigning the median valid
+    # sigma. That preserves the sweep support without pretending those rows
+    # have exceptionally high or low leverage.
+    if not np.all(finite):
+        sigma = sigma.copy()
+        sigma[~finite] = float(np.nanmedian(sigma[finite]))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        weights = 1.0 / np.square(sigma)
+    weights[~np.isfinite(weights) | (weights <= 0.0)] = np.nan
+    if np.count_nonzero(np.isfinite(weights) & (weights > 0.0)) < max(
+        int(min_points), 2
+    ):
+        return None, "unweighted"
+    return weights, "log_anl_uncertainty"
+
+
+def _solve_log_anl_power(slope, intercept, target_anl):
+    """Return power where ``log(anl)`` fit reaches ``target_anl``, else NaN."""
+    try:
+        target_anl = float(target_anl)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not (np.isfinite(target_anl) and target_anl > 0.0):
+        return float("nan")
+    if not (np.isfinite(slope) and np.isfinite(intercept) and slope != 0.0):
+        return float("nan")
+    return float((np.log(target_anl) - intercept) / slope)
+
+
+def _theil_sen_line(x, y):
+    """Robust initial line estimate for small power-sweep series."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    slopes = []
+    for i in range(x.size - 1):
+        dx = x[i + 1 :] - x[i]
+        good = dx != 0.0
+        if np.any(good):
+            slopes.append((y[i + 1 :][good] - y[i]) / dx[good])
+    if not slopes:
+        return _line_fit(x, y)
+    slopes = np.concatenate(slopes)
+    slopes = slopes[np.isfinite(slopes)]
+    if slopes.size == 0:
+        return _line_fit(x, y)
+    slope = float(np.median(slopes))
+    intercept = float(np.median(y - slope * x))
+    return slope, intercept
+
+
+def _fit_log_anl_power_law(
+    powers,
+    anl,
+    valid,
+    *,
+    anl_err=None,
+    target_anl,
+    min_points,
+    clip_sigma,
+    min_slope,
+    weight_by_uncertainty=True,
+):
+    """Fit ``log(anl) = slope * power_dbm + intercept``.
+
+    Performs an initial Theil-Sen line on all eligible points, one pass of
+    symmetric MAD-based outlier rejection in log space at ``clip_sigma``, and
+    then a least-squares refit on the retained points.  When ``anl_err`` is
+    available, the refit is weighted by propagated log-space uncertainty,
+    ``sigma_log_anl ~= sigma_anl / anl``.  The fit is marked reliable when
+    the refit has at least ``min_points`` retained points and a slope of at
+    least ``min_slope`` (decades/dB-equivalent in log space).
+    """
+    powers = np.asarray(powers, dtype=float)
+    anl = np.asarray(anl, dtype=float)
+    valid = np.asarray(valid, dtype=bool)
+    if anl_err is None:
+        anl_err = np.full(anl.shape, np.nan, dtype=float)
+    else:
+        anl_err = np.asarray(anl_err, dtype=float)
+        if anl_err.shape != anl.shape:
+            try:
+                anl_err = np.broadcast_to(anl_err, anl.shape)
+            except ValueError:
+                anl_err = np.full(anl.shape, np.nan, dtype=float)
+    n = powers.size
+    false_mask = np.zeros(n, dtype=bool)
+    result = {
+        "reliable": False,
+        "reason": "",
+        "reasons": [],
+        "slope_log_anl_per_db": float("nan"),
+        "intercept_log_anl": float("nan"),
+        "initial_slope_log_anl_per_db": float("nan"),
+        "initial_intercept_log_anl": float("nan"),
+        "target_power_dbm": None,
+        "range_position": "unavailable",
+        "weighted": False,
+        "weight_source": "unweighted",
+        "eligible_mask": false_mask.copy(),
+        "fit_mask": false_mask.copy(),
+        "outlier_mask": false_mask.copy(),
+    }
+
+    try:
+        target_anl = float(target_anl)
+    except (TypeError, ValueError):
+        target_anl = float("nan")
+    if not (np.isfinite(target_anl) and target_anl > 0.0):
+        result["reasons"].append("target_anl must be positive")
+        result["reason"] = "; ".join(result["reasons"])
+        return result
+
+    eligible = valid & np.isfinite(powers) & np.isfinite(anl) & (anl > 0.0)
+    result["eligible_mask"] = eligible.copy()
+
+    min_points = max(int(min_points), 2)
+    if np.count_nonzero(eligible) < min_points:
+        result["reasons"].append(
+            f"only {int(np.count_nonzero(eligible))} eligible ANL points"
+        )
+        result["reason"] = "; ".join(result["reasons"])
+        return result
+
+    eligible_indices = np.flatnonzero(eligible)
+    order = np.argsort(powers[eligible_indices])
+    eligible_indices = eligible_indices[order]
+    x = powers[eligible_indices]
+    y = np.log(anl[eligible_indices])
+    yerr = anl_err[eligible_indices]
+
+    if np.unique(x).size < 2:
+        result["reasons"].append("ANL fit needs at least two distinct powers")
+        result["reason"] = "; ".join(result["reasons"])
+        return result
+
+    weights = None
+    weight_source = "unweighted"
+    if weight_by_uncertainty:
+        weights, weight_source = _log_anl_fit_weights(
+            anl[eligible_indices], yerr, min_points
+        )
+
+    # Initial robust line: Theil-Sen, fall back to OLS.
+    slope, intercept = _theil_sen_line(x, y)
+    if not (np.isfinite(slope) and np.isfinite(intercept)):
+        slope, intercept = _line_fit(x, y, weights=weights)
+    if not (np.isfinite(slope) and np.isfinite(intercept)):
+        result["reasons"].append("could not fit log(ANL) line")
+        result["reason"] = "; ".join(result["reasons"])
+        return result
+    initial_slope = float(slope)
+    initial_intercept = float(intercept)
+
+    # One pass of MAD outlier rejection, then refit on the kept points.
+    residual = y - (slope * x + intercept)
+    sigma = _robust_sigma(residual)
+    if np.isfinite(sigma) and sigma > 0.0:
+        keep = np.abs(residual) <= float(clip_sigma) * sigma
+        if np.count_nonzero(keep) < min_points:
+            keep = np.ones_like(keep)
+    else:
+        keep = np.ones_like(residual, dtype=bool)
+
+    fit_weights = weights[keep] if weights is not None else None
+    refit_slope, refit_intercept = _line_fit(x[keep], y[keep], weights=fit_weights)
+    if not (np.isfinite(refit_slope) and np.isfinite(refit_intercept)):
+        keep = np.ones_like(keep)
+        fit_weights = weights if weights is not None else None
+        refit_slope, refit_intercept = _line_fit(x, y, weights=fit_weights)
+    if np.isfinite(refit_slope) and np.isfinite(refit_intercept):
+        slope, intercept = refit_slope, refit_intercept
+
+    fit_mask = false_mask.copy()
+    fit_mask[eligible_indices[keep]] = True
+    outlier_mask = false_mask.copy()
+    outlier_mask[eligible_indices[~keep]] = True
+
+    target_power = _solve_log_anl_power(slope, intercept, target_anl)
+
+    result.update({
+        "slope_log_anl_per_db": float(slope),
+        "intercept_log_anl": float(intercept),
+        "initial_slope_log_anl_per_db": initial_slope,
+        "initial_intercept_log_anl": initial_intercept,
+        "target_power_dbm": float(target_power) if np.isfinite(target_power) else None,
+        "weighted": bool(weights is not None),
+        "weight_source": weight_source,
+        "fit_mask": fit_mask,
+        "outlier_mask": outlier_mask,
+    })
+
+    reasons = []
+    n_fit = int(np.count_nonzero(fit_mask))
+    if n_fit < min_points:
+        reasons.append(f"only {n_fit} ANL fit points after clipping")
+    if np.isfinite(slope) and slope <= float(min_slope):
+        reasons.append(
+            f"ANL slope {slope:.3g}/dB below min_slope={float(min_slope):g}"
+        )
+    if result["target_power_dbm"] is None:
+        reasons.append("target ANL power is not finite")
+
+    if result["target_power_dbm"] is not None and np.any(fit_mask):
+        xmin = float(np.nanmin(powers[fit_mask]))
+        xmax = float(np.nanmax(powers[fit_mask]))
+        if result["target_power_dbm"] < xmin:
+            result["range_position"] = "below_measured_range"
+        elif result["target_power_dbm"] > xmax:
+            result["range_position"] = "above_measured_range"
+        else:
+            result["range_position"] = "within_measured_range"
+
+    result["reliable"] = not reasons
+    result["reasons"] = reasons
+    result["reason"] = "; ".join(reasons)
+    return result
+
+
+def _linear_interp_extrap(xs, ys, target):
+    """Linear interpolation in ``xs`` with linear extrapolation outside.
+
+    Returns ``(value, extrapolated)``.  Outside the data range the line is
+    extended through the two nearest endpoints.  With a single point the
+    constant is returned and ``extrapolated`` reflects whether ``target``
+    matches that point.
+    """
+    if xs.size == 0 or not np.isfinite(target):
+        return float("nan"), False
+    if xs.size == 1:
+        return float(ys[0]), bool(target != xs[0])
+    order = np.argsort(xs)
+    xs = xs[order]
+    ys = ys[order]
+    if target < xs[0]:
+        x0, x1, y0, y1 = xs[0], xs[1], ys[0], ys[1]
+        if x1 == x0:
+            return float(y0), True
+        return float(y0 + (target - x0) * (y1 - y0) / (x1 - x0)), True
+    if target > xs[-1]:
+        x0, x1, y0, y1 = xs[-2], xs[-1], ys[-2], ys[-1]
+        if x1 == x0:
+            return float(y1), True
+        return float(y0 + (target - x0) * (y1 - y0) / (x1 - x0)), True
+    return float(np.interp(target, xs, ys)), False
+
+
+def _nearest_finite_value(rows, powers, target_power, key):
+    """Return the first finite ``rows[i][key]`` ordered by |power - target|.
+
+    Returns ``NaN`` when no row has a finite value for ``key``.
+    """
+    if len(rows) == 0 or not np.isfinite(target_power):
+        return float("nan")
+    distances = np.abs(np.asarray(powers, dtype=float) - float(target_power))
+    distances = np.where(np.isfinite(distances), distances, np.inf)
+    for i in np.argsort(distances):
+        try:
+            v = float(rows[i].get(key, np.nan))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(v):
+            return v
+    return float("nan")
+
+
+def _interpolated_params_at_power(
+    rows, valid_mask, powers, target_power_dbm, *, anl_fit
+):
+    """Interpolate parameter-like fit-summary values at ``target_power_dbm``.
+
+    Uses the Stage-1-valid rows (``valid_mask``) as the support for linear
+    interpolation against ``power_dbm``, with linear extrapolation outside
+    the measured range.  ``anl`` is evaluated from the existing log(anl)
+    fit when it is reliable so the result is consistent with the
+    ``anl_power_law`` pick.  Returns a dict with one entry per key in
+    :data:`_INTERPOLATABLE_FIT_KEYS` plus:
+
+    - ``power_dbm``: the target power echoed for convenience.
+    - ``extrapolated``: ``True`` if any interpolated value used
+      extrapolation outside the support range (or if ``anl`` was solved
+      outside the ANL fit's clipped power range).
+    - ``n_rows_used``: number of Stage-1-valid rows available.
+    - ``fr_source``: how ``fr`` was obtained — ``"interpolated"`` when the
+      linear interpolation produced a finite value, otherwise the fallback
+      that supplied it: ``"nearest_fitted"`` (nearest row's fitted ``fr``),
+      ``"nearest_empirical"`` (nearest row's ``empirical_fr``),
+      ``"nearest_sweep_center"`` (nearest row's ``sweep_center_hz``), or
+      ``"unavailable"`` if no fallback was usable.  When a fallback is
+      used, ``fr`` is overwritten so it is never ``NaN`` as long as at
+      least one row has any of those fields.
+    """
+    try:
+        target = float(target_power_dbm)
+    except (TypeError, ValueError):
+        target = float("nan")
+    n_rows_used = int(np.count_nonzero(valid_mask)) if valid_mask is not None else 0
+    out = {
+        "power_dbm": target if np.isfinite(target) else float("nan"),
+        "extrapolated": False,
+        "n_rows_used": n_rows_used,
+        "fr_source": "unavailable",
+    }
+    for key in _INTERPOLATABLE_FIT_KEYS:
+        out[key] = float("nan")
+
+    valid_indices = (
+        np.flatnonzero(valid_mask) if valid_mask is not None else np.arange(len(rows))
+    )
+    if np.isfinite(target) and valid_indices.size:
+        valid_powers = powers[valid_indices]
+        finite_pwr = np.isfinite(valid_powers)
+        valid_indices = valid_indices[finite_pwr]
+        valid_powers = valid_powers[finite_pwr]
+    else:
+        valid_indices = np.array([], dtype=int)
+        valid_powers = np.array([], dtype=float)
+
+    extrapolated_any = False
+    if np.isfinite(target) and valid_indices.size:
+        for key in _INTERPOLATABLE_FIT_KEYS:
+            if (
+                key == "anl"
+                and anl_fit is not None
+                and bool(anl_fit.get("reliable", False))
+            ):
+                slope = float(anl_fit.get("slope_log_anl_per_db", float("nan")))
+                intercept = float(anl_fit.get("intercept_log_anl", float("nan")))
+                if np.isfinite(slope) and np.isfinite(intercept):
+                    out[key] = float(np.exp(slope * target + intercept))
+                    fit_mask = np.asarray(anl_fit.get("fit_mask", []), dtype=bool)
+                    if fit_mask.size and np.any(fit_mask):
+                        fit_powers = powers[np.flatnonzero(fit_mask)]
+                        fit_powers = fit_powers[np.isfinite(fit_powers)]
+                        if fit_powers.size and (
+                            target < fit_powers.min() or target > fit_powers.max()
+                        ):
+                            extrapolated_any = True
+                    continue
+
+            ys = np.empty(valid_indices.size, dtype=float)
+            for j, i in enumerate(valid_indices):
+                try:
+                    ys[j] = float(rows[i].get(key, np.nan))
+                except (TypeError, ValueError):
+                    ys[j] = float("nan")
+            finite = np.isfinite(ys)
+            xs = valid_powers[finite]
+            ys = ys[finite]
+            value, was_extrap = _linear_interp_extrap(xs, ys, target)
+            out[key] = value
+            if was_extrap:
+                extrapolated_any = True
+    out["extrapolated"] = bool(extrapolated_any)
+
+    if np.isfinite(out["fr"]):
+        out["fr_source"] = "interpolated"
+    else:
+        for source_key, source_label in (
+            ("fr", "nearest_fitted"),
+            ("empirical_fr", "nearest_empirical"),
+            ("sweep_center_hz", "nearest_sweep_center"),
+        ):
+            value = _nearest_finite_value(rows, powers, target, source_key)
+            if np.isfinite(value):
+                out["fr"] = value
+                out["fr_source"] = source_label
+                break
+
+    return out
+
+
+_MAD_OUTLIER_CHECK_PARAMS = ("Qi", "Qc", "phi")
+
+
+def _find_best_power_for_tone(
+    tone_index,
+    tone_rows,
+    *,
+    target_anl,
+    bifurcation_anl,
+    param_valid_ranges,
+    param_outliers_mad_clip,
+    param_uncertainty_outlier_mad_clip,
+    require_success,
+    use_readback_power,
+    anl_fit_min_points,
+    anl_fit_clip_sigma,
+    anl_fit_min_slope,
+    anl_fit_weight_by_uncertainty,
+):
+    """Per-tone implementation backing :py:func:`find_best_power`."""
+
+    def _power(row):
+        if use_readback_power:
+            value = row.get("readback_power_dbm", np.nan)
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = np.nan
+            if np.isfinite(value):
+                return value
+        try:
+            return float(row.get("power_dbm", np.nan))
+        except (TypeError, ValueError):
+            return np.nan
+
+    def _power_sort_key(row):
+        power = _power(row)
+        return (not np.isfinite(power), power if np.isfinite(power) else 0.0)
+
+    rows = sorted(tone_rows, key=_power_sort_key)
+    n = len(rows)
+    sweep_idx = np.array([int(r["sweep_index"]) for r in rows], dtype=int)
+    powers = np.array([_power(r) for r in rows], dtype=float)
+
+    def _column(name):
+        out = np.empty(n, dtype=float)
+        for i, row in enumerate(rows):
+            try:
+                out[i] = float(row.get(name, np.nan))
+            except (TypeError, ValueError):
+                out[i] = np.nan
+        return out
+
+    # Stage 1: per-row auto-exclusion.
+    excluded = np.zeros(n, dtype=bool)
+    exclude_reason = [""] * n
+    anl_fit_excluded = np.zeros(n, dtype=bool)
+    anl_fit_exclude_reason = [""] * n
+
+    # 1a: solver-reported failure.
+    if require_success:
+        for i, row in enumerate(rows):
+            success = row.get("success", True)
+            if isinstance(success, str):
+                success = success.strip().lower() not in {"false", "0", "no"}
+            if success is False or success == 0:
+                excluded[i] = True
+                exclude_reason[i] = "success=False"
+
+    # 1b: per-parameter validity-range exclusion (catches parameters pegged
+    # at a fitter clamp). Low-clamped ANL values are useful for the measured
+    # threshold fallback, but not for fitting the ANL-vs-power slope.
+    for name, (lo, hi) in param_valid_ranges.items():
+        values = _column(name)
+        if name == "anl":
+            low_pegged = (~excluded) & np.isfinite(values) & (values <= lo)
+            for i in np.flatnonzero(low_pegged):
+                anl_fit_excluded[i] = True
+                anl_fit_exclude_reason[i] = f"{name} outside ({lo:g}, {hi:g})"
+            high_pegged = (~excluded) & np.isfinite(values) & (values >= hi)
+            for i in np.flatnonzero(high_pegged):
+                excluded[i] = True
+                exclude_reason[i] = f"{name} outside ({lo:g}, {hi:g})"
+                anl_fit_excluded[i] = True
+                anl_fit_exclude_reason[i] = exclude_reason[i]
+            continue
+        out_of_range = (
+            (~excluded)
+            & np.isfinite(values)
+            & ((values <= lo) | (values >= hi))
+        )
+        for i in np.flatnonzero(out_of_range):
+            excluded[i] = True
+            exclude_reason[i] = f"{name} outside ({lo:g}, {hi:g})"
+
+    # 1c: per-tone MAD outlier check on parameters expected to be
+    # near-constant across powers.
+    if param_outliers_mad_clip is not None:
+        clip_k = float(param_outliers_mad_clip)
+        for key in _MAD_OUTLIER_CHECK_PARAMS:
+            values = _column(key)
+            eligible = (~excluded) & np.isfinite(values)
+            if np.count_nonzero(eligible) < 3:
+                continue
+            ref = values[eligible]
+            centre = float(np.median(ref))
+            scale = _MAD_TO_SIGMA * float(np.median(np.abs(ref - centre)))
+            if not (np.isfinite(scale) and scale > 0.0):
+                continue
+            deviation = np.abs(values - centre)
+            flag = eligible & (deviation > clip_k * scale)
+            for i in np.flatnonzero(flag):
+                excluded[i] = True
+                exclude_reason[i] = (
+                    f"{key} outside median ± {clip_k:g}*MAD"
+                )
+
+    # 1d: per-tone MAD outlier check on the uncertainty of those same
+    # parameters, so rows with wildly inflated <name>_err are dropped.
+    if param_uncertainty_outlier_mad_clip is not None:
+        clip_k = float(param_uncertainty_outlier_mad_clip)
+        for key in _MAD_OUTLIER_CHECK_PARAMS:
+            err_key = f"{key}_err"
+            values = _column(err_key)
+            eligible = (~excluded) & np.isfinite(values)
+            if np.count_nonzero(eligible) < 3:
+                continue
+            ref = values[eligible]
+            centre = float(np.median(ref))
+            scale = _MAD_TO_SIGMA * float(np.median(np.abs(ref - centre)))
+            if not (np.isfinite(scale) and scale > 0.0):
+                continue
+            deviation = np.abs(values - centre)
+            flag = eligible & (deviation > clip_k * scale)
+            for i in np.flatnonzero(flag):
+                excluded[i] = True
+                exclude_reason[i] = (
+                    f"{err_key} outside median ± {clip_k:g}*MAD"
+                )
+
+    # Stage 2: derived columns and validity mask.
+    anl = _column("anl")
+    anl_err = _column("anl_err")
+    valid = ~excluded
+    anl_fit_valid = valid & ~anl_fit_excluded
+    anl_ok = (
+        valid
+        & np.isfinite(anl)
+        & (anl > 0.0)
+        & (anl < float(target_anl))
+    )
+    # Highest power index that still satisfies the ANL ceiling, or -1 if none.
+    _anl_ok_indices = np.flatnonzero(anl_ok)
+    anl_idx = int(_anl_ok_indices[-1]) if _anl_ok_indices.size else -1
+
+    try:
+        _bifurcation_anl_value = float(bifurcation_anl)
+    except (TypeError, ValueError):
+        _bifurcation_anl_value = float("nan")
+    try:
+        _target_anl_value = float(target_anl)
+    except (TypeError, ValueError):
+        _target_anl_value = float("nan")
+    if (
+        np.isfinite(_bifurcation_anl_value)
+        and _bifurcation_anl_value > 0.0
+        and np.isfinite(_target_anl_value)
+    ):
+        anl_safe = (
+            valid
+            & np.isfinite(anl)
+            & np.isfinite(powers)
+            & (anl > 0.0)
+            & (anl < _bifurcation_anl_value)
+        )
+        safe_indices = np.flatnonzero(anl_safe)
+        if safe_indices.size:
+            nearest_target_idx = int(
+                safe_indices[
+                    np.argmin(np.abs(anl[safe_indices] - _target_anl_value))
+                ]
+            )
+        else:
+            nearest_target_idx = -1
+    else:
+        nearest_target_idx = -1
+
+    # Stage 3: ANL power-law fit on the non-excluded rows, skipping
+    # low-clamped ANL values that should not pull the fit slope down.
+    anl_fit = _fit_log_anl_power_law(
+        powers,
+        anl,
+        anl_fit_valid,
+        anl_err=anl_err,
+        target_anl=target_anl,
+        min_points=anl_fit_min_points,
+        clip_sigma=anl_fit_clip_sigma,
+        min_slope=anl_fit_min_slope,
+        weight_by_uncertainty=anl_fit_weight_by_uncertainty,
+    )
+
+    # Rows excluded from the ANL fit because anl pegged at a fitter bound;
+    # tracked separately so plots can mark them distinctly from generic
+    # excluded rows.
+    anl_pegged_sweep_indices = [
+        int(sweep_idx[i])
+        for i in range(n)
+        if (
+            anl_fit_excluded[i]
+            and anl_fit_exclude_reason[i].startswith("anl outside")
+        )
+    ]
+    anl_pegged = bool(anl_pegged_sweep_indices) and not np.any(
+        anl_fit_valid & np.isfinite(anl)
+    )
+
+    def _pack(i):
+        if i < 0:
+            return None
+        return {
+            "sweep_index": int(sweep_idx[i]),
+            "power_dbm": float(powers[i]),
+            "anl": float(anl[i]),
+        }
+
+    def _lowest_power_pick():
+        finite_power_indices = np.flatnonzero(np.isfinite(powers))
+        if finite_power_indices.size:
+            i = int(finite_power_indices[np.argmin(powers[finite_power_indices])])
+        elif n:
+            i = 0
+        else:
+            return None
+        return {
+            "sweep_index": int(sweep_idx[i]),
+            "power_dbm": float(powers[i]),
+            "anl": float(anl[i]),
+            "reason": (
+                "no reliable fit-derived pick; using lowest stepped power"
+            ),
+        }
+
+    def _pack_anl_power_law():
+        fit_mask = np.asarray(anl_fit["fit_mask"], dtype=bool)
+        outlier_mask = np.asarray(anl_fit["outlier_mask"], dtype=bool)
+        target_power = anl_fit.get("target_power_dbm")
+        range_position = anl_fit.get("range_position", "unavailable")
+        reliable = bool(anl_fit.get("reliable", False))
+        try:
+            bifurcation_anl_value = float(bifurcation_anl)
+        except (TypeError, ValueError):
+            bifurcation_anl_value = float("nan")
+        p_bif = (
+            _solve_log_anl_power(
+                float(anl_fit["slope_log_anl_per_db"]),
+                float(anl_fit["intercept_log_anl"]),
+                bifurcation_anl_value,
+            )
+            if reliable else float("nan")
+        )
+        p_bif_sub_3db = (
+            float(p_bif - DEFAULT_BIFURCATION_BACKOFF_DB)
+            if np.isfinite(p_bif) else float("nan")
+        )
+        reference_idx = -1
+        if target_power is not None and np.any(fit_mask):
+            fit_indices = np.flatnonzero(fit_mask)
+            reference_idx = int(
+                fit_indices[np.argmin(np.abs(powers[fit_indices] - target_power))]
+            )
+
+        # When the fit is reliable, always use the (extrapolated if needed)
+        # target power solved from the log(anl) line. ``range_position`` is
+        # kept as a diagnostic only.
+        if reliable and target_power is not None:
+            selected_power = float(target_power)
+        else:
+            selected_power = None
+
+        return {
+            "criterion": "anl_power_law",
+            "reliable": reliable,
+            "reason": anl_fit.get("reason", ""),
+            "target_anl": float(target_anl),
+            "bifurcation_anl": bifurcation_anl_value,
+            "power_dbm": selected_power,
+            "p_bif": p_bif,
+            "p_bif_sub_3db": p_bif_sub_3db,
+            "sweep_index": None,
+            "reference_sweep_index": (
+                int(sweep_idx[reference_idx]) if reference_idx >= 0 else None
+            ),
+            "target_power_dbm": target_power,
+            "range_position": range_position,
+            "slope_log_anl_per_db": float(anl_fit["slope_log_anl_per_db"]),
+            "intercept_log_anl": float(anl_fit["intercept_log_anl"]),
+            "initial_slope_log_anl_per_db": float(
+                anl_fit["initial_slope_log_anl_per_db"]
+            ),
+            "initial_intercept_log_anl": float(
+                anl_fit["initial_intercept_log_anl"]
+            ),
+            "weighted": bool(anl_fit.get("weighted", False)),
+            "weight_source": str(anl_fit.get("weight_source", "unweighted")),
+            "fit_sweep_indices": [
+                int(sweep_idx[i]) for i in range(n) if fit_mask[i]
+            ],
+            "outlier_sweep_indices": [
+                int(sweep_idx[i]) for i in range(n) if outlier_mask[i]
+            ],
+            "pegged_sweep_indices": list(anl_pegged_sweep_indices),
+        }
+
+    anl_power_law_pick = _pack_anl_power_law()
+    anl_pick = _pack(anl_idx)
+    anl_nearest_target_pick = _pack(nearest_target_idx)
+    lowest_power_pick = _lowest_power_pick()
+
+    # Stage 4: choose the most reliable available criterion.  The continuous
+    # ANL power-law pick wins when it passed its diagnostics; otherwise fall
+    # back to the highest-power row whose measured anl is below the target,
+    # then to the row whose measured anl is nearest to the target among
+    # those still below the bifurcation threshold, and finally to the
+    # lowest measured power.
+    chosen_power = None
+    chosen_sweep = None
+    chosen_reference = None
+    criterion = "none"
+    if (
+        anl_power_law_pick["reliable"]
+        and anl_power_law_pick["power_dbm"] is not None
+    ):
+        chosen_power = anl_power_law_pick["power_dbm"]
+        chosen_sweep = anl_power_law_pick["sweep_index"]
+        chosen_reference = anl_power_law_pick["reference_sweep_index"]
+        criterion = anl_power_law_pick["criterion"]
+    elif anl_pick is not None:
+        chosen_power = anl_pick["power_dbm"]
+        chosen_sweep = anl_pick["sweep_index"]
+        chosen_reference = chosen_sweep
+        criterion = "anl_threshold"
+    elif anl_nearest_target_pick is not None:
+        chosen_power = anl_nearest_target_pick["power_dbm"]
+        chosen_sweep = anl_nearest_target_pick["sweep_index"]
+        chosen_reference = chosen_sweep
+        criterion = "anl_nearest_target"
+    try:
+        chosen_power_is_finite = np.isfinite(float(chosen_power))
+    except (TypeError, ValueError):
+        chosen_power_is_finite = False
+    if not chosen_power_is_finite and lowest_power_pick is not None:
+        chosen_power = lowest_power_pick["power_dbm"]
+        chosen_sweep = lowest_power_pick["sweep_index"]
+        chosen_reference = chosen_sweep
+        criterion = "lowest_power_fallback"
+
+    chosen_params = _interpolated_params_at_power(
+        rows, valid, powers, chosen_power, anl_fit=anl_fit
+    )
+
+    return {
+        "tone_index": int(tone_index),
+        "chosen_sweep_index": chosen_sweep,
+        "chosen_reference_sweep_index": chosen_reference,
+        "chosen_power_dbm": chosen_power,
+        "chosen_criterion": criterion,
+        "chosen_params": chosen_params,
+        "bifurcation_anl": anl_power_law_pick["bifurcation_anl"],
+        "p_bif": anl_power_law_pick["p_bif"],
+        "p_bif_sub_3db": anl_power_law_pick["p_bif_sub_3db"],
+        "anl_power_law_pick": anl_power_law_pick,
+        "anl_pick": anl_pick,
+        "anl_nearest_target_pick": anl_nearest_target_pick,
+        "lowest_power_pick": lowest_power_pick,
+        "criteria": {
+            "anl_power_law": anl_power_law_pick,
+            "anl_threshold": anl_pick,
+            "anl_nearest_target": anl_nearest_target_pick,
+            "lowest_power_fallback": lowest_power_pick,
+        },
+        "anl_pegged": bool(anl_pegged),
+        "excluded_sweep_indices": [
+            int(sweep_idx[i]) for i in range(n) if excluded[i]
+        ],
+        "exclude_reasons": {
+            int(sweep_idx[i]): exclude_reason[i]
+            for i in range(n)
+            if excluded[i]
+        },
+        "anl_outlier_sweep_indices": anl_power_law_pick["outlier_sweep_indices"],
+        "anl_pegged_sweep_indices": anl_power_law_pick["pegged_sweep_indices"],
+    }
+
+
+def find_best_power(
+    summary,
+    *,
+    target_anl=0.01,
+    bifurcation_anl=DEFAULT_BIFURCATION_ANL,
+    param_valid_ranges=None,
+    param_outliers_mad_clip=5.0,
+    param_uncertainty_outlier_mad_clip=None,
+    require_success=True,
+    use_readback_power=True,
+    anl_fit_min_points=3,
+    anl_fit_clip_sigma=3.0,
+    anl_fit_min_slope=1e-2,
+    anl_fit_weight_by_uncertainty=True,
+):
+    """Pick a robust readout power per resonator from a fit-summary table.
+
+    Operates per ``tone_index`` on a :py:func:`fit_power_sweep` result, a
+    structured summary array (:py:func:`fit_summary_array` /
+    :py:func:`load_fit_summary`), or a CSV written by
+    :py:func:`write_fit_summary`.  The single criterion is a least-squares
+    fit to ``log(anl) = slope * power_dbm + intercept``, which is solved for
+    ``target_anl`` (default ``0.01``) to return a precise chosen power rather
+    than the nearest measured sweep point.  By default, the retained
+    log-linear refit is weighted by the propagated log-ANL uncertainty
+    ``sigma_log_anl ~= anl_err / anl`` when enough finite ``anl_err`` values
+    are available.
+
+    Row-level exclusions, applied in order:
+
+    1. ``success=False`` (skipped if ``require_success=False``).
+    2. Per-parameter validity-range check: a row is dropped when any entry of
+       ``param_valid_ranges`` has the row's fitted value at or beyond a
+       bound.  Defaults to :data:`DEFAULT_PARAM_VALID_RANGES`, which mirrors
+       the static parts of the fitter's physical bounds so rows where a
+       parameter was pinned at a fitter clamp are excluded.  The exception is
+       a low-clamped ``anl`` value: it is excluded from the ANL-vs-power fit,
+       but remains eligible for the measured ``anl_threshold`` fallback
+       because it still proves the measured point is below the requested
+       target.  Pass a dict like ``{"Qi": (1e3, 1e7), "anl": None}`` to
+       override; ``None`` disables a single entry, ``param_valid_ranges={}``
+       disables all.
+    3. Per-parameter MAD outlier check: for each parameter expected to be
+       near-constant across powers (``Qi``, ``Qc``, ``phi``), rows where the
+       value deviates from the per-tone median by more than
+       ``param_outliers_mad_clip`` MAD-equivalent sigmas are dropped.  Set
+       ``param_outliers_mad_clip=None`` to disable.
+    4. Per-parameter uncertainty MAD outlier check: same MAD criterion applied
+       to the ``<name>_err`` columns instead of the values, so rows with a
+       wildly inflated uncertainty on ``Qi``, ``Qc``, or ``phi`` are dropped.
+       Disabled by default (``param_uncertainty_outlier_mad_clip=None``); pass
+       a positive number to enable.
+
+    The ANL fit then takes the non-excluded, non-low-clamped-ANL rows,
+    performs one pass of symmetric MAD outlier rejection in log space at
+    ``anl_fit_clip_sigma``, and is marked reliable when the retained set has
+    at least ``anl_fit_min_points`` points and a slope of at least
+    ``anl_fit_min_slope`` decades/dB (default 1e-2).  Set
+    ``anl_fit_weight_by_uncertainty=False`` to restore an unweighted final
+    refit.  The chosen power is the value solved from the log-linear fit at
+    ``target_anl``, regardless of whether it falls inside or outside the
+    measured sweep range; the result field ``range_position``
+    (``within_measured_range`` / ``above_measured_range`` /
+    ``below_measured_range``) is reported as a diagnostic.
+
+    The top-level ``chosen_*`` fields use the ANL power-law pick when it is
+    reliable, otherwise fall back in order to: the highest measured power
+    with ``anl < target_anl`` (``anl_threshold``); the row whose measured
+    ``anl`` is nearest to ``target_anl`` among those still below
+    ``bifurcation_anl`` (``anl_nearest_target``, for sweeps where every
+    point is safely below bifurcation but the slope is too flat to solve
+    for ``target_anl``); and finally the lowest measured power
+    (``lowest_power_fallback``).  The returned rows also include ``p_bif``,
+    the power solved from the same ANL fit at ``bifurcation_anl`` (default
+    ``4/(3*sqrt(3)) ~= 0.77``), and ``p_bif_sub_3db``. Both are ``NaN``
+    when no reliable ANL fit is available.
+
+    Each returned row also includes ``chosen_params``: a dict with each
+    parameter-like fit-summary value (``fr``, ``Ql``, ``Qi``, ``Qc``,
+    ``Qc_abs``, ``phi``, ``a``, ``alpha``, ``tau``, ``anl``,
+    ``nonlinear_detuning_hz`` and the ``empirical_*`` fields) linearly
+    interpolated against ``power_dbm`` on the Stage-1-valid rows and evaluated
+    at ``chosen_power_dbm``.  Fit-quality diagnostics such as
+    ``residual_rms``, ``weighted_rms`` and ``reduced_chi2`` are excluded
+    because they are not meaningful to interpolate.  ``anl`` is taken from
+    the log(anl) fit so it is consistent with the chosen power.  Linear
+    extrapolation is used outside the measured range; ``extrapolated`` is set
+    to ``True`` when that happens.  Most values are ``NaN`` when no valid rows
+    are available.
+
+    ``chosen_params['fr']`` is given a fallback chain so it is non-``NaN``
+    whenever any row in the sweep supplies one of the inputs: when the
+    linear interpolation produces a finite value it is used as-is and
+    ``chosen_params['fr_source']`` is ``"interpolated"``; otherwise the
+    nearest row by ``|power_dbm - chosen_power_dbm|`` is searched for a
+    finite ``fr`` (``"nearest_fitted"``), then ``empirical_fr``
+    (``"nearest_empirical"``), then ``sweep_center_hz``
+    (``"nearest_sweep_center"``), with ``"unavailable"`` recorded only
+    when none of those columns has a finite entry in any row.
+
+    ``use_readback_power`` (default ``True``) selects the power axis: the
+    measured ``readback_power_dbm`` per row when available, otherwise the
+    requested ``power_dbm``.  Set ``False`` to always use the requested power.
+    """
+    rows = _coerce_summary_rows(summary)
+    if not rows:
+        return []
+    tones = sorted({int(row["tone_index"]) for row in rows})
+    param_valid_ranges = _normalise_param_valid_ranges(param_valid_ranges)
+    best_rows = [
+        _find_best_power_for_tone(
+            tone,
+            [r for r in rows if int(r["tone_index"]) == tone],
+            target_anl=target_anl,
+            bifurcation_anl=bifurcation_anl,
+            param_valid_ranges=param_valid_ranges,
+            param_outliers_mad_clip=param_outliers_mad_clip,
+            param_uncertainty_outlier_mad_clip=param_uncertainty_outlier_mad_clip,
+            require_success=require_success,
+            use_readback_power=use_readback_power,
+            anl_fit_min_points=anl_fit_min_points,
+            anl_fit_clip_sigma=anl_fit_clip_sigma,
+            anl_fit_min_slope=anl_fit_min_slope,
+            anl_fit_weight_by_uncertainty=anl_fit_weight_by_uncertainty,
+        )
+        for tone in tones
+    ]
+    # Repair at the source: replace negative (extrapolated) chosen_params with the
+    # cross-tone median so every consumer of these rows gets physical values.
+    _repair_negative_chosen_params(best_rows)
+    return best_rows
+
+
+def _repair_negative_chosen_params(rows, *, label="find_best_power"):
+    """Replace unphysical negative ``chosen_params`` values with a cross-tone median.
+
+    ``find_best_power`` interpolates each fit-summary field against power and
+    linearly extrapolates past the measured range (:func:`_linear_interp_extrap`),
+    which can drive a positive-but-decreasing quantity (e.g. a linewidth or Q)
+    negative at a chosen power outside the swept range. For each physically
+    non-negative key (:data:`_NONNEGATIVE_PARAM_KEYS`) this replaces any negative
+    entry with the median of the valid (finite, positive) values across all
+    ``rows`` (or ``NaN`` if none exist), repairing ``chosen_params`` **in place**.
+    Signed quantities (skew, nonlinear detuning, phases) are left untouched.
+
+    Parameters
+    ----------
+    rows : list of dict
+        Best-power rows, each with a ``chosen_params`` dict.
+    label : str, optional
+        Prefix for the warning emitted when any value is replaced.
+
+    Returns
+    -------
+    dict
+        ``{key: n_replaced}`` for the keys whose negatives were repaired.
+    """
+    # Cross-tone median of the valid (finite, positive) values for each key.
+    medians = {}
+    for key in _NONNEGATIVE_PARAM_KEYS:
+        vals = []
+        for row in rows:
+            cp = row.get("chosen_params") or {}
+            try:
+                v = float(cp.get(key, np.nan))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(v) and v > 0.0:
+                vals.append(v)
+        medians[key] = float(np.median(vals)) if vals else np.nan
+
+    repaired = {}
+    for row in rows:
+        cp = row.get("chosen_params")
+        if not isinstance(cp, dict):
+            continue
+        for key in _NONNEGATIVE_PARAM_KEYS:
+            try:
+                v = float(cp.get(key, np.nan))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(v) and v < 0.0:
+                cp[key] = medians[key]
+                repaired[key] = repaired.get(key, 0) + 1
+    if repaired:
+        warnings.warn(
+            f"{label}: replaced negative (extrapolated) chosen_params with the "
+            f"cross-tone median for {repaired} (NaN where no valid median existed).",
+            stacklevel=2)
+    return repaired
+
+
+def best_power_arrays(best_power, tone_count=None):
+    """Pull per-tone power and interpolated-parameter arrays from best-power rows.
+
+    Parameters
+    ----------
+    best_power : list of dict, dict, or path-like
+        Output of :py:func:`find_best_power`, a single such row, or a path
+        to a JSON file written by :py:func:`write_best_power` (the file or
+        its parent directory).
+    tone_count : int or None, optional
+        Length of the returned arrays.  ``None`` (default) uses
+        ``max(tone_index) + 1``.  Larger values pad with ``NaN``; smaller
+        values raise ``ValueError``.
+
+    Returns
+    -------
+    dict
+        Arrays have one entry per tone, in tone-index order; tones missing
+        from ``best_power`` are filled with ``NaN`` (or ``"unavailable"`` for
+        ``fr_source``).  The legacy keys ``chosen_power_dbm``, ``p_bif``,
+        ``p_bif_sub_3db``, ``fr_hz`` and ``fr_source`` are preserved.  Each
+        entry from ``chosen_params`` is also exposed directly as an array:
+        ``power_dbm``, every interpolated parameter-like fit-summary field
+        such as ``fr``, ``Ql``, ``Qi``, ``Qc``, ``anl`` and empirical fields,
+        plus ``extrapolated``, ``n_rows_used`` and ``fr_source``.
+
+        ``fr_hz`` is a compatibility alias for ``fr``.  ``fr`` is the
+        resonance frequency at the chosen power, with the fallback chain
+        described in :py:func:`find_best_power` so it is non-``NaN`` whenever
+        any row supplied a fitted ``fr``, ``empirical_fr``, or
+        ``sweep_center_hz``.
+    """
+    if isinstance(best_power, (str, Path)):
+        best_power = load_best_power(best_power)
+    if isinstance(best_power, dict):
+        best_power = [best_power]
+    # Copy rows (and their chosen_params) so repairing negatives here never mutates
+    # the caller's input. find_best_power already repairs at source; this also
+    # covers rows loaded from older files written before that fix.
+    rows = [dict(r) for r in best_power]
+    for r in rows:
+        if isinstance(r.get("chosen_params"), dict):
+            r["chosen_params"] = dict(r["chosen_params"])
+    _repair_negative_chosen_params(rows, label="best_power_arrays")
+    indices = [int(row["tone_index"]) for row in rows]
+    inferred = (max(indices) + 1) if indices else 0
+    if tone_count is None:
+        tone_count = inferred
+    else:
+        tone_count = int(tone_count)
+        if tone_count < inferred:
+            raise ValueError(
+                f"tone_count={tone_count} is smaller than the highest "
+                f"tone_index={inferred - 1} in best_power."
+            )
+    out = {
+        "tone_index": np.arange(tone_count, dtype=int),
+        "chosen_power_dbm": np.full(tone_count, np.nan, dtype=float),
+        "p_bif": np.full(tone_count, np.nan, dtype=float),
+        "p_bif_sub_3db": np.full(tone_count, np.nan, dtype=float),
+    }
+    param_arrays = {
+        name: (
+            np.full(tone_count, "unavailable", dtype=object)
+            if name == "fr_source" else
+            np.zeros(tone_count, dtype=bool)
+            if name == "extrapolated" else
+            np.full(tone_count, np.nan, dtype=float)
+        )
+        for name in _CHOSEN_PARAM_ARRAY_KEYS
+    }
+    for row in rows:
+        i = int(row["tone_index"])
+        for key, target in (
+            ("chosen_power_dbm", out["chosen_power_dbm"]),
+            ("p_bif", out["p_bif"]),
+            ("p_bif_sub_3db", out["p_bif_sub_3db"]),
+        ):
+            try:
+                target[i] = float(row.get(key, np.nan))
+            except (TypeError, ValueError):
+                pass
+        chosen_params = row.get("chosen_params") or {}
+        for key, target in param_arrays.items():
+            value = chosen_params.get(key, np.nan)
+            if key == "fr_source":
+                if isinstance(value, str):
+                    target[i] = value
+            elif key == "extrapolated":
+                if key in chosen_params:
+                    target[i] = bool(value)
+            else:
+                try:
+                    target[i] = float(value)
+                except (TypeError, ValueError):
+                    target[i] = np.nan
+
+    out.update(param_arrays)
+    out["fr_hz"] = out["fr"].copy()
+    return out
+
+
+def _jsonify_best_row(row):
+    """Convert a best-power row to JSON-native types (recursive)."""
+    if isinstance(row, dict):
+        return {str(k): _jsonify_best_row(v) for k, v in row.items()}
+    if isinstance(row, (list, tuple)):
+        return [_jsonify_best_row(v) for v in row]
+    if isinstance(row, (np.integer,)):
+        return int(row)
+    if isinstance(row, (np.floating,)):
+        value = float(row)
+        return value if np.isfinite(value) else None
+    if isinstance(row, float):
+        return row if np.isfinite(row) else None
+    if isinstance(row, np.ndarray):
+        return [_jsonify_best_row(v) for v in row.tolist()]
+    return row
+
+
+def _restore_best_row(row):
+    """Restore int-keyed ``exclude_reasons`` and ``NaN`` floats after a JSON load."""
+    if not isinstance(row, dict):
+        return row
+    out = dict(row)
+    reasons = out.get("exclude_reasons")
+    if isinstance(reasons, dict):
+        out["exclude_reasons"] = {int(k): v for k, v in reasons.items()}
+    for key in ("chosen_power_dbm", "p_bif", "p_bif_sub_3db", "bifurcation_anl"):
+        if key in out and out[key] is None:
+            out[key] = float("nan")
+    chosen_params = out.get("chosen_params")
+    if isinstance(chosen_params, dict):
+        out["chosen_params"] = {
+            k: (float("nan") if v is None else v)
+            for k, v in chosen_params.items()
+        }
+    return out
+
+
+def write_best_power(best_power, path):
+    """Save the list returned by :py:func:`find_best_power` to JSON.
+
+    ``path`` may be a file name or a directory; for a directory, the file
+    is written as ``analysis/best_power.json`` inside it.  The full per-tone
+    dicts are preserved (every criterion pick, exclusion reason, and
+    diagnostic field), so the load round-trip is lossless apart from NumPy
+    scalar types being normalised to Python floats/ints.  Returns the path
+    that was written.
+    """
+    if isinstance(best_power, dict):
+        best_power = [best_power]
+    target = Path(path)
+    if target.is_dir() or target.suffix == "":
+        target = target / BEST_POWER_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "kind": "souk_readout_tools.best_power",
+        "created": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+        "tones": [_jsonify_best_row(row) for row in best_power],
+    }
+    with target.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return target
+
+
+def load_best_power(path):
+    """Load a best-power list previously written by :py:func:`write_best_power`.
+
+    ``path`` may point at the JSON file directly or at the run directory that
+    contains ``analysis/best_power.json``.  ``exclude_reasons`` keys are
+    restored from strings to ``int`` so the loaded rows are interchangeable
+    with an in-memory :py:func:`find_best_power` result.
+    """
+    source = Path(path)
+    if source.is_dir():
+        source = source / BEST_POWER_FILE
+    with source.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if isinstance(payload, list):
+        rows = payload  # legacy format: bare list of rows
+    else:
+        rows = payload.get("tones", [])
+    return [_restore_best_row(row) for row in rows]
+
+
+# --- Comb balancing: re-allocate powers under bifurcation/TX/RX limits -------
+
+def _normalise_optional_range_db(value, name):
+    """Return ``None`` or a finite non-negative dB range."""
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be None or a non-negative number.") from exc
+    if not (np.isfinite(value) and value >= 0.0):
+        raise ValueError(f"{name} must be None or a non-negative finite number.")
+    return value
+
+
+def _as_tone_array(value, tone_count, name, *, fill=np.nan):
+    """Return a one-dimensional float array of length ``tone_count``."""
+    if value is None:
+        return np.full(tone_count, fill, dtype=float)
+    arr = np.asarray(value, dtype=float).ravel()
+    if arr.size == 1 and tone_count != 1:
+        arr = np.full(tone_count, float(arr[0]), dtype=float)
+    if arr.size != tone_count:
+        raise ValueError(f"{name} must have one value per tone.")
+    return arr.astype(float, copy=True)
+
+
+def _normalise_best_power_rows(best_power):
+    """Return ``best_power`` as a list of row dicts, loading paths if needed."""
+    if best_power is None:
+        return None
+    if isinstance(best_power, (str, Path)):
+        best_power = load_best_power(best_power)
+    if isinstance(best_power, dict):
+        return [best_power]
+    return list(best_power)
+
+
+def _row_power_for_balanced_params(row, use_readback_power):
+    """Return the summary-row power used for balanced-parameter interpolation."""
+    if use_readback_power:
+        try:
+            value = float(row.get("readback_power_dbm", np.nan))
+        except (TypeError, ValueError):
+            value = np.nan
+        if np.isfinite(value):
+            return value
+    try:
+        return float(row.get("power_dbm", np.nan))
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _anl_fit_from_best_row(best_row):
+    """Rebuild the small ANL-fit dict needed by ``_interpolated_params_at_power``."""
+    if not isinstance(best_row, dict):
+        return None
+    pick = best_row.get("anl_power_law_pick") or {}
+    if not isinstance(pick, dict):
+        return None
+    return {
+        "reliable": bool(pick.get("reliable", False)),
+        "slope_log_anl_per_db": pick.get("slope_log_anl_per_db", np.nan),
+        "intercept_log_anl": pick.get("intercept_log_anl", np.nan),
+        "fit_mask": [],
+    }
+
+
+def _balanced_param_arrays(summary, best_rows, tone_count, powers, *, use_readback_power):
+    """Interpolate fit-summary parameters at one balanced-power vector."""
+    names = _CHOSEN_PARAM_ARRAY_KEYS
+    out = {
+        name: (
+            np.full(tone_count, "unavailable", dtype=object)
+            if name == "fr_source" else
+            np.zeros(tone_count, dtype=bool)
+            if name == "extrapolated" else
+            np.full(tone_count, np.nan, dtype=float)
+        )
+        for name in names
+    }
+    if summary is None:
+        return out
+
+    rows = _coerce_summary_rows(summary)
+    rows_by_tone = {}
+    for row in rows:
+        try:
+            tone = int(row["tone_index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        rows_by_tone.setdefault(tone, []).append(row)
+
+    best_by_tone = {}
+    for row in best_rows or []:
+        try:
+            best_by_tone[int(row["tone_index"])] = row
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    for tone in range(tone_count):
+        tone_rows = rows_by_tone.get(int(tone), [])
+        if not tone_rows:
+            continue
+        tone_rows = sorted(
+            tone_rows,
+            key=lambda row: (
+                not np.isfinite(_row_power_for_balanced_params(row, use_readback_power)),
+                (
+                    _row_power_for_balanced_params(row, use_readback_power)
+                    if np.isfinite(_row_power_for_balanced_params(row, use_readback_power))
+                    else 0.0
+                ),
+            ),
+        )
+        row_powers = np.asarray(
+            [
+                _row_power_for_balanced_params(row, use_readback_power)
+                for row in tone_rows
+            ],
+            dtype=float,
+        )
+        best_row = best_by_tone.get(int(tone), {})
+        excluded = {
+            int(index)
+            for index in (best_row.get("excluded_sweep_indices") or [])
+        }
+        valid = np.asarray(
+            [
+                int(row.get("sweep_index", -1)) not in excluded
+                for row in tone_rows
+            ],
+            dtype=bool,
+        )
+        params = _interpolated_params_at_power(
+            tone_rows,
+            valid,
+            row_powers,
+            powers[tone],
+            anl_fit=_anl_fit_from_best_row(best_row),
+        )
+        for name in names:
+            if name not in params:
+                continue
+            if name == "fr_source":
+                out[name][tone] = params.get(name, "unavailable")
+            elif name == "extrapolated":
+                out[name][tone] = bool(params.get(name, False))
+            else:
+                try:
+                    out[name][tone] = float(params.get(name, np.nan))
+                except (TypeError, ValueError):
+                    out[name][tone] = np.nan
+    return out
+
+
+def _solve_balanced_power_lp(
+    caps,
+    *,
+    targets=None,
+    rx_offsets=None,
+    tx_power_range_db=None,
+    rx_level_range_db=None,
+    objective="nearest_target",
+):
+    """Solve the balanced-power allocation for finite-cap tones."""
+    from scipy.optimize import linprog
+
+    caps = np.asarray(caps, dtype=float).ravel()
+    n = caps.size
+    targets = (
+        None if targets is None
+        else np.asarray(targets, dtype=float).ravel()
+    )
+    rx_offsets = (
+        None if rx_offsets is None
+        else np.asarray(rx_offsets, dtype=float).ravel()
+    )
+    objective = str(objective).lower()
+    if objective not in {"nearest_target", "maximise_power"}:
+        raise ValueError("objective must be 'nearest_target' or 'maximise_power'.")
+    target_mask = (
+        np.isfinite(targets)
+        if objective == "nearest_target" and targets is not None
+        else np.zeros(n, dtype=bool)
+    )
+    target_indices = np.flatnonzero(target_mask)
+
+    n_vars = n
+    dev_start = None
+    if target_indices.size:
+        dev_start = n_vars
+        n_vars += target_indices.size
+    tx_lo = tx_hi = None
+    rx_lo = rx_hi = None
+    if tx_power_range_db is not None:
+        tx_lo = n_vars
+        tx_hi = n_vars + 1
+        n_vars += 2
+    if rx_level_range_db is not None:
+        rx_lo = n_vars
+        rx_hi = n_vars + 1
+        n_vars += 2
+
+    c = np.zeros(n_vars, dtype=float)
+    if target_indices.size:
+        c[dev_start : dev_start + target_indices.size] = 1.0
+        # Tiny tie-break: among equally target-close solutions, prefer the
+        # louder comb.  Kept far below one dB of target error.
+        c[:n] = -1e-6
+    else:
+        c[:n] = -1.0
+    bounds = [(None, float(cap)) for cap in caps]
+    bounds.extend([(0.0, None)] * target_indices.size)
+    bounds.extend([(None, None)] * (n_vars - n - target_indices.size))
+    a_ub = []
+    b_ub = []
+
+    def _row():
+        """A zeroed constraint/objective coefficient row for the LP."""
+        return np.zeros(n_vars, dtype=float)
+
+    if target_indices.size:
+        for j, i in enumerate(target_indices):
+            dev = dev_start + j
+            target = float(targets[i])
+
+            row = _row()
+            row[i] = 1.0
+            row[dev] = -1.0
+            a_ub.append(row)
+            b_ub.append(target)
+
+            row = _row()
+            row[i] = -1.0
+            row[dev] = -1.0
+            a_ub.append(row)
+            b_ub.append(-target)
+
+    if tx_power_range_db is not None:
+        for i in range(n):
+            row = _row()
+            row[i] = 1.0
+            row[tx_hi] = -1.0
+            a_ub.append(row)
+            b_ub.append(0.0)
+
+            row = _row()
+            row[i] = -1.0
+            row[tx_lo] = 1.0
+            a_ub.append(row)
+            b_ub.append(0.0)
+
+        row = _row()
+        row[tx_hi] = 1.0
+        row[tx_lo] = -1.0
+        a_ub.append(row)
+        b_ub.append(float(tx_power_range_db))
+
+    if rx_level_range_db is not None:
+        for i in range(n):
+            offset = float(rx_offsets[i])
+            row = _row()
+            row[i] = 1.0
+            row[rx_hi] = -1.0
+            a_ub.append(row)
+            b_ub.append(-offset)
+
+            row = _row()
+            row[i] = -1.0
+            row[rx_lo] = 1.0
+            a_ub.append(row)
+            b_ub.append(offset)
+
+        row = _row()
+        row[rx_hi] = 1.0
+        row[rx_lo] = -1.0
+        a_ub.append(row)
+        b_ub.append(float(rx_level_range_db))
+
+    result = linprog(
+        c,
+        A_ub=np.vstack(a_ub) if a_ub else None,
+        b_ub=np.asarray(b_ub, dtype=float) if b_ub else None,
+        bounds=bounds,
+        method="highs",
+    )
+    if not result.success:
+        return None, result
+    return np.asarray(result.x[:n], dtype=float), result
+
+
+def balance_tone_powers(
+    best_power=None,
+    *,
+    summary=None,
+    power_caps_dbm=None,
+    power_targets_dbm=None,
+    cap_key="p_bif_sub_3db",
+    target_key="chosen_power_dbm",
+    cap_margin_db=0.0,
+    missing_cap_policy="target",
+    tone_count=None,
+    use_readback_power=True,
+    rx_offsets_db=None,
+    tx_power_range_db=6.0,
+    rx_level_range_db=None,
+    objective="nearest_target",
+):
+    """Allocate per-tone powers under bifurcation, DAC, and ADC constraints.
+
+    This is the comb-balancing step after :py:func:`find_best_power`.
+    ``power_caps_dbm`` should contain the hard upper power limit for each
+    tone, usually ``p_bif_sub_3db``.  If ``power_caps_dbm`` is omitted,
+    ``best_power`` is passed through :py:func:`best_power_arrays` and
+    ``cap_key`` selects the cap array.  When a full ``best_power`` result is
+    supplied, ``target_key`` defaults to ``"chosen_power_dbm"`` so the
+    allocator treats the old best powers as preferred values while using the
+    bifurcation-backed caps as hard safety limits.
+    When a cap is missing, ``missing_cap_policy="target"`` uses the finite
+    target power as a conservative cap: the tone can be lowered for balance,
+    but not raised above its original best-power pick.  Pass
+    ``missing_cap_policy="drop"`` to exclude tones without finite caps.
+    If ``summary`` is supplied, it is used to interpolate the fit-summary
+    parameters at the original, TX-only, and final allocated powers.
+
+    With ``objective="nearest_target"`` (default), the optimiser minimises the
+    absolute distance to ``power_targets_dbm`` / ``target_key`` with a tiny
+    loudness tie-break.  With ``objective="maximise_power"``, it ignores
+    targets and maximises the sum of allocated tone powers subject to:
+
+    - ``allocated_power_dbm <= power_cap_dbm - cap_margin_db``
+    - optional TX spread: ``max(P) - min(P) <= tx_power_range_db``
+    - optional RX spread:
+      ``max(P + rx_offsets_db) - min(P + rx_offsets_db)
+      <= rx_level_range_db``
+    There is intentionally no lower physical tone-power bound; finite target
+    powers are preferences, not constraints.
+
+    ``tone_count`` sets/validates the number of tones when ``power_caps_dbm``
+    is given directly (inferred from ``best_power`` otherwise).
+    ``use_readback_power`` (default ``True``) selects whether interpolated
+    summary parameters use the measured readback power or the requested power
+    (passed through to the summary interpolation, as in
+    :py:func:`find_best_power`).
+    """
+    best_rows = _normalise_best_power_rows(best_power)
+    arrays = None
+    if best_rows is not None:
+        arrays = best_power_arrays(best_rows, tone_count=tone_count)
+
+    if power_caps_dbm is None:
+        if arrays is None:
+            raise ValueError("provide best_power or power_caps_dbm.")
+        if cap_key not in arrays:
+            raise ValueError(
+                f"cap_key must be one of {sorted(arrays)}, got {cap_key!r}."
+            )
+        caps = np.asarray(arrays[cap_key], dtype=float).ravel()
+        tone_count = caps.size
+        tone_index = np.asarray(arrays["tone_index"], dtype=int)
+        source = str(cap_key)
+    else:
+        caps = np.asarray(power_caps_dbm, dtype=float).ravel()
+        if tone_count is None:
+            tone_count = caps.size
+        else:
+            tone_count = int(tone_count)
+            if caps.size != tone_count:
+                raise ValueError("power_caps_dbm must have one value per tone.")
+        tone_index = np.arange(tone_count, dtype=int)
+        source = "power_caps_dbm"
+
+    raw_caps = caps.copy()
+    target_source = "none"
+    if power_targets_dbm is None and arrays is not None and target_key is not None:
+        if target_key not in arrays:
+            raise ValueError(
+                f"target_key must be one of {sorted(arrays)}, got {target_key!r}."
+            )
+        power_targets_dbm = arrays[target_key]
+        target_source = str(target_key)
+    elif power_targets_dbm is not None:
+        target_source = "power_targets_dbm"
+
+    try:
+        cap_margin_db = float(cap_margin_db)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cap_margin_db must be a finite number.") from exc
+    if not np.isfinite(cap_margin_db):
+        raise ValueError("cap_margin_db must be finite.")
+    caps = caps - cap_margin_db
+    cap_source_per_tone = np.full(tone_count, source, dtype=object)
+
+    if arrays is not None:
+        initial_chosen = _as_tone_array(
+            arrays.get("chosen_power_dbm"),
+            tone_count,
+            "chosen_power_dbm",
+            fill=np.nan,
+        )
+        p_bif = _as_tone_array(
+            arrays.get("p_bif"),
+            tone_count,
+            "p_bif",
+            fill=np.nan,
+        )
+        p_bif_sub_3db = _as_tone_array(
+            arrays.get("p_bif_sub_3db"),
+            tone_count,
+            "p_bif_sub_3db",
+            fill=np.nan,
+        )
+    else:
+        initial_chosen = _as_tone_array(
+            power_targets_dbm,
+            tone_count,
+            "power_targets_dbm",
+            fill=np.nan,
+        )
+        p_bif = np.full(tone_count, np.nan, dtype=float)
+        p_bif_sub_3db = raw_caps.copy()
+
+    tx_power_range_db = _normalise_optional_range_db(
+        tx_power_range_db,
+        "tx_power_range_db",
+    )
+    rx_level_range_db = _normalise_optional_range_db(
+        rx_level_range_db,
+        "rx_level_range_db",
+    )
+    rx_offsets = _as_tone_array(
+        rx_offsets_db,
+        tone_count,
+        "rx_offsets_db",
+        fill=np.nan,
+    )
+    targets = _as_tone_array(
+        power_targets_dbm,
+        tone_count,
+        "power_targets_dbm",
+        fill=np.nan,
+    )
+    objective = str(objective).lower()
+    if objective not in {"nearest_target", "maximise_power"}:
+        raise ValueError("objective must be 'nearest_target' or 'maximise_power'.")
+    missing_cap_policy = str(missing_cap_policy).lower()
+    if missing_cap_policy in {"chosen", "chosen_power", "target_power"}:
+        missing_cap_policy = "target"
+    if missing_cap_policy not in {"target", "drop"}:
+        raise ValueError("missing_cap_policy must be 'target' or 'drop'.")
+
+    missing_caps = ~np.isfinite(caps)
+    if missing_cap_policy == "target":
+        fallback = missing_caps & np.isfinite(targets)
+        caps[fallback] = targets[fallback] - cap_margin_db
+        cap_source_per_tone[fallback] = f"{target_source}_fallback"
+
+    cap_valid = np.isfinite(caps)
+    valid = cap_valid.copy()
+    invalid_reasons = {}
+    for i in np.flatnonzero(~valid):
+        invalid_reasons[int(tone_index[i])] = (
+            "power cap is not finite"
+            if missing_cap_policy == "drop"
+            else "power cap and fallback target are not finite"
+        )
+
+    if rx_level_range_db is not None:
+        missing_rx = valid & ~np.isfinite(rx_offsets)
+        for i in np.flatnonzero(missing_rx):
+            invalid_reasons[int(tone_index[i])] = "rx offset is not finite"
+        valid &= np.isfinite(rx_offsets)
+
+    rx_offset_range = float("nan")
+    min_rx_range_for_tx = float("nan")
+    min_tx_range_for_rx = float("nan")
+    rx_feasibility_note = ""
+    rx_valid = valid & np.isfinite(rx_offsets)
+    if np.any(rx_valid):
+        rx_offset_range = float(
+            np.nanmax(rx_offsets[rx_valid]) - np.nanmin(rx_offsets[rx_valid])
+        )
+        if tx_power_range_db is not None:
+            min_rx_range_for_tx = max(0.0, rx_offset_range - tx_power_range_db)
+        if rx_level_range_db is not None:
+            min_tx_range_for_rx = max(0.0, rx_offset_range - rx_level_range_db)
+        if (
+            tx_power_range_db is not None
+            and rx_level_range_db is not None
+            and tx_power_range_db + rx_level_range_db + 1e-9 < rx_offset_range
+        ):
+            rx_feasibility_note = (
+                "rx_offsets_db span exceeds tx_power_range_db + "
+                "rx_level_range_db"
+            )
+
+    allocated = np.full(tone_count, np.nan, dtype=float)
+    predicted_rx = np.full(tone_count, np.nan, dtype=float)
+    initial_predicted_rx = np.full(tone_count, np.nan, dtype=float)
+    tx_only_power = np.full(tone_count, np.nan, dtype=float)
+    tx_only_predicted_rx = np.full(tone_count, np.nan, dtype=float)
+    tx_only_solver_status = None
+    tx_only_solver_message = ""
+    tx_only_success = False
+    tx_only_reason = ""
+    solver_status = None
+    solver_message = ""
+    success = False
+    reason = ""
+
+    if np.any(np.isfinite(initial_chosen) & np.isfinite(rx_offsets)):
+        initial_predicted_rx = initial_chosen + rx_offsets
+
+    tx_only_idx = np.flatnonzero(cap_valid)
+    if tx_only_idx.size == 0:
+        tx_only_reason = "no tones with finite allocation constraints"
+    else:
+        tx_solution, tx_solver = _solve_balanced_power_lp(
+            caps[tx_only_idx],
+            targets=targets[tx_only_idx],
+            tx_power_range_db=tx_power_range_db,
+            objective=objective,
+        )
+        tx_only_solver_status = int(getattr(tx_solver, "status", -1))
+        tx_only_solver_message = str(getattr(tx_solver, "message", ""))
+        if tx_solution is None:
+            tx_only_reason = tx_only_solver_message or "TX-only allocation failed"
+        else:
+            tx_only_power[tx_only_idx] = tx_solution
+            tx_only_success = True
+
+    if np.any(np.isfinite(tx_only_power) & np.isfinite(rx_offsets)):
+        tx_only_predicted_rx = tx_only_power + rx_offsets
+
+    solve_idx = np.flatnonzero(valid)
+    if solve_idx.size == 0:
+        reason = "no tones with finite allocation constraints"
+    else:
+        solution, solver = _solve_balanced_power_lp(
+            caps[solve_idx],
+            targets=targets[solve_idx],
+            rx_offsets=(
+                rx_offsets[solve_idx]
+                if rx_level_range_db is not None else None
+            ),
+            tx_power_range_db=tx_power_range_db,
+            rx_level_range_db=rx_level_range_db,
+            objective=objective,
+        )
+        solver_status = int(getattr(solver, "status", -1))
+        solver_message = str(getattr(solver, "message", ""))
+        if solution is None:
+            reason = solver_message or "balanced-power allocation failed"
+        else:
+            allocated[solve_idx] = solution
+            success = True
+
+    if np.any(np.isfinite(allocated) & np.isfinite(rx_offsets)):
+        predicted_rx = allocated + rx_offsets
+
+    with np.errstate(invalid="ignore"):
+        initial_bif_margin = p_bif - initial_chosen
+        tx_only_bif_margin = p_bif - tx_only_power
+        final_bif_margin = p_bif - allocated
+        initial_cap_margin = p_bif_sub_3db - initial_chosen
+        tx_only_cap_margin = p_bif_sub_3db - tx_only_power
+        final_cap_margin = p_bif_sub_3db - allocated
+
+    finite_tx_only = np.isfinite(tx_only_power)
+    if np.count_nonzero(finite_tx_only) >= 2:
+        tx_only_tx_range = float(
+            np.nanmax(tx_only_power[finite_tx_only])
+            - np.nanmin(tx_only_power[finite_tx_only])
+        )
+    elif np.count_nonzero(finite_tx_only) == 1:
+        tx_only_tx_range = 0.0
+    else:
+        tx_only_tx_range = float("nan")
+
+    finite_tx_only_rx = np.isfinite(tx_only_predicted_rx)
+    if np.count_nonzero(finite_tx_only_rx) >= 2:
+        tx_only_rx_range = float(
+            np.nanmax(tx_only_predicted_rx[finite_tx_only_rx])
+            - np.nanmin(tx_only_predicted_rx[finite_tx_only_rx])
+        )
+    elif np.count_nonzero(finite_tx_only_rx) == 1:
+        tx_only_rx_range = 0.0
+    else:
+        tx_only_rx_range = float("nan")
+
+    finite_alloc = np.isfinite(allocated)
+    if np.count_nonzero(finite_alloc) >= 2:
+        actual_tx_range = float(
+            np.nanmax(allocated[finite_alloc])
+            - np.nanmin(allocated[finite_alloc])
+        )
+    elif np.count_nonzero(finite_alloc) == 1:
+        actual_tx_range = 0.0
+    else:
+        actual_tx_range = float("nan")
+
+    finite_rx = np.isfinite(predicted_rx)
+    if np.count_nonzero(finite_rx) >= 2:
+        actual_rx_range = float(
+            np.nanmax(predicted_rx[finite_rx])
+            - np.nanmin(predicted_rx[finite_rx])
+        )
+    elif np.count_nonzero(finite_rx) == 1:
+        actual_rx_range = 0.0
+    else:
+        actual_rx_range = float("nan")
+
+    if success and invalid_reasons:
+        status = "partial"
+        reason = f"{len(invalid_reasons)} tone(s) were not allocated"
+    elif success:
+        status = "success"
+        reason = ""
+    else:
+        status = "failed"
+
+    initial_params = _balanced_param_arrays(
+        summary,
+        best_rows,
+        tone_count,
+        initial_chosen,
+        use_readback_power=use_readback_power,
+    )
+    tx_only_params = _balanced_param_arrays(
+        summary,
+        best_rows,
+        tone_count,
+        tx_only_power,
+        use_readback_power=use_readback_power,
+    )
+    rx_constrained_params = _balanced_param_arrays(
+        summary,
+        best_rows,
+        tone_count,
+        allocated,
+        use_readback_power=use_readback_power,
+    )
+
+    return {
+        "tone_index": tone_index,
+        "allocated_power_dbm": allocated,
+        "initial_chosen_power_dbm": initial_chosen,
+        "p_bif": p_bif,
+        "p_bif_sub_3db": p_bif_sub_3db,
+        "power_cap_dbm": caps,
+        "power_cap_source": cap_source_per_tone.tolist(),
+        "power_target_dbm": targets,
+        "tx_only_power_dbm": tx_only_power,
+        "rx_constrained_power_dbm": allocated,
+        "initial_bifurcation_margin_db": initial_bif_margin,
+        "tx_only_bifurcation_margin_db": tx_only_bif_margin,
+        "bifurcation_margin_db": final_bif_margin,
+        "rx_constrained_bifurcation_margin_db": final_bif_margin,
+        "initial_cap_margin_db": initial_cap_margin,
+        "tx_only_cap_margin_db": tx_only_cap_margin,
+        "cap_margin_db": final_cap_margin,
+        "rx_constrained_cap_margin_db": final_cap_margin,
+        "rx_offsets_db": rx_offsets,
+        "initial_predicted_rx_level_db": initial_predicted_rx,
+        "tx_only_predicted_rx_level_db": tx_only_predicted_rx,
+        "predicted_rx_level_db": predicted_rx,
+        "initial_params": initial_params,
+        "tx_only_params": tx_only_params,
+        "rx_constrained_params": rx_constrained_params,
+        "valid_mask": valid,
+        "status": status,
+        "success": bool(success),
+        "reason": reason,
+        "invalid_reasons": invalid_reasons,
+        "constraints": {
+            "cap_source": source,
+            "target_source": target_source,
+            "cap_margin_db": float(cap_margin_db),
+            "missing_cap_policy": missing_cap_policy,
+            "use_readback_power": bool(use_readback_power),
+            "tx_power_range_db": tx_power_range_db,
+            "rx_level_range_db": rx_level_range_db,
+            "objective": objective,
+        },
+        "actual_tx_power_range_db": actual_tx_range,
+        "actual_rx_level_range_db": actual_rx_range,
+        "tx_only_tx_power_range_db": tx_only_tx_range,
+        "tx_only_rx_level_range_db": tx_only_rx_range,
+        "feasibility": {
+            "rx_offset_range_db": rx_offset_range,
+            "min_rx_level_range_db_for_tx_range": min_rx_range_for_tx,
+            "min_tx_power_range_db_for_rx_range": min_tx_range_for_rx,
+            "note": rx_feasibility_note,
+        },
+        "solver": {
+            "name": "scipy.optimize.linprog",
+            "status": solver_status,
+            "message": solver_message,
+        },
+        "tx_only_solver": {
+            "name": "scipy.optimize.linprog",
+            "success": bool(tx_only_success),
+            "reason": tx_only_reason,
+            "status": tx_only_solver_status,
+            "message": tx_only_solver_message,
+        },
+    }
+
+
+_BALANCED_POWER_ARRAY_KEYS = (
+    "tone_index",
+    "allocated_power_dbm",
+    "initial_chosen_power_dbm",
+    "p_bif",
+    "p_bif_sub_3db",
+    "power_cap_dbm",
+    "power_target_dbm",
+    "tx_only_power_dbm",
+    "rx_constrained_power_dbm",
+    "initial_bifurcation_margin_db",
+    "tx_only_bifurcation_margin_db",
+    "bifurcation_margin_db",
+    "rx_constrained_bifurcation_margin_db",
+    "initial_cap_margin_db",
+    "tx_only_cap_margin_db",
+    "cap_margin_db",
+    "rx_constrained_cap_margin_db",
+    "rx_offsets_db",
+    "initial_predicted_rx_level_db",
+    "tx_only_predicted_rx_level_db",
+    "predicted_rx_level_db",
+    "valid_mask",
+)
+
+
+def _restore_balanced_array(values, *, dtype=float):
+    """Rebuild a saved balanced-power column, mapping JSON ``null`` to NaN."""
+    values = [] if values is None else values
+    if dtype is bool:
+        return np.asarray(values, dtype=bool)
+    if dtype is int:
+        return np.asarray(values, dtype=int)
+    return np.asarray(
+        [np.nan if value is None else value for value in values],
+        dtype=float,
+    )
+
+
+def balanced_power_arrays(balanced_power, tone_count=None):
+    """Return the main arrays from ``balance_tone_powers`` output.
+
+    Parameters
+    ----------
+    balanced_power : dict or str or Path
+        An :py:func:`balance_tone_powers` result, or a path to a
+        JSON file written by :py:func:`write_balanced_power`.
+    tone_count : int or None, optional
+        Pad/validate the output to this many tones; ``None`` (default) infers
+        it from the allocated-power array.
+    """
+    if isinstance(balanced_power, (str, Path)):
+        balanced_power = load_balanced_power(balanced_power)
+    if not isinstance(balanced_power, dict):
+        raise TypeError("balanced_power must be a dict or path.")
+
+    if "allocated_power_dbm" not in balanced_power:
+        raise ValueError("balanced_power is missing allocated_power_dbm.")
+    allocated = np.asarray(balanced_power["allocated_power_dbm"], dtype=float).ravel()
+    inferred = allocated.size
+    if tone_count is None:
+        tone_count = inferred
+    else:
+        tone_count = int(tone_count)
+        if tone_count < inferred:
+            raise ValueError("tone_count is smaller than balanced_power arrays.")
+
+    out = {
+        "tone_index": np.arange(tone_count, dtype=int),
+        "allocated_power_dbm": np.full(tone_count, np.nan, dtype=float),
+        "initial_chosen_power_dbm": np.full(tone_count, np.nan, dtype=float),
+        "p_bif": np.full(tone_count, np.nan, dtype=float),
+        "p_bif_sub_3db": np.full(tone_count, np.nan, dtype=float),
+        "power_cap_dbm": np.full(tone_count, np.nan, dtype=float),
+        "power_target_dbm": np.full(tone_count, np.nan, dtype=float),
+        "tx_only_power_dbm": np.full(tone_count, np.nan, dtype=float),
+        "rx_constrained_power_dbm": np.full(tone_count, np.nan, dtype=float),
+        "initial_bifurcation_margin_db": np.full(tone_count, np.nan, dtype=float),
+        "tx_only_bifurcation_margin_db": np.full(tone_count, np.nan, dtype=float),
+        "bifurcation_margin_db": np.full(tone_count, np.nan, dtype=float),
+        "rx_constrained_bifurcation_margin_db": np.full(tone_count, np.nan, dtype=float),
+        "initial_cap_margin_db": np.full(tone_count, np.nan, dtype=float),
+        "tx_only_cap_margin_db": np.full(tone_count, np.nan, dtype=float),
+        "cap_margin_db": np.full(tone_count, np.nan, dtype=float),
+        "rx_constrained_cap_margin_db": np.full(tone_count, np.nan, dtype=float),
+        "rx_offsets_db": np.full(tone_count, np.nan, dtype=float),
+        "initial_predicted_rx_level_db": np.full(tone_count, np.nan, dtype=float),
+        "tx_only_predicted_rx_level_db": np.full(tone_count, np.nan, dtype=float),
+        "predicted_rx_level_db": np.full(tone_count, np.nan, dtype=float),
+        "valid_mask": np.zeros(tone_count, dtype=bool),
+    }
+    for key in _BALANCED_POWER_ARRAY_KEYS:
+        if key not in balanced_power:
+            continue
+        dtype = bool if key == "valid_mask" else int if key == "tone_index" else float
+        arr = _restore_balanced_array(balanced_power[key], dtype=dtype)
+        if arr.size > tone_count:
+            raise ValueError(f"{key} is longer than tone_count.")
+        out[key][: arr.size] = arr
+    return out
+
+
+def write_balanced_power(balanced_power, path):
+    """Save balanced-power allocation output to JSON.
+
+    Parameters
+    ----------
+    balanced_power : dict
+        An :py:func:`balance_tone_powers` result.
+    path : str or Path
+        Output file, or a directory/extension-less path under which
+        ``analysis/balanced_power.json`` is written.  Returns the file path.
+    """
+    target = Path(path)
+    if target.is_dir() or target.suffix == "":
+        target = target / BALANCED_POWER_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "kind": "souk_readout_tools.balanced_power",
+        "created": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+        "result": _jsonify_best_row(balanced_power),
+    }
+    with target.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return target
+
+
+def load_balanced_power(path):
+    """Load a balanced-power allocation written by ``write_balanced_power``.
+
+    Parameters
+    ----------
+    path : str or Path
+        The JSON file, or a directory containing
+        ``analysis/balanced_power.json``.
+    """
+    source = Path(path)
+    if source.is_dir():
+        source = source / BALANCED_POWER_FILE
+    with source.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    result = payload.get("result", payload) if isinstance(payload, dict) else payload
+    if not isinstance(result, dict):
+        raise ValueError(f"{source} is not a balanced-power JSON file.")
+    out = dict(result)
+    reasons = out.get("invalid_reasons")
+    if isinstance(reasons, dict):
+        out["invalid_reasons"] = {int(k): v for k, v in reasons.items()}
+    for key in _BALANCED_POWER_ARRAY_KEYS:
+        if key not in out:
+            continue
+        dtype = bool if key == "valid_mask" else int if key == "tone_index" else float
+        out[key] = _restore_balanced_array(out[key], dtype=dtype)
+    return out
+
+
+def accumulator_level_db(
+    parsed_samples,
+    tones=None,
+    *,
+    statistic="median",
+    ignore_packet_errors=True,
+):
+    """Return per-tone accumulated-I/Q levels from parsed samples in dB.
+
+    ``parsed_samples`` should be the dict returned by
+    :py:meth:`ReadoutClient.parse_samples`.  The returned values are relative
+    accumulated-I/Q magnitudes, useful for comparing ADC/RX bit utilisation
+    across tones.  They are not referred to an absolute RF plane.  Their
+    tone-to-tone differences are the natural ``rx_offsets_db`` input for
+    :py:func:`balance_tone_powers`.
+
+    Parameters
+    ----------
+    parsed_samples : dict
+        Parsed sample data from :py:meth:`ReadoutClient.parse_samples`.
+    tones : int or iterable of int or None, optional
+        Tone index/indices to report; ``None`` (default) does every tone.
+    statistic : {'median', 'mean'}, optional
+        How to reduce each tone's per-sample magnitude over time (default
+        ``'median'``, which is robust to packet glitches).
+    ignore_packet_errors : bool, optional
+        If ``True`` (default), drop samples flagged as packet errors before
+        reducing.
+    """
+    if not isinstance(parsed_samples, dict):
+        raise TypeError("parsed_samples must be a parsed sample-data dict.")
+    i_data = parsed_samples.get("i_data")
+    q_data = parsed_samples.get("q_data")
+    if not isinstance(i_data, dict) or not isinstance(q_data, dict):
+        raise ValueError("parsed_samples must contain i_data and q_data dicts.")
+
+    if tones is None:
+        try:
+            tone_count = int(parsed_samples.get("num_tones", len(i_data)))
+        except (TypeError, ValueError):
+            tone_count = len(i_data)
+        tones = range(tone_count)
+    elif np.isscalar(tones) and not isinstance(tones, str):
+        tones = [int(tones)]
+    else:
+        tones = list(tones)
+
+    first_key = f"{int(tones[0]):04d}" if tones else None
+    if first_key is not None and first_key in i_data:
+        n_samples = np.asarray(i_data[first_key]).size
+    else:
+        n_samples = 0
+    good = np.ones(n_samples, dtype=bool)
+    if ignore_packet_errors and "packet_error" in parsed_samples:
+        packet_error = np.asarray(parsed_samples["packet_error"])
+        if packet_error.size == n_samples:
+            good &= packet_error == 0
+
+    stat = str(statistic).lower()
+    levels = np.full(len(tones), np.nan, dtype=float)
+    for j, tone in enumerate(tones):
+        key = tone if isinstance(tone, str) else f"{int(tone):04d}"
+        if key not in i_data or key not in q_data:
+            continue
+        z = np.asarray(i_data[key], dtype=float) + 1j * np.asarray(
+            q_data[key],
+            dtype=float,
+        )
+        if z.size != good.size:
+            mask = np.isfinite(z.real) & np.isfinite(z.imag)
+        else:
+            mask = good & np.isfinite(z.real) & np.isfinite(z.imag)
+        mag = np.abs(z[mask])
+        mag = mag[np.isfinite(mag)]
+        if mag.size == 0:
+            continue
+        if stat == "median":
+            value = float(np.median(mag))
+        elif stat == "mean":
+            value = float(np.mean(mag))
+        elif stat == "rms":
+            value = float(np.sqrt(np.mean(np.square(mag))))
+        else:
+            raise ValueError("statistic must be 'median', 'mean', or 'rms'.")
+        levels[j] = 20.0 * np.log10(max(value, 1e-300))
+    return levels
+
+
+# --- Plotting ----------------------------------------------------------------
+
+def _plot_transform_title(title, deembed, phase_center, phase_rotate=False):
+    """Append the plotted S21 coordinate frame to a figure title."""
+    parts = []
+    if deembed:
+        parts.append("deembedded")
+    if phase_center and phase_rotate:
+        parts.append("centered + rotated")
+    elif phase_center:
+        parts.append("centered")
+    elif phase_rotate:
+        parts.append("rotated")
+    state = ", ".join(parts) if parts else "raw"
+    return f"{title} ({state})"
+
+
+def _consolidate_legend_outside(fig):
+    """Replace per-subplot legends with one figure-level legend on the right.
+
+    ``plot_fits`` places ``ax.legend()`` on every subplot.  With many power
+    steps that legend is large enough to crowd out the data inside the
+    axes and is duplicated across mag/phase or grid subplots.  This
+    helper collects the unique handle/label pairs from those legends,
+    removes them, and adds one ``fig.legend`` on the right.  Callers save
+    with ``bbox_inches='tight'`` to lay the figure out, so this helper does
+    not call ``tight_layout`` — that would emit an "incompatible Axes"
+    warning on the equal-aspect IQ panel of ``mag+phase+iq`` layouts.
+    """
+    handles, labels, seen = [], [], set()
+    for ax in fig.axes:
+        existing = ax.get_legend()
+        ax_handles, ax_labels = ax.get_legend_handles_labels()
+        for handle, label in zip(ax_handles, ax_labels):
+            if label and label != "_nolegend_" and label not in seen:
+                handles.append(handle)
+                labels.append(label)
+                seen.add(label)
+        if existing is not None:
+            existing.remove()
+    if handles:
+        # Reserve a right-side gutter so the figure legend does not overlap
+        # the axes; bbox_inches='tight' at save time crops to content.
+        fig.subplots_adjust(right=0.78)
+        fig.legend(
+            handles,
+            labels,
+            loc="center right",
+            bbox_to_anchor=(0.995, 0.5),
+            fontsize="small",
+            frameon=True,
+        )
+
+
+def _make_power_palette(powers):
+    """Build ``(colour, add_colorbar)`` helpers from a set of tone powers.
+
+    ``colour(power)`` maps a power onto the rainbow colormap and
+    ``add_colorbar(fig)`` adds a matching colorbar in a reserved right-side
+    gutter.  Kept at module scope so the per-tone plotting body can run in a
+    worker process.
+    """
+    from matplotlib import cm, colors
+
+    power_cmap = cm.rainbow
+    finite = np.asarray(powers, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size:
+        pmin = float(np.nanmin(finite))
+        pmax = float(np.nanmax(finite))
+        if pmax > pmin:
+            norm = colors.Normalize(vmin=pmin, vmax=pmax)
+        else:
+            norm = colors.Normalize(vmin=pmin - 0.5, vmax=pmax + 0.5)
+    else:
+        norm = None
+
+    def colour(power):
+        """Palette colour for a tone power (mid-colour when unscaled/non-finite)."""
+        if norm is None or not np.isfinite(power):
+            return power_cmap(0.5)
+        return power_cmap(norm(float(power)))
+
+    def add_colorbar(fig):
+        """Attach a tone-power colorbar to ``fig`` (no-op when unscaled)."""
+        if norm is None:
+            return
+        mappable = cm.ScalarMappable(norm=norm, cmap=power_cmap)
+        mappable.set_array([])
+        has_figure_legend = bool(getattr(fig, "legends", ()))
+        axes_right = 0.64 if has_figure_legend else 0.82
+        cbar_left = 0.68 if has_figure_legend else 0.86
+        cbar_width = 0.018
+        fig.subplots_adjust(right=axes_right)
+        axes = [ax for ax in fig.axes if ax.get_visible()]
+        positions = [ax.get_position() for ax in axes]
+        bottom = min(pos.y0 for pos in positions)
+        top = max(pos.y1 for pos in positions)
+        cax = fig.add_axes([cbar_left, bottom, cbar_width, top - bottom])
+        cbar = fig.colorbar(mappable, cax=cax)
+        cbar.set_label("Tone power (dBm)")
+
+    return colour, add_colorbar
 
 
 def _run_power_reference_plane(run):
@@ -2355,24 +4784,6 @@ def _run_power_reference_plane(run):
         if isinstance(sweep, dict) and sweep.get("tone_powers_reference_plane") is not None:
             return str(sweep["tone_powers_reference_plane"])
     return None
-
-
-def _format_power_label(power, sweep_index):
-    """Return a compact legend label for one power value."""
-    if np.isfinite(power):
-        return f"{power:.1f} dBm"
-    return f"step {sweep_index}"
-
-
-def _format_power_row_label(powers, sweep_index):
-    """Return a compact legend label for one possibly-multitone power row."""
-    powers = np.asarray(powers, dtype=float).ravel()
-    finite = powers[np.isfinite(powers)]
-    if finite.size == 0:
-        return f"step {sweep_index}"
-    if finite.size == 1 or np.allclose(finite, finite[0], atol=1e-9, rtol=0.0):
-        return f"{finite[0]:.1f} dBm"
-    return f"{np.nanmin(finite):.1f} to {np.nanmax(finite):.1f} dBm"
 
 
 _EMPIRICAL_FALLBACK_PARAMETER_KEYS = {"fr", "Ql", "Qi", "Qc"}
@@ -2478,150 +4889,6 @@ def _unique_empirical_fallback_reasons(fits):
         if reason is not None and reason not in reasons:
             reasons.append(reason)
     return reasons
-
-
-def _plot_transform_title(title, deembed, phase_center, phase_rotate=False):
-    """Append the plotted S21 coordinate frame to a figure title."""
-    parts = []
-    if deembed:
-        parts.append("deembedded")
-    if phase_center and phase_rotate:
-        parts.append("centered + rotated")
-    elif phase_center:
-        parts.append("centered")
-    elif phase_rotate:
-        parts.append("rotated")
-    state = ", ".join(parts) if parts else "raw"
-    return f"{title} ({state})"
-
-
-def _consolidate_legend_outside(fig):
-    """Replace per-subplot legends with one figure-level legend on the right.
-
-    ``plot_fits`` places ``ax.legend()`` on every subplot.  With many power
-    steps that legend is large enough to crowd out the data inside the
-    axes and is duplicated across mag/phase or grid subplots.  This
-    helper collects the unique handle/label pairs from those legends,
-    removes them, and adds one ``fig.legend`` on the right.  Callers save
-    with ``bbox_inches='tight'`` to lay the figure out, so this helper does
-    not call ``tight_layout`` — that would emit an "incompatible Axes"
-    warning on the equal-aspect IQ panel of ``mag+phase+iq`` layouts.
-    """
-    handles, labels, seen = [], [], set()
-    for ax in fig.axes:
-        existing = ax.get_legend()
-        ax_handles, ax_labels = ax.get_legend_handles_labels()
-        for handle, label in zip(ax_handles, ax_labels):
-            if label and label != "_nolegend_" and label not in seen:
-                handles.append(handle)
-                labels.append(label)
-                seen.add(label)
-        if existing is not None:
-            existing.remove()
-    if handles:
-        # Reserve a right-side gutter so the figure legend does not overlap
-        # the axes; bbox_inches='tight' at save time crops to content.
-        fig.subplots_adjust(right=0.78)
-        fig.legend(
-            handles,
-            labels,
-            loc="center right",
-            bbox_to_anchor=(0.995, 0.5),
-            fontsize="small",
-            frameon=True,
-        )
-
-
-def _fits_for_tone(fit_data, tone_index):
-    """Return a per-power list of fits for one tone, with None for misses."""
-    if fit_data is None:
-        return []
-    if "fits_by_power" in fit_data:
-        fits_for_tone = []
-        for fits_at_power in fit_data["fits_by_power"]:
-            fit = None
-            for fallback_index, candidate in enumerate(fits_at_power):
-                if int(getattr(candidate, "tone_index", fallback_index)) == tone_index:
-                    fit = candidate
-                    break
-            fits_for_tone.append(fit)
-        return fits_for_tone
-    if int(fit_data["tone_index"]) == int(tone_index):
-        return list(fit_data["fits"])
-    return []
-
-
-def _fits_for_power(fit_data, sweep_index, tone_indices):
-    """Return fits at one power step matching the selected tone indices."""
-    if fit_data is None:
-        return []
-    tone_set = {int(tone) for tone in tone_indices}
-    if "fits_by_power" in fit_data:
-        if sweep_index >= len(fit_data["fits_by_power"]):
-            return []
-        fits = []
-        for fallback_index, fit in enumerate(
-            fit_data["fits_by_power"][sweep_index]
-        ):
-            tone_index = int(getattr(fit, "tone_index", fallback_index))
-            if tone_index in tone_set:
-                fits.append(fit)
-        return fits
-    if sweep_index >= len(fit_data.get("fits", [])):
-        return []
-    tone_index = int(fit_data["tone_index"])
-    return [fit_data["fits"][sweep_index]] if tone_index in tone_set else []
-
-
-def _make_power_palette(powers):
-    """Build ``(colour, add_colorbar)`` helpers from a set of tone powers.
-
-    ``colour(power)`` maps a power onto the rainbow colormap and
-    ``add_colorbar(fig)`` adds a matching colorbar in a reserved right-side
-    gutter.  Kept at module scope so the per-tone plotting body can run in a
-    worker process.
-    """
-    from matplotlib import cm, colors
-
-    power_cmap = cm.rainbow
-    finite = np.asarray(powers, dtype=float)
-    finite = finite[np.isfinite(finite)]
-    if finite.size:
-        pmin = float(np.nanmin(finite))
-        pmax = float(np.nanmax(finite))
-        if pmax > pmin:
-            norm = colors.Normalize(vmin=pmin, vmax=pmax)
-        else:
-            norm = colors.Normalize(vmin=pmin - 0.5, vmax=pmax + 0.5)
-    else:
-        norm = None
-
-    def colour(power):
-        """Palette colour for a tone power (mid-colour when unscaled/non-finite)."""
-        if norm is None or not np.isfinite(power):
-            return power_cmap(0.5)
-        return power_cmap(norm(float(power)))
-
-    def add_colorbar(fig):
-        """Attach a tone-power colorbar to ``fig`` (no-op when unscaled)."""
-        if norm is None:
-            return
-        mappable = cm.ScalarMappable(norm=norm, cmap=power_cmap)
-        mappable.set_array([])
-        has_figure_legend = bool(getattr(fig, "legends", ()))
-        axes_right = 0.64 if has_figure_legend else 0.82
-        cbar_left = 0.68 if has_figure_legend else 0.86
-        cbar_width = 0.018
-        fig.subplots_adjust(right=axes_right)
-        axes = [ax for ax in fig.axes if ax.get_visible()]
-        positions = [ax.get_position() for ax in axes]
-        bottom = min(pos.y0 for pos in positions)
-        top = max(pos.y1 for pos in positions)
-        cax = fig.add_axes([cbar_left, bottom, cbar_width, top - bottom])
-        cbar = fig.colorbar(mappable, cax=cax)
-        cbar.set_label("Tone power (dBm)")
-
-    return colour, add_colorbar
 
 
 def _plot_one_tone(
@@ -3674,2249 +5941,6 @@ def _plot_power_sweep_parameters(
     if not show:
         plt.close(fig)
     paths["parameters"].append(str(param_path))
-
-
-# -- find_best_power and helpers ---------------------------------------------
-
-# 1.4826 = 1 / Phi^{-1}(0.75); scales MAD to the equivalent Gaussian σ so the
-# σ-clip thresholds below are interpretable as "k standard deviations" even
-# when the data are non-Gaussian.
-_MAD_TO_SIGMA = 1.4826
-DEFAULT_BIFURCATION_ANL = 4.0 / (3.0 * np.sqrt(3.0))
-DEFAULT_BIFURCATION_BACKOFF_DB = 3.0
-
-
-def _is_fit_data(summary):
-    """Return True for dictionaries produced by ``fit_power_sweep``."""
-    return (
-        isinstance(summary, dict)
-        and "run" in summary
-        and ("fits_by_power" in summary or "fits" in summary)
-    )
-
-
-def _coerce_summary_rows(summary):
-    """Return summary rows as a list of dicts with numeric columns floated.
-
-    Accepts a ``fit_power_sweep`` result dict, a structured summary array
-    (:py:func:`fit_summary_array` / :py:func:`load_fit_summary`), an iterable
-    of dicts (as produced by :py:func:`_fit_summary_rows`), a single row
-    dict, or a path to a CSV written by :py:func:`write_fit_summary`.
-    String columns that look numeric are converted to ``float`` (with empty
-    strings becoming ``NaN``); ``"true"``/``"false"`` become ``bool``; other
-    strings are left alone so the ``message`` field still parses.
-    """
-    if _is_fit_data(summary):
-        raw_rows = _fit_summary_rows(summary)
-    elif isinstance(summary, (str, Path)):
-        with Path(summary).open("r", newline="", encoding="utf-8") as handle:
-            raw_rows = list(csv.DictReader(handle))
-    elif isinstance(summary, dict):
-        if "tone_index" in summary and "sweep_index" in summary:
-            raw_rows = [summary]
-        else:
-            raise TypeError(
-                "summary dict must be a fit_power_sweep result or one summary row"
-            )
-    elif isinstance(summary, np.ndarray) and summary.dtype.names is not None:
-        raw_rows = []
-        for record in summary:
-            row = {}
-            for name in summary.dtype.names:
-                value = record[name]
-                if isinstance(value, np.generic):
-                    value = value.item()
-                row[name] = value
-            raw_rows.append(row)
-    else:
-        raw_rows = [dict(row) for row in summary]
-
-    coerced = []
-    for row in raw_rows:
-        new_row = {}
-        for key, value in row.items():
-            if not isinstance(value, str):
-                new_row[key] = value
-                continue
-            stripped = value.strip()
-            if stripped == "":
-                new_row[key] = np.nan
-            elif stripped.lower() == "true":
-                new_row[key] = True
-            elif stripped.lower() == "false":
-                new_row[key] = False
-            else:
-                try:
-                    new_row[key] = float(stripped)
-                except ValueError:
-                    new_row[key] = stripped
-        coerced.append(new_row)
-    return coerced
-
-
-def _robust_sigma(values):
-    """Return a MAD-based Gaussian-equivalent sigma, with std fallback."""
-    values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-    if values.size == 0:
-        return float("nan")
-    if values.size == 1:
-        return 0.0
-    centre = float(np.median(values))
-    sigma = _MAD_TO_SIGMA * float(np.median(np.abs(values - centre)))
-    if not np.isfinite(sigma) or sigma <= 0.0:
-        sigma = float(np.std(values, ddof=1))
-    return sigma
-
-
-def _line_fit(x, y, weights=None):
-    """Least-squares fit of ``y = slope*x + intercept``."""
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    if weights is None:
-        good = np.isfinite(x) & np.isfinite(y)
-        x = x[good]
-        y = y[good]
-        if x.size < 2 or np.nanmax(x) <= np.nanmin(x):
-            return float("nan"), float("nan")
-        design = np.column_stack([x, np.ones_like(x)])
-        slope, intercept = np.linalg.lstsq(design, y, rcond=None)[0]
-        return float(slope), float(intercept)
-
-    weights = np.asarray(weights, dtype=float)
-    good = np.isfinite(x) & np.isfinite(y) & np.isfinite(weights) & (weights > 0.0)
-    x = x[good]
-    y = y[good]
-    weights = weights[good]
-    if x.size < 2 or np.nanmax(x) <= np.nanmin(x):
-        return float("nan"), float("nan")
-    design = np.column_stack([x, np.ones_like(x)])
-    scale = np.sqrt(weights / np.nanmedian(weights))
-    slope, intercept = np.linalg.lstsq(
-        design * scale[:, None],
-        y * scale,
-        rcond=None,
-    )[0]
-    return float(slope), float(intercept)
-
-
-def _log_anl_sigma(anl, anl_err):
-    """Propagate linear ANL uncertainty to log(ANL) uncertainty."""
-    anl = np.asarray(anl, dtype=float)
-    if anl_err is None:
-        return np.full(anl.shape, np.nan, dtype=float)
-    anl_err = np.asarray(anl_err, dtype=float)
-    if anl_err.shape != anl.shape:
-        try:
-            anl_err = np.broadcast_to(anl_err, anl.shape)
-        except ValueError:
-            return np.full(anl.shape, np.nan, dtype=float)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        sigma = anl_err / anl
-    sigma = np.asarray(sigma, dtype=float)
-    sigma[~np.isfinite(sigma) | (sigma <= 0.0)] = np.nan
-    return sigma
-
-
-def _log_anl_fit_weights(anl, anl_err, min_points):
-    """Return inverse-variance weights for log(ANL), or ``None``."""
-    sigma = _log_anl_sigma(anl, anl_err)
-    finite = np.isfinite(sigma) & (sigma > 0.0)
-    if np.count_nonzero(finite) < max(int(min_points), 2):
-        return None, "unweighted"
-    # Keep points whose uncertainty failed by assigning the median valid
-    # sigma. That preserves the sweep support without pretending those rows
-    # have exceptionally high or low leverage.
-    if not np.all(finite):
-        sigma = sigma.copy()
-        sigma[~finite] = float(np.nanmedian(sigma[finite]))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        weights = 1.0 / np.square(sigma)
-    weights[~np.isfinite(weights) | (weights <= 0.0)] = np.nan
-    if np.count_nonzero(np.isfinite(weights) & (weights > 0.0)) < max(
-        int(min_points), 2
-    ):
-        return None, "unweighted"
-    return weights, "log_anl_uncertainty"
-
-
-def _solve_log_anl_power(slope, intercept, target_anl):
-    """Return power where ``log(anl)`` fit reaches ``target_anl``, else NaN."""
-    try:
-        target_anl = float(target_anl)
-    except (TypeError, ValueError):
-        return float("nan")
-    if not (np.isfinite(target_anl) and target_anl > 0.0):
-        return float("nan")
-    if not (np.isfinite(slope) and np.isfinite(intercept) and slope != 0.0):
-        return float("nan")
-    return float((np.log(target_anl) - intercept) / slope)
-
-
-def _theil_sen_line(x, y):
-    """Robust initial line estimate for small power-sweep series."""
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    slopes = []
-    for i in range(x.size - 1):
-        dx = x[i + 1 :] - x[i]
-        good = dx != 0.0
-        if np.any(good):
-            slopes.append((y[i + 1 :][good] - y[i]) / dx[good])
-    if not slopes:
-        return _line_fit(x, y)
-    slopes = np.concatenate(slopes)
-    slopes = slopes[np.isfinite(slopes)]
-    if slopes.size == 0:
-        return _line_fit(x, y)
-    slope = float(np.median(slopes))
-    intercept = float(np.median(y - slope * x))
-    return slope, intercept
-
-
-def _fit_log_anl_power_law(
-    powers,
-    anl,
-    valid,
-    *,
-    anl_err=None,
-    target_anl,
-    min_points,
-    clip_sigma,
-    min_slope,
-    weight_by_uncertainty=True,
-):
-    """Fit ``log(anl) = slope * power_dbm + intercept``.
-
-    Performs an initial Theil-Sen line on all eligible points, one pass of
-    symmetric MAD-based outlier rejection in log space at ``clip_sigma``, and
-    then a least-squares refit on the retained points.  When ``anl_err`` is
-    available, the refit is weighted by propagated log-space uncertainty,
-    ``sigma_log_anl ~= sigma_anl / anl``.  The fit is marked reliable when
-    the refit has at least ``min_points`` retained points and a slope of at
-    least ``min_slope`` (decades/dB-equivalent in log space).
-    """
-    powers = np.asarray(powers, dtype=float)
-    anl = np.asarray(anl, dtype=float)
-    valid = np.asarray(valid, dtype=bool)
-    if anl_err is None:
-        anl_err = np.full(anl.shape, np.nan, dtype=float)
-    else:
-        anl_err = np.asarray(anl_err, dtype=float)
-        if anl_err.shape != anl.shape:
-            try:
-                anl_err = np.broadcast_to(anl_err, anl.shape)
-            except ValueError:
-                anl_err = np.full(anl.shape, np.nan, dtype=float)
-    n = powers.size
-    false_mask = np.zeros(n, dtype=bool)
-    result = {
-        "reliable": False,
-        "reason": "",
-        "reasons": [],
-        "slope_log_anl_per_db": float("nan"),
-        "intercept_log_anl": float("nan"),
-        "initial_slope_log_anl_per_db": float("nan"),
-        "initial_intercept_log_anl": float("nan"),
-        "target_power_dbm": None,
-        "range_position": "unavailable",
-        "weighted": False,
-        "weight_source": "unweighted",
-        "eligible_mask": false_mask.copy(),
-        "fit_mask": false_mask.copy(),
-        "outlier_mask": false_mask.copy(),
-    }
-
-    try:
-        target_anl = float(target_anl)
-    except (TypeError, ValueError):
-        target_anl = float("nan")
-    if not (np.isfinite(target_anl) and target_anl > 0.0):
-        result["reasons"].append("target_anl must be positive")
-        result["reason"] = "; ".join(result["reasons"])
-        return result
-
-    eligible = valid & np.isfinite(powers) & np.isfinite(anl) & (anl > 0.0)
-    result["eligible_mask"] = eligible.copy()
-
-    min_points = max(int(min_points), 2)
-    if np.count_nonzero(eligible) < min_points:
-        result["reasons"].append(
-            f"only {int(np.count_nonzero(eligible))} eligible ANL points"
-        )
-        result["reason"] = "; ".join(result["reasons"])
-        return result
-
-    eligible_indices = np.flatnonzero(eligible)
-    order = np.argsort(powers[eligible_indices])
-    eligible_indices = eligible_indices[order]
-    x = powers[eligible_indices]
-    y = np.log(anl[eligible_indices])
-    yerr = anl_err[eligible_indices]
-
-    if np.unique(x).size < 2:
-        result["reasons"].append("ANL fit needs at least two distinct powers")
-        result["reason"] = "; ".join(result["reasons"])
-        return result
-
-    weights = None
-    weight_source = "unweighted"
-    if weight_by_uncertainty:
-        weights, weight_source = _log_anl_fit_weights(
-            anl[eligible_indices], yerr, min_points
-        )
-
-    # Initial robust line: Theil-Sen, fall back to OLS.
-    slope, intercept = _theil_sen_line(x, y)
-    if not (np.isfinite(slope) and np.isfinite(intercept)):
-        slope, intercept = _line_fit(x, y, weights=weights)
-    if not (np.isfinite(slope) and np.isfinite(intercept)):
-        result["reasons"].append("could not fit log(ANL) line")
-        result["reason"] = "; ".join(result["reasons"])
-        return result
-    initial_slope = float(slope)
-    initial_intercept = float(intercept)
-
-    # One pass of MAD outlier rejection, then refit on the kept points.
-    residual = y - (slope * x + intercept)
-    sigma = _robust_sigma(residual)
-    if np.isfinite(sigma) and sigma > 0.0:
-        keep = np.abs(residual) <= float(clip_sigma) * sigma
-        if np.count_nonzero(keep) < min_points:
-            keep = np.ones_like(keep)
-    else:
-        keep = np.ones_like(residual, dtype=bool)
-
-    fit_weights = weights[keep] if weights is not None else None
-    refit_slope, refit_intercept = _line_fit(x[keep], y[keep], weights=fit_weights)
-    if not (np.isfinite(refit_slope) and np.isfinite(refit_intercept)):
-        keep = np.ones_like(keep)
-        fit_weights = weights if weights is not None else None
-        refit_slope, refit_intercept = _line_fit(x, y, weights=fit_weights)
-    if np.isfinite(refit_slope) and np.isfinite(refit_intercept):
-        slope, intercept = refit_slope, refit_intercept
-
-    fit_mask = false_mask.copy()
-    fit_mask[eligible_indices[keep]] = True
-    outlier_mask = false_mask.copy()
-    outlier_mask[eligible_indices[~keep]] = True
-
-    target_power = _solve_log_anl_power(slope, intercept, target_anl)
-
-    result.update({
-        "slope_log_anl_per_db": float(slope),
-        "intercept_log_anl": float(intercept),
-        "initial_slope_log_anl_per_db": initial_slope,
-        "initial_intercept_log_anl": initial_intercept,
-        "target_power_dbm": float(target_power) if np.isfinite(target_power) else None,
-        "weighted": bool(weights is not None),
-        "weight_source": weight_source,
-        "fit_mask": fit_mask,
-        "outlier_mask": outlier_mask,
-    })
-
-    reasons = []
-    n_fit = int(np.count_nonzero(fit_mask))
-    if n_fit < min_points:
-        reasons.append(f"only {n_fit} ANL fit points after clipping")
-    if np.isfinite(slope) and slope <= float(min_slope):
-        reasons.append(
-            f"ANL slope {slope:.3g}/dB below min_slope={float(min_slope):g}"
-        )
-    if result["target_power_dbm"] is None:
-        reasons.append("target ANL power is not finite")
-
-    if result["target_power_dbm"] is not None and np.any(fit_mask):
-        xmin = float(np.nanmin(powers[fit_mask]))
-        xmax = float(np.nanmax(powers[fit_mask]))
-        if result["target_power_dbm"] < xmin:
-            result["range_position"] = "below_measured_range"
-        elif result["target_power_dbm"] > xmax:
-            result["range_position"] = "above_measured_range"
-        else:
-            result["range_position"] = "within_measured_range"
-
-    result["reliable"] = not reasons
-    result["reasons"] = reasons
-    result["reason"] = "; ".join(reasons)
-    return result
-
-
-_MAD_OUTLIER_CHECK_PARAMS = ("Qi", "Qc", "phi")
-
-
-def find_best_power(
-    summary,
-    *,
-    target_anl=0.01,
-    bifurcation_anl=DEFAULT_BIFURCATION_ANL,
-    param_valid_ranges=None,
-    param_outliers_mad_clip=5.0,
-    param_uncertainty_outlier_mad_clip=None,
-    require_success=True,
-    use_readback_power=True,
-    anl_fit_min_points=3,
-    anl_fit_clip_sigma=3.0,
-    anl_fit_min_slope=1e-2,
-    anl_fit_weight_by_uncertainty=True,
-):
-    """Pick a robust readout power per resonator from a fit-summary table.
-
-    Operates per ``tone_index`` on a :py:func:`fit_power_sweep` result, a
-    structured summary array (:py:func:`fit_summary_array` /
-    :py:func:`load_fit_summary`), or a CSV written by
-    :py:func:`write_fit_summary`.  The single criterion is a least-squares
-    fit to ``log(anl) = slope * power_dbm + intercept``, which is solved for
-    ``target_anl`` (default ``0.01``) to return a precise chosen power rather
-    than the nearest measured sweep point.  By default, the retained
-    log-linear refit is weighted by the propagated log-ANL uncertainty
-    ``sigma_log_anl ~= anl_err / anl`` when enough finite ``anl_err`` values
-    are available.
-
-    Row-level exclusions, applied in order:
-
-    1. ``success=False`` (skipped if ``require_success=False``).
-    2. Per-parameter validity-range check: a row is dropped when any entry of
-       ``param_valid_ranges`` has the row's fitted value at or beyond a
-       bound.  Defaults to :data:`DEFAULT_PARAM_VALID_RANGES`, which mirrors
-       the static parts of the fitter's physical bounds so rows where a
-       parameter was pinned at a fitter clamp are excluded.  The exception is
-       a low-clamped ``anl`` value: it is excluded from the ANL-vs-power fit,
-       but remains eligible for the measured ``anl_threshold`` fallback
-       because it still proves the measured point is below the requested
-       target.  Pass a dict like ``{"Qi": (1e3, 1e7), "anl": None}`` to
-       override; ``None`` disables a single entry, ``param_valid_ranges={}``
-       disables all.
-    3. Per-parameter MAD outlier check: for each parameter expected to be
-       near-constant across powers (``Qi``, ``Qc``, ``phi``), rows where the
-       value deviates from the per-tone median by more than
-       ``param_outliers_mad_clip`` MAD-equivalent sigmas are dropped.  Set
-       ``param_outliers_mad_clip=None`` to disable.
-    4. Per-parameter uncertainty MAD outlier check: same MAD criterion applied
-       to the ``<name>_err`` columns instead of the values, so rows with a
-       wildly inflated uncertainty on ``Qi``, ``Qc``, or ``phi`` are dropped.
-       Disabled by default (``param_uncertainty_outlier_mad_clip=None``); pass
-       a positive number to enable.
-
-    The ANL fit then takes the non-excluded, non-low-clamped-ANL rows,
-    performs one pass of symmetric MAD outlier rejection in log space at
-    ``anl_fit_clip_sigma``, and is marked reliable when the retained set has
-    at least ``anl_fit_min_points`` points and a slope of at least
-    ``anl_fit_min_slope`` decades/dB (default 1e-2).  Set
-    ``anl_fit_weight_by_uncertainty=False`` to restore an unweighted final
-    refit.  The chosen power is the value solved from the log-linear fit at
-    ``target_anl``, regardless of whether it falls inside or outside the
-    measured sweep range; the result field ``range_position``
-    (``within_measured_range`` / ``above_measured_range`` /
-    ``below_measured_range``) is reported as a diagnostic.
-
-    The top-level ``chosen_*`` fields use the ANL power-law pick when it is
-    reliable, otherwise fall back in order to: the highest measured power
-    with ``anl < target_anl`` (``anl_threshold``); the row whose measured
-    ``anl`` is nearest to ``target_anl`` among those still below
-    ``bifurcation_anl`` (``anl_nearest_target``, for sweeps where every
-    point is safely below bifurcation but the slope is too flat to solve
-    for ``target_anl``); and finally the lowest measured power
-    (``lowest_power_fallback``).  The returned rows also include ``p_bif``,
-    the power solved from the same ANL fit at ``bifurcation_anl`` (default
-    ``4/(3*sqrt(3)) ~= 0.77``), and ``p_bif_sub_3db``. Both are ``NaN``
-    when no reliable ANL fit is available.
-
-    Each returned row also includes ``chosen_params``: a dict with each
-    parameter-like fit-summary value (``fr``, ``Ql``, ``Qi``, ``Qc``,
-    ``Qc_abs``, ``phi``, ``a``, ``alpha``, ``tau``, ``anl``,
-    ``nonlinear_detuning_hz`` and the ``empirical_*`` fields) linearly
-    interpolated against ``power_dbm`` on the Stage-1-valid rows and evaluated
-    at ``chosen_power_dbm``.  Fit-quality diagnostics such as
-    ``residual_rms``, ``weighted_rms`` and ``reduced_chi2`` are excluded
-    because they are not meaningful to interpolate.  ``anl`` is taken from
-    the log(anl) fit so it is consistent with the chosen power.  Linear
-    extrapolation is used outside the measured range; ``extrapolated`` is set
-    to ``True`` when that happens.  Most values are ``NaN`` when no valid rows
-    are available.
-
-    ``chosen_params['fr']`` is given a fallback chain so it is non-``NaN``
-    whenever any row in the sweep supplies one of the inputs: when the
-    linear interpolation produces a finite value it is used as-is and
-    ``chosen_params['fr_source']`` is ``"interpolated"``; otherwise the
-    nearest row by ``|power_dbm - chosen_power_dbm|`` is searched for a
-    finite ``fr`` (``"nearest_fitted"``), then ``empirical_fr``
-    (``"nearest_empirical"``), then ``sweep_center_hz``
-    (``"nearest_sweep_center"``), with ``"unavailable"`` recorded only
-    when none of those columns has a finite entry in any row.
-
-    ``use_readback_power`` (default ``True``) selects the power axis: the
-    measured ``readback_power_dbm`` per row when available, otherwise the
-    requested ``power_dbm``.  Set ``False`` to always use the requested power.
-    """
-    rows = _coerce_summary_rows(summary)
-    if not rows:
-        return []
-    tones = sorted({int(row["tone_index"]) for row in rows})
-    param_valid_ranges = _normalise_param_valid_ranges(param_valid_ranges)
-    best_rows = [
-        _find_best_power_for_tone(
-            tone,
-            [r for r in rows if int(r["tone_index"]) == tone],
-            target_anl=target_anl,
-            bifurcation_anl=bifurcation_anl,
-            param_valid_ranges=param_valid_ranges,
-            param_outliers_mad_clip=param_outliers_mad_clip,
-            param_uncertainty_outlier_mad_clip=param_uncertainty_outlier_mad_clip,
-            require_success=require_success,
-            use_readback_power=use_readback_power,
-            anl_fit_min_points=anl_fit_min_points,
-            anl_fit_clip_sigma=anl_fit_clip_sigma,
-            anl_fit_min_slope=anl_fit_min_slope,
-            anl_fit_weight_by_uncertainty=anl_fit_weight_by_uncertainty,
-        )
-        for tone in tones
-    ]
-    # Repair at the source: replace negative (extrapolated) chosen_params with the
-    # cross-tone median so every consumer of these rows gets physical values.
-    _repair_negative_chosen_params(best_rows)
-    return best_rows
-
-
-def _repair_negative_chosen_params(rows, *, label="find_best_power"):
-    """Replace unphysical negative ``chosen_params`` values with a cross-tone median.
-
-    ``find_best_power`` interpolates each fit-summary field against power and
-    linearly extrapolates past the measured range (:func:`_linear_interp_extrap`),
-    which can drive a positive-but-decreasing quantity (e.g. a linewidth or Q)
-    negative at a chosen power outside the swept range. For each physically
-    non-negative key (:data:`_NONNEGATIVE_PARAM_KEYS`) this replaces any negative
-    entry with the median of the valid (finite, positive) values across all
-    ``rows`` (or ``NaN`` if none exist), repairing ``chosen_params`` **in place**.
-    Signed quantities (skew, nonlinear detuning, phases) are left untouched.
-
-    Parameters
-    ----------
-    rows : list of dict
-        Best-power rows, each with a ``chosen_params`` dict.
-    label : str, optional
-        Prefix for the warning emitted when any value is replaced.
-
-    Returns
-    -------
-    dict
-        ``{key: n_replaced}`` for the keys whose negatives were repaired.
-    """
-    # Cross-tone median of the valid (finite, positive) values for each key.
-    medians = {}
-    for key in _NONNEGATIVE_PARAM_KEYS:
-        vals = []
-        for row in rows:
-            cp = row.get("chosen_params") or {}
-            try:
-                v = float(cp.get(key, np.nan))
-            except (TypeError, ValueError):
-                continue
-            if np.isfinite(v) and v > 0.0:
-                vals.append(v)
-        medians[key] = float(np.median(vals)) if vals else np.nan
-
-    repaired = {}
-    for row in rows:
-        cp = row.get("chosen_params")
-        if not isinstance(cp, dict):
-            continue
-        for key in _NONNEGATIVE_PARAM_KEYS:
-            try:
-                v = float(cp.get(key, np.nan))
-            except (TypeError, ValueError):
-                continue
-            if np.isfinite(v) and v < 0.0:
-                cp[key] = medians[key]
-                repaired[key] = repaired.get(key, 0) + 1
-    if repaired:
-        warnings.warn(
-            f"{label}: replaced negative (extrapolated) chosen_params with the "
-            f"cross-tone median for {repaired} (NaN where no valid median existed).",
-            stacklevel=2)
-    return repaired
-
-
-def best_power_arrays(best_power, tone_count=None):
-    """Pull per-tone power and interpolated-parameter arrays from best-power rows.
-
-    Parameters
-    ----------
-    best_power : list of dict, dict, or path-like
-        Output of :py:func:`find_best_power`, a single such row, or a path
-        to a JSON file written by :py:func:`write_best_power` (the file or
-        its parent directory).
-    tone_count : int or None, optional
-        Length of the returned arrays.  ``None`` (default) uses
-        ``max(tone_index) + 1``.  Larger values pad with ``NaN``; smaller
-        values raise ``ValueError``.
-
-    Returns
-    -------
-    dict
-        Arrays have one entry per tone, in tone-index order; tones missing
-        from ``best_power`` are filled with ``NaN`` (or ``"unavailable"`` for
-        ``fr_source``).  The legacy keys ``chosen_power_dbm``, ``p_bif``,
-        ``p_bif_sub_3db``, ``fr_hz`` and ``fr_source`` are preserved.  Each
-        entry from ``chosen_params`` is also exposed directly as an array:
-        ``power_dbm``, every interpolated parameter-like fit-summary field
-        such as ``fr``, ``Ql``, ``Qi``, ``Qc``, ``anl`` and empirical fields,
-        plus ``extrapolated``, ``n_rows_used`` and ``fr_source``.
-
-        ``fr_hz`` is a compatibility alias for ``fr``.  ``fr`` is the
-        resonance frequency at the chosen power, with the fallback chain
-        described in :py:func:`find_best_power` so it is non-``NaN`` whenever
-        any row supplied a fitted ``fr``, ``empirical_fr``, or
-        ``sweep_center_hz``.
-    """
-    if isinstance(best_power, (str, Path)):
-        best_power = load_best_power(best_power)
-    if isinstance(best_power, dict):
-        best_power = [best_power]
-    # Copy rows (and their chosen_params) so repairing negatives here never mutates
-    # the caller's input. find_best_power already repairs at source; this also
-    # covers rows loaded from older files written before that fix.
-    rows = [dict(r) for r in best_power]
-    for r in rows:
-        if isinstance(r.get("chosen_params"), dict):
-            r["chosen_params"] = dict(r["chosen_params"])
-    _repair_negative_chosen_params(rows, label="best_power_arrays")
-    indices = [int(row["tone_index"]) for row in rows]
-    inferred = (max(indices) + 1) if indices else 0
-    if tone_count is None:
-        tone_count = inferred
-    else:
-        tone_count = int(tone_count)
-        if tone_count < inferred:
-            raise ValueError(
-                f"tone_count={tone_count} is smaller than the highest "
-                f"tone_index={inferred - 1} in best_power."
-            )
-    out = {
-        "tone_index": np.arange(tone_count, dtype=int),
-        "chosen_power_dbm": np.full(tone_count, np.nan, dtype=float),
-        "p_bif": np.full(tone_count, np.nan, dtype=float),
-        "p_bif_sub_3db": np.full(tone_count, np.nan, dtype=float),
-    }
-    param_arrays = {
-        name: (
-            np.full(tone_count, "unavailable", dtype=object)
-            if name == "fr_source" else
-            np.zeros(tone_count, dtype=bool)
-            if name == "extrapolated" else
-            np.full(tone_count, np.nan, dtype=float)
-        )
-        for name in _CHOSEN_PARAM_ARRAY_KEYS
-    }
-    for row in rows:
-        i = int(row["tone_index"])
-        for key, target in (
-            ("chosen_power_dbm", out["chosen_power_dbm"]),
-            ("p_bif", out["p_bif"]),
-            ("p_bif_sub_3db", out["p_bif_sub_3db"]),
-        ):
-            try:
-                target[i] = float(row.get(key, np.nan))
-            except (TypeError, ValueError):
-                pass
-        chosen_params = row.get("chosen_params") or {}
-        for key, target in param_arrays.items():
-            value = chosen_params.get(key, np.nan)
-            if key == "fr_source":
-                if isinstance(value, str):
-                    target[i] = value
-            elif key == "extrapolated":
-                if key in chosen_params:
-                    target[i] = bool(value)
-            else:
-                try:
-                    target[i] = float(value)
-                except (TypeError, ValueError):
-                    target[i] = np.nan
-
-    out.update(param_arrays)
-    out["fr_hz"] = out["fr"].copy()
-    return out
-
-
-def accumulator_level_db(
-    parsed_samples,
-    tones=None,
-    *,
-    statistic="median",
-    ignore_packet_errors=True,
-):
-    """Return per-tone accumulated-I/Q levels from parsed samples in dB.
-
-    ``parsed_samples`` should be the dict returned by
-    :py:meth:`ReadoutClient.parse_samples`.  The returned values are relative
-    accumulated-I/Q magnitudes, useful for comparing ADC/RX bit utilisation
-    across tones.  They are not referred to an absolute RF plane.  Their
-    tone-to-tone differences are the natural ``rx_offsets_db`` input for
-    :py:func:`balance_tone_powers`.
-
-    Parameters
-    ----------
-    parsed_samples : dict
-        Parsed sample data from :py:meth:`ReadoutClient.parse_samples`.
-    tones : int or iterable of int or None, optional
-        Tone index/indices to report; ``None`` (default) does every tone.
-    statistic : {'median', 'mean'}, optional
-        How to reduce each tone's per-sample magnitude over time (default
-        ``'median'``, which is robust to packet glitches).
-    ignore_packet_errors : bool, optional
-        If ``True`` (default), drop samples flagged as packet errors before
-        reducing.
-    """
-    if not isinstance(parsed_samples, dict):
-        raise TypeError("parsed_samples must be a parsed sample-data dict.")
-    i_data = parsed_samples.get("i_data")
-    q_data = parsed_samples.get("q_data")
-    if not isinstance(i_data, dict) or not isinstance(q_data, dict):
-        raise ValueError("parsed_samples must contain i_data and q_data dicts.")
-
-    if tones is None:
-        try:
-            tone_count = int(parsed_samples.get("num_tones", len(i_data)))
-        except (TypeError, ValueError):
-            tone_count = len(i_data)
-        tones = range(tone_count)
-    elif np.isscalar(tones) and not isinstance(tones, str):
-        tones = [int(tones)]
-    else:
-        tones = list(tones)
-
-    first_key = f"{int(tones[0]):04d}" if tones else None
-    if first_key is not None and first_key in i_data:
-        n_samples = np.asarray(i_data[first_key]).size
-    else:
-        n_samples = 0
-    good = np.ones(n_samples, dtype=bool)
-    if ignore_packet_errors and "packet_error" in parsed_samples:
-        packet_error = np.asarray(parsed_samples["packet_error"])
-        if packet_error.size == n_samples:
-            good &= packet_error == 0
-
-    stat = str(statistic).lower()
-    levels = np.full(len(tones), np.nan, dtype=float)
-    for j, tone in enumerate(tones):
-        key = tone if isinstance(tone, str) else f"{int(tone):04d}"
-        if key not in i_data or key not in q_data:
-            continue
-        z = np.asarray(i_data[key], dtype=float) + 1j * np.asarray(
-            q_data[key],
-            dtype=float,
-        )
-        if z.size != good.size:
-            mask = np.isfinite(z.real) & np.isfinite(z.imag)
-        else:
-            mask = good & np.isfinite(z.real) & np.isfinite(z.imag)
-        mag = np.abs(z[mask])
-        mag = mag[np.isfinite(mag)]
-        if mag.size == 0:
-            continue
-        if stat == "median":
-            value = float(np.median(mag))
-        elif stat == "mean":
-            value = float(np.mean(mag))
-        elif stat == "rms":
-            value = float(np.sqrt(np.mean(np.square(mag))))
-        else:
-            raise ValueError("statistic must be 'median', 'mean', or 'rms'.")
-        levels[j] = 20.0 * np.log10(max(value, 1e-300))
-    return levels
-
-
-def _normalise_optional_range_db(value, name):
-    """Return ``None`` or a finite non-negative dB range."""
-    if value is None:
-        return None
-    try:
-        value = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be None or a non-negative number.") from exc
-    if not (np.isfinite(value) and value >= 0.0):
-        raise ValueError(f"{name} must be None or a non-negative finite number.")
-    return value
-
-
-def _as_tone_array(value, tone_count, name, *, fill=np.nan):
-    """Return a one-dimensional float array of length ``tone_count``."""
-    if value is None:
-        return np.full(tone_count, fill, dtype=float)
-    arr = np.asarray(value, dtype=float).ravel()
-    if arr.size == 1 and tone_count != 1:
-        arr = np.full(tone_count, float(arr[0]), dtype=float)
-    if arr.size != tone_count:
-        raise ValueError(f"{name} must have one value per tone.")
-    return arr.astype(float, copy=True)
-
-
-def _normalise_best_power_rows(best_power):
-    """Return ``best_power`` as a list of row dicts, loading paths if needed."""
-    if best_power is None:
-        return None
-    if isinstance(best_power, (str, Path)):
-        best_power = load_best_power(best_power)
-    if isinstance(best_power, dict):
-        return [best_power]
-    return list(best_power)
-
-
-def _row_power_for_balanced_params(row, use_readback_power):
-    """Return the summary-row power used for balanced-parameter interpolation."""
-    if use_readback_power:
-        try:
-            value = float(row.get("readback_power_dbm", np.nan))
-        except (TypeError, ValueError):
-            value = np.nan
-        if np.isfinite(value):
-            return value
-    try:
-        return float(row.get("power_dbm", np.nan))
-    except (TypeError, ValueError):
-        return np.nan
-
-
-def _anl_fit_from_best_row(best_row):
-    """Rebuild the small ANL-fit dict needed by ``_interpolated_params_at_power``."""
-    if not isinstance(best_row, dict):
-        return None
-    pick = best_row.get("anl_power_law_pick") or {}
-    if not isinstance(pick, dict):
-        return None
-    return {
-        "reliable": bool(pick.get("reliable", False)),
-        "slope_log_anl_per_db": pick.get("slope_log_anl_per_db", np.nan),
-        "intercept_log_anl": pick.get("intercept_log_anl", np.nan),
-        "fit_mask": [],
-    }
-
-
-def _balanced_param_arrays(summary, best_rows, tone_count, powers, *, use_readback_power):
-    """Interpolate fit-summary parameters at one balanced-power vector."""
-    names = _CHOSEN_PARAM_ARRAY_KEYS
-    out = {
-        name: (
-            np.full(tone_count, "unavailable", dtype=object)
-            if name == "fr_source" else
-            np.zeros(tone_count, dtype=bool)
-            if name == "extrapolated" else
-            np.full(tone_count, np.nan, dtype=float)
-        )
-        for name in names
-    }
-    if summary is None:
-        return out
-
-    rows = _coerce_summary_rows(summary)
-    rows_by_tone = {}
-    for row in rows:
-        try:
-            tone = int(row["tone_index"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        rows_by_tone.setdefault(tone, []).append(row)
-
-    best_by_tone = {}
-    for row in best_rows or []:
-        try:
-            best_by_tone[int(row["tone_index"])] = row
-        except (KeyError, TypeError, ValueError):
-            continue
-
-    for tone in range(tone_count):
-        tone_rows = rows_by_tone.get(int(tone), [])
-        if not tone_rows:
-            continue
-        tone_rows = sorted(
-            tone_rows,
-            key=lambda row: (
-                not np.isfinite(_row_power_for_balanced_params(row, use_readback_power)),
-                (
-                    _row_power_for_balanced_params(row, use_readback_power)
-                    if np.isfinite(_row_power_for_balanced_params(row, use_readback_power))
-                    else 0.0
-                ),
-            ),
-        )
-        row_powers = np.asarray(
-            [
-                _row_power_for_balanced_params(row, use_readback_power)
-                for row in tone_rows
-            ],
-            dtype=float,
-        )
-        best_row = best_by_tone.get(int(tone), {})
-        excluded = {
-            int(index)
-            for index in (best_row.get("excluded_sweep_indices") or [])
-        }
-        valid = np.asarray(
-            [
-                int(row.get("sweep_index", -1)) not in excluded
-                for row in tone_rows
-            ],
-            dtype=bool,
-        )
-        params = _interpolated_params_at_power(
-            tone_rows,
-            valid,
-            row_powers,
-            powers[tone],
-            anl_fit=_anl_fit_from_best_row(best_row),
-        )
-        for name in names:
-            if name not in params:
-                continue
-            if name == "fr_source":
-                out[name][tone] = params.get(name, "unavailable")
-            elif name == "extrapolated":
-                out[name][tone] = bool(params.get(name, False))
-            else:
-                try:
-                    out[name][tone] = float(params.get(name, np.nan))
-                except (TypeError, ValueError):
-                    out[name][tone] = np.nan
-    return out
-
-
-def _solve_balanced_power_lp(
-    caps,
-    *,
-    targets=None,
-    rx_offsets=None,
-    tx_power_range_db=None,
-    rx_level_range_db=None,
-    objective="nearest_target",
-):
-    """Solve the balanced-power allocation for finite-cap tones."""
-    from scipy.optimize import linprog
-
-    caps = np.asarray(caps, dtype=float).ravel()
-    n = caps.size
-    targets = (
-        None if targets is None
-        else np.asarray(targets, dtype=float).ravel()
-    )
-    rx_offsets = (
-        None if rx_offsets is None
-        else np.asarray(rx_offsets, dtype=float).ravel()
-    )
-    objective = str(objective).lower()
-    if objective not in {"nearest_target", "maximise_power"}:
-        raise ValueError("objective must be 'nearest_target' or 'maximise_power'.")
-    target_mask = (
-        np.isfinite(targets)
-        if objective == "nearest_target" and targets is not None
-        else np.zeros(n, dtype=bool)
-    )
-    target_indices = np.flatnonzero(target_mask)
-
-    n_vars = n
-    dev_start = None
-    if target_indices.size:
-        dev_start = n_vars
-        n_vars += target_indices.size
-    tx_lo = tx_hi = None
-    rx_lo = rx_hi = None
-    if tx_power_range_db is not None:
-        tx_lo = n_vars
-        tx_hi = n_vars + 1
-        n_vars += 2
-    if rx_level_range_db is not None:
-        rx_lo = n_vars
-        rx_hi = n_vars + 1
-        n_vars += 2
-
-    c = np.zeros(n_vars, dtype=float)
-    if target_indices.size:
-        c[dev_start : dev_start + target_indices.size] = 1.0
-        # Tiny tie-break: among equally target-close solutions, prefer the
-        # louder comb.  Kept far below one dB of target error.
-        c[:n] = -1e-6
-    else:
-        c[:n] = -1.0
-    bounds = [(None, float(cap)) for cap in caps]
-    bounds.extend([(0.0, None)] * target_indices.size)
-    bounds.extend([(None, None)] * (n_vars - n - target_indices.size))
-    a_ub = []
-    b_ub = []
-
-    def _row():
-        """A zeroed constraint/objective coefficient row for the LP."""
-        return np.zeros(n_vars, dtype=float)
-
-    if target_indices.size:
-        for j, i in enumerate(target_indices):
-            dev = dev_start + j
-            target = float(targets[i])
-
-            row = _row()
-            row[i] = 1.0
-            row[dev] = -1.0
-            a_ub.append(row)
-            b_ub.append(target)
-
-            row = _row()
-            row[i] = -1.0
-            row[dev] = -1.0
-            a_ub.append(row)
-            b_ub.append(-target)
-
-    if tx_power_range_db is not None:
-        for i in range(n):
-            row = _row()
-            row[i] = 1.0
-            row[tx_hi] = -1.0
-            a_ub.append(row)
-            b_ub.append(0.0)
-
-            row = _row()
-            row[i] = -1.0
-            row[tx_lo] = 1.0
-            a_ub.append(row)
-            b_ub.append(0.0)
-
-        row = _row()
-        row[tx_hi] = 1.0
-        row[tx_lo] = -1.0
-        a_ub.append(row)
-        b_ub.append(float(tx_power_range_db))
-
-    if rx_level_range_db is not None:
-        for i in range(n):
-            offset = float(rx_offsets[i])
-            row = _row()
-            row[i] = 1.0
-            row[rx_hi] = -1.0
-            a_ub.append(row)
-            b_ub.append(-offset)
-
-            row = _row()
-            row[i] = -1.0
-            row[rx_lo] = 1.0
-            a_ub.append(row)
-            b_ub.append(offset)
-
-        row = _row()
-        row[rx_hi] = 1.0
-        row[rx_lo] = -1.0
-        a_ub.append(row)
-        b_ub.append(float(rx_level_range_db))
-
-    result = linprog(
-        c,
-        A_ub=np.vstack(a_ub) if a_ub else None,
-        b_ub=np.asarray(b_ub, dtype=float) if b_ub else None,
-        bounds=bounds,
-        method="highs",
-    )
-    if not result.success:
-        return None, result
-    return np.asarray(result.x[:n], dtype=float), result
-
-
-def balance_tone_powers(
-    best_power=None,
-    *,
-    summary=None,
-    power_caps_dbm=None,
-    power_targets_dbm=None,
-    cap_key="p_bif_sub_3db",
-    target_key="chosen_power_dbm",
-    cap_margin_db=0.0,
-    missing_cap_policy="target",
-    tone_count=None,
-    use_readback_power=True,
-    rx_offsets_db=None,
-    tx_power_range_db=6.0,
-    rx_level_range_db=None,
-    objective="nearest_target",
-):
-    """Allocate per-tone powers under bifurcation, DAC, and ADC constraints.
-
-    This is the comb-balancing step after :py:func:`find_best_power`.
-    ``power_caps_dbm`` should contain the hard upper power limit for each
-    tone, usually ``p_bif_sub_3db``.  If ``power_caps_dbm`` is omitted,
-    ``best_power`` is passed through :py:func:`best_power_arrays` and
-    ``cap_key`` selects the cap array.  When a full ``best_power`` result is
-    supplied, ``target_key`` defaults to ``"chosen_power_dbm"`` so the
-    allocator treats the old best powers as preferred values while using the
-    bifurcation-backed caps as hard safety limits.
-    When a cap is missing, ``missing_cap_policy="target"`` uses the finite
-    target power as a conservative cap: the tone can be lowered for balance,
-    but not raised above its original best-power pick.  Pass
-    ``missing_cap_policy="drop"`` to exclude tones without finite caps.
-    If ``summary`` is supplied, it is used to interpolate the fit-summary
-    parameters at the original, TX-only, and final allocated powers.
-
-    With ``objective="nearest_target"`` (default), the optimiser minimises the
-    absolute distance to ``power_targets_dbm`` / ``target_key`` with a tiny
-    loudness tie-break.  With ``objective="maximise_power"``, it ignores
-    targets and maximises the sum of allocated tone powers subject to:
-
-    - ``allocated_power_dbm <= power_cap_dbm - cap_margin_db``
-    - optional TX spread: ``max(P) - min(P) <= tx_power_range_db``
-    - optional RX spread:
-      ``max(P + rx_offsets_db) - min(P + rx_offsets_db)
-      <= rx_level_range_db``
-    There is intentionally no lower physical tone-power bound; finite target
-    powers are preferences, not constraints.
-
-    ``tone_count`` sets/validates the number of tones when ``power_caps_dbm``
-    is given directly (inferred from ``best_power`` otherwise).
-    ``use_readback_power`` (default ``True``) selects whether interpolated
-    summary parameters use the measured readback power or the requested power
-    (passed through to the summary interpolation, as in
-    :py:func:`find_best_power`).
-    """
-    best_rows = _normalise_best_power_rows(best_power)
-    arrays = None
-    if best_rows is not None:
-        arrays = best_power_arrays(best_rows, tone_count=tone_count)
-
-    if power_caps_dbm is None:
-        if arrays is None:
-            raise ValueError("provide best_power or power_caps_dbm.")
-        if cap_key not in arrays:
-            raise ValueError(
-                f"cap_key must be one of {sorted(arrays)}, got {cap_key!r}."
-            )
-        caps = np.asarray(arrays[cap_key], dtype=float).ravel()
-        tone_count = caps.size
-        tone_index = np.asarray(arrays["tone_index"], dtype=int)
-        source = str(cap_key)
-    else:
-        caps = np.asarray(power_caps_dbm, dtype=float).ravel()
-        if tone_count is None:
-            tone_count = caps.size
-        else:
-            tone_count = int(tone_count)
-            if caps.size != tone_count:
-                raise ValueError("power_caps_dbm must have one value per tone.")
-        tone_index = np.arange(tone_count, dtype=int)
-        source = "power_caps_dbm"
-
-    raw_caps = caps.copy()
-    target_source = "none"
-    if power_targets_dbm is None and arrays is not None and target_key is not None:
-        if target_key not in arrays:
-            raise ValueError(
-                f"target_key must be one of {sorted(arrays)}, got {target_key!r}."
-            )
-        power_targets_dbm = arrays[target_key]
-        target_source = str(target_key)
-    elif power_targets_dbm is not None:
-        target_source = "power_targets_dbm"
-
-    try:
-        cap_margin_db = float(cap_margin_db)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("cap_margin_db must be a finite number.") from exc
-    if not np.isfinite(cap_margin_db):
-        raise ValueError("cap_margin_db must be finite.")
-    caps = caps - cap_margin_db
-    cap_source_per_tone = np.full(tone_count, source, dtype=object)
-
-    if arrays is not None:
-        initial_chosen = _as_tone_array(
-            arrays.get("chosen_power_dbm"),
-            tone_count,
-            "chosen_power_dbm",
-            fill=np.nan,
-        )
-        p_bif = _as_tone_array(
-            arrays.get("p_bif"),
-            tone_count,
-            "p_bif",
-            fill=np.nan,
-        )
-        p_bif_sub_3db = _as_tone_array(
-            arrays.get("p_bif_sub_3db"),
-            tone_count,
-            "p_bif_sub_3db",
-            fill=np.nan,
-        )
-    else:
-        initial_chosen = _as_tone_array(
-            power_targets_dbm,
-            tone_count,
-            "power_targets_dbm",
-            fill=np.nan,
-        )
-        p_bif = np.full(tone_count, np.nan, dtype=float)
-        p_bif_sub_3db = raw_caps.copy()
-
-    tx_power_range_db = _normalise_optional_range_db(
-        tx_power_range_db,
-        "tx_power_range_db",
-    )
-    rx_level_range_db = _normalise_optional_range_db(
-        rx_level_range_db,
-        "rx_level_range_db",
-    )
-    rx_offsets = _as_tone_array(
-        rx_offsets_db,
-        tone_count,
-        "rx_offsets_db",
-        fill=np.nan,
-    )
-    targets = _as_tone_array(
-        power_targets_dbm,
-        tone_count,
-        "power_targets_dbm",
-        fill=np.nan,
-    )
-    objective = str(objective).lower()
-    if objective not in {"nearest_target", "maximise_power"}:
-        raise ValueError("objective must be 'nearest_target' or 'maximise_power'.")
-    missing_cap_policy = str(missing_cap_policy).lower()
-    if missing_cap_policy in {"chosen", "chosen_power", "target_power"}:
-        missing_cap_policy = "target"
-    if missing_cap_policy not in {"target", "drop"}:
-        raise ValueError("missing_cap_policy must be 'target' or 'drop'.")
-
-    missing_caps = ~np.isfinite(caps)
-    if missing_cap_policy == "target":
-        fallback = missing_caps & np.isfinite(targets)
-        caps[fallback] = targets[fallback] - cap_margin_db
-        cap_source_per_tone[fallback] = f"{target_source}_fallback"
-
-    cap_valid = np.isfinite(caps)
-    valid = cap_valid.copy()
-    invalid_reasons = {}
-    for i in np.flatnonzero(~valid):
-        invalid_reasons[int(tone_index[i])] = (
-            "power cap is not finite"
-            if missing_cap_policy == "drop"
-            else "power cap and fallback target are not finite"
-        )
-
-    if rx_level_range_db is not None:
-        missing_rx = valid & ~np.isfinite(rx_offsets)
-        for i in np.flatnonzero(missing_rx):
-            invalid_reasons[int(tone_index[i])] = "rx offset is not finite"
-        valid &= np.isfinite(rx_offsets)
-
-    rx_offset_range = float("nan")
-    min_rx_range_for_tx = float("nan")
-    min_tx_range_for_rx = float("nan")
-    rx_feasibility_note = ""
-    rx_valid = valid & np.isfinite(rx_offsets)
-    if np.any(rx_valid):
-        rx_offset_range = float(
-            np.nanmax(rx_offsets[rx_valid]) - np.nanmin(rx_offsets[rx_valid])
-        )
-        if tx_power_range_db is not None:
-            min_rx_range_for_tx = max(0.0, rx_offset_range - tx_power_range_db)
-        if rx_level_range_db is not None:
-            min_tx_range_for_rx = max(0.0, rx_offset_range - rx_level_range_db)
-        if (
-            tx_power_range_db is not None
-            and rx_level_range_db is not None
-            and tx_power_range_db + rx_level_range_db + 1e-9 < rx_offset_range
-        ):
-            rx_feasibility_note = (
-                "rx_offsets_db span exceeds tx_power_range_db + "
-                "rx_level_range_db"
-            )
-
-    allocated = np.full(tone_count, np.nan, dtype=float)
-    predicted_rx = np.full(tone_count, np.nan, dtype=float)
-    initial_predicted_rx = np.full(tone_count, np.nan, dtype=float)
-    tx_only_power = np.full(tone_count, np.nan, dtype=float)
-    tx_only_predicted_rx = np.full(tone_count, np.nan, dtype=float)
-    tx_only_solver_status = None
-    tx_only_solver_message = ""
-    tx_only_success = False
-    tx_only_reason = ""
-    solver_status = None
-    solver_message = ""
-    success = False
-    reason = ""
-
-    if np.any(np.isfinite(initial_chosen) & np.isfinite(rx_offsets)):
-        initial_predicted_rx = initial_chosen + rx_offsets
-
-    tx_only_idx = np.flatnonzero(cap_valid)
-    if tx_only_idx.size == 0:
-        tx_only_reason = "no tones with finite allocation constraints"
-    else:
-        tx_solution, tx_solver = _solve_balanced_power_lp(
-            caps[tx_only_idx],
-            targets=targets[tx_only_idx],
-            tx_power_range_db=tx_power_range_db,
-            objective=objective,
-        )
-        tx_only_solver_status = int(getattr(tx_solver, "status", -1))
-        tx_only_solver_message = str(getattr(tx_solver, "message", ""))
-        if tx_solution is None:
-            tx_only_reason = tx_only_solver_message or "TX-only allocation failed"
-        else:
-            tx_only_power[tx_only_idx] = tx_solution
-            tx_only_success = True
-
-    if np.any(np.isfinite(tx_only_power) & np.isfinite(rx_offsets)):
-        tx_only_predicted_rx = tx_only_power + rx_offsets
-
-    solve_idx = np.flatnonzero(valid)
-    if solve_idx.size == 0:
-        reason = "no tones with finite allocation constraints"
-    else:
-        solution, solver = _solve_balanced_power_lp(
-            caps[solve_idx],
-            targets=targets[solve_idx],
-            rx_offsets=(
-                rx_offsets[solve_idx]
-                if rx_level_range_db is not None else None
-            ),
-            tx_power_range_db=tx_power_range_db,
-            rx_level_range_db=rx_level_range_db,
-            objective=objective,
-        )
-        solver_status = int(getattr(solver, "status", -1))
-        solver_message = str(getattr(solver, "message", ""))
-        if solution is None:
-            reason = solver_message or "balanced-power allocation failed"
-        else:
-            allocated[solve_idx] = solution
-            success = True
-
-    if np.any(np.isfinite(allocated) & np.isfinite(rx_offsets)):
-        predicted_rx = allocated + rx_offsets
-
-    with np.errstate(invalid="ignore"):
-        initial_bif_margin = p_bif - initial_chosen
-        tx_only_bif_margin = p_bif - tx_only_power
-        final_bif_margin = p_bif - allocated
-        initial_cap_margin = p_bif_sub_3db - initial_chosen
-        tx_only_cap_margin = p_bif_sub_3db - tx_only_power
-        final_cap_margin = p_bif_sub_3db - allocated
-
-    finite_tx_only = np.isfinite(tx_only_power)
-    if np.count_nonzero(finite_tx_only) >= 2:
-        tx_only_tx_range = float(
-            np.nanmax(tx_only_power[finite_tx_only])
-            - np.nanmin(tx_only_power[finite_tx_only])
-        )
-    elif np.count_nonzero(finite_tx_only) == 1:
-        tx_only_tx_range = 0.0
-    else:
-        tx_only_tx_range = float("nan")
-
-    finite_tx_only_rx = np.isfinite(tx_only_predicted_rx)
-    if np.count_nonzero(finite_tx_only_rx) >= 2:
-        tx_only_rx_range = float(
-            np.nanmax(tx_only_predicted_rx[finite_tx_only_rx])
-            - np.nanmin(tx_only_predicted_rx[finite_tx_only_rx])
-        )
-    elif np.count_nonzero(finite_tx_only_rx) == 1:
-        tx_only_rx_range = 0.0
-    else:
-        tx_only_rx_range = float("nan")
-
-    finite_alloc = np.isfinite(allocated)
-    if np.count_nonzero(finite_alloc) >= 2:
-        actual_tx_range = float(
-            np.nanmax(allocated[finite_alloc])
-            - np.nanmin(allocated[finite_alloc])
-        )
-    elif np.count_nonzero(finite_alloc) == 1:
-        actual_tx_range = 0.0
-    else:
-        actual_tx_range = float("nan")
-
-    finite_rx = np.isfinite(predicted_rx)
-    if np.count_nonzero(finite_rx) >= 2:
-        actual_rx_range = float(
-            np.nanmax(predicted_rx[finite_rx])
-            - np.nanmin(predicted_rx[finite_rx])
-        )
-    elif np.count_nonzero(finite_rx) == 1:
-        actual_rx_range = 0.0
-    else:
-        actual_rx_range = float("nan")
-
-    if success and invalid_reasons:
-        status = "partial"
-        reason = f"{len(invalid_reasons)} tone(s) were not allocated"
-    elif success:
-        status = "success"
-        reason = ""
-    else:
-        status = "failed"
-
-    initial_params = _balanced_param_arrays(
-        summary,
-        best_rows,
-        tone_count,
-        initial_chosen,
-        use_readback_power=use_readback_power,
-    )
-    tx_only_params = _balanced_param_arrays(
-        summary,
-        best_rows,
-        tone_count,
-        tx_only_power,
-        use_readback_power=use_readback_power,
-    )
-    rx_constrained_params = _balanced_param_arrays(
-        summary,
-        best_rows,
-        tone_count,
-        allocated,
-        use_readback_power=use_readback_power,
-    )
-
-    return {
-        "tone_index": tone_index,
-        "allocated_power_dbm": allocated,
-        "initial_chosen_power_dbm": initial_chosen,
-        "p_bif": p_bif,
-        "p_bif_sub_3db": p_bif_sub_3db,
-        "power_cap_dbm": caps,
-        "power_cap_source": cap_source_per_tone.tolist(),
-        "power_target_dbm": targets,
-        "tx_only_power_dbm": tx_only_power,
-        "rx_constrained_power_dbm": allocated,
-        "initial_bifurcation_margin_db": initial_bif_margin,
-        "tx_only_bifurcation_margin_db": tx_only_bif_margin,
-        "bifurcation_margin_db": final_bif_margin,
-        "rx_constrained_bifurcation_margin_db": final_bif_margin,
-        "initial_cap_margin_db": initial_cap_margin,
-        "tx_only_cap_margin_db": tx_only_cap_margin,
-        "cap_margin_db": final_cap_margin,
-        "rx_constrained_cap_margin_db": final_cap_margin,
-        "rx_offsets_db": rx_offsets,
-        "initial_predicted_rx_level_db": initial_predicted_rx,
-        "tx_only_predicted_rx_level_db": tx_only_predicted_rx,
-        "predicted_rx_level_db": predicted_rx,
-        "initial_params": initial_params,
-        "tx_only_params": tx_only_params,
-        "rx_constrained_params": rx_constrained_params,
-        "valid_mask": valid,
-        "status": status,
-        "success": bool(success),
-        "reason": reason,
-        "invalid_reasons": invalid_reasons,
-        "constraints": {
-            "cap_source": source,
-            "target_source": target_source,
-            "cap_margin_db": float(cap_margin_db),
-            "missing_cap_policy": missing_cap_policy,
-            "use_readback_power": bool(use_readback_power),
-            "tx_power_range_db": tx_power_range_db,
-            "rx_level_range_db": rx_level_range_db,
-            "objective": objective,
-        },
-        "actual_tx_power_range_db": actual_tx_range,
-        "actual_rx_level_range_db": actual_rx_range,
-        "tx_only_tx_power_range_db": tx_only_tx_range,
-        "tx_only_rx_level_range_db": tx_only_rx_range,
-        "feasibility": {
-            "rx_offset_range_db": rx_offset_range,
-            "min_rx_level_range_db_for_tx_range": min_rx_range_for_tx,
-            "min_tx_power_range_db_for_rx_range": min_tx_range_for_rx,
-            "note": rx_feasibility_note,
-        },
-        "solver": {
-            "name": "scipy.optimize.linprog",
-            "status": solver_status,
-            "message": solver_message,
-        },
-        "tx_only_solver": {
-            "name": "scipy.optimize.linprog",
-            "success": bool(tx_only_success),
-            "reason": tx_only_reason,
-            "status": tx_only_solver_status,
-            "message": tx_only_solver_message,
-        },
-    }
-
-
-_BALANCED_POWER_ARRAY_KEYS = (
-    "tone_index",
-    "allocated_power_dbm",
-    "initial_chosen_power_dbm",
-    "p_bif",
-    "p_bif_sub_3db",
-    "power_cap_dbm",
-    "power_target_dbm",
-    "tx_only_power_dbm",
-    "rx_constrained_power_dbm",
-    "initial_bifurcation_margin_db",
-    "tx_only_bifurcation_margin_db",
-    "bifurcation_margin_db",
-    "rx_constrained_bifurcation_margin_db",
-    "initial_cap_margin_db",
-    "tx_only_cap_margin_db",
-    "cap_margin_db",
-    "rx_constrained_cap_margin_db",
-    "rx_offsets_db",
-    "initial_predicted_rx_level_db",
-    "tx_only_predicted_rx_level_db",
-    "predicted_rx_level_db",
-    "valid_mask",
-)
-
-
-def _restore_balanced_array(values, *, dtype=float):
-    """Rebuild a saved balanced-power column, mapping JSON ``null`` to NaN."""
-    values = [] if values is None else values
-    if dtype is bool:
-        return np.asarray(values, dtype=bool)
-    if dtype is int:
-        return np.asarray(values, dtype=int)
-    return np.asarray(
-        [np.nan if value is None else value for value in values],
-        dtype=float,
-    )
-
-
-def balanced_power_arrays(balanced_power, tone_count=None):
-    """Return the main arrays from ``balance_tone_powers`` output.
-
-    Parameters
-    ----------
-    balanced_power : dict or str or Path
-        An :py:func:`balance_tone_powers` result, or a path to a
-        JSON file written by :py:func:`write_balanced_power`.
-    tone_count : int or None, optional
-        Pad/validate the output to this many tones; ``None`` (default) infers
-        it from the allocated-power array.
-    """
-    if isinstance(balanced_power, (str, Path)):
-        balanced_power = load_balanced_power(balanced_power)
-    if not isinstance(balanced_power, dict):
-        raise TypeError("balanced_power must be a dict or path.")
-
-    if "allocated_power_dbm" not in balanced_power:
-        raise ValueError("balanced_power is missing allocated_power_dbm.")
-    allocated = np.asarray(balanced_power["allocated_power_dbm"], dtype=float).ravel()
-    inferred = allocated.size
-    if tone_count is None:
-        tone_count = inferred
-    else:
-        tone_count = int(tone_count)
-        if tone_count < inferred:
-            raise ValueError("tone_count is smaller than balanced_power arrays.")
-
-    out = {
-        "tone_index": np.arange(tone_count, dtype=int),
-        "allocated_power_dbm": np.full(tone_count, np.nan, dtype=float),
-        "initial_chosen_power_dbm": np.full(tone_count, np.nan, dtype=float),
-        "p_bif": np.full(tone_count, np.nan, dtype=float),
-        "p_bif_sub_3db": np.full(tone_count, np.nan, dtype=float),
-        "power_cap_dbm": np.full(tone_count, np.nan, dtype=float),
-        "power_target_dbm": np.full(tone_count, np.nan, dtype=float),
-        "tx_only_power_dbm": np.full(tone_count, np.nan, dtype=float),
-        "rx_constrained_power_dbm": np.full(tone_count, np.nan, dtype=float),
-        "initial_bifurcation_margin_db": np.full(tone_count, np.nan, dtype=float),
-        "tx_only_bifurcation_margin_db": np.full(tone_count, np.nan, dtype=float),
-        "bifurcation_margin_db": np.full(tone_count, np.nan, dtype=float),
-        "rx_constrained_bifurcation_margin_db": np.full(tone_count, np.nan, dtype=float),
-        "initial_cap_margin_db": np.full(tone_count, np.nan, dtype=float),
-        "tx_only_cap_margin_db": np.full(tone_count, np.nan, dtype=float),
-        "cap_margin_db": np.full(tone_count, np.nan, dtype=float),
-        "rx_constrained_cap_margin_db": np.full(tone_count, np.nan, dtype=float),
-        "rx_offsets_db": np.full(tone_count, np.nan, dtype=float),
-        "initial_predicted_rx_level_db": np.full(tone_count, np.nan, dtype=float),
-        "tx_only_predicted_rx_level_db": np.full(tone_count, np.nan, dtype=float),
-        "predicted_rx_level_db": np.full(tone_count, np.nan, dtype=float),
-        "valid_mask": np.zeros(tone_count, dtype=bool),
-    }
-    for key in _BALANCED_POWER_ARRAY_KEYS:
-        if key not in balanced_power:
-            continue
-        dtype = bool if key == "valid_mask" else int if key == "tone_index" else float
-        arr = _restore_balanced_array(balanced_power[key], dtype=dtype)
-        if arr.size > tone_count:
-            raise ValueError(f"{key} is longer than tone_count.")
-        out[key][: arr.size] = arr
-    return out
-
-
-def write_balanced_power(balanced_power, path):
-    """Save balanced-power allocation output to JSON.
-
-    Parameters
-    ----------
-    balanced_power : dict
-        An :py:func:`balance_tone_powers` result.
-    path : str or Path
-        Output file, or a directory/extension-less path under which
-        ``analysis/balanced_power.json`` is written.  Returns the file path.
-    """
-    target = Path(path)
-    if target.is_dir() or target.suffix == "":
-        target = target / BALANCED_POWER_FILE
-    target.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "kind": "souk_readout_tools.balanced_power",
-        "created": time.strftime("%Y-%m-%d %H:%M:%S %z"),
-        "result": _jsonify_best_row(balanced_power),
-    }
-    with target.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-    return target
-
-
-def load_balanced_power(path):
-    """Load a balanced-power allocation written by ``write_balanced_power``.
-
-    Parameters
-    ----------
-    path : str or Path
-        The JSON file, or a directory containing
-        ``analysis/balanced_power.json``.
-    """
-    source = Path(path)
-    if source.is_dir():
-        source = source / BALANCED_POWER_FILE
-    with source.open(encoding="utf-8") as handle:
-        payload = json.load(handle)
-    result = payload.get("result", payload) if isinstance(payload, dict) else payload
-    if not isinstance(result, dict):
-        raise ValueError(f"{source} is not a balanced-power JSON file.")
-    out = dict(result)
-    reasons = out.get("invalid_reasons")
-    if isinstance(reasons, dict):
-        out["invalid_reasons"] = {int(k): v for k, v in reasons.items()}
-    for key in _BALANCED_POWER_ARRAY_KEYS:
-        if key not in out:
-            continue
-        dtype = bool if key == "valid_mask" else int if key == "tone_index" else float
-        out[key] = _restore_balanced_array(out[key], dtype=dtype)
-    return out
-
-
-def write_best_power(best_power, path):
-    """Save the list returned by :py:func:`find_best_power` to JSON.
-
-    ``path`` may be a file name or a directory; for a directory, the file
-    is written as ``analysis/best_power.json`` inside it.  The full per-tone
-    dicts are preserved (every criterion pick, exclusion reason, and
-    diagnostic field), so the load round-trip is lossless apart from NumPy
-    scalar types being normalised to Python floats/ints.  Returns the path
-    that was written.
-    """
-    if isinstance(best_power, dict):
-        best_power = [best_power]
-    target = Path(path)
-    if target.is_dir() or target.suffix == "":
-        target = target / BEST_POWER_FILE
-    target.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "kind": "souk_readout_tools.best_power",
-        "created": time.strftime("%Y-%m-%d %H:%M:%S %z"),
-        "tones": [_jsonify_best_row(row) for row in best_power],
-    }
-    with target.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-    return target
-
-
-def load_best_power(path):
-    """Load a best-power list previously written by :py:func:`write_best_power`.
-
-    ``path`` may point at the JSON file directly or at the run directory that
-    contains ``analysis/best_power.json``.  ``exclude_reasons`` keys are
-    restored from strings to ``int`` so the loaded rows are interchangeable
-    with an in-memory :py:func:`find_best_power` result.
-    """
-    source = Path(path)
-    if source.is_dir():
-        source = source / BEST_POWER_FILE
-    with source.open(encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if isinstance(payload, list):
-        rows = payload  # legacy format: bare list of rows
-    else:
-        rows = payload.get("tones", [])
-    return [_restore_best_row(row) for row in rows]
-
-
-def _jsonify_best_row(row):
-    """Convert a best-power row to JSON-native types (recursive)."""
-    if isinstance(row, dict):
-        return {str(k): _jsonify_best_row(v) for k, v in row.items()}
-    if isinstance(row, (list, tuple)):
-        return [_jsonify_best_row(v) for v in row]
-    if isinstance(row, (np.integer,)):
-        return int(row)
-    if isinstance(row, (np.floating,)):
-        value = float(row)
-        return value if np.isfinite(value) else None
-    if isinstance(row, float):
-        return row if np.isfinite(row) else None
-    if isinstance(row, np.ndarray):
-        return [_jsonify_best_row(v) for v in row.tolist()]
-    return row
-
-
-def _restore_best_row(row):
-    """Restore int-keyed ``exclude_reasons`` and ``NaN`` floats after a JSON load."""
-    if not isinstance(row, dict):
-        return row
-    out = dict(row)
-    reasons = out.get("exclude_reasons")
-    if isinstance(reasons, dict):
-        out["exclude_reasons"] = {int(k): v for k, v in reasons.items()}
-    for key in ("chosen_power_dbm", "p_bif", "p_bif_sub_3db", "bifurcation_anl"):
-        if key in out and out[key] is None:
-            out[key] = float("nan")
-    chosen_params = out.get("chosen_params")
-    if isinstance(chosen_params, dict):
-        out["chosen_params"] = {
-            k: (float("nan") if v is None else v)
-            for k, v in chosen_params.items()
-        }
-    return out
-
-
-def _linear_interp_extrap(xs, ys, target):
-    """Linear interpolation in ``xs`` with linear extrapolation outside.
-
-    Returns ``(value, extrapolated)``.  Outside the data range the line is
-    extended through the two nearest endpoints.  With a single point the
-    constant is returned and ``extrapolated`` reflects whether ``target``
-    matches that point.
-    """
-    if xs.size == 0 or not np.isfinite(target):
-        return float("nan"), False
-    if xs.size == 1:
-        return float(ys[0]), bool(target != xs[0])
-    order = np.argsort(xs)
-    xs = xs[order]
-    ys = ys[order]
-    if target < xs[0]:
-        x0, x1, y0, y1 = xs[0], xs[1], ys[0], ys[1]
-        if x1 == x0:
-            return float(y0), True
-        return float(y0 + (target - x0) * (y1 - y0) / (x1 - x0)), True
-    if target > xs[-1]:
-        x0, x1, y0, y1 = xs[-2], xs[-1], ys[-2], ys[-1]
-        if x1 == x0:
-            return float(y1), True
-        return float(y0 + (target - x0) * (y1 - y0) / (x1 - x0)), True
-    return float(np.interp(target, xs, ys)), False
-
-
-def _nearest_finite_value(rows, powers, target_power, key):
-    """Return the first finite ``rows[i][key]`` ordered by |power - target|.
-
-    Returns ``NaN`` when no row has a finite value for ``key``.
-    """
-    if len(rows) == 0 or not np.isfinite(target_power):
-        return float("nan")
-    distances = np.abs(np.asarray(powers, dtype=float) - float(target_power))
-    distances = np.where(np.isfinite(distances), distances, np.inf)
-    for i in np.argsort(distances):
-        try:
-            v = float(rows[i].get(key, np.nan))
-        except (TypeError, ValueError):
-            continue
-        if np.isfinite(v):
-            return v
-    return float("nan")
-
-
-def _interpolated_params_at_power(
-    rows, valid_mask, powers, target_power_dbm, *, anl_fit
-):
-    """Interpolate parameter-like fit-summary values at ``target_power_dbm``.
-
-    Uses the Stage-1-valid rows (``valid_mask``) as the support for linear
-    interpolation against ``power_dbm``, with linear extrapolation outside
-    the measured range.  ``anl`` is evaluated from the existing log(anl)
-    fit when it is reliable so the result is consistent with the
-    ``anl_power_law`` pick.  Returns a dict with one entry per key in
-    :data:`_INTERPOLATABLE_FIT_KEYS` plus:
-
-    - ``power_dbm``: the target power echoed for convenience.
-    - ``extrapolated``: ``True`` if any interpolated value used
-      extrapolation outside the support range (or if ``anl`` was solved
-      outside the ANL fit's clipped power range).
-    - ``n_rows_used``: number of Stage-1-valid rows available.
-    - ``fr_source``: how ``fr`` was obtained — ``"interpolated"`` when the
-      linear interpolation produced a finite value, otherwise the fallback
-      that supplied it: ``"nearest_fitted"`` (nearest row's fitted ``fr``),
-      ``"nearest_empirical"`` (nearest row's ``empirical_fr``),
-      ``"nearest_sweep_center"`` (nearest row's ``sweep_center_hz``), or
-      ``"unavailable"`` if no fallback was usable.  When a fallback is
-      used, ``fr`` is overwritten so it is never ``NaN`` as long as at
-      least one row has any of those fields.
-    """
-    try:
-        target = float(target_power_dbm)
-    except (TypeError, ValueError):
-        target = float("nan")
-    n_rows_used = int(np.count_nonzero(valid_mask)) if valid_mask is not None else 0
-    out = {
-        "power_dbm": target if np.isfinite(target) else float("nan"),
-        "extrapolated": False,
-        "n_rows_used": n_rows_used,
-        "fr_source": "unavailable",
-    }
-    for key in _INTERPOLATABLE_FIT_KEYS:
-        out[key] = float("nan")
-
-    valid_indices = (
-        np.flatnonzero(valid_mask) if valid_mask is not None else np.arange(len(rows))
-    )
-    if np.isfinite(target) and valid_indices.size:
-        valid_powers = powers[valid_indices]
-        finite_pwr = np.isfinite(valid_powers)
-        valid_indices = valid_indices[finite_pwr]
-        valid_powers = valid_powers[finite_pwr]
-    else:
-        valid_indices = np.array([], dtype=int)
-        valid_powers = np.array([], dtype=float)
-
-    extrapolated_any = False
-    if np.isfinite(target) and valid_indices.size:
-        for key in _INTERPOLATABLE_FIT_KEYS:
-            if (
-                key == "anl"
-                and anl_fit is not None
-                and bool(anl_fit.get("reliable", False))
-            ):
-                slope = float(anl_fit.get("slope_log_anl_per_db", float("nan")))
-                intercept = float(anl_fit.get("intercept_log_anl", float("nan")))
-                if np.isfinite(slope) and np.isfinite(intercept):
-                    out[key] = float(np.exp(slope * target + intercept))
-                    fit_mask = np.asarray(anl_fit.get("fit_mask", []), dtype=bool)
-                    if fit_mask.size and np.any(fit_mask):
-                        fit_powers = powers[np.flatnonzero(fit_mask)]
-                        fit_powers = fit_powers[np.isfinite(fit_powers)]
-                        if fit_powers.size and (
-                            target < fit_powers.min() or target > fit_powers.max()
-                        ):
-                            extrapolated_any = True
-                    continue
-
-            ys = np.empty(valid_indices.size, dtype=float)
-            for j, i in enumerate(valid_indices):
-                try:
-                    ys[j] = float(rows[i].get(key, np.nan))
-                except (TypeError, ValueError):
-                    ys[j] = float("nan")
-            finite = np.isfinite(ys)
-            xs = valid_powers[finite]
-            ys = ys[finite]
-            value, was_extrap = _linear_interp_extrap(xs, ys, target)
-            out[key] = value
-            if was_extrap:
-                extrapolated_any = True
-    out["extrapolated"] = bool(extrapolated_any)
-
-    if np.isfinite(out["fr"]):
-        out["fr_source"] = "interpolated"
-    else:
-        for source_key, source_label in (
-            ("fr", "nearest_fitted"),
-            ("empirical_fr", "nearest_empirical"),
-            ("sweep_center_hz", "nearest_sweep_center"),
-        ):
-            value = _nearest_finite_value(rows, powers, target, source_key)
-            if np.isfinite(value):
-                out["fr"] = value
-                out["fr_source"] = source_label
-                break
-
-    return out
-
-
-def _find_best_power_for_tone(
-    tone_index,
-    tone_rows,
-    *,
-    target_anl,
-    bifurcation_anl,
-    param_valid_ranges,
-    param_outliers_mad_clip,
-    param_uncertainty_outlier_mad_clip,
-    require_success,
-    use_readback_power,
-    anl_fit_min_points,
-    anl_fit_clip_sigma,
-    anl_fit_min_slope,
-    anl_fit_weight_by_uncertainty,
-):
-    """Per-tone implementation backing :py:func:`find_best_power`."""
-
-    def _power(row):
-        if use_readback_power:
-            value = row.get("readback_power_dbm", np.nan)
-            try:
-                value = float(value)
-            except (TypeError, ValueError):
-                value = np.nan
-            if np.isfinite(value):
-                return value
-        try:
-            return float(row.get("power_dbm", np.nan))
-        except (TypeError, ValueError):
-            return np.nan
-
-    def _power_sort_key(row):
-        power = _power(row)
-        return (not np.isfinite(power), power if np.isfinite(power) else 0.0)
-
-    rows = sorted(tone_rows, key=_power_sort_key)
-    n = len(rows)
-    sweep_idx = np.array([int(r["sweep_index"]) for r in rows], dtype=int)
-    powers = np.array([_power(r) for r in rows], dtype=float)
-
-    def _column(name):
-        out = np.empty(n, dtype=float)
-        for i, row in enumerate(rows):
-            try:
-                out[i] = float(row.get(name, np.nan))
-            except (TypeError, ValueError):
-                out[i] = np.nan
-        return out
-
-    # Stage 1: per-row auto-exclusion.
-    excluded = np.zeros(n, dtype=bool)
-    exclude_reason = [""] * n
-    anl_fit_excluded = np.zeros(n, dtype=bool)
-    anl_fit_exclude_reason = [""] * n
-
-    # 1a: solver-reported failure.
-    if require_success:
-        for i, row in enumerate(rows):
-            success = row.get("success", True)
-            if isinstance(success, str):
-                success = success.strip().lower() not in {"false", "0", "no"}
-            if success is False or success == 0:
-                excluded[i] = True
-                exclude_reason[i] = "success=False"
-
-    # 1b: per-parameter validity-range exclusion (catches parameters pegged
-    # at a fitter clamp). Low-clamped ANL values are useful for the measured
-    # threshold fallback, but not for fitting the ANL-vs-power slope.
-    for name, (lo, hi) in param_valid_ranges.items():
-        values = _column(name)
-        if name == "anl":
-            low_pegged = (~excluded) & np.isfinite(values) & (values <= lo)
-            for i in np.flatnonzero(low_pegged):
-                anl_fit_excluded[i] = True
-                anl_fit_exclude_reason[i] = f"{name} outside ({lo:g}, {hi:g})"
-            high_pegged = (~excluded) & np.isfinite(values) & (values >= hi)
-            for i in np.flatnonzero(high_pegged):
-                excluded[i] = True
-                exclude_reason[i] = f"{name} outside ({lo:g}, {hi:g})"
-                anl_fit_excluded[i] = True
-                anl_fit_exclude_reason[i] = exclude_reason[i]
-            continue
-        out_of_range = (
-            (~excluded)
-            & np.isfinite(values)
-            & ((values <= lo) | (values >= hi))
-        )
-        for i in np.flatnonzero(out_of_range):
-            excluded[i] = True
-            exclude_reason[i] = f"{name} outside ({lo:g}, {hi:g})"
-
-    # 1c: per-tone MAD outlier check on parameters expected to be
-    # near-constant across powers.
-    if param_outliers_mad_clip is not None:
-        clip_k = float(param_outliers_mad_clip)
-        for key in _MAD_OUTLIER_CHECK_PARAMS:
-            values = _column(key)
-            eligible = (~excluded) & np.isfinite(values)
-            if np.count_nonzero(eligible) < 3:
-                continue
-            ref = values[eligible]
-            centre = float(np.median(ref))
-            scale = _MAD_TO_SIGMA * float(np.median(np.abs(ref - centre)))
-            if not (np.isfinite(scale) and scale > 0.0):
-                continue
-            deviation = np.abs(values - centre)
-            flag = eligible & (deviation > clip_k * scale)
-            for i in np.flatnonzero(flag):
-                excluded[i] = True
-                exclude_reason[i] = (
-                    f"{key} outside median ± {clip_k:g}*MAD"
-                )
-
-    # 1d: per-tone MAD outlier check on the uncertainty of those same
-    # parameters, so rows with wildly inflated <name>_err are dropped.
-    if param_uncertainty_outlier_mad_clip is not None:
-        clip_k = float(param_uncertainty_outlier_mad_clip)
-        for key in _MAD_OUTLIER_CHECK_PARAMS:
-            err_key = f"{key}_err"
-            values = _column(err_key)
-            eligible = (~excluded) & np.isfinite(values)
-            if np.count_nonzero(eligible) < 3:
-                continue
-            ref = values[eligible]
-            centre = float(np.median(ref))
-            scale = _MAD_TO_SIGMA * float(np.median(np.abs(ref - centre)))
-            if not (np.isfinite(scale) and scale > 0.0):
-                continue
-            deviation = np.abs(values - centre)
-            flag = eligible & (deviation > clip_k * scale)
-            for i in np.flatnonzero(flag):
-                excluded[i] = True
-                exclude_reason[i] = (
-                    f"{err_key} outside median ± {clip_k:g}*MAD"
-                )
-
-    # Stage 2: derived columns and validity mask.
-    anl = _column("anl")
-    anl_err = _column("anl_err")
-    valid = ~excluded
-    anl_fit_valid = valid & ~anl_fit_excluded
-    anl_ok = (
-        valid
-        & np.isfinite(anl)
-        & (anl > 0.0)
-        & (anl < float(target_anl))
-    )
-    # Highest power index that still satisfies the ANL ceiling, or -1 if none.
-    _anl_ok_indices = np.flatnonzero(anl_ok)
-    anl_idx = int(_anl_ok_indices[-1]) if _anl_ok_indices.size else -1
-
-    try:
-        _bifurcation_anl_value = float(bifurcation_anl)
-    except (TypeError, ValueError):
-        _bifurcation_anl_value = float("nan")
-    try:
-        _target_anl_value = float(target_anl)
-    except (TypeError, ValueError):
-        _target_anl_value = float("nan")
-    if (
-        np.isfinite(_bifurcation_anl_value)
-        and _bifurcation_anl_value > 0.0
-        and np.isfinite(_target_anl_value)
-    ):
-        anl_safe = (
-            valid
-            & np.isfinite(anl)
-            & np.isfinite(powers)
-            & (anl > 0.0)
-            & (anl < _bifurcation_anl_value)
-        )
-        safe_indices = np.flatnonzero(anl_safe)
-        if safe_indices.size:
-            nearest_target_idx = int(
-                safe_indices[
-                    np.argmin(np.abs(anl[safe_indices] - _target_anl_value))
-                ]
-            )
-        else:
-            nearest_target_idx = -1
-    else:
-        nearest_target_idx = -1
-
-    # Stage 3: ANL power-law fit on the non-excluded rows, skipping
-    # low-clamped ANL values that should not pull the fit slope down.
-    anl_fit = _fit_log_anl_power_law(
-        powers,
-        anl,
-        anl_fit_valid,
-        anl_err=anl_err,
-        target_anl=target_anl,
-        min_points=anl_fit_min_points,
-        clip_sigma=anl_fit_clip_sigma,
-        min_slope=anl_fit_min_slope,
-        weight_by_uncertainty=anl_fit_weight_by_uncertainty,
-    )
-
-    # Rows excluded from the ANL fit because anl pegged at a fitter bound;
-    # tracked separately so plots can mark them distinctly from generic
-    # excluded rows.
-    anl_pegged_sweep_indices = [
-        int(sweep_idx[i])
-        for i in range(n)
-        if (
-            anl_fit_excluded[i]
-            and anl_fit_exclude_reason[i].startswith("anl outside")
-        )
-    ]
-    anl_pegged = bool(anl_pegged_sweep_indices) and not np.any(
-        anl_fit_valid & np.isfinite(anl)
-    )
-
-    def _pack(i):
-        if i < 0:
-            return None
-        return {
-            "sweep_index": int(sweep_idx[i]),
-            "power_dbm": float(powers[i]),
-            "anl": float(anl[i]),
-        }
-
-    def _lowest_power_pick():
-        finite_power_indices = np.flatnonzero(np.isfinite(powers))
-        if finite_power_indices.size:
-            i = int(finite_power_indices[np.argmin(powers[finite_power_indices])])
-        elif n:
-            i = 0
-        else:
-            return None
-        return {
-            "sweep_index": int(sweep_idx[i]),
-            "power_dbm": float(powers[i]),
-            "anl": float(anl[i]),
-            "reason": (
-                "no reliable fit-derived pick; using lowest stepped power"
-            ),
-        }
-
-    def _pack_anl_power_law():
-        fit_mask = np.asarray(anl_fit["fit_mask"], dtype=bool)
-        outlier_mask = np.asarray(anl_fit["outlier_mask"], dtype=bool)
-        target_power = anl_fit.get("target_power_dbm")
-        range_position = anl_fit.get("range_position", "unavailable")
-        reliable = bool(anl_fit.get("reliable", False))
-        try:
-            bifurcation_anl_value = float(bifurcation_anl)
-        except (TypeError, ValueError):
-            bifurcation_anl_value = float("nan")
-        p_bif = (
-            _solve_log_anl_power(
-                float(anl_fit["slope_log_anl_per_db"]),
-                float(anl_fit["intercept_log_anl"]),
-                bifurcation_anl_value,
-            )
-            if reliable else float("nan")
-        )
-        p_bif_sub_3db = (
-            float(p_bif - DEFAULT_BIFURCATION_BACKOFF_DB)
-            if np.isfinite(p_bif) else float("nan")
-        )
-        reference_idx = -1
-        if target_power is not None and np.any(fit_mask):
-            fit_indices = np.flatnonzero(fit_mask)
-            reference_idx = int(
-                fit_indices[np.argmin(np.abs(powers[fit_indices] - target_power))]
-            )
-
-        # When the fit is reliable, always use the (extrapolated if needed)
-        # target power solved from the log(anl) line. ``range_position`` is
-        # kept as a diagnostic only.
-        if reliable and target_power is not None:
-            selected_power = float(target_power)
-        else:
-            selected_power = None
-
-        return {
-            "criterion": "anl_power_law",
-            "reliable": reliable,
-            "reason": anl_fit.get("reason", ""),
-            "target_anl": float(target_anl),
-            "bifurcation_anl": bifurcation_anl_value,
-            "power_dbm": selected_power,
-            "p_bif": p_bif,
-            "p_bif_sub_3db": p_bif_sub_3db,
-            "sweep_index": None,
-            "reference_sweep_index": (
-                int(sweep_idx[reference_idx]) if reference_idx >= 0 else None
-            ),
-            "target_power_dbm": target_power,
-            "range_position": range_position,
-            "slope_log_anl_per_db": float(anl_fit["slope_log_anl_per_db"]),
-            "intercept_log_anl": float(anl_fit["intercept_log_anl"]),
-            "initial_slope_log_anl_per_db": float(
-                anl_fit["initial_slope_log_anl_per_db"]
-            ),
-            "initial_intercept_log_anl": float(
-                anl_fit["initial_intercept_log_anl"]
-            ),
-            "weighted": bool(anl_fit.get("weighted", False)),
-            "weight_source": str(anl_fit.get("weight_source", "unweighted")),
-            "fit_sweep_indices": [
-                int(sweep_idx[i]) for i in range(n) if fit_mask[i]
-            ],
-            "outlier_sweep_indices": [
-                int(sweep_idx[i]) for i in range(n) if outlier_mask[i]
-            ],
-            "pegged_sweep_indices": list(anl_pegged_sweep_indices),
-        }
-
-    anl_power_law_pick = _pack_anl_power_law()
-    anl_pick = _pack(anl_idx)
-    anl_nearest_target_pick = _pack(nearest_target_idx)
-    lowest_power_pick = _lowest_power_pick()
-
-    # Stage 4: choose the most reliable available criterion.  The continuous
-    # ANL power-law pick wins when it passed its diagnostics; otherwise fall
-    # back to the highest-power row whose measured anl is below the target,
-    # then to the row whose measured anl is nearest to the target among
-    # those still below the bifurcation threshold, and finally to the
-    # lowest measured power.
-    chosen_power = None
-    chosen_sweep = None
-    chosen_reference = None
-    criterion = "none"
-    if (
-        anl_power_law_pick["reliable"]
-        and anl_power_law_pick["power_dbm"] is not None
-    ):
-        chosen_power = anl_power_law_pick["power_dbm"]
-        chosen_sweep = anl_power_law_pick["sweep_index"]
-        chosen_reference = anl_power_law_pick["reference_sweep_index"]
-        criterion = anl_power_law_pick["criterion"]
-    elif anl_pick is not None:
-        chosen_power = anl_pick["power_dbm"]
-        chosen_sweep = anl_pick["sweep_index"]
-        chosen_reference = chosen_sweep
-        criterion = "anl_threshold"
-    elif anl_nearest_target_pick is not None:
-        chosen_power = anl_nearest_target_pick["power_dbm"]
-        chosen_sweep = anl_nearest_target_pick["sweep_index"]
-        chosen_reference = chosen_sweep
-        criterion = "anl_nearest_target"
-    try:
-        chosen_power_is_finite = np.isfinite(float(chosen_power))
-    except (TypeError, ValueError):
-        chosen_power_is_finite = False
-    if not chosen_power_is_finite and lowest_power_pick is not None:
-        chosen_power = lowest_power_pick["power_dbm"]
-        chosen_sweep = lowest_power_pick["sweep_index"]
-        chosen_reference = chosen_sweep
-        criterion = "lowest_power_fallback"
-
-    chosen_params = _interpolated_params_at_power(
-        rows, valid, powers, chosen_power, anl_fit=anl_fit
-    )
-
-    return {
-        "tone_index": int(tone_index),
-        "chosen_sweep_index": chosen_sweep,
-        "chosen_reference_sweep_index": chosen_reference,
-        "chosen_power_dbm": chosen_power,
-        "chosen_criterion": criterion,
-        "chosen_params": chosen_params,
-        "bifurcation_anl": anl_power_law_pick["bifurcation_anl"],
-        "p_bif": anl_power_law_pick["p_bif"],
-        "p_bif_sub_3db": anl_power_law_pick["p_bif_sub_3db"],
-        "anl_power_law_pick": anl_power_law_pick,
-        "anl_pick": anl_pick,
-        "anl_nearest_target_pick": anl_nearest_target_pick,
-        "lowest_power_pick": lowest_power_pick,
-        "criteria": {
-            "anl_power_law": anl_power_law_pick,
-            "anl_threshold": anl_pick,
-            "anl_nearest_target": anl_nearest_target_pick,
-            "lowest_power_fallback": lowest_power_pick,
-        },
-        "anl_pegged": bool(anl_pegged),
-        "excluded_sweep_indices": [
-            int(sweep_idx[i]) for i in range(n) if excluded[i]
-        ],
-        "exclude_reasons": {
-            int(sweep_idx[i]): exclude_reason[i]
-            for i in range(n)
-            if excluded[i]
-        },
-        "anl_outlier_sweep_indices": anl_power_law_pick["outlier_sweep_indices"],
-        "anl_pegged_sweep_indices": anl_power_law_pick["pegged_sweep_indices"],
-    }
 
 
 def _fit_data_tone_indices(summary):
