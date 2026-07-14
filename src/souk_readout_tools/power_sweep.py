@@ -1,4 +1,59 @@
-"""Acquire, fit, summarize, and plot targeted sweeps at several tone powers."""
+"""Tone-power sweeps: acquisition, fitting, power selection, and balancing.
+
+Workflow
+--------
+1. Acquire a run (hardware attached), or reload a previous one::
+
+       from souk_readout_tools import power_sweep as ps
+
+       run = ps.run_power_sweep(client, centers, spans, powers_dbm,
+                                output_dir="kid_power_sweep")
+       run = ps.load_power_sweep("kid_power_sweep")
+
+2. Analyse it — fit every tone at every power, write the fit archive and
+   CSV summary, choose a best readout power per tone, render the plots —
+   or reload all of that from disk without recomputing anything::
+
+       analysis = ps.analyse_power_sweep(run, n_jobs=-1)
+       analysis = ps.load_analysis("kid_power_sweep")
+
+       arrays = ps.best_power_arrays(analysis["best_power"])
+
+3. Optionally balance the comb — re-allocate the per-tone powers under
+   bifurcation caps and TX/RX spread constraints::
+
+       balanced = ps.balance_tone_powers(analysis["best_power"])
+       ps.write_balanced_power(balanced, "kid_power_sweep")
+
+Pieces
+------
+The procedures above are assembled from these, all callable directly:
+
+======================  =====================================================
+fit_power_sweep         fit every tone at every power -> ``fit_data``
+parameter_series        one tone's fitted parameters vs power, as 1D arrays
+fit_summary_array       ``fit_data`` as one flat structured table
+write_fit_results /     the fit archive (``analysis/fit_results.pkl``)
+load_fit_results
+write_fit_summary /     the flat table (``analysis/fit_summary.csv``)
+load_fit_summary
+find_best_power         choose a readout power per tone from the summary
+best_power_arrays       best-power rows -> per-tone arrays
+write_best_power /      the chosen powers (``analysis/best_power.json``)
+load_best_power
+balance_tone_powers     re-allocation under bifurcation/TX/RX constraints
+balanced_power_arrays   balanced result -> per-tone arrays
+write_balanced_power /  the balanced powers (``analysis/balanced_power.json``)
+load_balanced_power
+accumulator_level_db    per-tone RX levels (``rx_offsets_db`` for balancing)
+plot_power_sweep        per-tone fit overlays and parameter-vs-power PNGs
+plot_best_power         per-tone ANL-vs-power selection diagnostics
+======================  =====================================================
+
+On disk a run directory holds ``measurement.json`` (the manifest),
+``data/`` (one sweep npz per power step), ``analysis/`` (the four artifact
+files above), and ``plots/``.
+"""
 
 from __future__ import annotations
 
@@ -134,30 +189,38 @@ def _normalise_param_valid_ranges(param_valid_ranges):
     return out
 
 __all__ = [
+    # On-disk artifact locations
     "MANIFEST_FILE",
     "FIT_RESULTS_FILE",
+    "FIT_SUMMARY_FILE",
+    "BEST_POWER_FILE",
     "BALANCED_POWER_FILE",
+    # Whole procedures
     "run_power_sweep",
     "load_power_sweep",
+    "analyse_power_sweep",
+    "load_analysis",
+    # Fitting and the fit-summary table
     "fit_power_sweep",
-    "fit_parameter_series",
-    "fit_summary_rows",
+    "parameter_series",
     "fit_summary_array",
-    "write_fit_summary",
     "write_fit_results",
     "load_fit_results",
-    "analyse_power_sweep",
-    "analyze_power_sweep",
-    "plot_power_sweep",
+    "write_fit_summary",
+    "load_fit_summary",
+    # Best readout power per tone
     "find_best_power",
     "best_power_arrays",
-    "allocate_balanced_tone_powers",
-    "balanced_power_arrays",
-    "accumulator_level_db",
-    "write_balanced_power",
-    "load_balanced_power",
     "write_best_power",
     "load_best_power",
+    # Comb balancing
+    "balance_tone_powers",
+    "balanced_power_arrays",
+    "write_balanced_power",
+    "load_balanced_power",
+    "accumulator_level_db",
+    # Plotting
+    "plot_power_sweep",
     "plot_best_power",
 ]
 
@@ -1275,7 +1338,7 @@ def fit_power_sweep(
     the resulting ``FitResult.parameter_uncertainties`` reflect
     measurement noise rather than the residual size of each individual
     fit. ``min_dip_depth_db`` rejects traces whose empirical dip is too
-    shallow; use ``min_dip_depth_db=None`` to force every optimizer run.
+    shallow; use ``min_dip_depth_db=None`` to force every optimiser run.
 
     Parameters
     ----------
@@ -1324,10 +1387,9 @@ def fit_power_sweep(
         per-tone mode returns
         ``{'run': run, 'tone_index': int, 'fits': [...]}``.  The same
         dict includes ``summary_array``, a structured NumPy array with the
-        same columns and values as :py:func:`fit_summary_rows` / the
-        fit-summary CSV.  It is also stored on ``run['fits']`` so subsequent
-        :py:func:`plot_power_sweep` / :py:func:`fit_summary_rows` calls
-        can omit it.
+        same columns and values as the fit-summary CSV (see
+        :py:func:`fit_summary_array`).  It is also stored on ``run['fits']``
+        so subsequent :py:func:`plot_power_sweep` calls can omit it.
     """
     run = _power_sweep_run_view(run)
 
@@ -1389,7 +1451,7 @@ def fit_power_sweep(
     return fit_data
 
 
-def fit_parameter_series(
+def parameter_series(
     fit_data,
     tone_index,
     parameters=None,
@@ -1401,7 +1463,7 @@ def fit_parameter_series(
     """Return one tone's fit parameters as arrays over the power axis.
 
     This is the interactive-inspection companion to
-    :py:func:`fit_summary_rows`: it keeps the native power-step ordering
+    :py:func:`fit_summary_array`: it keeps the native power-step ordering
     from :py:func:`fit_power_sweep` and fills missing fits with ``NaN`` by
     default.  It works with both ``fits_by_power`` output and the
     ``tone_index=<int>`` single-tone output.
@@ -1440,7 +1502,7 @@ def fit_parameter_series(
         Requested fit parameters are added under their own names, so an
         interactive plot can be as direct as::
 
-            s = fit_parameter_series(fits, tone_index=0)
+            s = parameter_series(fits, tone_index=0)
             plt.plot(s["power_dbm"], s["Qc"] / s["Qi"], marker="o")
     """
     run = fit_data["run"]
@@ -1550,7 +1612,7 @@ def fit_parameter_series(
     return series
 
 
-def fit_summary_rows(fit_data):
+def _fit_summary_rows(fit_data):
     """Flatten fit results into one CSV-friendly row per sweep/tone fit.
 
     Parameters
@@ -1696,9 +1758,8 @@ def _coerce_summary_value(value, dtype):
 def fit_summary_array(fit_data):
     """Return fit-summary rows as a structured NumPy array.
 
-    The field order matches :py:func:`fit_summary_rows` and
-    :py:func:`write_fit_summary`, so interactive inspection can use the
-    same names as the CSV header::
+    The field order matches the CSV written by :py:func:`write_fit_summary`,
+    so interactive inspection can use the same names as the CSV header::
 
         table = fits["summary_array"]
         anl = table["anl"]
@@ -1712,9 +1773,13 @@ def fit_summary_array(fit_data):
     ----------
     fit_data : dict
         A :py:func:`fit_power_sweep` result (the same dict passed to
-        :py:func:`fit_summary_rows`).
+        :py:func:`write_fit_summary`).
     """
-    rows = fit_summary_rows(fit_data)
+    return _rows_to_summary_array(_fit_summary_rows(fit_data))
+
+
+def _rows_to_summary_array(rows):
+    """Pack fit-summary rows (list of dicts) into a structured array."""
     columns = list(rows[0]) if rows else list(_fit_summary_column_names())
     array = np.empty(len(rows), dtype=_fit_summary_array_dtype(rows, columns))
     for row_index, row in enumerate(rows):
@@ -1726,36 +1791,83 @@ def fit_summary_array(fit_data):
     return array
 
 
-def write_fit_summary(fit_data, filename):
-    """Write ``fit_summary_rows`` to a CSV file and return the filename.
+def _fit_summary_path(path):
+    """Resolve a fit-summary path, accepting either a file or run directory."""
+    path = Path(path)
+    if path.exists() and path.is_dir():
+        return path / FIT_SUMMARY_FILE
+    if path.suffix:
+        return path
+    return path / FIT_SUMMARY_FILE
+
+
+def write_fit_summary(fit_data, path=None):
+    """Write the flat fit-summary table to a CSV file and return its path.
+
+    One row per (power step, tone) fit, with the columns described in
+    :py:func:`fit_summary_array`.  Read it back with
+    :py:func:`load_fit_summary`.
 
     Parameters
     ----------
     fit_data : dict
         Output of :py:func:`fit_power_sweep`.
-    filename : str or Path
-        Destination CSV path.  Parent directories are created if missing.
-        If ``fit_data`` produces no rows the file is not written.
+    path : str, Path, or None, optional
+        Destination CSV file or power-sweep directory.  ``None`` (default)
+        writes ``<fit_data['run']['root']>/analysis/fit_summary.csv``.
+        Parent directories are created if missing.  If ``fit_data``
+        produces no rows the file is not written.
 
     Returns
     -------
-    str
-        Resolved filename (as a string).
+    Path
+        The destination path.
     """
-    rows = fit_summary_rows(fit_data)
-    filename = Path(filename)
-    filename.parent.mkdir(parents=True, exist_ok=True)
+    if path is None:
+        root = fit_data.get("run", {}).get("root")
+        if root is None:
+            raise ValueError(
+                "path is required when fit_data['run']['root'] is missing."
+            )
+        path = Path(root) / FIT_SUMMARY_FILE
+    else:
+        path = _fit_summary_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = _fit_summary_rows(fit_data)
     if rows:
-        with filename.open("w", newline="", encoding="utf-8") as handle:
+        with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
-    return str(filename)
+    return path
+
+
+def load_fit_summary(path):
+    """Load a fit-summary CSV back as a structured array.
+
+    The inverse of :py:func:`write_fit_summary`.  Values are restored to
+    float/bool/int/str per column, so the loaded table has the same fields
+    as :py:func:`fit_summary_array` and can be fed straight to
+    :py:func:`find_best_power` or indexed by column name.
+
+    Parameters
+    ----------
+    path : str or Path
+        The CSV file, or a power-sweep run directory containing
+        ``analysis/fit_summary.csv``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Structured array, one record per (power step, tone) fit.
+    """
+    source = _fit_summary_path(path)
+    return _rows_to_summary_array(_coerce_summary_rows(source))
 
 
 _FIT_ARCHIVE_KIND = "souk_readout_tools.power_sweep.fit_results"
 _FIT_ARCHIVE_VERSION = 1
-_FIT_RESULT_OPTIMIZER_FIELDS = (
+_FIT_RESULT_OPTIMISER_FIELDS = (
     "opt",
     "opt_linear",
     "opt_nonlinear",
@@ -1786,17 +1898,17 @@ def _fit_data_step_count(fit_data):
     return len(run.get("sweeps", []))
 
 
-def _archive_fit(fit, include_optimizer):
+def _archive_fit(fit, include_optimiser):
     """Return a fit object suitable for compact persistence."""
-    if include_optimizer or not isinstance(fit, FitResult):
+    if include_optimiser or not isinstance(fit, FitResult):
         return fit
     return replace(
         fit,
-        **{name: None for name in _FIT_RESULT_OPTIMIZER_FIELDS},
+        **{name: None for name in _FIT_RESULT_OPTIMISER_FIELDS},
     )
 
 
-def _archive_fit_data(fit_data, *, include_sweeps, include_optimizer):
+def _archive_fit_data(fit_data, *, include_sweeps, include_optimiser):
     """Return a shallow, acyclic fit_data copy for persistence."""
     if not _is_fit_data(fit_data):
         raise TypeError("fit_data must be the dict returned by fit_power_sweep().")
@@ -1808,12 +1920,12 @@ def _archive_fit_data(fit_data, *, include_sweeps, include_optimizer):
     }
     if "fits_by_power" in fit_data:
         archived["fits_by_power"] = [
-            [_archive_fit(fit, include_optimizer) for fit in fits]
+            [_archive_fit(fit, include_optimiser) for fit in fits]
             for fits in fit_data["fits_by_power"]
         ]
     else:
         archived["fits"] = [
-            _archive_fit(fit, include_optimizer) for fit in fit_data["fits"]
+            _archive_fit(fit, include_optimiser) for fit in fit_data["fits"]
         ]
 
     run = dict(fit_data["run"])
@@ -1826,16 +1938,16 @@ def _archive_fit_data(fit_data, *, include_sweeps, include_optimizer):
 
 def write_fit_results(
     fit_data,
-    filename=None,
+    path=None,
     *,
     include_sweeps=False,
-    include_optimizer=False,
+    include_optimiser=False,
 ):
     """Write ``fit_power_sweep`` results to a pickle archive.
 
     Unlike :py:func:`write_fit_summary`, this preserves the
     :class:`~souk_readout_tools.fitting.FitResult` objects needed by
-    :py:func:`plot_power_sweep`, :py:func:`fit_parameter_series`,
+    :py:func:`plot_power_sweep`, :py:func:`parameter_series`,
     :py:func:`find_best_power`, and later summary export.  By default the
     embedded run metadata is compacted so the archive does not duplicate all
     raw sweeps already stored on disk; pass ``include_sweeps=True`` if you
@@ -1845,55 +1957,54 @@ def write_fit_results(
     ----------
     fit_data : dict
         Output of :py:func:`fit_power_sweep`.
-    filename : str, Path, or None, optional
-        Destination file or power-sweep directory.  ``None`` writes
-        ``<fit_data['run']['root']>/analysis/fit_results.pkl``.
+    path : str, Path, or None, optional
+        Destination file or power-sweep directory.  ``None`` (default)
+        writes ``<fit_data['run']['root']>/analysis/fit_results.pkl``.
     include_sweeps : bool, optional
         Include the raw sweep dictionaries from ``fit_data['run']`` in the
         archive.  Default ``False`` keeps only the metadata needed for
         plotting and summaries.
-    include_optimizer : bool, optional
-        Include raw SciPy optimizer objects and the nonlinear fit's stored
+    include_optimiser : bool, optional
+        Include raw SciPy optimiser objects and the nonlinear fit's stored
         linear seed result.  Default ``False`` keeps the archive smaller while
         preserving fitted parameters, uncertainties, traces, residuals, and
         status fields.
 
     Returns
     -------
-    str
-        Resolved filename (as a string).
+    Path
+        Resolved destination path.
 
     Notes
     -----
     Pickle files should only be loaded from trusted sources.
     """
-    if filename is None:
+    if path is None:
         root = fit_data.get("run", {}).get("root")
         if root is None:
             raise ValueError(
-                "filename is required when fit_data['run']['root'] is missing."
+                "path is required when fit_data['run']['root'] is missing."
             )
-        filename = Path(root) / FIT_RESULTS_FILE
+        path = Path(root) / FIT_RESULTS_FILE
     else:
-        filename = _fit_results_path(filename)
-    filename = Path(filename)
-    filename.parent.mkdir(parents=True, exist_ok=True)
+        path = _fit_results_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     payload = {
         "kind": _FIT_ARCHIVE_KIND,
         "version": _FIT_ARCHIVE_VERSION,
         "created": time.strftime("%Y-%m-%d %H:%M:%S %z"),
         "include_sweeps": bool(include_sweeps),
-        "include_optimizer": bool(include_optimizer),
+        "include_optimiser": bool(include_optimiser),
         "fit_data": _archive_fit_data(
             fit_data,
             include_sweeps=include_sweeps,
-            include_optimizer=include_optimizer,
+            include_optimiser=include_optimiser,
         ),
     }
-    with filename.open("wb") as handle:
+    with path.open("wb") as handle:
         pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    return str(filename.resolve())
+    return path.resolve()
 
 
 def load_fit_results(path, run=None):
@@ -1914,7 +2025,7 @@ def load_fit_results(path, run=None):
     fit_data : dict
         Restored ``fit_power_sweep``-style result.  The result is also stored
         on ``fit_data['run']['fits']`` so it can be passed straight to
-        :py:func:`plot_power_sweep` or :py:func:`fit_parameter_series`.
+        :py:func:`plot_power_sweep` or :py:func:`parameter_series`.
         ``fit_data['summary_array']`` is regenerated from the attached run
         metadata and loaded fits.
 
@@ -1955,7 +2066,8 @@ def analyse_power_sweep(
     target_anl=0.01,
     fit=True,
     save=True,
-    plot=True,
+    plot_fits=True,
+    plot_best=True,
     best_power=True,
     show=False,
     verbose=True,
@@ -1964,12 +2076,20 @@ def analyse_power_sweep(
     best_power_kwargs=None,
     best_plot_kwargs=None,
 ):
-    """Fit, summarize, plot, and choose best tone powers in one call.
+    """Fit, summarise, plot, and choose best tone powers in one call.
 
     This is the notebook-friendly path for the usual post-run workflow.  It
     performs nonlinear ANL fitting by default, writes the compact fit archive
     and CSV summary, finds the best power per tone, and writes both fit plots
     and ANL-vs-power diagnostics.
+
+    The stage switches make partial re-runs cheap.  The common case —
+    re-choose the powers from the stored fits (say with a new
+    ``target_anl``) and refresh only the ANL-vs-power plots, skipping the
+    expensive per-tone fit plots::
+
+        ps.analyse_power_sweep(run, fit=False, plot_fits=False,
+                               target_anl=0.03)
 
     Parameters
     ----------
@@ -1994,9 +2114,14 @@ def analyse_power_sweep(
     save : bool, optional
         Write the fit archive, CSV summary, and best-power JSON (default
         ``True``).
-    plot : bool, optional
-        Write per-tone fit plots, and ANL-vs-power plots when ``best_power``
-        is also set (default ``True``).
+    plot_fits : bool, optional
+        Write the per-tone fit and parameter plots via
+        :py:func:`plot_power_sweep` (default ``True``).  These are the slow
+        ones on a big array; disable them when only the power selection has
+        changed.
+    plot_best : bool, optional
+        Write the ANL-vs-power selection plots via :py:func:`plot_best_power`
+        (default ``True``; requires ``best_power``).
     best_power : bool, optional
         Run :py:func:`find_best_power` and write ``best_power.json`` (default
         ``True``).
@@ -2029,8 +2154,12 @@ def analyse_power_sweep(
     -------
     result : dict
         ``{'run', 'fits', 'fit_file', 'summary_csv', 'best_power',
-        'best_power_file', 'plots', 'best_power_plots'}``; entries for
-        disabled stages are ``None``.
+        'best_power_file', 'balanced_power', 'balanced_power_file',
+        'plots', 'best_power_plots'}``; entries for disabled stages are
+        ``None``.  The ``balanced_power`` entries are always ``None`` here
+        (balancing is a separate step, :py:func:`balance_tone_powers`);
+        they exist so the dict is interchangeable with
+        :py:func:`load_analysis` output.
     """
 
     view = _power_sweep_run_view(run)
@@ -2053,6 +2182,8 @@ def analyse_power_sweep(
         "summary_csv": None,
         "best_power": None,
         "best_power_file": None,
+        "balanced_power": None,
+        "balanced_power_file": None,
         "plots": None,
         "best_power_plots": None,
     }
@@ -2071,10 +2202,8 @@ def analyse_power_sweep(
     result["fits"] = fits
 
     if save:
-        result["fit_file"] = write_fit_results(fits, root)
-        result["summary_csv"] = write_fit_summary(
-            fits, root / FIT_SUMMARY_FILE
-        )
+        result["fit_file"] = str(write_fit_results(fits, root))
+        result["summary_csv"] = str(write_fit_summary(fits, root))
 
     if best_power:
         best = find_best_power(
@@ -2088,7 +2217,7 @@ def analyse_power_sweep(
     else:
         best = None
 
-    if plot:
+    if plot_fits:
         # Per-tone plots are independent; reuse the run-level n_jobs so the
         # convenience path renders in parallel by default (override via
         # plot_kwargs={'n_jobs': ...}).
@@ -2101,22 +2230,77 @@ def analyse_power_sweep(
             verbose=plot_verbose,
             **plot_kwargs,
         )
-        if best_power:
-            best_plot_n_jobs = best_plot_kwargs.pop("n_jobs", n_jobs)
-            result["best_power_plots"] = plot_best_power(
-                fits,
-                best_power=best,
-                target_anl=best_target_anl,
-                show=best_plot_show,
-                n_jobs=best_plot_n_jobs,
-                verbose=best_plot_verbose,
-                **best_plot_kwargs,
-            )
+
+    if plot_best and best_power:
+        best_plot_n_jobs = best_plot_kwargs.pop("n_jobs", n_jobs)
+        result["best_power_plots"] = plot_best_power(
+            fits,
+            best_power=best,
+            target_anl=best_target_anl,
+            show=best_plot_show,
+            n_jobs=best_plot_n_jobs,
+            verbose=best_plot_verbose,
+            **best_plot_kwargs,
+        )
 
     return result
 
 
-analyze_power_sweep = analyse_power_sweep
+def load_analysis(path):
+    """Reload a previously analysed power sweep from disk.
+
+    The read-only counterpart of :py:func:`analyse_power_sweep`: nothing is
+    recomputed and nothing is written.  The run manifest is loaded, then
+    every analysis artifact that exists under ``<run>/analysis/`` — the fit
+    archive, the fit-summary CSV, the best-power JSON, and (if a balancing
+    step was saved) the balanced-power JSON.
+
+    To *recompute* the power selection or plots from the stored fits
+    instead, use ``analyse_power_sweep(path, fit=False, ...)``.
+
+    Parameters
+    ----------
+    path : str or Path
+        Power-sweep run directory or its ``measurement.json`` manifest.
+
+    Returns
+    -------
+    result : dict
+        Same shape as the :py:func:`analyse_power_sweep` result.  Entries
+        whose artifact file is missing are ``None``, as are ``plots`` /
+        ``best_power_plots`` (plot paths are not recorded on disk).
+    """
+    view = load_power_sweep(path)
+    root = Path(view["root"])
+    result = {
+        "run": view,
+        "fits": None,
+        "fit_file": None,
+        "summary_csv": None,
+        "best_power": None,
+        "best_power_file": None,
+        "balanced_power": None,
+        "balanced_power_file": None,
+        "plots": None,
+        "best_power_plots": None,
+    }
+
+    fit_file = root / FIT_RESULTS_FILE
+    if fit_file.exists():
+        result["fits"] = load_fit_results(fit_file, run=view)
+        result["fit_file"] = str(fit_file)
+    summary_file = root / FIT_SUMMARY_FILE
+    if summary_file.exists():
+        result["summary_csv"] = str(summary_file)
+    best_file = root / BEST_POWER_FILE
+    if best_file.exists():
+        result["best_power"] = load_best_power(best_file)
+        result["best_power_file"] = str(best_file)
+    balanced_file = root / BALANCED_POWER_FILE
+    if balanced_file.exists():
+        result["balanced_power"] = load_balanced_power(balanced_file)
+        result["balanced_power_file"] = str(balanced_file)
+    return result
 
 
 def _normalise_tone_indices(tone_indices, tone_count):
@@ -2201,7 +2385,7 @@ def _fit_uses_empirical_fallback(fit):
     if bool(getattr(fit, "noise_only", False)):
         return True
     # Older persisted results may not have noise_only set but still carry the
-    # unresolved-trace shape: no model trace, no optimizer evaluations, and a
+    # unresolved-trace shape: no model trace, no optimiser evaluations, and a
     # failed status.
     if getattr(fit, "z_fit", None) is not None:
         return False
@@ -2237,7 +2421,7 @@ def _empirical_fallback_reason(fit):
         return "noise-only"
     if lower:
         return "fit-failed"
-    return "no-optimizer-fit"
+    return "no-optimiser-fit"
 
 
 def _empirical_fallback_reason_summary(fits):
@@ -3514,15 +3698,16 @@ def _is_fit_data(summary):
 def _coerce_summary_rows(summary):
     """Return summary rows as a list of dicts with numeric columns floated.
 
-    Accepts a ``fit_power_sweep`` result dict, a structured summary array, an
-    iterable of dicts (as produced by :py:func:`fit_summary_rows`), a single
-    row dict, or a path to a CSV written by :py:func:`write_fit_summary`.
+    Accepts a ``fit_power_sweep`` result dict, a structured summary array
+    (:py:func:`fit_summary_array` / :py:func:`load_fit_summary`), an iterable
+    of dicts (as produced by :py:func:`_fit_summary_rows`), a single row
+    dict, or a path to a CSV written by :py:func:`write_fit_summary`.
     String columns that look numeric are converted to ``float`` (with empty
     strings becoming ``NaN``); ``"true"``/``"false"`` become ``bool``; other
     strings are left alone so the ``message`` field still parses.
     """
     if _is_fit_data(summary):
-        raw_rows = fit_summary_rows(summary)
+        raw_rows = _fit_summary_rows(summary)
     elif isinstance(summary, (str, Path)):
         with Path(summary).open("r", newline="", encoding="utf-8") as handle:
             raw_rows = list(csv.DictReader(handle))
@@ -3877,8 +4062,9 @@ def find_best_power(
 ):
     """Pick a robust readout power per resonator from a fit-summary table.
 
-    Operates per ``tone_index`` on a :py:func:`fit_power_sweep` result, rows
-    from :py:func:`fit_summary_rows`, or a CSV written by
+    Operates per ``tone_index`` on a :py:func:`fit_power_sweep` result, a
+    structured summary array (:py:func:`fit_summary_array` /
+    :py:func:`load_fit_summary`), or a CSV written by
     :py:func:`write_fit_summary`.  The single criterion is a least-squares
     fit to ``log(anl) = slope * power_dbm + intercept``, which is solved for
     ``target_anl`` (default ``0.01``) to return a precise chosen power rather
@@ -4165,7 +4351,9 @@ def accumulator_level_db(
     ``parsed_samples`` should be the dict returned by
     :py:meth:`ReadoutClient.parse_samples`.  The returned values are relative
     accumulated-I/Q magnitudes, useful for comparing ADC/RX bit utilisation
-    across tones.  They are not referred to an absolute RF plane.
+    across tones.  They are not referred to an absolute RF plane.  Their
+    tone-to-tone differences are the natural ``rx_offsets_db`` input for
+    :py:func:`balance_tone_powers`.
 
     Parameters
     ----------
@@ -4416,8 +4604,8 @@ def _solve_balanced_power_lp(
         else np.asarray(rx_offsets, dtype=float).ravel()
     )
     objective = str(objective).lower()
-    if objective not in {"nearest_target", "maximize_power"}:
-        raise ValueError("objective must be 'nearest_target' or 'maximize_power'.")
+    if objective not in {"nearest_target", "maximise_power"}:
+        raise ValueError("objective must be 'nearest_target' or 'maximise_power'.")
     target_mask = (
         np.isfinite(targets)
         if objective == "nearest_target" and targets is not None
@@ -4529,7 +4717,7 @@ def _solve_balanced_power_lp(
     return np.asarray(result.x[:n], dtype=float), result
 
 
-def allocate_balanced_tone_powers(
+def balance_tone_powers(
     best_power=None,
     *,
     summary=None,
@@ -4563,10 +4751,10 @@ def allocate_balanced_tone_powers(
     If ``summary`` is supplied, it is used to interpolate the fit-summary
     parameters at the original, TX-only, and final allocated powers.
 
-    With ``objective="nearest_target"`` (default), the optimizer minimizes the
+    With ``objective="nearest_target"`` (default), the optimiser minimises the
     absolute distance to ``power_targets_dbm`` / ``target_key`` with a tiny
-    loudness tie-break.  With ``objective="maximize_power"``, it ignores
-    targets and maximizes the sum of allocated tone powers subject to:
+    loudness tie-break.  With ``objective="maximise_power"``, it ignores
+    targets and maximises the sum of allocated tone powers subject to:
 
     - ``allocated_power_dbm <= power_cap_dbm - cap_margin_db``
     - optional TX spread: ``max(P) - min(P) <= tx_power_range_db``
@@ -4681,8 +4869,8 @@ def allocate_balanced_tone_powers(
         fill=np.nan,
     )
     objective = str(objective).lower()
-    if objective not in {"nearest_target", "maximize_power"}:
-        raise ValueError("objective must be 'nearest_target' or 'maximize_power'.")
+    if objective not in {"nearest_target", "maximise_power"}:
+        raise ValueError("objective must be 'nearest_target' or 'maximise_power'.")
     missing_cap_policy = str(missing_cap_policy).lower()
     if missing_cap_policy in {"chosen", "chosen_power", "target_power"}:
         missing_cap_policy = "target"
@@ -4987,12 +5175,12 @@ def _restore_balanced_array(values, *, dtype=float):
 
 
 def balanced_power_arrays(balanced_power, tone_count=None):
-    """Return the main arrays from ``allocate_balanced_tone_powers`` output.
+    """Return the main arrays from ``balance_tone_powers`` output.
 
     Parameters
     ----------
     balanced_power : dict or str or Path
-        An :py:func:`allocate_balanced_tone_powers` result, or a path to a
+        An :py:func:`balance_tone_powers` result, or a path to a
         JSON file written by :py:func:`write_balanced_power`.
     tone_count : int or None, optional
         Pad/validate the output to this many tones; ``None`` (default) infers
@@ -5055,7 +5243,7 @@ def write_balanced_power(balanced_power, path):
     Parameters
     ----------
     balanced_power : dict
-        An :py:func:`allocate_balanced_tone_powers` result.
+        An :py:func:`balance_tone_powers` result.
     path : str or Path
         Output file, or a directory/extension-less path under which
         ``analysis/balanced_power.json`` is written.  Returns the file path.
@@ -6349,9 +6537,8 @@ def plot_best_power(
 ):
     """Plot ANL-vs-power fits and selected powers for each tone.
 
-    ``summary`` may be an in-memory result from :py:func:`fit_power_sweep`, the
-    rows returned by :py:func:`fit_summary_rows`, a single summary row, or a CSV
-    path.  When ``best_power`` is omitted this function calls
+    ``summary`` may be an in-memory result from :py:func:`fit_power_sweep`, a
+    structured summary array, a single summary row, or a CSV path.  When ``best_power`` is omitted this function calls
     :py:func:`find_best_power` with the same ``target_anl`` and
     ``use_readback_power`` settings plus any extra ``find_best_power_kwargs``.
 
