@@ -651,7 +651,7 @@ def needs_programming(r,config_dict, verbose=False):
 
     if r is None:
         if verbose:
-            _firmware_log('programming required: readout interface is missing', source='ready')
+            _firmware_log('needs_programming: no readout interface', source='ready')
         return True
 
     currentfpg = r.fpgfile
@@ -671,11 +671,11 @@ def needs_programming(r,config_dict, verbose=False):
     currentfpg = os.path.basename(currentfpg)
 
     if verbose:
-        _firmware_log(f'programming check: current={currentfpg}, requested={newfpg}', source='ready')
+        _firmware_log(f'needs_programming: current={currentfpg}, requested={newfpg}', source='ready')
 
     if not r.fpga.is_programmed():
         if verbose:
-            _firmware_log('programming required: FPGA is not programmed', source='ready')
+            _firmware_log('needs_programming: FPGA not programmed', source='ready')
         return True
 
     # The souk_mkid_readout constructor only builds its firmware block interfaces
@@ -686,24 +686,28 @@ def needs_programming(r,config_dict, verbose=False):
     # e.g. r.sync. Treat that as "needs (re)programming" so we reprogram first.
     if not getattr(r, 'blocks', None):
         if verbose:
-            _firmware_log('programming required: firmware blocks not created (unprogrammed or unsupported firmware)', source='ready')
+            _firmware_log('needs_programming: firmware blocks not built (unprogrammed or unsupported firmware)', source='ready')
         return True
 
     if newfpg != currentfpg:
         if verbose:
-            _firmware_log('programming required: current FPG does not match config', source='ready')
+            _firmware_log(f'needs_programming: fpg name mismatch (board={currentfpg}, config={newfpg})', source='ready')
         return True
 
-    # The fpgfile name above is read from the config (r.fpgfile), not the board,
-    # so on its own it cannot reveal that the board is running a *different* image
-    # than the config expects - e.g. an experimental bitfile loaded by hand. Worse,
-    # a single-pipeline (type 2) image and the dual (type 3) map overlap on the
-    # pipeline-0 blocks, so the interface builds cleanly against the wrong image
-    # (blocks populated, clock reads fine) and every softer check passes. The
-    # firmware TYPE, however, is a fixed-address register that reads reliably:
-    # compare it against the pipeline layout of the configured .fpg. A single/dual
-    # mismatch means the wrong image is loaded - reprogram. (Build-time would also
-    # catch same-type swaps; left for a later refinement.)
+    # The fpg name matches, but it is read from the config (r.fpgfile), not the
+    # board, so on its own it cannot reveal that the board is running a *different*
+    # image than the config expects - e.g. an experimental bitfile loaded by hand.
+    # A single-pipeline (type 2) image and the dual (type 3) map overlap on the
+    # pipeline-0 blocks, so the interface builds cleanly against the wrong one and
+    # softer checks pass. The firmware TYPE is a fixed-address register that reads
+    # reliably on every board: compare it against the pipeline layout of the
+    # configured .fpg. A single/dual mismatch means the wrong image is loaded.
+    #
+    # NB: we deliberately do NOT compare parse_fpg(r.fpgfile) register names against
+    # r._cfpga.listdev(). The two enumerations only agree on some boards/transports;
+    # on others (e.g. rfsoc4x2) listdev omits names the .fpg header declares, so the
+    # diff is non-empty on a perfectly good image and would loop the reprogram. The
+    # single/dual type check below is the reliable signal.
     try:
         board_type = r.fpga.get_firmware_type()
     except Exception:
@@ -714,37 +718,14 @@ def needs_programming(r,config_dict, verbose=False):
         if board_dual != configured_dual:
             if verbose:
                 _firmware_log(
-                    f'programming required: board firmware type {board_type} '
-                    f'({"dual" if board_dual else "single"}-pipeline) does not match the '
-                    f'configured {"dual" if configured_dual else "single"}-pipeline image',
+                    f'needs_programming: firmware-type mismatch - board is '
+                    f'{"dual" if board_dual else "single"}-pipeline (type {board_type}), '
+                    f'config is {"dual" if configured_dual else "single"}-pipeline',
                     source='ready')
             return True
 
-    # Generalise the above: every register the configured .fpg declares should be
-    # present on the running board. parse_fpg reads only the .fpg text header (it
-    # stops at ?quit, so no bitstream bytes are misread as registers); listdev()
-    # over katcp reflects the design actually running. Any register the .fpg
-    # declares but the board lacks means a different image is loaded - reprogram.
-    # This is the subset direction only (board extras are ignored), which is exact
-    # on a matching image - verified: identical 224-register sets, empty diff - so
-    # it cannot false-trigger a reprogram.
-    try:
-        from casperfpga import utils as _cfpga_utils
-        _, fpg_memmap = _cfpga_utils.parse_fpg(os.path.realpath(r.fpgfile))
-        missing = set(fpg_memmap) - set(r._cfpga.listdev())
-    except Exception:
-        missing = None
-    if missing:
-        if verbose:
-            _firmware_log(
-                f'programming required: board is missing {len(missing)} register(s) '
-                f'declared by the configured image (e.g. {sorted(missing)[:5]}); a '
-                f'different firmware is loaded',
-                source='ready')
-        return True
-
     if verbose:
-        _firmware_log('programming check: ready', source='ready')
+        _firmware_log('needs_programming: ready', source='ready')
     return False
 
 def interface_is_healthy(r):
@@ -769,19 +750,17 @@ def interface_is_healthy(r):
     hardware clock fault, which it does not.
     """
     if r is None:
-        return False, 'readout interface was not created'
+        return False, 'no readout interface'
     fpga = getattr(r, 'fpga', None)
     if fpga is None:
-        return False, 'firmware interface has no FPGA control block'
+        return False, 'interface has no FPGA control block'
     try:
         if not fpga.is_programmed():
-            return False, 'FPGA is not programmed'
+            return False, 'FPGA not programmed'
     except Exception as exc:
         return False, f'could not read FPGA programmed state: {exc}'
     if not getattr(r, 'blocks', None):
-        return False, ('firmware block interfaces failed to initialise - the loaded '
-                       'firmware does not match the configured image (wrong .fpg '
-                       'loaded, or the loaded image is not producing a fabric clock)')
+        return False, 'firmware blocks not built (image mismatch or no fabric clock)'
     return True, 'ok'
 
 def needs_shared_resource_initialising(r, config_dict, verbose=False):

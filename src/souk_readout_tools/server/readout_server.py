@@ -1150,10 +1150,9 @@ class ReadoutServer:
                 programmed = False
             if programmed:
                 _server_log(
-                    f'firmware interface did not initialise against the configured '
-                    f'image ({reason}); the board is programmed and PLLs are locked, '
-                    f'so the loaded firmware does not match the config rather than a '
-                    f'clock/PLL fault',
+                    f'_create_firmware_interfaces: interface did not build ({reason}); '
+                    f'board is programmed and PLLs locked - loaded firmware does not '
+                    f'match config',
                     source=source,
                 )
         return self.r, self.r_fast
@@ -1676,8 +1675,8 @@ class ReadoutServer:
             healthy, reason = firmware_lib.interface_is_healthy(self.r)
             if not healthy:
                 _server_log(
-                    f'loaded firmware is not usable with the configured image '
-                    f'({reason}); reprogramming', source='config')
+                    f'set_config: loaded firmware unusable with config ({reason}); '
+                    f'reprogramming', source='config')
                 self.force_ready(level="pipeline")
                 self.applied_config = copy.deepcopy(self.config)
                 self.update_active_tone_indices()
