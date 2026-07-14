@@ -210,6 +210,12 @@ spans = linewidths * 20
 the arrays before programming hardware. The `target_anl` value is a detector
 operating choice, not a universal constant.
 
+`ps.load_analysis(POWER_SWEEP_DIR)` reloads all of those outputs in a later
+session without recomputation. To re-run only the power selection from the
+stored fits (for example after changing `target_anl` or the
+`best_power_kwargs`) without re-rendering every per-tone fit plot, use
+`ps.analyse_power_sweep(POWER_SWEEP_DIR, fit=False, plot_fits=False, ...)`.
+
 ## Apply Powers and Retune
 
 Apply the selected powers while the tones are off resonance, then retune. This

@@ -1,5 +1,34 @@
 # Changelog & Feature List
 
+## v1.6.2 (in development)
+
+**Power-sweep API tidy (breaking)**
+- `power_sweep` now reads as the workflow: `run_power_sweep` /
+  `load_power_sweep` acquire, `analyse_power_sweep` / `load_analysis` (new)
+  analyse, then optional comb balancing — with the pieces grouped per
+  artifact, each with a symmetric `write_*`/`load_*` pair. The module
+  docstring tells the story and the file is ordered to match.
+- Removed the `analyze_power_sweep` alias; the spelling is
+  `analyse_power_sweep`.
+- Renamed `fit_parameter_series` → `parameter_series` and
+  `allocate_balanced_tone_powers` → `balance_tone_powers`; the
+  `include_optimizer` kwarg is now `include_optimiser` and the balancing
+  objective `"maximize_power"` is `"maximise_power"` (matching
+  `rx_policy='maximise'`). `fit_summary_rows` is private —
+  `fit_summary_array` and the CSV are the public views of the table.
+- New `load_analysis(path)`: read-only reload of everything
+  `analyse_power_sweep` wrote (fits, summary CSV, best power, and balanced
+  power if saved).
+- New `load_fit_summary(path)`: the fit-summary CSV back as a structured
+  array, accepted directly by `find_best_power`.
+- `analyse_power_sweep`'s `plot` flag split into `plot_fits` / `plot_best`,
+  so the power selection can be redone from stored fits without
+  re-rendering every per-tone fit plot:
+  `analyse_power_sweep(run, fit=False, plot_fits=False, target_anl=...)`.
+- Writers accept a destination file or run directory, default into
+  `<run>/analysis/` (`write_fit_summary(fit_data)` included), and return
+  `Path`.
+
 ## v1.6.1 (in development)
 
 **Filterbank channel-response compensation**

@@ -289,6 +289,31 @@ the attenuating dips.
 `fit_results.pkl`, `fit_summary.csv`, and `best_power.json`. It also writes
 per-tone fit and selected-power plots beneath `plots/`.
 
+In a later session, reload all of that without recomputing anything:
+
+```python
+analysis = ps.load_analysis("kid_power_sweep")
+```
+
+To re-choose the powers from the stored fits — say with a different
+`target_anl` — without re-rendering every per-tone fit plot, disable the
+stages you don't need:
+
+```python
+analysis = ps.analyse_power_sweep(
+    "kid_power_sweep",
+    fit=False,        # reuse analysis/fit_results.pkl
+    plot_fits=False,  # skip the slow per-tone fit plots
+    target_anl=0.03,  # re-pick powers and refresh the ANL plots
+)
+```
+
+To balance the comb afterwards, `balance_tone_powers()` re-allocates the
+per-tone powers under the bifurcation-backed caps and optional TX/RX spread
+constraints, with `write_balanced_power()` / `load_balanced_power()` for
+persistence and `balanced_power_arrays()` for per-tone arrays. The module
+docstring (`help(ps)`) lists every piece of the pipeline in order.
+
 For the full acquisition sequence and the recommended data layout, continue
 with [Resonator Drive Tuning and Noise
 Measurements](resonator_noise_workflow.md).
