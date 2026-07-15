@@ -1,5 +1,40 @@
 # Changelog & Feature List
 
+## v1.6.3
+
+**Fix: stale mixer dwell breaking software modulation after firmware-slot runs**
+- `disable_fw_modulation` left the mixer `dwell` register at the fw
+  `n_dwell`. The dwell gates *all* allowed LO switches — including the
+  ping-pong buffer flips driven by software modulation, sweeps and retunes —
+  so after any fw-mod run, sw modulation showed skipped points and ragged
+  dwells and sweeps averaged stale-frequency accumulations, long after all
+  modulation was reported off (confirmed on hardware: `dwell` read back 11).
+  The dwell is now restored to 1 on fw disable and asserted at sw arm.
+
+**Filterbank compensation: applied where you look at the data**
+- The software readout-flattening factors (the RX half the inert fabric
+  scale word cannot apply) are now applied at **parse time** by default:
+  `parse_samples(apply_readout_correction=True)` (per sample via the
+  modulation point tag) and `parse_sweep_data(apply_readout_correction=True)`
+  (per sweep point; the server ships the factors with `get_sweep_data`).
+  Output carries `readout_correction_applied`; `group_cycles` skips its own
+  application when marked. Pass `False` for raw accumulator values.
+- Sweeps/retunes now resolve the standard path group-delay calibration for
+  the image-phase term (previously override-only) and take a per-request
+  `compensate_filterbank` override (`perform_sweep`, `perform_retune`,
+  `wideband_sweep`), matching `enable_modulation`.
+- Plot/fit-time toggle: `plot_sweep`, `plot_timestream`,
+  `plot_timestream_psd`, `plot_timestream_on_resonance` and `batch_fit`
+  take `apply_readout_correction` (default on) and convert already-parsed
+  data either way (parsed sweeps keep the factors; modulated captures
+  re-derive them from the info snapshot).
+- Power optimisers (`maximise_tx_power`, `set_tone_powers(...,
+  optimise_dynamic_range=True)`, `maximise_tx_dsp_gain`) reserve
+  `FILTERBANK_TX_HEADROOM_DB` (1 dB) of amplitude-word headroom for the TX
+  drive-restoring boost when compensation is enabled — the psb_scale ramp
+  recovers the output level, so no power is lost. Explicit `set_tone_powers`
+  requests that eat into the reserve warn instead of failing.
+
 ## v1.6.2
 
 **Power-sweep API tidy (breaking)**
