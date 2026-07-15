@@ -16,6 +16,7 @@ from ._common import (_get_pyplot, _propagate_errors_mag,
                        _magnitude_error_units,
                        _scale_iq_to_magnitude_units,
                        _validate_reference_plane,
+                       _with_sweep_readout_correction,
                        _disable_axis_offsets)
 
 
@@ -666,7 +667,8 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                mag_centered=None, phase_centered=None,
                mag_rotated=None, phase_rotated=None,
                unwrap_phase=None, tx_power_dbm=None,
-               tx_power_reference_plane=None, **kwargs):
+               tx_power_reference_plane=None,
+               apply_readout_correction=True, **kwargs):
     """
     General-purpose sweep plot.
 
@@ -757,12 +759,18 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             ``tx_power_dbm``.  If it differs from ``reference_plane``, the
             structured info/config calibration is used to convert it when
             possible.
+        apply_readout_correction: bool, plot with (True, default) or without
+            (False) the filterbank compensation's software readout-flattening
+            factors.  Toggles the parsed data either way when the sweep
+            carries the per-(point, tone) factors; otherwise the data is
+            plotted as parsed.
         **kwargs: Passed to matplotlib plot/errorbar calls.
 
     Returns:
         matplotlib.figure.Figure
     """
     plt = _get_pyplot()
+    sweep_data = _with_sweep_readout_correction(sweep_data, apply_readout_correction)
     custom_title = kwargs.pop('title', None)
     units = _canonical_units(units)
     calibration_cache = {}

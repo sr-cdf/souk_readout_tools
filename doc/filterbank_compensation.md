@@ -51,8 +51,8 @@ Where control words are prepared, per tone (and per point, for modulation):
 | part | applied | what |
 |------|---------|------|
 | TX scaling `base × 1/G(δ_tx)` | **hardware**, per point/slot (and at snap residuals for set-tones/sweeps when amplitudes are in hand) | restores the physical drive on the detector |
-| RX magnitude `G(δ_rx)/⏐H⏐` (+ any TX clip shortfall) | **software**: the server reports per-(tone, point) `readout_correction` factors in the modulation state; `modulation.group_cycles` multiplies them onto the IQ | flattens the readout |
-| RX phase `−arg H(δ_rx)` | **hardware**, per point (only non-zero when a group delay is known) | removes the image phase turn-over |
+| RX magnitude `G(δ_rx)/⏐H⏐` (+ any TX clip shortfall) | **software**: the server reports per-(tone, point) `readout_correction` factors — in the modulation state (applied by `parse_samples` / `group_cycles`) and alongside sweep results (applied by `parse_sweep_data`) | flattens the readout |
+| RX phase `−arg H(δ_rx)` | **hardware**, per point (only non-zero when a group delay is known; sweeps resolve the same path calibration as modulation) | removes the image phase turn-over |
 
 - The **TX factor restores the physical drive on the detector** — the main
   synthesized tone rolls off with the *single-bank* `G`, even though the
@@ -65,10 +65,13 @@ Where control words are prepared, per tone (and per point, for modulation):
   scale multiplier is unconnected. If a future firmware connects it, flip
   `firmware_lib.FILTERBANK_RX_SCALE_IN_FABRIC` to `True`: the hardware RX
   scaling (on the 0.75 headroom base) switches on and the software factors
-  collapse to 1, so nothing double-corrects. The residual is only significant
-  beyond ±0.5 bins, i.e. for modulation data — which always flows through
-  `group_cycles` — so in practice nothing is left uncorrected (raw-stream
-  consumers bypassing `group_cycles` see the residual: −0.5 dB at 0.7 bins).
+  collapse to 1, so nothing double-corrects. The software factors are applied
+  by `ReadoutClient.parse_samples` (per sample, via the modulation point tag;
+  the output carries `readout_correction_applied` and `group_cycles` then
+  skips its own application), so plots and demod alike see a flat channel.
+  Pass `parse_samples(..., apply_readout_correction=False)` for the raw
+  accumulator values — those keep the residual (−0.5 dB at 0.7 bins), as do
+  live-stream consumers that never call `parse_samples`/`group_cycles`.
 - **Headroom**: the TX boost is +0.5 dB at the 1 dB operating point and +6 dB
   at the (unusable) channel edge. Keep base tone amplitudes ~1 dB (power)
   below full scale — including in power-optimisation results — so modulation
@@ -114,6 +117,28 @@ disables the compensation for one modulation run (it sticks for subsequent
 update/recenter calls until the next enable) — this is how the measurement
 scripts see the raw response. The applied per-point correction is reported in
 the modulation bundle (`bundle['compensation']['response_db']`).
+`perform_sweep(..., compensate_filterbank=False)` /
+`perform_retune(..., compensate_filterbank=False)` /
+`wideband_sweep(..., compensate_filterbank=False)` are the same switch for
+sweeps (None follows the config; False also stops the sweep results carrying
+`readout_correction`, so `parse_sweep_data` leaves the data raw).
+
+Already-parsed data can be viewed either way: the plotting helpers
+(`plot_sweep`, `plot_timestream`, `plot_timestream_psd`,
+`plot_timestream_on_resonance`) and `batch_fit` take
+`apply_readout_correction` (default `True`) and toggle the software factors
+on or off at plot/fit time — parsed sweeps keep the factors alongside the
+data, and modulated captures re-derive them from the info snapshot's
+modulation state. A `FitResult` inherits the choice made at `batch_fit` time
+(the fitted frames bake it in, and deembedding absorbs smooth gain anyway),
+so `plot_fits` shows whatever the fit used.
+
+The power optimisers (`maximise_tx_power`, `set_tone_powers(...,
+optimise_dynamic_range=True)`, `maximise_tx_dsp_gain`) reserve the headroom
+automatically: when the compensation is enabled they cap the strongest
+amplitude word `FILTERBANK_TX_HEADROOM_DB` (1 dB) below full scale — the
+psb_scale ramp recovers the output level, so no power is lost. An explicit
+`set_tone_powers` request that eats into the reserve is honoured but warns.
 
 ## Measuring and verifying: `scripts/filterbank/`
 

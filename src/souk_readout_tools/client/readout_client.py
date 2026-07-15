@@ -3071,6 +3071,13 @@ class ReadoutClient:
         return centers
 
     @staticmethod
+    def _readout_correction_factors(info, num_tones):
+        """Per-(point, tone) software readout-flattening factors from a
+        ``get_info`` payload (see :func:`modulation.readout_correction_factors`)."""
+        from souk_readout_tools.modulation import readout_correction_factors
+        return readout_correction_factors(info, num_tones)
+
+    @staticmethod
     def _normalise_modulated_sample_info(info, modulation_point, num_tones):
         """
         For modulated captures, expose centre frequencies in the standard
@@ -3098,7 +3105,7 @@ class ReadoutClient:
         return info
 
     @staticmethod
-    def parse_samples(sample_data, num_tones=None):
+    def parse_samples(sample_data, num_tones=None, apply_readout_correction=True):
         """
         Parse raw sample data into per-tone I/Q arrays.
 
@@ -3117,6 +3124,17 @@ class ReadoutClient:
         num_tones : int or None, optional
             Override the tone count; ``None`` (default) infers it from the
             frame size / tone metadata.
+        apply_readout_correction : bool, optional
+            For modulated captures, apply the filterbank compensation's
+            software readout-flattening factors (the modulation state's
+            per-(point, tone) ``readout_correction``; the RX scale word is
+            inert in current firmware, so this half of the compensation
+            cannot land in hardware) to the parsed I/Q, so plots and
+            downstream consumers see a flat channel without needing
+            :func:`modulation.group_cycles`. Default ``True``. The output is
+            marked with ``readout_correction_applied`` and ``group_cycles``
+            skips its own application accordingly. Pass ``False`` for the
+            raw accumulator values.
         """
         data_raw = sample_data['data_raw']
         sample_rate = sample_data['sample_rate']
@@ -3166,6 +3184,25 @@ class ReadoutClient:
         modulation_revision = ((f5 >> 17) & 0x7FFF).astype(int)
         info = ReadoutClient._normalise_modulated_sample_info(
             info, modulation_point, num_tones)
+
+        # Software readout flattening (filterbank compensation, RX half): the
+        # RX scale word is inert in current firmware, so the server reports
+        # per-(point, tone) linear gain factors in the modulation state and
+        # they are applied here, per sample via the point tag. Downstream
+        # consumers (plots, group_cycles, demod) then see a flat channel;
+        # group_cycles skips its own application when it sees the marker.
+        readout_correction_applied = False
+        if apply_readout_correction and np.any(modulation_point > 0):
+            factors = ReadoutClient._readout_correction_factors(info, num_tones)
+            if factors is not None:
+                n_points = factors.shape[0]
+                valid = (modulation_point >= 1) & (modulation_point <= n_points)
+                gain = np.ones((num_samples, num_tones), dtype=float)
+                gain[valid] = factors[modulation_point[valid] - 1]
+                i_data = i_data * gain
+                q_data = q_data * gain
+                readout_correction_applied = True
+
         data_dict = {'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
                     'num_tones':num_tones,
                     'num_samples':num_samples,
@@ -3180,6 +3217,7 @@ class ReadoutClient:
                     'modulation_point': modulation_point,
                     'modulation_settling': modulation_settling,
                     'modulation_revision': modulation_revision,
+                    'readout_correction_applied': readout_correction_applied,
                     }
 
         return data_dict
@@ -4348,7 +4386,8 @@ class ReadoutClient:
                       adc_cal_settle_time=2.0, wait=False, autosync=False,
                       setup_sync=True, mrst=False, setup_mrst=False,
                       compensate_rx_ticks=0, settle_accumulations=4,
-                      chanmap_settle_accumulations=4, clip_spans=True):
+                      chanmap_settle_accumulations=4, clip_spans=True,
+                      compensate_filterbank=None):
         """
         Perform a frequency sweep.
 
@@ -4396,6 +4435,12 @@ class ReadoutClient:
                 neighbouring sweep segments do not overlap (see
                 ``clip_overlapping_spans``). Only alters spans when overlaps
                 are present.
+            compensate_filterbank (bool or None): Per-request override of the
+                filterbank rolloff compensation for this sweep. ``None``
+                (default) follows the server config
+                (``filterbank_compensation``, default on); ``False`` disables
+                it for this sweep (raw channel response, no readout_correction
+                shipped with the results); ``True`` forces it on.
         """
         centers=np.atleast_1d(centers)
         spans=np.atleast_1d(spans)
@@ -4433,6 +4478,8 @@ class ReadoutClient:
             'settle_accumulations': int(settle_accumulations),
             'chanmap_settle_accumulations': int(chanmap_settle_accumulations),
         }
+        if compensate_filterbank is not None:
+            message['compensate_filterbank'] = bool(compensate_filterbank)
         response = self.send_request(message)
         if wait:
             print(response)
@@ -4446,7 +4493,8 @@ class ReadoutClient:
                        adc_cal_settle_time=2.0, wait=False, autosync=False,
                        setup_sync=True, mrst=False, setup_mrst=False,
                        compensate_rx_ticks=0, settle_accumulations=4,
-                       chanmap_settle_accumulations=4, clip_spans=True):
+                       chanmap_settle_accumulations=4, clip_spans=True,
+                       compensate_filterbank=None):
         """
         Perform a retune sweep to find optimal tone frequencies.
 
@@ -4492,6 +4540,10 @@ class ReadoutClient:
                 neighbouring sweep segments do not overlap (see
                 ``clip_overlapping_spans``). Only alters spans when overlaps
                 are present.
+            compensate_filterbank (bool or None): Per-request override of the
+                filterbank rolloff compensation for the underlying sweep.
+                ``None`` (default) follows the server config; ``False``
+                disables it for this retune; ``True`` forces it on.
         """
         centers=np.atleast_1d(centers)
         spans=np.atleast_1d(spans)
@@ -4548,6 +4600,8 @@ class ReadoutClient:
             'settle_accumulations': int(settle_accumulations),
             'chanmap_settle_accumulations': int(chanmap_settle_accumulations),
         }
+        if compensate_filterbank is not None:
+            message['compensate_filterbank'] = bool(compensate_filterbank)
         response = self.send_request(message)
         if wait:
             print(response)
@@ -4649,20 +4703,31 @@ class ReadoutClient:
             print(f"Error getting sweep_data: {response['message']}")
             return response
 
-    def parse_sweep_data(self, sweep_data, apply_phase_correction=False):
+    def parse_sweep_data(self, sweep_data, apply_phase_correction=False,
+                         apply_readout_correction=True):
         """
         Parse raw sweep data from the server into numpy arrays.
-        
+
         Args:
             sweep_data: Raw sweep data dictionary from get_sweep_data()
             apply_phase_correction (bool): Correct for phase jumps at filterbank channel
-                                           edges. Default is False. DEPRECATED: This 
-                                           correction is no longer needed following 
-                                           firmware fixes and will be removed in a 
+                                           edges. Default is False. DEPRECATED: This
+                                           correction is no longer needed following
+                                           firmware fixes and will be removed in a
                                            future version.
-        
+            apply_readout_correction (bool): Apply the filterbank compensation's
+                                           software readout-flattening factors
+                                           (per point, per tone; shipped with the
+                                           sweep when compensation was on) to the
+                                           sweep I/Q and errors. The RX scale
+                                           word is inert in current firmware, so
+                                           this half cannot land in hardware.
+                                           Default is True; the output carries
+                                           'readout_correction_applied'. Pass
+                                           False for the raw readout values.
+
         Returns:
-            dict: Parsed sweep data with 'sweep_f', 'sweep_i', 'sweep_q', 'sweep_ei', 
+            dict: Parsed sweep data with 'sweep_f', 'sweep_i', 'sweep_q', 'sweep_ei',
                   'sweep_eq' arrays and metadata.
         """
         if not isinstance(sweep_data, dict):
@@ -4700,6 +4765,21 @@ class ReadoutClient:
             sweep_tt = np.frombuffer(sweep_tt_bytes, dtype='u8').copy()
         else:
             sweep_tt = np.zeros(num_points, dtype=np.uint64)
+
+        # Software readout flattening (filterbank compensation, RX half): the
+        # server ships per-(point, tone) linear factors alongside the sweep
+        # when compensation was on; applying them removes the residual
+        # filterbank scalloping the inert hardware RX scale word cannot.
+        readout_correction_applied = False
+        readout_correction = None
+        if sweep_data['sweep'].get('readout_correction'):
+            rc_bytes = base64.b64decode(sweep_data['sweep']['readout_correction'])
+            readout_correction = np.frombuffer(
+                rc_bytes, dtype='f8').reshape((num_points, num_tones)).copy()
+            if apply_readout_correction:
+                sweep_z = sweep_z * readout_correction
+                sweep_e = sweep_e * readout_correction
+                readout_correction_applied = True
 
         if apply_phase_correction:
                 
@@ -4759,7 +4839,11 @@ class ReadoutClient:
                         'sweep_q': sweep_q,
                         'sweep_ei': err_i,
                         'sweep_eq': err_q,
-                        'telescope_time': sweep_tt
+                        'telescope_time': sweep_tt,
+                        # Factors kept alongside the flag so plotting helpers
+                        # can toggle the correction either way after parsing.
+                        'readout_correction': readout_correction,
+                        'readout_correction_applied': readout_correction_applied
                         }
         # Centers/spans as actually swept (after any client-side span clipping
         # and blind-tone expansion). Absent in sweeps taken before these were
@@ -6010,6 +6094,7 @@ class ReadoutClient:
                        compensate_rx_ticks=0,
                        settle_accumulations=4,
                        chanmap_settle_accumulations=4,
+                       compensate_filterbank=None,
                        verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
@@ -6093,6 +6178,10 @@ class ReadoutClient:
                 after a PSB/PFB channel-map update and before switching the
                 mixer control buffer. Passed through to perform_sweep. Default
                 0 preserves previous behavior.
+            compensate_filterbank (bool or None): Per-request override of the
+                filterbank rolloff compensation, passed through to
+                perform_sweep. None (default) follows the server config;
+                False disables it for this sweep; True forces it on.
             verbose (bool): Print progress information. Default is True.
 
         Returns:
@@ -6382,7 +6471,8 @@ class ReadoutClient:
                                       mrst=mrst, setup_mrst=setup_mrst,
                                       compensate_rx_ticks=compensate_rx_ticks,
                                       settle_accumulations=settle_accumulations,
-                                      chanmap_settle_accumulations=chanmap_settle_accumulations)
+                                      chanmap_settle_accumulations=chanmap_settle_accumulations,
+                                      compensate_filterbank=compensate_filterbank)
         
         if response['status'] != 'success':
             raise RuntimeError(f"Sweep failed: {response['message']}")

@@ -304,6 +304,21 @@ FILTERBANK_RX_SCALE_IN_FABRIC = False
 # (Only used when FILTERBANK_RX_SCALE_IN_FABRIC.)
 FILTERBANK_RX_SCALE_BASE = 0.75
 
+# Amplitude-word headroom (dB, power) the power optimisers reserve below full
+# scale when the filterbank compensation is enabled, so the TX drive-restoring
+# boost (base x 1/G: +0.5 dB at the -1 dB rolloff point, more further out) has
+# room to apply without clipping (doc/filterbank_compensation.md "Headroom").
+FILTERBANK_TX_HEADROOM_DB = 1.0
+
+
+def _filterbank_tx_headroom_factor(config_dict):
+    """Linear factor (<= 1) the amplitude ceiling is scaled by to reserve
+    filterbank-compensation TX boost headroom; 1.0 when compensation is off."""
+    fb_enabled, _ = filterbank_compensation_config(config_dict)
+    if fb_enabled:
+        return 10 ** (-FILTERBANK_TX_HEADROOM_DB / 20)
+    return 1.0
+
 _filterbank_prototype_cache = None
 
 
@@ -4164,15 +4179,22 @@ def disable_fw_modulation(r_fast, mrst=True):
     """
     Stop firmware-slot auto-cycling and return the mixer to slot 0.
 
-    Switches the mixer back to manual-slot mode, selects slot 0, and fires a
-    sync to latch it. The slot-0 comb (the centre comb) is left loaded, so a
-    plain single-LO stream resumes from it.
+    Switches the mixer back to manual-slot mode, selects slot 0, restores the
+    dwell to 1, and fires a sync to latch it. The slot-0 comb (the centre comb)
+    is left loaded, so a plain single-LO stream resumes from it.
+
+    The dwell restore matters: ``enable_fw_modulation`` sets the dwell register
+    to ``n_dwell``, and the dwell gates *all* allowed LO switches -- including
+    the ping-pong buffer flips used by software modulation, sweeps and retunes.
+    A stale dwell > 1 makes those flips latch late (skipped modulation points,
+    smeared sweep steps) long after firmware-slot modulation is disabled.
 
     :param r_fast: Fast readout firmware object.
     :param mrst: Pulse master-reset with the sync (default True).
     """
     r_fast.mixer.set_slot_manual_mode()
     r_fast.mixer.set_manual_slot(0)
+    r_fast.mixer.set_dwell_accs(1)
     force_sync_fast(r_fast, mrst=mrst)
     return
 
@@ -4180,7 +4202,8 @@ def disable_fw_modulation(r_fast, mrst=True):
 def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
                                 min_tone_separation=6, detailed_output=False,
                                 tone_amplitudes=None, tone_phases=None,
-                                compensate_rx_ticks=0):
+                                compensate_rx_ticks=0, group_delay_s=None,
+                                compensate_filterbank=None):
     """
     Prepare sweep step settings with VACC-aware tone index assignment.
 
@@ -4190,6 +4213,15 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
         sweep steps without a per-step sync. Because the RX offset varies per
         point, the offsets ride in each per-point write rather than the
         write-once path (TX still uses write-once). See _rx_phase_compensation.
+    group_delay_s: path group delay (seconds; scalar or per-tone array) for the
+        filterbank image-phase term. None (default) falls back to the
+        filterbank_group_delay_override_ns testing knob, else 0
+        (amplitude-only). Pass the resolved path calibration
+        (resolve_filterbank_group_delay) to also flatten the phase.
+    compensate_filterbank: per-request override of the filterbank rolloff
+        compensation. None (default) follows the config master switch
+        (``filterbank_compensation``); False disables it for this sweep (raw
+        channel response, no readout_correction); True forces it on.
     """
     sweep_frequencies = np.atleast_2d(sweep_frequencies)
     num_points,num_tones = sweep_frequencies.shape
@@ -4322,17 +4354,40 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
     # ri_steps_rx = np.exp(1j*phase_incs_rx)
 
     # Filterbank ripple compensation at every step's snap residual (|d| <= 0.5
-    # bins across the whole sweep, so the phase term is negligible -- only the
-    # override delay is honoured here, not the path calibration). Computed
-    # vectorised here, indexed per step in the loop below.
+    # bins across the whole sweep). The phase term uses the caller-resolved
+    # path calibration when supplied (group_delay_s), else the override knob,
+    # else 0 (amplitude-only). Computed vectorised here, indexed per step in
+    # the loop below.
     fb_enabled, fb_override_s = filterbank_compensation_config(config_dict)
-    fb_delay_s = fb_override_s if fb_override_s is not None else 0.0
+    if compensate_filterbank is not None:
+        fb_enabled = bool(compensate_filterbank)
+    if group_delay_s is not None:
+        fb_delay_s = group_delay_s
+    else:
+        fb_delay_s = fb_override_s if fb_override_s is not None else 0.0
+    fb_readout_corr = None
+    fb_phase_active = False
     if fb_enabled:
         rx_spacing = _bin_spacing_hz(all_rx_bin_centers_hz)
         fb = filterbank_compensation(
             tx_freq_offsets_hz / _bin_spacing_hz(all_tx_bin_centers_hz),
             rx_freq_offsets_hz / rx_spacing, rx_spacing, fb_delay_s,
             split_tx=tone_amplitudes is not None)
+        fb_phase_active = bool(np.any(np.asarray(fb_delay_s) != 0))
+        if not FILTERBANK_RX_SCALE_IN_FABRIC:
+            # RX scale word inert in current firmware: report the per-(point,
+            # tone) linear factors the software path must multiply onto the
+            # readout to flatten it (|H| plus any TX headroom shortfall), for
+            # the client to apply at parse time ('readout_correction' in the
+            # sweep results). Small at snap residuals (<= ~0.01 dB), but
+            # applying it removes the last of the filterbank scalloping.
+            if tone_amplitudes is not None:
+                tx_gain_applied = np.minimum(
+                    fb['tx_scale'], 1.0 / np.maximum(tone_amplitudes, 1e-9))
+            else:
+                tx_gain_applied = 1.0   # split_tx=False: no TX word written
+            fb_readout_corr = 1.0 / np.clip(
+                fb['response_mag'] * tx_gain_applied, 1e-3, None)
 
     # print('phase_incs_tx',phase_incs_tx.shape,'\n',phase_incs_tx)
     # print('phase_incs_rx',phase_incs_rx.shape,'\n',phase_incs_rx)
@@ -4373,9 +4428,10 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
     # (write_phase_offsets_both_buffers_fast) writes the *same* offset to both
     # tx and rx, which would clobber the per-point RX compensation -- so when
     # compensating we drop the write-once path entirely and bake both tx and rx
-    # offsets per point. A few extra offset words per point; negligible.
+    # offsets per point. A few extra offset words per point; negligible. The
+    # filterbank image-phase term also varies per point, so it forces the same.
     compensate_rx = bool(compensate_rx_ticks)
-    if compensate_rx:
+    if compensate_rx or fb_phase_active:
         write_offsets_once = False
 
 
@@ -4437,11 +4493,15 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
         if tone_phases is not None and not write_offsets_once:
             lo_control_values['tx']['phase_offsets'] = tone_phases
         # The RX offset rides per point whenever it varies across points: either
-        # because the LO slots move (not write_offsets_once) or because the
-        # path-delay compensation is active (it tracks this point's RX offset).
-        if (tone_phases is not None and not write_offsets_once) or compensate_rx:
+        # because the LO slots move (not write_offsets_once), because the
+        # path-delay compensation is active (it tracks this point's RX offset),
+        # or because the filterbank image-phase term is active.
+        if ((tone_phases is not None and not write_offsets_once)
+                or compensate_rx or fb_phase_active):
             rx_phase_comp = _rx_phase_compensation(
                 phase_incs_rx[p], fft_rbw_hz, compensate_rx_ticks)
+            if fb_phase_active:
+                rx_phase_comp = rx_phase_comp + fb['rx_phase_rad'][p]
             base_rx = tone_phases if tone_phases is not None else 0.0
             lo_control_values['rx']['phase_offsets'] = base_rx + rx_phase_comp
         allv[p], alli[p] = prepare_control_buffer_data_fast(
@@ -4488,7 +4548,16 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
                             'num_tones':num_tones,
                             'max_tones_per_bin':max_tones_per_bin,
                             'amplitude_scale_factor':amplitude_scale_factor,
-                            'vacc_max_amplitude':vacc_max_amplitude}
+                            'vacc_max_amplitude':vacc_max_amplitude,
+                            # Per-(point, tone) linear factors the software path
+                            # multiplies onto the readout to flatten the residual
+                            # filterbank response (RX scale word inert in fabric).
+                            # None when compensation is off.
+                            'readout_correction': fb_readout_corr,
+                            'compensation': {
+                                'enabled': fb_enabled,
+                                'group_delay_s': fb_delay_s,
+                                'phase_active': fb_phase_active}}
 
     return sweep_settings_dict
 
@@ -7385,7 +7454,9 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
           f'fftshift={format(init_psb_fftshift, "#016b")}, '
           f'max_amp={np.max(init_amps):.4f}')
 
-    max_amp = 1 - 2**-12
+    # Reserve filterbank-compensation TX boost headroom in the amplitude words
+    # (the psb_scale ramp below recovers the overall output level).
+    max_amp = (1 - 2**-12) * _filterbank_tx_headroom_factor(config_dict)
     scalemin = 1 / 256
     scalemax = 255
     tx_compression_state = None
@@ -7880,7 +7951,9 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
         return init_amps, init_psb_fftshift, init_psb_scale, dsp_overflow_details, dac_levels
 
     # --- Step 1: Mute and maximise amplitudes ---
-    max_amp = 1 - 2**-12
+    # Reserve filterbank-compensation TX boost headroom in the amplitude words
+    # (the psb_scale ramp below recovers the overall output level).
+    max_amp = (1 - 2**-12) * _filterbank_tx_headroom_factor(config_dict)
     if tone_amplitudes_fixed:
         amps = init_amps
         amps_gain = 1.0
@@ -9851,6 +9924,19 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
                     f'gain settings with {n_tones} tones. '
                     f'Reduce tone_powers_dbm or num_tones, '
                     f'or use optimise_dynamic_range=True to auto-adjust.')
+        # Explicit power requests are honoured up to full scale, but flag when
+        # they eat into the filterbank-compensation TX boost headroom -- the
+        # drive restore will clip out towards the channel edges (modulation).
+        fb_headroom = _filterbank_tx_headroom_factor(config_dict)
+        if fb_headroom < 1.0 and np.any(amps > max_amp * fb_headroom):
+            over_db = 20 * np.log10(float(np.max(amps)) / (max_amp * fb_headroom))
+            msg = (f'strongest tone leaves less than the {FILTERBANK_TX_HEADROOM_DB:.1f} dB '
+                   f'filterbank-compensation headroom (short by {over_db:.2f} dB); the '
+                   'modulation TX drive restore will clip at large probe offsets -- '
+                   'lower tone_powers_dbm or use optimise_dynamic_range=True')
+            print(f'  WARNING: {msg}')
+            warnings_list.append(msg)
+
         if np.any((amps > 0) & (amps < 2**-12)):
             n_low = int(np.sum((amps > 0) & (amps < 2**-12)))
             msg = f'{n_low} tone(s) below minimum amplitude resolution'
@@ -9943,7 +10029,10 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
           f'at reference_plane={reference_plane!r}')
     warnings_list = []
 
-    max_amp = (1 - 2**-12) / max_tones_per_bin
+    # Reserve filterbank-compensation TX boost headroom in the amplitude words
+    # on top of the per-bin sharing cap (psb_scale absorbs the difference).
+    max_amp = ((1 - 2**-12) / max_tones_per_bin
+               * _filterbank_tx_headroom_factor(config_dict))
     scalemin = 1 / 256
     scalemax = 255
     headroom_db = 1.0

@@ -2325,7 +2325,7 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
               nonlinear=True, sweep_direction="up", verbose=True,
               z_err=None, optimizer_z_err=None, use_error_weights=None,
               max_points=None, n_jobs=1, find_resonances=False,
-              skip_blind=True,
+              skip_blind=True, apply_readout_correction=True,
               **fit_kwargs):
     """Fit one or more resonances from a sweep-data dict.
 
@@ -2385,9 +2385,18 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
         all points.
     skip_blind : bool, optional
         Skip tones flagged as blind in the sweep metadata (default ``True``).
+    apply_readout_correction : bool, optional
+        Fit with (``True``, default) or without (``False``) the filterbank
+        compensation's software readout-flattening factors. Toggles the
+        parsed sweep either way when it carries the per-(point, tone)
+        factors; otherwise the data is fitted as parsed. The resulting
+        ``FitResult`` traces (and ``plot_fits``) inherit this choice — it
+        cannot be re-toggled after fitting.
     """
     from .peak_finder import find_mkid_resonances
+    from .plotting._common import _with_sweep_readout_correction
 
+    sweep_data = _with_sweep_readout_correction(sweep_data, apply_readout_correction)
     sf, z_stack, e_stack = _prepare_sweep_stack(sweep_data, z_err)
     f_all, z_all, e_all = _flatten_sweep(sweep_data, z_err)
     if use_error_weights is not None:

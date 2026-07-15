@@ -662,6 +662,95 @@ def _validated_reference_plane(reference_plane, frequencies, info, config,
     return reference_plane
 
 
+def _with_sweep_readout_correction(sweep_data, apply_readout_correction):
+    """
+    Return sweep data with the software readout correction (the filterbank
+    compensation's RX half) applied or removed to match the request.
+
+    Parsed sweep data carries the per-(point, tone) factors
+    (``readout_correction``) and whether they are already applied
+    (``readout_correction_applied``), so the correction can be toggled either
+    way at plot time. No-op (returns the input) when the data is already in
+    the requested state, or when the factors are unavailable or shape-
+    mismatched (older captures, concatenated wideband data).
+    """
+    if not isinstance(sweep_data, dict):
+        return sweep_data
+    want = bool(apply_readout_correction)
+    applied = bool(sweep_data.get('readout_correction_applied', False))
+    if want == applied:
+        return sweep_data
+    rc = sweep_data.get('readout_correction')
+    if rc is None or 'sweep_i' not in sweep_data:
+        return sweep_data
+    rc = np.asarray(rc, dtype=float)
+    if rc.shape != np.shape(sweep_data['sweep_i']):
+        return sweep_data
+    gain = rc if want else 1.0 / rc
+    out = dict(sweep_data)
+    for key in ('sweep_i', 'sweep_q', 'sweep_ei', 'sweep_eq'):
+        if key in out and out[key] is not None:
+            out[key] = np.asarray(out[key], dtype=float) * gain
+    out['readout_correction_applied'] = want
+    return out
+
+
+def _with_samples_readout_correction(ts_data, apply_readout_correction):
+    """
+    Return parsed timestream data with the software readout correction (the
+    filterbank compensation's RX half) applied or removed to match the
+    request, per sample via the modulation point tag.
+
+    No-op (returns the input) when the data is already in the requested state,
+    when the capture carries no modulation tags, or when the info snapshot
+    reports no correction factors (compensation off, older captures).
+    """
+    if not isinstance(ts_data, dict):
+        return ts_data
+    want = bool(apply_readout_correction)
+    applied = bool(ts_data.get('readout_correction_applied', False))
+    if want == applied:
+        return ts_data
+    points = ts_data.get('modulation_point')
+    if points is None:
+        return ts_data
+    points = np.asarray(points, dtype=int)
+    if not np.any(points > 0):
+        return ts_data
+    from souk_readout_tools.modulation import readout_correction_factors
+    num_tones = int(ts_data['num_tones'])
+    factors = readout_correction_factors(ts_data.get('info'), num_tones)
+    if factors is None:
+        return ts_data
+    n_points = factors.shape[0]
+    valid = (points >= 1) & (points <= n_points)
+    gain = np.ones((len(points), num_tones), dtype=float)
+    gain[valid] = factors[points[valid] - 1]
+    if not want:
+        gain = 1.0 / gain
+
+    def _scaled(per_tone_data):
+        scaled = {}
+        for key, values in per_tone_data.items():
+            try:
+                col = int(key)
+            except (TypeError, ValueError):
+                scaled[key] = values
+                continue
+            values = np.asarray(values)
+            if col < num_tones and len(values) == len(points):
+                scaled[key] = values.astype(float) * gain[:, col]
+            else:
+                scaled[key] = values
+        return scaled
+
+    out = dict(ts_data)
+    out['i_data'] = _scaled(ts_data['i_data'])
+    out['q_data'] = _scaled(ts_data['q_data'])
+    out['readout_correction_applied'] = want
+    return out
+
+
 def _scale_iq_components(si, sq, ei, eq, scale):
     """Apply one linear scale to I/Q data and optional I/Q uncertainties."""
     si = np.asarray(si) * scale

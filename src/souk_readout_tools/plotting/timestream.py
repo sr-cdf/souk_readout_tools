@@ -18,7 +18,9 @@ from ._common import (_get_pyplot, _compute_mag_phase,
                        _resolve_label,
                        _normalise_iq, _compute_mag_phase_units, UNITS,
                        _is_calibrated_magnitude_unit,
-                       _canonical_units, _validate_reference_plane)
+                       _canonical_units, _validate_reference_plane,
+                       _with_samples_readout_correction,
+                       _with_sweep_readout_correction)
 from ._psd import compute_psd, log_bin_psd
 
 # PTP clock rate: telescope_time counts per second
@@ -509,7 +511,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     units='raw', config=None, reference_plane='adc_input',
                     x_axis='time', unwrap_phase=True,
                     smooth_window_hz=1000, conversion_method='linearized',
-                    calibrations=None, **kwargs):
+                    calibrations=None, apply_readout_correction=True,
+                    **kwargs):
     """
     Plot timestream data in various formats.
 
@@ -580,12 +583,18 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         unwrap_phase: bool, optional.  Unwrap the phase in
             ``format='magphase'``.  Default ``True`` preserves the previous
             behaviour; pass ``False`` to show wrapped phase.
+        apply_readout_correction: bool, plot with (True, default) or without
+            (False) the filterbank compensation's software readout-flattening
+            factors, for modulated captures and any sweep trace used. Toggles
+            already-parsed data either way when the factors are available.
         **kwargs: Passed to matplotlib plot calls.
 
     Returns:
         matplotlib.figure.Figure
     """
     plt = _get_pyplot()
+    ts_data = _with_samples_readout_correction(ts_data, apply_readout_correction)
+    sweep_data = _with_sweep_readout_correction(sweep_data, apply_readout_correction)
     custom_title = kwargs.pop('title', None)
     selected = _get_tone_data(ts_data, tones)
     sample_rate = ts_data['sample_rate']
@@ -762,6 +771,7 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                         decorrelate_tones=None,
                         blind_tone_modes=0,
                         blind_tones=None,
+                        apply_readout_correction=True,
                         **kwargs):
     """
     Plot power spectral density of timestream data.
@@ -823,6 +833,8 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
         matplotlib.figure.Figure
     """
     plt = _get_pyplot()
+    ts_data = _with_samples_readout_correction(ts_data, apply_readout_correction)
+    sweep_data = _with_sweep_readout_correction(sweep_data, apply_readout_correction)
     selected = _get_tone_data(ts_data, tones)
     sample_rate = ts_data['sample_rate']
     psd_kw = psd_kwargs or {}
@@ -996,7 +1008,8 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
                                   unwrap=False,
                                   hide_modulation_settling_points=False,
                                   fig=None, label=None,
-                                  units='raw', config=None, **kwargs):
+                                  units='raw', config=None,
+                                  apply_readout_correction=True, **kwargs):
     """
     Overplot timestream I/Q points on the resonance circle from sweep data.
 
@@ -1021,12 +1034,19 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
             'peak' - normalise to the peak magnitude of the data.
             'adc_fs' - fraction of ADC full-scale (linear voltage).
         config: Config dict (needed for non-default rx_mix_scale).
+        apply_readout_correction: bool, plot with (True, default) or without
+            (False) the filterbank compensation's software readout-flattening
+            factors, applied consistently to the timestream samples and the
+            sweep trace. Toggles already-parsed data either way when the
+            factors are available.
         **kwargs: Passed to plot calls.
 
     Returns:
         matplotlib.figure.Figure
     """
     plt = _get_pyplot()
+    ts_data = _with_samples_readout_correction(ts_data, apply_readout_correction)
+    sweep_data = _with_sweep_readout_correction(sweep_data, apply_readout_correction)
     selected = _get_tone_data(ts_data, tones=[tone_index])
     key, i_arr, q_arr = selected[0]
 

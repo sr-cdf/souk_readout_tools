@@ -258,6 +258,40 @@ def active_modulation_state(info):
     return None
 
 
+def readout_correction_factors(info, num_tones):
+    """
+    Return the ``(num_points, num_tones)`` software readout-flattening factors
+    from a ``get_info`` payload's modulation state, or ``None`` when the state
+    carries none (compensation off, or nothing armed). Factors default to 1
+    for tones without a reported correction. These are the linear gains the
+    filterbank compensation cannot apply in hardware (the RX scale word is
+    inert); ``ReadoutClient.parse_samples`` multiplies them onto modulated
+    captures by default, and the plotting helpers use them to toggle the
+    correction on already-parsed data.
+    """
+    state = active_modulation_state(info)
+    if not isinstance(state, dict):
+        return None
+    n_points = int(state.get('num_points', 0) or 0)
+    if n_points < 1:
+        return None
+    factors = np.ones((n_points, int(num_tones)), dtype=float)
+    found = False
+    for tone in state.get('tones', []):
+        if not isinstance(tone, dict):
+            continue
+        rc = tone.get('readout_correction')
+        try:
+            idx = int(tone.get('index'))
+        except (TypeError, ValueError):
+            continue
+        if rc is None or len(rc) != n_points or not 0 <= idx < num_tones:
+            continue
+        factors[:, idx] = np.asarray(rc, dtype=float)
+        found = True
+    return factors if found else None
+
+
 def _extract_tone_metadata(container):
     """Collect tone role metadata from parsed-sample-style containers."""
     if not isinstance(container, dict):
@@ -469,14 +503,16 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
     # firmware -- see doc/filterbank_compensation.md), the server reports
     # per-(point, tone) linear gain factors in the state ('readout_correction')
     # and they are applied here, so downstream demod sees a flat channel. The
-    # factors are ~1 over the centre half of a channel.
+    # factors are ~1 over the centre half of a channel. Skipped when
+    # parse_samples already applied them (marked 'readout_correction_applied').
     readout_corr = None
-    for tone in tone_modulation_state.get('tones', []):
-        factors = tone.get('readout_correction')
-        if factors is not None and len(factors) == N and int(tone['index']) < n_tones:
-            if readout_corr is None:
-                readout_corr = np.ones((N, n_tones), dtype=float)
-            readout_corr[:, int(tone['index'])] = np.asarray(factors, dtype=float)
+    if not data_dict.get('readout_correction_applied', False):
+        for tone in tone_modulation_state.get('tones', []):
+            factors = tone.get('readout_correction')
+            if factors is not None and len(factors) == N and int(tone['index']) < n_tones:
+                if readout_corr is None:
+                    readout_corr = np.ones((N, n_tones), dtype=float)
+                readout_corr[:, int(tone['index'])] = np.asarray(factors, dtype=float)
     if readout_corr is not None:
         modulating = (points >= 1) & (points <= N)
         z[modulating] = z[modulating] * readout_corr[points[modulating] - 1, :]
@@ -893,10 +929,12 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         How to fill samples flagged with ``modulation_settling==1`` when they
         were not retained by ``group_cycles`` or when their transient IQ should
         be replaced. ``True`` / ``'raw'`` (default) demodulates the raw settling
-        IQ using the completed cycle's reference/slope (note: raw IQ does not
-        carry the software readout flattening ``group_cycles`` applies, so
-        filled settling samples can sit up to ~0.5 dB off at extreme probe
-        offsets -- they remain flagged). ``'interpolate'`` fills
+        IQ using the completed cycle's reference/slope (note: if the parsed
+        data does not carry the software readout flattening --
+        ``parse_samples`` now applies it by default; data parsed with
+        ``apply_readout_correction=False`` does not -- filled settling
+        samples can sit up to ~0.5 dB off at extreme probe offsets; they
+        remain flagged). ``'interpolate'`` fills
         settling samples by linear interpolation between non-settling
         demodulated samples, leaving flags intact. ``False`` / ``'none'`` leaves
         dropped settling samples as NaN. Incomplete cycles and missing packets
