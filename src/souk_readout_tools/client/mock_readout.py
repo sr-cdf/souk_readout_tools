@@ -18,8 +18,27 @@ import traceback
 
 import numpy as np
 import yaml
-import so3g
-import spt3g.core
+
+# so3g / spt3g are optional; only the receive_stream_g3() path needs them.
+# They have no PyPI wheels and are hard to build on Windows, so defer failure.
+try:
+    import so3g
+    import spt3g.core
+    _G3_IMPORT_ERROR = None
+except ImportError as _e:
+    so3g = None
+    spt3g = None
+    _G3_IMPORT_ERROR = _e
+
+
+def _require_g3():
+    '''Raise a helpful error if the optional so3g/spt3g stack is unavailable.'''
+    if _G3_IMPORT_ERROR is not None:
+        raise ImportError(
+            "The G3 stream format requires the 'so3g' / 'spt3g' packages, which "
+            "are not installed. Install with `pip install souk_readout_tools[g3]` "
+            "(unavailable on Windows). All other functionality works without them."
+        ) from _G3_IMPORT_ERROR
 
 from souk_readout_tools.config_utils import get_template_config_path
 from souk_readout_tools.timing import unix_to_iso, format_duration_s
@@ -1422,6 +1441,7 @@ class MockReadoutServer:
         ``duration`` mean the same as in
         :py:meth:`ReadoutClient.receive_stream_g3`.
         """
+        _require_g3()
         SOSTREAM_VERSION = 1
         num_sample_rows_per_frame = 400
         iq_data = None

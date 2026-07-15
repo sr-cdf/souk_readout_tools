@@ -866,12 +866,26 @@ def classify_clock_status(status=None):
     dict
         ``{'all_locked', 'lmk_locked', 'lmx_locked', 'fault', 'chips'}`` where
         ``fault`` is ``'lmk'`` (reference unlocked), ``'lmx'`` (a downstream PLL
-        unlocked while the LMK is locked), or ``None`` (all locked). If no chips
-        are reported (krc-utils unavailable/timed out) everything is treated as
-        unlocked, i.e. ``fault == 'lmk'``.
+        unlocked while the LMK is locked), or ``None`` (all locked). If
+        ``krc-utils`` is not installed (non-SOUK host, e.g. RFSoC 4x2) the result
+        carries ``available == False`` and ``fault == None`` so callers skip the
+        clock gate instead of faulting. Otherwise, if no chips are reported
+        (krc-utils timed out) everything is treated as unlocked (``fault ==
+        'lmk'``).
     """
     if status is None:
         status = get_clock_status()
+    if not status.get('available', True):
+        # krc-utils not present: no clock tree to manage here, so report no
+        # fault and let callers proceed without a lock check.
+        return {
+            'all_locked': False,
+            'lmk_locked': False,
+            'lmx_locked': False,
+            'fault': None,
+            'available': False,
+            'chips': status.get('chips', []),
+        }
     chips = status.get('chips', [])
     lmk_chips = [c for c in chips if str(c.get('name', '')).lower().startswith('lmk')]
     lmx_chips = [c for c in chips if str(c.get('name', '')).lower().startswith('lmx')]
@@ -889,6 +903,7 @@ def classify_clock_status(status=None):
         'lmk_locked': lmk_locked,
         'lmx_locked': lmx_locked,
         'fault': fault,
+        'available': True,
         'chips': chips,
     }
 
@@ -939,6 +954,14 @@ def apply_clock_config(config_dict, max_attempts=3):
     max_attempts = int(max_attempts)
     if max_attempts < 1:
         raise ValueError('max_attempts must be >= 1')
+
+    if not krc_utils_available():
+        _firmware_log(
+            'krc-utils not installed (non-SOUK host); skipping clock '
+            'configuration and lock check',
+            source='clock',
+        )
+        return {'all_locked': False, 'chips': [], 'available': False}
 
     desired_clock = _configured_clock_source(config_dict)
     current_clock = get_clock_source()
@@ -9426,6 +9449,18 @@ KRC_UTILS_BIN = '/home/casper/krc-utils/krc-utils'
 KRC_CLOCK_DIR = '/etc/krc-utils.d/clock.d'
 KRC_LMK_SYMLINK = os.path.join(KRC_CLOCK_DIR, 'lmk04208.txt')
 
+
+def krc_utils_available():
+    """Return True if the ``krc-utils`` clock tool is present on this host.
+
+    ``krc-utils`` is specific to SOUK RFSoC hosts. On a stock board (e.g. an
+    RFSoC 4x2) the binary is absent, the clocks are managed by other means, and
+    there is no LMK/LMX lock status to query. Callers use this to skip clock
+    lock checks entirely rather than treating the missing tool as an unlocked
+    (faulted) clock tree.
+    """
+    return os.path.isfile(KRC_UTILS_BIN) and os.access(KRC_UTILS_BIN, os.X_OK)
+
 # Map user-facing names to the LMK config filenames
 _CLOCK_SOURCE_FILES = {
     'internal': 'lmk04208_in_12M8_out_122M88.txt',
@@ -9462,8 +9497,15 @@ def get_clock_status():
     -------
     dict
         Keys: 'all_locked' (bool), 'chips' (list of dicts with 'name' and
-        'status' for each clock chip).
+        'status' for each clock chip), and 'available' (bool) - False when
+        ``krc-utils`` is not installed on this host, in which case there is no
+        clock status to report and lock checks should be skipped.
     """
+    if not krc_utils_available():
+        # Non-SOUK host (e.g. RFSoC 4x2): no krc-utils, so there is nothing to
+        # query. Report unavailable rather than 'unlocked' so callers skip the
+        # lock check instead of faulting.
+        return {'all_locked': False, 'chips': [], 'available': False}
     try:
         result = subprocess.run(
             [KRC_UTILS_BIN, 'status'],
@@ -9483,10 +9525,14 @@ def get_clock_status():
             except ValueError:
                 continue
         all_locked = all(c['status'] == 'locked' for c in chips) if chips else False
-        return {'all_locked': all_locked, 'chips': chips}
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return {'all_locked': all_locked, 'chips': chips, 'available': True}
+    except FileNotFoundError as exc:
+        # Binary went missing between the availability check and the call.
+        print(bcolors.WARNING + f'krc-utils unavailable: {exc}' + bcolors.ENDC)
+        return {'all_locked': False, 'chips': [], 'available': False, 'error': str(exc)}
+    except (subprocess.TimeoutExpired, OSError) as exc:
         print(bcolors.FAIL + f'Failed to query clock status: {exc}' + bcolors.ENDC)
-        return {'all_locked': False, 'chips': [], 'error': str(exc)}
+        return {'all_locked': False, 'chips': [], 'available': True, 'error': str(exc)}
 
 
 def select_clock_source(source):
