@@ -1,6 +1,6 @@
 # Changelog & Feature List
 
-## v1.6.1 (in development)
+## v1.6.1
 
 **Filterbank channel-response compensation**
 - Tones operating away from their filterbank bin centre are now gain- (and
@@ -49,6 +49,13 @@
   LO-stepping diagnostic. They configure the system from scratch (single
   test tone — avoids intermod/alias contamination), guard the digital-gain
   state around internal-loopback switches, and restore what they change.
+
+**Other**
+- rfsoc4x2: krc-utils availability checks in the clock status handling.
+- `so3g` is no longer a hard dependency — without it, SO 3G streaming is
+  unavailable (e.g. on Windows) but everything else works.
+- Docs/profiling: README and profiling scripts detail the accumulator
+  read-back geometry and timing metrics.
 
 ## v1.6.0
 
