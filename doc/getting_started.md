@@ -760,7 +760,12 @@ plot_timestream(data,x_axis='telescope_time')
 ### G3 Stream Output (so3g)
 
 For OCS / Simons Observatory data pipelines, streams can be recorded directly
-into so3g/spt3g `.g3` files instead of the default binary format:
+into so3g/spt3g `.g3` files instead of the default binary format.
+
+> **Optional dependency:** G3 output requires the `so3g`/`spt3g` packages, which
+> are not installed by default (they have no PyPI wheels and do not build on
+> Windows). Install them with `pip install souk_readout_tools[g3]` on Linux/macOS.
+> Every other feature works without them; only `receive_stream_g3()` needs them.
 
 ```python
 client.receive_stream_g3(

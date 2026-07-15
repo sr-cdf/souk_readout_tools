@@ -73,8 +73,29 @@ import ast
 import base64
 import io
 import logging
-import so3g
-import spt3g.core
+
+# so3g / spt3g provide the G3 (.g3) stream file format. They are not available
+# as pre-built wheels on PyPI and are difficult to build on Windows (spt3g needs
+# a C++ toolchain / nmake). They are only needed for the receive_stream_g3()
+# path, so make them optional and defer any import failure to actual use.
+try:
+    import so3g
+    import spt3g.core
+    _G3_IMPORT_ERROR = None
+except ImportError as _e:
+    so3g = None
+    spt3g = None
+    _G3_IMPORT_ERROR = _e
+
+
+def _require_g3():
+    '''Raise a helpful error if the optional so3g/spt3g stack is unavailable.'''
+    if _G3_IMPORT_ERROR is not None:
+        raise ImportError(
+            "The G3 stream format requires the 'so3g' / 'spt3g' packages, which "
+            "are not installed. Install with `pip install souk_readout_tools[g3]` "
+            "(unavailable on Windows). All other functionality works without them."
+        ) from _G3_IMPORT_ERROR
 
 from souk_readout_tools.config_utils import copy_template_config
 from souk_readout_tools.timing import unix_to_iso, DEFAULT_ALIGN_TOL_S
@@ -5015,6 +5036,7 @@ class ReadoutClient:
         duration : float, optional
             Capture duration in seconds (default ``30``).
         '''
+        _require_g3()
         if self.mock:
             return self._mock_server.receive_stream_g3(
                 num_tones=num_tones, filename=filename, print_data=print_data,
