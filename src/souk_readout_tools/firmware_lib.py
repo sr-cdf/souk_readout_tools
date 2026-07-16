@@ -273,7 +273,10 @@ def _bin_spacing_hz(bin_centers_hz):
 #   RX phase    - arg H(d_rx)    -- removes the image phase turn-over (only
 #                                   non-zero when a group delay is configured;
 #                                   the ordinary delay slope is left for the
-#                                   sweep calibration, which measures it)
+#                                   sweep calibration, which measures it).
+#                                   The written word carries +arg H -- the
+#                                   sign found to cancel on hardware (see
+#                                   filterbank_compensation).
 # RX scalings ride on FILTERBANK_RX_SCALE_BASE so the boost part of the
 # correction stays below full scale.
 #
@@ -492,7 +495,11 @@ def filterbank_compensation(tx_offset_bins, rx_offset_bins, bin_spacing_hz,
     return {
         'tx_scale': np.clip(tx_scale, 0.0, 2.0),
         'rx_scale': np.clip(rx_scale, 0.0, 2.0),
-        'rx_phase_rad': -np.angle(h),
+        # Sign is empirical (hardware, 2026-07-15): writing -arg H doubled
+        # the edge turn-over, +arg H cancels it. Why the word enters the
+        # readout with this sign is not pinned down (mixer convention or
+        # something subtler).
+        'rx_phase_rad': np.angle(h),
         'response_mag': h_mag,
     }
 

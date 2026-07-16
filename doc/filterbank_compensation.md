@@ -52,7 +52,7 @@ Where control words are prepared, per tone (and per point, for modulation):
 |------|---------|------|
 | TX scaling `base × 1/G(δ_tx)` | **hardware**, per point/slot (and at snap residuals for set-tones/sweeps when amplitudes are in hand) | restores the physical drive on the detector |
 | RX magnitude `G(δ_rx)/⏐H⏐` (+ any TX clip shortfall) | **software**: the server reports per-(tone, point) `readout_correction` factors — in the modulation state (applied by `parse_samples` / `group_cycles`) and alongside sweep results (applied by `parse_sweep_data`) | flattens the readout |
-| RX phase `−arg H(δ_rx)` | **hardware**, per point (only non-zero when a group delay is known; sweeps resolve the same path calibration as modulation) | removes the image phase turn-over |
+| RX phase `−arg H(δ_rx)` (written as `+arg H`, the sign found to cancel on hardware) | **hardware**, per point (only non-zero when a group delay is known; sweeps resolve the same path calibration as modulation) | removes the image phase turn-over |
 
 - The **TX factor restores the physical drive on the detector** — the main
   synthesized tone rolls off with the *single-bank* `G`, even though the
@@ -107,10 +107,13 @@ filterbank_compensation: true            # master switch (default true)
 With no calibration and no override the compensation is amplitude-only —
 exact in digital loopback and correct to a few mrad below ~0.6 bins in RF.
 On a real setup the path delay is hundreds of ns, putting the *uncorrected*
-edge phase term at ~0.5–1 rad, so keep the calibration current. If the edge
-phase turn-over **doubles** instead of cancelling after calibrating, the
-delay sign convention is inverted — negate the stored value (the convention
-here matches `remove_group_delay`: positive τ, correction `×e^{+2πifτ}`).
+edge phase term at ~0.5–1 rad, so keep the calibration current. The stored
+delay follows the `remove_group_delay` convention (positive τ, correction
+`×e^{+2πifτ}`). If the edge phase turn-over **doubles** instead of
+cancelling after calibrating, a sign in the phase chain is inverted — this
+happened once (2026-07-15): empirically the correction word must carry
+`+arg H`, not `−arg H`; the mechanism behind the word→readout sign is not
+pinned down.
 
 Per-request A/B switch: `enable_modulation(..., compensate_filterbank=False)`
 disables the compensation for one modulation run (it sticks for subsequent
