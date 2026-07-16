@@ -1005,6 +1005,7 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
 
 def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
                                   deembed=False, phase_center=False,
+                                  mag_centered=None, phase_centered=None,
                                   unwrap=False,
                                   hide_modulation_settling_points=False,
                                   fig=None, label=None,
@@ -1021,7 +1022,17 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
             baseline normalisation) to both sweep and timestream.
         phase_center: bool, apply phase centering (circle centering +
             rotation) to both sweep and timestream.  Applied after
-            deembedding when both are True.
+            deembedding when both are True.  Sets the default for the
+            per-panel ``mag_centered``/``phase_centered`` overrides below;
+            the I vs Q panel always follows this value.
+        mag_centered: bool or None, per-panel override for whether the
+            magnitude-vs-frequency panel is phase-centered. None (default)
+            follows phase_center. Centering flattens the resonance dip, so
+            pass False to keep the magnitude structure while the phase panel
+            stays centered.
+        phase_centered: bool or None, per-panel override for whether the
+            phase-vs-frequency panel is phase-centered. None (default)
+            follows phase_center.
         unwrap: bool, unwrap the phase.
         hide_modulation_settling_points: bool, optional. If True, omit
             timestream samples where ``modulation_settling`` is set. Default
@@ -1084,36 +1095,67 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     ts_freq = _get_modulated_probe_frequencies(
         ts_data, tone_index, tone_freq, len(z_ts))
 
-    # Apply transforms to sweep and timestream at their probe frequencies.
-    d_params = None
-    pc_params = None
+    # Deembedding is shared across all panels; apply it once at each trace's
+    # probe frequencies.
     if deembed:
         z_sweep, d_params = _apply_deembed(sweep_f, z_sweep, True)
         z_ts, _ = _apply_deembed(None, z_ts, d_params, frequency=ts_freq)
-    if phase_center:
-        z_sweep, pc_params = _apply_phase_center(z_sweep, True)
-        z_ts, _ = _apply_phase_center(z_ts, pc_params)
 
     visible = _visible_modulation_sample_mask(
         ts_data, len(z_ts), hide_modulation_settling_points)
     z_ts_plot = z_ts[visible]
     ts_freq_plot = ts_freq[visible]
 
-    # Compute phase for the frequency-domain panel
-    _, phase_sweep = _compute_mag_phase(z_sweep, unwrap=unwrap)
-    _, phase_ts = _compute_mag_phase(z_ts_plot, unwrap=unwrap)
+    # Phase centering can be enabled independently per panel; each override
+    # defaults to the shared phase_center. The I vs Q panel always follows
+    # phase_center.
+    iq_centered = phase_center
+    phase_centered = phase_center if phase_centered is None else phase_centered
+    mag_centered = phase_center if mag_centered is None else mag_centered
+
+    def _maybe_center(enable, z_s, z_t):
+        """Phase-center the sweep and timestream together, or pass through."""
+        if not enable:
+            return z_s, z_t
+        z_s, pc_params = _apply_phase_center(z_s, True)
+        z_t, _ = _apply_phase_center(z_t, pc_params)
+        return z_s, z_t
+
+    z_sweep_iq, z_ts_iq = _maybe_center(iq_centered, z_sweep, z_ts_plot)
+    z_sweep_ph, z_ts_ph = _maybe_center(phase_centered, z_sweep, z_ts_plot)
+    z_sweep_mg, z_ts_mg = _maybe_center(mag_centered, z_sweep, z_ts_plot)
+
+    # Compute magnitude and phase for the frequency-domain panels
+    _, phase_sweep = _compute_mag_phase(z_sweep_ph, unwrap=unwrap)
+    mag_sweep, _ = _compute_mag_phase(z_sweep_mg, unwrap=unwrap)
+    mag_ts, _ = _compute_mag_phase(z_ts_mg, unwrap=unwrap)
+    if unwrap:
+        # The timestream samples cycle through the modulation frequencies in
+        # time order, so np.unwrap along the sample axis mis-reads the jump
+        # back to the start of each modulation cycle as a phase wrap. Instead
+        # place each sample on the sweep's unwrapped branch at its own probe
+        # frequency, which does not depend on the sample ordering.
+        order = np.argsort(sweep_f)
+        expected = np.interp(ts_freq_plot, np.asarray(sweep_f)[order],
+                             phase_sweep[order])
+        wrapped_ts = np.angle(z_ts_ph)
+        phase_ts = wrapped_ts + 2 * np.pi * np.round(
+            (expected - wrapped_ts) / (2 * np.pi))
+    else:
+        _, phase_ts = _compute_mag_phase(z_ts_ph, unwrap=False)
 
     if fig is None:
-        fig, (ax_iq, ax_pf) = plt.subplots(1, 2, figsize=(14, 6))
+        fig, (ax_iq, ax_pf, ax_mf) = plt.subplots(1, 3, figsize=(20, 6))
+        ax_mf.sharex(ax_pf)  # both frequency-domain panels share the x axis
     else:
-        ax_iq, ax_pf = fig.axes[:2]
+        ax_iq, ax_pf, ax_mf = fig.axes[:3]
 
     ts_label = label if label is not None else 'Timestream'
 
     # Left panel: I vs Q resonance circle
-    ax_iq.plot(z_sweep.real, z_sweep.imag, '-', linewidth=1.5,
+    ax_iq.plot(z_sweep_iq.real, z_sweep_iq.imag, '-', linewidth=1.5,
                color='C0', label='Sweep', zorder=2)
-    ax_iq.plot(z_ts_plot.real, z_ts_plot.imag, '.', markersize=1, alpha=0.3,
+    ax_iq.plot(z_ts_iq.real, z_ts_iq.imag, '.', markersize=1, alpha=0.3,
                color='C1', label=ts_label, zorder=1, **kwargs)
     ax_iq.set_xlabel(f'I {iq_label}'.strip())
     ax_iq.set_ylabel(f'Q {iq_label}'.strip())
@@ -1129,6 +1171,16 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     ax_pf.set_xlabel('Frequency (Hz)')
     ax_pf.set_ylabel('Phase (rad)')
     ax_pf.legend(fontsize='small')
+
+    # Third panel: magnitude vs frequency
+    ax_mf.plot(sweep_f, mag_sweep, '-', linewidth=1.5,
+               color='C0', label='Sweep', zorder=2)
+    ax_mf.plot(ts_freq_plot, mag_ts,
+               '.', markersize=1, alpha=0.3,
+               color='C1', label=ts_label, zorder=1, **kwargs)
+    ax_mf.set_xlabel('Frequency (Hz)')
+    ax_mf.set_ylabel(f'Magnitude {iq_label}'.strip())
+    ax_mf.legend(fontsize='small')
 
     suffix = _transform_title_suffix(deembed, phase_center)
     fig.suptitle(f'Tone {tone_index} — Resonance Circle' + suffix)
