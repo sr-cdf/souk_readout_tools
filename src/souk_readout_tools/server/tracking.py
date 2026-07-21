@@ -506,11 +506,26 @@ class TrackingRuntime:
     def __init__(self, server, params):
         self.server = server
         self.params = params
-        cfg = server.modulation_cfg
-        state = server.modulation_state
+        # Engine: whichever modulation engine is armed (they are mutually
+        # exclusive). 'fw' slots and 'sw' points tag frames identically, so
+        # the estimator is shared; only the commit path differs.
+        if server.e_fw_modulation_enabled.is_set():
+            self.engine = 'fw'
+        elif server.modulation_cfg is not None:
+            self.engine = 'sw'
+        elif server.fw_modulation_cfg is not None:
+            self.engine = 'fw'
+        else:
+            raise ValueError('modulation must be armed (enable_modulation, '
+                             'either engine) before enable_tracking')
+        cfg = self._mod_cfg()
+        state = self._mod_state()
         if cfg is None or state is None:
             raise ValueError('modulation must be armed (enable_modulation) '
                              'before enable_tracking')
+        if self.engine == 'fw' and cfg.get('mode') != 'auto':
+            raise ValueError("fw-engine tracking needs mode='auto' (manual "
+                             'slot selection never completes cycles)')
         self.num_points = int(state['num_points'])
         if self.num_points < 3:
             raise ValueError('tracking needs >= 3 modulation points (got '
@@ -576,6 +591,21 @@ class TrackingRuntime:
 
     # -- setup helpers -------------------------------------------------------
 
+    def _mod_cfg(self):
+        """The active engine's resolved modulation cfg."""
+        return (self.server.fw_modulation_cfg if self.engine == 'fw'
+                else self.server.modulation_cfg)
+
+    def _mod_state(self):
+        """The active engine's modulation state (get_info payload)."""
+        return (self.server.fw_modulation_state if self.engine == 'fw'
+                else self.server.modulation_state)
+
+    def _mod_params(self):
+        """The active engine's prepared bundle (carries 'armed')."""
+        return (self.server.fw_modulation_params if self.engine == 'fw'
+                else self.server.modulation_params)
+
     def _expand_per_tone(self, values):
         """Expand a per-modulated-tone or per-tone array to (n_tones,)."""
         values = np.asarray(values, dtype=float)
@@ -596,13 +626,20 @@ class TrackingRuntime:
     def _full_offsets(self, cfg):
         """(N, n_tones) probe offsets from the resolved modulation cfg.
 
-        ``cfg['offsets']`` is (N, 1) (broadcast) or (N, len(mod_indices));
-        either broadcasts onto the modulated columns.
+        The per-point/per-slot offsets (``offsets`` for sw cfgs,
+        ``slot_offsets`` for fw cfgs) are (N, 1) (broadcast) or
+        (N, len(mod_indices)); either broadcasts onto the modulated columns.
         """
-        offsets = np.atleast_2d(np.asarray(cfg['offsets'], dtype=float))
+        key = 'slot_offsets' if self.engine == 'fw' else 'offsets'
+        offsets = np.atleast_2d(np.asarray(cfg[key], dtype=float))
         full = np.zeros((offsets.shape[0], self.n_tones))
         full[:, self.mod_indices] = offsets
         return full
+
+    # Conservative per-point drift bound (in channels) from an occupancy
+    # class, for states that do not report numeric drift_bins (fw engine):
+    # 'nearest' means < 0.5, 'second' < 1.0, 'beyond' = out of coverage.
+    _OCCUPANCY_DRIFT_BOUND = {'nearest': 0.5, 'second': 1.0, 'beyond': np.inf}
 
     def _lo_headroom_hz(self):
         """Per-tone |centre shift| that stays within armed-bin coverage.
@@ -610,24 +647,35 @@ class TrackingRuntime:
         Estimated from the reported per-(point, tone) ``drift_bins`` (signed
         drift from the armed bin centre in channels; |drift| > 1 is the
         ``needs_recenter`` / occupancy-'beyond' condition) and the armed TX
-        bin width. Classification only -- the commit path re-verifies with
-        the freshly prepared bundle's ``needs_recenter`` and reclassifies.
+        bin width. States without numeric drifts (fw engine) fall back to a
+        conservative bound from the occupancy class. Classification only --
+        the commit path re-verifies with the freshly prepared bundle's
+        ``needs_recenter`` and reclassifies.
         """
         headroom = np.full(self.n_tones, np.inf)
-        params = self.server.modulation_params
-        state = self.server.modulation_state
+        params = self._mod_params()
+        state = self._mod_state()
         if params is None or state is None:
             return headroom
         bin_width = float(params.get('armed', {}).get(
             'tx_bin_width_hz', 0.0) or 0.0)
         if bin_width <= 0:
             return headroom
+        tones = state.get('tones') or []
         try:
-            drift = np.array([tone['drift_bins'] for tone in state['tones']],
+            drift = np.array([tone['drift_bins'] for tone in tones],
                              dtype=float).T          # (n_points, n_tones)
+            max_drift = np.nanmax(np.abs(drift), axis=0)
         except (KeyError, TypeError, ValueError):
+            try:
+                max_drift = np.array([
+                    max(self._OCCUPANCY_DRIFT_BOUND.get(str(o), np.inf)
+                        for o in tone['occupancy'])
+                    for tone in tones], dtype=float)
+            except (KeyError, TypeError, ValueError):
+                return headroom
+        if len(max_drift) != self.n_tones:
             return headroom
-        max_drift = np.nanmax(np.abs(drift), axis=0)
         headroom = np.maximum(0.0, (1.0 - max_drift)) * bin_width
         return headroom
 
@@ -720,8 +768,7 @@ class TrackingRuntime:
                 if not self.filter.settled:
                     continue
 
-                centers = np.asarray(server.modulation_cfg['center'],
-                                     dtype=float)
+                centers = np.asarray(self._mod_cfg()['center'], dtype=float)
                 self.controller.decide(result['filtered_linewidths'],
                                        centers, self._lo_headroom_hz())
                 await self._auto_commit()
@@ -733,7 +780,7 @@ class TrackingRuntime:
         self._task = None
 
     def _applied_revision(self):
-        state = self.server.modulation_state
+        state = self._mod_state()
         return int(state.get('applied_revision', 0)) if state else 0
 
     def _interlocked(self):
@@ -742,11 +789,14 @@ class TrackingRuntime:
         if self.held:
             return True
         reason = None
+        modulating = (server.e_fw_modulation_enabled.is_set()
+                      if self.engine == 'fw'
+                      else server.e_modulation_enabled.is_set())
         if server.sweep_state.get('state') == 'running':
             reason = 'sweep/retune in progress'
         elif not server.e_stream_enabled.is_set():
             reason = 'streaming disabled'
-        elif not server.e_modulation_enabled.is_set():
+        elif not modulating:
             reason = 'modulation disabled'
         self.hold_reason = reason
         return reason is not None
@@ -806,7 +856,8 @@ class TrackingRuntime:
                 continue
             try:
                 result = await self.server._commit_tracking_update(
-                    klass, corrections, self.controller.staged_detunings)
+                    self.engine, klass, corrections,
+                    self.controller.staged_detunings)
                 if 'reclassified_to_bin' in result:
                     # The prepared bundle reported needs_recenter: the shift
                     # really needs a bin/map change. Move the tones to the
@@ -851,6 +902,7 @@ class TrackingRuntime:
                   for i in np.flatnonzero(tracked)}
         return {
             'enabled': self.enabled,
+            'engine': self.engine,
             'dry_run': self.dry_run,
             'held': bool(self.held or self.hold_reason),
             'hold_reason': self.hold_reason or

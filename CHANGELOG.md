@@ -2,19 +2,25 @@
 
 ## v1.6.6
 
-**Server-side FFM tone tracking (auto-recentering)**
+**Server-side FFM tone tracking (auto-recentering), both engines**
 - New `server/tracking.py` + minimal `readout_server.py` wiring: with
-  software modulation running (>= 3 points), the server demodulates the
-  streamed cycles (lean vectorised estimator, unit-tested to match
-  `demodulate`'s model-free maths to 1e-10), filters per-tone detunings
-  (boxcar/EWMA, runtime-configurable), applies a deadband +
-  K-consecutive-window confirmation, and stages clamped centre corrections.
-- Two update classes with independent commit policies: `lo` (seamless
-  LO-word `install_bundle` swap, auto-commit on) and `bin` (bin/map
-  recenter re-arm, staged + on-demand by default). Commits ride the normal
-  frame-producer ownership (epoch -> `to_thread(_prepare_modulation)` ->
-  `_pending_modulation`); staging is the executor-side prepare, so the
-  commit moment is just the scheduler picking up the new words.
+  frequency modulation running (fw — the default engine, `mode='auto'` —
+  or sw; >= 3 slots/points), the server demodulates the streamed cycles
+  (lean vectorised estimator, unit-tested to match `demodulate`'s
+  model-free maths to 1e-10), filters per-tone detunings (boxcar/EWMA,
+  runtime-configurable), applies a deadband + K-consecutive-window
+  confirmation, and stages clamped centre corrections. The loop picks
+  whichever engine is armed (fw slot tags and sw point tags ride the same
+  flag5 field, so estimation is engine-blind).
+- Two update classes with independent commit policies: `lo` (seamless —
+  fw: inactive mixer slot-buffer flip via `_update_fw_modulation`; sw:
+  LO-word `install_bundle` swap; auto-commit on) and `bin` (bin/map
+  recenter re-arm, staged + on-demand by default). fw commits mirror the
+  fw client handlers (executor-side apply, announced identically); sw
+  commits ride the frame-producer ownership (epoch ->
+  `to_thread(_prepare_modulation)` -> `_pending_modulation`) — either way
+  staging is the executor-side prepare, so the commit moment is a cheap
+  switch.
 - Hot-path cost is one deque append per frame (measured 0.066 us —
   no stream-rate regression); estimation runs vectorised across all 2048
   tones in the thread executor (`profiling/tracking_benchmark.py`).
@@ -24,19 +30,19 @@
   `hold_tracking` / `resume_tracking` / `commit_tracking_updates`, plus
   `get_info('tracking')` and matching `ReadoutClient` methods.
 - `enable_modulation(linewidth_hz=...)` carries `params_from_sweep`'s
-  per-tone linewidths on **both engines** (fw default included; pure
-  metadata in the armed config). The tracking loop itself currently runs
-  on `engine='sw'` — its tap/commit path rides the software scheduler;
-  extending it to the fw engine is a documented follow-up.
+  per-tone linewidths on both engines (fw default first; pure metadata in
+  the armed config), required by tracking unless given to
+  `enable_tracking` directly.
 
 **Typed stream frames (opt-in, in-band tone provenance)**
 - Stream clients may send one JSON line (`{"subscribe": ["tone_updates"]}`)
   to receive typed frames: `SNAPSHOT` on subscribe (revision + modulation
   table + tracking status, whichever engine is active) and `TONE_UPDATE`
-  on **every** modulation revision change, any origin — sw revisions hook
-  `_apply_pending_modulation_command` (the single place sw revisions
-  land), fw revisions announce from the fw enable/update/recenter/disable
-  handlers — with revision/op/kind/engine/source/changed centres/
+  on **every** modulation revision change, any origin — fw revisions
+  announce from the fw enable/update/recenter/disable handlers and
+  tracking commits; sw revisions hook `_apply_pending_modulation_command`
+  (the single place sw revisions land) — with
+  revision/op/kind/engine/source/changed centres/
   triggering detunings. Typed frames put a nonzero type code in the top
   byte of the length prefix; unsubscribed clients get a byte-identical
   legacy stream (asserted byte-for-byte in tests).

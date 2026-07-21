@@ -94,7 +94,7 @@ The stream rate is limited by the `stream_data` software loop (AXI
 accumulator reads dominate), so the hot path gets exactly one addition:
 
 ```
-stream_data (modulated branch, per sample):
+stream_data (modulated branches, fw and sw, per sample):
     payload = prepare_frame(...)          # unchanged
     write to stream clients               # unchanged
     if tracking enabled: tracking.tap(payload)   # ONE deque append, O(1)
@@ -187,28 +187,35 @@ No decisions are taken until the filter has seen a full window (`settled`).
 Every correction is classified per tone:
 
 - **`lo`** — the new centre stays within the armed-bin coverage, so only
-  the tone LO/mixer words change: the seamless in-place update path
-  (`update_modulation`'s `install_bundle` swap). No map writes, no re-arm.
+  the tone LO/mixer words change: the seamless in-place update path (fw:
+  the inactive mixer slot-buffer flip of `update_fw_modulation`; sw:
+  `update_modulation`'s `install_bundle` swap). No map writes, no re-arm.
 - **`bin`** — the shift needs an FFT-bin / channel-map change (the
   `needs_recenter` condition): the `recenter`-style re-arm path — slower
   and briefly disruptive.
 
-Classification uses the reported per-(point, tone) `drift_bins` and the
-armed TX bin width: headroom = `(1 − max|drift|) · bin_width`. This is a
-pre-check only — the commit path re-verifies against the freshly prepared
-bundle's `needs_recenter`, and a `lo` commit that turns out to need a
-recenter applies **nothing** and moves those tones to the `bin` staged set.
+Classification uses the reported per-(point, tone) drift and the armed TX
+bin width: headroom = `(1 − max|drift|) · bin_width` (fw states report
+occupancy classes instead of numeric `drift_bins`, so a conservative
+class bound is used). This is a pre-check only — the commit path
+re-verifies against the freshly prepared bundle's `needs_recenter`, and a
+`lo` commit that turns out to need a recenter applies **nothing** and
+moves those tones to the `bin` staged set.
 A mixed decision batch is split: `lo` tones commit seamlessly on their
 policy; `bin` tones wait for theirs (or an explicit command) and never
 block the `lo` set.
 
 ### Staged apply (pre-fill, then switch)
 
-The tone-control buffers are the same ping-pong pair the
-`ModulationScheduler` flips for probe-point stepping, and the slow part of
-any tone change is the AXI writes into them. The staged-commit design
-separates *staging* from *committing* — and resolving it against the code,
-the existing update machinery already provides exactly this:
+The staged-commit design separates *staging* (the slow AXI writes /
+prepare) from *committing* (a cheap switch), and both engines already
+provide exactly this. **fw engine** (default): the mixer LO slot combs are
+ping-pong buffered — a `lo` commit prepares the new per-slot words in the
+executor, loads them into the *inactive* buffer, and flips in one step
+(`_update_fw_modulation`); the running slot cycle swaps combs glitch-free.
+**sw engine**: the tone-control buffers are the same ping-pong pair the
+`ModulationScheduler` flips for probe-point stepping, and resolving the
+design against the code, the update machinery is the staged mechanism:
 
 1. **Staging** = `_prepare_modulation(...)` in the thread executor. It is
    pure computation (hardware *reads* only, no writes) and produces the
@@ -221,16 +228,18 @@ the existing update machinery already provides exactly this:
    the new words into the buffers over the following cycle. No buffer is
    ever written out of band — the one about to go live is never touched.
 
-So commit latency is decoupled from write latency by construction: the
-slow prepare happens ahead of the commit moment, and the physical buffer
-writes ride the rotation that was happening anyway. Corrections add **no**
-tone-control buffer writes beyond what a normal `update_modulation`
-performs.
+So commit latency is decoupled from write latency by construction on both
+engines: the slow prepare happens ahead of the commit moment, and the
+physical buffer writes either fill the inactive slot buffer (fw) or ride
+the rotation that was happening anyway (sw). Corrections add **no**
+tone-control buffer writes beyond what a normal
+`update_fw_modulation`/`update_modulation` performs.
 
 ### Correction transients and flagging
 
-- **`lo` commits** ride `install_bundle`: the live buffer picks up the new
-  words within one cycle. The buffer flips are the same edge-latched flips
+- **`lo` commits** are seamless on both engines (fw: inactive slot-buffer
+  flip; sw: `install_bundle` — the live buffer picks up the new
+  words within one cycle). The sw buffer flips are the same edge-latched flips
   modulation performs every dwell, and frames are tagged from the firmware
   `buffer_id` read-back, so the revision tag tracks the data exactly. The
   first cycle after the revision edge mixes old- and new-centre points as
@@ -318,8 +327,9 @@ in it.
 
 Server request port (and matching `ReadoutClient` methods):
 
-- `enable_tracking(**params)` — start/reconfigure (modulation must be armed
-  with ≥ 3 points; tracking needs the curvature estimate).
+- `enable_tracking(**params)` — start/reconfigure on whichever engine is
+  armed, fw (the default engine; needs `mode='auto'`) or sw; ≥ 3
+  slots/points (tracking needs the curvature estimate).
 - `disable_tracking()` — stop; staged corrections are dropped.
 - `hold_tracking()` / `resume_tracking()` — pause without teardown.
 - `commit_tracking_updates(classes=None, tones=None)` — on-demand commit of
@@ -329,15 +339,29 @@ Server request port (and matching `ReadoutClient` methods):
   per class, applied/suppressed counters, back-offs, commit timestamps,
   decision/applied revision, ring fill.
 
-Engines: `linewidth_hz` metadata and the typed-frame announcements work on
-**both** modulation engines (fw revisions announce from the
-`enable/update/recenter/disable_fw_modulation` handlers; the SNAPSHOT
-reports whichever engine is active). The tracking *loop* itself currently
-requires `engine='sw'` — its tap sits in `stream_data`'s software-modulated
-branch and its commits ride the software scheduler's staged
-`install_bundle` path. Extending the loop to the fw engine (tap the fw
-branch; commit via `update_fw_modulation`'s seamless slot rewrite) is the
-natural next step and needs no protocol changes.
+Engines: tracking runs on **both** modulation engines and picks whichever
+is armed — firmware-slot (`engine='fw'`, the default engine) or software
+(`engine='sw'`). Frames are tagged identically (fw slots and sw points
+share the flag5 field), so the tap/estimator/controller are engine-blind;
+only the commit path differs:
+
+- **fw**: `lo` commits mirror `update_fw_modulation` — the new slot combs
+  load into the inactive mixer ping-pong buffer and flip in one step
+  (seamless, `_update_fw_modulation`); `bin` commits mirror
+  `recenter_fw_modulation` (fresh maps, `_apply_fw_modulation`). The
+  firmware owns slot switching, so applies run in the executor exactly as
+  the fw client handlers do. fw tracking needs `mode='auto'` (manual slot
+  selection never completes cycles). fw states report occupancy classes
+  rather than numeric drifts, so the `lo`/`bin` pre-classification uses a
+  conservative occupancy bound — the commit-time `needs_recenter` re-check
+  is the authority either way.
+- **sw**: commits ride the frame producer's `_pending_modulation`
+  ownership (epoch → prepare → queue → `install_bundle` at a cycle
+  boundary), as described in the staged-apply section above.
+
+`linewidth_hz` metadata and the typed-frame announcements likewise work on
+both engines (fw revisions announce from the fw handlers and from tracking
+commits; the SNAPSHOT reports whichever engine is active).
 
 ## Recipe: an FFM tracking session
 
@@ -353,19 +377,24 @@ cfg = modulation.params_from_sweep(sweep, fits=fits)
 print(cfg['summary'])
 ```
 
-**2. Arm modulation (≥ 3 points — tracking needs the curvature) and
-stream.** Note `disable_stream` before the initial arm; linewidths ride
-along as metadata:
+**2. Arm modulation (≥ 3 points/slots — tracking needs the curvature) and
+stream.** The default engine is firmware-slot (`fw`); its `auto` mode
+round-robins all 4 mixer LO slots, so ask `params_from_sweep` for a
+4-entry pattern (e.g. `offset_linewidths=(-0.1, 0, 0.1, 0)` in step 1).
+Note `disable_stream` before the initial arm; linewidths ride along as
+metadata:
 
 ```python
 client.disable_stream()
-client.enable_modulation(engine='sw', center=cfg['center'],
+client.enable_modulation(center=cfg['center'],            # engine='fw' default
                          offsets=cfg['offsets'], mod_indices=cfg['mod_indices'],
                          samples_per_point=cfg['samples_per_point'],
                          n_settle=cfg['n_settle'],
                          linewidth_hz=cfg['linewidth_hz'])
 client.enable_stream()
 ```
+
+(`engine='sw'` works identically here and takes any number of points ≥ 3.)
 
 **3. Start tracking in dry-run** (the default) and watch it before letting
 it touch anything:

@@ -2022,21 +2022,28 @@ class MockReadoutServer:
         # state (params, held/dry_run flags, empty staged sets) for client
         # code paths and get_info('tracking') to be exercised end-to-end.
         if request == 'enable_tracking':
-            if self._mod is None:
+            # Whichever engine is armed (fw first -- it is the default).
+            if self._fw_mod is not None and self._fw_mod_enabled:
+                engine, mod = 'fw', self._fw_mod
+                n_points, revision = mod['n_slots'], mod['revision']
+            elif self._mod is not None:
+                engine, mod = 'sw', self._mod
+                n_points, revision = mod['n_points'], mod['revision']
+            else:
                 return {'status': 'error',
-                        'message': 'modulation must be armed (enable_modulation) '
-                                   'before enable_tracking'}
-            if int(self._mod['n_points']) < 3:
+                        'message': 'modulation must be armed (enable_modulation, '
+                                   'either engine) before enable_tracking'}
+            if int(n_points) < 3:
                 return {'status': 'error',
                         'message': 'tracking needs >= 3 modulation points'}
-            linewidth = message.get('linewidth_hz',
-                                    self._mod.get('linewidth_hz'))
+            linewidth = message.get('linewidth_hz', mod.get('linewidth_hz'))
             if linewidth is None:
                 return {'status': 'error',
                         'message': 'tracking requires per-tone linewidth_hz'}
             params = {k: v for k, v in message.items() if k != 'request'}
             self._tracking = {
                 'enabled': True,
+                'engine': engine,
                 'dry_run': bool(message.get('dry_run', True)),
                 'held': False,
                 'hold_reason': None,
@@ -2047,7 +2054,7 @@ class MockReadoutServer:
                                'staged_counts': {'lo': 0, 'bin': 0}},
                 'commits': {'lo': 0, 'bin': 0},
                 'backoffs': 0,
-                'applied_revision': self._mod['revision'],
+                'applied_revision': revision,
             }
             return {'status': 'success', 'result': dict(self._tracking)}
 

@@ -3648,16 +3648,13 @@ class ReadoutServer:
                             'result': {'purged': purged, 'revision': 0}})
 
                 elif request == 'enable_tracking':
-                    # Start (or reconfigure) the FFM tone-tracking loop.
-                    # Requires software modulation armed with >= 3 points and
-                    # per-tone linewidths (here or at enable_modulation).
-                    # dry_run defaults to True: full estimate/decide/log/
-                    # announce pipeline, no hardware applies.
+                    # Start (or reconfigure) the FFM tone-tracking loop on
+                    # whichever modulation engine is armed (fw or sw).
+                    # Requires >= 3 points/slots and per-tone linewidths
+                    # (here or at enable_modulation). dry_run defaults to
+                    # True: full estimate/decide/log/announce pipeline, no
+                    # hardware applies.
                     try:
-                        if self.e_fw_modulation_enabled.is_set():
-                            raise ValueError(
-                                'tracking works on software modulation; '
-                                'firmware-slot modulation is active')
                         params = dict(self.TRACKING_DEFAULTS)
                         for key in params:
                             if key in message:
@@ -5635,22 +5632,38 @@ class ReadoutServer:
         'commit_interval_s': None,        # commit every T s if staged
     }
 
-    async def _commit_tracking_update(self, klass, corrections,
+    async def _commit_tracking_update(self, engine, klass, corrections,
                                       staged_detunings):
-        """Apply one class's staged tracking corrections.
+        """Apply one class's staged tracking corrections on ``engine``.
 
-        Follows exactly the ownership discipline of a client
-        ``update_modulation``/``recenter_modulation``: epoch,
-        ``to_thread(_prepare_modulation, ...)`` (pure computation, hardware
-        reads only), epoch check, then a queued ``_pending_modulation`` the
-        frame producer applies at a cycle boundary. For ``'lo'`` the prepared
-        bundle rides the existing armed maps (seamless ``install_bundle``
-        swap: staging happened in the executor, the commit moment is just
-        the scheduler picking up the new words); ``'bin'`` re-arms fresh
-        maps (recenter path). If a ``'lo'`` commit turns out to need a
-        recenter after all, nothing is applied and the tones are handed back
-        for reclassification.
+        Both engines follow the same shape: prepare in the executor (pure
+        computation, hardware reads only), verify the prepared bundle
+        (``needs_recenter`` re-check -- a ``'lo'`` commit that turns out to
+        need a bin/map change applies nothing and hands the tones back for
+        reclassification), then apply.
+
+        ``engine='fw'`` (the default modulation engine): mirrors a client
+        ``update_fw_modulation`` / ``recenter_fw_modulation`` -- ``'lo'``
+        loads the new slot combs into the inactive mixer ping-pong buffer
+        and flips (seamless, ``_update_fw_modulation``); ``'bin'`` reloads
+        fresh maps (``_apply_fw_modulation``). The firmware owns slot
+        switching, so applies run in the executor like the fw client
+        handlers do.
+
+        ``engine='sw'``: exactly the client ``update_modulation`` ownership
+        discipline -- epoch, prepare, epoch check, then a queued
+        ``_pending_modulation`` the frame producer applies at a cycle
+        boundary (``'lo'`` = seamless ``install_bundle`` swap, ``'bin'`` =
+        recenter re-arm).
         """
+        announce = {
+            'tracking_class': klass,
+            'triggering_detunings_linewidths': {
+                str(t): staged_detunings.get(int(t)) for t in corrections},
+        }
+        if engine == 'fw':
+            return await self._commit_fw_tracking_update(
+                klass, corrections, announce)
         c = self.modulation_cfg
         if c is None or self.modulation_params is None:
             raise RuntimeError('modulation not armed')
@@ -5682,13 +5695,49 @@ class ReadoutServer:
         op = 'update' if klass == 'lo' else 'recenter'
         self._pending_modulation = {
             'op': op, 'bundle': bundle, 'state': state, 'cfg': cfg,
-            'revision': rev, 'source': 'tracking',
-            'announce': {
-                'tracking_class': klass,
-                'triggering_detunings_linewidths': {
-                    str(t): staged_detunings.get(int(t))
-                    for t in corrections},
-            }}
+            'revision': rev, 'source': 'tracking', 'announce': announce}
+        return {'class': klass, 'revision': rev,
+                'tones': sorted(int(t) for t in corrections)}
+
+    async def _commit_fw_tracking_update(self, klass, corrections, announce):
+        """fw-engine half of :meth:`_commit_tracking_update`."""
+        c = self.fw_modulation_cfg
+        if c is None or self.fw_modulation_params is None:
+            raise RuntimeError('firmware-slot modulation not armed')
+        center = np.asarray(c['center'], dtype=float).copy()
+        for tone, new_center in corrections.items():
+            center[int(tone)] = float(new_center)
+        armed = self.fw_modulation_params.get('armed') if klass == 'lo' \
+            else None
+        bundle, state, cfg = await self.to_thread(
+            self._prepare_fw_modulation, center, c['slot_offsets'],
+            c['mod_indices'], c['n_dwell'], mode=c['mode'],
+            n_settle=c['n_settle'],
+            compensate_rx_ticks=c.get('compensate_rx_ticks', 0),
+            armed=armed,
+            compensate_filterbank=c.get('compensate_filterbank'))
+        if klass == 'lo' and bundle['needs_recenter']:
+            return {'class': 'lo', 'reclassified_to_bin': corrections}
+        cfg['linewidth_hz'] = c.get('linewidth_hz')
+        rev = self._next_fw_modulation_revision(cfg)
+        previous_center = np.asarray(c['center'], dtype=float)
+        if klass == 'lo':
+            await self.to_thread(self._update_fw_modulation, bundle, cfg)
+        else:
+            await self.to_thread(self._apply_fw_modulation, bundle, cfg)
+        self.fw_modulation_params = bundle
+        self.fw_modulation_cfg = cfg
+        state['enabled'] = self.e_fw_modulation_enabled.is_set()
+        state['applied_revision'] = rev
+        state['revision_history'] = dict(self._fw_modulation_revision_history)
+        if cfg['mode'] == 'manual' and self.fw_modulation_state is not None:
+            state['slot'] = self.fw_modulation_state.get('slot', 0)
+        self.fw_modulation_state = state
+        self._announce_tone_update(
+            'update' if klass == 'lo' else 'recenter',
+            {'cfg': cfg, 'state': state, 'revision': rev, 'engine': 'fw',
+             'source': 'tracking', 'announce': announce},
+            previous_center)
         return {'class': klass, 'revision': rev,
                 'tones': sorted(int(t) for t in corrections)}
 
@@ -6261,6 +6310,10 @@ class ReadoutServer:
                         err_count += 1
                         print('Packet error:', cnt, err_count)
                     self._write_to_stream_clients(payload)
+                    if self.tracking is not None and self.tracking.enabled:
+                        # Tone-tracking tap (fw engine): O(1) append of the
+                        # already-built payload, same as the sw branch.
+                        self.tracking.tap(payload)
                     for client in list(self.stream_clients):
                         try:
                             await client.drain()
