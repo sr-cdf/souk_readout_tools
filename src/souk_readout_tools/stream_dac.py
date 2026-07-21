@@ -25,9 +25,9 @@ Contents
   readout-flattening factors as ``parse_samples(apply_readout_correction=True)``
   so stream IQ matches the units of parsed sweep data used for calibrations.
 - Converters: :class:`MagnitudeConverter`, :class:`PhaseConverter`,
-  :class:`DfModelFreeConverter`, :class:`DfCalibratedConverter` (and an
-  :class:`FfmConverter` placeholder for the future fast-frequency-modulation
-  demodulation mode; see ``doc/frequency_modulation.md``).
+  :class:`DfModelFreeConverter`, :class:`DfCalibratedConverter`, and
+  :class:`FfmConverter` (live fast-frequency-modulation demodulation with
+  recenter-proof absolute output; see ``doc/frequency_modulation.md``).
 - DAC backends: :class:`DummyDac` (default, no hardware) and
   :class:`LabJackDac` (optional ``labjack-ljm`` dependency).
 - Calibration persistence: :func:`save_calibrations`,
@@ -504,20 +504,148 @@ class DfCalibratedConverter(StreamConverter):
 
 
 class FfmConverter(StreamConverter):
-    """Placeholder for the fast-frequency-modulation demodulation mode.
+    """Live FFM demodulation: linearised frequency shift for one tone (Hz).
 
-    Not implemented yet. The plan (phase 2) is to demodulate whole
-    modulation cycles from the stream (grouping samples by the flag5 point
-    tag, as :func:`souk_readout_tools.modulation.demodulate` does offline)
-    and output the per-cycle frequency shift. Whoever implements it must
-    subtract the documented ``center - fr`` operating-point baseline -- see
-    ``doc/frequency_modulation.md`` and ``modulation.params_from_sweep``.
+    Unlike the fixed-tone converters this one consumes the modulated
+    stream frame-by-frame (``wants_frames = True``): samples are grouped
+    into modulation cycles by the flag5 point tag (settling excluded,
+    incomplete cycles dropped), each cycle's phase-vs-offset slope gives a
+    **live** ``dphi_df`` -- the modulation measures its own responsivity,
+    no prior calibration needed -- and the centre-point phase referenced to
+    a startup-captured baseline, divided by that slope, gives the
+    linearised probe-side shift (as
+    :func:`souk_readout_tools.modulation.demodulate`'s model-free
+    ``freq_shift_hz``). The linearisation is valid while the tone stays in
+    the linear part of the phase-frequency curve -- which is exactly what
+    server-side tone tracking (``enable_tracking``) maintains.
+
+    Recentering provenance: a tracking (or client) recenter changes the
+    tone centre and bumps the modulation revision stamped in every frame.
+    Per-revision centres are registered via :meth:`note_center` (fed from
+    the SNAPSHOT / TONE_UPDATE typed frames by :class:`StreamToDac`), and
+    the output is the absolute **resonator** frequency shift since startup
+    (detector-side sign: positive = resonance moved up):
+
+        x = (center[rev] - center[rev0]) - probe_side_freq_shift
+
+    (the reconstruction formula of ``doc/tone_tracking.md``, with
+    demodulate's probe-side ``freq_shift_hz`` sign-flipped to the
+    detector side). A recenter therefore does not step the analog output.
+    Without a typed-frame subscription the output is centre-relative only
+    and every recenter appears as a step of the recenter size.
+
+    The startup phase baseline absorbs the documented ``center - fr``
+    operating-point offset (see ``modulation.params_from_sweep``), so the
+    output reads zero at the startup state by construction.
+
+    Parameters
+    ----------
+    offsets_hz : array-like
+        This tone's per-point probe offsets (Hz), in point order (from
+        ``info['modulation']['tones'][i]['offsets_hz']``). Needs >= 2
+        distinct offsets; the point nearest 0 Hz is the centre point.
+    center_hz : float or None, optional
+        The tone centre at startup (defines ``center[rev0]``); ``None``
+        adopts the first centre registered via :meth:`note_center`.
+    average_cycles : int, optional
+        Boxcar over the last N per-cycle outputs (default 1 = latest
+        cycle).
+    baseline_cycles : int, optional
+        Cycles averaged (circularly) into the startup phase baseline
+        (default 20). The output is NaN until the baseline is set.
     """
 
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError(
-            'FFM demodulation output is not implemented yet; see '
-            'doc/stream_to_dac.md and doc/frequency_modulation.md')
+    units = 'Hz'
+    wants_frames = True
+
+    def __init__(self, offsets_hz, center_hz=None, average_cycles=1,
+                 baseline_cycles=20):
+        offsets = np.asarray(offsets_hz, dtype=float)
+        if len(offsets) < 2 or np.ptp(offsets) == 0:
+            raise ValueError('ffm mode needs >= 2 distinct probe offsets '
+                             'for this tone (is it modulated?)')
+        self._offsets = offsets
+        self._num_points = len(offsets)
+        self._center_index = int(np.argmin(np.abs(offsets)))
+        self._span = float(offsets[-1] - offsets[0])
+        if self._span == 0:
+            raise ValueError('first and last probe offsets are equal; '
+                             'cannot form the slope estimate')
+        self._center0 = None if center_hz is None else float(center_hz)
+        self._center_by_revision = {}
+        self._center_offset_hz = 0.0
+        self._baseline = None
+        self._baseline_phasors = []
+        self._baseline_cycles = max(1, int(baseline_cycles))
+        self._outputs = deque(maxlen=max(1, int(average_cycles)))
+        # Current-cycle accumulators (per-point complex sums + counts).
+        self._sums = np.zeros(self._num_points, dtype=complex)
+        self._counts = np.zeros(self._num_points, dtype=int)
+        self._last_point = 0
+        self._revision = None
+        self.cycles = 0
+        self.last_dphi_df = np.nan
+
+    def note_center(self, revision, center_hz):
+        """Register this tone's centre for a modulation ``revision``
+        (fed from SNAPSHOT / TONE_UPDATE typed frames)."""
+        self._center_by_revision[int(revision)] = float(center_hz)
+        if self._center0 is None:
+            self._center0 = float(center_hz)
+
+    def add_frame(self, iq, point, settling, revision):
+        """Feed one stream sample (this tone's corrected IQ + flag5 tags)."""
+        if point < 1 or point > self._num_points:
+            return
+        if point < self._last_point:
+            self._finalise_cycle()
+        self._last_point = point
+        self._revision = revision
+        if not settling:
+            self._sums[point - 1] += iq
+            self._counts[point - 1] += 1
+
+    def _finalise_cycle(self):
+        sums, counts = self._sums, self._counts
+        self._sums = np.zeros(self._num_points, dtype=complex)
+        self._counts = np.zeros(self._num_points, dtype=int)
+        if np.any(counts == 0):
+            return                        # incomplete cycle (drops): skip
+        z = sums / counts
+        phi = np.unwrap(np.angle(z))
+        slope = (phi[-1] - phi[0]) / self._span
+        if not np.isfinite(slope) or slope == 0.0:
+            return
+        self.cycles += 1
+        self.last_dphi_df = slope
+        phase_center = phi[self._center_index]
+        if self._baseline is None:
+            # Circular mean over the first baseline_cycles centre phases.
+            self._baseline_phasors.append(np.exp(1j * phase_center))
+            if len(self._baseline_phasors) >= self._baseline_cycles:
+                self._baseline = float(np.angle(np.mean(
+                    self._baseline_phasors)))
+                self._baseline_phasors = []
+            return
+        # Probe-side shift (demodulate's freq_shift_hz convention) ...
+        probe_shift = (phase_center - self._baseline) / slope
+        center = self._center_by_revision.get(self._revision)
+        if center is not None and self._center0 is not None:
+            self._center_offset_hz = center - self._center0
+        # ... combined detector-side: resonator motion since startup.
+        self._outputs.append(self._center_offset_hz - probe_shift)
+
+    def value(self):
+        """Latest output (mean of the last ``average_cycles`` cycles), or
+        NaN before the baseline is established."""
+        if not self._outputs:
+            return float('nan')
+        return float(np.mean(self._outputs))
+
+    def convert(self, iq):
+        """Interface compatibility: frame-consuming converters report the
+        latest per-cycle value; the averaged-IQ argument is ignored."""
+        return self.value()
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +1035,30 @@ class StreamToDac:
                 print(f'\nstream update frame: {kind} '
                       f'revision={payload.get("revision")} '
                       f'op={payload.get("op")}')
+            self._note_centers_from_payload(payload)
+
+    def _note_centers_from_payload(self, payload):
+        """Feed per-revision tone centres from SNAPSHOT / TONE_UPDATE frames
+        to frame-consuming converters (FFM absolute-output bookkeeping)."""
+        kind = payload.get('type')
+        if kind == 'SNAPSHOT':
+            revision = payload.get('revision')
+            centers = (payload.get('modulation') or {}).get('centers_hz') or {}
+        elif kind == 'TONE_UPDATE':
+            revision = payload.get('revision')
+            centers = payload.get('centers_hz') or {}
+        else:
+            return
+        if revision is None or not centers:
+            return
+        for ch in self.channels:
+            converter = ch.converter
+            if converter is None or \
+                    not getattr(converter, 'wants_frames', False):
+                continue
+            center = centers.get(str(ch.tone_position))
+            if center is not None:
+                converter.note_center(revision, center)
 
     def _reader(self):
         """Reader thread: source -> disk + bounded queue."""
@@ -1032,13 +1184,25 @@ class StreamToDac:
                         next_update = now + period
 
                 t_loop = time.monotonic()
-                # Drain the queue into the boxcar window.
+                # Drain the queue into the boxcar window. Frame-consuming
+                # converters (FFM) get every sample with its flag5 tags
+                # instead of the boxcar mean.
+                frame_converters = [
+                    ch.converter for ch in self.channels
+                    if getattr(ch.converter, 'wants_frames', False)]
                 while True:
                     try:
                         frame = self._queue.popleft()
                     except IndexError:
                         break
-                    window.append(self._selected_iq(frame))
+                    selected = self._selected_iq(frame)
+                    if frame_converters:
+                        for ch, iq in zip(self.channels, selected):
+                            if getattr(ch.converter, 'wants_frames', False):
+                                ch.converter.add_frame(
+                                    iq, frame.point, frame.settling,
+                                    frame.revision)
+                    window.append(selected)
 
                 # Watchdog: no frames for too long -> safe state + exit.
                 if self._last_frame_time is not None and \
@@ -1052,13 +1216,22 @@ class StreamToDac:
                     mean_iq = np.mean(np.asarray(window), axis=0)
                     values = {}
                     for ch, iq in zip(self.channels, mean_iq):
-                        x = float(np.real_if_close(ch.converter.convert(iq)))
+                        if getattr(ch.converter, 'wants_frames', False):
+                            # FFM: per-cycle output; NaN until the first
+                            # complete cycle + baseline -> hold the DAC.
+                            x = ch.converter.value()
+                            if not np.isfinite(x):
+                                continue
+                        else:
+                            x = float(np.real_if_close(
+                                ch.converter.convert(iq)))
                         ch.last_x = x
                         ch.last_volts = ch.volts(x)
                         values[ch.dac_channel] = ch.last_volts
-                    self.dac.write(values)
-                    self.updates_written += 1
-                    if ain_log is not None:
+                    if values:
+                        self.dac.write(values)
+                        self.updates_written += 1
+                    if values and ain_log is not None:
                         readings = self.dac.read_ain(self.ain_channels)
                         ain_log.write(
                             f'{time.time():.6f},{self._last_tt},' +
@@ -1237,5 +1410,30 @@ def build_converter(mode, conversion_config, info, tone_position,
             calibrations[tone_position], f_tone,
             output=conversion_config.get('output', 'frequency'))
     if mode == 'ffm':
-        return FfmConverter()
+        from .modulation import active_modulation_state
+        state = active_modulation_state(info)
+        if not isinstance(state, dict) or not state.get('tones'):
+            raise ValueError(
+                'ffm mode needs frequency modulation armed: the system info '
+                'carries no modulation state (enable_modulation first, or '
+                'replay a modulated recording)')
+        entry = next((t for t in state['tones']
+                      if int(t.get('index', -1)) == tone_position), None)
+        if entry is None or entry.get('offsets_hz') is None:
+            raise ValueError(f'no modulation state for tone {tone_position}')
+        offsets = np.asarray(entry['offsets_hz'], dtype=float)
+        if not np.any(offsets != 0.0):
+            raise ValueError(f'tone {tone_position} is not modulated '
+                             '(all probe offsets are zero)')
+        converter = FfmConverter(
+            offsets,
+            center_hz=entry.get('center_hz'),
+            average_cycles=conversion_config.get('average_cycles', 1),
+            baseline_cycles=conversion_config.get('baseline_cycles', 20))
+        # Seed the current revision's centre so the absolute output is
+        # anchored even before the first typed frame arrives.
+        revision = state.get('applied_revision')
+        if revision is not None and entry.get('center_hz') is not None:
+            converter.note_center(revision, entry['center_hz'])
+        return converter
     raise ValueError(f"unknown conversion mode '{mode}'")

@@ -23,18 +23,40 @@
   `dry_run` default on. Commands: `enable_tracking` / `disable_tracking` /
   `hold_tracking` / `resume_tracking` / `commit_tracking_updates`, plus
   `get_info('tracking')` and matching `ReadoutClient` methods.
-- `enable_modulation(engine='sw', linewidth_hz=...)` carries
-  `params_from_sweep`'s per-tone linewidths (tracking requires them).
+- `enable_modulation(linewidth_hz=...)` carries `params_from_sweep`'s
+  per-tone linewidths on **both engines** (fw default included; pure
+  metadata in the armed config). The tracking loop itself currently runs
+  on `engine='sw'` — its tap/commit path rides the software scheduler;
+  extending it to the fw engine is a documented follow-up.
 
 **Typed stream frames (opt-in, in-band tone provenance)**
 - Stream clients may send one JSON line (`{"subscribe": ["tone_updates"]}`)
   to receive typed frames: `SNAPSHOT` on subscribe (revision + modulation
-  table + tracking status) and `TONE_UPDATE` on **every** modulation
-  revision change, any origin (hooked at `_apply_pending_modulation_command`,
-  the single place revisions land) with revision/op/kind/source/changed
-  centres/triggering detunings. Typed frames put a nonzero type code in the
-  top byte of the length prefix; unsubscribed clients get a byte-identical
+  table + tracking status, whichever engine is active) and `TONE_UPDATE`
+  on **every** modulation revision change, any origin — sw revisions hook
+  `_apply_pending_modulation_command` (the single place sw revisions
+  land), fw revisions announce from the fw enable/update/recenter/disable
+  handlers — with revision/op/kind/engine/source/changed centres/
+  triggering detunings. Typed frames put a nonzero type code in the top
+  byte of the length prefix; unsubscribed clients get a byte-identical
   legacy stream (asserted byte-for-byte in tests).
+
+**stream-to-dac: live FFM demodulated output (`--mode ffm`)**
+- `stream_dac.FfmConverter` demodulates the modulated stream per cycle
+  (either engine's flag5 tags): the phase-vs-offset slope is a live,
+  self-calibrating `dphi_df`, and the centre-point phase against a
+  startup baseline gives the linearised frequency shift — no calibration
+  file needed, and valid while tracking keeps the tone in the linear
+  regime.
+- Output is the **absolute resonator shift** across recenters: per-revision
+  centres from the SNAPSHOT/TONE_UPDATE frames (subscribed automatically
+  in ffm mode) are combined as `(center[rev] − center[rev0]) −
+  probe_side_shift` (detector-side sign), so tracking corrections do not
+  step the analog output; the same updates land in the recording's
+  `.updates.jsonl` sidecar for offline reconstruction.
+- New `conversion.average_cycles` / `baseline_cycles` config keys; workflow
+  recipes added to doc/stream_to_dac.md (bench-to-beam analog output) and
+  doc/tone_tracking.md (FFM tracking session).
 - Client: `stream_dac.SocketFrameSource(subscribe_updates=True)` +
   `.updates.jsonl` sidecar logging in `StreamToDac`;
   `receive_stream_g3(subscribe_tone_updates=True)` writes a G3 Wiring frame

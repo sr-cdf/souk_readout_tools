@@ -28,10 +28,17 @@ connection:
 #   df_calibrated exact Mobius conversion via a ResonatorCalibration, in Hz
 #                 (needs calibration_file; see doc/stream_to_dac.md for the
 #                 sweep -> batch_fit -> calibration-file workflow)
-#   ffm           reserved (fast-frequency-modulation demod, not implemented)
+#   ffm           live FFM demodulation, in Hz: needs frequency modulation
+#                 running (enable_modulation + enable_stream). Each cycle's
+#                 phase slope gives a live dphi_df (self-calibrating), and
+#                 with tone tracking recentering the tone the output stays
+#                 an absolute response via the per-revision centres in the
+#                 typed tone-update frames (subscribed automatically).
 # reference_iq: [I, Q] reference point for the phase modes; null captures
 #   the average of reference_samples stream samples at startup instead.
 # output: 'frequency' or 'dissipation' (df_calibrated only).
+# average_cycles / baseline_cycles: ffm only — boxcar over the last N
+#   per-cycle outputs, and cycles averaged into the startup phase baseline.
 conversion:
   mode: magnitude
   reference_iq: null
@@ -39,6 +46,8 @@ conversion:
   dphi_df: null            # rad/Hz, for df_modelfree
   calibration_file: null   # .npz from stream_dac.save_calibrations
   output: frequency
+  average_cycles: 1        # ffm: boxcar over per-cycle outputs
+  baseline_cycles: 20      # ffm: startup phase-baseline cycles
 
 # --- Output channels ---
 # One entry per DAC channel. Select the tone by user-order index

@@ -32,7 +32,8 @@ DEFAULT_CONFIG = {
     'connection': {'config_file': None, 'address': None, 'request_port': None},
     'conversion': {'mode': 'magnitude', 'reference_iq': None,
                    'reference_samples': 100, 'dphi_df': None,
-                   'calibration_file': None, 'output': 'frequency'},
+                   'calibration_file': None, 'output': 'frequency',
+                   'average_cycles': 1, 'baseline_cycles': 20},
     'channels': [{'dac_channel': 'DAC0', 'tone_index': 0,
                   'tone_frequency_hz': None, 'gain': 1.0, 'x_offset': 0.0,
                   'v_offset': 0.0, 'v_min': 0.0, 'v_max': 5.0}],
@@ -186,6 +187,15 @@ def main():
 
     if args.selftest:
         sys.exit(selftest(config))
+
+    # FFM output reconstructs the absolute response across recenters from
+    # the per-revision centres in the typed tone-update frames, so a live
+    # ffm session subscribes automatically.
+    if config['conversion']['mode'] == 'ffm' and \
+            not config['stream'].get('subscribe_updates'):
+        print('ffm mode: subscribing to tone-update frames for centre '
+              'provenance')
+        config['stream']['subscribe_updates'] = True
 
     # --- frame source + system info ------------------------------------
     if args.replay is not None:

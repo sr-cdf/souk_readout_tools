@@ -2121,6 +2121,10 @@ class MockReadoutServer:
                                 'n_dwell': int(n_dwell), 'n_settle': int(n_settle),
                                 'mode': str(mode), 'n_slots': int(full.shape[0]),
                                 'revision': int(self._fw_mod_revision), 'state': state}
+                if message.get('linewidth_hz') is not None:
+                    # Pure metadata (params_from_sweep per-tone linewidths).
+                    self._fw_mod['linewidth_hz'] = list(np.atleast_1d(
+                        np.asarray(message['linewidth_hz'], dtype=float)))
                 self._fw_mod_enabled = True
                 self._fw_mod_slot = 0
                 self._fw_dwell_slot = -1

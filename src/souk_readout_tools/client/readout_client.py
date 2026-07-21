@@ -2498,12 +2498,14 @@ class ReadoutClient:
         loopback); ``True`` forces it on. The choice sticks for subsequent
         update/recenter calls until the next enable.
 
-        ``linewidth_hz`` (``engine='sw'`` only): optional per-tone resonator
+        ``linewidth_hz`` (both engines): optional per-tone resonator
         linewidths in Hz — one entry per modulated tone (as produced by
         :func:`souk_readout_tools.modulation.params_from_sweep`, key
         ``'linewidth_hz'``) or per active tone. Pure metadata carried in the
-        armed config; required by the server-side tone-tracking loop
-        (:meth:`enable_tracking`) unless supplied there instead.
+        armed config, used by demodulation consumers and required by the
+        server-side tone-tracking loop (:meth:`enable_tracking`) unless
+        supplied there instead (note the tracking loop itself currently
+        runs on ``engine='sw'``).
 
         Returns the server ack. Poll :meth:`get_modulation_state` for the unified
         state (it carries an ``engine`` field). See :meth:`_enable_sw_modulation`
@@ -2515,7 +2517,8 @@ class ReadoutClient:
                 n_dwell=(4 if samples_per_point is None else samples_per_point),
                 n_settle=(0 if n_settle is None else n_settle),
                 mode=mode, compensate_rx_ticks=compensate_rx_ticks, force=force,
-                compensate_filterbank=compensate_filterbank)
+                compensate_filterbank=compensate_filterbank,
+                linewidth_hz=linewidth_hz)
         if engine == 'sw':
             return self._enable_sw_modulation(
                 center=center, offsets=offsets, mod_indices=mod_indices,
@@ -2965,7 +2968,8 @@ class ReadoutClient:
 
     def _enable_fw_modulation(self, center=None, offsets=None, mod_indices=None,
                               n_dwell=4, n_settle=0, mode='auto', compensate_rx_ticks=0,
-                              force=False, compensate_filterbank=None):
+                              force=False, compensate_filterbank=None,
+                              linewidth_hz=None):
         """
         Enable firmware-slot frequency modulation (``enable_modulation`` engine
         ``'fw'``). Loads up to ``n_slots`` combs
@@ -3036,6 +3040,9 @@ class ReadoutClient:
             message['offsets'] = np.asarray(offsets, dtype=float).tolist()
         if mod_indices is not None:
             message['mod_indices'] = [int(i) for i in np.atleast_1d(mod_indices)]
+        if linewidth_hz is not None:
+            message['linewidth_hz'] = np.atleast_1d(
+                np.asarray(linewidth_hz, dtype=float)).tolist()
         response = self.send_request(message)
         self._warn_modulation_response(response)
         return response

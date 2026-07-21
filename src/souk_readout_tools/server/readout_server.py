@@ -3402,7 +3402,16 @@ class ReadoutServer:
                                 'slot offsets push at least one tone beyond fixed-bin coverage; '
                                 'reduce the offsets or pass force=True to arm anyway (those tones '
                                 'will wrap to the other end of the bin)')
+                        # Optional per-tone linewidths (params_from_sweep):
+                        # pure metadata for demodulation consumers.
+                        requested_linewidth = message.get('linewidth_hz')
+                        if requested_linewidth is None and self.fw_modulation_cfg is not None:
+                            requested_linewidth = self.fw_modulation_cfg.get('linewidth_hz')
+                        cfg['linewidth_hz'] = requested_linewidth
                         rev = self._next_fw_modulation_revision(cfg)
+                        previous_center = (
+                            None if self.fw_modulation_cfg is None else
+                            np.asarray(self.fw_modulation_cfg['center'], dtype=float))
                         # Load + start switching (hardware writes) off the event loop.
                         await self.to_thread(self._apply_fw_modulation, bundle, cfg)
                         self.fw_modulation_params = bundle
@@ -3412,6 +3421,9 @@ class ReadoutServer:
                         state['revision_history'] = dict(self._fw_modulation_revision_history)
                         self.fw_modulation_state = state
                         self.e_fw_modulation_enabled.set()
+                        self._announce_tone_update('enable', {
+                            'cfg': cfg, 'state': state, 'revision': rev,
+                            'engine': 'fw'}, previous_center)
                         await self.send_response(writer, {'status': 'success',
                             'warnings': list(state.get('warnings', [])),
                             'result': {
@@ -3504,7 +3516,9 @@ class ReadoutServer:
                             raise ValueError(
                                 'update pushes at least one tone beyond fixed-bin coverage; '
                                 'reduce the offsets, disable+enable to recentre, or pass force=True')
+                        cfg['linewidth_hz'] = c.get('linewidth_hz')
                         rev = self._next_fw_modulation_revision(cfg)
+                        previous_center = np.asarray(c['center'], dtype=float)
                         await self.to_thread(self._update_fw_modulation, bundle, cfg)
                         self.fw_modulation_params = bundle
                         self.fw_modulation_cfg = cfg
@@ -3517,6 +3531,9 @@ class ReadoutServer:
                         if cfg['mode'] == 'manual' and self.fw_modulation_state is not None:
                             state['slot'] = self.fw_modulation_state.get('slot', 0)
                         self.fw_modulation_state = state
+                        self._announce_tone_update('update', {
+                            'cfg': cfg, 'state': state, 'revision': rev,
+                            'engine': 'fw'}, previous_center)
                         await self.send_response(writer, {'status': 'success',
                             'warnings': list(state.get('warnings', [])),
                             'result': {
@@ -3556,7 +3573,9 @@ class ReadoutServer:
                             n_dwell, mode=mode, n_settle=n_settle,
                             compensate_rx_ticks=compensate_rx_ticks,
                             compensate_filterbank=c.get('compensate_filterbank'))
+                        cfg['linewidth_hz'] = c.get('linewidth_hz')
                         rev = self._next_fw_modulation_revision(cfg)
+                        previous_center = np.asarray(c['center'], dtype=float)
                         # Full load (writes chanmaps) + restart switching.
                         await self.to_thread(self._apply_fw_modulation, bundle, cfg)
                         self.fw_modulation_params = bundle
@@ -3565,6 +3584,9 @@ class ReadoutServer:
                         state['applied_revision'] = rev
                         state['revision_history'] = dict(self._fw_modulation_revision_history)
                         self.fw_modulation_state = state
+                        self._announce_tone_update('recenter', {
+                            'cfg': cfg, 'state': state, 'revision': rev,
+                            'engine': 'fw'}, previous_center)
                         await self.send_response(writer, {'status': 'success',
                             'warnings': list(state.get('warnings', [])),
                             'result': {
@@ -3588,6 +3610,7 @@ class ReadoutServer:
                         await self.to_thread(self._rest_fw_modulation)
                         if self.fw_modulation_state is not None:
                             self.fw_modulation_state['enabled'] = False
+                        self._announce_tone_update('disable')
                         await self.send_response(writer, {'status': 'success'})
                     except Exception as e:
                         print(traceback.format_exc())
@@ -4360,29 +4383,52 @@ class ReadoutServer:
                 print(f"Error sending SNAPSHOT frame: {e}")
 
     def _tone_update_snapshot(self):
-        """Build the SNAPSHOT payload sent to a newly subscribed client."""
+        """Build the SNAPSHOT payload sent to a newly subscribed client.
+
+        Reports whichever modulation engine is active (fw and sw are
+        mutually exclusive), matching ``get_info('modulation')``'s
+        resolution order.
+        """
         payload = {'type': 'SNAPSHOT', 'ts': time.time()}
-        state = self.modulation_state
-        cfg = self.modulation_cfg
-        if state is not None and cfg is not None:
-            center = np.asarray(cfg['center'], dtype=float)
-            mod_indices = [int(i) for i in state.get('mod_indices', [])]
-            payload['revision'] = int(state.get('applied_revision', 0))
-            payload['modulation'] = {
-                'enabled': self.e_modulation_enabled.is_set(),
-                'engine': 'sw',
-                'num_points': state.get('num_points'),
-                'samples_per_point': state.get('samples_per_point'),
-                'n_settle': state.get('n_settle'),
-                'mod_indices': mod_indices,
-                'centers_hz': {str(i): float(center[i]) for i in mod_indices
-                               if i < len(center)},
-                'offsets_hz': np.asarray(cfg['offsets'],
-                                         dtype=float).tolist(),
-            }
+        fw_on = self.e_fw_modulation_enabled.is_set()
+        sw_on = self.e_modulation_enabled.is_set()
+        if (fw_on or (self.fw_modulation_cfg is not None and not sw_on)) \
+                and self.fw_modulation_state is not None:
+            engine, state, cfg = 'fw', self.fw_modulation_state, \
+                self.fw_modulation_cfg
+            offsets = cfg.get('slot_offsets')
+            enabled = fw_on
+            num_points = state.get('n_slots')
+            samples_per_point = cfg.get('n_dwell')
+        elif self.modulation_state is not None and \
+                self.modulation_cfg is not None:
+            engine, state, cfg = 'sw', self.modulation_state, \
+                self.modulation_cfg
+            offsets = cfg.get('offsets')
+            enabled = sw_on
+            num_points = state.get('num_points')
+            samples_per_point = state.get('samples_per_point')
         else:
             payload['revision'] = 0
             payload['modulation'] = None
+            payload['tracking'] = (self.tracking.status() if self.tracking
+                                   else {'enabled': False})
+            return payload
+
+        center = np.asarray(cfg['center'], dtype=float)
+        mod_indices = [int(i) for i in state.get('mod_indices', [])]
+        payload['revision'] = int(state.get('applied_revision', 0))
+        payload['modulation'] = {
+            'enabled': enabled,
+            'engine': engine,
+            'num_points': num_points,
+            'samples_per_point': samples_per_point,
+            'n_settle': state.get('n_settle'),
+            'mod_indices': mod_indices,
+            'centers_hz': {str(i): float(center[i]) for i in mod_indices
+                           if i < len(center)},
+            'offsets_hz': np.asarray(offsets, dtype=float).tolist(),
+        }
         payload['tracking'] = (self.tracking.status() if self.tracking
                                else {'enabled': False})
         return payload
@@ -4432,6 +4478,7 @@ class ReadoutServer:
                 payload.update({
                     'revision': int(cmd['revision']),
                     'kind': kind,
+                    'engine': cmd.get('engine', 'sw'),
                     'source': cmd.get('source', 'client'),
                     'mod_indices': mod_indices,
                     'centers_hz': {str(i): float(center[i]) for i in changed},

@@ -89,18 +89,47 @@ agreement between the stream path and `parse_samples` on identical raw data.
 | `phase` | phase re: reference IQ (rad) | reference (startup capture or config) |
 | `df_modelfree` | phase / `dphi_df` (Hz) | reference + `conversion.dphi_df` (rad/Hz) |
 | `df_calibrated` | Möbius probe detuning (Hz) or dissipation | `conversion.calibration_file` |
-| `ffm` | — | **not implemented** (stub) |
+| `ffm` | absolute resonator shift (Hz), self-calibrating | frequency modulation running |
 
 `df_calibrated` uses `ResonatorCalibration.tone_converter(f_tone)` — the
 exact Möbius inversion, one complex multiply + add per sample — and can
 output the matched dissipation quadrature instead
 (`conversion.output: dissipation`).
 
-The converter sits behind a small interface (`stream_dac.StreamConverter`),
-so a future FFM/`demodulate`-based mode drops in without touching the I/O
-threads. Whoever implements it must subtract the documented `center − fr`
-operating-point baseline (see `doc/frequency_modulation.md` and
-`modulation.params_from_sweep`).
+### `ffm` mode: live demodulated output
+
+With frequency modulation running (`enable_modulation` + `enable_stream`,
+either engine — fw slot tags and sw point tags ride the same flag5 field),
+`FfmConverter` groups the stream into modulation cycles (settling excluded,
+incomplete cycles dropped) and per cycle:
+
+- the phase-vs-offset slope gives a **live `dφ/df`** — the modulation
+  measures its own responsivity every cycle, so no prior calibration file
+  is needed and slow responsivity drift is tracked automatically;
+- the centre-point phase, referenced to a startup-captured baseline
+  (`conversion.baseline_cycles`, default 20 cycles) and divided by that
+  slope, gives the linearised frequency shift.
+
+The linearisation is valid while the tone sits in the linear part of the
+phase-frequency curve — which is exactly what server-side tone tracking
+(`enable_tracking`, `doc/tone_tracking.md`) maintains. Run them together.
+
+**Recentering provenance**: a tracking (or client) recenter moves the tone
+centre and bumps the stream revision tag. The script subscribes to the
+typed tone-update frames automatically in ffm mode, keys the per-revision
+centres, and outputs the **absolute** resonator shift since startup:
+`x = (center[rev] − center[rev0]) − probe_side_shift` (detector-side sign:
+positive = resonance moved up). Recenters therefore do not step the analog
+output, and the same updates land in the `.updates.jsonl` sidecar next to
+the raw recording for offline reconstruction. The startup phase baseline
+absorbs the `center − fr` operating-point offset documented in
+`modulation.params_from_sweep`. `conversion.average_cycles` boxcars the
+last N per-cycle outputs before the DAC mapping.
+
+The converter interface (`stream_dac.StreamConverter`) keeps all of this
+out of the I/O threads: `ffm` is just a converter with
+`wants_frames = True` that consumes tagged samples instead of a boxcar
+mean.
 
 ### Calibration workflow (sweep → fit → file)
 
@@ -185,6 +214,74 @@ Parameters not yet pinned down are config options, not assumptions:
 | which KID(s) | `channels[].tone_index` or `tone_frequency_hz` |
 | acceptable stall before safe state | `stream.watchdog_s` |
 | safe/idle output level | `dac.idle_voltage` |
+
+## Recipe: analog output session, bench to beam
+
+A full session, assuming a working readout config (`my_readout.yaml`) and a
+LabJack on the client machine. Steps 1–3 are one-time preparation; 4–7 are
+the observing loop.
+
+**1. Prepare the DAC + config (no readout needed).**
+
+```bash
+cp .../template_stream_to_dac_config.yaml toptica_dac.yaml
+# edit: channels[0].tone_index / tone_frequency_hz, dac.backend: labjack,
+#       v_min/v_max to the TOPTICA input range, dac.idle_voltage
+souk-stream-to-dac --config toptica_dac.yaml --selftest   # wire DAC0->AIN0
+```
+
+The selftest reports the USB write+read transaction time (~1 ms class) and
+loopback error; pick `dac.update_rate_hz` accordingly (default 200 Hz).
+
+**2. Tune up the array as usual** (tones set, powers optimised), then take
+and fit a sweep and build the calibration file (only needed for
+`df_calibrated`; skip for `magnitude`/`phase`/`ffm`):
+
+```python
+from souk_readout_tools import stream_dac
+sweep = client.parse_sweep_data(client.get_sweep_data())
+cals = stream_dac.calibrations_from_sweep(sweep)
+stream_dac.save_calibrations('array_cal.npz', cals)   # -> conversion.calibration_file
+```
+
+**3. Zero-calibration first light.** Start streaming
+(`client.enable_stream()`), then:
+
+```bash
+souk-stream-to-dac -C my_readout.yaml --config toptica_dac.yaml \
+    --mode magnitude --backend dummy
+```
+
+Watch the status line respond to the source (chop by hand). Move to
+`--backend labjack` and check the voltage arrives at the TOPTICA input.
+
+**4. Choose the science mode.**
+
+- Fixed tone: `--mode df_calibrated` (with the calibration file) or
+  `--mode phase` / `df_modelfree` for quick looks. The df→V mapping
+  (`gain`, `v_offset`, clip range) sets the scale on the TOPTICA axis:
+  e.g. `gain: 2e-4` puts ±10 kHz of detuning across ±2 V.
+- Modulated (recommended for long scans): arm FFM + tracking on the
+  server first (see the recipe in `doc/tone_tracking.md`), then
+  `--mode ffm`. The output is then the absolute resonator shift,
+  self-calibrating and immune to recenters.
+
+**5. Measure end-to-end latency once per setup.** Step a known input —
+`client.update_modulation(center=...)` by a known offset, or chop the
+source — and cross-correlate the TOPTICA-side log against the raw
+recording's `tt` timeline (every frame carries its PTP timestamp; the AIN
+log ties host time to the nearest `tt`). The correlation-peak lag is the
+number to quote; budget contributions are in the table above.
+
+**6. Observe.** The TOPTICA software records the analog input against its
+scan axis; this side records, always: the raw stream (replayable), the
+`.updates.jsonl` tone provenance (ffm mode), and the AIN log if a monitor
+line is wired. On any stall/error the DAC parks at `idle_voltage`.
+
+**7. Verify offline.** Replay the recording through the identical
+pipeline (`--replay ./tmp/stream_to_dac --backend dummy`) or parse it with
+the standard tooling (`parse_samples` reads the same format) and compare
+against the TOPTICA-side trace.
 
 ## Testing without hardware
 

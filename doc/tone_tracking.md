@@ -31,8 +31,11 @@ Post-processing reconstructs the absolute per-tone response exactly:
 absolute_response(t) = (center[rev(t)] − center[rev0]) + freq_shift_hz(t)
 ```
 
-where `rev(t)` is the revision stamped into each frame's flag5 tag
-(bits 17–31) and `center[rev]` comes from the revision history
+with `freq_shift_hz` in the **detector-side** sign (resonator motion,
+`= −` `demodulate`'s probe-side `freq_shift_hz`; see
+`doc/frequency_modulation.md`), where `rev(t)` is the revision stamped into
+each frame's flag5 tag (bits 17–31) and `center[rev]` comes from the
+revision history
 (`get_info('modulation')['revision_history']`) or, equivalently, from the
 logged `TONE_UPDATE` frames. The tracker may follow real optically-induced
 shifts — that is acceptable **only because** every correction is
@@ -326,21 +329,99 @@ Server request port (and matching `ReadoutClient` methods):
   per class, applied/suppressed counters, back-offs, commit timestamps,
   decision/applied revision, ring fill.
 
-Typical bring-up:
+Engines: `linewidth_hz` metadata and the typed-frame announcements work on
+**both** modulation engines (fw revisions announce from the
+`enable/update/recenter/disable_fw_modulation` handlers; the SNAPSHOT
+reports whichever engine is active). The tracking *loop* itself currently
+requires `engine='sw'` — its tap sits in `stream_data`'s software-modulated
+branch and its commits ride the software scheduler's staged
+`install_bundle` path. Extending the loop to the fw engine (tap the fw
+branch; commit via `update_fw_modulation`'s seamless slot rewrite) is the
+natural next step and needs no protocol changes.
+
+## Recipe: an FFM tracking session
+
+**1. Sweep, fit, and build the modulation config.** `params_from_sweep`
+picks each tone's operating point (max-SNR steepest point) and per-tone
+probe spacing, and returns everything `enable_modulation` and tracking
+need — including `linewidth_hz`:
 
 ```python
-cfg = modulation.params_from_sweep(sweep, fits=fits)      # linewidths + cal
+sweep = client.parse_sweep_data(client.get_sweep_data())
+fits = fitting.batch_fit(sweep)
+cfg = modulation.params_from_sweep(sweep, fits=fits)
+print(cfg['summary'])
+```
+
+**2. Arm modulation (≥ 3 points — tracking needs the curvature) and
+stream.** Note `disable_stream` before the initial arm; linewidths ride
+along as metadata:
+
+```python
+client.disable_stream()
 client.enable_modulation(engine='sw', center=cfg['center'],
                          offsets=cfg['offsets'], mod_indices=cfg['mod_indices'],
                          samples_per_point=cfg['samples_per_point'],
                          n_settle=cfg['n_settle'],
                          linewidth_hz=cfg['linewidth_hz'])
 client.enable_stream()
-client.enable_tracking()                  # dry-run by default: watch it
-client.get_tracking_state()               # tune filter/threshold here
-client.enable_tracking(dry_run=False)     # let it correct
-...
-client.hold_tracking()                    # around a critical dwell
-client.resume_tracking()
-client.commit_tracking_updates(classes='bin')   # apply staged re-arms
 ```
+
+**3. Start tracking in dry-run** (the default) and watch it before letting
+it touch anything:
+
+```python
+client.enable_tracking()                       # dry_run=True
+state = client.get_tracking_state()
+state['filtered_detuning_linewidths']          # per-tone filtered detunings
+state['controller']['staged']                  # what it WOULD correct
+```
+
+Tune here: `filter_window`/`filter_tau_s` against your science band (the
+filter responses are above — keep the loop bandwidth well below the
+signals you care about), `threshold_linewidths` against the quiet-sky
+scatter of the filtered detunings, `confirm_windows` against glitch rates.
+Dry-run decisions are also announced in-band (`op: tracking_dry_run`), so
+a subscribed recorder captures the would-be behaviour for offline review.
+
+**4. Enable corrections** once the dry-run behaviour looks right:
+
+```python
+client.enable_tracking(dry_run=False)          # lo auto-commits; bin stages
+```
+
+Seamless `lo` corrections now keep every tone at its operating point,
+each one revision-stamped and announced. `bin`-class shifts (a tone
+walking off its armed FFT bin) accumulate in the staged set — apply them
+at a convenient boundary:
+
+```python
+client.get_tracking_state()['controller']['staged_counts']
+client.commit_tracking_updates(classes='bin')  # brief, flagged transient
+```
+
+**5. Record with provenance.** Any consumer that must reconstruct
+absolute response subscribes to the typed frames:
+`receive_stream_g3(subscribe_tone_updates=True)` (Wiring frame per
+update), or `SocketFrameSource(subscribe_updates=True)` /
+`souk-stream-to-dac --mode ffm` (JSONL sidecar). Legacy
+`souk-receive-stream` recordings still work — the revision tag is in every
+frame's flag5, and `get_info('modulation')['revision_history']` maps
+revisions to centres (mind the 15-bit wrap on long runs; the JSONL/G3
+records are the wrap-proof source).
+
+**6. Around critical dwells** (calibrator crossings, where even seamless
+steps are unwanted): `client.hold_tracking()` … `client.resume_tracking()`.
+Sweeps and retunes hold it automatically.
+
+**7. Reconstruct offline.** For each tone, cut the timestream at the
+revision edges (mask `expected_transient_cycles` after `bin` edges and the
+settling flags), demodulate as usual, and apply
+
+```
+absolute_response(t) = (center[rev(t)] − center[rev0]) + freq_shift_det(t)
+```
+
+with the detector-side sign convention noted above. The result is
+identical to what an untracked (but never-drifting) tone would have
+measured.
