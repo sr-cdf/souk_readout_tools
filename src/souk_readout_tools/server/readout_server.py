@@ -1902,7 +1902,9 @@ class ReadoutServer:
         max_detuning_hz = None
         if self.tracking is not None:
             try:
-                tracking_summary = self.tracking.summary()
+                # Cached snapshot (O(1) on the event loop; rebuilt off-loop
+                # by the tracking consumer) -- health_check runs on the loop.
+                tracking_summary = self.tracking.status()['summary']
                 resonators_tracking = bool(tracking_summary['enabled']
                                            and not tracking_summary['dry_run'])
                 max_detuning_hz = tracking_summary['max_abs_detuning_hz']

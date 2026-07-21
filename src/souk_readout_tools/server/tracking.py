@@ -590,9 +590,10 @@ class TrackingRuntime:
         self.last_estimate_ts = None
 
         # Per-tone running health statistics (exponentially weighted over
-        # cycles, ~20-cycle memory). Fed by process_batch; consumed by
-        # tone_health() / summary() for get_info('tracking') and the
-        # server health_check. The model-free detuning estimate COMPRESSES
+        # cycles, ~20-cycle memory). Written by process_batch and read by
+        # tone_health()/_build_snapshot -- all in the consumer's off-loop
+        # to_thread, so the sole writer is also the sole reader and there is
+        # no cross-thread race. The model-free detuning estimate COMPRESSES
         # at large shifts (~x/2/(1+x^2), saturating near 0.25 linewidths),
         # so a lost resonance is detected by the phase slope collapsing
         # toward zero and by invalid (NaN) cycles -- not by big readings.
@@ -601,6 +602,12 @@ class TrackingRuntime:
         self.stat_abs_slope = np.full(self.n_tones, np.nan)     # |dphi_df|
         self.stat_invalid_frac = np.full(self.n_tones, np.nan)
         self.slope_baseline = None   # |dphi_df| captured once settled
+
+        # Cached get_info('tracking') snapshot, rebuilt off-loop by the
+        # consumer each poll (see _build_snapshot / status). Primed here so a
+        # health poll before the first consumer iteration still returns a
+        # well-formed payload.
+        self._snapshot = self._build_snapshot()
 
     # -- setup helpers -------------------------------------------------------
 
@@ -773,8 +780,54 @@ class TrackingRuntime:
             'filtered_linewidths': filtered,
         }
 
+    def _consume_batch(self, payloads, centers):
+        """Off-loop consumer step: estimate + decision-gate + decide.
+
+        Runs entirely in the ``to_thread`` executor -- the whole per-tone
+        pipeline (parse, cycle assembly, estimation, filtering, running
+        stats and the controller's deadband/confirmation ``decide``) is
+        kept off the event loop so the stream loop is never charged for it.
+        Performs **no** hardware writes and never touches
+        ``_pending_modulation``; it only mutates this runtime's own
+        controller/filter/stat state (the consumer is their sole writer).
+        Returns ``True`` when a decision was taken, so the on-loop caller
+        runs the commit -- which owns the modulation hardware writes.
+
+        ``centers`` is snapshotted on the loop before the hop so this reads
+        no live server modulation state beyond the benign, commit-revalidated
+        headroom pre-check.
+        """
+        result = self.process_batch(payloads)
+        if result is None:
+            return False
+        applied = self._applied_revision()
+        if result['revision_last'] != applied:
+            # An external command landed inside this batch; its cycles mix
+            # configs. Discard and restart confirmation.
+            self.backoffs += 1
+            self.filter.reset()
+            self.controller.reset_confirmation()
+            return False
+        if self.decision_revision != applied:
+            # First batch against a new revision: (re)base decisions.
+            self.decision_revision = applied
+            self.controller.reset_confirmation()
+            return False
+        if not self.filter.settled:
+            return False
+        self.controller.decide(result['filtered_linewidths'],
+                               centers, self._lo_headroom_hz())
+        return True
+
     async def run(self):
-        """Consumer task: poll the ring, estimate, decide, commit."""
+        """Consumer task: poll the ring; estimate/decide off-loop; commit.
+
+        The heavy per-tone work (``_consume_batch``) and the health-snapshot
+        rebuild both run in the ``to_thread`` executor; only the commit --
+        which must own the modulation hardware writes -- runs on the event
+        loop. So neither tracking estimation nor health reporting adds
+        per-tone work to the stream loop.
+        """
         poll = float(self.params['poll_interval_s'])
         server = self.server
         while not self._stop:
@@ -788,33 +841,19 @@ class TrackingRuntime:
                     self.drain()
                     self._carry = None
                     self.controller.reset_confirmation()
-                    continue
-                payloads = self.drain()
-                if not payloads:
-                    continue
-                result = await server.to_thread(self.process_batch, payloads)
-                if result is None:
-                    continue
-                applied = self._applied_revision()
-                if result['revision_last'] != applied:
-                    # An external command landed inside this batch; its
-                    # cycles mix configs. Discard and restart confirmation.
-                    self.backoffs += 1
-                    self.filter.reset()
-                    self.controller.reset_confirmation()
-                    continue
-                if self.decision_revision != applied:
-                    # First batch against a new revision: (re)base decisions.
-                    self.decision_revision = applied
-                    self.controller.reset_confirmation()
-                    continue
-                if not self.filter.settled:
-                    continue
-
-                centers = np.asarray(self._mod_cfg()['center'], dtype=float)
-                self.controller.decide(result['filtered_linewidths'],
-                                       centers, self._lo_headroom_hz())
-                await self._auto_commit()
+                else:
+                    payloads = self.drain()
+                    if payloads:
+                        centers = np.asarray(self._mod_cfg()['center'],
+                                             dtype=float)
+                        decided = await server.to_thread(
+                            self._consume_batch, payloads, centers)
+                        if decided:
+                            await self._auto_commit()
+                # Refresh the cached health snapshot off-loop (after any
+                # commit, so its staged counts are current). Keeps held /
+                # liveness fields fresh even on idle/held polls.
+                self._snapshot = await server.to_thread(self._build_snapshot)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1017,9 +1056,16 @@ class TrackingRuntime:
             }
         return tones, counts
 
-    def summary(self):
-        """Compact health summary (the lean block for monitoring tools)."""
-        _, counts = self.tone_health()
+    def summary(self, counts=None):
+        """Compact health summary (the lean block for monitoring tools).
+
+        ``counts`` may be a precomputed per-state count dict (from
+        :meth:`tone_health`) to avoid recomputing the O(n_tones) per-tone
+        pass -- :meth:`_build_snapshot` passes it so the whole snapshot
+        costs one ``tone_health`` call, not two.
+        """
+        if counts is None:
+            _, counts = self.tone_health()
         tracked = self.controller.enable_mask
         filtered = self.last_filtered_lw[tracked]
         detuning_hz = filtered * self.linewidth_hz[tracked]
@@ -1062,18 +1108,22 @@ class TrackingRuntime:
             'applied_revision': self._applied_revision(),
         }
 
-    def status(self):
-        """The ``get_info('tracking')`` payload: the compact ``summary``
-        block (for lean health polling), per-tone ``tones`` health/lock
-        states, and the full controller/parameter detail."""
-        filtered = self.last_filtered_lw
-        tracked = self.controller.enable_mask
-        recent = {int(i): (None if not np.isfinite(filtered[i])
-                           else float(filtered[i]))
-                  for i in np.flatnonzero(tracked)}
-        tones, _ = self.tone_health()
+    def _build_snapshot(self):
+        """Assemble the full ``get_info('tracking')`` payload.
+
+        This is the O(n_tones) work: it builds the per-tone health dict
+        **once** (fixing the previous double ``tone_health`` compute) and
+        derives ``summary`` and ``filtered_detuning_linewidths`` from that
+        single pass. It is run **off the event loop** (the consumer task's
+        ``to_thread`` hop) and cached in ``self._snapshot``; :meth:`status`
+        just serves that cache, so a health poll never runs this on the
+        stream loop. See doc/tone_tracking.md ("Health monitoring") and
+        profiling/tracking_health_benchmark.py.
+        """
+        tones, counts = self.tone_health()
+        recent = {i: t['detuning_linewidths'] for i, t in tones.items()}
         return {
-            'summary': self.summary(),
+            'summary': self.summary(counts=counts),
             'tones': tones,
             'enabled': self.enabled,
             'engine': self.engine,
@@ -1098,3 +1148,15 @@ class TrackingRuntime:
             'ring_depth': self.ring.maxlen,
             'ring_fill': len(self.ring),
         }
+
+    def status(self):
+        """Return the cached ``get_info('tracking')`` snapshot (O(1)).
+
+        The snapshot is rebuilt off-loop by the consumer task each poll
+        (:meth:`_build_snapshot`), so this accessor -- called on the event
+        loop by ``get_info('tracking')``, ``health_check`` and the SNAPSHOT
+        stream frame -- adds no per-tone work to the loop. It is at most one
+        poll (``poll_interval_s``) stale, which is far finer than any health
+        cadence. Call :meth:`_build_snapshot` directly for a synchronous
+        fresh build (tests)."""
+        return self._snapshot

@@ -42,6 +42,15 @@
   (`unlock_slope_ratio`) and/or the invalid-cycle fraction
   (`unlock_invalid_fraction`) — not by the detuning magnitude, which
   *compresses* far from resonance and would read deceptively small.
+- **All per-tone tracking work is now off the event loop.** The consumer's
+  single `to_thread` hop per poll now also runs the deadband/confirmation
+  `decide` and rebuilds the health snapshot; only the per-correction commit
+  (which owns the hardware writes) stays on the loop. `get_info('tracking')`
+  and `health_check()` serve that cached snapshot in O(1) — measured ~0.05
+  µs and flat 256→2048 tones, versus the ~14–30 ms an on-loop rebuild cost
+  (and the redundant double per-tone pass in `status()` is removed). So a
+  health poll no longer stalls the stream loop, at any tone count.
+  Benchmark: `profiling/tracking_health_benchmark.py`.
 - `enable_modulation(linewidth_hz=...)` carries `params_from_sweep`'s
   per-tone linewidths on both engines (fw default first; pure metadata in
   the armed config), required by tracking unless given to

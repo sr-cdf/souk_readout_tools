@@ -104,10 +104,16 @@ stream_data (modulated branches, fw and sw, per sample):
 (no copy, no parsing, no per-tone work). A slow consumer can never stall
 the stream — the ring just drops oldest.
 
-The consumer task polls the ring (`poll_interval_s`, default 0.2 s), and
-runs parse → cycle assembly → estimation → filtering in the thread executor
-(`to_thread`; the heavy numpy ops release the GIL), **vectorised across all
-tones** — no Python loops over tones anywhere in the pipeline.
+The consumer task polls the ring (`poll_interval_s`, default 0.2 s) and does
+**all** its per-tone work in the thread executor (`to_thread`; the heavy
+numpy ops release the GIL), **vectorised across all tones** — parse → cycle
+assembly → estimation → filtering → the controller's deadband/confirmation
+`decide` → the health-snapshot rebuild all run in one off-loop step per
+poll. Only the **commit** runs back on the event loop, because it owns the
+modulation hardware writes (it queues `_pending_modulation` / calls the fw
+apply path); it's O(number of corrected tones), not O(all tones). So
+nothing in tracking — estimation, decision, or health reporting — charges
+per-tone work to the stream loop.
 
 **Estimator**: `estimate_detunings` is a lean whole-array implementation of
 `demodulate`'s model-free `method='fast'` maths (finite-difference phase
@@ -121,18 +127,24 @@ complete cycles are used; partial cycles carry across batches.
 tones, N=3 points, 2 samples/point, 500 Hz stream — re-run on the RFSoC ARM
 quad-A53 for production numbers):
 
-| stage | cost |
-|---|---|
-| tap (per frame, the only hot-path work) | 0.066 µs = 0.003 % of a 2 ms frame period |
-| consumer batch (parse+assemble+estimate+filter) | 107 ms per 1.2 s of stream ≈ 9 % of one core |
-| estimator alone | 0.39 ms per cycle, all 2048 tones |
-| `demodulate` reference on same batch | 7× slower than the lean estimator |
+| stage | where | cost |
+|---|---|---|
+| tap (per frame, the only hot-path work) | stream loop | 0.066 µs = 0.003 % of a 2 ms frame period |
+| consumer batch (parse+assemble+estimate+filter+decide) | to_thread (off-loop) | 107 ms per 1.2 s of stream ≈ 9 % of one core |
+| estimator alone | to_thread | 0.39 ms per cycle, all 2048 tones |
+| `demodulate` reference on same batch | — | 7× slower than the lean estimator |
+| health snapshot rebuild | to_thread | ~14 ms per poll (`profiling/tracking_health_benchmark.py`) |
+| `status()` / `health_check()` accessor | event loop | ~0.05 µs, flat in tone count (cache read) |
+| `commit` (staging + queue) | event loop | O(corrected tones), per correction only |
 
-The tap cost is measured to be negligible, so tracking adds no measurable
-stream-rate regression; the estimation runs on a different core from the
-stream loop. On the A53 expect the consumer batch to scale up roughly an
-order of magnitude — still comfortably real-time at 2048 tones, and
-`poll_interval_s` can be raised to trade latency for duty cycle.
+The only tracking work on the stream loop is the per-frame tap (negligible)
+and the per-correction commit (rare, small). Everything O(all-tones) —
+estimation, the deadband/confirmation decision, and the health-snapshot
+rebuild — runs in the consumer's `to_thread`, on a different core from the
+stream loop, so neither tracking nor a health poll adds a stream-rate
+regression. On the A53 expect the off-loop consumer batch to scale up
+roughly an order of magnitude — still comfortably real-time at 2048 tones,
+and `poll_interval_s` can be raised to trade latency for duty cycle.
 
 **`get_samples` as producer**: tracking taps **only** `stream_data`.
 Finite `get_samples` captures are not tapped (they are short and usually
@@ -338,6 +350,15 @@ covered by the standard `get_info` / `health_check` tooling:
 - **`get_info('tracking')`** returns `{summary, tones, controller, …}` —
   the same summary block, **plus per-tone** health, plus the full
   controller/parameter detail. `client.get_tracking_state()` fetches it.
+
+Both are served on the event loop, so the full payload is **cached**: the
+O(number-of-tones) snapshot is rebuilt off-loop by the consumer each poll
+(`poll_interval_s`, ≤ 0.2 s stale — far finer than any health cadence), and
+the `get_info`/`health_check` accessors just return the cache in O(1). A
+health poll therefore never runs per-tone work on the stream loop
+regardless of tone count (measured ~0.05 µs and flat 256→2048 tones, vs the
+~14–30 ms the on-loop build would cost; see
+`profiling/tracking_health_benchmark.py`).
 
 **Summary block** (`summary`) — array-wide counts and extrema, the block a
 monitor watches:
