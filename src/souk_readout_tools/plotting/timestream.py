@@ -7,6 +7,8 @@ PSDs. Includes a debugging overlay of timestream points on the resonance
 circle from sweep data, with optional deembedding or phase centering.
 """
 
+import warnings
+
 import numpy as np
 from collections.abc import Mapping
 
@@ -40,6 +42,14 @@ def _build_x_axis(ts_data, x_axis='time'):
     """
     n = ts_data.get('num_samples', len(next(iter(ts_data['i_data'].values()))))
     if x_axis == 'time':
+        # A producer (e.g. modulation.point_timestreams) may supply a real time
+        # axis carrying each sample's true offset; prefer it over the uniform
+        # arange so per-point streams keep their sub-cycle shifts.
+        t = ts_data.get('time_s')
+        if t is not None:
+            t = np.asarray(t, dtype=float)
+            if t.shape == (n,):
+                return t, 'Time (s)'
         return np.arange(n) / ts_data['sample_rate'], 'Time (s)'
     elif x_axis == 'sample':
         return np.arange(n), 'Sample number'
@@ -263,6 +273,28 @@ def _has_precomputed_freq_diss(ts_data):
         'frequency_shift_hz',
         'frequency_hz',
     ))
+
+
+def _warn_ignored_conversion_args(conversion_method, calibrations):
+    """
+    Warn when plot-time conversion knobs cannot take effect because the
+    timestream already carries demodulated frequency/dissipation.
+    """
+    ignored = []
+    if conversion_method is not None:
+        ignored.append(f'conversion_method={conversion_method!r}')
+    if calibrations is not None:
+        ignored.append('calibrations')
+    if not ignored:
+        return
+    import warnings
+    warnings.warn(
+        'ts_data already carries demodulated frequency/dissipation, so '
+        + ' and '.join(ignored) + ' cannot affect this plot. The '
+        'conversion was chosen when the timestream was demodulated: pass '
+        'calibration= to demodulate_timestream for the calibrated Mobius '
+        'inversion, or omit it for the linearized estimate.',
+        stacklevel=3)
 
 
 def _sample_tone_column(ts_data, key, tone_idx):
@@ -510,7 +542,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     fig=None, label=None,
                     units='raw', config=None, reference_plane='adc_input',
                     x_axis='time', unwrap_phase=True,
-                    smooth_window_hz=1000, conversion_method='linearized',
+                    smooth_window_hz=1000, conversion_method=None,
                     calibrations=None, apply_readout_correction=True,
                     **kwargs):
     """
@@ -546,10 +578,15 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         smooth_window_hz: Smoothing window passed to
             the linearized resonator conversion for ``format='freq_diss'``.
             Pass ``None`` or ``0`` to disable sweep smoothing.
-        conversion_method: ``'linearized'`` (default), ``'mobius'``, or
-            ``'circle'`` for ``format='freq_diss'``.
+        conversion_method: ``'linearized'``, ``'mobius'``, or ``'circle'``
+            for ``format='freq_diss'``; ``None`` (default) means
+            ``'linearized'``. Ignored -- with a warning -- when ``ts_data``
+            already carries demodulated freq/diss (``demodulate_timestream``
+            output): there the conversion was fixed at demodulation time via
+            its ``calibration`` argument.
         calibrations: Per-tone resonator calibrations or fit results. Required
-            by ``conversion_method='mobius'`` and ``'circle'``.
+            by ``conversion_method='mobius'`` and ``'circle'``. Ignored for
+            already-demodulated timestreams (see ``conversion_method``).
         fig: Existing figure. If None, create new.
         label: Legend label. If None, uses an auto-incrementing index.
         units: Unit for I/Q normalisation.  One of:
@@ -646,6 +683,10 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
     precomputed_freq_diss = _has_precomputed_freq_diss(ts_data)
     if format == 'freq_diss' and sweep_data is None and not precomputed_freq_diss:
         raise ValueError("sweep_data is required for format='freq_diss'")
+    if format == 'freq_diss' and precomputed_freq_diss:
+        _warn_ignored_conversion_args(conversion_method, calibrations)
+    if conversion_method is None:
+        conversion_method = 'linearized'
 
     suffix = _transform_title_suffix(deembed, phase_center)
 
@@ -756,12 +797,62 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
     return fig
 
 
+def _nonsettling_decimation(ts_data, sample_rate):
+    """Non-settling sample indices + the decimated sample rate for a PSD.
+
+    ``demodulate_timestream`` leaves ``modulation_settling`` samples in place (as
+    NaN when ``fill_settling='none'``), so a PSD of that stream is all-NaN.
+    Dropping the flagged samples only yields a well-defined spectrum if the
+    survivors are uniformly spaced -- true when each slot dwell keeps a single
+    run of good samples (e.g. ``dwell - n_settle == 1``). Returns
+    ``(keep_idx, decimated_rate)``; raises if the flag is missing or the
+    survivors are not uniformly spaced.
+    """
+    settling = ts_data.get('modulation_settling')
+    if settling is None:
+        raise ValueError(
+            "exclude_settling=True but ts_data has no 'modulation_settling' flag; "
+            "pass a demodulated/parsed modulation timestream, or exclude_settling=False.")
+    settling = np.asarray(settling, dtype=int)
+    keep_idx = np.flatnonzero(settling == 0)
+    if keep_idx.size < 2:
+        raise ValueError(
+            f"exclude_settling kept {keep_idx.size} non-settling samples; need >= 2.")
+    strides = np.unique(np.diff(keep_idx))
+    if strides.size != 1:
+        raise ValueError(
+            "non-settling samples are not uniformly spaced "
+            f"(sample strides {strides.tolist()}), so their PSD is not well "
+            "defined. Use a dwell / n_settle split that keeps one run of good "
+            "samples per slot (e.g. dwell - n_settle == 1), or fill the settling "
+            "samples (fill_settling='interpolate') instead of dropping them.")
+    return keep_idx, sample_rate / float(strides[0])
+
+
+def _warn_if_psd_nan(arr, tone_key, quantity):
+    """Warn (instead of silently drawing nothing) when a PSD input is non-finite."""
+    finite = np.isfinite(np.asarray(arr))
+    if finite.size == 0 or not np.any(finite):
+        warnings.warn(
+            f"tone {tone_key}: {quantity} timestream is entirely non-finite; "
+            "nothing will be plotted. For a demodulated modulation timestream the "
+            "settling samples are NaN -- pass exclude_settling=True, or demodulate "
+            "with fill_settling='interpolate'.", stacklevel=3)
+    elif not np.all(finite):
+        n_bad = int(np.sum(~finite))
+        warnings.warn(
+            f"tone {tone_key}: {quantity} timestream has {n_bad} non-finite "
+            "sample(s); the Welch PSD will be NaN. Drop or fill them "
+            "(exclude_settling=True, or fill_settling='interpolate').",
+            stacklevel=3)
+
+
 def plot_timestream_psd(ts_data, format='iq', tones=None,
                         sweep_data=None, reference_tone_frequency=None,
                         psd_kwargs=None,
                         precomputed_psd=None, fig=None, label=None,
                         smooth_window_hz=1000, *,
-                        conversion_method='linearized',
+                        conversion_method=None,
                         calibrations=None,
                         include_dc_point=False,
                         log_bin=False,
@@ -771,6 +862,7 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                         decorrelate_tones=None,
                         blind_tone_modes=0,
                         blind_tones=None,
+                        exclude_settling=False,
                         apply_readout_correction=True,
                         **kwargs):
     """
@@ -791,10 +883,15 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
         smooth_window_hz: Smoothing window passed to
             the linearized resonator conversion for ``format='freq_diss'``.
             Pass ``None`` or ``0`` to disable sweep smoothing.
-        conversion_method: ``'linearized'`` (default), ``'mobius'``, or
-            ``'circle'`` for ``format='freq_diss'``.
+        conversion_method: ``'linearized'``, ``'mobius'``, or ``'circle'``
+            for ``format='freq_diss'``; ``None`` (default) means
+            ``'linearized'``. Ignored -- with a warning -- when ``ts_data``
+            already carries demodulated freq/diss (``demodulate_timestream``
+            output) and no cleaning modes are active: there the conversion
+            was fixed at demodulation time via its ``calibration`` argument.
         calibrations: Per-tone resonator calibrations or fit results. Required
-            by ``conversion_method='mobius'`` and ``'circle'``.
+            by ``conversion_method='mobius'`` and ``'circle'``. Ignored for
+            already-demodulated timestreams (see ``conversion_method``).
         psd_kwargs: dict of kwargs passed to compute_psd().
         precomputed_psd: dict mapping tone_key -> (f_psd, psd_values).
             If provided, skip computation.
@@ -827,6 +924,14 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
         blind_tones: iterable of int or None, optional. Explicit blind-tone
             indices. ``None`` (default) infers them from saved timestream
             metadata. Use this for older captures without role metadata.
+        exclude_settling: bool, optional. Compute the PSD from only the
+            samples not flagged ``modulation_settling`` (rather than filling
+            them). The kept samples must be uniformly spaced -- true when the
+            dwell keeps one run of good samples per slot (e.g.
+            ``dwell - n_settle == 1``) -- and the PSD is computed at the
+            decimated sample rate. Raises if the flag is missing or the kept
+            samples are not evenly spaced. Incompatible with SVD / blind-tone
+            cleaning. Default ``False``.
         **kwargs: Passed to plot calls.
 
     Returns:
@@ -838,6 +943,24 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
     selected = _get_tone_data(ts_data, tones)
     sample_rate = ts_data['sample_rate']
     psd_kw = psd_kwargs or {}
+
+    keep_idx = None
+    psd_sample_rate = sample_rate
+    if exclude_settling:
+        if decorrelate_modes or blind_tone_modes:
+            raise ValueError(
+                "exclude_settling is not supported together with SVD / blind-tone "
+                "cleaning (those operate on the full-rate stream).")
+        keep_idx, psd_sample_rate = _nonsettling_decimation(ts_data, sample_rate)
+
+    def _psd(arr, tone_key=None, quantity=None):
+        """compute_psd, dropping settling samples first when exclude_settling."""
+        a = np.asarray(arr)
+        if keep_idx is not None:
+            a = a[keep_idx]
+        if quantity is not None:
+            _warn_if_psd_nan(a, tone_key, quantity)
+        return compute_psd(a, psd_sample_rate, **psd_kw)
 
     precomputed_freq_diss = _has_precomputed_freq_diss(ts_data)
     if format == 'freq_diss' and sweep_data is None and not precomputed_freq_diss:
@@ -863,6 +986,14 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
             "SVD and blind-tone cleaning require sweep_data; precomputed "
             "modulation demodulation can be plotted only without these "
             "cleaning modes.")
+    # With cleaning modes active the freq/diss is recomputed from raw I/Q, so
+    # the conversion knobs do apply; otherwise a precomputed (demodulated)
+    # timestream is plotted as-is and they cannot.
+    if (format == 'freq_diss' and precomputed_freq_diss
+            and not (decorrelate_modes or blind_tone_modes)):
+        _warn_ignored_conversion_args(conversion_method, calibrations)
+    if conversion_method is None:
+        conversion_method = 'linearized'
 
     if format in ('iq', 'magphase'):
         if fig is None:
@@ -879,13 +1010,15 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                 f1, p1 = precomputed_psd[key][:2]
                 f2, p2 = precomputed_psd[key][2:4] if len(precomputed_psd[key]) > 2 else (f1, p1)
             elif format == 'iq':
-                f1, p1 = compute_psd(i_arr, sample_rate, **psd_kw)
-                f2, p2 = compute_psd(q_arr, sample_rate, **psd_kw)
+                f1, p1 = _psd(i_arr, key, 'I')
+                f2, p2 = _psd(q_arr, key, 'Q')
             else:  # magphase
-                mag = np.abs(z)
-                phase = np.unwrap(np.angle(z))
-                f1, p1 = compute_psd(mag, sample_rate, **psd_kw)
-                f2, p2 = compute_psd(phase, sample_rate, **psd_kw)
+                zc = z[keep_idx] if keep_idx is not None else z
+                _warn_if_psd_nan(zc, key, 'magnitude/phase')
+                mag = np.abs(zc)
+                phase = np.unwrap(np.angle(zc))
+                f1, p1 = compute_psd(mag, psd_sample_rate, **psd_kw)
+                f2, p2 = compute_psd(phase, psd_sample_rate, **psd_kw)
 
             f1, p1 = _prepare_psd_for_log_plot(
                 f1, p1, include_dc_point, log_bin, bins_per_decade)
@@ -946,8 +1079,8 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                         smooth_window_hz=smooth_window_hz,
                         conversion_method=conversion_method,
                         calibrations=calibrations)
-                f1, p1 = compute_psd(frac_f, sample_rate, **psd_kw)
-                f2, p2 = compute_psd(frac_d, sample_rate, **psd_kw)
+                f1, p1 = _psd(frac_f, key, 'frequency')
+                f2, p2 = _psd(frac_d, key, 'dissipation')
 
                 f1, p1 = _prepare_psd_for_log_plot(
                     f1, p1, include_dc_point, log_bin, bins_per_decade)
@@ -1095,11 +1228,41 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     ts_freq = _get_modulated_probe_frequencies(
         ts_data, tone_index, tone_freq, len(z_ts))
 
+    # demodulate_timestream() output is already centre-referred, and when it was
+    # given a calibration it is already de-embedded + phase-centred. Re-applying
+    # the transforms here would double them (IQ thrown off the circle, magnitude
+    # collapsed), and every sample already reads at the centre point rather than
+    # its probe offset. So for demodulated data: skip the transforms on the
+    # timestream (still transform the sweep, so the two share a frame) and place
+    # all samples at the centre reference frequency.
+    demodulated = bool(ts_data.get('modulation_demodulated'))
+    if demodulated:
+        ref_f = None
+        drf = ts_data.get('dissipation_reference_frequency_hz')
+        if drf is not None:
+            try:
+                ref_f = float(np.asarray(drf)[tone_index])
+            except (IndexError, TypeError, ValueError):
+                ref_f = None
+        if ref_f is None or not np.isfinite(ref_f):
+            ref_f = tone_freq
+        ts_freq = np.full(len(z_ts), ref_f, dtype=float)
+        if deembed or phase_center or phase_centered or mag_centered:
+            warnings.warn(
+                "ts_data is a demodulated timestream (already centre-referred, "
+                "and calibrated demodulation is already de-embedded/phase-"
+                "centred). Applying deembed/phase-centering to the sweep only, "
+                "not to the timestream, and plotting every sample at the centre "
+                "frequency.",
+                stacklevel=2)
+
     # Deembedding is shared across all panels; apply it once at each trace's
-    # probe frequencies.
+    # probe frequencies. For a demodulated timestream the transform goes on the
+    # sweep only -- the timestream is already in that basis.
     if deembed:
         z_sweep, d_params = _apply_deembed(sweep_f, z_sweep, True)
-        z_ts, _ = _apply_deembed(None, z_ts, d_params, frequency=ts_freq)
+        if not demodulated:
+            z_ts, _ = _apply_deembed(None, z_ts, d_params, frequency=ts_freq)
 
     visible = _visible_modulation_sample_mask(
         ts_data, len(z_ts), hide_modulation_settling_points)
@@ -1114,10 +1277,16 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     mag_centered = phase_center if mag_centered is None else mag_centered
 
     def _maybe_center(enable, z_s, z_t):
-        """Phase-center the sweep and timestream together, or pass through."""
+        """Phase-center the sweep and timestream together, or pass through.
+
+        A demodulated timestream is already phase-centred, so only the sweep is
+        transformed (into the same frame); the timestream passes through.
+        """
         if not enable:
             return z_s, z_t
         z_s, pc_params = _apply_phase_center(z_s, True)
+        if demodulated:
+            return z_s, z_t
         z_t, _ = _apply_phase_center(z_t, pc_params)
         return z_s, z_t
 

@@ -20,6 +20,8 @@ The workflow a consumer follows is:
    cycle (settling samples dropped), plus the per-point probe offsets (Hz) read
    from ``get_info('modulation')`` and the grouped packet counters,
    telescope time, packet errors and stream flags.
+   (:func:`point_timestreams` reshapes this into one ``parse_samples``-style
+   timestream per probe point, for per-point PSDs with the standard plotters.)
 3. :func:`demodulate` -> per-cycle dphi/df, d2phi/df2, frequency shift and a
    detuning estimate (with a ``needs_update`` flag for the future tracking loop).
 
@@ -863,6 +865,177 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
     }
 
 
+def point_timestreams(grouped, data_dict=None, sample_rate=None, dwell='mean'):
+    """
+    Split grouped modulation data into one timestream per probe point.
+
+    Each of the N probe points is visited once per modulation cycle, so its
+    samples form a timestream at (a multiple of) the cycle rate. This
+    returns, for every point, a dict shaped like ``parse_samples`` output
+    (``i_data`` / ``q_data`` / ``sample_rate`` / ...), so the existing
+    timestream tools apply directly -- e.g. per-point noise spectra with
+    ``plot_timestream_psd(ts[1], format='freq_diss', sweep_data=sweep)``.
+    Each dict carries its point's *probe* frequencies in
+    ``info['tones']['frequencies_hz']``, so the freq/diss conversion
+    references the correct location on the sweep.
+
+    Parameters
+    ----------
+    grouped : dict
+        Output of :func:`group_cycles` (either ``reduce`` mode). Note that
+        cycles inserted as NaN placeholders by ``on_missing='fill'`` stay
+        NaN here, and a Welch PSD of a stream containing NaN is all-NaN;
+        for gappy captures drop or interpolate those cycles first.
+    data_dict : dict or None, optional
+        The parsed sample dict the grouping came from. Supplies the raw
+        stream ``sample_rate`` and fallback centre frequencies for tones
+        absent from the modulation state.
+    sample_rate : float or None, optional
+        Raw stream sample rate (Hz). Overrides ``data_dict``; one of the
+        two must provide it.
+    dwell : {'mean', int, None}, optional
+        ``'mean'`` (default) NaN-averages the kept dwell samples of each
+        point to one value per cycle -- a strictly uniform stream at the
+        cycle rate (the averaging acts as a boxcar filter before the
+        decimation). An integer selects that single dwell sample instead
+        (uniform at the cycle rate, no filtering). ``None`` keeps every
+        kept dwell sample in time order with no averaging; with more than
+        one kept sample per point that stream is *bursty* -- the dwell
+        samples sit at the raw rate within each cycle, then wait for the
+        next cycle -- and its ``sample_rate`` is the average rate (kept
+        samples per point x cycle rate), so spectral features above the
+        cycle rate are smeared by the burst sampling. Settling samples
+        kept by ``include_settling=True`` are averaged/kept like any
+        other -- regroup with ``include_settling=False`` if that is not
+        wanted.
+
+    Returns
+    -------
+    dict
+        ``{point_number: ts_dict}`` for point numbers ``1..N``.
+        ``point_offsets_hz`` records the per-tone probe offset of that
+        point.
+    """
+    z = np.asarray(grouped['z'])
+    if z.ndim == 3:          # reduce='mean': (n_cycles, N, n_tones)
+        z = z[:, :, None, :]
+    elif z.ndim != 4:
+        raise ValueError(f'grouped["z"] must be 3D or 4D, got {z.ndim}D')
+    n_cycles, N, n_used, n_tones = z.shape
+    if n_cycles < 2:
+        raise ValueError('need at least two complete cycles to form a '
+                         f'per-point timestream, got {n_cycles}')
+
+    if sample_rate is None:
+        if not isinstance(data_dict, dict) or 'sample_rate' not in data_dict:
+            raise ValueError('pass data_dict (with sample_rate) or an '
+                             'explicit raw-stream sample_rate')
+        sample_rate = data_dict['sample_rate']
+    # Cycle rate from the per-cycle packet counters: the counter increments
+    # once per raw sample, so the median counter step between cycles is the
+    # cycle length in raw samples (robust to dropped/incomplete cycles).
+    cpc = np.asarray(grouped['cycle_packet_counter'], dtype=float)
+    steps = np.diff(cpc)
+    steps = steps[steps > 0]
+    if not len(steps):
+        raise ValueError('cycle_packet_counter has no positive steps; '
+                         'cannot establish the cycle rate')
+    cycle_rate = float(sample_rate) / float(np.median(steps))
+
+    # Shared time origin = the globally-earliest retained sample (not a mid-cycle
+    # cycle reference), so t=0 lands on the true first sample and every point's
+    # axis uses the same origin. Each point is visited slightly later within a
+    # cycle than the one before, so referencing the raw packet counter to this
+    # origin surfaces those small per-point offsets instead of collapsing every
+    # point onto the same times.
+    valid_pkt = np.asarray(grouped['packet_counter'])[np.asarray(grouped['packet_counter']) >= 0]
+    counter0 = float(valid_pkt.min()) if valid_pkt.size else 0.0
+
+    if dwell is None:
+        z_sel = z                       # keep every kept dwell sample
+    elif dwell == 'mean':
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)  # all-NaN dwells
+            z_sel = np.nanmean(z, axis=2, keepdims=True)
+    else:
+        dwell_pick = int(dwell)
+        if not 0 <= dwell_pick < n_used:
+            raise ValueError(f'dwell index {dwell_pick} out of range for '
+                             f'{n_used} kept samples per point')
+        z_sel = z[:, :, dwell_pick:dwell_pick + 1, :]
+    n_out = z_sel.shape[2]              # kept samples per point per cycle
+    point_rate = cycle_rate * n_out
+
+    def _point_meta(name, p):
+        # Per-(cycle, point[, sample]) metadata -> flat per-point stream,
+        # matching the dwell selection above.
+        arr = grouped.get(name)
+        if arr is None or np.ndim(arr) not in (2, 3):
+            return None
+        arr = np.asarray(arr)
+        if arr.ndim == 2:               # mean-reduced grouping: one per cycle
+            return arr[:, p].copy() if arr.shape == (n_cycles, N) else None
+        if arr.shape[:2] != (n_cycles, N):
+            return None
+        if dwell is None:
+            return arr[:, p, :].reshape(-1).copy()
+        if dwell == 'mean':             # representative: first kept sample
+            return arr[:, p, 0].copy()
+        return arr[:, p, int(dwell)].copy()
+
+    # Absolute probe frequency per (point, tone); tones without a modulation
+    # state entry sit at 0.0 there, so fall back to the capture's centre
+    # frequencies for them.
+    freq_hz = np.asarray(grouped['freq_hz'], dtype=float)
+    fallback_freqs = None
+    if isinstance(data_dict, dict):
+        info = data_dict.get('info')
+        if isinstance(info, dict):
+            tf = info.get('tones', {}).get('frequencies_hz')
+            if tf is not None and len(tf) == n_tones:
+                fallback_freqs = np.asarray(tf, dtype=float)
+
+    out = {}
+    for p in range(N):
+        freqs = freq_hz[p].copy()
+        missing = ~np.isfinite(freqs) | (freqs == 0.0)
+        if fallback_freqs is not None:
+            freqs[missing] = fallback_freqs[missing]
+        # (n_cycles, n_out, n_tones) -> (n_cycles * n_out, n_tones), in time
+        # order (cycle-major, dwell-minor).
+        zp = z_sel[:, p, :, :].reshape(-1, n_tones)
+        ts = {
+            'i_data': {f'{t:04d}': zp[:, t].real.copy() for t in range(n_tones)},
+            'q_data': {f'{t:04d}': zp[:, t].imag.copy() for t in range(n_tones)},
+            'sample_rate': point_rate,
+            'num_samples': zp.shape[0],
+            'num_tones': n_tones,
+            # group_cycles / parse_samples already applied the software
+            # readout flattening to these samples.
+            'readout_correction_applied': True,
+            'point_number': p + 1,
+            'point_offsets_hz': np.asarray(grouped['offsets_hz'], dtype=float)[p].copy(),
+            'info': {'tones': {'frequencies_hz': freqs.tolist()}},
+        }
+        if grouped.get('tone_metadata') is not None:
+            ts['tone_metadata'] = grouped['tone_metadata']
+        for name in ('packet_counter', 'telescope_time', 'packet_error',
+                     'sample_present', 'packet_missing',
+                     'modulation_point', 'modulation_settling'):
+            meta = _point_meta(name, p)
+            if meta is not None and len(meta) == zp.shape[0]:
+                ts[name] = meta
+        # Real per-sample time axis from the raw packet counter (shared origin),
+        # so x_axis='time' plots this point at its true sub-cycle offset rather
+        # than at arange(n)/point_rate. Falls back to arange when the counter is
+        # unavailable.
+        pc = ts.get('packet_counter')
+        if pc is not None and len(pc) == zp.shape[0]:
+            ts['time_s'] = (np.asarray(pc, dtype=float) - counter0) / float(sample_rate)
+        out[p + 1] = ts
+    return out
+
+
 def demodulate_timestream(grouped, offsets=None, *, method='accurate',
                           calibration=None, reference_z=None,
                           data_dict=None, n_samples=None,
@@ -1219,8 +1392,26 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         if calibration is None:
             return None
         if isinstance(calibration, dict):
-            return calibration.get(t)
-        return calibration[t] if t < len(calibration) else None
+            cal = calibration.get(t)
+        else:
+            # A list/sequence of fits or calibrations. Match on the tone index
+            # each entry carries (as params_from_sweep does) so an unordered or
+            # partial batch fit maps correctly; fall back to positional order
+            # for entries without a tone_index (e.g. ResonatorCalibrations).
+            cal = None
+            for position, entry in enumerate(calibration):
+                if entry is None:
+                    continue
+                idx = int(getattr(entry, 'tone_index', -1))
+                idx = idx if idx >= 0 else position
+                if idx == t:
+                    cal = entry
+                    break
+        # Accept a raw FitResult and wrap it, so calibration=fits works directly.
+        if cal is not None and not hasattr(cal, 'transform_raw_iq'):
+            from .resonator import ResonatorCalibration
+            cal = ResonatorCalibration.from_fit(cal)
+        return cal
 
     def _reference_frequency_hz(t, c_point):
         candidates = []
@@ -1610,8 +1801,26 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
         if calibration is None:
             return None
         if isinstance(calibration, dict):
-            return calibration.get(t)
-        return calibration[t] if t < len(calibration) else None
+            cal = calibration.get(t)
+        else:
+            # A list/sequence of fits or calibrations. Match on the tone index
+            # each entry carries (as params_from_sweep does) so an unordered or
+            # partial batch fit maps correctly; fall back to positional order
+            # for entries without a tone_index (e.g. ResonatorCalibrations).
+            cal = None
+            for position, entry in enumerate(calibration):
+                if entry is None:
+                    continue
+                idx = int(getattr(entry, 'tone_index', -1))
+                idx = idx if idx >= 0 else position
+                if idx == t:
+                    cal = entry
+                    break
+        # Accept a raw FitResult and wrap it, so calibration=fits works directly.
+        if cal is not None and not hasattr(cal, 'transform_raw_iq'):
+            from .resonator import ResonatorCalibration
+            cal = ResonatorCalibration.from_fit(cal)
+        return cal
 
     for t in range(n_tones):
         f = offsets[:, t]                       # (N,) probe offsets for this tone

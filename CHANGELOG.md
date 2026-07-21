@@ -1,5 +1,29 @@
 # Changelog & Feature List
 
+## v1.6.4
+
+**Per-point modulation timestreams**
+- New `modulation.point_timestreams()` splits `group_cycles` output into one
+  `parse_samples`-shaped timestream per probe point (with a real sub-cycle
+  time axis), so the standard timestream/PSD plotters work per point.
+- `demodulate`/`demodulate_timestream` accept a list of fits/calibrations for
+  `calibration=` (matched by `tone_index`) and auto-wrap raw `FitResult`s.
+
+**Timestream plotting: demodulated-stream handling**
+- Plotters honour a producer-supplied `time_s` axis; `conversion_method`
+  defaults to `None` and warns when conversion knobs can't apply to
+  already-demodulated data.
+- `plot_timestream_psd(exclude_settling=True)` computes the PSD from only the
+  non-settling samples at the decimated rate; non-finite PSDs now warn.
+- `plot_timestream_on_resonance` detects demodulated input and no longer
+  double-applies deembed/phase-centering.
+
+**Server: firmware-modulation revision history**
+- `_next_fw_modulation_revision` records center/offsets/dwell/mode per
+  revision (exposed via `state['revision_history']`) so tagged frames can be
+  attributed offline; `purge_revisions` clears fw history and refuses while
+  fw modulation is enabled.
+
 ## v1.6.3
 
 **Fix: stale mixer dwell breaking software modulation after firmware-slot runs**

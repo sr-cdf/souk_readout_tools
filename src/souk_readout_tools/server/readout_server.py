@@ -951,6 +951,7 @@ class ReadoutServer:
         self.fw_modulation_cfg = None                   # center, slot offsets, mod_indices, n_dwell, mode
         self.fw_modulation_state = None                 # get_info payload
         self._fw_modulation_revision = 0
+        self._fw_modulation_revision_history = {}       # revision -> {center, slot_offsets, mod_indices, n_dwell, n_settle, mode, ts}
         self._mod_dwell_tag = -1                        # last slot seen by prepare_frame
         self._mod_dwell_pos = 0                          # accumulations into the current dwell
 
@@ -1279,6 +1280,7 @@ class ReadoutServer:
         self.fw_modulation_cfg = None                   # center, slot offsets, mod_indices, n_dwell, mode
         self.fw_modulation_state = None                 # get_info payload
         self._fw_modulation_revision = 0
+        self._fw_modulation_revision_history = {}       # revision -> {center, slot_offsets, mod_indices, n_dwell, n_settle, mode, ts}
         self._mod_dwell_tag = -1                        # last slot seen by prepare_frame
         self._mod_dwell_pos = 0                          # accumulations into the current dwell
 
@@ -3379,13 +3381,14 @@ class ReadoutServer:
                                 'slot offsets push at least one tone beyond fixed-bin coverage; '
                                 'reduce the offsets or pass force=True to arm anyway (those tones '
                                 'will wrap to the other end of the bin)')
-                        rev = self._next_fw_modulation_revision()
+                        rev = self._next_fw_modulation_revision(cfg)
                         # Load + start switching (hardware writes) off the event loop.
                         await self.to_thread(self._apply_fw_modulation, bundle, cfg)
                         self.fw_modulation_params = bundle
                         self.fw_modulation_cfg = cfg
                         state['enabled'] = True
                         state['applied_revision'] = rev
+                        state['revision_history'] = dict(self._fw_modulation_revision_history)
                         self.fw_modulation_state = state
                         self.e_fw_modulation_enabled.set()
                         await self.send_response(writer, {'status': 'success',
@@ -3480,12 +3483,13 @@ class ReadoutServer:
                             raise ValueError(
                                 'update pushes at least one tone beyond fixed-bin coverage; '
                                 'reduce the offsets, disable+enable to recentre, or pass force=True')
-                        rev = self._next_fw_modulation_revision()
+                        rev = self._next_fw_modulation_revision(cfg)
                         await self.to_thread(self._update_fw_modulation, bundle, cfg)
                         self.fw_modulation_params = bundle
                         self.fw_modulation_cfg = cfg
                         state['enabled'] = self.e_fw_modulation_enabled.is_set()
                         state['applied_revision'] = rev
+                        state['revision_history'] = dict(self._fw_modulation_revision_history)
                         # A seamless update rides the running slot cycle without
                         # re-selecting, so preserve the live manual slot rather than
                         # snapping the rebuilt state back to slot 0.
@@ -3531,13 +3535,14 @@ class ReadoutServer:
                             n_dwell, mode=mode, n_settle=n_settle,
                             compensate_rx_ticks=compensate_rx_ticks,
                             compensate_filterbank=c.get('compensate_filterbank'))
-                        rev = self._next_fw_modulation_revision()
+                        rev = self._next_fw_modulation_revision(cfg)
                         # Full load (writes chanmaps) + restart switching.
                         await self.to_thread(self._apply_fw_modulation, bundle, cfg)
                         self.fw_modulation_params = bundle
                         self.fw_modulation_cfg = cfg
                         state['enabled'] = self.e_fw_modulation_enabled.is_set()
                         state['applied_revision'] = rev
+                        state['revision_history'] = dict(self._fw_modulation_revision_history)
                         self.fw_modulation_state = state
                         await self.send_response(writer, {'status': 'success',
                             'warnings': list(state.get('warnings', [])),
@@ -3579,17 +3584,22 @@ class ReadoutServer:
                     # revision_history snapshot. The next frame producer applies
                     # that snapshot and silently resurrects the purged entries, so
                     # the purge would not stick. Require disable_modulation first.
-                    if self.e_modulation_enabled.is_set():
+                    if self.e_modulation_enabled.is_set() or self.e_fw_modulation_enabled.is_set():
                         await self.send_response(writer, {'status': 'error',
                             'message': 'modulation is enabled; call disable_modulation() '
                                        'before purging revisions (an armed config can carry '
                                        'a pending snapshot that would resurrect the history)'})
                     else:
-                        purged = len(self._modulation_revision_history)
+                        purged = (len(self._modulation_revision_history)
+                                  + len(self._fw_modulation_revision_history))
                         self._modulation_revision = 0
                         self._modulation_revision_history = {}
                         if self.modulation_state is not None:
                             self.modulation_state['revision_history'] = {}
+                        self._fw_modulation_revision = 0
+                        self._fw_modulation_revision_history = {}
+                        if self.fw_modulation_state is not None:
+                            self.fw_modulation_state['revision_history'] = {}
                         await self.send_response(writer, {'status': 'success',
                             'result': {'purged': purged, 'revision': 0}})
 
@@ -5517,11 +5527,30 @@ class ReadoutServer:
             'tones': tones,
         }
 
-    def _next_fw_modulation_revision(self):
-        """Bump and return the firmware-slot modulation revision (frame[-5] bits
-        17..31), so captured frames can be attributed to a config generation."""
+    def _next_fw_modulation_revision(self, cfg):
+        """
+        Bump and return the firmware-slot modulation revision (frame[-5] bits
+        17..31), recording the config in the revision history so captured frames
+        can be attributed offline to the centre/slot-offsets that produced them.
+        The firmware analog of :meth:`_next_modulation_revision`: an update or
+        recenter mid-capture mints a new revision, and holding the map here lets a
+        consumer reconstruct which slot combs applied to each tagged frame.
+
+        ``cfg`` is the resolved configuration dict being applied.
+        """
         self._fw_modulation_revision = (self._fw_modulation_revision + 1) & 0x7FFF
-        return self._fw_modulation_revision
+        rev = self._fw_modulation_revision
+        self._fw_modulation_revision_history[rev] = {
+            'center': np.asarray(cfg['center'], dtype=float).tolist(),
+            'slot_offsets': np.asarray(cfg['slot_offsets'], dtype=float).tolist(),
+            'mod_indices': list(cfg['mod_indices']),
+            'n_dwell': int(cfg['n_dwell']),
+            'n_settle': int(cfg['n_settle']),
+            'mode': str(cfg['mode']),
+            'compensate_rx_ticks': int(cfg.get('compensate_rx_ticks', 0)),
+            'ts': time.time(),
+        }
+        return rev
 
     def _apply_fw_modulation(self, bundle, cfg):
         """
