@@ -1,0 +1,113 @@
+# ============================================================================
+# SOUK Readout Tools — stream-to-dac Configuration Template
+# ============================================================================
+# Configuration for the souk-stream-to-dac client script: live stream ->
+# IQ->x conversion -> analog DAC output. Copy this file and edit it.
+# Every experimental parameter that is not yet pinned down (TOPTICA analog
+# input range, logging rate, LabJack model, monitor/trigger lines) is a
+# config option here — see the table in doc/stream_to_dac.md.
+#
+# This file is separate from (and does not modify) the readout config schema.
+# Run:  souk-stream-to-dac --config my_stream_to_dac.yaml -a <addr> -r <port>
+# ============================================================================
+
+# --- Readout server connection ---
+# Either a path to a local readout config file, or an address/request_port
+# pair (the running config is then pulled from the remote server). The
+# -C/-a/-r command-line arguments override these.
+connection:
+  config_file: null
+  address: null
+  request_port: null
+
+# --- IQ -> x conversion ---
+# mode:
+#   magnitude     |IQ| in raw counts (zero-calibration first-light mode)
+#   phase         phase relative to a reference IQ point, in rad
+#   df_modelfree  phase / dphi_df, in Hz (needs dphi_df)
+#   df_calibrated exact Mobius conversion via a ResonatorCalibration, in Hz
+#                 (needs calibration_file; see doc/stream_to_dac.md for the
+#                 sweep -> batch_fit -> calibration-file workflow)
+#   ffm           reserved (fast-frequency-modulation demod, not implemented)
+# reference_iq: [I, Q] reference point for the phase modes; null captures
+#   the average of reference_samples stream samples at startup instead.
+# output: 'frequency' or 'dissipation' (df_calibrated only).
+conversion:
+  mode: magnitude
+  reference_iq: null
+  reference_samples: 100
+  dphi_df: null            # rad/Hz, for df_modelfree
+  calibration_file: null   # .npz from stream_dac.save_calibrations
+  output: frequency
+
+# --- Output channels ---
+# One entry per DAC channel. Select the tone by user-order index
+# (tone_index) or by frequency (tone_frequency_hz resolves to the nearest
+# active tone). The df->volts mapping per channel is
+#   volts = clip(gain * (x - x_offset) + v_offset, v_min, v_max)
+# where x is the converter output (counts / rad / Hz depending on mode).
+# Match v_min/v_max to the TOPTICA analog input range once known. With an
+# LJTick-DAC (+/-10 V) use e.g. dac_channel: TDAC0 and v_min: -10.0.
+channels:
+  - dac_channel: DAC0
+    tone_index: 0
+    tone_frequency_hz: null
+    gain: 1.0
+    x_offset: 0.0
+    v_offset: 0.0
+    v_min: 0.0
+    v_max: 5.0
+  # - dac_channel: DAC1     # optional second tone
+  #   tone_index: 1
+  #   gain: 1.0
+  #   x_offset: 0.0
+  #   v_offset: 0.0
+  #   v_min: 0.0
+  #   v_max: 5.0
+
+# --- DAC backend ---
+# backend: 'labjack' (LabJack T4/T7 via labjack-ljm) or 'dummy' (no
+# hardware; also the automatic fallback when LJM is not installed).
+# update_rate_hz: DAC updates per second. USB command-response writes cost
+#   ~1 ms each, so keep this in the low hundreds of Hz. The stream is
+#   boxcar-averaged over N = round(sample_rate / update_rate_hz) samples
+#   per update.
+# idle_voltage: safe-state voltage driven on every channel on exit/error.
+# ain_channels: analog inputs sampled once per output update and logged
+#   with host time + nearest frame tt — reserved for a future TOPTICA
+#   frequency-monitor or step-trigger line. Empty list disables.
+dac:
+  backend: dummy
+  update_rate_hz: 200.0
+  idle_voltage: 0.0
+  labjack:
+    device_type: ANY       # ANY / T4 / T7
+    connection_type: ANY   # ANY / USB / ETHERNET
+    identifier: ANY        # serial number, IP address, or ANY
+  ain_channels: []         # e.g. [AIN0]
+
+# --- Stream handling ---
+# queue_depth: reader->output queue depth in frames; bounds the worst-case
+#   staleness at queue_depth / sample_rate on top of the averaging window.
+#   null (default) uses max(8, 2 * N) where N is the boxcar length.
+# watchdog_s: exit to safe state when no frame arrives for this long.
+# apply_readout_correction: apply the same software readout-flattening
+#   factors as parse_samples(apply_readout_correction=True) so stream IQ
+#   matches the units of parsed sweep data (identity when not modulated).
+stream:
+  queue_depth: null
+  watchdog_s: 5.0
+  apply_readout_correction: true
+
+# --- Recording ---
+# The raw stream is always recorded (same file + JSON-sidecar format as
+# souk-receive-stream, readable by the existing tooling, replayable with
+# --replay). Set filename to null to disable. ain_log overrides the AIN
+# CSV path (default <directory>/<filename>.ain.csv).
+recording:
+  directory: ./tmp
+  filename: stream_to_dac
+  ain_log: null
+
+# Seconds between status lines (0 disables; --quiet also disables).
+status_interval_s: 1.0

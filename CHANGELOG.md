@@ -1,5 +1,31 @@
 # Changelog & Feature List
 
+## v1.6.5
+
+**stream-to-dac: live analog output of KID response**
+- New `souk-stream-to-dac` client script + `stream_dac` module: receives the
+  continuous TCP stream, converts a chosen tone's IQ to magnitude / phase /
+  frequency shift and drives a USB DAC (LabJack T-series via optional
+  `labjack-ljm`, or a no-hardware dummy backend) — built for recording KID
+  spectral response on an external analog logger (TOPTICA cw-THz scans).
+- Reader/output thread pair with a bounded drop-oldest queue (bounded
+  latency), boxcar averaging to the DAC update rate, watchdog + safe-state
+  idle voltage on any error/stall/exit, and drop/loop-time diagnostics.
+- Raw stream is always recorded in the `receive_stream` file + JSON-sidecar
+  format; `--replay` plays a recording back through the full pipeline at
+  true rate (end-to-end testing with zero hardware), `--mock` uses the
+  emulated readout server.
+- Stream IQ gets the same software readout-flattening factors as
+  `parse_samples(apply_readout_correction=True)` before conversion (unit
+  test asserts equality on identical raw bytes).
+- Calibrated mode uses `ResonatorCalibration.tone_converter` (exact Möbius
+  inversion); `stream_dac.calibrations_from_sweep` / `save_calibrations` /
+  `load_calibrations` give a sweep → `batch_fit` → portable `.npz`
+  calibration-file workflow.
+- New config template `template_stream_to_dac_config.yaml` (all
+  campaign-unknowns are config keys), `doc/stream_to_dac.md`, and a
+  `--selftest` DAC→AIN loopback latency check for on-hardware use.
+
 ## v1.6.4
 
 **Per-point modulation timestreams**

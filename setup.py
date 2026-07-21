@@ -85,6 +85,7 @@ if install_client:
         'souk-wideband_sweep=souk_readout_tools.client.client_scripts.wideband_sweep:main',
         'souk-batch-snapshots=souk_readout_tools.client.client_scripts.batch_snapshots:main',
         'souk-find-resonances=souk_readout_tools.client.client_scripts.find_resonances:main',
+        'souk-stream-to-dac=souk_readout_tools.client.client_scripts.stream_to_dac:main',
         'souk-mkid-finder-app=souk_readout_tools.mkid_finder_app:main'
     ])
     entry_points['gui_scripts'].extend([
