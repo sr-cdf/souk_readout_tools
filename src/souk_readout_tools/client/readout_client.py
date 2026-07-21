@@ -2471,7 +2471,8 @@ class ReadoutClient:
                           samples_per_point=None, n_settle=None, engine='fw',
                           mode='auto', compensate_rx_ticks=0, force=False,
                           autosync=False, setup_sync=True, mrst=False, setup_mrst=False,
-                          buffer_reuse_delay_accs=3, compensate_filterbank=None):
+                          buffer_reuse_delay_accs=3, compensate_filterbank=None,
+                          linewidth_hz=None):
         """
         Enable frequency modulation. ``engine`` selects the modulation engine and
         **defaults to** ``'fw'`` (firmware-slot: the mixer switches between LO
@@ -2497,6 +2498,13 @@ class ReadoutClient:
         loopback); ``True`` forces it on. The choice sticks for subsequent
         update/recenter calls until the next enable.
 
+        ``linewidth_hz`` (``engine='sw'`` only): optional per-tone resonator
+        linewidths in Hz — one entry per modulated tone (as produced by
+        :func:`souk_readout_tools.modulation.params_from_sweep`, key
+        ``'linewidth_hz'``) or per active tone. Pure metadata carried in the
+        armed config; required by the server-side tone-tracking loop
+        (:meth:`enable_tracking`) unless supplied there instead.
+
         Returns the server ack. Poll :meth:`get_modulation_state` for the unified
         state (it carries an ``engine`` field). See :meth:`_enable_sw_modulation`
         for the full software-mode detail.
@@ -2516,14 +2524,16 @@ class ReadoutClient:
                 autosync=autosync, setup_sync=setup_sync, mrst=mrst, setup_mrst=setup_mrst,
                 compensate_rx_ticks=compensate_rx_ticks,
                 buffer_reuse_delay_accs=buffer_reuse_delay_accs, force=force,
-                compensate_filterbank=compensate_filterbank)
+                compensate_filterbank=compensate_filterbank,
+                linewidth_hz=linewidth_hz)
         raise ValueError(f"engine must be 'fw' or 'sw', not {engine!r}")
 
     def _enable_sw_modulation(self, center=None, offsets=None, mod_indices=None,
                               samples_per_point=4, n_settle=1, autosync=False,
                               setup_sync=True, mrst=False, setup_mrst=False,
                               compensate_rx_ticks=0, buffer_reuse_delay_accs=3,
-                              force=False, compensate_filterbank=None):
+                              force=False, compensate_filterbank=None,
+                              linewidth_hz=None):
         """
         Arm software (ping-pong) tone-frequency modulation. This only **arms**
         (loads the config on the server); it does not start output. Call
@@ -2604,6 +2614,9 @@ class ReadoutClient:
             message['offsets'] = np.asarray(offsets, dtype=float).tolist()
         if mod_indices is not None:
             message['mod_indices'] = [int(i) for i in np.atleast_1d(mod_indices)]
+        if linewidth_hz is not None:
+            message['linewidth_hz'] = np.atleast_1d(
+                np.asarray(linewidth_hz, dtype=float)).tolist()
         response = self.send_request(message)
         self._warn_modulation_response(response)
         return response
@@ -2798,6 +2811,157 @@ class ReadoutClient:
         :func:`souk_readout_tools.modulation.group_cycles` for **either** engine.
         """
         return self.get_info('modulation')
+
+    # ----- FFM tone tracking (server-side auto-recentering) -----------------
+
+    def enable_tracking(self, linewidth_hz=None, dry_run=True,
+                        threshold_linewidths=None, confirm_windows=None,
+                        gain=None, max_step_linewidths=None, enable_mask=None,
+                        filter=None, filter_window=None, filter_tau_s=None,
+                        poll_interval_s=None, ring_depth=None,
+                        lo_auto_commit=None, lo_min_commit_interval_s=None,
+                        bin_auto_commit=None, bin_min_commit_interval_s=None,
+                        commit_threshold_count=None, commit_interval_s=None):
+        """
+        Start the server-side FFM tone-tracking loop (see doc/tone_tracking.md).
+
+        With software modulation armed (>= 3 points), the server demodulates
+        the streamed cycles, filters the per-tone detuning, and stages small
+        centre corrections. Seamless LO-word updates (``'lo'`` class) and
+        FFT-bin/map changes (``'bin'`` class) have independent commit
+        policies; every committed correction bumps the modulation revision
+        (stamped into each frame's flag5 tag) and is announced in-band as a
+        typed ``TONE_UPDATE`` stream frame. ``None`` parameters keep the
+        server defaults.
+
+        Parameters
+        ----------
+        linewidth_hz : array-like or None, optional
+            Per-tone resonator linewidths (Hz): one entry per modulated tone
+            (``params_from_sweep(...)['linewidth_hz']``) or per active tone.
+            Optional here if already supplied to :meth:`enable_modulation`;
+            tracking requires it from one of the two.
+        dry_run : bool, optional
+            Full estimate/decide/log/announce pipeline with **no** hardware
+            applies (default True). Disable once the behaviour is trusted.
+        threshold_linewidths : float, optional
+            Deadband on the *filtered* detuning (server default 0.3).
+        confirm_windows : int, optional
+            Consecutive decision windows over threshold before staging a
+            correction (server default 3).
+        gain : float, optional
+            ``new_center = center - gain * detuning_hz`` (server default 1.0).
+        max_step_linewidths : float, optional
+            Per-decision correction clamp (server default 0.5).
+        enable_mask : array-like of int or None, optional
+            Tones allowed to receive corrections (default: all modulated).
+        filter : {'boxcar', 'ewma'}, optional
+            Averaging filter on the per-cycle detunings (server default
+            'boxcar'). Boxcar of W cycles has a sinc response (first null at
+            cycle_rate/W); EWMA is a single real pole at 1/(2*pi*tau).
+        filter_window : int, optional
+            Boxcar length in cycles (server default 10).
+        filter_tau_s : float, optional
+            EWMA time constant in seconds (server default 1.0).
+        poll_interval_s : float, optional
+            Consumer-task poll period (server default 0.2 s).
+        ring_depth : int, optional
+            Producer->consumer ring depth in frames (default ~2 s of samples).
+        lo_auto_commit : bool, optional
+            Auto-commit seamless LO-word corrections (server default True).
+        lo_min_commit_interval_s : float, optional
+            Minimum interval between lo commits (server default 5 s).
+        bin_auto_commit : bool, optional
+            Auto-commit bin/map re-arms (server default **False**: staged,
+            flagged and logged, applied only on demand).
+        bin_min_commit_interval_s : float, optional
+            Minimum interval between bin commits (server default 30 s).
+        commit_threshold_count : int or None, optional
+            Commit policy: commit a class when >= M tones are staged.
+        commit_interval_s : float or None, optional
+            Commit policy: commit every T seconds if anything is staged.
+
+        Returns
+        -------
+        dict
+            Server ack; ``result`` is the initial ``get_info('tracking')``
+            payload.
+        """
+        message = {'request': 'enable_tracking', 'dry_run': bool(dry_run)}
+        if linewidth_hz is not None:
+            message['linewidth_hz'] = np.asarray(
+                linewidth_hz, dtype=float).tolist()
+        if enable_mask is not None:
+            message['enable_mask'] = [int(i) for i in np.atleast_1d(enable_mask)]
+        for key, value in (('threshold_linewidths', threshold_linewidths),
+                           ('confirm_windows', confirm_windows),
+                           ('gain', gain),
+                           ('max_step_linewidths', max_step_linewidths),
+                           ('filter', filter),
+                           ('filter_window', filter_window),
+                           ('filter_tau_s', filter_tau_s),
+                           ('poll_interval_s', poll_interval_s),
+                           ('ring_depth', ring_depth),
+                           ('lo_auto_commit', lo_auto_commit),
+                           ('lo_min_commit_interval_s', lo_min_commit_interval_s),
+                           ('bin_auto_commit', bin_auto_commit),
+                           ('bin_min_commit_interval_s', bin_min_commit_interval_s),
+                           ('commit_threshold_count', commit_threshold_count),
+                           ('commit_interval_s', commit_interval_s)):
+            if value is not None:
+                message[key] = value
+        return self.send_request(message)
+
+    def disable_tracking(self):
+        """Stop the tone-tracking loop (staged, uncommitted corrections are
+        dropped; the modulation itself is untouched)."""
+        return self.send_request({'request': 'disable_tracking'})
+
+    def hold_tracking(self):
+        """Pause tracking decisions/commits without tearing the loop down
+        (e.g. around a critical dwell). Buffered data is discarded while
+        held, so confirmation restarts on :meth:`resume_tracking`."""
+        return self.send_request({'request': 'hold_tracking'})
+
+    def resume_tracking(self):
+        """Resume a held tracking loop (see :meth:`hold_tracking`)."""
+        return self.send_request({'request': 'resume_tracking'})
+
+    def commit_tracking_updates(self, classes=None, tones=None):
+        """
+        Immediately commit staged tracking corrections (on-demand policy).
+
+        Parameters
+        ----------
+        classes : str, list of str, or None, optional
+            Restrict to ``'lo'`` (seamless LO-word updates) and/or ``'bin'``
+            (bin/map re-arms). ``None`` commits both classes.
+        tones : array-like of int or None, optional
+            Restrict to these tone indices; ``None`` commits every staged
+            tone of the selected classes.
+
+        Returns
+        -------
+        dict
+            Server ack; ``result.commits`` lists one entry per committed
+            class with the new revision and tone list (or ``dry_run: true``).
+        """
+        message = {'request': 'commit_tracking_updates'}
+        if classes is not None:
+            message['classes'] = classes
+        if tones is not None:
+            message['tones'] = [int(t) for t in np.atleast_1d(tones)]
+        return self.send_request(message)
+
+    def get_tracking_state(self):
+        """
+        Return the ``get_info('tracking')`` section: enabled/dry-run/held
+        flags (and why), the resolved parameters, recent per-tone filtered
+        detunings, the staged-pending sets per class, applied/suppressed
+        counters, back-off count and the current revision. A pure server-side
+        read, safe to poll while streaming.
+        """
+        return self.get_info('tracking')
 
     def _enable_fw_modulation(self, center=None, offsets=None, mod_indices=None,
                               n_dwell=4, n_settle=0, mode='auto', compensate_rx_ticks=0,
@@ -5183,7 +5347,8 @@ class ReadoutClient:
 
 
     def receive_stream_g3(self, num_tones=None, filename=None, print_data=False,
-                          kid_stream_id='UNSET', duration=30):
+                          kid_stream_id='UNSET', duration=30,
+                          subscribe_tone_updates=False):
         '''Receive a data stream and write it to a G3 (spt3g) file.
 
         Parameters
@@ -5198,6 +5363,12 @@ class ReadoutClient:
             Stream identifier written into the G3 metadata (default ``'UNSET'``).
         duration : float, optional
             Capture duration in seconds (default ``30``).
+        subscribe_tone_updates : bool, optional
+            Subscribe to the server's typed tone-update stream frames and
+            emit a G3 Wiring frame (like the one written at start, with the
+            update JSON in ``'status'``) whenever a ``TONE_UPDATE`` arrives
+            mid-stream, so tone provenance is recorded in-band in the G3
+            file. Default ``False`` (byte path identical to before).
         '''
         _require_g3()
         if self.mock:
@@ -5272,6 +5443,9 @@ class ReadoutClient:
 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((self.stream_server_address, self.stream_server_port))
+            if subscribe_tone_updates:
+                s.sendall(json.dumps({'subscribe': ['tone_updates']}).encode()
+                          + b'\n')
 
             with spt3g.core.G3Writer(filename=filename) as writer:
                 logger.info(f"Writing data to {filename}")
@@ -5352,11 +5526,18 @@ class ReadoutClient:
                                 size_of_this_frame = row_frame_count
                                 break
 
-                            # Read data length
+                            # Read data length. Typed frames (opt-in via
+                            # subscribe_tone_updates) put a nonzero type code
+                            # in the top byte with the length in the low 24
+                            # bits; data frames use all 32 bits (top byte
+                            # 0x00 at current sizes).
                             raw_datalen = s.recv(4)
                             if not raw_datalen:
                                 continue
                             datalen = struct.unpack('>I', raw_datalen)[0]
+                            frame_type = (datalen >> 24) & 0xFF
+                            if frame_type:
+                                datalen &= 0xFFFFFF
                             if datalen == 0:
                                 continue
                             if datalen > len(data):
@@ -5373,6 +5554,30 @@ class ReadoutClient:
                                 print(f"Expected {datalen} bytes, but only received {received_len} bytes.")
                                 size_of_this_frame = row_frame_count
                                 break
+
+                            if frame_type:
+                                # Typed JSON frame (SNAPSHOT / TONE_UPDATE):
+                                # record it as a Wiring frame, consistent
+                                # with the one written at start, so tone
+                                # provenance lives in-band in the G3 file.
+                                try:
+                                    update_payload = json.loads(
+                                        bytes(data[:datalen]).decode())
+                                except Exception as e:
+                                    logger.error(f"Undecodable typed frame: {e}")
+                                    continue
+                                logger.info(f"Tone update frame: {update_payload}")
+                                fr = spt3g.core.G3Frame(spt3g.core.G3FrameType.Wiring)
+                                fr['frame_num'] = frame_count
+                                fr['session_id'] = session_id
+                                fr['sostream_id'] = kid_stream_id
+                                fr['sostream_version'] = SOSTREAM_VERSION
+                                fr['time'] = spt3g.core.G3Time(
+                                    time.time() * spt3g.core.G3Units.s)
+                                fr['status'] = json.dumps(update_payload).encode()
+                                writer(fr)
+                                frame_count += 1
+                                continue
 
                             #############################################
                             # JL Pickout out data from the bufferm contruct a 1-D "row" transfomar into a column vector

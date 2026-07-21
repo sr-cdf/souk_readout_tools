@@ -94,10 +94,14 @@ dac:
 # apply_readout_correction: apply the same software readout-flattening
 #   factors as parse_samples(apply_readout_correction=True) so stream IQ
 #   matches the units of parsed sweep data (identity when not modulated).
+# subscribe_updates: opt in to the server's typed tone-update frames and
+#   log them to <recording>.updates.jsonl (tone provenance; needs a server
+#   with typed-frame support, see doc/tone_tracking.md).
 stream:
   queue_depth: null
   watchdog_s: 5.0
   apply_readout_correction: true
+  subscribe_updates: false
 
 # --- Recording ---
 # The raw stream is always recorded (same file + JSON-sidecar format as

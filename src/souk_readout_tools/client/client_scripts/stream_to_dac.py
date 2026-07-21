@@ -39,7 +39,8 @@ DEFAULT_CONFIG = {
     'dac': {'backend': 'dummy', 'update_rate_hz': 200.0, 'idle_voltage': 0.0,
             'labjack': {}, 'ain_channels': []},
     'stream': {'queue_depth': None, 'watchdog_s': 5.0,
-               'apply_readout_correction': True},
+               'apply_readout_correction': True,
+               'subscribe_updates': False},
     'recording': {'directory': './tmp', 'filename': 'stream_to_dac',
                   'ain_log': None},
     'status_interval_s': 1.0,
@@ -204,8 +205,10 @@ def main():
         sample_rate = client.get_sample_rate()
         tone_indices = info.get('tones', {}).get('firmware_indices')
         num_tones = len(tone_indices) if tone_indices is not None else 2048
-        source = stream_dac.SocketFrameSource(client.stream_server_address,
-                                              client.stream_server_port)
+        source = stream_dac.SocketFrameSource(
+            client.stream_server_address, client.stream_server_port,
+            subscribe_updates=config['stream'].get('subscribe_updates',
+                                                   False))
 
     # --- output channels ------------------------------------------------
     mode = config['conversion']['mode']

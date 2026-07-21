@@ -43,6 +43,7 @@ import base64
 from importlib.resources import files as importlib_files
 from souk_readout_tools.config_utils import copy_template_config
 from souk_readout_tools.timing import get_timing_summary, get_timing_status, report_sync_readiness, unix_to_iso, format_duration_s, DEFAULT_ALIGN_TOL_S
+from souk_readout_tools.server import tracking as tone_tracking
 import argparse
 
 import time
@@ -955,6 +956,11 @@ class ReadoutServer:
         self._mod_dwell_tag = -1                        # last slot seen by prepare_frame
         self._mod_dwell_pos = 0                          # accumulations into the current dwell
 
+        #FFM tone tracking (doc/tone_tracking.md): off by default -- zero
+        # behavioural change while None. The TrackingRuntime owns the ring
+        # buffer + consumer task; stream_data's hot path only calls tap().
+        self.tracking = None
+
         #firmware interface attributes
         self.r = None
         self.r_fast = None
@@ -1283,6 +1289,11 @@ class ReadoutServer:
         self._fw_modulation_revision_history = {}       # revision -> {center, slot_offsets, mod_indices, n_dwell, n_settle, mode, ts}
         self._mod_dwell_tag = -1                        # last slot seen by prepare_frame
         self._mod_dwell_pos = 0                          # accumulations into the current dwell
+
+        #FFM tone tracking (doc/tone_tracking.md): off by default -- zero
+        # behavioural change while None. The TrackingRuntime owns the ring
+        # buffer + consumer task; stream_data's hot path only calls tap().
+        self.tracking = None
 
         #firmware interface attributes
         self.r = None
@@ -1746,7 +1757,7 @@ class ReadoutServer:
     ]
     ALL_INFO_SECTIONS = DEFAULT_INFO_SECTIONS + [
         'diagnostics', 'config', 'calibrations', 'resonators', 'registers',
-        'modulation',
+        'modulation', 'tracking',
     ]
 
     # Sections that only read PS-side state (clock chips over I2C/SPI, sysmon,
@@ -1791,6 +1802,7 @@ class ReadoutServer:
             'resonators':   self._info_resonators,
             'registers':    self._info_registers,
             'modulation': self._info_modulation,
+            'tracking': self._info_tracking,
         }
         if sections == 'list':
             # Catalogue of available sections (derived from what's actually
@@ -3148,6 +3160,13 @@ class ReadoutServer:
                             buffer_reuse_delay_accs=buffer_reuse_delay_accs,
                             compensate_filterbank=compensate_filterbank)
                         self._check_modulation_command_epoch(epoch)
+                        # Optional per-tone linewidths (params_from_sweep's
+                        # linewidth_hz): pure metadata carried in the cfg for
+                        # the tracking loop; no hardware effect.
+                        requested_linewidth = message.get('linewidth_hz')
+                        if requested_linewidth is None and self.modulation_cfg is not None:
+                            requested_linewidth = self.modulation_cfg.get('linewidth_hz')
+                        cfg['linewidth_hz'] = requested_linewidth
                         if bundle['needs_recenter'] and not force:
                             raise ValueError(
                                 'modulation offsets push at least one tone beyond fixed-bin coverage; '
@@ -3243,6 +3262,7 @@ class ReadoutServer:
                                 op = 'recenter'
                             else:
                                 op = 'update'
+                            cfg['linewidth_hz'] = c.get('linewidth_hz')
                             rev = self._next_modulation_revision(cfg)
                             state['enabled'] = True
                             state['desired_revision'] = rev
@@ -3296,6 +3316,7 @@ class ReadoutServer:
                             buffer_reuse_delay_accs=buffer_reuse_delay_accs,
                             compensate_filterbank=c.get('compensate_filterbank'))
                         self._check_modulation_command_epoch(epoch)
+                        cfg['linewidth_hz'] = c.get('linewidth_hz')
                         rev = self._next_modulation_revision(cfg)
                         state['enabled'] = True
                         state['desired_revision'] = rev
@@ -3602,6 +3623,82 @@ class ReadoutServer:
                             self.fw_modulation_state['revision_history'] = {}
                         await self.send_response(writer, {'status': 'success',
                             'result': {'purged': purged, 'revision': 0}})
+
+                elif request == 'enable_tracking':
+                    # Start (or reconfigure) the FFM tone-tracking loop.
+                    # Requires software modulation armed with >= 3 points and
+                    # per-tone linewidths (here or at enable_modulation).
+                    # dry_run defaults to True: full estimate/decide/log/
+                    # announce pipeline, no hardware applies.
+                    try:
+                        if self.e_fw_modulation_enabled.is_set():
+                            raise ValueError(
+                                'tracking works on software modulation; '
+                                'firmware-slot modulation is active')
+                        params = dict(self.TRACKING_DEFAULTS)
+                        for key in params:
+                            if key in message:
+                                params[key] = message[key]
+                        unknown = (set(message) - set(params)
+                                   - {'request'})
+                        if unknown:
+                            raise ValueError(
+                                f'unknown tracking parameter(s) {sorted(unknown)}')
+                        if self.tracking is not None:
+                            self.tracking.stop()
+                            self.tracking = None
+                        runtime = tone_tracking.TrackingRuntime(self, params)
+                        runtime.start()
+                        self.tracking = runtime
+                        await self.send_response(writer, {'status': 'success',
+                            'result': runtime.status()})
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'disable_tracking':
+                    if self.tracking is not None:
+                        self.tracking.stop()
+                        self.tracking = None
+                    await self.send_response(writer, {'status': 'success'})
+
+                elif request == 'hold_tracking':
+                    if self.tracking is None:
+                        await self.send_response(writer, {'status': 'error',
+                            'message': 'tracking is not enabled'})
+                    else:
+                        self.tracking.held = True
+                        await self.send_response(writer, {'status': 'success'})
+
+                elif request == 'resume_tracking':
+                    if self.tracking is None:
+                        await self.send_response(writer, {'status': 'error',
+                            'message': 'tracking is not enabled'})
+                    else:
+                        self.tracking.held = False
+                        await self.send_response(writer, {'status': 'success'})
+
+                elif request == 'commit_tracking_updates':
+                    # Immediate on-demand commit of the staged corrections,
+                    # optionally filtered by class ('lo'/'bin') and/or tones.
+                    try:
+                        if self.tracking is None:
+                            raise ValueError('tracking is not enabled')
+                        classes = message.get('classes')
+                        if classes is None:
+                            classes = list(tone_tracking.UPDATE_CLASSES)
+                        elif isinstance(classes, str):
+                            classes = [classes]
+                        tones = message.get('tones')
+                        if tones is not None:
+                            tones = [int(t) for t in tones]
+                        results = await self.tracking.commit(
+                            classes=classes, tones=tones)
+                        await self.send_response(writer, {'status': 'success',
+                            'result': {'commits': results}})
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
 
                 elif request == 'enable_triggered_stream':
                     self.e_stream_enabled.clear()
@@ -4191,23 +4288,167 @@ class ReadoutServer:
         Data streams will be sent to all connected stream clients.
         Simply keep the stream alive by sending zero length frames every second.
         Clients should receive that the length is zero and not try to unpack the frame.
+
+        Typed-frame opt-in: a client may send one JSON line (e.g.
+        ``{"subscribe": ["tone_updates"]}\\n``) at any time after connecting to
+        receive typed frames (SNAPSHOT immediately, then TONE_UPDATE on every
+        modulation revision change) interleaved with the data stream. Typed
+        frames put a nonzero type code in the top byte of the 4-byte length
+        prefix (data frames are far below 16 MB, so that byte is always 0x00
+        for them). Clients that send nothing get a byte-identical legacy
+        stream. See doc/tone_tracking.md.
         """
         addr = writer.get_extra_info('peername')
         print(f"Stream client connected: {addr}")
         sock = writer.get_extra_info('socket')
         self.stream_keepalive(sock) # Enable TCP keepalive so we can detect when the client disconnects
         writer.addr = addr
+        writer.typed_updates = False
         self.stream_clients.append(writer)
 
+        reader_eof = False
         while writer in self.stream_clients:
             try:
                 writer.write(b'\x00\x00\x00\x00')
                 await writer.drain()
-                await asyncio.sleep(1)
+                if reader_eof:
+                    await asyncio.sleep(1)
+                    continue
+                # The 1 s wait doubles as the keepalive pacing and the poll
+                # for an optional subscribe line (legacy clients never write).
+                try:
+                    line = await asyncio.wait_for(reader.readline(), timeout=1)
+                except asyncio.TimeoutError:
+                    continue
+                if not line:
+                    reader_eof = True
+                    continue
+                self._handle_stream_subscribe(writer, line)
             except ConnectionResetError:
                 print(f"Stream client disconnected: {addr} (ConnectionResetError)")
                 self.stream_clients.remove(writer)
                 break
+
+    def _handle_stream_subscribe(self, writer, line):
+        """Parse a stream client's JSON subscribe line and mark the writer.
+
+        On a valid subscription the writer is flagged update-capable and a
+        SNAPSHOT typed frame (current revision, modulation table, tracking
+        status) is sent immediately so late joiners synchronise without a
+        request-port round trip. Malformed lines are logged and ignored.
+        """
+        try:
+            message = json.loads(line.decode())
+        except Exception:
+            print(f"stream client {getattr(writer, 'addr', '?')} sent an "
+                  "unparseable line; ignoring")
+            return
+        wants = message.get('subscribe')
+        if isinstance(wants, list):
+            subscribed = 'tone_updates' in wants
+        else:
+            subscribed = bool(wants)
+        if subscribed and not writer.typed_updates:
+            writer.typed_updates = True
+            print(f"stream client {getattr(writer, 'addr', '?')} subscribed "
+                  "to typed tone-update frames")
+            try:
+                writer.write(tone_tracking.pack_typed_frame(
+                    tone_tracking.FRAME_TYPE_SNAPSHOT,
+                    self._tone_update_snapshot()))
+            except Exception as e:
+                print(f"Error sending SNAPSHOT frame: {e}")
+
+    def _tone_update_snapshot(self):
+        """Build the SNAPSHOT payload sent to a newly subscribed client."""
+        payload = {'type': 'SNAPSHOT', 'ts': time.time()}
+        state = self.modulation_state
+        cfg = self.modulation_cfg
+        if state is not None and cfg is not None:
+            center = np.asarray(cfg['center'], dtype=float)
+            mod_indices = [int(i) for i in state.get('mod_indices', [])]
+            payload['revision'] = int(state.get('applied_revision', 0))
+            payload['modulation'] = {
+                'enabled': self.e_modulation_enabled.is_set(),
+                'engine': 'sw',
+                'num_points': state.get('num_points'),
+                'samples_per_point': state.get('samples_per_point'),
+                'n_settle': state.get('n_settle'),
+                'mod_indices': mod_indices,
+                'centers_hz': {str(i): float(center[i]) for i in mod_indices
+                               if i < len(center)},
+                'offsets_hz': np.asarray(cfg['offsets'],
+                                         dtype=float).tolist(),
+            }
+        else:
+            payload['revision'] = 0
+            payload['modulation'] = None
+        payload['tracking'] = (self.tracking.status() if self.tracking
+                               else {'enabled': False})
+        return payload
+
+    def _write_typed_update_frame(self, frame_bytes):
+        """Send one typed frame to every update-subscribed stream client.
+
+        Unsubscribed (legacy) clients never receive typed frames, so their
+        byte stream is unchanged.
+        """
+        for client in list(self.stream_clients):
+            if not getattr(client, 'typed_updates', False):
+                continue
+            try:
+                client.write(frame_bytes)
+            except Exception as e:
+                print(f"Error sending typed frame to client: {e}")
+                self.stream_clients.remove(client)
+
+    def _announce_tone_update(self, op, cmd=None, previous_center=None):
+        """Emit a TONE_UPDATE typed frame for a modulation revision change.
+
+        Called from :meth:`_apply_pending_modulation_command` -- the single
+        place revisions land -- so **every** revision change is announced
+        regardless of origin (client command or tracking). ``kind`` is
+        ``'lo'`` for the seamless in-place update path (LO/mixer words only)
+        and ``'bin'`` for FFT-bin / channel-map changes (enable/recenter),
+        which disturb the stream briefly (``expected_transient_cycles``).
+        """
+        try:
+            if not any(getattr(c, 'typed_updates', False)
+                       for c in self.stream_clients):
+                return
+            payload = {'type': 'TONE_UPDATE', 'ts': time.time(), 'op': op}
+            if cmd is not None:
+                cfg = cmd['cfg']
+                state = cmd['state']
+                center = np.asarray(cfg['center'], dtype=float)
+                mod_indices = [int(i) for i in cfg['mod_indices']]
+                kind = 'lo' if op == 'update' else 'bin'
+                changed = mod_indices
+                if previous_center is not None and \
+                        len(previous_center) == len(center):
+                    previous_center = np.asarray(previous_center, dtype=float)
+                    changed = [i for i in mod_indices
+                               if center[i] != previous_center[i]]
+                payload.update({
+                    'revision': int(cmd['revision']),
+                    'kind': kind,
+                    'source': cmd.get('source', 'client'),
+                    'mod_indices': mod_indices,
+                    'centers_hz': {str(i): float(center[i]) for i in changed},
+                    'warnings': list(state.get('warnings', [])),
+                })
+                if kind == 'bin':
+                    # Bin/map re-arms disturb the stream briefly; consumers
+                    # should mask about one modulation cycle after the
+                    # revision edge (plus the usual settling flags).
+                    payload['expected_transient_cycles'] = 1
+                if 'announce' in cmd:
+                    payload.update(cmd['announce'])
+            self._write_typed_update_frame(tone_tracking.pack_typed_frame(
+                tone_tracking.FRAME_TYPE_TONE_UPDATE, payload))
+        except Exception as e:
+            print(f"Error announcing tone update: {e}")
+            print(traceback.format_exc())
 
 
     async def send_response(self, writer, response):
@@ -5324,6 +5565,110 @@ class ReadoutServer:
         if epoch != self._modulation_command_epoch:
             raise RuntimeError('modulation command superseded by a newer request')
 
+    # ----- FFM tone tracking (doc/tone_tracking.md) --------------------------
+
+    TRACKING_DEFAULTS = {
+        'linewidth_hz': None,             # falls back to enable_modulation's
+        'threshold_linewidths': 0.3,      # deadband on the FILTERED detuning
+        'confirm_windows': 3,             # consecutive windows over threshold
+        'gain': 1.0,                      # new_center = center - gain*detuning
+        'max_step_linewidths': 0.5,       # per-decision step clamp
+        'enable_mask': None,              # tones allowed corrections (None=all)
+        'filter': 'boxcar',               # 'boxcar' | 'ewma'
+        'filter_window': 10,              # boxcar length (cycles)
+        'filter_tau_s': 1.0,              # EWMA time constant (s)
+        'poll_interval_s': 0.2,           # consumer-task poll period
+        'ring_depth': None,               # tap ring frames (None ~ 2 s)
+        'dry_run': True,                  # estimate/decide/announce, no apply
+        'lo_auto_commit': True,           # seamless LO-word updates
+        'lo_min_commit_interval_s': 5.0,
+        'bin_auto_commit': False,         # bin/map re-arms: staged, on demand
+        'bin_min_commit_interval_s': 30.0,
+        'commit_threshold_count': None,   # commit when >= M tones staged
+        'commit_interval_s': None,        # commit every T s if staged
+    }
+
+    async def _commit_tracking_update(self, klass, corrections,
+                                      staged_detunings):
+        """Apply one class's staged tracking corrections.
+
+        Follows exactly the ownership discipline of a client
+        ``update_modulation``/``recenter_modulation``: epoch,
+        ``to_thread(_prepare_modulation, ...)`` (pure computation, hardware
+        reads only), epoch check, then a queued ``_pending_modulation`` the
+        frame producer applies at a cycle boundary. For ``'lo'`` the prepared
+        bundle rides the existing armed maps (seamless ``install_bundle``
+        swap: staging happened in the executor, the commit moment is just
+        the scheduler picking up the new words); ``'bin'`` re-arms fresh
+        maps (recenter path). If a ``'lo'`` commit turns out to need a
+        recenter after all, nothing is applied and the tones are handed back
+        for reclassification.
+        """
+        c = self.modulation_cfg
+        if c is None or self.modulation_params is None:
+            raise RuntimeError('modulation not armed')
+        center = np.asarray(c['center'], dtype=float).copy()
+        for tone, new_center in corrections.items():
+            center[int(tone)] = float(new_center)
+        armed = self.modulation_params['armed'] if klass == 'lo' else None
+        epoch = self._next_modulation_command_epoch()
+        bundle, state, cfg = await self.to_thread(
+            self._prepare_modulation, center, c['offsets'], c['mod_indices'],
+            c['samples_per_point'], c['n_settle'],
+            armed=armed,
+            autosync=c.get('autosync', False),
+            setup_sync=c.get('setup_sync', True),
+            mrst=c.get('mrst', False),
+            setup_mrst=c.get('setup_mrst', False),
+            compensate_rx_ticks=c.get('compensate_rx_ticks', 0),
+            buffer_reuse_delay_accs=c.get('buffer_reuse_delay_accs', 3),
+            compensate_filterbank=c.get('compensate_filterbank'))
+        self._check_modulation_command_epoch(epoch)
+        if klass == 'lo' and bundle['needs_recenter']:
+            # Classification miss: this shift needs a bin/map change.
+            return {'class': 'lo', 'reclassified_to_bin': corrections}
+        cfg['linewidth_hz'] = c.get('linewidth_hz')
+        rev = self._next_modulation_revision(cfg)
+        state['enabled'] = True
+        state['desired_revision'] = rev
+        state['revision_history'] = dict(self._modulation_revision_history)
+        op = 'update' if klass == 'lo' else 'recenter'
+        self._pending_modulation = {
+            'op': op, 'bundle': bundle, 'state': state, 'cfg': cfg,
+            'revision': rev, 'source': 'tracking',
+            'announce': {
+                'tracking_class': klass,
+                'triggering_detunings_linewidths': {
+                    str(t): staged_detunings.get(int(t))
+                    for t in corrections},
+            }}
+        return {'class': klass, 'revision': rev,
+                'tones': sorted(int(t) for t in corrections)}
+
+    def _announce_tracking_dry_run(self, klass, corrections, controller):
+        """Announce a dry-run tracking decision in-band (nothing applied)."""
+        try:
+            payload = {
+                'type': 'TONE_UPDATE', 'ts': time.time(),
+                'op': 'tracking_dry_run', 'kind': klass, 'source': 'tracking',
+                'dry_run': True,
+                'centers_hz': {str(t): float(v)
+                               for t, v in corrections.items()},
+                'triggering_detunings_linewidths': {
+                    str(t): controller.staged_detunings.get(int(t))
+                    for t in corrections},
+            }
+            self._write_typed_update_frame(tone_tracking.pack_typed_frame(
+                tone_tracking.FRAME_TYPE_TONE_UPDATE, payload))
+        except Exception as e:
+            print(f"Error announcing tracking dry run: {e}")
+
+    def _info_tracking(self):
+        """Return the ``get_info('tracking')`` payload (pure read)."""
+        if self.tracking is None:
+            return {'enabled': False}
+        return self.tracking.status()
+
     # ----- firmware-slot frequency modulation (v7.11) -----------------------
     # The slot analog of the software-modulation engine above. Software
     # modulation steps one comb across N points from software, swapping the two
@@ -5723,6 +6068,9 @@ class ReadoutServer:
             return
         self._pending_modulation = None
         op = cmd['op']
+        previous_center = (None if self.modulation_cfg is None
+                           else np.asarray(self.modulation_cfg['center'],
+                                           dtype=float))
         try:
             if op in ('disable', 'rest'):
                 if op == 'disable':
@@ -5748,6 +6096,9 @@ class ReadoutServer:
                 if self.modulation_state is not None:
                     self.modulation_state['enabled'] = self.e_modulation_enabled.is_set()
                 self._modulation_owner = None
+                # Announce the state change in-band (no revision bump for
+                # disable/rest, but subscribed clients still learn of it).
+                self._announce_tone_update(op)
                 return
 
             self.modulation_params = cmd['bundle']
@@ -5786,6 +6137,9 @@ class ReadoutServer:
             self._mod_dwell_pos = 0
             # Record which revision actually landed (vs the desired one in state).
             self.modulation_state['applied_revision'] = cmd['revision']
+            # Announce every applied revision in-band (client or tracking
+            # origin alike) -- this is the single place revisions land.
+            self._announce_tone_update(op, cmd, previous_center)
         except Exception as e:
             print(f"Error applying modulation command ({op}): {e}")
             print(traceback.format_exc())
@@ -5832,6 +6186,11 @@ class ReadoutServer:
                                 fast_read_params, sw_buf_point_map=sched._buf_holds,
                                 sw_n_settle=sched.n_settle, revision=sched.revision)
                             self._write_to_stream_clients(payload)
+                            if self.tracking is not None and self.tracking.enabled:
+                                # Tone-tracking tap: O(1) append of the
+                                # already-built payload; all estimation runs
+                                # in the tracking consumer task.
+                                self.tracking.tap(payload)
                             sched.after_sample()
                         sched.advance()
                         await asyncio.sleep(0)  # stay responsive to new commands

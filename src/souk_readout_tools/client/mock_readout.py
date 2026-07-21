@@ -53,7 +53,7 @@ class MockReadoutServer:
     ]
     ALL_INFO_SECTIONS = DEFAULT_INFO_SECTIONS + [
         'diagnostics', 'config', 'calibrations', 'resonators', 'registers',
-        'modulation',
+        'modulation', 'tracking',
     ]
 
     @staticmethod
@@ -96,6 +96,7 @@ class MockReadoutServer:
         self._mod_linewidth = 1.0e5     # mock resonator FWHM (Hz)
         self._mod_bin_hz = 1.0e6        # mock filterbank channel spacing (Hz)
         self._mod_armed_bin_center = None   # per-tone armed bin centre (Hz), fixed until recenter
+        self._tracking = None           # status-level mock of the tracking loop
         # firmware-slot modulation (mock): _fw_mod is the loaded config (or None),
         # _fw_mod_enabled the on/off switch, _fw_mod_slot the live slot in manual
         # mode. Frames are tagged with slot+1 in the same flag5 field as software
@@ -389,6 +390,7 @@ class MockReadoutServer:
             'resonators': self._info_resonators,
             'registers': self._info_registers,
             'modulation': self._info_modulation,
+            'tracking': self._info_tracking,
         }
         if sections == 'list':
             return {
@@ -1229,6 +1231,12 @@ class MockReadoutServer:
         state['engine'] = engine
         return state
 
+    def _info_tracking(self):
+        """Mock ``get_info('tracking')`` payload (status-level)."""
+        if self._tracking is None:
+            return {'enabled': False}
+        return dict(self._tracking)
+
     def stream_frame(self, num_tones=None):
         """Build one modern stream packet: IQ words plus six flags, TT, cnt, err.
 
@@ -1893,6 +1901,7 @@ class MockReadoutServer:
                 autosync = bool(message.get('autosync', False))
                 mrst = bool(message.get('mrst', False))
                 force = bool(message.get('force', False))
+                linewidth_hz = message.get('linewidth_hz')
                 if message.get('offsets') is None:
                     raise ValueError('offsets required to arm modulation')
                 old_mod = copy.deepcopy(self._mod)
@@ -1917,6 +1926,11 @@ class MockReadoutServer:
                         'arm anyway (those tones will wrap to the other end of the bin)')
                 self._mod_enabled = True
                 state['enabled'] = True
+                if linewidth_hz is not None:
+                    # Pure metadata for the tracking loop (params_from_sweep's
+                    # per-modulated-tone linewidths), as on the real server.
+                    self._mod['linewidth_hz'] = list(
+                        np.atleast_1d(np.asarray(linewidth_hz, dtype=float)))
                 return {'status': 'success',
                         'warnings': list(state.get('warnings', [])),
                         'result': {
@@ -2002,6 +2016,61 @@ class MockReadoutServer:
             if self._mod is not None:
                 self._mod['state']['enabled'] = False
             return {'status': 'success'}
+
+        # ----- FFM tone tracking (status-level mock) ----------------------
+        # The real tracking loop lives in the server; the mock keeps enough
+        # state (params, held/dry_run flags, empty staged sets) for client
+        # code paths and get_info('tracking') to be exercised end-to-end.
+        if request == 'enable_tracking':
+            if self._mod is None:
+                return {'status': 'error',
+                        'message': 'modulation must be armed (enable_modulation) '
+                                   'before enable_tracking'}
+            if int(self._mod['n_points']) < 3:
+                return {'status': 'error',
+                        'message': 'tracking needs >= 3 modulation points'}
+            linewidth = message.get('linewidth_hz',
+                                    self._mod.get('linewidth_hz'))
+            if linewidth is None:
+                return {'status': 'error',
+                        'message': 'tracking requires per-tone linewidth_hz'}
+            params = {k: v for k, v in message.items() if k != 'request'}
+            self._tracking = {
+                'enabled': True,
+                'dry_run': bool(message.get('dry_run', True)),
+                'held': False,
+                'hold_reason': None,
+                'params': params,
+                'cycles_seen': 0,
+                'filtered_detuning_linewidths': {},
+                'controller': {'staged': {'lo': {}, 'bin': {}},
+                               'staged_counts': {'lo': 0, 'bin': 0}},
+                'commits': {'lo': 0, 'bin': 0},
+                'backoffs': 0,
+                'applied_revision': self._mod['revision'],
+            }
+            return {'status': 'success', 'result': dict(self._tracking)}
+
+        if request == 'disable_tracking':
+            self._tracking = None
+            return {'status': 'success'}
+
+        if request == 'hold_tracking':
+            if self._tracking is None:
+                return {'status': 'error', 'message': 'tracking is not enabled'}
+            self._tracking['held'] = True
+            return {'status': 'success'}
+
+        if request == 'resume_tracking':
+            if self._tracking is None:
+                return {'status': 'error', 'message': 'tracking is not enabled'}
+            self._tracking['held'] = False
+            return {'status': 'success'}
+
+        if request == 'commit_tracking_updates':
+            if self._tracking is None:
+                return {'status': 'error', 'message': 'tracking is not enabled'}
+            return {'status': 'success', 'result': {'commits': []}}
 
         if request == 'enable_fw_modulation':
             try:

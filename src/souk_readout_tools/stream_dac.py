@@ -187,25 +187,42 @@ class SocketFrameSource:
     timeout : float, optional
         Socket receive timeout in seconds; :meth:`read` returns ``None``
         when nothing arrives within it so the caller can poll for shutdown.
+    subscribe_updates : bool, optional
+        Opt in to the server's typed frames (default False): on connect a
+        one-line JSON subscribe message is sent, and the server then
+        interleaves SNAPSHOT / TONE_UPDATE JSON frames (nonzero type in the
+        length-prefix top byte) with the data stream. Decoded typed frames
+        are appended to :attr:`typed_frames` for the consumer to drain
+        (e.g. :class:`StreamToDac` logs them to a JSONL sidecar). Legacy
+        servers simply never send any, so this is safe to enable against
+        either.
     """
 
-    def __init__(self, address, port, timeout=0.5):
+    def __init__(self, address, port, timeout=0.5, subscribe_updates=False):
         self.address = address
         self.port = int(port)
         self.timeout = float(timeout)
+        self.subscribe_updates = bool(subscribe_updates)
+        self.typed_frames = deque()   # decoded (type, dict) typed frames
         self._sock = None
         self._assembler = FrameAssembler()
         self._pending = deque()
 
     def open(self):
-        """Connect to the stream server."""
+        """Connect to the stream server (and subscribe, if requested)."""
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock.settimeout(self.timeout)
         self._sock.connect((self.address, self.port))
+        if self.subscribe_updates:
+            self._sock.sendall(
+                json.dumps({'subscribe': ['tone_updates']}).encode() + b'\n')
 
     def read(self):
         """Return the next data-frame payload, or ``None`` on timeout.
+
+        Typed frames encountered along the way are decoded and queued on
+        :attr:`typed_frames` rather than returned.
 
         Raises
         ------
@@ -222,6 +239,13 @@ class SocketFrameSource:
             for frame_type, payload in self._assembler.feed(chunk):
                 if frame_type == FRAME_TYPE_DATA:
                     self._pending.append(payload)
+                else:
+                    try:
+                        self.typed_frames.append(
+                            (frame_type, json.loads(payload.decode())))
+                    except Exception as exc:
+                        print(f'WARNING: undecodable typed frame '
+                              f'(type {frame_type}): {exc}')
         return self._pending.popleft()
 
     def close(self):
@@ -863,9 +887,31 @@ class StreamToDac:
         with open(self.recording_path + '.json', 'w') as f:
             json.dump(metadata, f, indent=4)
 
+    def _drain_typed_frames(self, updates_log):
+        """Write any typed frames the source has decoded to the JSONL log."""
+        typed = getattr(self.source, 'typed_frames', None)
+        if not typed:
+            return
+        while True:
+            try:
+                frame_type, payload = typed.popleft()
+            except IndexError:
+                break
+            record = {'host_time_unix': time.time(),
+                      'frame_type': frame_type, 'payload': payload}
+            if updates_log is not None:
+                updates_log.write(json.dumps(record) + '\n')
+                updates_log.flush()
+            else:
+                kind = payload.get('type', f'type{frame_type}')
+                print(f'\nstream update frame: {kind} '
+                      f'revision={payload.get("revision")} '
+                      f'op={payload.get("op")}')
+
     def _reader(self):
         """Reader thread: source -> disk + bounded queue."""
         recording = None
+        updates_log = None
         try:
             if self.recording_path is not None:
                 directory = os.path.dirname(os.path.abspath(
@@ -874,8 +920,14 @@ class StreamToDac:
                 self._write_sidecar()
                 recording = open(self.recording_path, 'wb')
                 print(f'Recording raw stream to {self.recording_path}')
+                if getattr(self.source, 'subscribe_updates', False):
+                    updates_log = open(
+                        self.recording_path + '.updates.jsonl', 'w')
+                    print('Logging tone-update frames to '
+                          f'{self.recording_path}.updates.jsonl')
             while not self._stop.is_set():
                 payload = self.source.read()
+                self._drain_typed_frames(updates_log)
                 if payload is None:
                     continue
                 if recording is not None:
@@ -899,6 +951,8 @@ class StreamToDac:
         finally:
             if recording is not None:
                 recording.close()
+            if updates_log is not None:
+                updates_log.close()
 
     # -- output thread ------------------------------------------------------
 
