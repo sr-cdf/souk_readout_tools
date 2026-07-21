@@ -1895,6 +1895,20 @@ class ReadoutServer:
             except Exception:
                 pass
 
+        # Tone-tracking health (compact summary; full detail via
+        # get_info('tracking')).
+        tracking_summary = None
+        resonators_tracking = False
+        max_detuning_hz = None
+        if self.tracking is not None:
+            try:
+                tracking_summary = self.tracking.summary()
+                resonators_tracking = bool(tracking_summary['enabled']
+                                           and not tracking_summary['dry_run'])
+                max_detuning_hz = tracking_summary['max_abs_detuning_hz']
+            except Exception:
+                pass
+
         clock_fault = getattr(self, '_clock_fault', None)
         return {
             'initialisation_level': init_level,
@@ -1919,8 +1933,9 @@ class ReadoutServer:
                               and self.lna_controller.is_hardware),
             'tone_count': tone_count,
             'client_count': len(self.request_clients),
-            'resonators_tracking': False,  # placeholder until tracking module
-            'max_detuning_hz': None,       # placeholder
+            'resonators_tracking': resonators_tracking,
+            'max_detuning_hz': max_detuning_hz,
+            'tracking': tracking_summary,
         }
 
     # -- Section helpers for get_info --
@@ -5630,6 +5645,14 @@ class ReadoutServer:
         'bin_min_commit_interval_s': 30.0,
         'commit_threshold_count': None,   # commit when >= M tones staged
         'commit_interval_s': None,        # commit every T s if staged
+        # Lost-resonance (lock-health) detection: a far-off-resonance tone
+        # reads a SMALL detuning (the model-free estimate compresses), so
+        # 'unlocked' is called on the phase slope collapsing below this
+        # fraction of its settled baseline and/or on the fraction of
+        # invalid (NaN) cycles. The reading-based trip is off by default.
+        'unlock_slope_ratio': 0.25,
+        'unlock_invalid_fraction': 0.5,
+        'unlock_detuning_linewidths': None,
     }
 
     async def _commit_tracking_update(self, engine, klass, corrections,

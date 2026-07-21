@@ -316,12 +316,65 @@ If a residual effect matters, compute it from the logged step times/sizes
 | `bin_min_commit_interval_s` | 30 | floor between bin commits |
 | `commit_threshold_count` | off | commit a class when ≥ M tones staged |
 | `commit_interval_s` | off | commit every T s if anything staged |
+| `unlock_slope_ratio` | 0.25 | `unlocked` when phase slope drops below this fraction of its settled baseline |
+| `unlock_invalid_fraction` | 0.5 | `unlocked` when this fraction of recent cycles are unusable |
+| `unlock_detuning_linewidths` | off | also `unlocked` when the reading exceeds this (usually left off — see below) |
 
 Commit policies combine — first to fire wins, gated by the per-class
 minimum interval; with neither optional policy set, a class commits as soon
 as its minimum interval allows. Decisions accumulate into the staged sets
 between commits; **one commit = one revision** covering every tone changed
 in it.
+
+## Health monitoring
+
+Telescope-control health polling reads tracking state two ways, both
+covered by the standard `get_info` / `health_check` tooling:
+
+- **`health_check()`** carries a compact `tracking` block (the
+  `summary()` below), plus `resonators_tracking` (true only when tracking
+  is enabled and actually applying — not dry-run) and `max_detuning_hz`.
+  This is the lean, poll-often path.
+- **`get_info('tracking')`** returns `{summary, tones, controller, …}` —
+  the same summary block, **plus per-tone** health, plus the full
+  controller/parameter detail. `client.get_tracking_state()` fetches it.
+
+**Summary block** (`summary`) — array-wide counts and extrema, the block a
+monitor watches:
+
+| field | meaning |
+|---|---|
+| `n_tracked` | tones under tracking |
+| `n_locked` / `n_drifting` / `n_recenter_pending` / `n_unlocked` / `n_no_data` | tones in each lock state (below) |
+| `n_over_threshold` | filtered \|detuning\| past the deadband |
+| `max_abs_detuning_linewidths`, `median_abs_detuning_linewidths` | drift extrema/centre, in linewidths |
+| `max_abs_detuning_hz` | worst drift in Hz |
+| `staged` | `{lo, bin}` corrections awaiting commit |
+| `commits`, `backoffs` | applied corrections; batches discarded on external revisions |
+| `filter_settled`, `held`, `hold_reason`, `dry_run`, `last_estimate_age_s` | loop liveness (a stale `last_estimate_age_s` means the loop has stopped estimating) |
+
+**Per-tone health** (`tones[i]`) — `state` plus
+`detuning_linewidths`, `detuning_std_linewidths` (running spread — a
+noisy/unstable tone shows a large std at a small mean),
+`slope_ratio` (current responsivity ÷ its on-resonance baseline),
+`invalid_fraction`, and `staged_center_hz` if a correction is pending.
+
+**Lock states**: `locked` (inside deadband), `drifting` (past threshold,
+correcting/suppressed), `recenter_pending` (a `bin` correction staged),
+`no_data` (nothing usable yet), and **`unlocked`** — the resonance is
+likely lost and the loop would be tracking noise.
+
+`unlocked` is deliberately **not** detected from a large detuning reading:
+the model-free estimate *compresses* (≈ `x/2/(1+x²)`, saturating near 0.25
+linewidths), so a resonance that has run far away reads a deceptively
+*small* detuning. Instead it is caught by the **phase slope collapsing**
+below `unlock_slope_ratio` of the on-resonance baseline (a flat phase far
+from resonance has no responsivity) and/or by the invalid-cycle fraction
+exceeding `unlock_invalid_fraction`. `unlock_detuning_linewidths` can
+additionally trip on the reading, but is off by default for this reason.
+So the monitor's "have we lost the resonance / are we tracking noise?"
+question is answered by `n_unlocked` and each tone's `slope_ratio`, not by
+the detuning magnitude alone.
 
 ## Commands
 
@@ -334,10 +387,11 @@ Server request port (and matching `ReadoutClient` methods):
 - `hold_tracking()` / `resume_tracking()` — pause without teardown.
 - `commit_tracking_updates(classes=None, tones=None)` — on-demand commit of
   the staged set, optionally filtered by class and/or tones.
-- `get_info('tracking')` / `client.get_tracking_state()` — enabled,
-  dry_run, held (and why), params, recent filtered detunings, staged sets
+- `get_info('tracking')` / `client.get_tracking_state()` — the health
+  `summary`, per-tone `tones` health/lock states, and the full controller
+  detail (dry_run, held and why, params, filtered detunings, staged sets
   per class, applied/suppressed counters, back-offs, commit timestamps,
-  decision/applied revision, ring fill.
+  decision/applied revision, ring fill). See **Health monitoring** above.
 
 Engines: tracking runs on **both** modulation engines and picks whichever
 is armed — firmware-slot (`engine='fw'`, the default engine) or software

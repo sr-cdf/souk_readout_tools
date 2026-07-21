@@ -589,6 +589,19 @@ class TrackingRuntime:
         self.last_filtered_lw = np.full(self.n_tones, np.nan)
         self.last_estimate_ts = None
 
+        # Per-tone running health statistics (exponentially weighted over
+        # cycles, ~20-cycle memory). Fed by process_batch; consumed by
+        # tone_health() / summary() for get_info('tracking') and the
+        # server health_check. The model-free detuning estimate COMPRESSES
+        # at large shifts (~x/2/(1+x^2), saturating near 0.25 linewidths),
+        # so a lost resonance is detected by the phase slope collapsing
+        # toward zero and by invalid (NaN) cycles -- not by big readings.
+        self._stats_alpha = 0.05
+        self.stat_detuning_var = np.full(self.n_tones, np.nan)  # lw^2
+        self.stat_abs_slope = np.full(self.n_tones, np.nan)     # |dphi_df|
+        self.stat_invalid_frac = np.full(self.n_tones, np.nan)
+        self.slope_baseline = None   # |dphi_df| captured once settled
+
     # -- setup helpers -------------------------------------------------------
 
     def _mod_cfg(self):
@@ -701,6 +714,36 @@ class TrackingRuntime:
 
     # -- consumer ------------------------------------------------------------
 
+    @staticmethod
+    def _ew_update(target, value, alpha):
+        """In-place EW update of ``target`` with ``value`` (NaN-aware)."""
+        seed = np.isnan(target) & np.isfinite(value)
+        target[seed] = value[seed]
+        ok = np.isfinite(target) & np.isfinite(value)
+        target[ok] += alpha * (value[ok] - target[ok])
+
+    def _update_stats(self, estimate):
+        """Fold one batch's per-cycle estimates into the running health
+        statistics (see ``__init__``)."""
+        detunings = estimate['detuning_linewidths']
+        n_cycles = detunings.shape[0]
+        valid = np.isfinite(detunings)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            batch_var = np.nanvar(detunings, axis=0)
+            batch_slope = np.nanmean(np.abs(estimate['dphi_df']), axis=0)
+        batch_invalid = 1.0 - valid.mean(axis=0)
+        # Effective alpha for a batch of n cycles at the per-cycle rate.
+        alpha = 1.0 - (1.0 - self._stats_alpha) ** n_cycles
+        self._ew_update(self.stat_detuning_var, batch_var, alpha)
+        self._ew_update(self.stat_abs_slope, batch_slope, alpha)
+        self._ew_update(self.stat_invalid_frac, batch_invalid, alpha)
+        if self.slope_baseline is None and self.filter.settled:
+            # On-resonance responsivity reference, captured once the
+            # startup transient has averaged out. A later slope collapse
+            # relative to this is the lost-resonance signature.
+            self.slope_baseline = self.stat_abs_slope.copy()
+
     def process_batch(self, payloads):
         """Parse + assemble + estimate + filter one drained batch.
 
@@ -719,6 +762,10 @@ class TrackingRuntime:
         estimate = estimate_detunings(
             cycles['z'], self.offsets, self.linewidth_hz)
         filtered = self.filter.update(estimate['detuning_linewidths'])
+        self._update_stats(estimate)
+        self.cycles_seen += cycles['z'].shape[0]
+        self.last_filtered_lw = filtered
+        self.last_estimate_ts = time.time()
         return {
             'n_cycles': cycles['z'].shape[0],
             'revision_first': int(revisions[0]),
@@ -748,10 +795,6 @@ class TrackingRuntime:
                 result = await server.to_thread(self.process_batch, payloads)
                 if result is None:
                     continue
-                self.cycles_seen += result['n_cycles']
-                self.last_estimate_ts = time.time()
-                self.last_filtered_lw = result['filtered_linewidths']
-
                 applied = self._applied_revision()
                 if result['revision_last'] != applied:
                     # An external command landed inside this batch; its
@@ -893,14 +936,145 @@ class TrackingRuntime:
             self._task.cancel()
         self.ring.clear()
 
+    # -- health ---------------------------------------------------------------
+
+    def tone_health(self):
+        """Per-tone tracking health and a lock state for each tracked tone.
+
+        Lock states:
+
+        - ``locked``: filtered |detuning| inside the deadband, estimates
+          healthy.
+        - ``drifting``: filtered |detuning| over the threshold (a
+          correction is confirming/staging or suppressed by config).
+        - ``recenter_pending``: a bin/map correction is staged for this
+          tone, awaiting its commit policy or an explicit commit.
+        - ``unlocked``: the estimates are untrustworthy -- the resonance is
+          likely lost and the loop would be tracking noise. Detected by the
+          phase slope collapsing below ``unlock_slope_ratio`` of its
+          settled baseline and/or the invalid-cycle fraction exceeding
+          ``unlock_invalid_fraction`` (a far-off-resonance tone has a flat
+          phase, so the reading *shrinks* rather than grows -- see the
+          compression note in ``__init__``). ``unlock_detuning_linewidths``
+          optionally also trips this on the reading itself.
+        - ``no_data``: no usable estimate yet (startup, or held).
+
+        Returns
+        -------
+        (tones, counts) : (dict, dict)
+            ``tones``: ``{tone_index: {state, detuning_linewidths,
+            detuning_std_linewidths, slope_ratio, invalid_fraction,
+            staged_center_hz}}`` for every tracked tone. ``counts``: number
+            of tones in each state.
+        """
+        p = self.params
+        filtered = self.last_filtered_lw
+        with np.errstate(invalid='ignore', divide='ignore'):
+            std = np.sqrt(self.stat_detuning_var)
+            slope_ratio = (self.stat_abs_slope / self.slope_baseline
+                           if self.slope_baseline is not None
+                           else np.full(self.n_tones, np.nan))
+        unlock_lw = p.get('unlock_detuning_linewidths')
+        tones = {}
+        counts = {'locked': 0, 'drifting': 0, 'recenter_pending': 0,
+                  'unlocked': 0, 'no_data': 0}
+
+        def _value(x):
+            return float(x) if np.isfinite(x) else None
+
+        for i in np.flatnonzero(self.controller.enable_mask):
+            i = int(i)
+            f = filtered[i]
+            bad_slope = (np.isfinite(slope_ratio[i])
+                         and slope_ratio[i] < p['unlock_slope_ratio'])
+            bad_invalid = (np.isfinite(self.stat_invalid_frac[i])
+                           and self.stat_invalid_frac[i]
+                           > p['unlock_invalid_fraction'])
+            bad_reading = (unlock_lw is not None and np.isfinite(f)
+                           and abs(f) > float(unlock_lw))
+            if bad_slope or bad_invalid or bad_reading:
+                state = 'unlocked'
+            elif i in self.controller.staged['bin']:
+                state = 'recenter_pending'
+            elif np.isfinite(f) and \
+                    abs(f) > self.controller.threshold_linewidths:
+                state = 'drifting'
+            elif np.isfinite(f):
+                state = 'locked'
+            else:
+                state = 'no_data'
+            counts[state] += 1
+            staged = self.controller.staged['lo'].get(
+                i, self.controller.staged['bin'].get(i))
+            tones[i] = {
+                'state': state,
+                'detuning_linewidths': _value(f),
+                'detuning_std_linewidths': _value(std[i]),
+                'slope_ratio': _value(slope_ratio[i]),
+                'invalid_fraction': _value(self.stat_invalid_frac[i]),
+                'staged_center_hz': (None if staged is None
+                                     else float(staged)),
+            }
+        return tones, counts
+
+    def summary(self):
+        """Compact health summary (the lean block for monitoring tools)."""
+        _, counts = self.tone_health()
+        tracked = self.controller.enable_mask
+        filtered = self.last_filtered_lw[tracked]
+        detuning_hz = filtered * self.linewidth_hz[tracked]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            max_lw = np.nanmax(np.abs(filtered)) if filtered.size else np.nan
+            median_lw = np.nanmedian(np.abs(filtered)) if filtered.size \
+                else np.nan
+            max_hz = np.nanmax(np.abs(detuning_hz)) if filtered.size \
+                else np.nan
+        over = np.abs(filtered) > self.controller.threshold_linewidths
+        now = time.time()
+        return {
+            'enabled': self.enabled,
+            'engine': self.engine,
+            'dry_run': self.dry_run,
+            'held': bool(self.held or self.hold_reason),
+            'hold_reason': self.hold_reason or
+                           ('held by request' if self.held else None),
+            'filter_settled': self.filter.settled,
+            'n_tracked': int(np.count_nonzero(tracked)),
+            'n_locked': counts['locked'],
+            'n_drifting': counts['drifting'],
+            'n_recenter_pending': counts['recenter_pending'],
+            'n_unlocked': counts['unlocked'],
+            'n_no_data': counts['no_data'],
+            'n_over_threshold': int(np.count_nonzero(
+                over & np.isfinite(filtered))),
+            'max_abs_detuning_linewidths': (None if not np.isfinite(max_lw)
+                                            else float(max_lw)),
+            'median_abs_detuning_linewidths': (
+                None if not np.isfinite(median_lw) else float(median_lw)),
+            'max_abs_detuning_hz': (None if not np.isfinite(max_hz)
+                                    else float(max_hz)),
+            'staged': {k: len(s) for k, s in self.controller.staged.items()},
+            'commits': dict(self.commits),
+            'backoffs': self.backoffs,
+            'last_estimate_age_s': (None if self.last_estimate_ts is None
+                                    else now - self.last_estimate_ts),
+            'applied_revision': self._applied_revision(),
+        }
+
     def status(self):
-        """The ``get_info('tracking')`` payload."""
+        """The ``get_info('tracking')`` payload: the compact ``summary``
+        block (for lean health polling), per-tone ``tones`` health/lock
+        states, and the full controller/parameter detail."""
         filtered = self.last_filtered_lw
         tracked = self.controller.enable_mask
         recent = {int(i): (None if not np.isfinite(filtered[i])
                            else float(filtered[i]))
                   for i in np.flatnonzero(tracked)}
+        tones, _ = self.tone_health()
         return {
+            'summary': self.summary(),
+            'tones': tones,
             'enabled': self.enabled,
             'engine': self.engine,
             'dry_run': self.dry_run,

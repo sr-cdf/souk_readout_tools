@@ -29,6 +29,19 @@
   `dry_run` default on. Commands: `enable_tracking` / `disable_tracking` /
   `hold_tracking` / `resume_tracking` / `commit_tracking_updates`, plus
   `get_info('tracking')` and matching `ReadoutClient` methods.
+- **Health monitoring**: `get_info('tracking')` returns
+  `{summary, tones, controller, …}` — a lean array-wide `summary`
+  (per-state tone counts locked/drifting/recenter_pending/unlocked/no_data,
+  n_over_threshold, max/median drift in linewidths and Hz, staged/commit/
+  back-off counts, loop liveness) and per-tone health (lock `state`,
+  running detuning mean+std, `slope_ratio`, invalid-cycle fraction, staged
+  centre). `health_check()` gains the same `summary` block plus
+  `resonators_tracking`/`max_detuning_hz` (previously placeholders) for
+  telescope-control polling. A **lost resonance** ("tracking noise") is
+  flagged by the phase slope collapsing vs its on-resonance baseline
+  (`unlock_slope_ratio`) and/or the invalid-cycle fraction
+  (`unlock_invalid_fraction`) — not by the detuning magnitude, which
+  *compresses* far from resonance and would read deceptively small.
 - `enable_modulation(linewidth_hz=...)` carries `params_from_sweep`'s
   per-tone linewidths on both engines (fw default first; pure metadata in
   the armed config), required by tracking unless given to

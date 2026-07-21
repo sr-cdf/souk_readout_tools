@@ -2958,11 +2958,28 @@ class ReadoutClient:
 
     def get_tracking_state(self):
         """
-        Return the ``get_info('tracking')`` section: enabled/dry-run/held
-        flags (and why), the resolved parameters, recent per-tone filtered
-        detunings, the staged-pending sets per class, applied/suppressed
-        counters, back-off count and the current revision. A pure server-side
-        read, safe to poll while streaming.
+        Return the ``get_info('tracking')`` section for health monitoring.
+
+        Three blocks:
+
+        - ``summary`` — lean, array-wide health for frequent polling:
+          per-state tone counts (``n_locked`` / ``n_drifting`` /
+          ``n_recenter_pending`` / ``n_unlocked`` / ``n_no_data``),
+          ``n_over_threshold``, drift extrema
+          (``max_abs_detuning_linewidths`` / ``_hz``,
+          ``median_abs_detuning_linewidths``), staged/commit/back-off counts
+          and loop liveness (``filter_settled``, ``held``, ``dry_run``,
+          ``last_estimate_age_s``). The same block appears in
+          :meth:`health_check`.
+        - ``tones`` — per-tone ``{state, detuning_linewidths,
+          detuning_std_linewidths, slope_ratio, invalid_fraction,
+          staged_center_hz}``. A **lost resonance** (tracking noise) shows
+          ``state='unlocked'`` and a low ``slope_ratio`` — the detuning
+          reading itself compresses far from resonance and is not a
+          reliable lost-lock signal.
+        - ``controller`` — the full parameter/staged/counter detail.
+
+        A pure server-side read, safe to poll while streaming.
         """
         return self.get_info('tracking')
 

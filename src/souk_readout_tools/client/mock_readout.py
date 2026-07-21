@@ -895,8 +895,12 @@ class MockReadoutServer:
             'lna_available': False,
             'tone_count': len(self.tone_frequencies),
             'client_count': 1,
-            'resonators_tracking': False,
+            'resonators_tracking': (self._tracking is not None
+                                    and not self._tracking.get('dry_run',
+                                                               True)),
             'max_detuning_hz': None,
+            'tracking': (None if self._tracking is None
+                         else dict(self._tracking.get('summary') or {})),
         }
 
     def get_parameter(self, param_name, message=None):
@@ -2041,6 +2045,7 @@ class MockReadoutServer:
                 return {'status': 'error',
                         'message': 'tracking requires per-tone linewidth_hz'}
             params = {k: v for k, v in message.items() if k != 'request'}
+            n_tracked = len(mod['mod_indices'])
             self._tracking = {
                 'enabled': True,
                 'engine': engine,
@@ -2050,6 +2055,31 @@ class MockReadoutServer:
                 'params': params,
                 'cycles_seen': 0,
                 'filtered_detuning_linewidths': {},
+                # Health blocks mirroring the real get_info('tracking'):
+                # the mock has no estimation loop, so tones report no_data.
+                'tones': {int(i): {'state': 'no_data',
+                                   'detuning_linewidths': None,
+                                   'detuning_std_linewidths': None,
+                                   'slope_ratio': None,
+                                   'invalid_fraction': None,
+                                   'staged_center_hz': None}
+                          for i in mod['mod_indices']},
+                'summary': {
+                    'enabled': True, 'engine': engine,
+                    'dry_run': bool(message.get('dry_run', True)),
+                    'held': False, 'hold_reason': None,
+                    'filter_settled': False,
+                    'n_tracked': n_tracked, 'n_locked': 0, 'n_drifting': 0,
+                    'n_recenter_pending': 0, 'n_unlocked': 0,
+                    'n_no_data': n_tracked, 'n_over_threshold': 0,
+                    'max_abs_detuning_linewidths': None,
+                    'median_abs_detuning_linewidths': None,
+                    'max_abs_detuning_hz': None,
+                    'staged': {'lo': 0, 'bin': 0},
+                    'commits': {'lo': 0, 'bin': 0}, 'backoffs': 0,
+                    'last_estimate_age_s': None,
+                    'applied_revision': revision,
+                },
                 'controller': {'staged': {'lo': {}, 'bin': {}},
                                'staged_counts': {'lo': 0, 'bin': 0}},
                 'commits': {'lo': 0, 'bin': 0},
