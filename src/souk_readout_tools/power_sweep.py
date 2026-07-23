@@ -130,6 +130,7 @@ __all__ = [
     # Best readout power per tone
     "find_best_power",
     "best_power_arrays",
+    "best_power_flag_summary",
     "write_best_power",
     "load_best_power",
     # Comb balancing
@@ -2460,6 +2461,24 @@ _MAD_TO_SIGMA = 1.4826
 DEFAULT_BIFURCATION_ANL = 4.0 / (3.0 * np.sqrt(3.0))
 DEFAULT_BIFURCATION_BACKOFF_DB = 3.0
 
+# Post-fit guard defaults for ``find_best_power``. All three are expressed in
+# self-calibrating units so nothing is tuned to a particular campaign or system:
+#   * the extrapolation bound is dB beyond each tone's own measured window;
+#   * the fit-quality gate is a robust outlier in log(reduced_chi2) *relative to
+#     the other tones in the same run* (a MAD-based z-score), not an absolute
+#     chi2 number;
+#   * the multi-resonance gate is a gap in fitted fr measured in each tone's own
+#     linewidths.
+DEFAULT_MAX_EXTRAPOLATION_DB = 5.0
+# 3.5 is the Iglewicz-Hoaglin modified-z outlier cutoff: a standard,
+# distribution-agnostic robust threshold, not a value tuned to any one run.
+DEFAULT_CHI2_OUTLIER_MAD_CLIP = 3.5
+DEFAULT_MULTI_RESONANCE_LINEWIDTHS = 3.0
+# A relative chi2 gate needs a population to compare against; below this many
+# tones with a finite median reduced_chi2 the gate is disabled rather than
+# tuned on too few points.
+_CHI2_GATE_MIN_TONES = 8
+
 
 # Fit-summary keys that ``find_best_power`` interpolates against power_dbm
 # to estimate parameter-like values at the chosen readout power. Booleans,
@@ -2991,6 +3010,99 @@ def _interpolated_params_at_power(
 _MAD_OUTLIER_CHECK_PARAMS = ("Qi", "Qc", "phi")
 
 
+def _row_success(row):
+    """Interpret a fit-summary ``success`` field as a bool (default ``True``)."""
+    success = row.get("success", True)
+    if isinstance(success, str):
+        return success.strip().lower() not in {"false", "0", "no"}
+    return not (success is False or success == 0)
+
+
+def _tone_median_reduced_chi2(tone_rows):
+    """Median ``reduced_chi2`` over a tone's successful rows (``NaN`` if none)."""
+    vals = []
+    for row in tone_rows:
+        if not _row_success(row):
+            continue
+        try:
+            v = float(row.get("reduced_chi2", np.nan))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(v) and v > 0.0:
+            vals.append(v)
+    return float(np.median(vals)) if vals else float("nan")
+
+
+def _population_reduced_chi2_threshold(median_chi2_by_tone, *, clip):
+    """Data-driven ``reduced_chi2`` ceiling from the run's own tone population.
+
+    Flags tones whose typical fit quality is a robust outlier *relative to the
+    other tones in the same run*: the threshold is ``exp(median + clip*sigma)``
+    of ``log(reduced_chi2)`` across tones, with ``sigma`` estimated by MAD.
+    Returns ``inf`` (gate disabled) when ``clip`` is ``None``, there are fewer
+    than :data:`_CHI2_GATE_MIN_TONES` finite tones, or the scatter is degenerate.
+    Working in log space keeps the estimate robust to the long high-chi2 tail.
+    """
+    if clip is None:
+        return float("inf")
+    med = np.asarray(
+        [m for m in median_chi2_by_tone if np.isfinite(m) and m > 0.0],
+        dtype=float,
+    )
+    if med.size < _CHI2_GATE_MIN_TONES:
+        return float("inf")
+    log_chi2 = np.log(med)
+    sigma = _robust_sigma(log_chi2)
+    if not (np.isfinite(sigma) and sigma > 0.0):
+        return float("inf")
+    centre = float(np.median(log_chi2))
+    return float(np.exp(centre + float(clip) * sigma))
+
+
+def _fr_bimodal_gap_linewidths(tone_rows, *, min_side=2):
+    """Largest gap in sorted fitted ``fr``, in units of the median linewidth.
+
+    A single resonator's ``fr`` barely moves across power (only a small
+    nonlinear pull), so all rows form one tight cluster. When two resonances
+    sit in one sweep window the fitter locks onto different dips at different
+    powers, splitting ``fr`` into two clusters separated by many linewidths.
+    Returns the largest gap between adjacent ``fr`` values that has at least
+    ``min_side`` points on each side (so a single stray row does not trip it),
+    divided by the median linewidth ``fr / Ql``. ``NaN`` when there are too few
+    successful rows or no usable linewidth.
+    """
+    frs = []
+    lws = []
+    for row in tone_rows:
+        if not _row_success(row):
+            continue
+        try:
+            fr = float(row.get("fr", np.nan))
+            ql = float(row.get("Ql", np.nan))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(fr) and fr > 0.0:
+            frs.append(fr)
+            if np.isfinite(ql) and ql > 0.0:
+                lws.append(fr / ql)
+    if len(frs) < 2 * min_side or not lws:
+        return float("nan")
+    linewidth = float(np.median(lws))
+    if not (np.isfinite(linewidth) and linewidth > 0.0):
+        return float("nan")
+    frs = np.sort(np.asarray(frs, dtype=float))
+    gaps = np.diff(frs)
+    best = float("nan")
+    for j in range(gaps.size):
+        left = j + 1
+        right = frs.size - (j + 1)
+        if left >= min_side and right >= min_side:
+            g = float(gaps[j] / linewidth)
+            if not np.isfinite(best) or g > best:
+                best = g
+    return best
+
+
 def _find_best_power_for_tone(
     tone_index,
     tone_rows,
@@ -3006,6 +3118,9 @@ def _find_best_power_for_tone(
     anl_fit_clip_sigma,
     anl_fit_min_slope,
     anl_fit_weight_by_uncertainty,
+    max_extrapolation_db,
+    reduced_chi2_threshold,
+    multi_resonance_linewidths,
 ):
     """Per-tone implementation backing :py:func:`find_best_power`."""
 
@@ -3306,20 +3421,75 @@ def _find_best_power_for_tone(
     anl_nearest_target_pick = _pack(nearest_target_idx)
     lowest_power_pick = _lowest_power_pick()
 
+    # Stage 3.5: post-fit guards. A "reliable" log(anl) fit can still yield a
+    # power we should not trust: solved far outside the measured window, on a
+    # tone whose fits are junk, or on a tone with two resonances in the span.
+    # Each guard is expressed in self-calibrating units (a dB margin on the
+    # tone's own window, a robust outlier vs the run's other tones, the tone's
+    # own linewidth), records a flag for reporting, and, when tripped, drops
+    # the power-law pick so selection falls back to a measured power inside the
+    # swept window rather than an invented extrapolation.
+    flags = []
+    finite_powers = powers[np.isfinite(powers)]
+    if finite_powers.size:
+        pmin_meas = float(np.min(finite_powers))
+        pmax_meas = float(np.max(finite_powers))
+    else:
+        pmin_meas = pmax_meas = float("nan")
+
+    power_law_usable = bool(
+        anl_power_law_pick["reliable"]
+        and anl_power_law_pick["power_dbm"] is not None
+    )
+    target_power = anl_power_law_pick["power_dbm"]
+
+    # (A) Extrapolation bound: no data supports a target power more than
+    # ``max_extrapolation_db`` beyond the tone's measured window.
+    if (
+        power_law_usable
+        and max_extrapolation_db is not None
+        and np.isfinite(pmin_meas)
+        and target_power is not None
+        and np.isfinite(float(target_power))
+        and (
+            float(target_power) < pmin_meas - float(max_extrapolation_db)
+            or float(target_power) > pmax_meas + float(max_extrapolation_db)
+        )
+    ):
+        power_law_usable = False
+        flags.append("outside_operating_window")
+
+    # (B) Fit-quality: median reduced_chi2 a robust outlier vs the run's tones.
+    median_reduced_chi2 = _tone_median_reduced_chi2(rows)
+    if (
+        np.isfinite(reduced_chi2_threshold)
+        and np.isfinite(median_reduced_chi2)
+        and median_reduced_chi2 > reduced_chi2_threshold
+    ):
+        power_law_usable = False
+        flags.append("low_confidence_fit")
+
+    # (D) Multi-resonance: fitted fr splits into clusters >N linewidths apart.
+    fr_gap_linewidths = _fr_bimodal_gap_linewidths(rows)
+    if (
+        multi_resonance_linewidths is not None
+        and np.isfinite(fr_gap_linewidths)
+        and fr_gap_linewidths > float(multi_resonance_linewidths)
+    ):
+        power_law_usable = False
+        flags.append("multi_resonance")
+
     # Stage 4: choose the most reliable available criterion.  The continuous
-    # ANL power-law pick wins when it passed its diagnostics; otherwise fall
-    # back to the highest-power row whose measured anl is below the target,
-    # then to the row whose measured anl is nearest to the target among
-    # those still below the bifurcation threshold, and finally to the
-    # lowest measured power.
+    # ANL power-law pick wins when it passed its diagnostics *and* the guards
+    # above; otherwise fall back to the highest-power row whose measured anl is
+    # below the target, then to the row whose measured anl is nearest to the
+    # target among those still below the bifurcation threshold, and finally to
+    # the lowest measured power.
     chosen_power = None
     chosen_sweep = None
     chosen_reference = None
     criterion = "none"
-    if (
-        anl_power_law_pick["reliable"]
-        and anl_power_law_pick["power_dbm"] is not None
-    ):
+    if power_law_usable:
         chosen_power = anl_power_law_pick["power_dbm"]
         chosen_sweep = anl_power_law_pick["sweep_index"]
         chosen_reference = anl_power_law_pick["reference_sweep_index"]
@@ -3369,6 +3539,15 @@ def _find_best_power_for_tone(
             "lowest_power_fallback": lowest_power_pick,
         },
         "anl_pegged": bool(anl_pegged),
+        "flags": list(flags),
+        "flagged": bool(flags),
+        "operating_window_dbm": [pmin_meas, pmax_meas],
+        "median_reduced_chi2": median_reduced_chi2,
+        "reduced_chi2_threshold": (
+            float(reduced_chi2_threshold)
+            if np.isfinite(reduced_chi2_threshold) else None
+        ),
+        "fr_gap_linewidths": fr_gap_linewidths,
         "excluded_sweep_indices": [
             int(sweep_idx[i]) for i in range(n) if excluded[i]
         ],
@@ -3394,8 +3573,11 @@ def find_best_power(
     use_readback_power=True,
     anl_fit_min_points=3,
     anl_fit_clip_sigma=3.0,
-    anl_fit_min_slope=1e-2,
+    anl_fit_min_slope=0.03,
     anl_fit_weight_by_uncertainty=True,
+    max_extrapolation_db=DEFAULT_MAX_EXTRAPOLATION_DB,
+    chi2_outlier_mad_clip=DEFAULT_CHI2_OUTLIER_MAD_CLIP,
+    multi_resonance_linewidths=DEFAULT_MULTI_RESONANCE_LINEWIDTHS,
 ):
     """Pick a robust readout power per resonator from a fit-summary table.
 
@@ -3439,20 +3621,52 @@ def find_best_power(
     performs one pass of symmetric MAD outlier rejection in log space at
     ``anl_fit_clip_sigma``, and is marked reliable when the retained set has
     at least ``anl_fit_min_points`` points and a slope of at least
-    ``anl_fit_min_slope`` decades/dB (default 1e-2).  Set
+    ``anl_fit_min_slope`` (natural-log ANL units per dB; default ``0.03``, a
+    weak physical floor well below a healthy slope of ~0.2–0.3).  Set
     ``anl_fit_weight_by_uncertainty=False`` to restore an unweighted final
     refit.  The chosen power is the value solved from the log-linear fit at
-    ``target_anl``, regardless of whether it falls inside or outside the
-    measured sweep range; the result field ``range_position``
+    ``target_anl``; the result field ``range_position``
     (``within_measured_range`` / ``above_measured_range`` /
     ``below_measured_range``) is reported as a diagnostic.
 
+    Post-fit guards then decide whether that solved power is trustworthy.  A
+    reliable fit can still point somewhere unsupported by data, so a tone is
+    *flagged* and its power-law pick is *dropped* (selection falls back to a
+    measured power inside the swept window) when any of these fire.  Each is
+    expressed in self-calibrating units, so none is tuned to a particular
+    campaign or system:
+
+    - ``outside_operating_window``: the solved power lands more than
+      ``max_extrapolation_db`` dB (default ``5``) beyond the tone's own
+      measured power window.  This is the main guard against absurd
+      extrapolations (e.g. a shallow-slope fit solving hundreds of dB below
+      the sweep).  Pass ``None`` to allow unbounded extrapolation.
+    - ``low_confidence_fit``: the tone's median ``reduced_chi2`` is a robust
+      outlier *relative to the other tones in the same run* — above
+      ``exp(median + chi2_outlier_mad_clip * sigma)`` of ``log(reduced_chi2)``
+      across tones, with ``sigma`` from the MAD (default clip ``3.5``, the
+      Iglewicz-Hoaglin modified-z outlier cutoff).  This
+      catches noisy/garbage sweeps without a hard-coded chi2 number; it is
+      disabled automatically for runs with fewer than
+      :data:`_CHI2_GATE_MIN_TONES` tones.  Pass ``chi2_outlier_mad_clip=None``
+      to disable.
+    - ``multi_resonance``: the fitted ``fr`` splits into clusters separated by
+      more than ``multi_resonance_linewidths`` (default ``3``) median
+      linewidths (``fr / Ql``), the signature of two resonances in one sweep
+      window with the fitter jumping between dips.  Pass ``None`` to disable.
+
+    Each returned row carries ``flags`` (a list of the above strings),
+    ``flagged`` (bool), ``operating_window_dbm``, ``median_reduced_chi2``,
+    ``reduced_chi2_threshold``, and ``fr_gap_linewidths``.  A one-line
+    :mod:`warnings` summary is emitted when any tone is flagged; see
+    :py:func:`best_power_flag_summary` for machine-readable counts.
+
     The top-level ``chosen_*`` fields use the ANL power-law pick when it is
-    reliable, otherwise fall back in order to: the highest measured power
-    with ``anl < target_anl`` (``anl_threshold``); the row whose measured
-    ``anl`` is nearest to ``target_anl`` among those still below
-    ``bifurcation_anl`` (``anl_nearest_target``, for sweeps where every
-    point is safely below bifurcation but the slope is too flat to solve
+    reliable *and passes the guards above*, otherwise fall back in order to:
+    the highest measured power with ``anl < target_anl`` (``anl_threshold``);
+    the row whose measured ``anl`` is nearest to ``target_anl`` among those
+    still below ``bifurcation_anl`` (``anl_nearest_target``, for sweeps where
+    every point is safely below bifurcation but the slope is too flat to solve
     for ``target_anl``); and finally the lowest measured power
     (``lowest_power_fallback``).  The returned rows also include ``p_bif``,
     the power solved from the same ANL fit at ``bifurcation_anl`` (default
@@ -3491,10 +3705,21 @@ def find_best_power(
         return []
     tones = sorted({int(row["tone_index"]) for row in rows})
     param_valid_ranges = _normalise_param_valid_ranges(param_valid_ranges)
+    rows_by_tone = {tone: [] for tone in tones}
+    for r in rows:
+        rows_by_tone[int(r["tone_index"])].append(r)
+
+    # Data-driven fit-quality ceiling from this run's own tone population, so
+    # the low-confidence gate is never tuned to a particular campaign/system.
+    reduced_chi2_threshold = _population_reduced_chi2_threshold(
+        [_tone_median_reduced_chi2(rows_by_tone[tone]) for tone in tones],
+        clip=chi2_outlier_mad_clip,
+    )
+
     best_rows = [
         _find_best_power_for_tone(
             tone,
-            [r for r in rows if int(r["tone_index"]) == tone],
+            rows_by_tone[tone],
             target_anl=target_anl,
             bifurcation_anl=bifurcation_anl,
             param_valid_ranges=param_valid_ranges,
@@ -3506,13 +3731,76 @@ def find_best_power(
             anl_fit_clip_sigma=anl_fit_clip_sigma,
             anl_fit_min_slope=anl_fit_min_slope,
             anl_fit_weight_by_uncertainty=anl_fit_weight_by_uncertainty,
+            max_extrapolation_db=max_extrapolation_db,
+            reduced_chi2_threshold=reduced_chi2_threshold,
+            multi_resonance_linewidths=multi_resonance_linewidths,
         )
         for tone in tones
     ]
     # Repair at the source: replace negative (extrapolated) chosen_params with the
     # cross-tone median so every consumer of these rows gets physical values.
     _repair_negative_chosen_params(best_rows)
+    _warn_flagged_best_power(best_rows)
     return best_rows
+
+
+def _warn_flagged_best_power(rows, *, label="find_best_power"):
+    """Emit a one-line warning summarising guard-flagged tones, if any."""
+    summary = best_power_flag_summary(rows)
+    if summary["n_flagged"]:
+        counts = ", ".join(
+            f"{flag}={len(tones)}"
+            for flag, tones in summary["tones_by_flag"].items()
+        )
+        warnings.warn(
+            f"{label}: {summary['n_flagged']} of {summary['n_tones']} tones "
+            f"flagged and fell back to a measured power ({counts}); "
+            f"inspect these tones' sweeps before trusting them.",
+            stacklevel=2,
+        )
+
+
+def best_power_flag_summary(best_power):
+    """Summarise the post-fit guard flags across a best-power result.
+
+    Accepts the list returned by :py:func:`find_best_power`, a single row, or
+    a path/directory holding ``analysis/best_power.json``. Returns a dict:
+
+    - ``n_tones`` / ``n_flagged``: totals.
+    - ``counts``: ``{flag: n_tones}`` for each guard flag that fired
+      (``outside_operating_window``, ``low_confidence_fit``,
+      ``multi_resonance``).
+    - ``tones_by_flag``: ``{flag: [tone_index, ...]}`` for the same flags.
+    - ``flagged_tones``: sorted tone indices with any flag.
+
+    Use it to print a campaign-summary line, e.g. how many chosen powers fell
+    back off the ANL power-law because they would have extrapolated outside the
+    swept window.
+    """
+    rows = _normalise_best_power_rows(best_power) or []
+    counts = {}
+    tones_by_flag = {}
+    flagged = []
+    for row in rows:
+        try:
+            tone = int(row.get("tone_index"))
+        except (TypeError, ValueError):
+            tone = None
+        row_flags = row.get("flags") or []
+        if row_flags and tone is not None:
+            flagged.append(tone)
+        for flag in row_flags:
+            counts[flag] = counts.get(flag, 0) + 1
+            tones_by_flag.setdefault(flag, [])
+            if tone is not None:
+                tones_by_flag[flag].append(tone)
+    return {
+        "n_tones": len(rows),
+        "n_flagged": len(set(flagged)),
+        "counts": counts,
+        "tones_by_flag": {k: sorted(v) for k, v in tones_by_flag.items()},
+        "flagged_tones": sorted(set(flagged)),
+    }
 
 
 def _repair_negative_chosen_params(rows, *, label="find_best_power"):
@@ -3702,7 +3990,10 @@ def _restore_best_row(row):
     reasons = out.get("exclude_reasons")
     if isinstance(reasons, dict):
         out["exclude_reasons"] = {int(k): v for k, v in reasons.items()}
-    for key in ("chosen_power_dbm", "p_bif", "p_bif_sub_3db", "bifurcation_anl"):
+    for key in (
+        "chosen_power_dbm", "p_bif", "p_bif_sub_3db", "bifurcation_anl",
+        "median_reduced_chi2", "fr_gap_linewidths",
+    ):
         if key in out and out[key] is None:
             out[key] = float("nan")
     chosen_params = out.get("chosen_params")
