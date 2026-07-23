@@ -2148,8 +2148,18 @@ def _batch_fit_one(task):
     return fit
 
 
-def _stack_rows(f_stack, z_stack, z_err_stack=None):
-    """Turn 1D/2D sweep stacks into a list of per-resonance rows."""
+def _stack_rows(f_stack, z_stack, z_err_stack=None, tone_axis=None):
+    """Turn 1D/2D sweep stacks into a list of per-resonance rows.
+
+    ``tone_axis`` forces which axis of a 2D stack indexes resonances/tones
+    (``0`` = one row per resonance, ``1`` = one column per resonance). Leave
+    it ``None`` to auto-detect by shape, assuming there are fewer resonances
+    than points per resonance. That size heuristic silently picks the wrong
+    axis when the stack has as many (or more) tones as sweep points, so
+    callers that know their orientation -- e.g. server sweep-data dicts, which
+    are always ``(n_points, n_tones)`` -- should pass ``tone_axis`` explicitly
+    rather than rely on the guess.
+    """
     z = np.asarray(z_stack, complex)
     f = np.asarray(f_stack, float)
     e = None if z_err_stack is None else np.asarray(z_err_stack)
@@ -2168,7 +2178,12 @@ def _stack_rows(f_stack, z_stack, z_err_stack=None):
     elif f.shape == z.shape:
         if z.ndim != 2:
             rows.append((f.ravel(), z.ravel(), None if e is None else e.ravel()))
-        elif z.shape[0] <= z.shape[1]:
+            return rows
+        if tone_axis is None:
+            rows_axis0 = z.shape[0] <= z.shape[1]
+        else:
+            rows_axis0 = int(tone_axis) == 0
+        if rows_axis0:
             for i in range(z.shape[0]):
                 rows.append((f[i], z[i], None if e is None else e[i]))
         else:
@@ -2415,13 +2430,18 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
 
     if resonances is None:
         if _is_targeted_sweep_data(sweep_data) and not find_resonances:
-            rows = _stack_rows(sf, z_stack, e_stack)
+            # Server sweep-data is always (n_points, n_tones): tones are
+            # columns. Pin tone_axis=1 so _stack_rows never mistakes the sweep
+            # axis for the tone axis when there are >= as many tones as points.
+            rows = _stack_rows(sf, z_stack, e_stack, tone_axis=1)
             tone_indices, blind_indices = _targeted_sweep_tone_indices(
                 sweep_data, len(rows), skip_blind=skip_blind)
             if opt_stack is None:
                 opt_rows = [None] * len(rows)
             else:
-                opt_rows = [row for _, row, _ in _stack_rows(sf, opt_stack)]
+                opt_rows = [
+                    row for _, row, _ in _stack_rows(sf, opt_stack, tone_axis=1)
+                ]
 
             tasks = []
             for tone_index in tone_indices:

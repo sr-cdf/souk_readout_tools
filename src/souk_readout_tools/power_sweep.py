@@ -256,14 +256,18 @@ def _normalise_tone_indices(tone_indices, tone_count):
 
 # --- Acquisition: run a stepped tone-power sweep -----------------------------
 
-def _find_dip_centers(sweep_data, centers, spans, follow_min_depth_db):
+def _find_dip_centers(sweep_data, centers, spans, follow_min_depth_db,
+                      min_separation=1.0):
     """Empirical-dip recentering used by ``run_power_sweep``.
 
     Each regular (non-blind) tone is recentered on the deepest dip in its full
     sweep trace.  A dip shallower than ``follow_min_depth_db`` is rejected so a
     tone never locks onto noise.  Finally, since tones are ordered by frequency,
-    any neighbouring pair whose new centers would swap order (both chasing the
-    same resonance) is reverted to its previous centers.
+    any neighbouring pair whose new centers would swap order or land within
+    ``min_separation`` Hz of each other (both chasing the same resonance) is
+    reverted to its previous centers.  The returned comb is therefore always at
+    least ``min_separation`` Hz apart, matching the check ``perform_sweep``
+    enforces (default 1 Hz) -- a converged pair no longer poisons the sweep.
 
     Returns ``(next_centers, record)`` where ``record`` is the per-tone
     diagnostic dict (candidate frequencies, depths, accept flags, reasons,
@@ -322,14 +326,26 @@ def _find_dip_centers(sweep_data, centers, spans, follow_min_depth_db):
 
     next_centers = centers.copy()
     next_centers[accepted] = candidates[accepted]
-    # Tones are ordered by frequency; if recentering swapped any neighbouring
-    # pair (both chasing the same resonance), revert both to their old centers.
-    for left, right in zip(np.argsort(centers)[:-1], np.argsort(centers)[1:]):
-        if next_centers[left] >= next_centers[right]:
-            accepted[left] = accepted[right] = False
-            next_centers[left], next_centers[right] = centers[left], centers[right]
-            reasons[left] = f"conflict_with_tone_{int(right)}"
-            reasons[right] = f"conflict_with_tone_{int(left)}"
+    # Tones are ordered by frequency.  If recentering moved a neighbouring pair
+    # so that they swap order or fall within ``min_separation`` (both chasing the
+    # same resonance), revert the accepted one(s) to their old centers -- which
+    # the previous sweep already proved are far enough apart.  A revert can
+    # expose a fresh conflict with the next neighbour, so repeat until the comb
+    # is clear.  This terminates: every pass only reverts accepted tones back to
+    # their separated originals, and the all-original state is conflict-free.
+    order = np.argsort(centers)
+    while True:
+        adjusted = False
+        for left, right in zip(order[:-1], order[1:]):
+            if next_centers[right] - next_centers[left] < min_separation:
+                for tone, other in ((left, right), (right, left)):
+                    if accepted[tone]:
+                        accepted[tone] = False
+                        next_centers[tone] = centers[tone]
+                        reasons[tone] = f"conflict_with_tone_{int(other)}"
+                        adjusted = True
+        if not adjusted:
+            break
 
     record = {
         "candidate_centers_hz": candidates.tolist(),

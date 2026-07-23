@@ -28,8 +28,9 @@ Contents
   :class:`DfModelFreeConverter`, :class:`DfCalibratedConverter`, and
   :class:`FfmConverter` (live fast-frequency-modulation demodulation with
   recenter-proof absolute output; see ``doc/frequency_modulation.md``).
-- DAC backends: :class:`DummyDac` (default, no hardware) and
-  :class:`LabJackDac` (optional ``labjack-ljm`` dependency).
+- DAC backends: :class:`DummyDac` (default, no hardware),
+  :class:`LabJackDac` (T-series, optional ``labjack-ljm`` dependency) and
+  :class:`LabJackU12Dac` (U12, optional ``LabJackPython`` + Exodriver).
 - Calibration persistence: :func:`save_calibrations`,
   :func:`load_calibrations`, :func:`calibrations_from_sweep`.
 - The application: :class:`StreamToDac`.
@@ -757,15 +758,98 @@ class LabJackDac(DacBackend):
                 self._handle = None
 
 
-def make_dac_backend(backend, labjack_options=None, print_writes=False):
-    """Build a DAC backend by name ('dummy' or 'labjack').
+class LabJackU12Dac(DacBackend):
+    """LabJack U12 backend via LabJackPython + the Exodriver (Linux/macOS).
 
-    'labjack' falls back to :class:`DummyDac` with a warning when the LJM
-    package is unavailable, so development machines run the full pipeline.
+    The U12 predates the LJM library, so it uses a different driver stack from
+    :class:`LabJackDac`: the ``LabJackPython`` package's ``u12`` module talking
+    to the Exodriver (``liblabjackusb``, built on libusb-1.0). Outputs are the
+    two 0-5 V analog outs ``AO0``/``AO1`` (``DAC0``/``DAC1`` accepted as
+    aliases); inputs are ``AI0``..``AI7`` (``AIN0``.. accepted too).
+
+    The U12's analog outs are filtered PWM and its USB transactions are
+    command-response at roughly ~20 ms each, so keep ``update_rate_hz`` low
+    (tens of Hz) -- well below the T-series' few-hundred Hz.
+
+    Parameters
+    ----------
+    id : int, optional
+        Local device id; -1 (default) opens the first U12 found.
+    serial_number : int, optional
+        Open a specific device by serial number (default: any).
     """
-    if backend == 'labjack':
+
+    _MAX_VOLTS = 5.0
+
+    def __init__(self, id=-1, serial_number=None):
         try:
-            return LabJackDac(**(labjack_options or {}))
+            import u12 as u12_module
+        except ImportError as exc:
+            raise ImportError(
+                "LabJack U12 backend needs the 'LabJackPython' package "
+                "(pip install LabJackPython) and the Exodriver (liblabjackusb; "
+                "https://labjack.com/support/software/installers/exodriver)"
+                ) from exc
+        self._u12 = u12_module.U12(id=id, serialNumber=serial_number)
+        # eAnalogOut writes both outputs at once, so remember each output's
+        # last value and only change the ones a given write() names.
+        self._ao = [0.0, 0.0]
+        self._u12.eAnalogOut(self._ao[0], self._ao[1])
+        serial = getattr(self._u12, 'serialNumber', None)
+        print('LabJackU12Dac: opened U12'
+              + (f' (serial {serial})' if serial else ''))
+
+    @staticmethod
+    def _output_index(name):
+        """Map an output channel name to 0/1 (AO0/AO1, DAC0/DAC1 aliased)."""
+        key = name.strip().upper()
+        for prefix in ('AO', 'DAC'):
+            rest = key[len(prefix):]
+            if key.startswith(prefix) and rest.isdigit() and int(rest) in (0, 1):
+                return int(rest)
+        raise ValueError(f"U12 output channel must be AO0/AO1 (got '{name}')")
+
+    @staticmethod
+    def _input_index(name):
+        """Map an input channel name to 0..7 (AI0.., AIN0.. aliased)."""
+        key = name.strip().upper()
+        for prefix in ('AIN', 'AI'):
+            rest = key[len(prefix):]
+            if key.startswith(prefix) and rest.isdigit() and 0 <= int(rest) <= 7:
+                return int(rest)
+        raise ValueError(f"U12 input channel must be AI0..AI7 (got '{name}')")
+
+    def write(self, values):
+        for name, volts in values.items():
+            # Clamp to the device's 0-5 V range: a negative value is the u12
+            # module's "leave this output unchanged" sentinel, so never emit one.
+            self._ao[self._output_index(name)] = min(
+                max(float(volts), 0.0), self._MAX_VOLTS)
+        self._u12.eAnalogOut(self._ao[0], self._ao[1])
+
+    def read_ain(self, channels):
+        return [self._u12.eAnalogIn(self._input_index(name))['voltage']
+                for name in channels]
+
+    def close(self):
+        if self._u12 is not None:
+            try:
+                self._u12.close()
+            finally:
+                self._u12 = None
+
+
+def make_dac_backend(backend, labjack_options=None, print_writes=False):
+    """Build a DAC backend by name ('dummy', 'labjack', or 'labjack_u12').
+
+    'labjack' (T-series via LJM) and 'labjack_u12' (U12 via LabJackPython/
+    Exodriver) fall back to :class:`DummyDac` with a warning when their driver
+    is unavailable, so development machines still run the full pipeline.
+    """
+    labjack_classes = {'labjack': LabJackDac, 'labjack_u12': LabJackU12Dac}
+    if backend in labjack_classes:
+        try:
+            return labjack_classes[backend](**(labjack_options or {}))
         except ImportError as exc:
             print(f'WARNING: {exc}; falling back to dummy DAC backend')
             return DummyDac(print_writes=print_writes)

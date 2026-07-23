@@ -168,9 +168,18 @@ just a channel name (`TDAC0`) with wider `v_min`/`v_max`. Match
 
 - `labjack` — LabJack T4/T7 via `labjack-ljm` (guarded import; optional
   dependency). USB command-response writes cost ≈1 ms each, so keep
-  `update_rate_hz` in the low hundreds of Hz (default 200).
-- `dummy` — no hardware; remembers/prints writes. Default fallback when LJM
-  is not installed, and what all development and tests use.
+  `update_rate_hz` in the low hundreds of Hz (default 200). Channels `DAC0`/
+  `DAC1` (0–5 V) or `TDAC0`.. (LJTick-DAC, ±10 V).
+- `labjack_u12` — LabJack U12 via `LabJackPython` + the Exodriver
+  (`liblabjackusb`; the U12 predates LJM, so it uses this separate driver
+  stack — Linux/macOS). Outputs `AO0`/`AO1` (0–5 V only; `DAC0`/`DAC1`
+  aliased), inputs `AI0`..`AI7` (`AIN0`.. aliased). The U12's filtered-PWM
+  outs and ≈20 ms command-response transactions cap the useful rate at tens
+  of Hz — set `update_rate_hz` accordingly (e.g. 40). Driver options in
+  `dac.labjack` are `id` (default −1 = first device) and `serial_number`.
+- `dummy` — no hardware; remembers/prints writes. Default fallback when the
+  selected LabJack driver is not installed, and what all development and
+  tests use.
 
 Optional AIN sampling (`dac.ain_channels`) reads listed analog inputs once
 per output update and logs them with host time plus the `tt` of the nearest

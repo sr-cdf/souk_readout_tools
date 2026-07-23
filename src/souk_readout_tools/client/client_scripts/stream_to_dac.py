@@ -89,8 +89,12 @@ def selftest(config):
     """DAC0 -> AIN0 loopback latency check (needs a real LabJack + a wire)."""
     import time
     import numpy as np
-    dac = stream_dac.make_dac_backend('labjack',
-                                      config['dac'].get('labjack'))
+    # Use the configured LabJack backend so --selftest --backend labjack_u12
+    # exercises the U12; a bare --selftest still defaults to the T-series.
+    backend = config['dac']['backend']
+    if backend not in ('labjack', 'labjack_u12'):
+        backend = 'labjack'
+    dac = stream_dac.make_dac_backend(backend, config['dac'].get('labjack'))
     if isinstance(dac, stream_dac.DummyDac):
         print('selftest: no LabJack available, nothing to measure')
         return 1
@@ -155,8 +159,9 @@ def main():
     parser.add_argument('--rate', type=float, default=None,
                         help='Override: DAC update rate in Hz.')
     parser.add_argument('--backend', type=str, default=None,
-                        choices=['dummy', 'labjack'],
-                        help='Override: DAC backend.')
+                        choices=['dummy', 'labjack', 'labjack_u12'],
+                        help='Override: DAC backend (labjack = T-series/LJM, '
+                             'labjack_u12 = U12/LabJackPython).')
     parser.add_argument('--replay', type=str, default=None,
                         help='Replay a recorded stream file (with .json '
                              'sidecar) instead of connecting to a server.')

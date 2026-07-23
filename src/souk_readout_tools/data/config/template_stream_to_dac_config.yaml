@@ -75,25 +75,39 @@ channels:
   #   v_max: 5.0
 
 # --- DAC backend ---
-# backend: 'labjack' (LabJack T4/T7 via labjack-ljm) or 'dummy' (no
-# hardware; also the automatic fallback when LJM is not installed).
+# backend:
+#   'labjack'      LabJack T4/T7 via labjack-ljm; channels DAC0/DAC1 (0-5 V),
+#                  TDAC0.. (LJTick-DAC, +/-10 V). Keep update_rate_hz in the
+#                  low hundreds of Hz.
+#   'labjack_u12'  LabJack U12 via LabJackPython + the Exodriver
+#                  (liblabjackusb); outputs AO0/AO1 (0-5 V only; DAC0/DAC1
+#                  accepted as aliases), inputs AI0..AI7 (AIN0.. aliased).
+#                  The U12's PWM outs and ~20 ms command-response transactions
+#                  cap the useful rate at tens of Hz — set update_rate_hz
+#                  accordingly (e.g. 40).
+#   'dummy'        no hardware; also the automatic fallback when the selected
+#                  LabJack driver is not installed.
 # update_rate_hz: DAC updates per second. USB command-response writes cost
-#   ~1 ms each, so keep this in the low hundreds of Hz. The stream is
-#   boxcar-averaged over N = round(sample_rate / update_rate_hz) samples
-#   per update.
+#   ~1 ms (T-series) to ~20 ms (U12) each. The stream is boxcar-averaged over
+#   N = round(sample_rate / update_rate_hz) samples per update.
 # idle_voltage: safe-state voltage driven on every channel on exit/error.
 # ain_channels: analog inputs sampled once per output update and logged
 #   with host time + nearest frame tt — reserved for a future TOPTICA
 #   frequency-monitor or step-trigger line. Empty list disables.
+# labjack: driver options for the selected LabJack backend (keys differ by
+#   backend, see below). Ignored for the dummy backend.
 dac:
   backend: dummy
   update_rate_hz: 200.0
   idle_voltage: 0.0
-  labjack:
-    device_type: ANY       # ANY / T4 / T7
-    connection_type: ANY   # ANY / USB / ETHERNET
-    identifier: ANY        # serial number, IP address, or ANY
-  ain_channels: []         # e.g. [AIN0]
+  labjack:                 # T-series (backend: labjack):
+    device_type: ANY       #   ANY / T4 / T7
+    connection_type: ANY   #   ANY / USB / ETHERNET
+    identifier: ANY        #   serial number, IP address, or ANY
+    # U12 (backend: labjack_u12) uses these instead — delete the three above:
+    # id: -1               #   local device id; -1 opens the first U12 found
+    # serial_number: null  #   open a specific device by serial (null = any)
+  ain_channels: []         # e.g. [AIN0] (T-series) or [AI0] (U12)
 
 # --- Stream handling ---
 # queue_depth: reader->output queue depth in frames; bounds the worst-case
