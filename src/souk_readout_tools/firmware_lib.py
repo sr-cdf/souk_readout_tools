@@ -856,6 +856,154 @@ class ClockFault(RuntimeError):
         self.status = status    # raw classify_clock_status() dict
 
 
+class FpgaWriteError(RuntimeError):
+    """Raised when a register / control-buffer write to the FPGA fails.
+
+    Stands in for the low-level transport error so a multi-step tone operation
+    (set_tone_amplitudes / _phases / _powers) aborts loudly on the first failed
+    write instead of marching a dead device through the remaining steps.
+
+    In particular this replaces the ``UnicodeDecodeError`` that the pinned katcp
+    library raises *inside its own error handler* when a binary ``?write``
+    payload drops mid-flight (``client.py`` logs the failure with ``str(msg)``,
+    which tries to UTF-8 decode the raw amplitude/phase buffer). That masked the
+    real "device disconnected" cause; here we catch it and re-raise with the
+    register context and the true cause chained via ``__cause__``.
+
+    Subclasses ``RuntimeError`` so existing ``except (ValueError, RuntimeError)``
+    handlers still catch it.
+    """
+
+
+class DeviceDisconnected(FpgaWriteError):
+    """The casperfpga katcp transport is not connected to the device.
+
+    A subclass of :class:`FpgaWriteError` (so ``except FpgaWriteError`` catches
+    both) but distinguishable, letting callers treat a dead transport as a fatal
+    error that should stop the whole operation rather than a transient
+    single-write failure worth retrying / degrading past.
+    """
+
+
+# Bounded time to let katcp's own auto-reconnect re-establish a dropped link
+# before we give up on a control-buffer write. Kept short so a genuinely dead
+# device fails fast (and does not keep katcp's reconnect loop spawning sockets)
+# rather than stalling a tone operation.
+TRANSPORT_RECONNECT_TIMEOUT_S = 2.0
+
+
+def _mixer_transport(r):
+    """Return the casperfpga transport behind ``r.mixer``, or ``None``.
+
+    The devmem fast path and unit-test mocks may not expose one; callers treat
+    ``None`` as "no connection state to check" and proceed as before.
+    """
+    try:
+        return r.mixer.host.transport
+    except AttributeError:
+        return None
+
+
+def _transport_connected(transport):
+    """Best-effort connection check for a katcp transport.
+
+    Returns ``True`` when the state cannot be determined (no ``is_connected``,
+    or it raised) so a healthy or connection-agnostic write path is never
+    blocked; only a transport that positively reports "not connected" is treated
+    as down.
+    """
+    if transport is None:
+        return True
+    is_connected = getattr(transport, 'is_connected', None)
+    if not callable(is_connected):
+        return True
+    try:
+        return bool(is_connected())
+    except Exception:
+        return False
+
+
+def _transport_label(transport):
+    """A human-readable name for the transport, for error messages."""
+    if transport is None:
+        return '?'
+    return (getattr(transport, 'bind_address_string', None)
+            or getattr(transport, 'host', None) or '?')
+
+
+def _ensure_transport_connected(transport, context):
+    """Verify the katcp transport is connected before a large write sequence.
+
+    If it is not, give katcp's own auto-reconnect a brief, bounded chance to
+    re-establish the link (:data:`TRANSPORT_RECONNECT_TIMEOUT_S`) and then fail
+    fast with :class:`DeviceDisconnected` rather than pushing a multi-step
+    operation into a dead transport -- which is what wedged the link and leaked
+    reconnect sockets in the 2026-07-23 incident.
+    """
+    if _transport_connected(transport):
+        return
+    wait_connected = getattr(transport, 'wait_connected', None)
+    if callable(wait_connected):
+        try:
+            wait_connected(timeout=TRANSPORT_RECONNECT_TIMEOUT_S)
+        except Exception:
+            pass
+    if not _transport_connected(transport):
+        raise DeviceDisconnected(
+            f'FPGA transport not connected ({_transport_label(transport)}); '
+            f'aborting {context} instead of writing to a dead device')
+
+
+def _blindwrite_control_reg(r, transport, reg, data, offset, context):
+    """Write one control-buffer register, converting any transport failure into
+    a typed :class:`FpgaWriteError` / :class:`DeviceDisconnected`.
+
+    This is the single choke point that stops a dropped katcp write from
+    (a) surfacing as a masked ``UnicodeDecodeError`` and (b) being silently
+    continued past. On failure we give katcp's auto-reconnect one bounded chance
+    and retry the write exactly once if the link is back; otherwise we raise a
+    typed error carrying the register context and the real cause.
+    """
+    try:
+        r.mixer.write(reg, data, offset=offset)
+        return
+    except Exception as first_exc:
+        if transport is None:
+            # No connection to check or recover (devmem fast path / test mock):
+            # surface a typed error, but never silently continue the sequence.
+            raise FpgaWriteError(
+                f'FPGA write to {reg} failed [{context}]: '
+                f'{type(first_exc).__name__}: {first_exc}') from first_exc
+
+        # katcp masks a dropped binary ?write as a UnicodeDecodeError from its
+        # own str(msg) logging; that and every real transport error land here.
+        # Give auto-reconnect one bounded chance, then retry the write once. If
+        # the link is still dead, fail fast (typed) so the operation aborts
+        # rather than writing into the void.
+        if not _transport_connected(transport):
+            wait_connected = getattr(transport, 'wait_connected', None)
+            if callable(wait_connected):
+                try:
+                    wait_connected(timeout=TRANSPORT_RECONNECT_TIMEOUT_S)
+                except Exception:
+                    pass
+        if _transport_connected(transport):
+            try:
+                r.mixer.write(reg, data, offset=offset)
+                return
+            except Exception as retry_exc:
+                first_exc = retry_exc
+
+        if not _transport_connected(transport):
+            raise DeviceDisconnected(
+                f'FPGA write to {reg} failed and the transport is disconnected '
+                f'({_transport_label(transport)}); aborting control-buffer write '
+                f'[{context}]') from first_exc
+        raise FpgaWriteError(
+            f'FPGA write to {reg} failed [{context}]: '
+            f'{type(first_exc).__name__}: {first_exc}') from first_exc
+
+
 def classify_clock_status(status=None):
     """Classify PLL lock state, separating the LMK reference from the LMX PLLs.
 
@@ -2596,11 +2744,17 @@ def write_control_buffer_data(r,buf,v,slot=0):
         raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
     if not 0 <= slot < r.mixer.n_slots:
         raise ValueError(f"Slot must be in 0..{r.mixer.n_slots-1}. Not {slot}.")
+    # Confirm the transport is up before starting the multi-register write; a
+    # failed write mid-loop raises a typed error (below) that aborts the whole
+    # sequence rather than continuing to write into a dead device.
+    transport = _mixer_transport(r)
+    _ensure_transport_connected(transport, f'control-buffer write (buf={buf}, slot={slot})')
     for lo in ['tx','rx']:
         for i in range(min(r.mixer._n_parallel_chans, n_tone)):
             reg = f'{lo}_lo{i}_control{buf}'
             offset = 4 * r.mixer._CONTROL_N_WORDS * (slot * r.mixer._n_serial_chans + i)
-            r.mixer.write(reg, v[lo].tobytes(),offset=offset)
+            _blindwrite_control_reg(r, transport, reg, v[lo].tobytes(), offset,
+                                    context=f'buf={buf} slot={slot} {lo} lo{i}')
     return
 
 def write_control_buffer_data_fast(r_fast,buf,v,indices,slot=0):

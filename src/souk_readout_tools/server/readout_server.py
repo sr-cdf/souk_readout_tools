@@ -4294,6 +4294,25 @@ class ReadoutServer:
 
         except asyncio.IncompleteReadError:
             print(f"request client disconnected unexpectedly: {addr} (IncompleteReadError)")
+        except firmware_lib.FpgaWriteError as e:
+            # A register write to the FPGA failed (e.g. the katcp link to
+            # tcpborphserver dropped mid-write). Clear any in-progress tone
+            # set-flags so streaming state is not left wedged, and return a
+            # clean, typed error reply describing the real failure rather than
+            # letting the masked UnicodeDecodeError surface. ``fatal`` lets the
+            # caller (e.g. the power sweep) stop instead of silently degrading.
+            for flag in (FLAG_SET_FREQS, FLAG_SET_AMPS, FLAG_SET_PHASES,
+                         FLAG_SERVER_REQUEST):
+                self.stream_flags[flag].clear()
+            fatal = isinstance(e, firmware_lib.DeviceDisconnected)
+            print(f"FPGA write failure handling request client {addr}: {e}")
+            print(traceback.format_exc())
+            await self.send_response(writer, {
+                'status': 'error',
+                'message': str(e),
+                'error_type': type(e).__name__,
+                'fatal': fatal,
+            })
         except Exception as e:
             self.stream_flags[FLAG_SERVER_REQUEST].clear()
             print(f"Error handling request client {addr}: {e}")

@@ -514,10 +514,28 @@ def _preflight_feasible_steps(client, power_steps, reference_plane,
     return feasible, record
 
 
+class FatalReadoutError(RuntimeError):
+    """A server error the sweep must not continue past.
+
+    Raised for replies the server flags as ``fatal`` (e.g. the FPGA transport
+    disconnected). Unlike an ordinary per-step failure -- which is recorded as a
+    NaN placeholder so the run continues -- a fatal error aborts the whole run
+    rather than silently degrading every remaining step.
+    """
+
+
 def _require_success(response, message):
-    """Raise if a client call returned a ``{'status': ...}`` failure dict."""
+    """Raise if a client call returned a ``{'status': ...}`` failure dict.
+
+    A reply the server marked ``fatal`` raises :class:`FatalReadoutError` so the
+    run stops instead of recording NaN placeholders for every remaining step on
+    a dead transport.
+    """
     if isinstance(response, dict) and response.get("status") != "success":
-        raise RuntimeError(response.get("message", message))
+        detail = response.get("message", message)
+        if response.get("fatal"):
+            raise FatalReadoutError(detail)
+        raise RuntimeError(detail)
 
 
 def run_power_sweep(
@@ -936,6 +954,11 @@ def run_power_sweep(
             manifest["metadata"]["search_centers_hz"] = centers.tolist()
             manifest["metadata"]["current_centers_hz"] = centers.tolist()
             _write_manifest(manifest, output_dir)
+          except FatalReadoutError:
+            # A dead transport (or other fatal server error) is not a recoverable
+            # "bad center search" -- let it abort the run rather than marching the
+            # power steps into the same failure.
+            raise
           except Exception as exc:
             # A failed center search must not abort the run: fall back to the
             # requested centers and continue to the recorded power steps.
@@ -1095,6 +1118,11 @@ def run_power_sweep(
                 step["status"] = "success"
                 step["finished"] = _timestamp()
                 centers = next_centers
+            except FatalReadoutError:
+                # A fatal server error (e.g. the FPGA transport disconnected)
+                # would fail every remaining step identically -- abort the run
+                # loudly instead of filling the schedule with NaN placeholders.
+                raise
             except Exception as exc:
                 # A power level that can't be set (or a sweep that fails) must
                 # not break the loop: warn loudly, record a NaN placeholder, and
