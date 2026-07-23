@@ -173,10 +173,15 @@ just a channel name (`TDAC0`) with wider `v_min`/`v_max`. Match
 - `labjack_u12` — LabJack U12 via `LabJackPython` + the Exodriver
   (`liblabjackusb`; the U12 predates LJM, so it uses this separate driver
   stack — Linux/macOS). Outputs `AO0`/`AO1` (0–5 V only; `DAC0`/`DAC1`
-  aliased), inputs `AI0`..`AI7` (`AIN0`.. aliased). The U12's filtered-PWM
-  outs and ≈20 ms command-response transactions cap the useful rate at tens
-  of Hz — set `update_rate_hz` accordingly (e.g. 40). Driver options in
+  aliased), inputs `AI0`..`AI7` (`AIN0`.. aliased). Driver options in
   `dac.labjack` are `id` (default −1 = first device) and `serial_number`.
+  Measured on hardware: each USB transaction is ≈16 ms (≈62 writes/s), and an
+  AIN read costs another ≈16 ms, so a tick that also samples `ain_channels`
+  is ≈32 ms (≈31/s). Set `update_rate_hz` with headroom below those ceilings —
+  **≤50 Hz output-only, ≤25 Hz with AIN monitoring**. The filtered-PWM outs
+  also settle slowly: expect ~0.1 V of ripple/settling lag at these rates
+  (loopback error ≈0.11 V rms), so add RC filtering on the AO line if the
+  TOPTICA needs a cleaner control voltage.
 - `dummy` — no hardware; remembers/prints writes. Default fallback when the
   selected LabJack driver is not installed, and what all development and
   tests use.
@@ -195,7 +200,7 @@ Contributions per update, all bounded:
 | accumulator sample period | 1/sample_rate | server config |
 | boxcar window | N/sample_rate = 1/update_rate | `dac.update_rate_hz` |
 | queue staleness (worst case) | queue_depth/sample_rate | `stream.queue_depth` |
-| USB DAC write | ≈1 ms | backend/rate |
+| USB DAC write | ≈1 ms (T-series) / ≈16 ms (U12) | backend/rate |
 
 **Bench check** — `souk-stream-to-dac --selftest` (real LabJack, wire DAC0 →
 AIN0): toggles the output 100 times and reports the write+read transaction

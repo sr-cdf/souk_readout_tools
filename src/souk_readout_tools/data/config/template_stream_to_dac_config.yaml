@@ -82,9 +82,9 @@ channels:
 #   'labjack_u12'  LabJack U12 via LabJackPython + the Exodriver
 #                  (liblabjackusb); outputs AO0/AO1 (0-5 V only; DAC0/DAC1
 #                  accepted as aliases), inputs AI0..AI7 (AIN0.. aliased).
-#                  The U12's PWM outs and ~20 ms command-response transactions
-#                  cap the useful rate at tens of Hz — set update_rate_hz
-#                  accordingly (e.g. 40).
+#                  Measured: ~16 ms/transaction (~62 writes/s); a tick that
+#                  also samples ain_channels adds another ~16 ms (~31/s). Keep
+#                  update_rate_hz <= 50 (output-only) or <= 25 (with AIN).
 #   'dummy'        no hardware; also the automatic fallback when the selected
 #                  LabJack driver is not installed.
 # update_rate_hz: DAC updates per second. USB command-response writes cost
