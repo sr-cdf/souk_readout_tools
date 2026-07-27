@@ -3283,6 +3283,16 @@ DEFAULT_BIF_MISMATCH_DB = 3.0
 # this far apart means the fits, not the resonator, are direction-dependent.
 DEFAULT_ANL_DIRECTION_RATIO = 3.0
 
+# The tones that lose their ANL power-law pick are not a random sample: they
+# are typically the highest-Q resonators, whose sweeps spend most of their
+# range past bifurcation and so fit badly.  The measured-anl fallbacks then
+# hand those very tones the *highest* power in the sweep, because one noisy
+# low anl value at the top of the schedule satisfies "highest power below
+# target_anl".  The population model below is the alternative: predict the
+# power from the tones that did work, using the drive scaling anl ~ P Ql^3/Qc
+# so a tone is placed by its own measured Q rather than by the array average.
+DEFAULT_POPULATION_FALLBACK_MIN_TONES = 8
+
 
 # Fit-summary keys that ``find_best_power`` interpolates against power_dbm
 # to estimate parameter-like values at the chosen readout power. Booleans,
@@ -3812,6 +3822,51 @@ def _interpolated_params_at_power(
 
 
 _MAD_OUTLIER_CHECK_PARAMS = ("Qi", "Qc", "phi")
+# Parameters whose power dependence is multiplicative, so the trend below is
+# fitted (and the scatter measured) in log space.
+_MAD_OUTLIER_LOG_PARAMS = {"Qi", "Qc"}
+# Detrending needs enough points for the robust line to be about the trend
+# rather than about one outlier; below this the constant-median form is used.
+_MAD_DETREND_MIN_POINTS = 5
+
+
+def _param_outlier_deviation(powers, values, eligible, *, detrend, log_space):
+    """Robust per-row deviation of one parameter, in MAD-equivalent sigmas.
+
+    The point of the check this feeds is to catch a fit that jumped -- to a
+    neighbouring resonance, or to a corner of parameter space -- not to
+    penalise a parameter for depending on power.  ``Qi`` in particular is
+    flat at low power and then falls steeply as the drive approaches
+    bifurcation; measured against a constant median that smooth trend reads
+    as a growing outlier and takes the whole high-power end of the sweep with
+    it, which is exactly the end that anchors the ANL slope.
+
+    So with ``detrend`` (the default) the deviation is measured about a
+    Theil-Sen line in power, and only the scatter *about that trend* is
+    clipped.  ``detrend=False`` restores the constant-median form.
+    """
+    values = np.asarray(values, dtype=float)
+    eligible = np.asarray(eligible, dtype=bool)
+    reference = values[eligible]
+    if log_space:
+        positive = eligible & (values > 0.0)
+        if np.count_nonzero(positive) != np.count_nonzero(eligible):
+            log_space = False          # non-positive values: stay linear
+        else:
+            values = np.log(np.where(values > 0.0, values, np.nan))
+            reference = values[eligible]
+
+    if detrend and np.count_nonzero(eligible) >= _MAD_DETREND_MIN_POINTS:
+        slope, intercept = _theil_sen_line(powers[eligible], reference)
+        if np.isfinite(slope) and np.isfinite(intercept):
+            values = values - (slope * powers + intercept)
+            reference = values[eligible]
+
+    centre = float(np.median(reference))
+    scale = _MAD_TO_SIGMA * float(np.median(np.abs(reference - centre)))
+    if not (np.isfinite(scale) and scale > 0.0):
+        return None
+    return np.abs(values - centre) / scale
 
 
 def _row_success(row):
@@ -3927,6 +3982,7 @@ def _find_best_power_for_tone(
     bifurcation_anl,
     param_valid_ranges,
     param_outliers_mad_clip,
+    param_outliers_detrend,
     param_uncertainty_outlier_mad_clip,
     require_success,
     use_readback_power,
@@ -4019,8 +4075,10 @@ def _find_best_power_for_tone(
             excluded[i] = True
             exclude_reason[i] = f"{name} outside ({lo:g}, {hi:g})"
 
-    # 1c: per-tone MAD outlier check on parameters expected to be
-    # near-constant across powers.
+    # 1c: per-tone MAD outlier check on parameters that should vary smoothly
+    # (at most) with power -- by default measured about a robust trend, so a
+    # real power dependence is not mistaken for a run of outliers.
+    trend_note = "trend" if param_outliers_detrend else "median"
     if param_outliers_mad_clip is not None:
         clip_k = float(param_outliers_mad_clip)
         for key in _MAD_OUTLIER_CHECK_PARAMS:
@@ -4028,17 +4086,18 @@ def _find_best_power_for_tone(
             eligible = (~excluded) & np.isfinite(values)
             if np.count_nonzero(eligible) < 3:
                 continue
-            ref = values[eligible]
-            centre = float(np.median(ref))
-            scale = _MAD_TO_SIGMA * float(np.median(np.abs(ref - centre)))
-            if not (np.isfinite(scale) and scale > 0.0):
+            deviation = _param_outlier_deviation(
+                powers, values, eligible,
+                detrend=param_outliers_detrend,
+                log_space=key in _MAD_OUTLIER_LOG_PARAMS,
+            )
+            if deviation is None:
                 continue
-            deviation = np.abs(values - centre)
-            flag = eligible & (deviation > clip_k * scale)
+            flag = eligible & (deviation > clip_k)
             for i in np.flatnonzero(flag):
                 excluded[i] = True
                 exclude_reason[i] = (
-                    f"{key} outside median ± {clip_k:g}*MAD"
+                    f"{key} outside {trend_note} ± {clip_k:g}*MAD"
                 )
 
     # 1d: per-tone MAD outlier check on the uncertainty of those same
@@ -4051,17 +4110,20 @@ def _find_best_power_for_tone(
             eligible = (~excluded) & np.isfinite(values)
             if np.count_nonzero(eligible) < 3:
                 continue
-            ref = values[eligible]
-            centre = float(np.median(ref))
-            scale = _MAD_TO_SIGMA * float(np.median(np.abs(ref - centre)))
-            if not (np.isfinite(scale) and scale > 0.0):
+            # Uncertainties grow with power just as the values drift, so the
+            # same detrending applies; they are positive, hence log space.
+            deviation = _param_outlier_deviation(
+                powers, values, eligible,
+                detrend=param_outliers_detrend,
+                log_space=True,
+            )
+            if deviation is None:
                 continue
-            deviation = np.abs(values - centre)
-            flag = eligible & (deviation > clip_k * scale)
+            flag = eligible & (deviation > clip_k)
             for i in np.flatnonzero(flag):
                 excluded[i] = True
                 exclude_reason[i] = (
-                    f"{err_key} outside median ± {clip_k:g}*MAD"
+                    f"{err_key} outside {trend_note} ± {clip_k:g}*MAD"
                 )
 
     # 1e: measured hysteresis (bidirectional runs only).  A power at which the
@@ -4395,21 +4457,34 @@ def _find_best_power_for_tone(
     # Measured-onset pick: a bidirectional run knows where the resonator
     # actually bifurcated even when every fit failed, so it rescues tones
     # that would otherwise fall all the way through to the lowest power.
+    # The backoff from the onset to the *pick* is not the cap's fixed margin:
+    # it is however far below bifurcation ``target_anl`` sits.  Since anl is
+    # proportional to drive power, that is 10*log10(anl_bif / target_anl) dB
+    # (about 19 dB for the defaults) -- using the cap's 3 dB here would hand
+    # these tones a power an order of magnitude hotter than every other
+    # criterion aims for.
     hysteresis_pick = None
     if np.isfinite(onset["p_hyst_onset"]):
-        hysteresis_pick = {
-            "criterion": "hysteresis_onset",
-            "power_dbm": float(
-                onset["p_hyst_onset"] - float(hysteresis_backoff_db)
-            ),
-            "sweep_index": None,
-            "p_hyst_onset": onset["p_hyst_onset"],
-            "backoff_db": float(hysteresis_backoff_db),
-            "reason": (
-                "measured hysteresis onset, backed off "
-                f"{float(hysteresis_backoff_db):g} dB"
-            ),
-        }
+        target_backoff_db = float("nan")
+        if (
+            np.isfinite(_bifurcation_anl_value) and _bifurcation_anl_value > 0.0
+            and np.isfinite(_target_anl_value) and _target_anl_value > 0.0
+        ):
+            target_backoff_db = 10.0 * np.log10(
+                _bifurcation_anl_value / _target_anl_value
+            )
+        if np.isfinite(target_backoff_db):
+            hysteresis_pick = {
+                "criterion": "hysteresis_onset",
+                "power_dbm": float(onset["p_hyst_onset"] - target_backoff_db),
+                "sweep_index": None,
+                "p_hyst_onset": onset["p_hyst_onset"],
+                "backoff_db": float(target_backoff_db),
+                "reason": (
+                    "measured hysteresis onset, backed off "
+                    f"{target_backoff_db:.1f} dB to reach target_anl"
+                ),
+            }
 
     chosen_power = None
     chosen_sweep = None
@@ -4518,6 +4593,16 @@ def _find_best_power_for_tone(
         "hysteresis_capped": bool(hysteresis_capped),
         "anl_direction_ratio": anl_direction_ratio_measured,
         "anl_pegged": bool(anl_pegged),
+        # Private: what the cross-tone rescue pass in ``find_best_power``
+        # needs to re-evaluate this tone at a different power.  Popped there,
+        # so it never reaches a caller or a saved file.
+        "_context": {
+            "rows": rows,
+            "valid": valid,
+            "powers": powers,
+            "sweep_idx": sweep_idx,
+            "anl_fit": anl_fit,
+        },
         "flags": list(flags),
         "flagged": bool(flags),
         "operating_window_dbm": [pmin_meas, pmax_meas],
@@ -4547,6 +4632,7 @@ def find_best_power(
     bifurcation_anl=DEFAULT_BIFURCATION_ANL,
     param_valid_ranges=None,
     param_outliers_mad_clip=5.0,
+    param_outliers_detrend=True,
     param_uncertainty_outlier_mad_clip=None,
     require_success=True,
     use_readback_power=True,
@@ -4562,6 +4648,8 @@ def find_best_power(
     bif_mismatch_db=DEFAULT_BIF_MISMATCH_DB,
     anl_direction_ratio=DEFAULT_ANL_DIRECTION_RATIO,
     exclude_hysteretic_rows=False,
+    population_fallback=True,
+    population_fallback_min_tones=DEFAULT_POPULATION_FALLBACK_MIN_TONES,
 ):
     """Pick a robust readout power per resonator from a fit-summary table.
 
@@ -4590,11 +4678,20 @@ def find_best_power(
        target.  Pass a dict like ``{"Qi": (1e3, 1e7), "anl": None}`` to
        override; ``None`` disables a single entry, ``param_valid_ranges={}``
        disables all.
-    3. Per-parameter MAD outlier check: for each parameter expected to be
-       near-constant across powers (``Qi``, ``Qc``, ``phi``), rows where the
-       value deviates from the per-tone median by more than
-       ``param_outliers_mad_clip`` MAD-equivalent sigmas are dropped.  Set
-       ``param_outliers_mad_clip=None`` to disable.
+    3. Per-parameter MAD outlier check on ``Qi``, ``Qc`` and ``phi``: rows
+       deviating by more than ``param_outliers_mad_clip`` MAD-equivalent
+       sigmas are dropped.  The deviation is measured about a robust
+       (Theil-Sen) trend in power, *not* about a constant median, because
+       these parameters genuinely depend on power -- ``Qi`` in particular is
+       flat at low power and then falls steeply as the drive approaches
+       bifurcation.  Measured against a constant median that smooth droop
+       reads as a growing outlier and takes the entire high-power end of the
+       sweep with it, which is exactly the end that anchors the ANL slope
+       (on one 389-tone campaign this dropped 227 of 389 tones at one power
+       step; detrending cut it to 16).  ``Qi`` and ``Qc`` are detrended in
+       log space.  Set ``param_outliers_detrend=False`` for the old
+       constant-median form, or ``param_outliers_mad_clip=None`` to disable
+       the check entirely.
     4. Per-parameter uncertainty MAD outlier check: same MAD criterion applied
        to the ``<name>_err`` columns instead of the values, so rows with a
        wildly inflated uncertainty on ``Qi``, ``Qc``, or ``phi`` are dropped.
@@ -4693,9 +4790,36 @@ def find_best_power(
     the row whose measured ``anl`` is nearest to ``target_anl`` among those
     still below ``bifurcation_anl`` (``anl_nearest_target``, for sweeps where
     every point is safely below bifurcation but the slope is too flat to solve
-    for ``target_anl``); the measured hysteresis onset backed off by
-    ``hysteresis_backoff_db`` (``hysteresis_onset``, bidirectional runs only);
-    and finally the lowest measured power (``lowest_power_fallback``).  The returned rows also include ``p_bif``,
+    for ``target_anl``); the measured hysteresis onset (``hysteresis_onset``,
+    bidirectional runs only, backed off by ``10*log10(bifurcation_anl /
+    target_anl)`` so it aims at the same nonlinearity as every other
+    criterion); and finally the lowest measured power
+    (``lowest_power_fallback``).
+
+    Those single-row fallbacks are unreliable, and ``population_fallback``
+    (default ``True``) replaces them.  The tones that lose the power-law pick
+    are not a random sample -- they are largely the resonators whose sweeps
+    spend most of their range past bifurcation, so their fits are bad
+    *because* they need less power.  ``anl_threshold`` then does the worst
+    possible thing: one spuriously small ``anl`` at the top of the schedule
+    satisfies "highest measured power below ``target_anl``", so those tones
+    are handed the hottest power in the run.  (On one 389-tone campaign the
+    fallback tones' median came out 18 dB *above* the array median, nine of
+    them pinned at the very top of the sweep.)
+
+    Instead, such a tone is placed from the tones that did work: a robust
+    line of chosen power against that tone's own ``-30*log10(Ql) +
+    10*log10(Qc)``, the scaling along which the Duffing nonlinearity runs
+    (``anl ~ P * Ql**3 / Qc``), evaluated with fit-free empirical ``Q``
+    values from the lowest powers.  The criterion becomes
+    ``population_scaling``.  A tone whose own ``Q`` falls outside the range
+    the line was learned over gets the plain population median instead
+    (``population_median``) -- the empirical ``Q`` of a tone whose fits
+    failed is often nonsense, and extrapolating on it is confidently wrong.
+    ``population_fallback_min_tones`` (default ``8``) is how many reliable
+    tones the line needs before it is fitted at all; below that the median is
+    used.  Rescued rows keep ``superseded_criterion`` /
+    ``superseded_power_dbm``, and every row carries ``population_model``.  The returned rows also include ``p_bif``,
     the power solved from the same ANL fit at ``bifurcation_anl`` (default
     ``4/(3*sqrt(3)) ~= 0.77``), and ``p_bif_sub_3db``. Both are ``NaN``
     when no reliable ANL fit is available.
@@ -4751,6 +4875,7 @@ def find_best_power(
             bifurcation_anl=bifurcation_anl,
             param_valid_ranges=param_valid_ranges,
             param_outliers_mad_clip=param_outliers_mad_clip,
+            param_outliers_detrend=param_outliers_detrend,
             param_uncertainty_outlier_mad_clip=param_uncertainty_outlier_mad_clip,
             require_success=require_success,
             use_readback_power=use_readback_power,
@@ -4769,12 +4894,193 @@ def find_best_power(
         )
         for tone in tones
     ]
+    # Cross-tone rescue: a tone that lost its ANL power-law pick is better
+    # served by what the rest of the array measured than by one of its own
+    # untrusted anl values.  Runs before the repair below so the interpolated
+    # chosen_params belong to the power actually chosen.
+    if population_fallback:
+        _apply_population_fallback(
+            best_rows, rows_by_tone,
+            min_tones=population_fallback_min_tones,
+        )
+    for row in best_rows:
+        row.pop("_context", None)
     # Repair at the source: replace negative (extrapolated) chosen_params with the
     # cross-tone median so every consumer of these rows gets physical values.
     _repair_negative_chosen_params(best_rows)
     _warn_flagged_best_power(best_rows)
     _warn_hysteresis_capped(best_rows)
     return best_rows
+
+
+def _tone_q_scaling(tone_rows):
+    """``-30 log10(Ql) + 10 log10(Qc)`` for one tone, from empirical values.
+
+    This is the power axis the Duffing nonlinearity scales along: at fixed
+    ``anl``, drive power goes as ``Qc / Ql^3``.  Empirical (fit-free)
+    estimates are used and taken from the lowest powers, where the resonance
+    is most nearly linear -- the point being to have a usable number for
+    exactly those tones whose fits are untrustworthy.
+    """
+    powers, ql, qc = [], [], []
+    for row in tone_rows:
+        try:
+            powers.append(float(row.get("power_dbm", np.nan)))
+            ql.append(float(row.get("empirical_Ql", np.nan)))
+            qc.append(float(row.get("empirical_Qc", np.nan)))
+        except (TypeError, ValueError):
+            powers.append(np.nan)
+            ql.append(np.nan)
+            qc.append(np.nan)
+    powers = np.asarray(powers, dtype=float)
+    ql = np.asarray(ql, dtype=float)
+    qc = np.asarray(qc, dtype=float)
+    good = np.isfinite(powers) & np.isfinite(ql) & np.isfinite(qc) & (ql > 0) & (qc > 0)
+    if not np.any(good):
+        return float("nan")
+    order = np.argsort(powers[good])
+    keep = order[: max(1, int(np.ceil(0.3 * order.size)))]
+    return float(
+        -30.0 * np.log10(np.median(ql[good][keep]))
+        + 10.0 * np.log10(np.median(qc[good][keep]))
+    )
+
+
+def _population_power_model(best_rows, rows_by_tone, *, min_tones):
+    """Fit chosen power against Q scaling across the run's reliable tones.
+
+    Returns ``None`` when there is nothing to learn from, otherwise a dict
+    with ``slope`` / ``intercept`` (a Theil-Sen line against
+    :py:func:`_tone_q_scaling`), the residual scatter, and the plain median
+    as the degenerate form used when the tones do not span enough Q.
+    """
+    x_by_tone = {
+        int(tone): _tone_q_scaling(rows) for tone, rows in rows_by_tone.items()
+    }
+    xs, ys = [], []
+    for row in best_rows:
+        if row.get("chosen_criterion") != "anl_power_law" or row.get("flagged"):
+            continue
+        try:
+            power = float(row.get("chosen_power_dbm"))
+        except (TypeError, ValueError):
+            continue
+        x = x_by_tone.get(int(row["tone_index"]), np.nan)
+        if np.isfinite(power) and np.isfinite(x):
+            xs.append(x)
+            ys.append(power)
+    if len(ys) < 2:
+        return None
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    median_power = float(np.median(ys))
+
+    slope = 0.0
+    intercept = median_power
+    source = "median"
+    if len(ys) >= int(min_tones) and float(np.ptp(xs)) > 0.0:
+        fit_slope, fit_intercept = _theil_sen_line(xs, ys)
+        if np.isfinite(fit_slope) and np.isfinite(fit_intercept):
+            slope, intercept = float(fit_slope), float(fit_intercept)
+            source = "q_scaling"
+    residual = ys - (slope * xs + intercept)
+    return {
+        "slope_db_per_db": slope,
+        "intercept_dbm": intercept,
+        "median_power_dbm": median_power,
+        "residual_sigma_db": float(
+            _MAD_TO_SIGMA * np.median(np.abs(residual - np.median(residual)))
+        ),
+        "n_tones": int(len(ys)),
+        "source": source,
+        # The Q range the relation was actually learned over.  A tone whose
+        # own value falls outside it gets the plain median instead: the
+        # empirical Q of a tone whose fits failed is often nonsense (a dip
+        # too shallow to measure gives a near-zero linewidth and so an
+        # enormous Ql), and extrapolating the line on such a value produces
+        # a confidently wrong power.
+        "x_range": (float(np.min(xs)), float(np.max(xs))),
+        "x_by_tone": x_by_tone,
+    }
+
+
+def _apply_population_fallback(best_rows, rows_by_tone, *, min_tones,
+                               label="find_best_power"):
+    """Replace unreliable per-tone fallbacks with the population prediction.
+
+    Only tones that lost the ANL power-law pick are touched, and the
+    prediction is clipped into the power window that tone was actually swept
+    over, so this can never invent a power the hardware was not asked for.
+    """
+    model = _population_power_model(best_rows, rows_by_tone, min_tones=min_tones)
+    if model is None:
+        return None
+    rescued = []
+    for row in best_rows:
+        row["population_model"] = {
+            key: model[key] for key in
+            ("slope_db_per_db", "intercept_dbm", "median_power_dbm",
+             "residual_sigma_db", "n_tones", "source")
+        }
+        row["population_power_dbm"] = float("nan")
+        if row.get("chosen_criterion") == "anl_power_law" and not row.get("flagged"):
+            continue
+        context = row.get("_context") or {}
+        x = model["x_by_tone"].get(int(row["tone_index"]), np.nan)
+        x_lo, x_hi = model["x_range"]
+        if model["source"] == "q_scaling" and np.isfinite(x) and x_lo <= x <= x_hi:
+            predicted = float(
+                model["slope_db_per_db"] * x + model["intercept_dbm"]
+            )
+            row["population_source"] = "q_scaling"
+        else:
+            # No usable Q for this tone: the array median is all we know.
+            predicted = float(model["median_power_dbm"])
+            row["population_source"] = (
+                "median_no_q" if not np.isfinite(x) else "median_outside_support"
+            )
+        window = row.get("operating_window_dbm") or [np.nan, np.nan]
+        if np.isfinite(window[0]) and np.isfinite(window[1]):
+            predicted = float(np.clip(predicted, window[0], window[1]))
+        # Never let the rescue undo a measured bifurcation cap.
+        cap = row.get("hysteresis_cap_dbm", np.nan)
+        try:
+            cap = float(cap)
+        except (TypeError, ValueError):
+            cap = np.nan
+        if np.isfinite(cap) and predicted > cap:
+            predicted = cap
+            row["hysteresis_capped"] = True
+        row["population_power_dbm"] = predicted
+        row["superseded_criterion"] = row.get("chosen_criterion")
+        row["superseded_power_dbm"] = row.get("chosen_power_dbm")
+        row["chosen_power_dbm"] = predicted
+        row["chosen_criterion"] = (
+            "population_scaling"
+            if row.get("population_source") == "q_scaling"
+            else "population_median"
+        )
+        row["chosen_sweep_index"] = None
+        row["chosen_reference_sweep_index"] = _nearest_measured_sweep_index(
+            context.get("powers", np.array([])),
+            context.get("sweep_idx", np.array([], dtype=int)),
+            predicted,
+        )
+        if context:
+            row["chosen_params"] = _interpolated_params_at_power(
+                context["rows"], context["valid"], context["powers"],
+                predicted, anl_fit=context["anl_fit"],
+            )
+        rescued.append(int(row["tone_index"]))
+    if rescued:
+        warnings.warn(
+            f"{label}: {len(rescued)} of {len(best_rows)} tones took the "
+            f"population {model['source']} fallback instead of a single-row "
+            f"measured-ANL pick (model from {model['n_tones']} reliable tones, "
+            f"residual {model['residual_sigma_db']:.1f} dB).",
+            stacklevel=2,
+        )
+    return model
 
 
 def _warn_hysteresis_capped(rows, *, label="find_best_power"):
@@ -5057,6 +5363,7 @@ def _restore_best_row(row):
     for key in (
         "chosen_power_dbm", "p_bif", "p_bif_sub_3db", "bifurcation_anl",
         "median_reduced_chi2", "fr_gap_linewidths",
+        "population_power_dbm", "superseded_power_dbm",
         "p_hyst_onset", "p_hyst_onset_err", "p_hyst_lower", "p_hyst_upper",
         "p_bif_minus_onset_db", "hysteresis_cap_dbm", "anl_direction_ratio",
     ):
@@ -7460,6 +7767,8 @@ _BEST_POWER_CRITERION_LABELS = {
     "anl_threshold": "highest measured power below target ANL",
     "anl_nearest_target": "measured ANL nearest target",
     "hysteresis_onset": "measured hysteresis onset, backed off",
+    "population_scaling": "population fit vs Q scaling",
+    "population_median": "population median power",
     "lowest_power_fallback": "lowest measured power fallback",
     "none": "no selection",
 }
