@@ -640,6 +640,19 @@ def _prepare_arrays(f, z, z_err=None, optimizer_z_err=None):
             "at least five finite samples are required for a resonator fit")
     order = np.argsort(f)
     f, z = f[order], z[order]
+    # A sweep whose frequency axis never advances for the majority of its
+    # points (median step 0) carries no resonance shape: the derivative-based
+    # initial guess divides by the zero spacing and returns NaN, which
+    # scipy.least_squares then rejects with "Initial guess is outside of
+    # provided bounds". This happens when the requested sweep span falls below
+    # the hardware frequency resolution, so most steps quantise onto the same
+    # tone -- e.g. near-coincident tones with a sub-microhertz span. Degrade to
+    # a failed fit rather than aborting the whole batch.
+    if np.median(np.diff(f)) <= 0.0:
+        raise InsufficientSamplesError(
+            "degenerate sweep: frequency did not advance across the majority "
+            f"of points (span {np.ptp(f):.3g} Hz, {np.unique(f).size} distinct "
+            f"frequencies of {f.size} samples)")
     if z_error is not None:
         z_error = (z_error[0][good][order], z_error[1][good][order])
     if opt_error is not None:
@@ -1368,7 +1381,8 @@ def _make_noise_result(f, z, z_error, optimizer_z_error, sweep_direction, f0,
     )
 
 
-def _make_insufficient_data_result(f, z, sweep_direction, fit_start, nonlinear):
+def _make_insufficient_data_result(f, z, sweep_direction, fit_start, nonlinear,
+                                   reason=None):
     """Build a failed, ``noise_only`` FitResult for a trace with too few finite
     samples to attempt a fit (e.g. a skipped or NaN-filled power-sweep step).
 
@@ -1378,10 +1392,11 @@ def _make_insufficient_data_result(f, z, sweep_direction, fit_start, nonlinear):
     data to compute one)."""
     f_arr = np.asarray(f, float).ravel()
     z_arr = np.asarray(z, complex).ravel()
-    n_finite = int(np.count_nonzero(
-        np.isfinite(f_arr) & np.isfinite(z_arr.real) & np.isfinite(z_arr.imag)
-    ))
-    reason = f"insufficient finite samples ({n_finite} < 5)"
+    if reason is None:
+        n_finite = int(np.count_nonzero(
+            np.isfinite(f_arr) & np.isfinite(z_arr.real) & np.isfinite(z_arr.imag)
+        ))
+        reason = f"insufficient finite samples ({n_finite} < 5)"
     parameter_names = NONLINEAR_NAMES if nonlinear else LINEAR_NAMES
     return FitResult(
         success=False,
@@ -1524,6 +1539,24 @@ def _make_result(f, z, z_error, optimizer_z_error, opt, sweep_direction, f0,
     )
 
 
+def _sweep_tone(sweep_data, tone_index):
+    """Extract one tone's ``(frequency, complex S21)`` trace from a sweep dict.
+
+    Lets ``fit_resonance(sweep_data, tone_index)`` accept the same parsed sweep
+    structure ``batch_fit`` takes, instead of making the caller unpack the
+    ``(n_points, n_tones)`` stack by hand. ``tone_axis=1`` matches batch_fit's
+    targeted path (tones are columns).
+    """
+    if tone_index is None or isinstance(tone_index, np.ndarray):
+        raise ValueError(
+            "fit_resonance(sweep_data, tone_index): pass the integer tone "
+            "index to fit when the first argument is a sweep-data dict")
+    sf, z_stack, _ = _prepare_sweep_stack(sweep_data)
+    rows = _stack_rows(sf, z_stack, tone_axis=1)
+    f_row, z_row, _ = rows[int(tone_index)]
+    return f_row, z_row
+
+
 def fit_resonance(f, z, z_err=None, nonlinear=True, sweep_direction="up",
                   initial_guess=None, param_bounds=None, param_fixed=None,
                   max_nfev=1000, tol=1e-8, return_uncertainties=True,
@@ -1600,6 +1633,12 @@ def fit_resonance(f, z, z_err=None, nonlinear=True, sweep_direction="up",
         redundant intermediate result build and sharply cuts the data pickled
         back from worker processes under ``n_jobs > 1``.
     """
+    # Convenience: fit_resonance(sweep_data, tone_index) pulls one tone's
+    # (f, z) trace out of a parsed sweep dict -- the same structure batch_fit
+    # takes -- so the second positional argument (normally ``z``) is read as
+    # the integer tone index. See _sweep_tone.
+    if isinstance(f, dict):
+        f, z = _sweep_tone(f, z)
     # ``nonlinear`` accepts True/False or the string 'auto'. 'auto' runs the
     # cheap linear fit first and only continues to the Duffing fit when that
     # linear fit is judged insufficient (see fit_resonance_nonlinear's
@@ -1629,9 +1668,9 @@ def fit_resonance(f, z, z_err=None, nonlinear=True, sweep_direction="up",
         optimizer_z_err = True if use_error_weights else None
     try:
         f, z, z_error, opt_error = _prepare_arrays(f, z, z_err, optimizer_z_err)
-    except InsufficientSamplesError:
+    except InsufficientSamplesError as exc:
         return _make_insufficient_data_result(
-            f, z, sweep_direction, fit_start, nonlinear=False)
+            f, z, sweep_direction, fit_start, nonlinear=False, reason=str(exc))
     empirical = estimate_resonance_empirical(f, s21=z)
     f0_full = float(np.mean(f))
     if (
@@ -1726,9 +1765,9 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
         optimizer_z_err = True if use_error_weights else None
     try:
         f, z, z_error, opt_error = _prepare_arrays(f, z, z_err, optimizer_z_err)
-    except InsufficientSamplesError:
+    except InsufficientSamplesError as exc:
         return _make_insufficient_data_result(
-            f, z, sweep_direction, fit_start, nonlinear=True)
+            f, z, sweep_direction, fit_start, nonlinear=True, reason=str(exc))
     empirical = estimate_resonance_empirical(f, s21=z)
     f0 = float(np.mean(f))
     if (

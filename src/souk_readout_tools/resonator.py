@@ -950,6 +950,182 @@ def linearized_frequency_and_dissipation(
     return frequency, dissipation
 
 
+class PhaseLookupCalibration:
+    """Fit-free frequency readout by inverting a sweep's phase-vs-frequency curve.
+
+    Where :class:`ResonatorCalibration` needs a resonator fit and
+    :class:`LinearizedResonatorCalibration` linearises about one point (so it
+    saturates for large excursions), this calibration uses the *whole* measured
+    sweep as a lookup table. The resonance loop is centred (Kasa circle fit) and
+    rotated so the off-resonance point sits near ``+/-pi``; the unwrapped phase
+    ``theta(f) = angle(z_centered)`` is then monotonic through resonance, and the
+    inverse ``f(theta)`` maps a measured phase straight back to an equivalent
+    probe frequency. This is exact across the full swept span -- it never
+    linearises -- so it is the natural fallback when a tone will not fit but its
+    sweep still resolves a resonance.
+
+    Build with :meth:`from_sweep`; convert raw timestream IQ with
+    :meth:`convert_raw_iq`. The frequency result follows the same convention as
+    :meth:`ResonatorCalibration.convert_raw_iq`: a probe-side detuning relative
+    to ``reference_frequency`` (positive above it); resonator motion at a fixed
+    probe has the opposite sign. The loss result is the model-free radial proxy
+    ``abs(z_centered) / radius - 1`` (a diagnostic, not a matched
+    ``Delta(1 / (2 * Qi))``).
+
+    Excursions past the swept edges clamp to the sweep endpoints rather than
+    extrapolating, so keep the sweep at least as wide as the timestream's
+    frequency motion.
+
+    **Noise on the steep part matters.** The inverse ``f(theta)`` is read out
+    right where ``theta(f)`` is steepest, so a little IQ noise there turns into a
+    large frequency error if the calibration curve is jagged. ``from_sweep``
+    therefore smooths the complex sweep (Savitzky-Golay over ``smooth_window_hz``)
+    before building the lookup; raise ``smooth_window_hz`` for a noisy sweep.
+    """
+
+    def __init__(self, reference_frequency, center, radius, rotation_angle,
+                 sign, phase_lookup, frequency_lookup, reference_phase):
+        self.reference_frequency = float(reference_frequency)
+        self.center = complex(center)
+        self.radius = float(radius)
+        self.rotation_angle = float(rotation_angle)
+        # +1 or -1: whether unwrapped phase increases or decreases with
+        # frequency through resonance. Folded into the stored lookup and the
+        # reference phase, and re-applied to measured angles in convert_raw_iq.
+        self.sign = float(sign)
+        # Strictly ascending phase and the sweep frequency at each phase, for
+        # np.interp inversion.
+        self.phase_lookup = np.asarray(phase_lookup, dtype=float)
+        self.frequency_lookup = np.asarray(frequency_lookup, dtype=float)
+        # Centred phase at the parked tone; measured angles are folded onto the
+        # branch nearest this so the inversion stays single-valued within a loop.
+        self.reference_phase = float(reference_phase)
+
+    @classmethod
+    def from_sweep(cls, frequencies, s21, reference_frequency,
+                   smooth_window_hz=1000, min_phase_progress=0.5):
+        """Build a phase lookup from one complex sweep trace.
+
+        Pass a **targeted, single-resonance** sweep (the same trace you would
+        fit). ``reference_frequency`` is the parked-tone frequency the timestream
+        is read out at (only the detuning origin; it need not be a sweep point).
+        ``smooth_window_hz`` sets the Savitzky-Golay smoothing applied to the
+        complex sweep before the lookup is built -- raise it for a noisy sweep,
+        pass 0/None to disable. ``min_phase_progress`` is the minimum ratio of
+        net phase travel to total variation required to accept the loop as
+        invertible (~1 for a clean resonance, ~0 for noise); below it the sweep
+        is rejected as having no resolved resonance.
+        """
+        frequencies = np.asarray(frequencies, dtype=float).ravel()
+        z = np.asarray(s21, dtype=complex).ravel()
+        if frequencies.size != z.size:
+            raise ValueError("frequencies and s21 must be matching 1-D arrays")
+        if frequencies.size < 5:
+            raise ValueError("at least five sweep points are required")
+        order = np.argsort(frequencies)
+        f = frequencies[order]
+        z = z[order]
+        # A collapsed sweep (frequency never advances for most points) has no
+        # invertible phase curve; reject it up front with the same criterion the
+        # fitter uses, rather than letting circle-fit noise sneak through.
+        if np.median(np.diff(f)) <= 0.0:
+            raise ValueError(
+                "degenerate sweep: frequency did not advance across the majority "
+                "of points; cannot build a phase lookup")
+        # Smooth the complex sweep before taking angles: noise on the steep part
+        # of theta(f) is what limits a lookup inverter (see class docstring).
+        # Same window policy as LinearizedResonatorCalibration.
+        if smooth_window_hz:
+            step_hz = float(np.median(np.abs(np.diff(f))))
+            if step_hz > 0.0:
+                window = max(3, int(float(smooth_window_hz) / step_hz))
+                window = min(window, f.size)
+                if window % 2 == 0:
+                    window -= 1
+                if window >= 3:
+                    z = (signal.savgol_filter(z.real, window, 1)
+                         + 1j * signal.savgol_filter(z.imag, window, 1))
+        # Work in the centred basis: the raw notch phase (angle about the origin)
+        # is not monotonic with frequency, but the angle about the resonance
+        # circle's centre sweeps monotonically through the loop. Centre (Kasa
+        # fit) then rotate off-resonance to +/-pi so on-resonance sits near 0.
+        _, center, radius = center_circle(z)
+        _, rotation_angle = rotate_to_real_axis(z - center)
+        z_centered = (z - center) * np.exp(1j * rotation_angle)
+        theta_f = np.unwrap(np.angle(z_centered))  # phase in frequency order
+        # The inverse f(theta) only exists if theta advances monotonically
+        # through resonance. Judge that by net travel vs total variation (~1 for
+        # a clean loop, ~0 for noise); a backward-step count would wrongly reject
+        # the flat, noise-dominated off-resonance tails of a real sweep.
+        dtheta = np.diff(theta_f)
+        total_variation = float(np.sum(np.abs(dtheta)))
+        net_travel = float(abs(np.sum(dtheta)))
+        if total_variation <= 0.0 or net_travel < min_phase_progress * total_variation:
+            raise ValueError(
+                "sweep phase is not monotonic through resonance; cannot build a "
+                "phase lookup (loop too noisy or no resolved resonance)")
+        sign = 1.0 if np.sum(dtheta) >= 0.0 else -1.0
+        theta_f = sign * theta_f
+        reference_phase = float(np.interp(float(reference_frequency), f, theta_f))
+        # Sort by ascending phase and drop ties so np.interp stays single-valued.
+        p_order = np.argsort(theta_f)
+        phase_lookup = theta_f[p_order]
+        frequency_lookup = f[p_order]
+        keep = np.concatenate(([True], np.diff(phase_lookup) > 0.0))
+        return cls(
+            reference_frequency, center, radius, rotation_angle, sign,
+            phase_lookup[keep], frequency_lookup[keep], reference_phase,
+        )
+
+    def convert_raw_iq(self, s21, *, fractional=True):
+        """Convert raw timestream IQ to (probe detuning, radial loss proxy).
+
+        ``fractional`` divides the detuning by ``reference_frequency``. The loss
+        proxy ``abs(z_centered) / radius - 1`` is dimensionless and returned
+        unscaled either way.
+        """
+        z = np.asarray(s21, dtype=complex)
+        z_centered = (z - self.center) * np.exp(1j * self.rotation_angle)
+        theta = self.sign * np.angle(z_centered)
+        # Fold each measured angle onto the 2*pi branch nearest the parked
+        # reference phase. This tracks the whole resonance loop (far past where a
+        # linearised readout saturates) and, unlike folding into a fixed range,
+        # stays correct when a cable-delay ramp makes the sweep span exceed 2*pi.
+        # Excursions beyond ~half a loop from park are inherently ambiguous.
+        theta += 2.0 * np.pi * np.round(
+            (self.reference_phase - theta) / (2.0 * np.pi))
+        f_equiv = np.interp(theta, self.phase_lookup, self.frequency_lookup)
+        df = f_equiv - self.reference_frequency
+        radial = np.abs(z_centered) / self.radius - 1.0
+        if fractional:
+            return df / self.reference_frequency, radial
+        return df, radial
+
+
+def phase_lookup_frequency_and_dissipation(
+        sweep_frequencies, sweep_s21, reference_frequency, timestream_s21,
+        smooth_window_hz=1000, *, fractional=True, return_calibration=False):
+    """Convert raw IQ by inverting the sweep's phase curve (fit-free fallback).
+
+    Mirrors :func:`linearized_frequency_and_dissipation` but inverts the whole
+    resonance loop instead of linearising about the parked tone, so it tracks
+    large signals far past where the linear readout saturates. Returns
+    ``(frequency, radial_loss_proxy)``; see :class:`PhaseLookupCalibration` for
+    conventions.
+    """
+    calibration = PhaseLookupCalibration.from_sweep(
+        sweep_frequencies,
+        sweep_s21,
+        reference_frequency,
+        smooth_window_hz=smooth_window_hz,
+    )
+    frequency, dissipation = calibration.convert_raw_iq(
+        timestream_s21, fractional=fractional)
+    if return_calibration:
+        return frequency, dissipation, calibration
+    return frequency, dissipation
+
+
 def calibration_for_tone(calibrations, tone_index):
     """Resolve one per-tone calibration from a mapping, sequence, or fit."""
     if calibrations is None:

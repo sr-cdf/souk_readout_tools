@@ -447,15 +447,23 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
         -> complex ``z`` of shape ``(n_cycles, N, n_tones)``. ``None`` retains the
         sample axis -> ``(n_cycles, N, n_used, n_tones)`` (``n_used`` = kept
         dwell samples per point; assumed constant).
-    on_missing : {'notify', 'fill'}, optional
-        How to handle gaps in ``packet_counter`` (dropped accumulations).
-        ``'notify'`` (default) issues a warning reporting the number and location
-        of missing packets and proceeds (cycles straddling a gap are simply
-        dropped, since they are incomplete). ``'fill'`` additionally rebuilds the
-        stream on a contiguous counter axis with **NaN-IQ placeholders** for the
-        missing packets (their point/settling inferred from the deterministic
-        cadence), so affected cycles still appear in the output with NaN where
-        data was lost. A warning is always emitted when packets are missing.
+    on_missing : {'notify', 'fill', 'interpolate'}, optional
+        How to handle gaps in ``packet_counter`` (dropped accumulations). A
+        warning reporting the number and location of missing packets is always
+        emitted when packets are missing.
+        ``'notify'`` (default) proceeds without reconstruction (cycles straddling
+        a gap are simply dropped, since they are incomplete).
+        ``'fill'`` rebuilds the stream on a contiguous counter axis with
+        **NaN-IQ placeholders** for the missing packets (their point/settling
+        inferred from the deterministic cadence), so affected cycles still appear
+        in the output with NaN where data was lost.
+        ``'interpolate'`` reconstructs the same contiguous axis but linearly
+        interpolates each missing sample's I/Q from the real samples probing the
+        **same modulation point** (so the uniform cycle-rate sampling a PSD needs
+        is preserved across any gap, large or small); gaps at the very start/end
+        hold the nearest valid value, and a point with no real samples is left
+        NaN. Interpolated samples keep their ``sample_present=False`` /
+        ``packet_missing=True`` provenance so they stay identifiable.
     include_settling : bool, optional
         If ``False`` (default), drop samples with ``modulation_settling==1``.
         If ``True``, keep them in the grouped ``z`` and metadata arrays while
@@ -492,6 +500,9 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
         raise ValueError('tone_modulation_state has num_points < 1; is modulation armed?')
     if reduce not in ('mean', None):
         raise ValueError(f"reduce must be 'mean' or None, got {reduce!r}")
+    if on_missing not in ('notify', 'fill', 'interpolate'):
+        raise ValueError(
+            f"on_missing must be 'notify', 'fill' or 'interpolate', got {on_missing!r}")
 
     points = np.asarray(data_dict['modulation_point'], dtype=int)
     settling = np.asarray(data_dict['modulation_settling'], dtype=int)
@@ -519,8 +530,9 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
         modulating = (points >= 1) & (points <= N)
         z[modulating] = z[modulating] * readout_corr[points[modulating] - 1, :]
 
-    # Detect dropped accumulations via the packet counter, and either notify or
-    # fill the gaps with NaN placeholders (their tag inferred from the cadence).
+    # Detect dropped accumulations via the packet counter, and (per on_missing)
+    # notify only, fill the gaps with NaN placeholders, or interpolate them
+    # (their tag inferred from the cadence in either reconstruction path).
     pc = data_dict.get('packet_counter')
     source_indices = sample_index.copy()
     if pc is not None:
@@ -535,7 +547,7 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
                 f'[(after_counter, n_missing), ...]: {locs}'
                 + (' ...' if len(gap_at) > 5 else ''),
                 stacklevel=2)
-            if on_missing == 'fill':
+            if on_missing in ('fill', 'interpolate'):
                 filled = _reconstruct_contiguous(
                     pc, points, settling, revisions, z,
                     N, int(tone_modulation_state.get('samples_per_point', 1)),
@@ -546,10 +558,18 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
                 else:
                     pc, points, settling, revisions, z, sample_present, source_indices = filled
                     sample_index = source_indices.copy()
-            elif on_missing != 'notify':
-                raise ValueError(f"on_missing must be 'notify' or 'fill', got {on_missing!r}")
-    elif on_missing not in ('notify', 'fill'):
-        raise ValueError(f"on_missing must be 'notify' or 'fill', got {on_missing!r}")
+                    if on_missing == 'interpolate':
+                        # Fill the NaN-IQ placeholders per modulation point, so a
+                        # reconstructed sample is interpolated only from real
+                        # samples at the same probe frequency (never across
+                        # neighbouring points), keeping the cycle-rate sampling
+                        # uniform across the gap.
+                        inserted = ~sample_present
+                        for p in range(1, N + 1):
+                            targets = (points == p) & inserted
+                            if np.any(targets):
+                                z = _interp_nan_targets(
+                                    z, targets, (points == p) & sample_present)
 
     n_samples = len(points)
 
