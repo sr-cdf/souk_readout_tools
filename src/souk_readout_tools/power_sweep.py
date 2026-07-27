@@ -19,6 +19,18 @@ Workflow
 
        arrays = ps.best_power_arrays(analysis["best_power"])
 
+   Taking the run with ``direction='both'`` sweeps each power step up and
+   then down.  Above the bifurcation power the two directions follow
+   different branches, so the bifurcation power is *measured* rather than
+   extrapolated from the fitted ``anl``, and the two estimates check each
+   other::
+
+       run = ps.run_power_sweep(client, centers, spans, powers_dbm,
+                                output_dir="kid_power_sweep",
+                                direction="both")
+       analysis = ps.analyse_power_sweep(run)     # p_hyst_onset vs p_bif
+       ps.hysteresis_metrics(run)                 # or the raw comparison
+
 3. Optionally balance the comb — re-allocate the per-tone powers under
    bifurcation caps and TX/RX spread constraints::
 
@@ -30,6 +42,8 @@ Pieces
 The procedures above are assembled from these, all callable directly:
 
 ======================  =====================================================
+hysteresis_metrics      up-vs-down sweep comparison, per tone and power
+hysteresis_onset        one tone's measured bifurcation bracket
 fit_power_sweep         fit every tone at every power -> ``fit_data``
 parameter_series        one tone's fitted parameters vs power, as 1D arrays
 fit_summary_array       ``fit_data`` as one flat structured table
@@ -119,6 +133,9 @@ __all__ = [
     "load_power_sweep",
     "analyse_power_sweep",
     "load_analysis",
+    # Bidirectional runs: measured bifurcation
+    "hysteresis_metrics",
+    "hysteresis_onset",
     # Fitting and the fit-summary table
     "fit_power_sweep",
     "parameter_series",
@@ -558,6 +575,7 @@ def run_power_sweep(
     adc_cal_settle_time=2.0,
     file_format="npz",
     follow_dips=True,
+    follow_dips_from="down",
     follow_min_depth_db=0.5,
     search_for_center=None,
     verbose=True,
@@ -600,8 +618,22 @@ def run_power_sweep(
         Frequency points per sweep (default ``201``).
     samples_per_point : int, optional
         Averaging samples per sweep point (default ``10``).
-    direction : {'up', 'down'}, optional
-        Sweep direction in frequency (default ``'up'``).
+    direction : {'up', 'down', 'both'}, optional
+        Sweep direction in frequency (default ``'up'``).  ``'both'`` takes
+        two sweeps at every power step — one upward, then one downward over
+        the same centers and spans — which doubles the sweep time but makes
+        bifurcation directly measurable: above the bifurcation power the two
+        traces separate (hysteresis) and the swept branch shows a
+        discontinuous jump.  The upward sweep remains the canonical saved
+        sweep, so every downstream fit/plot behaves exactly as for
+        ``'up'``; the downward sweep is saved alongside it and analysed by
+        :py:func:`hysteresis_metrics`.
+
+        The spans must be wider than the bistable region for this to mean
+        anything: both sweeps have to *start* off resonance, or the branch
+        the resonator lands on is undefined.  ``hysteresis_metrics`` flags
+        tones whose jump sits at a sweep edge (``jump_at_edge``) so a too
+        narrow span is visible rather than silent.
     phases : {'newman', None} or array-like, optional
         Tone phase scheme:
 
@@ -665,6 +697,13 @@ def run_power_sweep(
         in each regular tone's full trace and use those frequencies as the
         next step's centers.  Blind tones (per ``client.get_tone_metadata``)
         are always left at their current frequency.  Default ``True``.
+    follow_dips_from : {'down', 'up'}, optional
+        Which trace ``follow_dips`` recenters on when ``direction='both'``
+        (default ``'down'``).  The downward sweep follows the high-field
+        branch into the dip, so its minimum tracks the driven resonance
+        even once the resonator is bifurcated, whereas the upward sweep's
+        minimum sits at the jump discontinuity and lags.  Ignored (the only
+        recorded trace is used) for a single-direction run.
     follow_min_depth_db : float or None, optional
         Minimum dip depth in dB required for a candidate to be accepted
         by ``follow_dips`` (default ``0.5`` dB, matching
@@ -707,6 +746,18 @@ def run_power_sweep(
     """
     if str(file_format).lstrip(".") != "npz":
         raise ValueError("run_power_sweep stores sweep artifacts as npz.")
+
+    # 'both' takes an up sweep and a down sweep at every step; the up sweep is
+    # the canonical one every existing consumer reads, the down sweep rides
+    # alongside it for the hysteresis check.
+    direction = str(direction).lower()
+    if direction not in {"up", "down", "both"}:
+        raise ValueError("direction must be 'up', 'down', or 'both'.")
+    bidirectional = direction == "both"
+    primary_direction = "up" if bidirectional else direction
+    follow_dips_from = str(follow_dips_from).lower()
+    if follow_dips_from not in {"up", "down"}:
+        raise ValueError("follow_dips_from must be 'up' or 'down'.")
 
     # --- Put the sweep inputs into the shapes the client uses: one center and
     # span per tone, and one requested power vector per sweep step. ---
@@ -763,6 +814,7 @@ def run_power_sweep(
             "points": int(points),
             "samples_per_point": int(samples_per_point),
             "direction": direction,
+            "bidirectional": bidirectional,
             "phase_mode": phase_mode,
             "reference_plane": reference_plane,
             "optimise_dynamic_range": bool(optimise_dynamic_range),
@@ -771,6 +823,7 @@ def run_power_sweep(
             "refresh_adc_cal": bool(refresh_adc_cal),
             "adc_cal_settle_time_s": float(adc_cal_settle_time),
             "follow_dips": follow_dips,
+            "follow_dips_from": follow_dips_from,
             "search_for_center": search_for_center,
             "search_span_factor": search_span_factor,
             "tone_count": int(initial_centers.size),
@@ -871,6 +924,46 @@ def run_power_sweep(
         step["error"] = str(reason)
         step["finished"] = _timestamp()
 
+    def _park_tones(park_centers, park_spans, park_direction):
+        """Park the tones just outside the edge the sweep starts from.
+
+        An upward sweep starts at the low edge and a downward one at the high
+        edge.  Parking there rather than on resonance means each direction
+        enters the bistable region from outside it, which is what makes the
+        two branches (and so the hysteresis) well defined.  Parking also keeps
+        any RX optimisation inside ``set_tone_powers`` looking at the highest
+        level the sweep reaches instead of the dip."""
+        edge = -0.5 if park_direction == "up" else 0.5
+        _progress(
+            verbose,
+            f"  Parking {park_centers.size} tones at sweep "
+            f"{'low' if edge < 0 else 'high'} edge",
+        )
+        _require_success(
+            client.set_tone_frequencies(park_centers + edge * park_spans),
+            "set_tone_frequencies failed",
+        )
+
+    def _sweep_and_parse(sweep_centers, sweep_spans, sweep_direction,
+                         sweep_phases, refresh_cal):
+        """Run one targeted sweep and return the parsed sweep data."""
+        _progress(verbose, f"  Running targeted {sweep_direction} sweep")
+        _require_success(
+            client.perform_sweep(
+                sweep_centers, sweep_spans, points=int(points),
+                samples_per_point=int(samples_per_point),
+                direction=sweep_direction,
+                phases=sweep_phases, refresh_adc_cal=refresh_cal,
+                adc_cal_settle_time=adc_cal_settle_time,
+            ),
+            "perform_sweep failed",
+        )
+        client.wait_for_sweep(progress_bar=verbose)
+        data = client.parse_sweep_data(client.get_sweep_data())
+        data["tone_metadata"] = client.get_tone_metadata()
+        data["sweep_direction"] = sweep_direction
+        return data
+
     try:
         # Optional center search: one discarded sweep (at the first requested
         # power, optionally over wider spans) used only to recenter on the
@@ -894,14 +987,9 @@ def run_power_sweep(
                 if phase_mode == "newman"
                 else phase_values
             )
-            # Park tones off-resonance (sweep low edge) before set_tone_powers so
-            # any rx optimisation sees the highest rx level the sweep reaches, not
-            # the on-resonance dip.  perform_sweep restores them before sweeping.
-            _progress(verbose, f"  Parking {centers.size} tones at sweep low edge")
-            _require_success(
-                client.set_tone_frequencies(centers - search_spans / 2.0),
-                "set_tone_frequencies failed",
-            )
+            # Park tones off-resonance before set_tone_powers; perform_sweep
+            # restores them before sweeping.
+            _park_tones(centers, search_spans, primary_direction)
             if search_phases is not None:
                 _progress(verbose, "  Setting tone phases")
                 _require_success(
@@ -926,19 +1014,10 @@ def run_power_sweep(
             if settle_time:
                 _progress(verbose, f"  Settling for {float(settle_time):g} s")
                 time.sleep(float(settle_time))
-            _progress(verbose, "  Running targeted sweep")
-            _require_success(
-                client.perform_sweep(
-                    centers, search_spans, points=int(points),
-                    samples_per_point=int(samples_per_point), direction=direction,
-                    phases=search_phases, refresh_adc_cal=refresh_adc_cal,
-                    adc_cal_settle_time=adc_cal_settle_time,
-                ),
-                "perform_sweep failed",
+            search_sweep = _sweep_and_parse(
+                centers, search_spans, primary_direction, search_phases,
+                refresh_adc_cal,
             )
-            client.wait_for_sweep(progress_bar=verbose)
-            search_sweep = client.parse_sweep_data(client.get_sweep_data())
-            search_sweep["tone_metadata"] = client.get_tone_metadata()
 
             new_centers, search_record = _find_dip_centers(
                 search_sweep, centers, search_spans, follow_min_depth_db
@@ -1023,13 +1102,7 @@ def run_power_sweep(
                     step["metadata"]["tone_phases_rad"] = step_phases.tolist()
 
                 # Park, power, settle, sweep (same sequence as the center search).
-                _progress(
-                    verbose, f"  Parking {centers.size} tones at sweep low edge"
-                )
-                _require_success(
-                    client.set_tone_frequencies(centers - spans / 2.0),
-                    "set_tone_frequencies failed",
-                )
+                _park_tones(centers, spans, primary_direction)
                 if step_phases is not None:
                     _progress(verbose, "  Setting tone phases")
                     _require_success(
@@ -1055,47 +1128,65 @@ def run_power_sweep(
                 if settle_time:
                     _progress(verbose, f"  Settling for {float(settle_time):g} s")
                     time.sleep(float(settle_time))
-                _progress(verbose, "  Running targeted sweep")
-                _require_success(
-                    client.perform_sweep(
-                        centers, spans, points=int(points),
-                        samples_per_point=int(samples_per_point),
-                        direction=direction,
-                        phases=step_phases, refresh_adc_cal=refresh_adc_cal,
-                        adc_cal_settle_time=adc_cal_settle_time,
-                    ),
-                    "perform_sweep failed",
+                sweep_data = _sweep_and_parse(
+                    centers, spans, primary_direction, step_phases,
+                    refresh_adc_cal,
                 )
-                client.wait_for_sweep(progress_bar=verbose)
-                sweep_data = client.parse_sweep_data(client.get_sweep_data())
-                sweep_data["tone_metadata"] = client.get_tone_metadata()
+
+                # Reverse sweep for the hysteresis check.  It reuses the ADC
+                # calibration the up sweep just ran with (refresh_adc_cal is
+                # forced False here) so the pair differs only by direction --
+                # a refresh in between would move the gain and swamp the small
+                # difference we are trying to measure.
+                reverse_sweep = None
+                if bidirectional:
+                    _park_tones(centers, spans, "down")
+                    reverse_sweep = _sweep_and_parse(
+                        centers, spans, "down", step_phases, False,
+                    )
 
                 readback = np.asarray(
                     client.get_tone_powers(reference_plane=reference_plane),
                     dtype=float,
                 ).ravel()
                 step["readback"]["tone_power_dbm"] = readback.tolist()
-                sweep_data["requested_tone_powers_dbm"] = requested.copy()
-                sweep_data["readback_tone_powers_dbm"] = readback.copy()
-                sweep_data["tone_powers_reference_plane"] = reference_plane
-                sweep_data["sweep_centers_hz"] = centers.copy()
+                for data in (sweep_data, reverse_sweep):
+                    if data is None:
+                        continue
+                    data["requested_tone_powers_dbm"] = requested.copy()
+                    data["readback_tone_powers_dbm"] = readback.copy()
+                    data["tone_powers_reference_plane"] = reference_plane
+                    data["sweep_centers_hz"] = centers.copy()
 
                 # If requested, find the measured dip in each regular trace and
                 # use it as the next step's center.  Blind tones are left fixed.
+                # With both directions recorded the downward trace is followed
+                # by default: it rides the high-field branch into the dip, so
+                # its minimum still tracks the driven resonance once the tone
+                # is bifurcated, where the upward trace's minimum sits at the
+                # jump and lags behind.
+                follow_source = sweep_data
+                follow_label = primary_direction
+                if reverse_sweep is not None and follow_dips_from == "down":
+                    follow_source = reverse_sweep
+                    follow_label = "down"
                 next_centers = centers.copy()
                 if follow_dips:
                     next_centers, follow_record = _find_dip_centers(
-                        sweep_data, centers, spans, follow_min_depth_db
+                        follow_source, centers, spans, follow_min_depth_db
                     )
+                    follow_record["source_direction"] = follow_label
                     sweep_data["follow_dips"] = follow_record
                     sweep_data["next_sweep_centers_hz"] = next_centers.copy()
                     blind_count = len(follow_record["blind_indices"])
                     _progress(
                         verbose,
-                        f"  Following dips: {int(np.sum(follow_record['accepted']))}/"
+                        f"  Following dips ({follow_label} sweep): "
+                        f"{int(np.sum(follow_record['accepted']))}/"
                         f"{centers.size - blind_count} centers updated",
                     )
                 step["metadata"]["next_centers_hz"] = next_centers.tolist()
+                step["metadata"]["follow_dips_source"] = follow_label
 
                 rel_path = f"data/step_{index:04d}_sweep.npz"
                 _save_npz(output_dir / rel_path, sweep_data)
@@ -1115,6 +1206,27 @@ def run_power_sweep(
                     "created": _timestamp(),
                 })
                 _progress(verbose, f"  Saved {rel_path}")
+
+                if reverse_sweep is not None:
+                    down_path = f"data/step_{index:04d}_sweep_down.npz"
+                    _save_npz(output_dir / down_path, reverse_sweep)
+                    step["artifacts"].append({
+                        "name": f"step_{index:04d}_sweep_down",
+                        "kind": "sweep_down",
+                        "path": down_path,
+                        "format": "npz",
+                        "metadata": {
+                            "reference_plane": reference_plane,
+                            "requested_tone_powers_dbm": requested.tolist(),
+                            "readback_tone_powers_dbm": readback.tolist(),
+                            "centers_hz": centers.tolist(),
+                            "spans_hz": spans.tolist(),
+                            "direction": "down",
+                            "system_info_source": "embedded",
+                        },
+                        "created": _timestamp(),
+                    })
+                    _progress(verbose, f"  Saved {down_path}")
 
                 step["status"] = "success"
                 step["finished"] = _timestamp()
@@ -1204,6 +1316,7 @@ def _power_sweep_run_view(run):
     sweeps, files, powers, readback, centers, next_centers, steps = (
         [], [], [], [], [], [], []
     )
+    sweeps_down, files_down = [], []
     for step in manifest.get("steps", []):
         step_meta = step.get("metadata", {})
         # Each step's sweep is stored as an npz artifact; load it (or keep a
@@ -1223,6 +1336,24 @@ def _power_sweep_run_view(run):
             sweeps.append(None)
             files.append("")
             sweep_file = None
+        # A run taken with direction='both' also stores the reverse sweep;
+        # older runs simply have no such artifact and get a None placeholder.
+        down_artifact = next(
+            (art for art in step.get("artifacts", [])
+             if art.get("kind") == "sweep_down"),
+            None,
+        )
+        if down_artifact is not None:
+            down_path = Path(down_artifact["path"])
+            if not down_path.is_absolute():
+                down_path = root / down_path
+            sweeps_down.append(_load_npz(down_path))
+            files_down.append(str(down_path))
+            sweep_down_file = down_artifact["path"]
+        else:
+            sweeps_down.append(None)
+            files_down.append("")
+            sweep_down_file = None
         power = np.asarray(
             step.get("axis", {}).get("tone_power_dbm", []), dtype=float
         ).ravel()
@@ -1247,6 +1378,7 @@ def _power_sweep_run_view(run):
             "centers_hz": step_centers.tolist(),
             "next_centers_hz": step_next_centers.tolist(),
             "sweep_file": sweep_file,
+            "sweep_down_file": sweep_down_file,
             "metadata": step_meta,
         })
 
@@ -1280,7 +1412,10 @@ def _power_sweep_run_view(run):
         "spans_hz": np.asarray(parameters.get("spans_hz", []), dtype=float),
         "steps": steps,
         "sweeps": sweeps,
+        "sweeps_down": sweeps_down,
         "files": files,
+        "files_down": files_down,
+        "bidirectional": any(sweep is not None for sweep in sweeps_down),
         "powers_dbm": powers,
         "readback_powers_dbm": readback,
         "centers_by_step_hz": centers,
@@ -1337,6 +1472,493 @@ def _power_for_tone(run, sweep_index, tone_index, use_readback=True):
     return np.nan
 
 
+# --- Hysteresis: the measured bifurcation power -------------------------------
+#
+# A Duffing resonator driven past ``anl = 4/(3*sqrt(3))`` is bistable over a
+# range of detunings: the upward and downward sweeps follow different branches
+# and each jumps discontinuously where its branch ends.  Below that power the
+# two traces lie on top of each other.  So a run taken with
+# ``direction='both'`` brackets the bifurcation power directly, without
+# extrapolating the fitted ``anl`` -- and the two numbers can be checked
+# against each other (see :py:func:`find_best_power`).
+
+DEFAULT_HYSTERESIS_SIGMA = 5.0
+DEFAULT_HYSTERESIS_AREA = 0.02
+DEFAULT_HYSTERESIS_SPLIT_WIDTHS = 0.1
+DEFAULT_HYSTERESIS_EDGE_FRACTION = 0.05
+DEFAULT_HYSTERESIS_BASELINE_FRACTION = 0.1
+
+# 1 / (sqrt(6) * 0.6745): converts the median |second difference| of a trace
+# into a per-point Gaussian sigma (the second difference of white noise has
+# variance 6*sigma^2, and median|x| = 0.6745*sigma for a Gaussian).
+_SECOND_DIFF_TO_SIGMA = 1.0 / (np.sqrt(6.0) * 0.6744897501960817)
+
+HYSTERESIS_COLUMNS = (
+    ("sweep_index", np.int64),
+    ("tone_index", np.int64),
+    ("power_dbm", float),
+    ("readback_power_dbm", float),
+    ("hyst_sigma", float),
+    ("hyst_area", float),
+    ("hyst_split_hz", float),
+    ("hyst_split_widths", float),
+    ("jump_ratio_up", float),
+    ("jump_ratio_down", float),
+    ("jump_f_up_hz", float),
+    ("jump_f_down_hz", float),
+    ("empirical_width_hz", float),
+    ("hyst_n_points", np.int64),
+    ("noise_from_errors", np.bool_),
+    ("jump_at_edge", np.bool_),
+    ("hysteretic", np.bool_),
+)
+
+# The subset merged into the fit summary (and so visible to find_best_power,
+# parameter_series, and the CSV) -- everything except the two index columns
+# the merge joins on.
+_HYSTERESIS_SUMMARY_KEYS = tuple(
+    name for name, _ in HYSTERESIS_COLUMNS
+    if name not in {"sweep_index", "tone_index", "power_dbm",
+                    "readback_power_dbm"}
+)
+
+
+def _trace_noise_sigma(z):
+    """Per-point noise sigma estimated from a trace's own second difference.
+
+    Used when a sweep carries no ``sweep_ei`` / ``sweep_eq`` errors.  The
+    second difference kills any smooth resonance shape, so what is left is
+    noise -- a self-calibrating estimate that needs no external scale.
+    """
+    z = np.asarray(z, dtype=complex).ravel()
+    if z.size < 5:
+        return np.nan
+    d2 = z[2:] - 2.0 * z[1:-1] + z[:-2]
+    sigmas = []
+    for component in (d2.real, d2.imag):
+        good = np.isfinite(component)
+        if np.count_nonzero(good) < 3:
+            return np.nan
+        sigmas.append(
+            float(np.median(np.abs(component[good]))) * _SECOND_DIFF_TO_SIGMA
+        )
+    return float(np.mean(sigmas))
+
+
+def _jump_ratio(f, z):
+    """Largest single-point step in a trace, against its 90th percentile.
+
+    A branch that ends at a bifurcation crosses the bistable gap in one
+    point, so its largest step stands out from the rest of the steep part of
+    the trace.  Reported as a diagnostic rather than used for the verdict:
+    the absolute scale depends on how densely the sweep samples the
+    linewidth (an undersampled smooth resonance also moves a long way per
+    point), whereas the up/down difference statistics do not.  Comparing
+    against the 90th percentile rather than the median at least removes the
+    dependence on how much off-resonance baseline the span contains.
+
+    Returns ``(ratio, jump_frequency_hz, index_fraction)``, where the last
+    value is the position of the jump along the trace (0 at the first point,
+    1 at the last) so a jump sitting at a sweep edge can be spotted.
+    """
+    f = np.asarray(f, dtype=float).ravel()
+    z = np.asarray(z, dtype=complex).ravel()
+    if f.size < 4:
+        return np.nan, np.nan, np.nan
+    steps = np.abs(np.diff(z))
+    good = np.isfinite(steps)
+    if np.count_nonzero(good) < 3:
+        return np.nan, np.nan, np.nan
+    reference = float(np.percentile(steps[good], 90))
+    if not (np.isfinite(reference) and reference > 0.0):
+        return np.nan, np.nan, np.nan
+    idx = int(np.flatnonzero(good)[np.argmax(steps[good])])
+    ratio = float(steps[idx] / reference)
+    f_jump = float(0.5 * (f[idx] + f[idx + 1]))
+    position = float((idx + 0.5) / max(steps.size, 1))
+    return ratio, f_jump, position
+
+
+def _sorted_trace(sweep, tone_index):
+    """Return ``(f, z, sigma_per_point)`` for one tone, sorted by frequency.
+
+    A downward sweep is stored in the order it was taken, so the arrays come
+    back descending; sorting here lets the two directions be compared point
+    for point.  ``sigma_per_point`` is ``NaN`` when the sweep carries no
+    error arrays.
+    """
+    if not isinstance(sweep, dict):
+        return None
+    f = np.atleast_2d(np.asarray(sweep["sweep_f"], dtype=float))
+    i = np.atleast_2d(np.asarray(sweep["sweep_i"], dtype=float))
+    q = np.atleast_2d(np.asarray(sweep["sweep_q"], dtype=float))
+    if tone_index >= f.shape[1]:
+        return None
+    f = f[:, tone_index]
+    z = i[:, tone_index] + 1j * q[:, tone_index]
+    if "sweep_ei" in sweep and "sweep_eq" in sweep:
+        ei = np.atleast_2d(np.asarray(sweep["sweep_ei"], dtype=float))[:, tone_index]
+        eq = np.atleast_2d(np.asarray(sweep["sweep_eq"], dtype=float))[:, tone_index]
+        sigma = 0.5 * (np.abs(ei) + np.abs(eq))
+    else:
+        sigma = np.full(f.size, np.nan)
+    good = np.isfinite(f) & np.isfinite(z.real) & np.isfinite(z.imag)
+    if np.count_nonzero(good) < 4:
+        return None
+    f, z, sigma = f[good], z[good], sigma[good]
+    order = np.argsort(f)
+    return f[order], z[order], sigma[order]
+
+
+def _hysteresis_row(sweep_up, sweep_down, tone_index, *, baseline_fraction,
+                    edge_fraction):
+    """Compare one tone's upward and downward traces at a single power.
+
+    Returns the raw (unthresholded) metrics as a dict; the caller applies the
+    detection thresholds.
+    """
+    blank = {name: np.nan for name, _ in HYSTERESIS_COLUMNS}
+    blank["hyst_n_points"] = 0
+    blank["noise_from_errors"] = False
+    blank["jump_at_edge"] = False
+
+    up = _sorted_trace(sweep_up, tone_index)
+    down = _sorted_trace(sweep_down, tone_index)
+    if up is None or down is None:
+        return blank
+    f_up, z_up, sigma_up = up
+    f_down, z_down, sigma_down = down
+
+    # Put the downward trace on the upward trace's frequency grid.  They are
+    # the same grid reversed for a normal run, so this is usually exact; it
+    # also copes with a re-centred or differently gridded pair.
+    lo = max(f_up[0], f_down[0])
+    hi = min(f_up[-1], f_down[-1])
+    inside = (f_up >= lo) & (f_up <= hi)
+    if np.count_nonzero(inside) < 4:
+        return blank
+    f = f_up[inside]
+    z_a = z_up[inside]
+    sigma_a = sigma_up[inside]
+    z_b = np.interp(f, f_down, z_down.real) + 1j * np.interp(f, f_down, z_down.imag)
+    sigma_b = np.interp(f, f_down, sigma_down)
+
+    # Noise per point: measured errors when the sweeps carry them, otherwise
+    # estimated from the traces themselves.
+    noise_from_errors = bool(
+        np.all(np.isfinite(sigma_a)) and np.all(np.isfinite(sigma_b))
+        and np.all(sigma_a > 0.0) and np.all(sigma_b > 0.0)
+    )
+    if noise_from_errors:
+        variance = sigma_a ** 2 + sigma_b ** 2
+    else:
+        est = np.array([_trace_noise_sigma(z_a), _trace_noise_sigma(z_b)])
+        if not np.all(np.isfinite(est)) or not np.all(est > 0.0):
+            variance = None
+        else:
+            variance = np.full(f.size, float(np.sum(est ** 2)))
+
+    # Significance: chi-square of the complex difference against the noise,
+    # as a z-score.  Under the null (no hysteresis) chi2 has 2N degrees of
+    # freedom, so (chi2 - 2N) / sqrt(4N) is ~N(0, 1) whatever the array size
+    # or the units of the readout.
+    difference = z_a - z_b
+    if variance is None:
+        hyst_sigma = np.nan
+    else:
+        chi2 = float(
+            np.sum(difference.real ** 2 / variance)
+            + np.sum(difference.imag ** 2 / variance)
+        )
+        dof = 2.0 * f.size
+        hyst_sigma = float((chi2 - dof) / np.sqrt(2.0 * dof))
+
+    # Area: the mean separation of the two traces as a fraction of the dip
+    # depth, i.e. "how far apart are the branches compared with the feature
+    # they sit in".  Dimensionless and insensitive to overall gain.
+    mean_trace = 0.5 * (z_a + z_b)
+    n_edge = max(int(round(baseline_fraction * f.size)), 1)
+    baseline = float(np.median(
+        np.abs(np.concatenate([mean_trace[:n_edge], mean_trace[-n_edge:]]))
+    ))
+    depth = baseline - float(np.min(np.abs(mean_trace)))
+    hyst_area = (
+        float(np.mean(np.abs(difference)) / depth)
+        if np.isfinite(depth) and depth > 0.0 else np.nan
+    )
+
+    # Branch split: the separation of the two traces' minima, normalised by
+    # the empirical linewidth so it is comparable across resonators.
+    est_up = estimate_resonance_empirical(f, z_a)
+    est_down = estimate_resonance_empirical(f, z_b)
+    width = float(np.nanmean([est_up.linewidth_hz, est_down.linewidth_hz]))
+    split = float(est_up.fr - est_down.fr)
+    split_widths = (
+        float(split / width) if np.isfinite(width) and width > 0.0 else np.nan
+    )
+
+    ratio_up, f_jump_up, position_up = _jump_ratio(f, z_a)
+    ratio_down, f_jump_down, position_down = _jump_ratio(f, z_b)
+    # A jump pinned against a sweep edge means the span did not contain the
+    # whole bistable region, so the branch was still jumping when the sweep
+    # ran out -- the measurement is a lower bound, not a clean bracket.
+    jump_at_edge = bool(
+        np.any([
+            np.isfinite(position) and (
+                position < edge_fraction or position > 1.0 - edge_fraction
+            )
+            for position in (position_up, position_down)
+        ])
+    )
+
+    return {
+        "hyst_sigma": hyst_sigma,
+        "hyst_area": hyst_area,
+        "hyst_split_hz": split,
+        "hyst_split_widths": split_widths,
+        "jump_ratio_up": ratio_up,
+        "jump_ratio_down": ratio_down,
+        "jump_f_up_hz": f_jump_up,
+        "jump_f_down_hz": f_jump_down,
+        "empirical_width_hz": width,
+        "hyst_n_points": int(f.size),
+        "noise_from_errors": noise_from_errors,
+        "jump_at_edge": jump_at_edge,
+    }
+
+
+def hysteresis_metrics(
+    run,
+    *,
+    sigma_threshold=DEFAULT_HYSTERESIS_SIGMA,
+    area_threshold=DEFAULT_HYSTERESIS_AREA,
+    split_widths_threshold=DEFAULT_HYSTERESIS_SPLIT_WIDTHS,
+    edge_fraction=DEFAULT_HYSTERESIS_EDGE_FRACTION,
+    baseline_fraction=DEFAULT_HYSTERESIS_BASELINE_FRACTION,
+):
+    """Compare the up and down sweeps of a bidirectional run, per tone/power.
+
+    Requires a run taken with ``direction='both'``
+    (:py:func:`run_power_sweep`); a single-direction run returns an empty
+    array.  Nothing here depends on the resonance fits, so the result is
+    available straight after acquisition.
+
+    Parameters
+    ----------
+    run : dict or str or Path
+        A run from :py:func:`run_power_sweep` / :py:func:`load_power_sweep`,
+        or a path to a run directory or manifest.
+    sigma_threshold : float or None, optional
+        How significant the up/down difference must be to count as
+        hysteresis, in sigma (default ``5``).  The significance is a
+        chi-square z-score against the sweeps' own measurement errors, so
+        this is a plain statistical cut, not a tuned number.  ``None``
+        drops the requirement.
+    area_threshold : float or None, optional
+        How *large* the difference must be, as a fraction of the dip depth
+        (default ``0.02``): the branches must be separated by at least a
+        couple of percent of the resonance circle, not merely separated to
+        high statistical significance.  ``None`` drops it.
+    split_widths_threshold : float or None, optional
+        Alternative size test: separation of the two traces' minima in
+        empirical linewidths (default ``0.1``).  This one only opens up well
+        past bifurcation, so it confirms rather than detects.  ``None``
+        drops it.
+    edge_fraction : float, optional
+        A jump within this fraction of a sweep end sets ``jump_at_edge``
+        (default ``0.05``), the marker for a span too narrow to contain the
+        bistable region.
+    baseline_fraction : float, optional
+        Fraction of points at each end of the trace used for the
+        off-resonance level in ``hyst_area`` (default ``0.1``).
+
+    Returns
+    -------
+    metrics : numpy.ndarray
+        Structured array with one row per (sweep step, tone):
+        ``sweep_index``, ``tone_index``, ``power_dbm``,
+        ``readback_power_dbm``, ``hyst_sigma`` (the z-score),
+        ``hyst_area`` (mean branch separation / dip depth),
+        ``hyst_split_hz`` and ``hyst_split_widths`` (up minus down minimum),
+        ``jump_ratio_up`` / ``jump_ratio_down`` and their frequencies,
+        ``empirical_width_hz``, ``hyst_n_points``, ``noise_from_errors``,
+        ``jump_at_edge``, and the ``hysteretic`` verdict -- statistically
+        significant *and* physically large, so neither a noisy pair of
+        sweeps nor a tiny but well-measured drift can trip it.
+    """
+    run = _power_sweep_run_view(run)
+    sweeps = run.get("sweeps") or []
+    sweeps_down = run.get("sweeps_down") or []
+    dtype = np.dtype(list(HYSTERESIS_COLUMNS))
+    if not any(sweep is not None for sweep in sweeps_down):
+        return np.empty(0, dtype=dtype)
+
+    tone_count = int(run.get("tone_count", 0))
+    rows = []
+    for sweep_index, sweep in enumerate(sweeps):
+        down = sweeps_down[sweep_index] if sweep_index < len(sweeps_down) else None
+        power_row = _power_row_for_step(run, sweep_index, use_readback=False)
+        readback_row = _power_row_for_step(run, sweep_index, use_readback=True)
+        for tone_index in range(tone_count):
+            values = _hysteresis_row(
+                sweep, down, tone_index,
+                baseline_fraction=baseline_fraction,
+                edge_fraction=edge_fraction,
+            )
+            values["sweep_index"] = sweep_index
+            values["tone_index"] = tone_index
+            values["power_dbm"] = (
+                float(power_row[tone_index]) if tone_index < power_row.size
+                else np.nan
+            )
+            values["readback_power_dbm"] = (
+                float(readback_row[tone_index]) if tone_index < readback_row.size
+                else np.nan
+            )
+            values["hysteretic"] = _is_hysteretic(
+                values,
+                sigma_threshold=sigma_threshold,
+                area_threshold=area_threshold,
+                split_widths_threshold=split_widths_threshold,
+            )
+            rows.append(values)
+
+    out = np.empty(len(rows), dtype=dtype)
+    for i, values in enumerate(rows):
+        for name, _ in HYSTERESIS_COLUMNS:
+            out[name][i] = values[name]
+    return out
+
+
+def _is_hysteretic(values, *, sigma_threshold, area_threshold,
+                   split_widths_threshold):
+    """Apply the detection thresholds to one row of raw hysteresis metrics.
+
+    Significance and size are both required (when enabled).  With enough
+    averaging a chi-square z-score will eventually resolve any drift or gain
+    difference between the two sweeps, so significance alone is not enough;
+    conversely a large apparent separation on noisy sweeps means nothing.
+    Bifurcation is the case where the branches are separated by a
+    substantial fraction of the resonance itself, and measurably so."""
+    if sigma_threshold is not None:
+        sigma = values.get("hyst_sigma", np.nan)
+        if not (np.isfinite(sigma) and sigma > float(sigma_threshold)):
+            return False
+
+    size_tests = []
+    if area_threshold is not None:
+        area = values.get("hyst_area", np.nan)
+        size_tests.append(np.isfinite(area) and area > float(area_threshold))
+    if split_widths_threshold is not None:
+        split = values.get("hyst_split_widths", np.nan)
+        size_tests.append(
+            np.isfinite(split) and abs(split) > float(split_widths_threshold)
+        )
+    if size_tests and not any(size_tests):
+        return False
+    # With every test disabled there is nothing to detect.
+    if sigma_threshold is None and not size_tests:
+        return False
+    return True
+
+
+def hysteresis_onset(metrics, tone_index, *, use_readback_power=True):
+    """Bracket a tone's bifurcation power from its hysteresis metrics.
+
+    The onset is the midpoint between the highest measured power that is not
+    hysteretic and the lowest that is, with an uncertainty of half that gap.
+    Unlike the power solved from the ``anl`` power law this is a measured
+    quantity: it needs no model and no extrapolation, but it is only ever as
+    precise as the power step of the sweep, and it exists only when the run
+    actually straddled the transition.  It is also biased high -- just past
+    bifurcation the bistable region can be narrower than the sweep's
+    frequency step, so both directions still trace the same curve until the
+    drive is pushed somewhat further.  Treat it as an upper bound on the
+    true bifurcation power.
+
+    Returns
+    -------
+    onset : dict
+        ``{'p_hyst_onset', 'p_hyst_onset_err', 'p_hyst_lower',
+        'p_hyst_upper', 'bracket', 'n_hysteretic', 'jump_at_edge'}``.
+        ``bracket`` is ``'measured'`` when the run straddles the transition,
+        ``'above_measured_range'`` when no power was hysteretic (the onset
+        is above everything swept), ``'below_measured_range'`` when every
+        power was (it is below everything swept), or ``'unavailable'``.
+    """
+    if metrics is None or len(metrics) == 0:
+        return _bracket_hysteresis_onset([], [], [])
+    rows = metrics[metrics["tone_index"] == int(tone_index)]
+    if rows.size == 0:
+        return _bracket_hysteresis_onset([], [], [])
+
+    power_key = "readback_power_dbm" if use_readback_power else "power_dbm"
+    powers = np.asarray(rows[power_key], dtype=float)
+    if not np.any(np.isfinite(powers)):
+        powers = np.asarray(rows["power_dbm"], dtype=float)
+    measured = np.asarray(rows["hyst_n_points"]) > 0
+    return _bracket_hysteresis_onset(
+        powers[measured],
+        np.asarray(rows["hysteretic"], dtype=bool)[measured],
+        np.asarray(rows["jump_at_edge"], dtype=bool)[measured],
+    )
+
+
+def _bracket_hysteresis_onset(powers, hysteretic, jump_at_edge):
+    """Bracket the bifurcation power from per-power hysteresis verdicts.
+
+    Shared by :py:func:`hysteresis_onset` (which reads the metrics array)
+    and :py:func:`find_best_power` (which reads the fit-summary columns).
+    """
+    out = {
+        "p_hyst_onset": float("nan"),
+        "p_hyst_onset_err": float("nan"),
+        "p_hyst_lower": float("nan"),
+        "p_hyst_upper": float("nan"),
+        "bracket": "unavailable",
+        "n_hysteretic": 0,
+        "jump_at_edge": False,
+    }
+    powers = np.asarray(powers, dtype=float).ravel()
+    hysteretic = np.asarray(hysteretic, dtype=bool).ravel()
+    jump_at_edge = np.asarray(jump_at_edge, dtype=bool).ravel()
+    finite = np.isfinite(powers)
+    if not np.any(finite):
+        return out
+    powers = powers[finite]
+    hysteretic = hysteretic[finite]
+    jump_at_edge = jump_at_edge[finite]
+
+    out["n_hysteretic"] = int(np.count_nonzero(hysteretic))
+    out["jump_at_edge"] = bool(np.any(jump_at_edge & hysteretic))
+
+    if not np.any(hysteretic):
+        out["p_hyst_lower"] = float(np.max(powers))
+        out["bracket"] = "above_measured_range"
+        return out
+    if np.all(hysteretic):
+        out["p_hyst_upper"] = float(np.min(powers))
+        out["bracket"] = "below_measured_range"
+        return out
+
+    # Straddled: take the transition at the lowest hysteretic power, so a
+    # single anomalous low-power detection cannot drag the onset down past
+    # clean non-hysteretic points above it.
+    upper = float(np.min(powers[hysteretic]))
+    below = powers[(~hysteretic) & (powers < upper)]
+    if below.size == 0:
+        out["p_hyst_upper"] = upper
+        out["bracket"] = "below_measured_range"
+        return out
+    lower = float(np.max(below))
+    out["p_hyst_lower"] = lower
+    out["p_hyst_upper"] = upper
+    out["p_hyst_onset"] = 0.5 * (lower + upper)
+    out["p_hyst_onset_err"] = 0.5 * (upper - lower)
+    out["bracket"] = "measured"
+    return out
+
+
 # --- Fitting -----------------------------------------------------------------
 
 def fit_power_sweep(
@@ -1347,6 +1969,9 @@ def fit_power_sweep(
     n_jobs=1,
     verbose=True,
     min_dip_depth_db=0.5,
+    hysteresis=True,
+    hysteresis_kwargs=None,
+    fit_down_sweeps=True,
     **fit_kwargs,
 ):
     """Fit all tones at each power, or one tone across the power axis.
@@ -1404,6 +2029,24 @@ def fit_power_sweep(
         optimiser (default ``0.5``). Fits below this threshold are returned as
         ``success=False`` and ``noise_only=True``. Set ``None`` to force every
         fit.
+    hysteresis : bool, optional
+        For a run taken with ``direction='both'``, run
+        :py:func:`hysteresis_metrics` and merge its columns into the fit
+        summary (default ``True``; ignored when the run has no down sweeps).
+        This is what makes the measured bifurcation power available to
+        :py:func:`find_best_power`.
+    hysteresis_kwargs : dict, optional
+        Keyword arguments forwarded to :py:func:`hysteresis_metrics` (e.g.
+        ``sigma_threshold``, ``split_widths_threshold``).
+    fit_down_sweeps : bool, optional
+        Also fit the downward sweeps, with ``sweep_direction='down'`` so the
+        fitter follows the other Duffing branch (default ``True``; ignored
+        when the run has no down sweeps).  Adds ``anl_down``, ``anl_down_err``
+        and ``fr_down`` to the summary: below bifurcation the two directions
+        must agree on ``anl``, so a divergence is independent evidence that
+        the model is being pushed past where it holds.  Roughly doubles the
+        fitting time; set ``False`` to skip it and keep the hysteresis
+        metrics, which do not need any fit.
     **fit_kwargs
         Forwarded to :py:func:`batch_fit` (per-power mode) or
         :py:func:`fit_sweep_stack` (per-tone mode).  Common kwargs:
@@ -1421,9 +2064,29 @@ def fit_power_sweep(
         dict includes ``summary_array``, a structured NumPy array with the
         same columns and values as the fit-summary CSV (see
         :py:func:`fit_summary_array`).  It is also stored on ``run['fits']``
-        so subsequent :py:func:`plot_power_sweep` calls can omit it.
+        so subsequent :py:func:`plot_power_sweep` calls can omit it.  A
+        bidirectional run additionally carries ``hysteresis`` (the
+        :py:func:`hysteresis_metrics` array) and, unless
+        ``fit_down_sweeps=False``, ``fits_by_power_down``.
     """
     run = _power_sweep_run_view(run)
+    has_down = any(
+        sweep is not None for sweep in (run.get("sweeps_down") or [])
+    )
+
+    # Bidirectional run: measure the up/down difference first. This needs no
+    # fit at all, so it is available even when every fit fails.
+    metrics = None
+    if hysteresis and has_down:
+        metrics = hysteresis_metrics(run, **(hysteresis_kwargs or {}))
+        run["hysteresis"] = metrics
+        if verbose:
+            n_hyst = int(np.count_nonzero(metrics["hysteretic"]))
+            _progress(
+                verbose,
+                f"Hysteresis: {n_hyst}/{metrics.size} tone/power pairs "
+                f"show bifurcation",
+            )
 
     # Per-power mode keeps the server sweep boundary intact: every saved sweep
     # goes through batch_fit, so blind-tone handling and original tone indices
@@ -1442,6 +2105,25 @@ def fit_power_sweep(
             for sweep in run["sweeps"]
         ]
         fit_data = {"run": run, "fits_by_power": fits_by_power}
+        # The down sweeps follow the other branch, so they are fitted with
+        # sweep_direction='down'; below bifurcation both directions must
+        # return the same anl.
+        if fit_down_sweeps and has_down:
+            fit_data["fits_by_power_down"] = [
+                batch_fit(
+                    sweep,
+                    nonlinear=nonlinear,
+                    sweep_direction="down",
+                    n_jobs=n_jobs,
+                    verbose=verbose,
+                    min_dip_depth_db=min_dip_depth_db,
+                    **fit_kwargs,
+                )
+                if sweep is not None else []
+                for sweep in run["sweeps_down"]
+            ]
+        if metrics is not None:
+            fit_data["hysteresis"] = metrics
         fit_data["summary_array"] = fit_summary_array(fit_data)
         run["fits"] = fit_data
         return fit_data
@@ -1449,25 +2131,32 @@ def fit_power_sweep(
     # Single-tone mode lines up one resonator's trace from each power and uses
     # the lower-level array stack fitter. This changes the output shape from
     # power -> tone to one tone -> power; rows are not chained as initial guesses.
-    f_stack, z_stack, e_stack = [], [], []
-    have_error_stack = True
-    for sweep in run["sweeps"]:
-        f = np.atleast_2d(np.asarray(sweep["sweep_f"], dtype=float))
-        i = np.atleast_2d(np.asarray(sweep["sweep_i"], dtype=float))
-        q = np.atleast_2d(np.asarray(sweep["sweep_q"], dtype=float))
-        f_stack.append(f[:, tone_index])
-        z_stack.append(i[:, tone_index] + 1j * q[:, tone_index])
-        if "sweep_ei" in sweep and "sweep_eq" in sweep:
-            ei = np.atleast_2d(np.asarray(sweep["sweep_ei"], dtype=float))
-            eq = np.atleast_2d(np.asarray(sweep["sweep_eq"], dtype=float))
-            e_stack.append(ei[:, tone_index] + 1j * eq[:, tone_index])
-        else:
-            have_error_stack = False
+    def _stack(sweeps):
+        f_stack, z_stack, e_stack = [], [], []
+        have_error_stack = True
+        for sweep in sweeps:
+            f = np.atleast_2d(np.asarray(sweep["sweep_f"], dtype=float))
+            i = np.atleast_2d(np.asarray(sweep["sweep_i"], dtype=float))
+            q = np.atleast_2d(np.asarray(sweep["sweep_q"], dtype=float))
+            f_stack.append(f[:, tone_index])
+            z_stack.append(i[:, tone_index] + 1j * q[:, tone_index])
+            if "sweep_ei" in sweep and "sweep_eq" in sweep:
+                ei = np.atleast_2d(np.asarray(sweep["sweep_ei"], dtype=float))
+                eq = np.atleast_2d(np.asarray(sweep["sweep_eq"], dtype=float))
+                e_stack.append(ei[:, tone_index] + 1j * eq[:, tone_index])
+            else:
+                have_error_stack = False
+        return (
+            np.asarray(f_stack),
+            np.asarray(z_stack),
+            np.asarray(e_stack) if have_error_stack else None,
+        )
 
+    f_stack, z_stack, e_stack = _stack(run["sweeps"])
     fits = fit_sweep_stack(
-        np.asarray(f_stack),
-        np.asarray(z_stack),
-        z_err_stack=np.asarray(e_stack) if have_error_stack else None,
+        f_stack,
+        z_stack,
+        z_err_stack=e_stack,
         nonlinear=nonlinear,
         sweep_direction=sweep_direction,
         n_jobs=n_jobs,
@@ -1478,6 +2167,26 @@ def fit_power_sweep(
     for fit in fits:
         fit.tone_index = int(tone_index)
     fit_data = {"run": run, "tone_index": int(tone_index), "fits": list(fits)}
+    if fit_down_sweeps and has_down and all(
+        sweep is not None for sweep in run["sweeps_down"]
+    ):
+        f_down, z_down, e_down = _stack(run["sweeps_down"])
+        fits_down = fit_sweep_stack(
+            f_down,
+            z_down,
+            z_err_stack=e_down,
+            nonlinear=nonlinear,
+            sweep_direction="down",
+            n_jobs=n_jobs,
+            verbose=verbose,
+            min_dip_depth_db=min_dip_depth_db,
+            **fit_kwargs,
+        )
+        for fit in fits_down:
+            fit.tone_index = int(tone_index)
+        fit_data["fits_down"] = list(fits_down)
+    if metrics is not None:
+        fit_data["hysteresis"] = metrics
     fit_data["summary_array"] = fit_summary_array(fit_data)
     run["fits"] = fit_data
     return fit_data
@@ -1687,9 +2396,16 @@ def _fits_for_power(fit_data, sweep_index, tone_indices):
 
 # --- The fit-summary table (one row per power step and tone) -----------------
 
-_FIT_SUMMARY_INDEX_KEYS = {"sweep_index", "tone_index"}
-_FIT_SUMMARY_BOOL_KEYS = {"success", "noise_only"}
+_FIT_SUMMARY_INDEX_KEYS = {"sweep_index", "tone_index", "hyst_n_points"}
+_FIT_SUMMARY_BOOL_KEYS = {
+    "success", "noise_only",
+    "noise_from_errors", "jump_at_edge", "hysteretic", "success_down",
+}
 _FIT_SUMMARY_STRING_KEYS = {"message"}
+
+# Columns contributed by a bidirectional run: the hysteresis metrics, then
+# the down-sweep fit values used for the up/down anl consistency check.
+_DOWN_FIT_SUMMARY_KEYS = ("anl_down", "anl_down_err", "fr_down", "success_down")
 
 
 def _fit_summary_rows(fit_data):
@@ -1718,6 +2434,7 @@ def _fit_summary_rows(fit_data):
     """
     run = fit_data["run"]
     rows = []
+    bidirectional, bidirectional_blank = _bidirectional_summary_columns(fit_data)
 
     def _center_hz(sweep_index, tone_index):
         centers_by_step = run.get("centers_by_step_hz")
@@ -1725,6 +2442,14 @@ def _fit_summary_rows(fit_data):
             return np.nan
         centers = np.asarray(centers_by_step[sweep_index], dtype=float).ravel()
         return float(centers[tone_index]) if tone_index < centers.size else np.nan
+
+    def _add_bidirectional(row):
+        """Append the hysteresis / down-sweep columns, if this run has any."""
+        if bidirectional is None:
+            return row
+        key = (int(row["sweep_index"]), int(row["tone_index"]))
+        row.update(bidirectional.get(key, bidirectional_blank))
+        return row
 
     # Each row records the power for the tone being fitted and the common
     # parameters exported by the resonator fitter.
@@ -1744,7 +2469,7 @@ def _fit_summary_rows(fit_data):
                     "sweep_center_hz": _center_hz(sweep_index, tone_index),
                 }
                 row.update(fit_result_summary_row(fit))
-                rows.append(row)
+                rows.append(_add_bidirectional(row))
         return rows
 
     tone_index = int(fit_data["tone_index"])
@@ -1759,8 +2484,60 @@ def _fit_summary_rows(fit_data):
             "sweep_center_hz": _center_hz(sweep_index, tone_index),
         }
         row.update(fit_result_summary_row(fit))
-        rows.append(row)
+        rows.append(_add_bidirectional(row))
     return rows
+
+
+def _bidirectional_summary_columns(fit_data):
+    """Hysteresis and down-sweep-fit columns, keyed by (sweep, tone).
+
+    Returns ``(lookup, blank)``, or ``(None, None)`` for a single-direction
+    run.  ``blank`` fills rows the bidirectional data does not cover, so
+    every summary row ends up with the same columns.
+    """
+    metrics = fit_data.get("hysteresis")
+    if metrics is None:
+        metrics = (fit_data.get("run") or {}).get("hysteresis")
+    down_fits = fit_data.get("fits_by_power_down")
+    if down_fits is None and "fits_down" in fit_data:
+        tone = int(fit_data["tone_index"])
+        down_fits = [[fit] for fit in fit_data["fits_down"]]
+        for fits in down_fits:
+            for fit in fits:
+                fit.tone_index = tone
+    if (metrics is None or len(metrics) == 0) and not down_fits:
+        return None, None
+
+    blank = {}
+    if metrics is not None and len(metrics):
+        blank.update({key: np.nan for key in _HYSTERESIS_SUMMARY_KEYS})
+        blank["hyst_n_points"] = 0
+        for key in ("noise_from_errors", "jump_at_edge", "hysteretic"):
+            blank[key] = False
+    if down_fits:
+        blank.update({key: np.nan for key in _DOWN_FIT_SUMMARY_KEYS})
+        blank["success_down"] = False
+
+    lookup = {}
+    if metrics is not None and len(metrics):
+        for row in metrics:
+            key = (int(row["sweep_index"]), int(row["tone_index"]))
+            lookup.setdefault(key, dict(blank)).update(
+                {name: row[name] for name in _HYSTERESIS_SUMMARY_KEYS}
+            )
+    if down_fits:
+        for sweep_index, fits in enumerate(down_fits):
+            for fit_index, fit in enumerate(fits or []):
+                tone_index = int(getattr(fit, "tone_index", fit_index))
+                summary = fit_result_summary_row(fit)
+                key = (sweep_index, tone_index)
+                lookup.setdefault(key, dict(blank)).update({
+                    "anl_down": summary.get("anl", np.nan),
+                    "anl_down_err": summary.get("anl_err", np.nan),
+                    "fr_down": summary.get("fr", np.nan),
+                    "success_down": bool(summary.get("success", False)),
+                })
+    return lookup, blank
 
 
 def _fit_summary_column_names():
@@ -2061,7 +2838,8 @@ def _archive_fit_data(fit_data, *, include_sweeps, include_optimiser):
     archived = {
         key: value
         for key, value in fit_data.items()
-        if key not in {"run", "fits_by_power", "fits"}
+        if key not in {"run", "fits_by_power", "fits",
+                       "fits_by_power_down", "fits_down"}
     }
     if "fits_by_power" in fit_data:
         archived["fits_by_power"] = [
@@ -2072,11 +2850,23 @@ def _archive_fit_data(fit_data, *, include_sweeps, include_optimiser):
         archived["fits"] = [
             _archive_fit(fit, include_optimiser) for fit in fit_data["fits"]
         ]
+    # Down-sweep fits from a bidirectional run travel with the archive so a
+    # reloaded analysis still has the up/down anl comparison.
+    if "fits_by_power_down" in fit_data:
+        archived["fits_by_power_down"] = [
+            [_archive_fit(fit, include_optimiser) for fit in fits]
+            for fits in fit_data["fits_by_power_down"]
+        ]
+    if "fits_down" in fit_data:
+        archived["fits_down"] = [
+            _archive_fit(fit, include_optimiser) for fit in fit_data["fits_down"]
+        ]
 
     run = dict(fit_data["run"])
     run.pop("fits", None)
     if not include_sweeps:
         run["sweeps"] = [None] * _fit_data_step_count(fit_data)
+        run["sweeps_down"] = [None] * _fit_data_step_count(fit_data)
     archived["run"] = run
     return archived
 
@@ -2250,7 +3040,10 @@ def analyse_power_sweep(
         tones linear and only refines the rest (faster, but drops the
         small-``anl`` values).
     sweep_direction : {'up', 'down'}, optional
-        Direction the saved sweeps were taken in (default ``'up'``).
+        Direction the *saved* sweeps were taken in (default ``'up'``).  For a
+        bidirectional run this stays ``'up'``: the upward sweep is the
+        canonical one, and the downward sweeps are fitted with
+        ``'down'`` automatically (see :py:func:`fit_power_sweep`).
     n_jobs : int, optional
         joblib worker count shared by fitting and both plot passes (``-1``
         all CPUs by default; ``1`` is serial).
@@ -2280,8 +3073,9 @@ def analyse_power_sweep(
     fit_kwargs : dict, optional
         Extra keyword arguments forwarded to :py:func:`fit_power_sweep`
         (e.g. ``min_dip_depth_db``, ``tone_index``, ``initial_guess``,
-        ``param_bounds``).  A ``'verbose'`` entry here overrides ``verbose``
-        for fitting.
+        ``param_bounds``, and for a bidirectional run ``hysteresis``,
+        ``hysteresis_kwargs``, ``fit_down_sweeps``).  A ``'verbose'`` entry
+        here overrides ``verbose`` for fitting.
     plot_kwargs : dict, optional
         Extra keyword arguments forwarded to :py:func:`plot_power_sweep`
         (e.g. ``reference_plane``, ``deembed``, ``units``).  ``'show'`` ->
@@ -2290,8 +3084,10 @@ def analyse_power_sweep(
     best_power_kwargs : dict, optional
         Extra keyword arguments forwarded to :py:func:`find_best_power`
         (e.g. ``param_valid_ranges``, ``use_readback_power``,
-        ``min_points``).  A ``'target_anl'`` entry here overrides
-        ``target_anl``.
+        ``min_points``, and for a bidirectional run ``hysteresis_cap``,
+        ``hysteresis_backoff_db``, ``bif_mismatch_db``,
+        ``anl_direction_ratio``, ``exclude_hysteretic_rows``).  A
+        ``'target_anl'`` entry here overrides ``target_anl``.
     best_plot_kwargs : dict, optional
         Extra keyword arguments forwarded to :py:func:`plot_best_power`.
         ``'show'``, ``'verbose'``, and ``'n_jobs'`` here override the
@@ -2478,6 +3274,14 @@ DEFAULT_MULTI_RESONANCE_LINEWIDTHS = 3.0
 # tones with a finite median reduced_chi2 the gate is disabled rather than
 # tuned on too few points.
 _CHI2_GATE_MIN_TONES = 8
+
+# Cross-checks available only on a bidirectional run (direction='both').
+# The mismatch tolerance is added to the onset's own half-step uncertainty,
+# so a coarse power schedule is not punished for being coarse.
+DEFAULT_BIF_MISMATCH_DB = 3.0
+# Below bifurcation the up and down sweeps must return the same anl; a factor
+# this far apart means the fits, not the resonator, are direction-dependent.
+DEFAULT_ANL_DIRECTION_RATIO = 3.0
 
 
 # Fit-summary keys that ``find_best_power`` interpolates against power_dbm
@@ -3103,6 +3907,18 @@ def _fr_bimodal_gap_linewidths(tone_rows, *, min_side=2):
     return best
 
 
+def _nearest_measured_sweep_index(powers, sweep_idx, power_dbm):
+    """Sweep index whose measured power is closest to ``power_dbm``, or None."""
+    try:
+        target = float(power_dbm)
+    except (TypeError, ValueError):
+        return None
+    finite = np.flatnonzero(np.isfinite(powers))
+    if not finite.size or not np.isfinite(target):
+        return None
+    return int(sweep_idx[finite[np.argmin(np.abs(powers[finite] - target))]])
+
+
 def _find_best_power_for_tone(
     tone_index,
     tone_rows,
@@ -3121,6 +3937,11 @@ def _find_best_power_for_tone(
     max_extrapolation_db,
     reduced_chi2_threshold,
     multi_resonance_linewidths,
+    hysteresis_cap,
+    hysteresis_backoff_db,
+    bif_mismatch_db,
+    anl_direction_ratio,
+    exclude_hysteretic_rows,
 ):
     """Per-tone implementation backing :py:func:`find_best_power`."""
 
@@ -3242,6 +4063,31 @@ def _find_best_power_for_tone(
                 exclude_reason[i] = (
                     f"{err_key} outside median ± {clip_k:g}*MAD"
                 )
+
+    # 1e: measured hysteresis (bidirectional runs only).  A power at which the
+    # up and down sweeps disagree is past bifurcation, so the single-branch
+    # model does not describe it; optionally keep those rows out of the
+    # ANL-vs-power fit.
+    def _flag_column(name):
+        out = np.zeros(n, dtype=bool)
+        for i, row in enumerate(rows):
+            value = row.get(name, False)
+            if isinstance(value, str):
+                value = value.strip().lower() not in {"", "false", "0", "no"}
+            out[i] = bool(value)
+        return out
+
+    have_hysteresis = any("hysteretic" in row for row in rows)
+    hysteretic = _flag_column("hysteretic") if have_hysteresis else np.zeros(n, dtype=bool)
+    # A skipped or failed power step still has a requested power but no
+    # measured trace; it must not be read as "no hysteresis here".
+    hysteresis_measured = (
+        _column("hyst_n_points") > 0 if have_hysteresis else np.zeros(n, dtype=bool)
+    )
+    if exclude_hysteretic_rows and have_hysteresis:
+        for i in np.flatnonzero(hysteretic):
+            anl_fit_excluded[i] = True
+            anl_fit_exclude_reason[i] = "hysteretic (up/down sweeps disagree)"
 
     # Stage 2: derived columns and validity mask.
     anl = _column("anl")
@@ -3479,12 +4325,92 @@ def _find_best_power_for_tone(
         power_law_usable = False
         flags.append("multi_resonance")
 
+    # (E) Bifurcation cross-check, for bidirectional runs only.  The measured
+    # hysteresis and the p_bif extrapolated from the ANL power law are two
+    # independent statements about the same physical power, so p_bif should
+    # land inside the measured bracket.  The comparison is against the
+    # bracket rather than its midpoint because the measurement is one-sided
+    # near threshold: just above bifurcation the bistable region can be
+    # narrower than the frequency step, so the sweeps still look identical
+    # and the measured onset is biased *high*.  What is never excusable is
+    # p_bif claiming headroom at a power where hysteresis was actually seen.
+    onset = _bracket_hysteresis_onset(
+        powers[hysteresis_measured],
+        hysteretic[hysteresis_measured],
+        _flag_column("jump_at_edge")[hysteresis_measured],
+    ) if have_hysteresis else _bracket_hysteresis_onset([], [], [])
+    p_bif = anl_power_law_pick["p_bif"]
+    p_bif_minus_onset_db = float("nan")
+    if np.isfinite(p_bif) and onset["bracket"] != "unavailable":
+        if np.isfinite(onset["p_hyst_onset"]):
+            p_bif_minus_onset_db = float(p_bif - onset["p_hyst_onset"])
+        if bif_mismatch_db is not None:
+            tolerance = float(bif_mismatch_db)
+            too_high = (
+                np.isfinite(onset["p_hyst_upper"])
+                and p_bif > onset["p_hyst_upper"] + tolerance
+            )
+            too_low = (
+                np.isfinite(onset["p_hyst_lower"])
+                and p_bif < onset["p_hyst_lower"] - tolerance
+            )
+            if too_high or too_low:
+                power_law_usable = False
+                flags.append("bif_hysteresis_mismatch")
+
+    # (F) Direction consistency: below bifurcation the up and down sweeps
+    # must return the same anl, since they are then the same single-valued
+    # curve.  A systematic ratio between them means the fitted nonlinearity
+    # is an artefact of which branch was followed, so the ANL-vs-power line
+    # built from it cannot be trusted either.
+    anl_down = _column("anl_down")
+    comparable = (
+        valid
+        & ~hysteretic
+        & np.isfinite(anl) & (anl > 0.0)
+        & np.isfinite(anl_down) & (anl_down > 0.0)
+        & (anl >= float(target_anl))
+    )
+    if np.count_nonzero(comparable) >= 2:
+        pairs = np.stack([anl[comparable], anl_down[comparable]])
+        anl_direction_ratio_measured = float(
+            np.median(np.max(pairs, axis=0) / np.min(pairs, axis=0))
+        )
+    else:
+        anl_direction_ratio_measured = float("nan")
+    if (
+        anl_direction_ratio is not None
+        and np.isfinite(anl_direction_ratio_measured)
+        and anl_direction_ratio_measured > float(anl_direction_ratio)
+    ):
+        power_law_usable = False
+        flags.append("anl_direction_mismatch")
+
     # Stage 4: choose the most reliable available criterion.  The continuous
     # ANL power-law pick wins when it passed its diagnostics *and* the guards
     # above; otherwise fall back to the highest-power row whose measured anl is
     # below the target, then to the row whose measured anl is nearest to the
     # target among those still below the bifurcation threshold, and finally to
     # the lowest measured power.
+    # Measured-onset pick: a bidirectional run knows where the resonator
+    # actually bifurcated even when every fit failed, so it rescues tones
+    # that would otherwise fall all the way through to the lowest power.
+    hysteresis_pick = None
+    if np.isfinite(onset["p_hyst_onset"]):
+        hysteresis_pick = {
+            "criterion": "hysteresis_onset",
+            "power_dbm": float(
+                onset["p_hyst_onset"] - float(hysteresis_backoff_db)
+            ),
+            "sweep_index": None,
+            "p_hyst_onset": onset["p_hyst_onset"],
+            "backoff_db": float(hysteresis_backoff_db),
+            "reason": (
+                "measured hysteresis onset, backed off "
+                f"{float(hysteresis_backoff_db):g} dB"
+            ),
+        }
+
     chosen_power = None
     chosen_sweep = None
     chosen_reference = None
@@ -3504,6 +4430,11 @@ def _find_best_power_for_tone(
         chosen_sweep = anl_nearest_target_pick["sweep_index"]
         chosen_reference = chosen_sweep
         criterion = "anl_nearest_target"
+    elif hysteresis_pick is not None:
+        chosen_power = hysteresis_pick["power_dbm"]
+        chosen_sweep = None
+        chosen_reference = None
+        criterion = "hysteresis_onset"
     try:
         chosen_power_is_finite = np.isfinite(float(chosen_power))
     except (TypeError, ValueError):
@@ -3513,6 +4444,37 @@ def _find_best_power_for_tone(
         chosen_sweep = lowest_power_pick["sweep_index"]
         chosen_reference = chosen_sweep
         criterion = "lowest_power_fallback"
+
+    # Stage 4.5: the measured cap.  Hysteresis is direct evidence that the
+    # resonator is bifurcated at that power, which beats any extrapolation,
+    # so the chosen power is clipped below it regardless of which criterion
+    # won.  The cap sits a backoff below the onset itself, or below the
+    # lowest hysteretic power when the whole schedule was already bifurcated.
+    hysteresis_cap_dbm = float("nan")
+    if hysteresis_cap:
+        if np.isfinite(onset["p_hyst_onset"]):
+            hysteresis_cap_dbm = float(
+                onset["p_hyst_onset"] - float(hysteresis_backoff_db)
+            )
+        elif (
+            onset["bracket"] == "below_measured_range"
+            and np.isfinite(onset["p_hyst_upper"])
+        ):
+            hysteresis_cap_dbm = float(
+                onset["p_hyst_upper"] - float(hysteresis_backoff_db)
+            )
+    hysteresis_capped = False
+    try:
+        over_cap = float(chosen_power) > hysteresis_cap_dbm
+    except (TypeError, ValueError):
+        over_cap = False
+    if np.isfinite(hysteresis_cap_dbm) and over_cap:
+        chosen_power = hysteresis_cap_dbm
+        chosen_sweep = None
+        chosen_reference = _nearest_measured_sweep_index(
+            powers, sweep_idx, chosen_power
+        )
+        hysteresis_capped = True
 
     chosen_params = _interpolated_params_at_power(
         rows, valid, powers, chosen_power, anl_fit=anl_fit
@@ -3531,13 +4493,30 @@ def _find_best_power_for_tone(
         "anl_power_law_pick": anl_power_law_pick,
         "anl_pick": anl_pick,
         "anl_nearest_target_pick": anl_nearest_target_pick,
+        "hysteresis_pick": hysteresis_pick,
         "lowest_power_pick": lowest_power_pick,
         "criteria": {
             "anl_power_law": anl_power_law_pick,
             "anl_threshold": anl_pick,
             "anl_nearest_target": anl_nearest_target_pick,
+            "hysteresis_onset": hysteresis_pick,
             "lowest_power_fallback": lowest_power_pick,
         },
+        # Measured bifurcation (bidirectional runs only). ``p_hyst_onset`` is
+        # the midpoint of the bracket, ``p_bif`` above is the extrapolated
+        # counterpart, and ``p_bif_minus_onset_db`` is the disagreement
+        # between them -- the headline cross-check on the ANL power law.
+        "p_hyst_onset": onset["p_hyst_onset"],
+        "p_hyst_onset_err": onset["p_hyst_onset_err"],
+        "p_hyst_lower": onset["p_hyst_lower"],
+        "p_hyst_upper": onset["p_hyst_upper"],
+        "hysteresis_bracket": onset["bracket"],
+        "n_hysteretic": onset["n_hysteretic"],
+        "hysteresis_jump_at_edge": onset["jump_at_edge"],
+        "p_bif_minus_onset_db": p_bif_minus_onset_db,
+        "hysteresis_cap_dbm": hysteresis_cap_dbm,
+        "hysteresis_capped": bool(hysteresis_capped),
+        "anl_direction_ratio": anl_direction_ratio_measured,
         "anl_pegged": bool(anl_pegged),
         "flags": list(flags),
         "flagged": bool(flags),
@@ -3578,6 +4557,11 @@ def find_best_power(
     max_extrapolation_db=DEFAULT_MAX_EXTRAPOLATION_DB,
     chi2_outlier_mad_clip=DEFAULT_CHI2_OUTLIER_MAD_CLIP,
     multi_resonance_linewidths=DEFAULT_MULTI_RESONANCE_LINEWIDTHS,
+    hysteresis_cap=True,
+    hysteresis_backoff_db=DEFAULT_BIFURCATION_BACKOFF_DB,
+    bif_mismatch_db=DEFAULT_BIF_MISMATCH_DB,
+    anl_direction_ratio=DEFAULT_ANL_DIRECTION_RATIO,
+    exclude_hysteretic_rows=False,
 ):
     """Pick a robust readout power per resonator from a fit-summary table.
 
@@ -3654,6 +4638,48 @@ def find_best_power(
       more than ``multi_resonance_linewidths`` (default ``3``) median
       linewidths (``fr / Ql``), the signature of two resonances in one sweep
       window with the fitter jumping between dips.  Pass ``None`` to disable.
+    - ``bif_hysteresis_mismatch`` (bidirectional runs only): the extrapolated
+      ``p_bif`` falls more than ``bif_mismatch_db`` (default ``3``) outside
+      the *measured* hysteresis bracket -- above the lowest power where the
+      up and down sweeps disagreed, or below the highest power where they
+      still agreed.  These are two independent statements about the same
+      power, so a disagreement means the ANL power law, and the target power
+      solved from the same line, is wrong somewhere.  Pass ``None`` to
+      disable.  Note the measurement is one-sided near threshold (see
+      ``p_hyst_onset`` below), so the "too low" half is the weaker test.
+    - ``anl_direction_mismatch`` (bidirectional runs only, and only when
+      ``fit_down_sweeps`` supplied ``anl_down``): below bifurcation the
+      upward and downward sweeps are the same single-valued curve and must
+      return the same ``anl``.  The median ratio between them exceeding
+      ``anl_direction_ratio`` (default ``3``) means the fitted nonlinearity
+      depends on which branch was followed.  Pass ``None`` to disable.
+
+    Hysteresis (bidirectional runs, ``run_power_sweep(direction='both')``)
+    also enters the selection directly, through the columns
+    :py:func:`fit_power_sweep` merges into the summary:
+
+    - The onset is bracketed between the highest non-hysteretic and the
+      lowest hysteretic measured power (``p_hyst_onset`` +/-
+      ``p_hyst_onset_err``, ``hysteresis_bracket``).  Unlike ``p_bif`` this
+      is measured, not extrapolated -- but only to within half a power step,
+      and only when the run straddled the transition.  It is also biased
+      *high*: just above bifurcation the bistable region can be narrower
+      than the sweep's frequency step, so the two directions still trace the
+      same curve and the transition is not seen until somewhat more power.
+      Read ``p_hyst_onset`` as an upper bound on the true bifurcation power,
+      tightened by finer power steps and more sweep points.
+    - ``hysteresis_cap`` (default ``True``) clips the chosen power to
+      ``p_hyst_onset - hysteresis_backoff_db`` whichever criterion won,
+      because direct evidence of bifurcation beats any extrapolation.
+      ``hysteresis_capped`` records when this bit, and
+      ``hysteresis_cap_dbm`` the cap applied.
+    - ``hysteresis_onset`` is a new fallback criterion, below the ANL ones
+      and above ``lowest_power_fallback``: a tone whose fits are all
+      unusable still has a measured bifurcation power to back off from.
+    - ``exclude_hysteretic_rows`` (default ``False``) additionally keeps the
+      hysteretic powers out of the ANL-vs-power fit.  They are past the
+      single-branch model's validity, but they also carry the largest
+      ``anl`` values that anchor the slope, so this is off by default.
 
     Each returned row carries ``flags`` (a list of the above strings),
     ``flagged`` (bool), ``operating_window_dbm``, ``median_reduced_chi2``,
@@ -3667,8 +4693,9 @@ def find_best_power(
     the row whose measured ``anl`` is nearest to ``target_anl`` among those
     still below ``bifurcation_anl`` (``anl_nearest_target``, for sweeps where
     every point is safely below bifurcation but the slope is too flat to solve
-    for ``target_anl``); and finally the lowest measured power
-    (``lowest_power_fallback``).  The returned rows also include ``p_bif``,
+    for ``target_anl``); the measured hysteresis onset backed off by
+    ``hysteresis_backoff_db`` (``hysteresis_onset``, bidirectional runs only);
+    and finally the lowest measured power (``lowest_power_fallback``).  The returned rows also include ``p_bif``,
     the power solved from the same ANL fit at ``bifurcation_anl`` (default
     ``4/(3*sqrt(3)) ~= 0.77``), and ``p_bif_sub_3db``. Both are ``NaN``
     when no reliable ANL fit is available.
@@ -3734,6 +4761,11 @@ def find_best_power(
             max_extrapolation_db=max_extrapolation_db,
             reduced_chi2_threshold=reduced_chi2_threshold,
             multi_resonance_linewidths=multi_resonance_linewidths,
+            hysteresis_cap=hysteresis_cap,
+            hysteresis_backoff_db=hysteresis_backoff_db,
+            bif_mismatch_db=bif_mismatch_db,
+            anl_direction_ratio=anl_direction_ratio,
+            exclude_hysteretic_rows=exclude_hysteretic_rows,
         )
         for tone in tones
     ]
@@ -3741,7 +4773,27 @@ def find_best_power(
     # cross-tone median so every consumer of these rows gets physical values.
     _repair_negative_chosen_params(best_rows)
     _warn_flagged_best_power(best_rows)
+    _warn_hysteresis_capped(best_rows)
     return best_rows
+
+
+def _warn_hysteresis_capped(rows, *, label="find_best_power"):
+    """Report tones whose chosen power was clipped by a measured onset.
+
+    Not a flag: the cap is a normal, wanted outcome on a bidirectional run.
+    It is worth one line because it means the selection criterion did not
+    have the last word."""
+    capped = [
+        int(row["tone_index"]) for row in rows
+        if row.get("hysteresis_capped")
+    ]
+    if capped:
+        warnings.warn(
+            f"{label}: {len(capped)} of {len(rows)} tones were capped at "
+            "their measured hysteresis onset (the chosen criterion asked "
+            "for more power than the resonator tolerates).",
+            stacklevel=2,
+        )
 
 
 def _warn_flagged_best_power(rows, *, label="find_best_power"):
@@ -3769,7 +4821,8 @@ def best_power_flag_summary(best_power):
     - ``n_tones`` / ``n_flagged``: totals.
     - ``counts``: ``{flag: n_tones}`` for each guard flag that fired
       (``outside_operating_window``, ``low_confidence_fit``,
-      ``multi_resonance``).
+      ``multi_resonance``, and on a bidirectional run
+      ``bif_hysteresis_mismatch`` and ``anl_direction_mismatch``).
     - ``tones_by_flag``: ``{flag: [tone_index, ...]}`` for the same flags.
     - ``flagged_tones``: sorted tone indices with any flag.
 
@@ -3882,7 +4935,11 @@ def best_power_arrays(best_power, tone_count=None):
         Arrays have one entry per tone, in tone-index order; tones missing
         from ``best_power`` are filled with ``NaN`` (or ``"unavailable"`` for
         ``fr_source``).  The legacy keys ``chosen_power_dbm``, ``p_bif``,
-        ``p_bif_sub_3db``, ``fr_hz`` and ``fr_source`` are preserved.  Each
+        ``p_bif_sub_3db``, ``fr_hz`` and ``fr_source`` are preserved, and
+        ``p_hyst_onset``, ``p_hyst_onset_err`` and ``hysteresis_cap_dbm``
+        carry the measured bifurcation power from a bidirectional run
+        (all ``NaN`` otherwise) -- ``hysteresis_cap_dbm`` is the natural
+        ``power_caps_dbm`` input to :py:func:`balance_tone_powers`.  Each
         entry from ``chosen_params`` is also exposed directly as an array:
         ``power_dbm``, every interpolated parameter-like fit-summary field
         such as ``fr``, ``Ql``, ``Qi``, ``Qc``, ``anl`` and empirical fields,
@@ -3922,6 +4979,10 @@ def best_power_arrays(best_power, tone_count=None):
         "chosen_power_dbm": np.full(tone_count, np.nan, dtype=float),
         "p_bif": np.full(tone_count, np.nan, dtype=float),
         "p_bif_sub_3db": np.full(tone_count, np.nan, dtype=float),
+        # Measured bifurcation, NaN on a single-direction run.
+        "p_hyst_onset": np.full(tone_count, np.nan, dtype=float),
+        "p_hyst_onset_err": np.full(tone_count, np.nan, dtype=float),
+        "hysteresis_cap_dbm": np.full(tone_count, np.nan, dtype=float),
     }
     param_arrays = {
         name: (
@@ -3939,6 +5000,9 @@ def best_power_arrays(best_power, tone_count=None):
             ("chosen_power_dbm", out["chosen_power_dbm"]),
             ("p_bif", out["p_bif"]),
             ("p_bif_sub_3db", out["p_bif_sub_3db"]),
+            ("p_hyst_onset", out["p_hyst_onset"]),
+            ("p_hyst_onset_err", out["p_hyst_onset_err"]),
+            ("hysteresis_cap_dbm", out["hysteresis_cap_dbm"]),
         ):
             try:
                 target[i] = float(row.get(key, np.nan))
@@ -3993,6 +5057,8 @@ def _restore_best_row(row):
     for key in (
         "chosen_power_dbm", "p_bif", "p_bif_sub_3db", "bifurcation_anl",
         "median_reduced_chi2", "fr_gap_linewidths",
+        "p_hyst_onset", "p_hyst_onset_err", "p_hyst_lower", "p_hyst_upper",
+        "p_bif_minus_onset_db", "hysteresis_cap_dbm", "anl_direction_ratio",
     ):
         if key in out and out[key] is None:
             out[key] = float("nan")
@@ -5254,6 +6320,7 @@ def _plot_one_tone(
     ncol,
     parameter_show_errors,
     parameter_colour_points,
+    show_down_sweeps,
 ):
     """Render and save one tone's fit-overlay PNG and parameter-trend PNG.
 
@@ -5350,8 +6417,45 @@ def _plot_one_tone(
                 tx_power_dbm=power,
                 tx_power_reference_plane=tx_power_reference_plane,
             )
+
+        # Reverse sweep, dashed in the same colour: where the two separate,
+        # the resonator is bifurcated at that power.
+        down_sweep = (
+            run.get("sweeps_down") or [None] * n_sweeps
+        )[sweep_index] if show_down_sweeps else None
+        if down_sweep is not None and fig is not None:
+            fig = plot_sweep(
+                down_sweep,
+                format=format,
+                tones=[tone_index],
+                fig=fig,
+                label="_nolegend_",
+                show_errors=False,
+                title=title,
+                color=power_colour(power),
+                linestyle="--",
+                deembed=deembed,
+                phase_center=phase_center,
+                phase_rotate=phase_rotate,
+                mag_centered=mag_centered,
+                phase_centered=phase_centered,
+                mag_rotated=mag_rotated,
+                phase_rotated=phase_rotated,
+                group_delay_cal=group_delay_cal,
+                unwrap_phase=unwrap_phase,
+                units=units,
+                config=config,
+                reference_plane=reference_plane,
+                tx_power_dbm=power,
+                tx_power_reference_plane=tx_power_reference_plane,
+            )
     if fig is not None:
         full_title = title
+        n_down = sum(
+            sweep is not None for sweep in (run.get("sweeps_down") or [])
+        ) if show_down_sweeps else 0
+        if n_down:
+            full_title += " (dashed: down sweep)"
         no_fit_count = sum(
             _empirical_fallback_reason(fit) is not None for fit in fits_for_tone
         )
@@ -5442,6 +6546,7 @@ def plot_power_sweep(
     units=None,
     config=None,
     reference_plane="adc_input",
+    show_down_sweeps=True,
     n_jobs=1,
     verbose=True,
 ):
@@ -5527,6 +6632,14 @@ def plot_power_sweep(
     parameter_colour_points : bool, optional
         Colour parameter-trend points by tone power, matching fit overlays.
         Default ``False`` uses one lightweight line+marker artist per subplot.
+    show_down_sweeps : bool, optional
+        On a bidirectional run, overlay each power step's downward sweep as
+        a dashed line in the same colour as its upward sweep (default
+        ``True``; ignored when the run has no down sweeps).  Powers where
+        the dashed and solid traces separate are bifurcated -- this is the
+        raw picture behind :py:func:`hysteresis_metrics`.  Only the per-tone
+        figures get the overlay; the combined all-tones overlay would be
+        unreadable with twice the traces.
     deembed : bool, optional
         Apply RF deembedding to the traces before plotting (default
         ``False``).  Forwarded to :py:func:`plot_fits`.  For mag/phase plots
@@ -5772,6 +6885,7 @@ def plot_power_sweep(
         ncol=ncol,
         parameter_show_errors=parameter_show_errors,
         parameter_colour_points=parameter_colour_points,
+        show_down_sweeps=bool(show_down_sweeps),
     )
     workers = _resolve_n_jobs(n_jobs, len(tone_indices))
     plot_start = time.time()
@@ -6345,6 +7459,7 @@ _BEST_POWER_CRITERION_LABELS = {
     "anl_power_law": "fitted target ANL",
     "anl_threshold": "highest measured power below target ANL",
     "anl_nearest_target": "measured ANL nearest target",
+    "hysteresis_onset": "measured hysteresis onset, backed off",
     "lowest_power_fallback": "lowest measured power fallback",
     "none": "no selection",
 }
@@ -6372,6 +7487,7 @@ def _plot_best_power_one_tone(
     show_weights,
     target_anl,
     bifurcation_anl,
+    show_hysteresis,
 ):
     """Render and save one tone's ANL-power-selection PNG.
 
@@ -6659,6 +7775,40 @@ def _plot_best_power_one_tone(
             linewidth=1.15,
             label="p_bif_sub_3db",
         )
+    # Measured bifurcation from a bidirectional run: the shaded band is the
+    # bracket the sweeps actually straddled.  Comparing it with the p_bif
+    # line above is the point of taking both directions.
+    if show_hysteresis:
+        p_hyst_lower = _as_float(result.get("p_hyst_lower", np.nan))
+        p_hyst_upper = _as_float(result.get("p_hyst_upper", np.nan))
+        p_hyst_onset = _as_float(result.get("p_hyst_onset", np.nan))
+        if np.isfinite(p_hyst_lower) and np.isfinite(p_hyst_upper):
+            ax.axvspan(
+                p_hyst_lower,
+                p_hyst_upper,
+                color="tab:red",
+                alpha=0.12,
+                zorder=0,
+                label="measured hysteresis onset",
+            )
+        elif np.isfinite(p_hyst_upper):
+            # Every power was hysteretic: the onset is below the sweep.
+            ax.axvline(
+                p_hyst_upper,
+                color="tab:red",
+                linestyle="-.",
+                linewidth=1.1,
+                label="lowest hysteretic power",
+            )
+        if np.isfinite(p_hyst_onset):
+            ax.axvline(
+                p_hyst_onset,
+                color="tab:red",
+                linestyle="-",
+                linewidth=1.0,
+                alpha=0.6,
+                label="p_hyst_onset",
+            )
     if np.isfinite(chosen_power):
         # Map the internal criterion key to a plot-friendly label.
         criterion = str(result.get("chosen_criterion") or "none")
@@ -6887,6 +8037,7 @@ def plot_best_power(
     show_anl_errors=True,
     anl_errorbar_scale=1.0,
     show_weights=True,
+    show_hysteresis=True,
     show=False,
     dpi=80,
     figsize=(6.8, 4.2),
@@ -6936,6 +8087,12 @@ def plot_best_power(
     ``bifurcation_anl`` is the ANL value drawn as the ``ANL_bif`` reference
     line and forwarded to :py:func:`find_best_power`.  ``show_anl_errors``
     (default ``True``) toggles the ``anl_err`` error bars.
+
+    ``show_hysteresis`` (default ``True``) shades the measured bifurcation
+    bracket from a bidirectional run, so the *measured* onset and the
+    ``p_bif`` extrapolated from the ANL fit can be read off the same axis.
+    Agreement between them is the check the second sweep direction buys;
+    disagreement shows up as the ``bif_hysteresis_mismatch`` flag.
 
     Returns
     -------
@@ -7066,6 +8223,7 @@ def plot_best_power(
         show_weights=show_weights,
         target_anl=target_anl,
         bifurcation_anl=bifurcation_anl,
+        show_hysteresis=bool(show_hysteresis),
     )
     tasks = [
         (tone_index, rows_by_tone.get(tone_index, []),
