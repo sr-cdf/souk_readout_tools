@@ -1,49 +1,97 @@
-"""Tone-power sweeps: acquisition, fitting, power selection, and balancing.
+"""Tone-power sweeps: acquisition, fitting, power selection, and comb planning.
 
-Workflow
---------
-1. Acquire a run (hardware attached), or reload a previous one::
+The recommended workflow
+=======================
+Six steps, in this order.  Every default below is chosen so that the short
+form works on a first run; every stage is also callable on its own with full
+control (see `Doing it stage by stage`_).
 
-       from souk_readout_tools import power_sweep as ps
+::
 
-       run = ps.run_power_sweep(client, centers, spans, powers_dbm,
-                                output_dir="kid_power_sweep")
-       run = ps.load_power_sweep("kid_power_sweep")
+    from souk_readout_tools import power_sweep as ps
 
-2. Analyse it — fit every tone at every power, write the fit archive and
-   CSV summary, choose a best readout power per tone, render the plots —
-   or reload all of that from disk without recomputing anything::
+    # 1. SWEEP     acquire, up and down, so bifurcation is measured not guessed
+    run = ps.run_power_sweep(client, centers, spans, powers_dbm,
+                             output_dir="kid_power_sweep",
+                             direction="both")
 
-       analysis = ps.analyse_power_sweep(run, n_jobs=-1)
-       analysis = ps.load_analysis("kid_power_sweep")
+    # 2-4. ANALYSE  fit every sweep, choose a power per tone, write the plots
+    analysis = ps.analyse_power_sweep(run, n_jobs=-1)
 
-       arrays = ps.best_power_arrays(analysis["best_power"])
+    # 5. BALANCE   re-allocate powers under bifurcation caps and TX/RX spread
+    balanced = ps.balance_tone_powers(analysis["best_power"])
+    ps.write_balanced_power(balanced, "kid_power_sweep")
 
-   Taking the run with ``direction='both'`` sweeps each power step up and
-   then down.  Above the bifurcation power the two directions follow
-   different branches, so the bifurcation power is *measured* rather than
-   extrapolated from the fitted ``anl``, and the two estimates check each
-   other::
+    # 6. PLAN      decide the next run's comb, explicitly
+    comb = ps.plan_tone_comb(run=run, best_power=analysis["best_power"])
 
-       run = ps.run_power_sweep(client, centers, spans, powers_dbm,
-                                output_dir="kid_power_sweep",
-                                direction="both")
-       analysis = ps.analyse_power_sweep(run)     # p_hyst_onset vs p_bif
-       ps.hysteresis_metrics(run)                 # or the raw comparison
+    ps.run_power_sweep(client, comb["frequencies_hz"], comb["spans_hz"],
+                       balanced_power_dbm, output_dir="next_run")
 
-3. Optionally balance the comb — re-allocate the per-tone powers under
-   bifurcation caps and TX/RX spread constraints::
+Reload any of it later without recomputing anything::
 
-       balanced = ps.balance_tone_powers(analysis["best_power"])
-       ps.write_balanced_power(balanced, "kid_power_sweep")
+    run      = ps.load_power_sweep("kid_power_sweep")
+    analysis = ps.load_analysis("kid_power_sweep")
 
-Pieces
-------
-The procedures above are assembled from these, all callable directly:
+Why each step
+-------------
+**1. Sweep with** ``direction='both'``.  Each power step is swept upward and
+then downward.  Past the bifurcation power the two directions follow
+different branches, so bifurcation is *measured* — no extrapolation of the
+fitted ``anl`` needed — and the measured and extrapolated numbers then check
+each other (``p_hyst_onset`` against ``p_bif``).  It doubles the sweep time;
+``direction='up'`` keeps the old single-direction behaviour and everything
+downstream still works, just without the cross-check.  See
+:py:func:`hysteresis_metrics`.
+
+**2. Fit** (:py:func:`fit_power_sweep`).  Each tone is fitted at each power.
+Where a tone's window turns out to hold two resonances, the fit is
+restricted to the one that tone is reading out — otherwise the neighbour
+inflates the fitted ``anl`` by one to two orders of magnitude and the tone
+reads as though it were near bifurcation when it is not.
+
+**3. Choose** (:py:func:`find_best_power`).  A power per tone, from a
+log-linear fit of ``anl`` against power solved at ``target_anl``, with
+guards that drop the fit when it points somewhere the data does not support.
+Tones that lose that fit are placed from the rest of the array rather than
+from one of their own untrusted values.
+
+**4. Plot** (:py:func:`plot_power_sweep`, :py:func:`plot_best_power`).
+Per-tone fit overlays and the ANL-vs-power selection diagnostic, which is
+where the measured and extrapolated bifurcation powers can be compared by
+eye.
+
+**5. Balance** (:py:func:`balance_tone_powers`).  The per-tone choices are
+preferences; this re-allocates them under hard bifurcation caps and the
+TX/RX dynamic-range spread the hardware can actually deliver.
+
+**6. Plan the comb** (:py:func:`plan_tone_comb`).  The deliberate boundary
+between discovery and configuration: fitting may find that a window held two
+resonances, but the comb only ever changes when you ask it to, because a run
+that silently changes the tone count invalidates the powers it just
+measured.  ``policy='keep'`` (the default) preserves the tone count exactly;
+``'replace'`` moves a tone to the better resonance in its window at no cost
+in power or channels; ``'add'`` grows the comb, subject to explicit
+admission tests.  Any tone parameter can be overridden per tone or per
+column — see the ``overrides`` examples in :py:func:`plan_tone_comb`.
+
+Doing it stage by stage
+-----------------------
+:py:func:`analyse_power_sweep` is steps 2-4 in one call, and its stage
+switches make partial re-runs cheap — re-choose powers from stored fits
+without refitting, for instance::
+
+    ps.analyse_power_sweep(run, fit=False, plot_fits=False, target_anl=0.03)
+
+Each stage is also a plain function.  The full set:
 
 ======================  =====================================================
-hysteresis_metrics      up-vs-down sweep comparison, per tone and power
+run_power_sweep         acquire a run (``direction='both'`` for hysteresis)
+load_power_sweep        reload one from disk
+hysteresis_metrics      up-vs-down comparison, per tone and power
 hysteresis_onset        one tone's measured bifurcation bracket
+resonator_catalogue     every resonance found — one row per *resonance*
+split_multi_dip_sweep   restrict each tone's trace to its own resonance
 fit_power_sweep         fit every tone at every power -> ``fit_data``
 parameter_series        one tone's fitted parameters vs power, as 1D arrays
 fit_summary_array       ``fit_data`` as one flat structured table
@@ -53,6 +101,7 @@ write_fit_summary /     the flat table (``analysis/fit_summary.csv``)
 load_fit_summary
 find_best_power         choose a readout power per tone from the summary
 best_power_arrays       best-power rows -> per-tone arrays
+best_power_flag_summary which tones were flagged, and why
 write_best_power /      the chosen powers (``analysis/best_power.json``)
 load_best_power
 balance_tone_powers     re-allocation under bifurcation/TX/RX constraints
@@ -60,13 +109,17 @@ balanced_power_arrays   balanced result -> per-tone arrays
 write_balanced_power /  the balanced powers (``analysis/balanced_power.json``)
 load_balanced_power
 accumulator_level_db    per-tone RX levels (``rx_offsets_db`` for balancing)
+plan_tone_comb          catalogue + choices -> the next run's comb
+analyse_power_sweep     steps 2-4 in one call
+load_analysis           reload a finished analysis
 plot_power_sweep        per-tone fit overlays and parameter-vs-power PNGs
 plot_best_power         per-tone ANL-vs-power selection diagnostics
 ======================  =====================================================
 
 On disk a run directory holds ``measurement.json`` (the manifest),
-``data/`` (one sweep npz per power step), ``analysis/`` (the four artifact
-files above), and ``plots/``.
+``data/`` (one sweep npz per power step, plus ``_down`` files for a
+bidirectional run), ``analysis/`` (the artifact files above), and
+``plots/``.
 """
 
 from __future__ import annotations
@@ -90,6 +143,7 @@ from .fitting import (
     FitResult,
     batch_fit,
     extract_parameters,
+    fit_resonance,
     fit_result_summary_row,
     fit_sweep_stack,
     _resolve_n_jobs,
@@ -99,6 +153,7 @@ from .plotting._common import (
     _apply_compact_scientific_ticks,
     _validate_reference_plane,
 )
+from .peak_finder import find_mkid_resonances
 from .resonator import estimate_resonance_empirical
 from .measurement import (
     MANIFEST_FILE,
@@ -121,6 +176,11 @@ BALANCED_POWER_FILE = "analysis/balanced_power.json"
 SUMMARY_KEYS = FIT_SUMMARY_KEYS
 UNCERTAINTY_KEYS = FIT_UNCERTAINTY_KEYS
 
+# ``follow_dips`` separation floor, as a fraction of the pair's sweep span.
+# Two tones closer than this leave each other too little span after
+# ``clip_overlapping_spans`` to sweep at all -- see _find_dip_centers.
+DEFAULT_FOLLOW_MIN_SEPARATION_SPANS = 0.5
+
 __all__ = [
     # On-disk artifact locations
     "MANIFEST_FILE",
@@ -136,6 +196,10 @@ __all__ = [
     # Bidirectional runs: measured bifurcation
     "hysteresis_metrics",
     "hysteresis_onset",
+    # Multiple resonances in one window
+    "resonator_catalogue",
+    "split_multi_dip_sweep",
+    "plan_tone_comb",
     # Fitting and the fit-summary table
     "fit_power_sweep",
     "parameter_series",
@@ -275,17 +339,28 @@ def _normalise_tone_indices(tone_indices, tone_count):
 # --- Acquisition: run a stepped tone-power sweep -----------------------------
 
 def _find_dip_centers(sweep_data, centers, spans, follow_min_depth_db,
-                      min_separation=1.0):
+                      min_separation_spans=DEFAULT_FOLLOW_MIN_SEPARATION_SPANS,
+                      min_separation_hz=None):
     """Empirical-dip recentering used by ``run_power_sweep``.
 
     Each regular (non-blind) tone is recentered on the deepest dip in its full
     sweep trace.  A dip shallower than ``follow_min_depth_db`` is rejected so a
     tone never locks onto noise.  Finally, since tones are ordered by frequency,
-    any neighbouring pair whose new centers would swap order or land within
-    ``min_separation`` Hz of each other (both chasing the same resonance) is
-    reverted to its previous centers.  The returned comb is therefore always at
-    least ``min_separation`` Hz apart, matching the check ``perform_sweep``
-    enforces (default 1 Hz) -- a converged pair no longer poisons the sweep.
+    any neighbouring pair whose new centers would swap order or land closer
+    than the separation floor (both chasing the same resonance) is reverted to
+    its previous centers.
+
+    ``min_separation_spans`` is a **fraction of the pair's sweep span**
+    (default ``0.5``), because an absolute frequency is the wrong unit here.
+    ``perform_sweep`` only demands distinct centers (1 Hz), but
+    ``clip_overlapping_spans`` shares the gap between neighbouring tones, so
+    two tones that converge to within a fraction of a span leave each other
+    almost no span to sweep.  Converged pairs 10 Hz apart have been observed
+    to collapse both spans to zero, so that all 201 sweep points sat at one
+    frequency and every fit for both tones failed for the rest of the run.
+    Requiring half a span between neighbours keeps at least a quarter of each
+    span after clipping.  ``min_separation_hz`` overrides it with a plain
+    frequency floor when that is what you want.
 
     Returns ``(next_centers, record)`` where ``record`` is the per-tone
     diagnostic dict (candidate frequencies, depths, accept flags, reasons,
@@ -345,17 +420,23 @@ def _find_dip_centers(sweep_data, centers, spans, follow_min_depth_db,
     next_centers = centers.copy()
     next_centers[accepted] = candidates[accepted]
     # Tones are ordered by frequency.  If recentering moved a neighbouring pair
-    # so that they swap order or fall within ``min_separation`` (both chasing the
-    # same resonance), revert the accepted one(s) to their old centers -- which
-    # the previous sweep already proved are far enough apart.  A revert can
-    # expose a fresh conflict with the next neighbour, so repeat until the comb
-    # is clear.  This terminates: every pass only reverts accepted tones back to
-    # their separated originals, and the all-original state is conflict-free.
+    # so that they swap order or fall within the separation floor (both chasing
+    # the same resonance), revert the accepted one(s) to their old centers --
+    # which the previous sweep already proved are far enough apart.  A revert
+    # can expose a fresh conflict with the next neighbour, so repeat until the
+    # comb is clear.  This terminates: every pass only reverts accepted tones
+    # back to their separated originals, and the all-original state is
+    # conflict-free.
     order = np.argsort(centers)
     while True:
         adjusted = False
         for left, right in zip(order[:-1], order[1:]):
-            if next_centers[right] - next_centers[left] < min_separation:
+            floor = (
+                float(min_separation_hz) if min_separation_hz is not None
+                else float(min_separation_spans)
+                * min(spans[left], spans[right])
+            )
+            if next_centers[right] - next_centers[left] < floor:
                 for tone, other in ((left, right), (right, left)):
                     if accepted[tone]:
                         accepted[tone] = False
@@ -577,6 +658,8 @@ def run_power_sweep(
     follow_dips=True,
     follow_dips_from="down",
     follow_min_depth_db=0.5,
+    follow_min_separation_spans=DEFAULT_FOLLOW_MIN_SEPARATION_SPANS,
+    follow_min_separation_hz=None,
     search_for_center=None,
     verbose=True,
     search_span_factor=2.0,
@@ -824,6 +907,11 @@ def run_power_sweep(
             "adc_cal_settle_time_s": float(adc_cal_settle_time),
             "follow_dips": follow_dips,
             "follow_dips_from": follow_dips_from,
+            "follow_min_separation_spans": float(follow_min_separation_spans),
+            "follow_min_separation_hz": (
+                None if follow_min_separation_hz is None
+                else float(follow_min_separation_hz)
+            ),
             "search_for_center": search_for_center,
             "search_span_factor": search_span_factor,
             "tone_count": int(initial_centers.size),
@@ -1020,7 +1108,9 @@ def run_power_sweep(
             )
 
             new_centers, search_record = _find_dip_centers(
-                search_sweep, centers, search_spans, follow_min_depth_db
+                search_sweep, centers, search_spans, follow_min_depth_db,
+                min_separation_spans=follow_min_separation_spans,
+                min_separation_hz=follow_min_separation_hz,
             )
             blind_count = len(search_record["blind_indices"])
             _progress(
@@ -1173,7 +1263,9 @@ def run_power_sweep(
                 next_centers = centers.copy()
                 if follow_dips:
                     next_centers, follow_record = _find_dip_centers(
-                        follow_source, centers, spans, follow_min_depth_db
+                        follow_source, centers, spans, follow_min_depth_db,
+                        min_separation_spans=follow_min_separation_spans,
+                        min_separation_hz=follow_min_separation_hz,
                     )
                     follow_record["source_direction"] = follow_label
                     sweep_data["follow_dips"] = follow_record
@@ -1959,6 +2051,788 @@ def _bracket_hysteresis_onset(powers, hysteretic, jump_at_edge):
     return out
 
 
+# --- More than one resonance in a sweep window --------------------------------
+#
+# The resonance finder that builds the tone comb enforces a minimum spacing, so
+# a close pair is emitted as a single detection and one tone ends up covering
+# both.  The fitter then sees two dips and, having only a one-resonator model
+# to explain them with, reports a badly distorted resonance: on one campaign
+# the fitted ``anl`` came out 10-100x too large, so the tone read as though it
+# were near bifurcation when it was not, and its ANL power law was rejected.
+#
+# Fitting a joint two-resonator model would be the heavyweight answer.  It is
+# not needed: the readout only cares about *this* tone's resonator, so it is
+# enough to keep the deepest dip and cut the trace at the midpoint to each
+# neighbouring dip.  Measured on 28 contaminated tone/power pairs that took the
+# median reduced chi-square from 10423 to 148.
+
+DEFAULT_SECONDARY_DEPTH_FRACTION = 0.2
+# Below this separation a pair cannot be given a tone each: clip_overlapping_
+# spans splits the gap between neighbouring tones, so each would be left with
+# less than about three linewidths of span -- too narrow to sweep.
+DEFAULT_MIN_SPLIT_LINEWIDTHS = 6.0
+
+_CATALOGUE_DTYPE = np.dtype([
+    ("origin_tone_index", np.int64),
+    ("role", "U16"),
+    ("frequency_hz", float),
+    ("dip_depth_db", float),
+    ("linewidth_hz", float),
+    ("Ql", float),
+    ("Qc", float),
+    ("separation_hz", float),
+    ("separation_linewidths", float),
+    ("sweepable", np.bool_),
+    ("n_in_window", np.int64),
+    ("sweep_index", np.int64),
+])
+
+
+def _tone_dips(f, z, *, secondary_depth_fraction):
+    """Dips in one tone's trace, deepest first.
+
+    Thin wrapper over :py:func:`~souk_readout_tools.peak_finder.find_mkid_resonances`
+    (the same finder used on wideband sweeps -- it separates close pairs in a
+    201-point targeted trace reliably), keeping only dips at least
+    ``secondary_depth_fraction`` as deep as the deepest one so noise ripple is
+    not mistaken for a second resonator.
+    """
+    f = np.asarray(f, dtype=float).ravel()
+    z = np.asarray(z, dtype=complex).ravel()
+    good = np.isfinite(f) & np.isfinite(z.real) & np.isfinite(z.imag)
+    if np.count_nonzero(good) < 20:
+        return []
+    f, z = f[good], z[good]
+    order = np.argsort(f)
+    f, z = f[order], z[order]
+    try:
+        found = find_mkid_resonances(f, z, verbose=False)
+    except Exception:                      # a finder failure is not fatal here
+        return []
+    dips = [
+        r for r in found
+        if np.isfinite(getattr(r, "frequency", np.nan))
+        and np.isfinite(getattr(r, "dip_depth", np.nan) or np.nan)
+    ]
+    if not dips:
+        return []
+    dips.sort(key=lambda r: r.dip_depth, reverse=True)
+    deepest = dips[0].dip_depth
+    if not (np.isfinite(deepest) and deepest > 0):
+        return dips[:1]
+    return [
+        r for r in dips
+        if r.dip_depth >= float(secondary_depth_fraction) * deepest
+    ]
+
+
+def _dominant_dip_window(f, dips):
+    """``(lo, hi)`` keeping the deepest dip, cut midway to its neighbours.
+
+    The cut is geometric rather than a multiple of the linewidth because a
+    second dip inflates the very linewidth estimate a +/-N-FWHM window would
+    be built from -- on real data that window was a no-op in 26 of 28 cases,
+    while midpoint splitting improved 25 of 28.
+    """
+    f = np.asarray(f, dtype=float).ravel()
+    finite = f[np.isfinite(f)]
+    if finite.size == 0 or len(dips) < 2:
+        return None
+    lo, hi = float(np.min(finite)), float(np.max(finite))
+    main = float(dips[0].frequency)
+    for other in dips[1:]:
+        mid = 0.5 * (float(other.frequency) + main)
+        if other.frequency < main:
+            lo = max(lo, mid)
+        else:
+            hi = min(hi, mid)
+    if not (lo < main < hi):
+        return None
+    return lo, hi
+
+
+def split_multi_dip_sweep(sweep, *,
+                          secondary_depth_fraction=DEFAULT_SECONDARY_DEPTH_FRACTION,
+                          min_points=20):
+    """Mask each tone's trace down to its own resonance.
+
+    Returns ``(masked_sweep, records)``.  ``masked_sweep`` is a shallow copy
+    of ``sweep`` whose I/Q (and errors) are ``NaN`` outside each contaminated
+    tone's dominant-dip window; the fitter drops non-finite samples, so this
+    restricts the fit without any change to the fitter itself.  Tones with a
+    single dip are untouched, and a tone is left alone when the split would
+    leave fewer than ``min_points`` samples.
+
+    ``records`` maps ``tone_index`` to a dict describing what was cut
+    (``n_dips``, ``window_hz``, ``kept_points``, ``dip_frequencies_hz``,
+    ``dip_depths_db``), which is what :py:func:`resonator_catalogue` reports.
+    """
+    if not isinstance(sweep, dict):
+        return sweep, {}
+    f_all = np.atleast_2d(np.asarray(sweep["sweep_f"], dtype=float))
+    i_all = np.atleast_2d(np.asarray(sweep["sweep_i"], dtype=float))
+    q_all = np.atleast_2d(np.asarray(sweep["sweep_q"], dtype=float))
+    records = {}
+    masked_i = masked_q = masked_ei = masked_eq = None
+
+    for tone_index in range(f_all.shape[1]):
+        f = f_all[:, tone_index]
+        z = i_all[:, tone_index] + 1j * q_all[:, tone_index]
+        dips = _tone_dips(
+            f, z, secondary_depth_fraction=secondary_depth_fraction
+        )
+        if len(dips) < 2:
+            continue
+        window = _dominant_dip_window(f, dips)
+        if window is None:
+            continue
+        lo, hi = window
+        keep = ~np.isfinite(f) | ((f >= lo) & (f <= hi))
+        if np.count_nonzero(keep & np.isfinite(f)) < int(min_points):
+            continue
+        if masked_i is None:               # copy on first write only
+            masked_i, masked_q = i_all.copy(), q_all.copy()
+            if "sweep_ei" in sweep and "sweep_eq" in sweep:
+                masked_ei = np.atleast_2d(
+                    np.asarray(sweep["sweep_ei"], dtype=float)).copy()
+                masked_eq = np.atleast_2d(
+                    np.asarray(sweep["sweep_eq"], dtype=float)).copy()
+        drop = ~keep
+        masked_i[drop, tone_index] = np.nan
+        masked_q[drop, tone_index] = np.nan
+        if masked_ei is not None:
+            masked_ei[drop, tone_index] = np.nan
+            masked_eq[drop, tone_index] = np.nan
+        records[int(tone_index)] = {
+            "n_dips": len(dips),
+            "window_hz": (float(lo), float(hi)),
+            "kept_points": int(np.count_nonzero(keep & np.isfinite(f))),
+            "dip_frequencies_hz": [float(d.frequency) for d in dips],
+            "dip_depths_db": [float(d.dip_depth) for d in dips],
+            "dip_linewidths_hz": [
+                float(d.fwhm) if d.fwhm else np.nan for d in dips
+            ],
+        }
+
+    if masked_i is None:
+        return sweep, {}
+    masked = dict(sweep)
+    masked["sweep_i"] = masked_i
+    masked["sweep_q"] = masked_q
+    if masked_ei is not None:
+        masked["sweep_ei"] = masked_ei
+        masked["sweep_eq"] = masked_eq
+    masked["multi_dip_records"] = records
+    return masked, records
+
+
+def resonator_catalogue(run, *, sweep_index=None,
+                        secondary_depth_fraction=DEFAULT_SECONDARY_DEPTH_FRACTION,
+                        min_split_linewidths=DEFAULT_MIN_SPLIT_LINEWIDTHS):
+    """Every resonance found in the run: one row per *resonance*, not per tone.
+
+    A tone whose window contains a close pair yields two rows -- the one the
+    tone is actually reading out (``role='primary'``) and the one it is
+    sharing its window with (``role='secondary'``).  This is the input to
+    :py:func:`plan_tone_comb`, and on its own it answers "what did we
+    actually find?", which a per-tone table cannot.
+
+    Parameters
+    ----------
+    run : dict or str or Path
+        A run from :py:func:`run_power_sweep` / :py:func:`load_power_sweep`,
+        or a path to one.
+    sweep_index : int or None, optional
+        Which power step to catalogue.  ``None`` (default) uses the middle
+        of the usable steps.  Neither end of the schedule is a good choice:
+        the lowest powers are noise-limited and produce spurious second dips
+        (on one campaign, 50 secondaries at the bottom step against a stable
+        13-16 over the whole middle of the range), while the highest are
+        bifurcated and start losing real ones.
+    secondary_depth_fraction : float, optional
+        How deep a second dip must be, relative to the deepest one in the
+        same window, to be catalogued (default ``0.2``).
+
+        Note the finder needs roughly four linewidths of separation to
+        resolve two dips at all, so a catalogue is a lower bound on how many
+        blended pairs a run contains: a pair closer than that reads as one
+        broad, skewed resonance.  That is also the regime where splitting
+        would leave too little data to fit, so the two limits coincide.
+    min_split_linewidths : float, optional
+        Separation, in linewidths, above which a pair can be given a tone
+        each and still be sweepable (default ``6``).  Below it,
+        ``clip_overlapping_spans`` would leave each tone under about three
+        linewidths of span.  Recorded per row as ``sweepable``.
+
+    Returns
+    -------
+    catalogue : numpy.ndarray
+        Structured array with ``origin_tone_index``, ``role``,
+        ``frequency_hz``, ``dip_depth_db``, ``linewidth_hz``, ``Ql``,
+        ``Qc``, ``separation_hz``, ``separation_linewidths``, ``sweepable``,
+        ``n_in_window``, and ``sweep_index``.
+    """
+    run = _power_sweep_run_view(run)
+    sweeps = run.get("sweeps") or []
+    if sweep_index is None:
+        usable = [
+            i for i, sweep in enumerate(sweeps)
+            if isinstance(sweep, dict) and not sweep.get("skipped", False)
+        ]
+        if not usable:
+            return np.empty(0, dtype=_CATALOGUE_DTYPE)
+        # Middle of the usable schedule: away from the noise-limited bottom
+        # and the bifurcated top (see the docstring).
+        powers = np.array([
+            float(np.nanmedian(_power_row_for_step(run, i)))
+            if _power_row_for_step(run, i).size else np.nan
+            for i in usable
+        ])
+        if np.any(np.isfinite(powers)):
+            usable = [i for i, p in zip(usable, powers) if np.isfinite(p)]
+            powers = powers[np.isfinite(powers)]
+            usable = [usable[k] for k in np.argsort(powers)]
+        sweep_index = usable[len(usable) // 2]
+    sweep = sweeps[sweep_index] if sweep_index < len(sweeps) else None
+    if not isinstance(sweep, dict):
+        return np.empty(0, dtype=_CATALOGUE_DTYPE)
+
+    f_all = np.atleast_2d(np.asarray(sweep["sweep_f"], dtype=float))
+    i_all = np.atleast_2d(np.asarray(sweep["sweep_i"], dtype=float))
+    q_all = np.atleast_2d(np.asarray(sweep["sweep_q"], dtype=float))
+    rows = []
+    for tone_index in range(f_all.shape[1]):
+        f = f_all[:, tone_index]
+        z = i_all[:, tone_index] + 1j * q_all[:, tone_index]
+        dips = _tone_dips(
+            f, z, secondary_depth_fraction=secondary_depth_fraction
+        )
+        if not dips:
+            continue
+        main = dips[0]
+        for rank, dip in enumerate(dips):
+            width = float(dip.fwhm) if dip.fwhm else np.nan
+            if rank == 0:
+                separation = np.nan
+            else:
+                separation = abs(float(dip.frequency) - float(main.frequency))
+            # Judge sweepability on the pair's own width, falling back to the
+            # primary's when the secondary has no usable estimate.
+            reference_width = width if np.isfinite(width) else (
+                float(main.fwhm) if main.fwhm else np.nan
+            )
+            separation_widths = (
+                separation / reference_width
+                if np.isfinite(separation) and np.isfinite(reference_width)
+                and reference_width > 0 else np.nan
+            )
+            rows.append((
+                int(tone_index),
+                "primary" if rank == 0 else "secondary",
+                float(dip.frequency),
+                float(dip.dip_depth) if dip.dip_depth is not None else np.nan,
+                width,
+                float(dip.q_factor) if dip.q_factor else np.nan,
+                float(dip.qc) if dip.qc else np.nan,
+                separation,
+                separation_widths,
+                bool(
+                    rank == 0 or (
+                        np.isfinite(separation_widths)
+                        and separation_widths >= float(min_split_linewidths)
+                    )
+                ),
+                len(dips),
+                int(sweep_index),
+            ))
+    out = np.empty(len(rows), dtype=_CATALOGUE_DTYPE)
+    for i, row in enumerate(rows):
+        out[i] = row
+    return out
+
+
+def _override_key_matches(key, row_tone, row_frequency, tolerance_hz):
+    """True when an ``overrides`` key selects this planned tone.
+
+    Integer keys select by ``origin_tone_index``, float keys by frequency
+    (nearest within ``tolerance_hz``), so both "the tone that was index 12"
+    and "the resonator at 1.234 GHz" work without the caller having to know
+    which index a resonance ended up at.
+    """
+    if isinstance(key, (bool, np.bool_)):
+        return False
+    if isinstance(key, (int, np.integer)):
+        return int(key) == int(row_tone)
+    try:
+        return abs(float(key) - float(row_frequency)) <= float(tolerance_hz)
+    except (TypeError, ValueError):
+        return False
+
+
+def plan_tone_comb(
+    catalogue=None,
+    *,
+    run=None,
+    best_power=None,
+    policy="keep",
+    max_tones=None,
+    min_split_linewidths=DEFAULT_MIN_SPLIT_LINEWIDTHS,
+    readout_only=False,
+    span_hz=None,
+    default_power_dbm=None,
+    power_budget_dbm=None,
+    frequencies_hz=None,
+    powers_dbm=None,
+    spans_hz=None,
+    phases_rad=None,
+    overrides=None,
+    include=None,
+    exclude=None,
+    override_tolerance_hz=1e4,
+    verbose=True,
+):
+    """Turn a resonator catalogue into the next run's tone comb.
+
+    This is the deliberate boundary between *discovery* and *configuration*.
+    Fitting may find that a tone's window held two resonances, but that must
+    never silently change the comb: a power-tune run that alters the tone
+    count invalidates the powers it just measured.  So the catalogue records
+    what was found, and this function -- run when you choose to -- decides
+    what to do about it, under explicit constraints, and hands back arrays
+    ready for :py:func:`run_power_sweep` or ``client.set_tone_*``.
+
+    Quick start, in the order the workflow runs::
+
+        analysis  = ps.analyse_power_sweep(run)
+        balanced  = ps.balance_tone_powers(analysis["best_power"])
+        comb      = ps.plan_tone_comb(run=run, best_power=analysis["best_power"])
+
+        ps.run_power_sweep(client, comb["frequencies_hz"], comb["spans_hz"],
+                           powers_dbm, "next_run")
+
+    Parameters
+    ----------
+    catalogue : numpy.ndarray or None, optional
+        Output of :py:func:`resonator_catalogue`.  ``None`` (default) builds
+        one from ``run``.
+    run : dict or str or Path, optional
+        The run to catalogue when ``catalogue`` is not given.
+    best_power : list of dict or path-like, optional
+        Result of :py:func:`find_best_power`, used for each tone's power.
+        A resonance that never had a tone of its own has no measured power;
+        it is given one from the run's population Q-scaling model when that
+        is available (see :py:func:`find_best_power`), otherwise it inherits
+        the power of the tone whose window it was found in.  The source is
+        reported per tone in ``power_source``.
+    policy : {'keep', 'replace', 'add'}, optional
+        What to do about windows holding more than one resonance:
+
+        - ``'keep'`` (default) -- the comb keeps exactly the tones it had,
+          re-centred on the measured dip.  Secondaries are catalogued and
+          reported but not tuned.  Nothing downstream changes.
+        - ``'replace'`` -- same tone count, but where a window's *other*
+          resonance is the better one (deeper), the tone moves to it.  Power,
+          headroom and channel use are all unchanged, which makes this the
+          cheapest way to stop reading out the worse of a pair.
+        - ``'add'`` -- grow the comb by admitting secondaries that pass the
+          tests below.  Rejections are reported, never silent.
+
+    max_tones : int or None, optional
+        Hard ceiling on the planned comb.  ``None`` (default) means the
+        original count for ``'keep'`` / ``'replace'``, and unlimited for
+        ``'add'``.  When admissions exceed it, the deepest dips win.
+    min_split_linewidths : float, optional
+        Separation, in linewidths, a secondary needs before it can have its
+        own tone (default ``6``).  This is the binding constraint in
+        practice, not power: ``clip_overlapping_spans`` shares the gap
+        between neighbouring tones, so a closer pair leaves each tone under
+        about three linewidths of span -- too narrow to sweep.  On one
+        campaign only 2 of 21 close pairs cleared it.
+    readout_only : bool, optional
+        Admit secondaries that are too close to sweep separately (default
+        ``False``).  A parked readout tone needs no span, so the separation
+        test does not apply to it -- but such tones cannot be power-tuned by
+        a targeted sweep afterwards, and close pairs may share a PSB bin,
+        which costs extra LO indices in firmware.  Use when you want the
+        detector, not another power sweep.
+    span_hz : float or array-like or None, optional
+        Requested sweep span per planned tone.  ``None`` (default) reuses the
+        run's spans.  The returned ``spans_hz`` are additionally narrowed so
+        neighbours do not overlap, matching what ``perform_sweep`` would do.
+    default_power_dbm : float or None, optional
+        Power for tones with no measured or modelled value.  ``None``
+        (default) uses the median planned power.
+    power_budget_dbm : float or None, optional
+        Total comb power ceiling.  When the plan exceeds it, every tone is
+        scaled down by the excess and ``power_budget`` reports it.  ``None``
+        (default) only reports the totals.  Adding tones is rarely the
+        problem -- adding 21 tones to 389 raises the total by 0.23 dB.
+    frequencies_hz, powers_dbm, spans_hz, phases_rad : array-like, optional
+        Whole-column overrides, applied after planning.  Each must match the
+        planned tone count; pass ``None`` (default) to leave the planned
+        values alone.  ``phases_rad`` defaults to ``None``, which lets
+        :py:func:`run_power_sweep` regenerate Newman phases for the new comb
+        (they are a function of the frequencies, so they need no accounting).
+    overrides : dict, optional
+        Per-tone overrides, ``{key: {field: value}}``.  The key is either an
+        ``int`` (the ``origin_tone_index``) or a ``float`` frequency in Hz
+        matched within ``override_tolerance_hz``.  Fields are
+        ``frequency_hz``, ``power_dbm``, ``span_hz``, ``phase_rad`` and
+        ``include`` (``False`` drops the tone).  For example::
+
+            overrides={
+                12: {"power_dbm": -95.0},          # tone 12, by index
+                1.2345e9: {"span_hz": 200e3},      # by frequency
+                57: {"include": False},            # drop it
+            }
+
+    include, exclude : iterable, optional
+        Force resonances in or out, using the same key form as
+        ``overrides``.  ``exclude`` wins over ``include``.
+    override_tolerance_hz : float, optional
+        Frequency matching tolerance for float keys (default ``10 kHz``).
+    verbose : bool, optional
+        Print a one-line summary of the plan (default ``True``).
+
+    Returns
+    -------
+    plan : dict
+        ``frequencies_hz``, ``spans_hz``, ``powers_dbm``, ``phases_rad``
+        (arrays ready to pass straight to :py:func:`run_power_sweep`), plus
+        ``origin_tone_index``, ``role``, ``power_source``, ``n_tones``,
+        ``n_original``, ``policy``, ``rejected`` (one dict per resonance not
+        admitted, with a ``reason``), ``overrides_applied``, and
+        ``power_budget`` with the before/after totals in dBm.
+    """
+    policy = str(policy).lower()
+    if policy not in {"keep", "replace", "add"}:
+        raise ValueError("policy must be 'keep', 'replace', or 'add'.")
+    if catalogue is None:
+        if run is None:
+            raise ValueError("plan_tone_comb needs a catalogue or a run.")
+        catalogue = resonator_catalogue(
+            run, min_split_linewidths=min_split_linewidths
+        )
+    if len(catalogue) == 0:
+        raise ValueError("The catalogue is empty; nothing to plan.")
+
+    view = _power_sweep_run_view(run) if run is not None else None
+    tones = sorted({int(t) for t in catalogue["origin_tone_index"]})
+    n_original = len(tones)
+
+    # --- Choose which resonance each original tone holds, and what else is
+    # on offer.  'keep' takes the primary; 'replace' takes the deepest in the
+    # window; 'add' takes the primary and offers the rest for admission.
+    chosen, offered = [], []
+    for tone in tones:
+        rows = catalogue[catalogue["origin_tone_index"] == tone]
+        if rows.size == 0:
+            continue
+        order = np.argsort(np.nan_to_num(rows["dip_depth_db"], nan=-np.inf))[::-1]
+        deepest = rows[order[0]]
+        primary = rows[rows["role"] == "primary"]
+        primary = primary[0] if primary.size else deepest
+        if policy == "replace":
+            chosen.append(deepest)
+            offered.extend(r for r in rows if r["frequency_hz"] != deepest["frequency_hz"])
+        else:
+            chosen.append(primary)
+            offered.extend(r for r in rows if r["frequency_hz"] != primary["frequency_hz"])
+
+    rejected = []
+    admitted = []
+    if policy == "add":
+        for row in offered:
+            if not readout_only and not bool(row["sweepable"]):
+                rejected.append({
+                    "frequency_hz": float(row["frequency_hz"]),
+                    "origin_tone_index": int(row["origin_tone_index"]),
+                    "reason": (
+                        f"separation {row['separation_linewidths']:.1f} "
+                        f"linewidths < {float(min_split_linewidths):g}; too "
+                        "close to sweep separately (pass readout_only=True "
+                        "to admit it as a parked tone)"
+                    ),
+                })
+                continue
+            admitted.append(row)
+    else:
+        for row in offered:
+            rejected.append({
+                "frequency_hz": float(row["frequency_hz"]),
+                "origin_tone_index": int(row["origin_tone_index"]),
+                "reason": f"policy={policy!r} keeps the tone count unchanged",
+            })
+
+    planned = list(chosen) + list(admitted)
+    planned.sort(key=lambda r: float(r["frequency_hz"]))
+
+    # --- Powers: measured where we have them, modelled where we do not.
+    best_rows = _normalise_best_power_rows(best_power) or []
+    best_by_tone = {int(r["tone_index"]): r for r in best_rows}
+    model = next(
+        (r.get("population_model") for r in best_rows if r.get("population_model")),
+        None,
+    )
+
+    def _power_for(row):
+        tone = int(row["origin_tone_index"])
+        best = best_by_tone.get(tone)
+        if row["role"] == "primary" and best is not None:
+            value = _as_float_or_nan(best.get("chosen_power_dbm"))
+            if np.isfinite(value):
+                return value, "measured"
+        # A resonance that never had its own tone: predict from the run's
+        # population Q scaling, which is exactly the case that model exists
+        # for; otherwise inherit the window's measured power.
+        if model and np.isfinite(row["Ql"]) and np.isfinite(row["Qc"]) \
+                and row["Ql"] > 0 and row["Qc"] > 0:
+            x = -30.0 * np.log10(row["Ql"]) + 10.0 * np.log10(row["Qc"])
+            value = float(
+                model["slope_db_per_db"] * x + model["intercept_dbm"]
+            )
+            if np.isfinite(value):
+                return value, "population_model"
+        if best is not None:
+            value = _as_float_or_nan(best.get("chosen_power_dbm"))
+            if np.isfinite(value):
+                return value, "inherited"
+        return np.nan, "unavailable"
+
+    frequencies = np.array([float(r["frequency_hz"]) for r in planned])
+    origin = np.array([int(r["origin_tone_index"]) for r in planned])
+    roles = np.array([str(r["role"]) for r in planned], dtype=object)
+    powers = np.empty(len(planned))
+    power_source = np.empty(len(planned), dtype=object)
+    for i, row in enumerate(planned):
+        powers[i], power_source[i] = _power_for(row)
+    fallback_power = (
+        float(default_power_dbm) if default_power_dbm is not None
+        else (float(np.nanmedian(powers)) if np.any(np.isfinite(powers)) else np.nan)
+    )
+    powers[~np.isfinite(powers)] = fallback_power
+
+    # --- Spans: the requested span, narrowed so neighbours do not overlap.
+    if span_hz is not None:
+        spans = np.broadcast_to(
+            np.asarray(span_hz, dtype=float).ravel(), (len(planned),)
+        ).astype(float).copy()
+    elif view is not None and np.size(view.get("spans_hz", [])):
+        run_spans = np.asarray(view["spans_hz"], dtype=float).ravel()
+        spans = np.array([
+            run_spans[o] if o < run_spans.size else float(np.median(run_spans))
+            for o in origin
+        ])
+    else:
+        spans = np.full(len(planned), np.nan)
+    spans = _narrow_spans_to_neighbours(frequencies, spans)
+
+    # --- Overrides last, so the user always has the final word.
+    applied = []
+    keep_mask = np.ones(len(planned), dtype=bool)
+    for column, values in (
+        ("frequencies_hz", frequencies_hz), ("powers_dbm", powers_dbm),
+        ("spans_hz", spans_hz),
+    ):
+        if values is None:
+            continue
+        values = np.asarray(values, dtype=float).ravel()
+        if values.size != len(planned):
+            raise ValueError(
+                f"{column} override has {values.size} entries but the plan has "
+                f"{len(planned)} tones."
+            )
+        target = {"frequencies_hz": frequencies, "powers_dbm": powers,
+                  "spans_hz": spans}[column]
+        target[:] = values
+        applied.append({"scope": "column", "field": column})
+
+    phases = (
+        None if phases_rad is None
+        else np.asarray(phases_rad, dtype=float).ravel().copy()
+    )
+    if phases is not None and phases.size != len(planned):
+        raise ValueError(
+            f"phases_rad has {phases.size} entries but the plan has "
+            f"{len(planned)} tones."
+        )
+
+    def _rows_matching(key):
+        return [
+            i for i in range(len(planned))
+            if _override_key_matches(
+                key, origin[i], frequencies[i], override_tolerance_hz
+            )
+        ]
+
+    for key in (include or []):
+        applied.append({"scope": "include", "key": key,
+                        "matched": _rows_matching(key)})
+    for key in (exclude or []):
+        matched = _rows_matching(key)
+        keep_mask[matched] = False
+        applied.append({"scope": "exclude", "key": key, "matched": matched})
+
+    field_to_array = {
+        "frequency_hz": frequencies, "power_dbm": powers, "span_hz": spans,
+    }
+    for key, fields in (overrides or {}).items():
+        matched = _rows_matching(key)
+        if not matched:
+            warnings.warn(
+                f"plan_tone_comb: override key {key!r} matched no planned tone.",
+                stacklevel=2,
+            )
+            continue
+        for field, value in dict(fields).items():
+            if field == "include":
+                keep_mask[matched] = bool(value)
+            elif field == "phase_rad":
+                if phases is None:
+                    phases = np.full(len(planned), np.nan)
+                phases[matched] = float(value)
+            elif field in field_to_array:
+                field_to_array[field][matched] = float(value)
+            else:
+                raise ValueError(
+                    f"plan_tone_comb: unknown override field {field!r}; "
+                    f"use one of {sorted(field_to_array) + ['phase_rad', 'include']}"
+                )
+        applied.append({"scope": "tone", "key": key, "matched": matched,
+                        "fields": dict(fields)})
+
+    # --- Ceiling on the tone count: keep the deepest dips.
+    limit = max_tones
+    if limit is None and policy in {"keep", "replace"}:
+        limit = n_original
+    if limit is not None and int(np.count_nonzero(keep_mask)) > int(limit):
+        depths = np.array([
+            float(r["dip_depth_db"]) if np.isfinite(r["dip_depth_db"]) else -np.inf
+            for r in planned
+        ])
+        eligible = np.flatnonzero(keep_mask)
+        drop = eligible[np.argsort(depths[eligible])][: eligible.size - int(limit)]
+        keep_mask[drop] = False
+        for i in drop:
+            rejected.append({
+                "frequency_hz": float(frequencies[i]),
+                "origin_tone_index": int(origin[i]),
+                "reason": f"max_tones={int(limit)} reached; shallower dip dropped",
+            })
+
+    frequencies, powers, spans = (
+        frequencies[keep_mask], powers[keep_mask], spans[keep_mask]
+    )
+    origin, roles = origin[keep_mask], roles[keep_mask]
+    power_source = power_source[keep_mask]
+    if phases is not None:
+        phases = phases[keep_mask]
+    order = np.argsort(frequencies)
+    frequencies, powers, spans = frequencies[order], powers[order], spans[order]
+    origin, roles = origin[order], roles[order]
+    power_source = power_source[order]
+    if phases is not None:
+        phases = phases[order]
+    spans = _narrow_spans_to_neighbours(frequencies, spans)
+
+    # --- Power budget: report, and scale down only if a ceiling was given.
+    total_before = _total_power_dbm(
+        np.array([
+            _as_float_or_nan(best_by_tone[t].get("chosen_power_dbm"))
+            for t in tones if t in best_by_tone
+        ])
+    )
+    total_after = _total_power_dbm(powers)
+    if (
+        power_budget_dbm is not None
+        and np.isfinite(total_after)
+        and total_after > float(power_budget_dbm)
+    ):
+        excess = total_after - float(power_budget_dbm)
+        powers = powers - excess
+        total_after = _total_power_dbm(powers)
+    budget = {
+        "total_dbm_before": total_before,
+        "total_dbm_after": total_after,
+        "delta_db": (
+            float(total_after - total_before)
+            if np.isfinite(total_after) and np.isfinite(total_before) else np.nan
+        ),
+        "budget_dbm": (
+            None if power_budget_dbm is None else float(power_budget_dbm)
+        ),
+    }
+
+    plan = {
+        "frequencies_hz": frequencies,
+        "spans_hz": spans,
+        "powers_dbm": powers,
+        "phases_rad": phases,
+        "origin_tone_index": origin,
+        "role": roles,
+        "power_source": power_source,
+        "policy": policy,
+        "n_tones": int(frequencies.size),
+        "n_original": int(n_original),
+        "rejected": rejected,
+        "overrides_applied": applied,
+        "power_budget": budget,
+    }
+    if verbose:
+        n_added = int(np.count_nonzero(roles == "secondary"))
+        _progress(
+            verbose,
+            f"plan_tone_comb[{policy}]: {plan['n_tones']} tones "
+            f"(was {n_original}; {n_added} from shared windows, "
+            f"{len(rejected)} not admitted), total power "
+            f"{budget['delta_db']:+.2f} dB",
+        )
+    return plan
+
+
+def _as_float_or_nan(value):
+    """Float ``value``, or ``NaN`` when it is missing or not a number."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return np.nan
+    return value
+
+
+def _total_power_dbm(powers):
+    """Total power of a comb, in dBm, from per-tone dBm values."""
+    powers = np.asarray(powers, dtype=float).ravel()
+    powers = powers[np.isfinite(powers)]
+    if powers.size == 0:
+        return np.nan
+    return float(10.0 * np.log10(np.sum(10.0 ** (powers / 10.0))))
+
+
+def _narrow_spans_to_neighbours(frequencies, spans):
+    """Shrink spans so neighbouring sweep windows do not overlap.
+
+    Mirrors what ``perform_sweep`` does with ``clip_overlapping_spans``, so a
+    plan reports the spans the next run will actually use rather than the
+    ones it asked for.
+    """
+    frequencies = np.asarray(frequencies, dtype=float).ravel()
+    spans = np.asarray(spans, dtype=float).ravel().copy()
+    if frequencies.size < 2:
+        return spans
+    order = np.argsort(frequencies)
+    ordered = frequencies[order]
+    gaps = np.diff(ordered)
+    for position, index in enumerate(order):
+        limits = []
+        if position > 0:
+            limits.append(gaps[position - 1])
+        if position < ordered.size - 1:
+            limits.append(gaps[position])
+        if limits and np.isfinite(spans[index]):
+            spans[index] = min(spans[index], float(min(limits)))
+    return spans
+
+
 # --- Fitting -----------------------------------------------------------------
 
 def fit_power_sweep(
@@ -1972,6 +2846,8 @@ def fit_power_sweep(
     hysteresis=True,
     hysteresis_kwargs=None,
     fit_down_sweeps=True,
+    split_multi_dip=True,
+    secondary_depth_fraction=DEFAULT_SECONDARY_DEPTH_FRACTION,
     **fit_kwargs,
 ):
     """Fit all tones at each power, or one tone across the power axis.
@@ -2047,6 +2923,22 @@ def fit_power_sweep(
         the model is being pushed past where it holds.  Roughly doubles the
         fitting time; set ``False`` to skip it and keep the hysteresis
         metrics, which do not need any fit.
+    split_multi_dip : bool, optional
+        When a tone's window contains more than one resonance, fit only the
+        one that tone is reading out, cutting the trace at the midpoint to
+        each neighbouring dip (default ``True``; see
+        :py:func:`split_multi_dip_sweep`).  Without this a close pair
+        distorts the single-resonator fit badly enough to inflate ``anl`` by
+        one to two orders of magnitude, so the tone reads as though it were
+        near bifurcation when it is not.  Each split tone is also fitted on
+        its full trace and the better of the two (by ``reduced_chi2``) is
+        kept, so a split can never make a tone worse.  The cost is dip
+        detection on every trace plus one extra fit per contaminated tone:
+        measured at +21% on a 389-tone, 21-step campaign where 5% of tones
+        were contaminated (161 s against 133 s).
+    secondary_depth_fraction : float, optional
+        How deep a second dip must be, relative to the deepest in the same
+        window, to count as a resonance rather than noise (default ``0.2``).
     **fit_kwargs
         Forwarded to :py:func:`batch_fit` (per-power mode) or
         :py:func:`fit_sweep_stack` (per-tone mode).  Common kwargs:
@@ -2092,9 +2984,17 @@ def fit_power_sweep(
     # goes through batch_fit, so blind-tone handling and original tone indices
     # match normal one-sweep fitting.
     if tone_index is None:
-        fits_by_power = [
-            batch_fit(
-                sweep,
+        fits_by_power, split_by_power = [], []
+        for sweep in run["sweeps"]:
+            to_fit, records = (
+                split_multi_dip_sweep(
+                    sweep, secondary_depth_fraction=secondary_depth_fraction
+                )
+                if (split_multi_dip and isinstance(sweep, dict))
+                else (sweep, {})
+            )
+            fits = batch_fit(
+                to_fit,
                 nonlinear=nonlinear,
                 sweep_direction=sweep_direction,
                 n_jobs=n_jobs,
@@ -2102,9 +3002,25 @@ def fit_power_sweep(
                 min_dip_depth_db=min_dip_depth_db,
                 **fit_kwargs,
             )
-            for sweep in run["sweeps"]
-        ]
+            if records:
+                fits = _keep_better_unsplit_fits(
+                    fits, sweep, records,
+                    nonlinear=nonlinear,
+                    sweep_direction=sweep_direction,
+                    min_dip_depth_db=min_dip_depth_db,
+                    fit_kwargs=fit_kwargs,
+                )
+            fits_by_power.append(fits)
+            split_by_power.append(records)
         fit_data = {"run": run, "fits_by_power": fits_by_power}
+        if any(split_by_power):
+            fit_data["multi_dip_by_power"] = split_by_power
+            n_split = sum(len(r) for r in split_by_power)
+            _progress(
+                verbose,
+                f"Multi-dip: restricted {n_split} tone/power fits to their "
+                f"own resonance",
+            )
         # The down sweeps follow the other branch, so they are fitted with
         # sweep_direction='down'; below bifurcation both directions must
         # return the same anl.
@@ -2396,16 +3312,21 @@ def _fits_for_power(fit_data, sweep_index, tone_indices):
 
 # --- The fit-summary table (one row per power step and tone) -----------------
 
-_FIT_SUMMARY_INDEX_KEYS = {"sweep_index", "tone_index", "hyst_n_points"}
+_FIT_SUMMARY_INDEX_KEYS = {
+    "sweep_index", "tone_index", "hyst_n_points", "n_dips_in_window",
+}
 _FIT_SUMMARY_BOOL_KEYS = {
     "success", "noise_only",
     "noise_from_errors", "jump_at_edge", "hysteretic", "success_down",
+    "split_applied",
 }
 _FIT_SUMMARY_STRING_KEYS = {"message"}
 
 # Columns contributed by a bidirectional run: the hysteresis metrics, then
 # the down-sweep fit values used for the up/down anl consistency check.
 _DOWN_FIT_SUMMARY_KEYS = ("anl_down", "anl_down_err", "fr_down", "success_down")
+# Columns contributed when a window held more than one resonance.
+_MULTI_DIP_SUMMARY_KEYS = ("n_dips_in_window", "split_applied")
 
 
 def _fit_summary_rows(fit_data):
@@ -2434,7 +3355,7 @@ def _fit_summary_rows(fit_data):
     """
     run = fit_data["run"]
     rows = []
-    bidirectional, bidirectional_blank = _bidirectional_summary_columns(fit_data)
+    extra_columns, extra_blank = _extra_summary_columns(fit_data)
 
     def _center_hz(sweep_index, tone_index):
         centers_by_step = run.get("centers_by_step_hz")
@@ -2443,12 +3364,12 @@ def _fit_summary_rows(fit_data):
         centers = np.asarray(centers_by_step[sweep_index], dtype=float).ravel()
         return float(centers[tone_index]) if tone_index < centers.size else np.nan
 
-    def _add_bidirectional(row):
-        """Append the hysteresis / down-sweep columns, if this run has any."""
-        if bidirectional is None:
+    def _add_extra(row):
+        """Append the hysteresis / down-sweep / multi-dip columns, if any."""
+        if extra_columns is None:
             return row
         key = (int(row["sweep_index"]), int(row["tone_index"]))
-        row.update(bidirectional.get(key, bidirectional_blank))
+        row.update(extra_columns.get(key, extra_blank))
         return row
 
     # Each row records the power for the tone being fitted and the common
@@ -2469,7 +3390,7 @@ def _fit_summary_rows(fit_data):
                     "sweep_center_hz": _center_hz(sweep_index, tone_index),
                 }
                 row.update(fit_result_summary_row(fit))
-                rows.append(_add_bidirectional(row))
+                rows.append(_add_extra(row))
         return rows
 
     tone_index = int(fit_data["tone_index"])
@@ -2484,16 +3405,78 @@ def _fit_summary_rows(fit_data):
             "sweep_center_hz": _center_hz(sweep_index, tone_index),
         }
         row.update(fit_result_summary_row(fit))
-        rows.append(_add_bidirectional(row))
+        rows.append(_add_extra(row))
     return rows
 
 
-def _bidirectional_summary_columns(fit_data):
-    """Hysteresis and down-sweep-fit columns, keyed by (sweep, tone).
+def _keep_better_unsplit_fits(fits, sweep, records, *, nonlinear,
+                              sweep_direction, min_dip_depth_db, fit_kwargs):
+    """Re-fit each split tone on its full trace and keep the better result.
 
-    Returns ``(lookup, blank)``, or ``(None, None)`` for a single-direction
-    run.  ``blank`` fills rows the bidirectional data does not cover, so
-    every summary row ends up with the same columns.
+    Splitting is right for a genuine close pair, but the dip finder can be
+    wrong -- a shallow shoulder read as a second resonance costs the fit half
+    its data for nothing.  Comparing ``reduced_chi2`` against the unsplit fit
+    makes the split strictly an improvement.  Only the handful of tones that
+    were actually split are re-fitted.
+    """
+    f_all = np.atleast_2d(np.asarray(sweep["sweep_f"], dtype=float))
+    i_all = np.atleast_2d(np.asarray(sweep["sweep_i"], dtype=float))
+    q_all = np.atleast_2d(np.asarray(sweep["sweep_q"], dtype=float))
+    has_err = "sweep_ei" in sweep and "sweep_eq" in sweep
+    if has_err:
+        ei_all = np.atleast_2d(np.asarray(sweep["sweep_ei"], dtype=float))
+        eq_all = np.atleast_2d(np.asarray(sweep["sweep_eq"], dtype=float))
+
+    by_tone = {int(getattr(fit, "tone_index", i)): i for i, fit in enumerate(fits)}
+    for tone_index in records:
+        position = by_tone.get(int(tone_index))
+        if position is None:
+            continue
+        split_fit = fits[position]
+        f = f_all[:, tone_index]
+        z = i_all[:, tone_index] + 1j * q_all[:, tone_index]
+        z_err = (
+            ei_all[:, tone_index] + 1j * eq_all[:, tone_index]
+            if has_err else None
+        )
+        try:
+            full_fit = fit_resonance(
+                f, z, z_err=z_err, nonlinear=nonlinear,
+                sweep_direction=sweep_direction,
+                min_dip_depth_db=min_dip_depth_db, **fit_kwargs,
+            )
+        except Exception:                  # the unsplit fit is only a fallback
+            continue
+        full_fit.tone_index = int(tone_index)
+        split_chi2 = _finite_or_inf(getattr(split_fit, "reduced_chi2", np.nan))
+        full_chi2 = _finite_or_inf(getattr(full_fit, "reduced_chi2", np.nan))
+        split_ok = bool(getattr(split_fit, "success", False))
+        full_ok = bool(getattr(full_fit, "success", False))
+        if (full_ok and not split_ok) or (
+            full_ok and split_ok and full_chi2 < split_chi2
+        ):
+            fits[position] = full_fit
+            records[int(tone_index)]["split_used"] = False
+        else:
+            records[int(tone_index)]["split_used"] = True
+    return fits
+
+
+def _finite_or_inf(value):
+    """Float ``value``, or ``+inf`` when it is missing or not finite."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float("inf")
+    return value if np.isfinite(value) else float("inf")
+
+
+def _extra_summary_columns(fit_data):
+    """Optional per (sweep, tone) columns: hysteresis, down fits, multi-dip.
+
+    Returns ``(lookup, blank)``, or ``(None, None)`` when the run has none of
+    them.  ``blank`` fills rows the optional data does not cover, so every
+    summary row ends up with the same columns.
     """
     metrics = fit_data.get("hysteresis")
     if metrics is None:
@@ -2505,7 +3488,8 @@ def _bidirectional_summary_columns(fit_data):
         for fits in down_fits:
             for fit in fits:
                 fit.tone_index = tone
-    if (metrics is None or len(metrics) == 0) and not down_fits:
+    multi_dip = fit_data.get("multi_dip_by_power")
+    if (metrics is None or len(metrics) == 0) and not down_fits and not multi_dip:
         return None, None
 
     blank = {}
@@ -2517,6 +3501,9 @@ def _bidirectional_summary_columns(fit_data):
     if down_fits:
         blank.update({key: np.nan for key in _DOWN_FIT_SUMMARY_KEYS})
         blank["success_down"] = False
+    if multi_dip:
+        blank["n_dips_in_window"] = 1
+        blank["split_applied"] = False
 
     lookup = {}
     if metrics is not None and len(metrics):
@@ -2536,6 +3523,14 @@ def _bidirectional_summary_columns(fit_data):
                     "anl_down_err": summary.get("anl_err", np.nan),
                     "fr_down": summary.get("fr", np.nan),
                     "success_down": bool(summary.get("success", False)),
+                })
+    if multi_dip:
+        for sweep_index, records in enumerate(multi_dip):
+            for tone_index, record in (records or {}).items():
+                key = (sweep_index, int(tone_index))
+                lookup.setdefault(key, dict(blank)).update({
+                    "n_dips_in_window": int(record.get("n_dips", 1)),
+                    "split_applied": bool(record.get("split_used", True)),
                 })
     return lookup, blank
 
@@ -3006,6 +4001,7 @@ def analyse_power_sweep(
     plot_fits=True,
     plot_best=True,
     best_power=True,
+    catalogue=True,
     show=False,
     verbose=True,
     fit_kwargs=None,
@@ -3065,6 +4061,11 @@ def analyse_power_sweep(
     best_power : bool, optional
         Run :py:func:`find_best_power` and write ``best_power.json`` (default
         ``True``).
+    catalogue : bool, optional
+        Build the :py:func:`resonator_catalogue` for the run (default
+        ``True``).  Cheap, and it is what :py:func:`plan_tone_comb` consumes;
+        it also answers "did any tone's window hold more than one
+        resonance?", which the per-tone tables cannot.
     show : bool, optional
         Default ``show`` forwarded to the plotters (default ``False``).
     verbose : bool, optional
@@ -3097,9 +4098,9 @@ def analyse_power_sweep(
     -------
     result : dict
         ``{'run', 'fits', 'fit_file', 'summary_csv', 'best_power',
-        'best_power_file', 'balanced_power', 'balanced_power_file',
-        'plots', 'best_power_plots'}``; entries for disabled stages are
-        ``None``.  The ``balanced_power`` entries are always ``None`` here
+        'best_power_file', 'catalogue', 'balanced_power',
+        'balanced_power_file', 'plots', 'best_power_plots'}``; entries for
+        disabled stages are ``None``.  The ``balanced_power`` entries are always ``None`` here
         (balancing is a separate step, :py:func:`balance_tone_powers`);
         they exist so the dict is interchangeable with
         :py:func:`load_analysis` output.
@@ -3125,6 +4126,7 @@ def analyse_power_sweep(
         "summary_csv": None,
         "best_power": None,
         "best_power_file": None,
+        "catalogue": None,
         "balanced_power": None,
         "balanced_power_file": None,
         "plots": None,
@@ -3159,6 +4161,14 @@ def analyse_power_sweep(
             result["best_power_file"] = str(write_best_power(best, root))
     else:
         best = None
+
+    if catalogue:
+        try:
+            result["catalogue"] = resonator_catalogue(view)
+        except Exception as exc:      # never let a catalogue failure abort
+            warnings.warn(
+                f"analyse_power_sweep: could not build the resonator "
+                f"catalogue ({exc}); continuing without it.", stacklevel=2)
 
     if plot_fits:
         # Per-tone plots are independent; reuse the run-level n_jobs so the
@@ -3222,6 +4232,9 @@ def load_analysis(path):
         "summary_csv": None,
         "best_power": None,
         "best_power_file": None,
+        # Rebuilt from the saved sweeps rather than stored: it is cheap, and
+        # this way it always matches the data on disk.
+        "catalogue": None,
         "balanced_power": None,
         "balanced_power_file": None,
         "plots": None,
@@ -3243,6 +4256,10 @@ def load_analysis(path):
     if balanced_file.exists():
         result["balanced_power"] = load_balanced_power(balanced_file)
         result["balanced_power_file"] = str(balanced_file)
+    try:
+        result["catalogue"] = resonator_catalogue(view)
+    except Exception:            # a run whose sweeps are gone still loads
+        pass
     return result
 
 
@@ -4139,6 +5156,16 @@ def _find_best_power_for_tone(
             out[i] = bool(value)
         return out
 
+    # Windows shared with another resonance.  Reported, not vetoed: the fit
+    # already restricted itself to this tone's own dip (see
+    # ``split_multi_dip``), so the result is usable -- but it is worth
+    # knowing which tones sit next to a neighbour when reading the numbers.
+    n_dips_column = _column("n_dips_in_window")
+    shares_window = bool(np.any(np.isfinite(n_dips_column) & (n_dips_column > 1)))
+    n_dips_in_window = (
+        int(np.nanmax(n_dips_column)) if np.any(np.isfinite(n_dips_column)) else 1
+    )
+
     have_hysteresis = any("hysteretic" in row for row in rows)
     hysteretic = _flag_column("hysteretic") if have_hysteresis else np.zeros(n, dtype=bool)
     # A skipped or failed power step still has a requested power but no
@@ -4612,6 +5639,8 @@ def _find_best_power_for_tone(
             if np.isfinite(reduced_chi2_threshold) else None
         ),
         "fr_gap_linewidths": fr_gap_linewidths,
+        "shares_window": shares_window,
+        "n_dips_in_window": n_dips_in_window,
         "excluded_sweep_indices": [
             int(sweep_idx[i]) for i in range(n) if excluded[i]
         ],
