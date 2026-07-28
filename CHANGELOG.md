@@ -1,5 +1,37 @@
 # Changelog & Feature List
 
+## v1.7.1 (in progress)
+
+**Match resonance lists between sweeps — `resonance_matching`**
+- New module answering "which resonance in this sweep is which device in
+  that one?" when the two lists have different lengths, the frequencies
+  have all moved, and some devices were found in one sweep but not the
+  other. `rm.match_index(a, b)` returns a plain A->B index array with `-1`
+  for unmatched; `rm.match_resonances(a, b)` returns the same mapping with
+  the diagnostics attached.
+- Works from anything already lying around: bare frequency lists (Hz/MHz/GHz
+  auto-detected), dicts, structured arrays, `.resonances` files, KIDLAB
+  toneslists, fit-summary CSVs, power-sweep run directories (uses the run's
+  own best-power fits), and parsed sweep dicts — resonances are found in a
+  raw sweep automatically.
+- Three stages: a global shift model chosen automatically from `none`,
+  `constant`, `proportional`, `affine` and `linear_frac` (preferring the
+  simplest that fits, so a process with no global shift is not fitted a
+  spurious one); a tolerance derived from the measured scatter, floored at a
+  linewidth and capped at a fraction of the resonance spacing; then a global
+  one-to-one assignment (`free` by default, `monotonic` or `nearest`
+  available). The order-preserving solution is always run as a cross-check
+  and disagreements are reported.
+- Coverage-aware: devices outside the other sweep's band are reported
+  `out_of_range` rather than counted as lost.
+- `compare()` lines up any per-resonance quantity across the two lists —
+  either by parameter name or as arbitrary arrays in each list's own input
+  order — and `transfer()` carries per-device information (beam-map
+  positions, names, tone powers) onto the other list's ordering.
+- Matches are flagged `ok`/`crossed`/`ambiguous`/`outlier`/`unmatched_*`,
+  written to CSV by `save()`, and read back by `load_match()` with any
+  hand-edited `b_index` honoured.
+
 ## v1.7.0
 
 **Centralised LNA bias service + v2 bias board support**
