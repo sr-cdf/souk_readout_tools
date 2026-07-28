@@ -1,0 +1,27 @@
+# ============================================================================
+# SOUK Readout Tools — Site Configuration Template
+# ============================================================================
+# Machine-wide settings shared by every pipeline on this host, and pointers to
+# telescope hardware that lives on another machine.
+#
+# Copy this to ~/.souk_readout_tools/site.yaml on each machine that runs a
+# readout server, and edit to match your rack. Keeping shared-hardware
+# addresses here means a rack change is one edit per machine rather than one
+# edit per pipeline config.
+#
+# The file is optional: it is only needed by pipelines using
+# cryostat.lna_bias.backend "remote" that do not set their own host override.
+# ============================================================================
+
+# --- LNA bias service ---
+# Only one RFSoC per telescope is wired to the cryostat LNA bias board: the
+# board in slot 1 of the telescope's rack. That machine runs the LNA bias
+# service (souk-lna-service-install); point every readout server at it here,
+# including the servers on that machine itself.
+#
+# Prefer a hostname over an IP if your site has stable DNS or /etc/hosts
+# entries: then a rack reshuffle needs no config edits at all.
+lna_service:
+  host: "10.11.11.11"      # RFSoC wired to the LNA bias board
+  port: 10500              # must match the service's --port
+  timeout_s: 15.0          # per-request timeout; a remote set can take seconds

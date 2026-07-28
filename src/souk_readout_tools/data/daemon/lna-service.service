@@ -1,0 +1,20 @@
+[Unit]
+Description=SOUK LNA bias service -- serves the cryostat LNA bias board to every readout server
+Documentation=https://github.com/sr-cdf/souk_readout_tools
+# Install this on the ONE RFSoC per telescope that is wired to the LNA bias
+# board. Every readout server (including the ones on this board) reaches the
+# bias hardware through it, so it should start early and stay up:
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/casper/py3.12-venv/bin/souk-lna-service
+Restart=always
+RestartSec=5
+User=root
+SyslogIdentifier=souk-lna-service
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

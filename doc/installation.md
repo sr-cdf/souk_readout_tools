@@ -12,6 +12,7 @@ Detailed installation instructions for SOUK Readout Tools.
 - [Server Software Installation & Setup](#server-software-installation--setup)
   - [Writing the SD Card Image](#0-writing-the-sd-card-image)
   - [Enable Timing Services](#7-enable-timing-services-recommended)
+  - [Enable the LNA Bias Service](#8-enable-the-lna-bias-service-one-board-per-telescope)
 - [Client Installation](#client-installation)
 - [Configuration Reference](#configuration-reference)
 - [Troubleshooting](#troubleshooting)
@@ -404,6 +405,58 @@ sudo python3 ~/souk-firmware/software/rfsoc_scripts/ptp/run_strobe.py
 
 See [timing.md](timing.md) for the full timing setup, standalone laptop
 monitoring, site checks, lab UTC offset notes, and firmware sync caveats.
+
+### 8. Enable the LNA Bias Service (One Board Per Telescope)
+
+**Enable this service only on the RFSoC in slot 1 of each telescope's rack** —
+the one physically wired to the cryostat LNA bias board. Every RFSoC has its own
+RF module on I2C, but the LNA bias board is shared hardware serving all 14
+channels from that single machine. Running the service anywhere else will fail
+at startup because no bias board answers on the bus.
+
+On the slot-1 board:
+
+```bash
+souk-lna-service-install     # install + enable + start (calls sudo internally)
+souk-lna-service-status
+```
+
+Check it came up and found the board:
+
+```bash
+systemctl status lna-service
+sudo journalctl -f -xu lna-service
+```
+
+Startup probes all 14 slots and can take tens of seconds on a sparsely
+populated board. The service refuses to start if the board does not answer, so
+a wiring or power problem shows up here rather than as confusing per-request
+errors later.
+
+Then, on **every** RFSoC in the rack — including the slot-1 board itself —
+point the readout servers at the service by creating
+`~/.souk_readout_tools/site.yaml`:
+
+```yaml
+lna_service:
+  host: "10.11.11.11"   # address of the slot-1 RFSoC
+  port: 10500
+  timeout_s: 15.0
+```
+
+and set `cryostat.lna_bias.backend: "remote"` in each pipeline config (the
+default in the template). The slot-1 board's own servers use `remote` via this
+same route, so there is exactly one process driving the bias board.
+
+Prefer a hostname over an IP if your site has stable DNS or `/etc/hosts`
+entries: a rack reshuffle then needs no config edits at all.
+
+Restart, stop, or remove the service with `souk-lna-service-restart`,
+`souk-lna-service-stop`, and `souk-lna-service-remove`.
+
+See [lna_bias.md](lna_bias.md) for the client API, board revisions (v2 adds
+per-channel hard power switching), and the `i2c`/`fixed` backends used for
+bench setups.
 
 ---
 

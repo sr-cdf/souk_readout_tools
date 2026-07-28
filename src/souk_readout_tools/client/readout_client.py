@@ -2456,6 +2456,44 @@ class ReadoutClient:
         """
         return self.send_request({'request': 'soft_off_lna_bias_all'})
 
+    def set_lna_output_enabled(self, enabled, channel=None):
+        """Hard-enable or disable the bias output for one LNA channel.
+
+        v2 bias boards have a per-channel output switch, so this genuinely
+        removes power from the LNA rather than driving it to its minimum
+        voltage. v1 boards have no such switch and return ``status: error``
+        pointing at :meth:`soft_off_lna_bias` instead.
+
+        Args:
+            enabled: True to power the channel, False to cut it.
+            channel: LNA channel index (1-14). Defaults to this pipeline's
+                configured channel.
+
+        Returns:
+            ``{'status': 'success', 'result': {..., 'output_enabled': bool}}``.
+        """
+        msg = {'request': 'set_lna_output_enabled', 'enabled': bool(enabled)}
+        if channel is not None:
+            msg['channel'] = int(channel)
+        return self.send_request(msg)
+
+    def set_lna_output_enabled_all(self, enabled):
+        """Hard-enable or disable the bias output for all 14 LNA channels.
+
+        Channels are switched together, so the rail settling delay is paid
+        once rather than once per channel. v2 bias boards only.
+
+        Args:
+            enabled: True to power every channel, False to cut them.
+
+        Returns:
+            ``{'status': 'success', 'result': {chn: {...}, ...}}``.
+        """
+        return self.send_request({
+            'request': 'set_lna_output_enabled_all',
+            'enabled': bool(enabled),
+        })
+
     def enable_stream(self):
         """Enable continuous sample streaming on the server."""
         self._warn_zero_phases()

@@ -25,6 +25,9 @@ silent fake-success.
 import logging
 import os
 import sys
+from contextlib import contextmanager
+
+from souk_readout_tools.server.i2c_lock import i2c_bus_lock
 
 logger = logging.getLogger(__name__)
 
@@ -205,10 +208,11 @@ class RFPeripheralController:
                 )
             else:
                 try:
-                    bus = SMBus(0)
-                    self._mixerless_module = SOUKRFMixerlessModule(
-                        bus, _mixerless_module_hw_config_list(),
-                    )
+                    with i2c_bus_lock(purpose='RF module init'):
+                        bus = SMBus(0)
+                        self._mixerless_module = SOUKRFMixerlessModule(
+                            bus, _mixerless_module_hw_config_list(),
+                        )
                     logger.info(
                         'SOUK mixerless module %r initialised, rf_channel %d',
                         self.hardware_id, self._channel,
@@ -315,35 +319,54 @@ class RFPeripheralController:
 
     # -- TX/RX amplifier bypass --
 
+    @contextmanager
+    def _i2c_lock(self):
+        """Hold the shared I2C bus lock while touching the mixerless module.
+
+        The LNA bias board sits on the same bus on the RFSoC that is wired to
+        it, so this keeps RF traffic from interleaving with the LNA service's
+        multi-step mux operations. A no-op for the RUDAT and fixed backends,
+        which never touch I2C.
+        """
+        if self._mixerless_module is None:
+            yield
+            return
+        with i2c_bus_lock(purpose='RF peripherals'):
+            yield
+
     def set_tx_amp_bypass(self, bypass):
         """Set TX amplifier bypass state (True = bypassed)."""
         self._require_bypass_amps()
-        self._mixerless_module.set_amp_bypass_state(
-            self._channel, 'transmit_atten', bool(bypass),
-        )
+        with self._i2c_lock():
+            self._mixerless_module.set_amp_bypass_state(
+                self._channel, 'transmit_atten', bool(bypass),
+            )
         self._sync_runtime_state('transmit_atten')
 
     def get_tx_amp_bypass(self):
         """Get TX amplifier bypass state."""
         self._require_bypass_amps()
-        return self._mixerless_module.get_amp_bypass_state(
-            self._channel, 'transmit_atten',
-        )
+        with self._i2c_lock():
+            return self._mixerless_module.get_amp_bypass_state(
+                self._channel, 'transmit_atten',
+            )
 
     def set_rx_amp_bypass(self, bypass):
         """Set RX amplifier bypass state (True = bypassed)."""
         self._require_bypass_amps()
-        self._mixerless_module.set_amp_bypass_state(
-            self._channel, 'recv_atten', bool(bypass),
-        )
+        with self._i2c_lock():
+            self._mixerless_module.set_amp_bypass_state(
+                self._channel, 'recv_atten', bool(bypass),
+            )
         self._sync_runtime_state('recv_atten')
 
     def get_rx_amp_bypass(self):
         """Get RX amplifier bypass state."""
         self._require_bypass_amps()
-        return self._mixerless_module.get_amp_bypass_state(
-            self._channel, 'recv_atten',
-        )
+        with self._i2c_lock():
+            return self._mixerless_module.get_amp_bypass_state(
+                self._channel, 'recv_atten',
+            )
 
     # -- transfer functions / gain / 1 dB compression --
 
@@ -536,7 +559,9 @@ class RFPeripheralController:
             )
 
     def _set_attenuation(self, dev_name, attenuation_db):
-        self._require_attenuator().set_attenuation(self._channel, dev_name, attenuation_db)
+        attenuator = self._require_attenuator()
+        with self._i2c_lock():
+            attenuator.set_attenuation(self._channel, dev_name, attenuation_db)
         self._sync_runtime_state(dev_name)
 
     def _get_attenuation(self, dev_name):
@@ -550,7 +575,9 @@ class RFPeripheralController:
                     .get(key)
                 )
             return 0.0 if value is None else float(value)
-        return self._require_attenuator().get_attenuation_value(self._channel, dev_name)
+        attenuator = self._require_attenuator()
+        with self._i2c_lock():
+            return attenuator.get_attenuation_value(self._channel, dev_name)
 
     def _sync_runtime_state(self, dev_name):
         """Update runtime_state to reflect the current peripheral state."""
@@ -696,33 +723,34 @@ def find_attenuators(include_state=False):
     # -- I2C attenuators (SOUK mixerless module on SMBus(0)) --
     if _HW_AVAILABLE:
         try:
-            bus = SMBus(0)
-            mod = SOUKRFMixerlessModule(bus, _mixerless_module_hw_config_list())
-            # Each channel has two independent MAX7329-driven attenuators —
-            # one on the TX path and one on the RX path. Probe both.
-            for ch in range(2):
-                for path, label in (('transmit_atten', 'TX'),
-                                    ('recv_atten', 'RX')):
-                    try:
-                        atten_amp = mod._get_atten_amp(ch, path)
-                        entry = {
-                            'backend': 'i2c',
-                            'serial': None,
-                            'bus': 0,
-                            'address': hex(atten_amp.atten_amp.addr),
-                            'channel': ch,
-                            'path': label,
-                            'model': f'SOUK RF Mixerless Module ch{ch} {label}',
-                        }
-                        if include_state:
-                            try:
-                                entry['attenuation_db'] = mod.get_attenuation_value(ch, path)
-                            except Exception:
-                                entry['attenuation_db'] = None
-                        results.append(entry)
-                    except Exception:
-                        pass
-            bus.close()
+            with i2c_bus_lock(purpose='attenuator discovery'):
+                bus = SMBus(0)
+                mod = SOUKRFMixerlessModule(bus, _mixerless_module_hw_config_list())
+                # Each channel has two independent MAX7329-driven attenuators —
+                # one on the TX path and one on the RX path. Probe both.
+                for ch in range(2):
+                    for path, label in (('transmit_atten', 'TX'),
+                                        ('recv_atten', 'RX')):
+                        try:
+                            atten_amp = mod._get_atten_amp(ch, path)
+                            entry = {
+                                'backend': 'i2c',
+                                'serial': None,
+                                'bus': 0,
+                                'address': hex(atten_amp.atten_amp.addr),
+                                'channel': ch,
+                                'path': label,
+                                'model': f'SOUK RF Mixerless Module ch{ch} {label}',
+                            }
+                            if include_state:
+                                try:
+                                    entry['attenuation_db'] = mod.get_attenuation_value(ch, path)
+                                except Exception:
+                                    entry['attenuation_db'] = None
+                            results.append(entry)
+                        except Exception:
+                            pass
+                bus.close()
         except Exception as e:
             print(f'I2C mixerless-module discovery error: {e}')
     else:
@@ -746,30 +774,31 @@ def find_bypass_amps(include_state=False):
 
     if _HW_AVAILABLE:
         try:
-            bus = SMBus(0)
-            mod = SOUKRFMixerlessModule(bus, _mixerless_module_hw_config_list())
-            for ch in range(2):
-                for path, label in (('transmit_atten', 'TX'),
-                                    ('recv_atten', 'RX')):
-                    try:
-                        atten_amp = mod._get_atten_amp(ch, path)
-                        entry = {
-                            'backend': 'i2c',
-                            'bus': 0,
-                            'address': hex(atten_amp.atten_amp.addr),
-                            'channel': ch,
-                            'path': label,
-                            'model': f'SOUK RF Mixerless Module ch{ch} {label} bypass amp',
-                        }
-                        if include_state:
-                            try:
-                                entry['bypassed'] = mod.get_amp_bypass_state(ch, path)
-                            except Exception:
-                                entry['bypassed'] = None
-                        results.append(entry)
-                    except Exception:
-                        pass
-            bus.close()
+            with i2c_bus_lock(purpose='bypass-amp discovery'):
+                bus = SMBus(0)
+                mod = SOUKRFMixerlessModule(bus, _mixerless_module_hw_config_list())
+                for ch in range(2):
+                    for path, label in (('transmit_atten', 'TX'),
+                                        ('recv_atten', 'RX')):
+                        try:
+                            atten_amp = mod._get_atten_amp(ch, path)
+                            entry = {
+                                'backend': 'i2c',
+                                'bus': 0,
+                                'address': hex(atten_amp.atten_amp.addr),
+                                'channel': ch,
+                                'path': label,
+                                'model': f'SOUK RF Mixerless Module ch{ch} {label} bypass amp',
+                            }
+                            if include_state:
+                                try:
+                                    entry['bypassed'] = mod.get_amp_bypass_state(ch, path)
+                                except Exception:
+                                    entry['bypassed'] = None
+                            results.append(entry)
+                        except Exception:
+                            pass
+                bus.close()
         except Exception as e:
             print(f'Bypass-amp discovery error: {e}')
     else:

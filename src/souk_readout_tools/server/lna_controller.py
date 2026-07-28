@@ -13,14 +13,20 @@ The ``i2c`` backend controls hardware via ``smbus2`` and the
 records an explicit, non-controllable bias value in config.
 """
 
+import json
 import logging
 import math
 import os
+import socket
+import struct
 import sys
-import tempfile
-from contextlib import contextmanager
+import time
 
-import fcntl
+from souk_readout_tools.config_utils import (
+    get_site_config_path,
+    resolve_lna_service_endpoint,
+)
+from souk_readout_tools.server.i2c_lock import i2c_bus_lock as _i2c_bus_lock
 
 logger = logging.getLogger(__name__)
 
@@ -36,29 +42,45 @@ try:
         SOUKLNABiasControlMonitor,
         SOUKLNABiasControlMonitorHWConfig,
         REFDES_LNA_MONITOR_CHN_MAP,
+        REFDES_OE_CHN_MAP,
+        OE_ADDR_RESISTOR_MAP,
+        SWITCH_ADDR_RESISTOR_MAP,
+        OE_PIN_I2C_SWITCH_RESET,
+        ROOT_LEAF_CONN,
+        AWAIT_TURN_ON_DELAY,
     )
-    from lna_monitor import LNAMonitorHWConfig
+    from lna_monitor import LNAMonitor, LNAMonitorHWConfig
     from ad511_0_2_4bcpz_5_10_80 import AD511_0_2_4BCPZ_5_10_80HWConfig
     from ltc2481cdd import LTC2481CDDHWConfig
+    from max732_8_9 import MAX732_8_9
+    from tca9548 import TCA9548
     _HW_AVAILABLE = True
 except ImportError:
     _HW_AVAILABLE = False
     REFDES_LNA_MONITOR_CHN_MAP = {}
+    REFDES_OE_CHN_MAP = {}
 
 
 class _I2CRetryWarningFilter(logging.Filter):
-    """Drop the ``... trying again after delay ...`` retry-warnings emitted
-    by souk-peripherals-control's i2c_devices module when the underlying
-    OSError is ``No such device or address`` — i.e. an unpopulated LNA
-    slot. Real I2C transients with other root causes still surface."""
+    """Drop the retry/failure log noise emitted by souk-peripherals-control's
+    i2c_devices module when the underlying OSError is ``No such device or
+    address`` — i.e. an unpopulated LNA slot. Real I2C transients with other
+    root causes still surface.
 
-    _SUPPRESS_PATTERNS = ('trying again after delay', 'No such device or address')
+    Matches both the per-attempt ``... retrying after delay ...`` warnings and
+    the final ``Failed ... after N attempts`` error.
+    """
+
+    _ABSENT_DEVICE = 'No such device or address'
+    _RETRY_MARKERS = ('retrying after delay', 'attempts:')
 
     def filter(self, record):
         """Logging filter: drop ``record`` if it matches the suppressed
         retry/noise patterns, else keep it."""
         msg = record.getMessage()
-        return not all(p in msg for p in self._SUPPRESS_PATTERNS)
+        if self._ABSENT_DEVICE not in msg:
+            return True
+        return not any(marker in msg for marker in self._RETRY_MARKERS)
 
 
 if _HW_AVAILABLE:
@@ -69,27 +91,6 @@ if _HW_AVAILABLE:
 
 NUM_LNA_CHANNELS = 14
 LNA_I2C_BUS_NUM = 0
-
-
-@contextmanager
-def _i2c_bus_lock(bus_num, purpose='LNA bias'):
-    """Serialize access to a shared Linux I2C bus across server processes."""
-    lock_path = os.path.join(
-        tempfile.gettempdir(),
-        f'souk_readout_tools_i2c_bus_{int(bus_num)}.lock',
-    )
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    try:
-        os.chmod(lock_path, 0o666)
-    except OSError:
-        pass
-    with os.fdopen(fd, 'r+') as lock_fd:
-        logger.debug('Waiting for %s I2C bus %d lock', purpose, bus_num)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
 # Substrings in the upstream message that mean "the requested voltage was
@@ -121,6 +122,37 @@ def _finite_voltage(value):
         return math.isfinite(float(value))
     except (TypeError, ValueError):
         return False
+
+
+def _output_enabled_value(raw):
+    """Normalise the driver's ``output enable`` reading to True/False/None.
+
+    v1 boards have no output-enable switch, and the driver reports NaN for
+    them; None says "not applicable" rather than implying "off".
+    """
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return None
+    try:
+        if math.isnan(float(raw)):
+            return None
+    except (TypeError, ValueError):
+        return None
+    return bool(raw)
+
+
+def _output_enable_unsupported_result(chn, hw_version):
+    return {
+        'channel': chn,
+        'output_enabled': None,
+        'message': (
+            f'LNA bias board hw v{hw_version} has no per-channel output '
+            'enable; use soft_off to drive the channel to its minimum '
+            'local voltage instead.'
+        ),
+        'success': False,
+    }
 
 
 def _local_lna_result(chn, voltage):
@@ -198,17 +230,52 @@ def _open_circuit_message(chn, current_a, remote_v):
 
 
 _LNA_REFDES = [f"M{i}" for i in range(17, 31)]
-_LNA_BOARD_RESISTORS = dict(
-    r9_r12="R12", r8_r10="R10", r7_r5="R7",
-    r11_r13="R13", r14_r15="R14", r6_r4="R6",
+
+SUPPORTED_HW_VERSIONS = (1, 2)
+
+# I2C address-select resistor fits for the mux tree, per board revision.
+# v2 moved two of the address straps (r7_r5 and r11_r13).
+_LNA_BOARD_RESISTORS = {
+    1: dict(r9_r12="R12", r8_r10="R10", r7_r5="R7",
+            r11_r13="R13", r14_r15="R14", r6_r4="R6"),
+    2: dict(r9_r12="R12", r8_r10="R10", r7_r5="R5",
+            r11_r13="R11", r14_r15="R14", r6_r4="R6"),
+}
+
+# Output-enable expander (U6/U7) address straps. These parts only exist on v2
+# boards, but the upstream hw_config dataclass requires the fields on both
+# revisions, so v1 carries them unused.
+_LNA_OE_RESISTORS = dict(
+    r28_r30="R28", r29_r31="R29", r32_r33="R32",
+    r34_r36="R36", r35_r37="R35", r38_r39="R38",
+    u6_dev_type="MAX7329", u7_dev_type="MAX7329",
 )
 
 
-def _default_lna_monitor_hw_config():
+def _default_lna_monitor_hw_config(hw_version=1):
     """Per-channel LNA monitor hw_config used by every populated LNA slot.
 
-    Identical for every channel — matches the production board.
+    Identical for every channel on a given board revision. The v1 values are
+    those of our production board and deliberately differ from the submodule's
+    own ``LNAMonitorHWConfig.default_config('v1')``, which describes a
+    different build.
     """
+    if int(hw_version) == 2:
+        # v2 drops the switched divider leg entirely (switch_status=False) and
+        # swaps the remote ADC address straps.
+        return LNAMonitorHWConfig(
+            r_dac_hw_config=AD511_0_2_4BCPZ_5_10_80HWConfig(
+                DEV_ADDR=0x2C, RESOLUTION=128, R_FULL_SCALE_KOHM=10.0,
+            ),
+            remote_adc_hw_config=LTC2481CDDHWConfig(CA0="float", CA1="low"),
+            imonitor_adc_hw_config=LTC2481CDDHWConfig(CA0="float", CA1="float"),
+            switch_status=False,
+            r_LDO_set_kOhm=150.0,
+            r_RTop1_kOhm=4.7,
+            r_RBot1_kOhm=8.2,
+            r_RAdj1_kOhm=200.0,
+            r_RSENSE_OHMS=10.0,
+        )
     return LNAMonitorHWConfig(
         r_dac_hw_config=AD511_0_2_4BCPZ_5_10_80HWConfig(
             DEV_ADDR=0x2C, RESOLUTION=128, R_FULL_SCALE_KOHM=10.0,
@@ -224,41 +291,276 @@ def _default_lna_monitor_hw_config():
     )
 
 
-def _detect_lna_channels(bus, per_channel_cfg):
-    """Probe each LNA refdes (M17-M30) and return the list that responds.
+def _build_lna_hw_config(hw_version=1, refdes=None):
+    """Build a SOUKLNABiasControlMonitorHWConfig for ``hw_version``.
 
-    For each candidate channel, build a single-channel
-    SOUKLNABiasControlMonitorHWConfig and try to instantiate it.  If
-    construction raises (typically ConnectionError because no LNAMonitor
-    hardware is wired to that mux path), the channel is treated as
-    unpopulated and skipped.
+    ``refdes`` restricts the populated slots to that iterable; the default
+    (None) populates all of M17-M30 and lets the driver discover which ones
+    actually answer.
     """
-    detected = []
-    for ref in _LNA_REFDES:
-        single = {r: None for r in _LNA_REFDES}
-        single[ref] = per_channel_cfg
-        probe_cfg = SOUKLNABiasControlMonitorHWConfig(
-            lna_monitor_hw_configs=single,
-            **_LNA_BOARD_RESISTORS,
-        )
-        try:
-            SOUKLNABiasControlMonitor(bus, probe_cfg)
-            detected.append(ref)
-        except ConnectionError:
-            pass
-    return detected
-
-
-def _build_lna_hw_config(detected_refdes, per_channel_cfg):
-    """Build a SOUKLNABiasControlMonitorHWConfig populated with only the
-    given refdes (others left None)."""
-    lna_configs = {ref: None for ref in _LNA_REFDES}
-    for ref in detected_refdes:
-        lna_configs[ref] = per_channel_cfg
+    per_channel_cfg = _default_lna_monitor_hw_config(hw_version)
+    wanted = _LNA_REFDES if refdes is None else list(refdes)
+    lna_configs = {
+        ref: (per_channel_cfg if ref in wanted else None)
+        for ref in _LNA_REFDES
+    }
     return SOUKLNABiasControlMonitorHWConfig(
         lna_monitor_hw_configs=lna_configs,
-        **_LNA_BOARD_RESISTORS,
+        **_LNA_BOARD_RESISTORS[int(hw_version)],
+        **_LNA_OE_RESISTORS,
     )
+
+
+def _detect_hw_version(bus):
+    """Return the LNA bias board revision present on ``bus`` (1 or 2).
+
+    The v2 board carries two MAX7329 output-enable expanders (U6/U7) that the
+    v1 board does not, so a successful probe of U6 identifies v2. On a v1
+    board the probe costs one full I2C retry cycle (a couple of seconds); its
+    log noise is suppressed by _I2CRetryWarningFilter.
+    """
+    try:
+        MAX732_8_9(
+            dev_name="oe_probe",
+            i2c_bus=bus,
+            ad2=OE_ADDR_RESISTOR_MAP["U6"]["ad2"][_LNA_OE_RESISTORS['r32_r33']],
+            ad1=OE_ADDR_RESISTOR_MAP["U6"]["ad1"][_LNA_OE_RESISTORS['r29_r31']],
+            ad0=OE_ADDR_RESISTOR_MAP["U6"]["ad0"][_LNA_OE_RESISTORS['r28_r30']],
+            dev_type=_LNA_OE_RESISTORS['u6_dev_type'],
+        )
+    except OSError:
+        return 1
+    return 2
+
+
+class _BiasMonitor(SOUKLNABiasControlMonitor):
+    """LNA bias board driver covering both v1 and v2 hardware.
+
+    Mirrors the upstream constructor with two deliberate differences:
+
+    * The U6/U7 output-enable expanders only exist on v2, so they are built
+      only there and every output-enable operation is a no-op on v1.
+    * Neither revision powers the LNAs off on construction. Upstream disables
+      all outputs in ``__init__``; here that would cut bias to every LNA in
+      the cryostat every time the service restarts.
+
+    Multi-channel output-enable operations are also batched into one
+    read-modify-write per expander instead of one per channel.
+    """
+
+    def __init__(self, i2c_bus, hw_config, hw_version=1):
+        self.hw_version = int(hw_version)
+        if self.hw_version == 2:
+            self._oe_u6 = MAX732_8_9(
+                dev_name="oe_u6",
+                i2c_bus=i2c_bus,
+                ad2=OE_ADDR_RESISTOR_MAP["U6"]["ad2"][hw_config.r32_r33],
+                ad1=OE_ADDR_RESISTOR_MAP["U6"]["ad1"][hw_config.r29_r31],
+                ad0=OE_ADDR_RESISTOR_MAP["U6"]["ad0"][hw_config.r28_r30],
+                dev_type=hw_config.u6_dev_type,
+            )
+            self._oe_u7 = MAX732_8_9(
+                dev_name="oe_u7",
+                i2c_bus=i2c_bus,
+                ad2=OE_ADDR_RESISTOR_MAP["U7"]["ad2"][hw_config.r38_r39],
+                ad1=OE_ADDR_RESISTOR_MAP["U7"]["ad1"][hw_config.r35_r37],
+                ad0=OE_ADDR_RESISTOR_MAP["U7"]["ad0"][hw_config.r34_r36],
+                dev_type=hw_config.u7_dev_type,
+            )
+            # U6 also drives the mux reset line; pulse it so a wedged switch
+            # tree recovers on startup.
+            self._reset_channel_switch()
+        else:
+            self._oe_u6 = None
+            self._oe_u7 = None
+
+        self._root_switch = TCA9548(
+            dev_name="root_switch",
+            i2c_bus=i2c_bus,
+            a0=SWITCH_ADDR_RESISTOR_MAP["root"]["A0"][hw_config.r8_r10],
+            a1=SWITCH_ADDR_RESISTOR_MAP["root"]["A1"][hw_config.r7_r5],
+            a2=SWITCH_ADDR_RESISTOR_MAP["root"]["A2"][hw_config.r6_r4],
+        )
+        self._root_switch.turn_off_channel()
+        self._root_switch.turn_on_channel(ROOT_LEAF_CONN)
+        self._leaf_switch = TCA9548(
+            dev_name="leaf_switch",
+            i2c_bus=i2c_bus,
+            a0=SWITCH_ADDR_RESISTOR_MAP["leaf"]["A0"][hw_config.r14_r15],
+            a1=SWITCH_ADDR_RESISTOR_MAP["leaf"]["A1"][hw_config.r11_r13],
+            a2=SWITCH_ADDR_RESISTOR_MAP["leaf"]["A2"][hw_config.r9_r12],
+        )
+        self._leaf_switch.turn_off_channel()
+
+        self._lna_monitors = {}
+        for refdes, lna_hw_config in hw_config.lna_monitor_hw_configs.items():
+            if lna_hw_config is None:
+                self._lna_monitors[refdes] = None
+                continue
+            chn = list(REFDES_LNA_MONITOR_CHN_MAP[refdes].keys())[0]
+            self._turn_on_channel(chn)
+            try:
+                self._lna_monitors[refdes] = LNAMonitor(
+                    i2c_bus=i2c_bus, hw_config=lna_hw_config,
+                )
+            except OSError:
+                # Unpopulated slot, or a monitor that has stopped answering.
+                self._lna_monitors[refdes] = None
+            finally:
+                self._turn_off_all_channels()
+        self._hw_config = hw_config
+
+    @property
+    def supports_output_enable(self):
+        """True when the board has per-channel hard output-enable switches."""
+        return self.hw_version == 2
+
+    @property
+    def detected_refdes(self):
+        """Refdes (M17-M30) whose monitors answered during construction."""
+        return [ref for ref, mon in self._lna_monitors.items() if mon is not None]
+
+    @property
+    def bias_oe_status(self):
+        """Output-enable state as ``{channel: bool}``; empty dict on v1.
+
+        Reads each expander once rather than once per channel.
+        """
+        if not self.supports_output_enable:
+            return {}
+        bytes_by_dev = {
+            'U6': self._oe_u6.read_gpio(),
+            'U7': self._oe_u7.read_gpio(),
+        }
+        return {
+            chn: bool(bytes_by_dev[dev_name] & (1 << bit))
+            for chn, (dev_name, bit) in REFDES_OE_CHN_MAP.items()
+        }
+
+    def _reset_channel_switch(self):
+        """Pulse the mux reset line (v2 only)."""
+        if self.supports_output_enable:
+            self._oe_u6.pulse_gpio_bit(OE_PIN_I2C_SWITCH_RESET, polarity=False)
+
+    def set_lna_bias_output(self, chn, enabled):
+        """Set the hard output-enable state for one or more channels.
+
+        No-op on v1 hardware, which has no output-enable switches. Waits for
+        the LNA rail to settle only when a channel actually turns on.
+        """
+        if not self.supports_output_enable:
+            return
+        channels = [chn] if isinstance(chn, int) else list(chn)
+        enabled = bool(enabled)
+        turning_on = enabled and any(
+            not state
+            for c, state in self.bias_oe_status.items() if c in channels
+        )
+        grouped = {}
+        for c in channels:
+            dev_name, bit = REFDES_OE_CHN_MAP[c]
+            grouped.setdefault(dev_name, []).append(bit)
+        for dev_name, bits in grouped.items():
+            dev = self._oe_u6 if dev_name == 'U6' else self._oe_u7
+            dev.set_gpio_bit(bits, [enabled] * len(bits))
+        if turning_on:
+            time.sleep(AWAIT_TURN_ON_DELAY)
+
+    def enable_lna_bias_output(self, chn):
+        """Enable the bias output for one or more channels (v2 only)."""
+        self.set_lna_bias_output(chn, True)
+
+    def disable_lna_bias_output(self, chn):
+        """Disable the bias output for one or more channels (v2 only)."""
+        self.set_lna_bias_output(chn, False)
+
+    def enable_all_lna_bias_outputs(self):
+        """Enable the bias output for every channel (v2 only)."""
+        self.set_lna_bias_output(list(REFDES_OE_CHN_MAP), True)
+
+    def disable_all_lna_bias_outputs(self):
+        """Disable the bias output for every channel (v2 only)."""
+        self.set_lna_bias_output(list(REFDES_OE_CHN_MAP), False)
+
+
+def open_bias_monitor(bus, hw_version='auto', refdes=None):
+    """Open the LNA bias board on ``bus`` and return ``(monitor, hw_version)``.
+
+    ``hw_version`` may be 1, 2, or ``'auto'`` (probe for the v2 output-enable
+    expanders). ``refdes`` optionally restricts which slots are probed; the
+    default probes all of M17-M30, and slots that do not answer are marked
+    unpopulated by the driver.
+
+    Probing an absent slot costs a full I2C retry cycle (a couple of seconds
+    each), so on a sparsely populated board this can take tens of seconds.
+    That cost is why the bias board is opened once by a long-lived service
+    rather than on every readout-server start.
+    """
+    if hw_version in (None, 'auto'):
+        hw_version = _detect_hw_version(bus)
+    hw_version = int(hw_version)
+    if hw_version not in SUPPORTED_HW_VERSIONS:
+        raise ValueError(
+            f'Unsupported LNA bias board hw_version {hw_version}; '
+            f'supported: {SUPPORTED_HW_VERSIONS}'
+        )
+    hw_config = _build_lna_hw_config(hw_version, refdes=refdes)
+    return _BiasMonitor(bus, hw_config, hw_version), hw_version
+
+
+def _recv_exactly(sock, count):
+    """Read exactly ``count`` bytes from ``sock`` or raise ConnectionError."""
+    buf = bytearray(count)
+    view = memoryview(buf)
+    got = 0
+    while got < count:
+        n = sock.recv_into(view[got:], count - got)
+        if n == 0:
+            raise ConnectionError(
+                f'LNA service closed the connection after {got}/{count} bytes'
+            )
+        got += n
+    return bytes(buf)
+
+
+class _LNAServiceClient:
+    """Request client for the LNA bias service.
+
+    Speaks the same 4-byte-length-prefixed JSON framing as the readout
+    server, and opens a fresh connection per request so a restarted service
+    never leaves a stale socket behind.
+    """
+
+    def __init__(self, host, port, timeout_s):
+        self.host = host
+        self.port = int(port)
+        self.timeout_s = float(timeout_s)
+
+    @property
+    def endpoint(self):
+        """``host:port`` of the service, for logging and status."""
+        return f'{self.host}:{self.port}'
+
+    def request(self, message):
+        """Send ``message`` and return the service's ``result`` payload.
+
+        Raises RuntimeError if the service reports an error, or an OSError
+        subclass if it cannot be reached.
+        """
+        payload = json.dumps(message).encode()
+        with socket.create_connection(
+            (self.host, self.port), timeout=self.timeout_s,
+        ) as sock:
+            sock.settimeout(self.timeout_s)
+            sock.sendall(struct.pack('>I', len(payload)) + payload)
+            (length,) = struct.unpack('>I', _recv_exactly(sock, 4))
+            body = _recv_exactly(sock, length)
+        response = json.loads(body.decode())
+        if response.get('status') != 'success':
+            raise RuntimeError(
+                response.get('message') or 'LNA bias service reported an error'
+            )
+        return response.get('result')
 
 
 class LNABiasController:
@@ -266,8 +568,21 @@ class LNABiasController:
     Controller for the SOUK cryostat LNA bias system.
 
     Provides voltage and current control/monitoring for up to 14 LNA
-    channels via I2C.  Each readout pipeline maps to one LNA channel
-    specified by ``cryostat.lna_bias.lna_channel`` in the config.
+    channels.  Each readout pipeline maps to one LNA channel specified by
+    ``cryostat.lna_bias.lna_channel`` in the config.
+
+    Backends
+    --------
+    ``remote``
+        Talk to the LNA bias service on the one RFSoC that is wired to the
+        bias board. This is the normal telescope deployment: every readout
+        server, including those on the wired RFSoC itself, goes through the
+        service so there is a single owner of the board.
+    ``i2c``
+        Drive the bias board directly over the local I2C bus. Intended for
+        bench setups where a board is attached to the machine under test.
+    ``fixed``
+        Record an explicit, non-controllable bias value from config.
 
     Parameters
     ----------
@@ -278,8 +593,8 @@ class LNABiasController:
         Pipeline index.
     """
 
-    SUPPORTED_BACKENDS = ('i2c', 'fixed')
-    CONTROLLABLE_BACKENDS = ('i2c',)
+    SUPPORTED_BACKENDS = ('remote', 'i2c', 'fixed')
+    CONTROLLABLE_BACKENDS = ('remote', 'i2c')
     DEFAULT_BIAS_VOLTAGE_V = 1.5
     DEFAULT_METHOD = 'local'
     DEFAULT_BLIND = False
@@ -289,6 +604,9 @@ class LNABiasController:
         self.config = config_dict
         self.pipeline_id = pipeline_id
         self._monitor = None
+        self._service_client = None
+        self._hw_version = None
+        self._detected_refdes = []
         self.runtime_state = {'lna_bias': {}}
         # Per-channel last-observed health state for transition-only logging.
         self._last_lna_state = {}
@@ -349,6 +667,22 @@ class LNABiasController:
             logger.info('Using fixed LNA bias value from config')
             return
 
+        if self._backend == 'remote':
+            try:
+                host, port, timeout_s = resolve_lna_service_endpoint(lna_cfg)
+            except ValueError as e:
+                logger.error(
+                    'LNA bias backend remote enabled but unusable: %s', e,
+                )
+                return
+            self._service_client = _LNAServiceClient(host, port, timeout_s)
+            logger.info(
+                'LNA bias controller using remote service at %s; '
+                'pipeline LNA channel %d',
+                self._service_client.endpoint, self._lna_channel,
+            )
+            return
+
         if not _HW_AVAILABLE:
             logger.error(
                 'LNA bias backend i2c enabled in config but smbus2 / '
@@ -360,23 +694,25 @@ class LNABiasController:
         try:
             with _i2c_bus_lock(self._i2c_bus_num, 'LNA bias init'):
                 bus = SMBus(self._i2c_bus_num)
-                per_channel_cfg = _default_lna_monitor_hw_config()
-                detected = _detect_lna_channels(bus, per_channel_cfg)
-                if not detected:
-                    logger.error(
-                        'No LNA channels responded on i2c bus %d — '
-                        'subsequent LNA calls will fail.',
-                        self._i2c_bus_num,
-                    )
-                    return
-                hw_config = _build_lna_hw_config(detected, per_channel_cfg)
-                self._monitor = SOUKLNABiasControlMonitor(bus, hw_config)
+                monitor, hw_version = open_bias_monitor(
+                    bus, lna_cfg.get('hw_version', 'auto'),
+                )
+            detected = monitor.detected_refdes
+            if not detected:
+                logger.error(
+                    'No LNA channels responded on i2c bus %d — '
+                    'subsequent LNA calls will fail.',
+                    self._i2c_bus_num,
+                )
+                return
+            self._monitor = monitor
+            self._hw_version = hw_version
             self._detected_refdes = detected
             logger.info(
-                'LNA bias controller initialised on backend %s, bus %d: '
-                '%d/%d channels detected (%s); '
+                'LNA bias controller initialised on backend %s, bus %d, '
+                'board hw v%d: %d/%d channels detected (%s); '
                 'pipeline LNA channel %d',
-                self._backend, self._i2c_bus_num,
+                self._backend, self._i2c_bus_num, hw_version,
                 len(detected), len(_LNA_REFDES), ', '.join(detected),
                 self._lna_channel,
             )
@@ -390,18 +726,51 @@ class LNABiasController:
 
     @property
     def is_hardware(self):
-        """True if controlling real hardware."""
-        return self._monitor is not None
+        """True if this controller is backed by real hardware.
+
+        True for the remote backend too: the bias board is real, it just
+        lives on another RFSoC.
+        """
+        return self._monitor is not None or self._service_client is not None
 
     @property
     def is_controllable(self):
         """True when LNA bias can be changed by software."""
-        return self._backend in self.CONTROLLABLE_BACKENDS and self._monitor is not None
+        return self._backend in self.CONTROLLABLE_BACKENDS and self.is_hardware
+
+    @property
+    def is_remote(self):
+        """True when this controller reaches the board via the LNA service."""
+        return self._service_client is not None
 
     @property
     def backend(self):
         """Name of the active LNA bias backend."""
         return self._backend or 'none'
+
+    @property
+    def hw_version(self):
+        """LNA bias board revision (1 or 2), or None if not yet known.
+
+        For the remote backend this is filled in from the first successful
+        service response.
+        """
+        return self._hw_version
+
+    @property
+    def supports_output_enable(self):
+        """True when the board has per-channel hard output-enable switches."""
+        if self._monitor is not None:
+            return self._monitor.supports_output_enable
+        return self._hw_version == 2
+
+    @property
+    def detected_refdes(self):
+        """Refdes (M17-M30) whose monitors answered when the board was opened.
+
+        Empty for the remote and fixed backends, which do not open a board.
+        """
+        return list(self._detected_refdes)
 
     @property
     def lna_channel(self):
@@ -516,6 +885,17 @@ class LNABiasController:
         if method not in ('remote', 'local'):
             raise ValueError("method must be 'remote' or 'local'")
 
+        if self.is_remote:
+            out = self._remote_call(
+                'set_lna_bias_voltage', channel=chn,
+                voltage_v=float(voltage_v), method=method, blind=bool(blind),
+                fallback={'channel': chn, 'voltage_v': float('nan'),
+                          'method': method},
+            )
+            if out.get('success', True):
+                self._sync_runtime_state_from_result(out, blind=blind)
+            return out
+
         with _i2c_bus_lock(self._i2c_bus_num, 'LNA bias set'):
             if method == 'local':
                 vmin, vmax = self._monitor.lna_local_voltage_ranges.get(
@@ -560,6 +940,18 @@ class LNABiasController:
         chn = channel if channel is not None else self._lna_channel
         self._validate_channel(chn)
 
+        if self.is_remote:
+            out = self._remote_call(
+                'soft_off_lna_bias', channel=chn,
+                fallback={'channel': chn, 'voltage_v': float('nan'),
+                          'method': 'local', 'soft_off': False},
+            )
+            if out.get('success', True):
+                self._sync_runtime_state_from_result(
+                    out, blind=False, soft_off=True,
+                )
+            return out
+
         with _i2c_bus_lock(self._i2c_bus_num, 'LNA bias soft-off'):
             vmin = self._minimum_local_voltage(chn)
             if not _finite_voltage(vmin):
@@ -595,6 +987,19 @@ class LNABiasController:
         if method not in ('remote', 'local'):
             raise ValueError("method must be 'remote' or 'local'")
         channels = list(range(1, NUM_LNA_CHANNELS + 1))
+
+        if self.is_remote:
+            out = self._remote_call(
+                'set_lna_bias_voltage_all', voltage_v=float(voltage_v),
+                method=method, blind=bool(blind),
+            )
+            out = self._keyed_by_channel(out, channels, method=method)
+            default_result = out.get(self._lna_channel)
+            if default_result and default_result.get('success', True):
+                self._sync_runtime_state_from_result(
+                    default_result, blind=blind, soft_off=False,
+                )
+            return out
 
         with _i2c_bus_lock(self._i2c_bus_num, 'LNA bias set-all'):
             if method == 'local':
@@ -654,10 +1059,11 @@ class LNABiasController:
         channels are reported as failures in the same shape as set-all calls.
         """
         self._require_hardware()
-        return {
-            chn: self.soft_off_lna_bias(channel=chn)
-            for chn in range(1, NUM_LNA_CHANNELS + 1)
-        }
+        channels = list(range(1, NUM_LNA_CHANNELS + 1))
+        if self.is_remote:
+            out = self._remote_call('soft_off_lna_bias_all')
+            return self._keyed_by_channel(out, channels, method='local')
+        return {chn: self.soft_off_lna_bias(channel=chn) for chn in channels}
 
     # -- read status --
 
@@ -683,6 +1089,14 @@ class LNABiasController:
 
         self._require_hardware()
 
+        if self.is_remote:
+            return self._remote_call(
+                'get_lna_bias_status', channel=chn,
+                fallback={'channel': chn, 'remote_voltage_v': None,
+                          'local_voltage_v': None, 'bias_current_a': None,
+                          'output_enabled': None},
+            )
+
         with _i2c_bus_lock(self._i2c_bus_num, 'LNA bias status'):
             status = self._monitor.read_lna_status(chn=[chn])
         s = status[chn]
@@ -694,6 +1108,7 @@ class LNABiasController:
             'remote_voltage_v': s['remote voltage'],
             'local_voltage_v': s['local voltage'],
             'bias_current_a': s['bias current'],
+            'output_enabled': _output_enabled_value(s.get('output enable')),
             'message': message,
         }
 
@@ -712,6 +1127,11 @@ class LNABiasController:
             return {chn: self._fixed_lna_status(chn) for chn in channels}
 
         self._require_hardware()
+
+        if self.is_remote:
+            out = self._remote_call('get_lna_bias_status_all')
+            return self._keyed_by_channel(out, channels)
+
         with _i2c_bus_lock(self._i2c_bus_num, 'LNA bias status-all'):
             status = self._monitor.read_lna_status(chn=channels)
         return {
@@ -720,11 +1140,80 @@ class LNABiasController:
                 'remote_voltage_v': status[chn]['remote voltage'],
                 'local_voltage_v': status[chn]['local voltage'],
                 'bias_current_a': status[chn]['bias current'],
+                'output_enabled': _output_enabled_value(
+                    status[chn].get('output enable')),
                 'message': self._check_status_health(
                     chn,
                     status[chn]['remote voltage'],
                     status[chn]['bias current'],
                 ),
+            }
+            for chn in channels
+        }
+
+    # -- output enable (v2 boards only) --
+
+    def set_lna_output_enabled(self, enabled, channel=None):
+        """Hard-enable or disable the bias output for one LNA channel.
+
+        v2 bias boards have a per-channel output switch, so this genuinely
+        removes power from the LNA rather than driving it to its minimum
+        voltage. On v1 boards there is no such switch and this returns a
+        failure result pointing at ``soft_off_lna_bias`` instead.
+        """
+        self._require_hardware()
+        chn = channel if channel is not None else self._lna_channel
+        self._validate_channel(chn)
+
+        if self.is_remote:
+            return self._remote_call(
+                'set_lna_output_enabled', channel=chn, enabled=bool(enabled),
+                fallback={'channel': chn, 'output_enabled': None},
+            )
+
+        if not self.supports_output_enable:
+            return _output_enable_unsupported_result(chn, self._hw_version)
+
+        with _i2c_bus_lock(self._i2c_bus_num, 'LNA output enable'):
+            self._monitor.set_lna_bias_output(chn, bool(enabled))
+            state = self._monitor.bias_oe_status.get(chn)
+        return {
+            'channel': chn,
+            'output_enabled': _output_enabled_value(state),
+            'message': '',
+            'success': bool(state) == bool(enabled),
+        }
+
+    def set_lna_output_enabled_all(self, enabled):
+        """Hard-enable or disable the bias output for all 14 LNA channels.
+
+        Channels are switched together so the rail settling delay is paid
+        once rather than once per channel.
+        """
+        self._require_hardware()
+        channels = list(range(1, NUM_LNA_CHANNELS + 1))
+
+        if self.is_remote:
+            out = self._remote_call(
+                'set_lna_output_enabled_all', enabled=bool(enabled),
+            )
+            return self._keyed_by_channel(out, channels)
+
+        if not self.supports_output_enable:
+            return {
+                chn: _output_enable_unsupported_result(chn, self._hw_version)
+                for chn in channels
+            }
+
+        with _i2c_bus_lock(self._i2c_bus_num, 'LNA output enable-all'):
+            self._monitor.set_lna_bias_output(channels, bool(enabled))
+            states = self._monitor.bias_oe_status
+        return {
+            chn: {
+                'channel': chn,
+                'output_enabled': _output_enabled_value(states.get(chn)),
+                'message': '',
+                'success': bool(states.get(chn)) == bool(enabled),
             }
             for chn in channels
         }
@@ -758,6 +1247,11 @@ class LNABiasController:
                 self.config.get('cryostat', {}).get('lna_bias', {}).get(
                     'blind', self.DEFAULT_BLIND,
                 ),
+            ),
+            'hw_version': self._hw_version,
+            'supports_output_enable': self.supports_output_enable,
+            'service_endpoint': (
+                self._service_client.endpoint if self.is_remote else None
             ),
         }
 
@@ -832,10 +1326,75 @@ class LNABiasController:
             )
 
     def _require_hardware(self):
-        if self._monitor is None:
+        if not self.is_hardware:
             if self._backend == 'fixed':
                 raise RuntimeError('Fixed LNA bias backend is not controllable')
+            if self._backend == 'remote':
+                raise RuntimeError(
+                    'LNA bias service endpoint not configured; see '
+                    f'{get_site_config_path()}'
+                )
             raise RuntimeError('LNA bias hardware not initialised')
+
+    # -- remote backend --
+
+    def _remote_call(self, request, fallback=None, **kwargs):
+        """Forward one request to the LNA bias service and return its result.
+
+        Transport and service-side failures become the same failure-shaped
+        result dict the local backends return, so an unreachable service
+        degrades this server's LNA control rather than breaking the server.
+        """
+        message = {'request': request}
+        message.update(kwargs)
+        try:
+            result = self._service_client.request(message)
+        except Exception as e:
+            logger.warning(
+                'LNA bias service request %r to %s failed: %s',
+                request, self._service_client.endpoint, e,
+            )
+            out = dict(fallback or {})
+            out['success'] = False
+            out['message'] = (
+                f'LNA bias service at {self._service_client.endpoint} '
+                f'is unreachable: {e}'
+            )
+            return out
+        if isinstance(result, dict) and result.get('hw_version'):
+            self._hw_version = int(result['hw_version'])
+        return result
+
+    def _keyed_by_channel(self, result, channels, method=None):
+        """Re-key a per-channel service response by int channel index.
+
+        JSON object keys are strings, so an all-channel response comes back
+        keyed '1'..'14'. A failure-shaped dict (from an unreachable service)
+        is expanded to one entry per channel so callers always see the same
+        shape.
+        """
+        if not isinstance(result, dict):
+            result = {}
+        if 'success' in result and result.get('success') is False:
+            per_channel = {}
+            for chn in channels:
+                entry = dict(result)
+                entry['channel'] = chn
+                if method is not None:
+                    entry['method'] = method
+                per_channel[chn] = entry
+            return per_channel
+        out = {}
+        for chn in channels:
+            entry = result.get(str(chn), result.get(chn))
+            if entry is None:
+                entry = {
+                    'channel': chn,
+                    'message': 'No result returned by the LNA bias service.',
+                    'success': False,
+                }
+            out[chn] = entry
+        return out
 
     def _augment_with_open_circuit_hint(self, chn, message):
         """Append an open-circuit hint when bias current is near zero and
@@ -918,19 +1477,14 @@ def find_lnas(include_state=False):
             print(f'LNA discovery error opening SMBus({LNA_I2C_BUS_NUM}): {e}')
             return []
 
-        per_channel_cfg = _default_lna_monitor_hw_config()
-        detected = _detect_lna_channels(bus, per_channel_cfg)
-        if not detected:
+        try:
+            monitor, hw_version = open_bias_monitor(bus)
+        except Exception as e:
+            print(f'LNA discovery failed: {e}')
             return []
 
-        monitor = None
-        if include_state:
-            try:
-                hw_config = _build_lna_hw_config(detected, per_channel_cfg)
-                monitor = SOUKLNABiasControlMonitor(bus, hw_config)
-            except Exception as e:
-                print(f'LNA status read setup failed: {e}')
-                monitor = None
+        detected = monitor.detected_refdes
+        oe_status = monitor.bias_oe_status if include_state else {}
 
         results = []
         for refdes in detected:
@@ -940,9 +1494,10 @@ def find_lnas(include_state=False):
                 'bus': LNA_I2C_BUS_NUM,
                 'refdes': refdes,
                 'channel': chn,
-                'model': f'SOUK LNA bias monitor {refdes}',
+                'model': f'SOUK LNA bias monitor {refdes} (board hw v{hw_version})',
             }
-            if include_state and monitor is not None and chn is not None:
+            if include_state and chn is not None:
+                entry['output_enabled'] = oe_status.get(chn)
                 try:
                     status = monitor.read_lna_status(chn=[chn])[chn]
                     entry['remote_voltage_v'] = float(status['remote voltage'])

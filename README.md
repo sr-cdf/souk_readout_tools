@@ -170,6 +170,8 @@ For full installation details (including server setup, SD card imaging, and daem
 | `souk-find-bypass-amps` | Discover SOUK mixerless-module bypass amplifiers (`--status` for bypass state) |
 | `souk-find-lnas` | Discover populated LNA bias monitors (`--status` for voltage/current readings) |
 | `souk-rf-peripherals-status` | Combined attenuator, bypass-amplifier, and LNA status report |
+| `souk-lna-service` | Run the LNA bias service (slot-1 board of each telescope rack only) |
+| `souk-lna-service-install` | Install and start the LNA bias service (`-start`/`-stop`/`-restart`/`-status`/`-remove`) |
 
 ## Documentation
 

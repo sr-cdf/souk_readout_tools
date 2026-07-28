@@ -806,6 +806,9 @@ class MockReadoutServer:
             'method': lna_cfg.get('method', 'target_current'),
             'blind': lna_cfg.get('blind', False),
             'lna_model': cryo_cfg.get('lna_model'),
+            'hw_version': None,
+            'supports_output_enable': False,
+            'service_endpoint': None,
             'bias_readings': None,
         }
 

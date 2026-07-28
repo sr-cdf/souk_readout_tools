@@ -66,6 +66,86 @@ def get_template_config_path():
     return str(importlib_files('souk_readout_tools').joinpath('data', 'config', 'template_config.yaml'))
 
 
+# ---------------------------------------------------------------------
+# Site file
+# ---------------------------------------------------------------------
+# Board-wide settings that are the same for every pipeline on a machine, and
+# that describe where shared telescope hardware lives. Kept out of the
+# per-pipeline configs so that moving a piece of shared hardware means editing
+# one file per machine rather than every config.
+
+SITE_CONFIG_FILENAME = 'site.yaml'
+
+DEFAULT_LNA_SERVICE_PORT = 10500
+DEFAULT_LNA_SERVICE_TIMEOUT_S = 15.0
+
+
+def get_site_config_path():
+    """Return the path to this machine's ``site.yaml``.
+
+    The file is optional; ``load_site_config`` returns an empty dict when it
+    does not exist.
+    """
+    return os.path.join(get_user_dir(), SITE_CONFIG_FILENAME)
+
+
+def load_site_config():
+    """Load this machine's ``site.yaml``, or return ``{}`` if absent.
+
+    A malformed site file raises, rather than being silently ignored — a
+    typo there would otherwise send LNA traffic nowhere with no explanation.
+    """
+    import yaml
+
+    path = get_site_config_path()
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        content = yaml.safe_load(f)
+    if content is None:
+        return {}
+    if not isinstance(content, dict):
+        raise ValueError(
+            f'Site config {path} must contain a YAML mapping, '
+            f'got {type(content).__name__}'
+        )
+    return content
+
+
+def resolve_lna_service_endpoint(lna_cfg=None, site_cfg=None):
+    """Resolve where the LNA bias service lives, as ``(host, port, timeout_s)``.
+
+    Only one RFSoC per telescope is wired to the LNA bias board, so every
+    other readout server reaches it over the network. The address is looked up
+    in this order:
+
+    1. ``host``/``port`` in the pipeline config's ``cryostat.lna_bias``
+       section (per-pipeline override, useful on the bench),
+    2. ``lna_service.host``/``.port`` in this machine's ``site.yaml``.
+
+    Raises ValueError naming the site file if neither supplies a host, since
+    that is the actionable fix.
+    """
+    lna_cfg = lna_cfg or {}
+    if site_cfg is None:
+        site_cfg = load_site_config()
+    service_cfg = site_cfg.get('lna_service') or {}
+
+    host = lna_cfg.get('host') or service_cfg.get('host')
+    if not host:
+        raise ValueError(
+            "LNA bias backend 'remote' needs the address of the RFSoC "
+            'running the LNA bias service. Set lna_service.host in '
+            f'{get_site_config_path()}, or cryostat.lna_bias.host in the '
+            'pipeline config.'
+        )
+    port = (lna_cfg.get('request_port') or service_cfg.get('port')
+            or DEFAULT_LNA_SERVICE_PORT)
+    timeout_s = (lna_cfg.get('timeout_s') or service_cfg.get('timeout_s')
+                 or DEFAULT_LNA_SERVICE_TIMEOUT_S)
+    return str(host), int(port), float(timeout_s)
+
+
 def copy_template_config(destination, pipeline_id=0, nyquist_zone=1,
                          config_id=None, created_by=None, comments=None):
     """

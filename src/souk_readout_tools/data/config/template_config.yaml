@@ -226,16 +226,30 @@ cryostat:
   # This can be enabled even when cryostat.connected is false.
   # There are 14 LNA channels per cryostat (indices 1-14).
   # Set lna_channel to the LNA index that this readout pipeline is connected to.
-  # backend: i2c   uses the SOUK LNA bias board on the RFSoC I2C bus
-  # backend: fixed records a fixed, non-controllable bias value
+  #
+  # Only one RFSoC per telescope is wired to the LNA bias board. That machine
+  # runs the LNA bias service (souk-lna-service-install); every readout server,
+  # including the ones on that same board, reaches the hardware through it.
+  #
+  # backend: remote talks to the LNA bias service -- the normal deployment.
+  #                 Its address comes from lna_service.host in
+  #                 ~/.souk_readout_tools/site.yaml, or from host/request_port
+  #                 below if you need a per-pipeline override.
+  # backend: i2c    drives a bias board attached to this machine's own I2C bus.
+  #                 Bench use only: in a telescope this would give the board a
+  #                 second owner alongside the service.
+  # backend: fixed  records a fixed, non-controllable bias value.
   lna_bias:
     enabled: true
-    backend: "i2c"
+    backend: "remote"
     lna_channel: 1                   # LNA index (1-14) for this readout pipeline
     bias_voltage_v: 1.5              # applied on config push/apply when enabled
     soft_off: false                  # true drives channel to min local voltage; not a hard power cut
     method: "local"                 # 'remote' feedback or 'local' DAC set
     blind: false                     # remote method only; skip LNA-voltage sanity check
+    # host:                          # override site.yaml's lna_service.host
+    # request_port: 10500            # override site.yaml's lna_service.port
+    # hw_version: "auto"             # bias board revision: auto, 1, or 2 (i2c backend)
     i2c:
       bus: 0                         # LNA bias board is always on SMBus(0), independent of pipeline_id
 

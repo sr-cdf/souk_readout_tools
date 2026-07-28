@@ -406,7 +406,8 @@ def _ensure_daemon_files(dirs, pipeline_id):
             dst_script = os.path.join(daemon_dir, script)
             copy_package_file(pkg_daemon_dir.joinpath(script), dst_script, 0o775)
 
-        for service in ('ptp4l.service', 'timing-monitor.service', 'tsu-strobe.service'):
+        for service in ('ptp4l.service', 'timing-monitor.service',
+                        'tsu-strobe.service', 'lna-service.service'):
             dst_service = os.path.join(daemon_dir, service)
             copy_package_file(pkg_daemon_dir.joinpath(service), dst_service, 0o664)
 
@@ -2352,6 +2353,10 @@ class ReadoutServer:
             'method': lna_status.get('method', lna.DEFAULT_METHOD),
             'blind': lna_status.get('blind', lna.DEFAULT_BLIND),
             'lna_model': cryo_cfg.get('lna_model'),
+            'hw_version': lna_status.get('hw_version'),
+            'supports_output_enable': lna_status.get(
+                'supports_output_enable', False),
+            'service_endpoint': lna_status.get('service_endpoint'),
         }
 
         # Bias readings -- only this pipeline's LNA channel. Reading all 14
@@ -4006,6 +4011,41 @@ class ReadoutServer:
 
                 elif request == 'soft_off_lna_bias_all':
                     result = self.lna_controller.soft_off_lna_bias_all()
+                    failed = [r for r in result.values() if not r.get('success', True)]
+                    if failed:
+                        msgs = '; '.join(
+                            f"chn {r['channel']}: {r.get('message', 'failed')}"
+                            for r in failed
+                        )
+                        await self.send_response(writer, {
+                            'status': 'error',
+                            'message': f'{len(failed)}/{len(result)} channels failed: {msgs}',
+                            'result': result,
+                        })
+                    else:
+                        await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'set_lna_output_enabled':
+                    enabled = bool(message.get('enabled'))
+                    channel = message.get('channel')
+                    if channel is not None:
+                        channel = int(channel)
+                    result = self.lna_controller.set_lna_output_enabled(
+                        enabled, channel,
+                    )
+                    if not result.get('success', True):
+                        await self.send_response(writer, {
+                            'status': 'error',
+                            'message': result.get(
+                                'message', 'LNA output enable failed'),
+                            'result': result,
+                        })
+                    else:
+                        await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'set_lna_output_enabled_all':
+                    enabled = bool(message.get('enabled'))
+                    result = self.lna_controller.set_lna_output_enabled_all(enabled)
                     failed = [r for r in result.values() if not r.get('success', True)]
                     if failed:
                         msgs = '; '.join(
