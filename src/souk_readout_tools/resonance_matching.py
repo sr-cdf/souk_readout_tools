@@ -1120,7 +1120,7 @@ def fingerprint_power(cost, ia, ib):
             'n': int(len(ranks))}
 
 
-def _rescue(rows, cols, a, b, fp_cost, power, mode, log,
+def _rescue(rows, cols, a, b, fp_cost, power, mode, log, held=(),
             min_accuracy=DEFAULT_RESCUE_MIN_ACCURACY,
             max_distance=DEFAULT_RESCUE_MAX_DISTANCE,
             min_ratio=DEFAULT_RESCUE_MIN_RATIO):
@@ -1141,6 +1141,9 @@ def _rescue(rows, cols, a, b, fp_cost, power, mode, log,
     if mode is False or mode == 'off':
         return rows, cols, [], []
     matched_a, matched_b = set(rows.tolist()), set(cols.tolist())
+    # An entry the caller deliberately unmatched is not a leftover looking
+    # for a home; leaving it out is the whole point.
+    matched_a |= set(held)
     left_a = [i for i in range(len(a)) if i not in matched_a]
     left_b = [j for j in range(len(b)) if j not in matched_b]
     # Only leftovers the other sweep actually looked for can be rescued.
@@ -1606,6 +1609,146 @@ class ResonanceMatch:
                       f"({row['residual_sigma']:+.1f} sigma)  "
                       f"ambiguity {row['ambiguity']:.2f}  {row['flag']}")
 
+    # -- adjusting it by hand ------------------------------------------------
+
+    def _resolve(self, key, which):
+        """An index into a list, from either an index or a frequency.
+
+        Integers select by position, floats by nearest frequency, so both
+        "the one that was number 12" and "the resonator at 1.2345 GHz" work
+        without having to know which is which.
+        """
+        source = self.a if which == 'a' else self.b
+        if key is None:
+            return None
+        if isinstance(key, (int, np.integer)):
+            if not -len(source) <= int(key) < len(source):
+                raise IndexError(
+                    f"list {which.upper()} has {len(source)} entries; "
+                    f"{key} is out of range.")
+            return int(key) % len(source)
+        frequency = float(key)
+        sorted_index = int(np.argmin(np.abs(source.frequency - frequency)))
+        offset = abs(source.frequency[sorted_index] - frequency)
+        if offset > 10 * self.tolerance:
+            raise ValueError(
+                f"nothing in list {which.upper()} within "
+                f"{10 * self.tolerance / 1e3:.0f} kHz of "
+                f"{frequency / 1e6:.4f} MHz (nearest is "
+                f"{source.frequency[sorted_index] / 1e6:.4f} MHz).")
+        return int(source.order[sorted_index])
+
+    @property
+    def locked(self):
+        """Pairings fixed by hand, as ``{a_index: b_index}``.
+
+        Survive :py:meth:`rematch`, which re-solves everything else around
+        them.
+        """
+        return dict(self.settings.get('locked') or {})
+
+    def set(self, a, b):
+        """Pair these two by hand, and keep them paired.
+
+        Whatever either of them was matched to is released.  Both arguments
+        take an index or a frequency in Hz.
+
+        Examples
+        --------
+        >>> m.set(a=17, b=22)
+        >>> m.set(a=1.23456e9, b=1.23012e9)
+        """
+        ai, bi = self._resolve(a, 'a'), self._resolve(b, 'b')
+        locked = {held_a: held_b for held_a, held_b in self.locked.items()
+                  if held_a != ai and held_b != bi}
+        locked[ai] = bi
+        index = self.index
+        index[index == bi] = -1
+        index[ai] = bi
+        return self._replace(index, manual=set(locked), locked=locked)
+
+    def unmatch(self, a=None, b=None):
+        """Break a pairing, and stop it being remade.
+
+        Give either side; the other follows.
+        """
+        ai, bi = self._resolve(a, 'a'), self._resolve(b, 'b')
+        index = self.index
+        if ai is None and bi is not None:
+            ai = int(self.index_b[bi]) if self.index_b[bi] >= 0 else None
+        if ai is None:
+            raise ValueError("give a= or b= to say which pairing to break.")
+        locked = dict(self.locked)
+        # Remember the refusal as a lock to nothing, so a rematch -- and the
+        # rescue pass, which is otherwise glad to pair up two leftovers --
+        # does not simply undo it.
+        locked[ai] = -1
+        index[ai] = -1
+        return self._replace(index, manual=(), locked=locked)
+
+    def lock(self, *a_indices):
+        """Fix the current pairings of these entries of A against a rematch."""
+        locked = dict(self.locked)
+        index = self.index
+        for key in a_indices:
+            ai = self._resolve(key, 'a')
+            locked[ai] = int(index[ai])
+        return self._replace(index, manual=(), locked=locked)
+
+    def rematch(self, **kwargs):
+        """Solve again from scratch, holding the locked pairings fixed.
+
+        Everything else is free to move around them, which is the point:
+        pin the two you are sure of and let the rest re-solve.  Any keyword
+        overrides the setting used the first time.
+        """
+        settings = {k: v for k, v in self.settings.items() if k != 'locked'}
+        settings.update(kwargs)
+        settings.setdefault('verbose', False)
+        return match_resonances(self.a, self.b, locked=self.locked, **settings)
+
+    def _replace(self, index, manual=(), locked=None):
+        """A copy of this match carrying a different index array.
+
+        Settings are copied, not shared, so editing a match never reaches
+        back and changes the one it came from.
+        """
+        pairs = _build_pairs(self.a, self.b, index, self.transform,
+                             self.tolerance)
+        for row in pairs:
+            if row['a_index'] in manual and row['b_index'] >= 0:
+                row['flag'] = 'manual'
+        settings = dict(self.settings)
+        if locked is not None:
+            settings['locked'] = dict(locked)
+        return ResonanceMatch(
+            a=self.a, b=self.b, pairs=pairs, transform=self.transform,
+            tolerance=self.tolerance, settings=settings, trace=self.trace,
+            fingerprint=self.fingerprint, fingerprint_power=self.fingerprint_power,
+            rescued=self.rescued, suggested=self.suggested)
+
+    # -- plots ---------------------------------------------------------------
+
+    def plot(self, **kwargs):
+        """The overlay plot; see :py:func:`plot_match`."""
+        return plot_match(self, **kwargs)
+
+    def plot_shift(self, **kwargs):
+        """Fractional shift against frequency; see :py:func:`plot_shift`."""
+        return plot_shift(self, **kwargs)
+
+    def plot_quality(self, **kwargs):
+        """Residuals and ambiguity; see :py:func:`plot_quality`."""
+        return plot_quality(self, **kwargs)
+
+    def plot_compare(self, *args, **kwargs):
+        """Compare a quantity across the two; see :py:func:`plot_compare`."""
+        return plot_compare(self, *args, **kwargs)
+
+    def plot_pair(self, a_index, **kwargs):
+        """One device's two raw traces; see :py:func:`plot_pair`."""
+        return plot_pair(self, a_index, **kwargs)
+
     def save(self, path):
         """Write the match to CSV, for the record or for editing by hand.
 
@@ -1747,7 +1890,7 @@ def match_resonances(a, b, shift_model='auto', tolerance='auto', order='free',
                      ambiguity_threshold=DEFAULT_AMBIGUITY,
                      fingerprint_max_ratio=DEFAULT_FINGERPRINT_MAX_RATIO,
                      fingerprint_weight=DEFAULT_FINGERPRINT_WEIGHT,
-                     verbose=True):
+                     locked=None, verbose=True):
     """Match two resonance lists, working out which entry is which device.
 
     Parameters
@@ -1799,6 +1942,12 @@ def match_resonances(a, b, shift_model='auto', tolerance='auto', order='free',
     ambiguity_threshold : float, optional
         Pairs whose runner-up costs more than this fraction of the best are
         flagged ``ambiguous`` (default 0.5).
+    locked : dict or None, optional
+        ``{a_index: b_index}`` pairings to hold fixed, imposed on the cost
+        matrix so everything else is solved optimally around them.  A
+        ``b_index`` of ``-1`` holds that entry deliberately unmatched.
+        Usually set for you by :py:meth:`ResonanceMatch.set` and applied by
+        :py:meth:`ResonanceMatch.rematch`.
     verbose : bool, optional
         Print the decisions as they are made (default True).
 
@@ -1840,6 +1989,18 @@ def match_resonances(a, b, shift_model='auto', tolerance='auto', order='free',
 
     fa_t = apply_transform(transform, a.frequency)
     cost = _cost_matrix(fa_t, b.frequency, tol)
+    # Pinned pairings are imposed on the cost matrix rather than forced on
+    # afterwards, so the rest of the array is solved optimally around them.
+    for pin_a, pin_b in (locked or {}).items():
+        row = int(np.where(a.order == pin_a)[0][0])
+        cost[row, :] = _FORBIDDEN
+        if pin_b is None or pin_b < 0:
+            continue                       # held deliberately unmatched
+        col = int(np.where(b.order == pin_b)[0][0])
+        cost[:, col] = _FORBIDDEN
+        cost[row, col] = 0.0
+    if locked:
+        log(f"  holding {len(locked)} pairing(s) fixed by hand")
     if order not in _ASSIGNERS:
         raise ValueError(f"order must be one of {sorted(_ASSIGNERS)}, got {order!r}")
     rows, cols = _ASSIGNERS[order](cost)
@@ -1893,8 +2054,11 @@ def match_resonances(a, b, shift_model='auto', tolerance='auto', order='free',
             amb = _ambiguity(blended, rows, cols)
 
     n_windowed = len(rows)
+    held = [int(np.where(a.order == pin_a)[0][0])
+            for pin_a, pin_b in (locked or {}).items()
+            if pin_b is None or pin_b < 0]
     rows, cols, rescued, suggested = _rescue(rows, cols, a, b, fp_cost, power,
-                                             rescue, log)
+                                             rescue, log, held=held)
     # A rescue was only tested against the other leftovers, not the whole
     # array, so carry its own runner-up margin across as its ambiguity.
     if len(rows) > n_windowed:
@@ -1923,11 +2087,362 @@ def match_resonances(a, b, shift_model='auto', tolerance='auto', order='free',
     settings = {'shift_model': shift_model, 'tolerance': tolerance,
                 'order': order, 'iterations': iterations,
                 'outlier_sigma': outlier_sigma, 'fingerprint': fingerprint,
-                'ambiguity_threshold': ambiguity_threshold, 'rescue': rescue}
+                'ambiguity_threshold': ambiguity_threshold, 'rescue': rescue,
+                'locked': dict(locked or {})}
     return ResonanceMatch(a=a, b=b, pairs=pairs, transform=transform,
                           tolerance=tol, settings=settings, trace=trace,
                           fingerprint=calibration, fingerprint_power=power,
                           rescued=rescued, suggested=suggested)
+
+
+# --- plots ------------------------------------------------------------------
+
+# Kept in this module rather than in the plotting package: these are only
+# useful with a match in hand, and the point of the tool is that one file
+# can be read and adjusted end to end.
+
+_FLAG_COLOURS = {
+    'ok': '#4c72b0', 'crossed': '#dd8452', 'ambiguous': '#c44e52',
+    'outlier': '#8172b3', 'rescued': '#55a868', 'manual': '#000000',
+}
+
+
+def _source_labels(match):
+    """Names for the two lists, kept distinguishable when they collide.
+
+    Two sweeps loaded the same way arrive with the same source name, which
+    would otherwise label both axes of a comparison identically.
+    """
+    name_a = match.a.source or 'A'
+    name_b = match.b.source or 'B'
+    if name_a == name_b:
+        return f'{name_a} (A)', f'{name_b} (B)'
+    return name_a, name_b
+
+
+def _new_axes(ax, **kwargs):
+    """Return ``(figure, axes)``, making them only if the caller did not."""
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        fig, ax = plt.subplots(**kwargs)
+        return fig, ax
+    return ax.get_figure(), ax
+
+
+def _sweep_traces(source):
+    """``(frequency, |S21|)`` traces from a list's sweep, if it has one."""
+    sweep = source.sweep
+    if not sweep:
+        return []
+    f = np.atleast_2d(np.asarray(sweep['sweep_f'], dtype=float))
+    z = (np.atleast_2d(np.asarray(sweep['sweep_i'], dtype=float))
+         + 1j * np.atleast_2d(np.asarray(sweep['sweep_q'], dtype=float)))
+    if sweep.get('wideband_sweep', False) or f.shape[0] == 1:
+        return [(f[0], np.abs(z[0]))]
+    return [(f[:, j], np.abs(z[:, j])) for j in range(f.shape[1])]
+
+
+def _draw_list(ax, source, traces, invert=False):
+    """One list's S21 (or bare ticks) with a marker at every resonance."""
+    if traces:
+        for trace_f, trace_mag in traces:
+            good = np.isfinite(trace_mag) & (trace_mag > 0)
+            ax.plot(trace_f[good] / 1e6, 20 * np.log10(trace_mag[good]),
+                    lw=0.5, color='0.4')
+        ax.set_ylabel('|S21| (dB)')
+    else:
+        ax.set_yticks([])
+        ax.set_ylim(0, 1)
+    low, high = ax.get_ylim()
+    ax.vlines(source.frequency / 1e6, low, low + 0.12 * (high - low),
+              color='#4c72b0', lw=0.8)
+    if invert:
+        ax.invert_yaxis()
+
+
+def plot_match(match, f_range=None, ax=None, figsize=(12, 6)):
+    """The two lists, one above the other, with matched devices joined up.
+
+    The plot to look at first.  Crossed links, devices with no counterpart,
+    and any rescue that claims a device moved a long way are all visible as
+    shapes rather than numbers.  Zoom in (or pass ``f_range``) to read
+    individual pairings.
+
+    Parameters
+    ----------
+    match : ResonanceMatch
+    f_range : tuple or None, optional
+        ``(f_min, f_max)`` in Hz to show.  Default shows everything.
+    ax : matplotlib.axes.Axes or None, optional
+        Ignored -- this plot builds its own three-panel layout.
+    figsize : tuple, optional
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=figsize, sharex=True,
+        gridspec_kw={'height_ratios': [3, 1, 3], 'hspace': 0.05})
+    top, link, bottom = axes
+    _draw_list(top, match.a, _sweep_traces(match.a))
+    _draw_list(bottom, match.b, _sweep_traces(match.b), invert=True)
+
+    link.set_ylim(0, 1)
+    link.set_yticks([])
+    for spine in link.spines.values():
+        spine.set_visible(False)
+    for row in match.pairs:
+        if row['a_index'] < 0 or row['b_index'] < 0:
+            lonely = row['f_a'] if row['a_index'] >= 0 else row['f_b']
+            y = 1.0 if row['a_index'] >= 0 else 0.0
+            link.plot([lonely / 1e6], [y], marker='x', ms=5,
+                      color='#c44e52' if row['flag'] != 'out_of_range' else '0.7')
+            continue
+        colour = _FLAG_COLOURS.get(row['flag'], '#4c72b0')
+        link.plot([row['f_a'] / 1e6, row['f_b'] / 1e6], [1, 0],
+                  color=colour, lw=1.4 if row['flag'] != 'ok' else 0.6,
+                  alpha=0.9 if row['flag'] != 'ok' else 0.5)
+
+    seen = [f for f in np.unique(match.pairs['flag']) if f in _FLAG_COLOURS]
+    if seen:
+        link.legend(handles=[plt.Line2D([], [], color=_FLAG_COLOURS[f], label=f)
+                             for f in seen],
+                    loc='center left', bbox_to_anchor=(1.0, 0.5),
+                    frameon=False, fontsize='small')
+    name_a, name_b = _source_labels(match)
+    top.set_title(f"{name_a} ({len(match.a)})  ->  {name_b} ({len(match.b)}):  "
+                  f"{len(match.matched)} matched")
+    bottom.set_xlabel('frequency (MHz)')
+    if f_range is not None:
+        top.set_xlim(f_range[0] / 1e6, f_range[1] / 1e6)
+    return fig
+
+
+def plot_shift(match, ax=None, figsize=(9, 5)):
+    """Fractional frequency shift against frequency, with the fitted model.
+
+    This is where you check the physics rather than the bookkeeping.  A flat
+    band of points means the whole array moved together, as a loading change
+    or ageing would do.  Structure means the global model is the wrong
+    shape.  A tight core with a sparse tail is the signature of a subset of
+    devices being disturbed on their own -- trapped flux through the
+    transition, say -- rather than of a bad match.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    fig, ax = _new_axes(ax, figsize=figsize)
+    matched = match.matched
+    if len(matched):
+        for flag in np.unique(matched['flag']):
+            rows = matched[matched['flag'] == flag]
+            ax.plot(rows['f_a'] / 1e6, rows['df_frac'], 'o', ms=3.5,
+                    color=_FLAG_COLOURS.get(flag, '0.5'), label=flag,
+                    alpha=0.8)
+        grid = np.linspace(matched['f_a'].min(), matched['f_a'].max(), 300)
+        model = (apply_transform(match.transform, grid) - grid) / grid
+        ax.plot(grid / 1e6, model, '-', color='k', lw=1.2,
+                label=describe_transform(match.transform, match.a.frequency))
+        ax.legend(frameon=False, fontsize='small')
+    ax.axhline(0.0, color='0.8', lw=0.8, zorder=0)
+    ax.set_xlabel('frequency in A (MHz)')
+    ax.set_ylabel(r'$\Delta f / f$')
+    ax.set_title('frequency shift between the two sweeps')
+    return fig
+
+
+def plot_quality(match, ax=None, figsize=(11, 4.5)):
+    """Residuals and ambiguity, against the tolerance that was used.
+
+    Left: how far matched pairs sit from the global model, with the
+    tolerance drawn on.  A histogram that fills the tolerance means it is
+    too tight to trust; one confined to the middle means there was room to
+    spare.  Right: how close each match's runner-up was, so a handful of
+    coin-flips in a dense patch can be told from a systematic problem.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+    else:
+        fig, axes = ax.get_figure(), np.atleast_1d(ax)
+    matched = match.matched
+    left = axes[0]
+    if len(matched):
+        left.hist(matched['residual_hz'] / 1e3, bins=40, color='#4c72b0')
+    for sign in (-1, 1):
+        left.axvline(sign * match.tolerance / 1e3, color='#c44e52', ls='--',
+                     lw=1.0, label='tolerance' if sign > 0 else None)
+    left.set_xlabel('residual (kHz)')
+    left.set_ylabel('devices')
+    left.legend(frameon=False, fontsize='small')
+    left.set_title('residual about the global shift')
+
+    if len(axes) > 1:
+        right = axes[1]
+        if len(matched):
+            for flag in np.unique(matched['flag']):
+                rows = matched[matched['flag'] == flag]
+                right.plot(rows['f_a'] / 1e6, rows['ambiguity'], 'o', ms=3.5,
+                           color=_FLAG_COLOURS.get(flag, '0.5'), label=flag,
+                           alpha=0.8)
+            right.legend(frameon=False, fontsize='small')
+        right.axhline(match.settings.get('ambiguity_threshold', DEFAULT_AMBIGUITY),
+                      color='#c44e52', ls='--', lw=1.0)
+        right.set_ylim(-0.05, 1.05)
+        right.set_xlabel('frequency in A (MHz)')
+        right.set_ylabel('ambiguity (0 clean, 1 a tie)')
+        right.set_title('how close the runner-up was')
+    fig.tight_layout()
+    return fig
+
+
+def plot_compare(match, a_values, b_values=None, label=None, mode='ratio',
+                 log=None, ax=None, figsize=(11, 4.5)):
+    """Compare any per-resonance quantity between the two sweeps.
+
+    Takes the same arguments as :py:meth:`ResonanceMatch.compare`: a
+    parameter name present in both lists, or two arrays in each list's own
+    input order.
+
+    Parameters
+    ----------
+    match : ResonanceMatch
+    a_values, b_values : str or array-like
+        What to compare.  See :py:meth:`ResonanceMatch.compare`.
+    label : str or None, optional
+        Axis label; defaults to the parameter name.
+    mode : {'ratio', 'delta'}, optional
+        Whether the right-hand panel shows B/A or B-A.
+    log : bool or None, optional
+        Log axes.  Default decides from the spread of the values.
+    ax : matplotlib.axes.Axes or None, optional
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+    else:
+        fig, axes = ax.get_figure(), np.atleast_1d(ax)
+    if label is None:
+        label = a_values if isinstance(a_values, str) else 'value'
+    va, vb = match.compare(a_values, b_values, on='matched')
+    good = np.isfinite(va) & np.isfinite(vb)
+    if log is None:
+        positive = good & (va > 0) & (vb > 0)
+        log = bool(positive.sum() > 0.9 * good.sum() and positive.sum()
+                   and np.nanmax(va[positive]) / np.nanmin(va[positive]) > 20)
+
+    left = axes[0]
+    left.plot(va[good], vb[good], 'o', ms=3.5, color='#4c72b0', alpha=0.7)
+    if good.any():
+        lim = [np.nanmin([va[good].min(), vb[good].min()]),
+               np.nanmax([va[good].max(), vb[good].max()])]
+        left.plot(lim, lim, '-', color='0.6', lw=1.0, label='unchanged')
+        left.legend(frameon=False, fontsize='small')
+    if log:
+        left.set_xscale('log')
+        left.set_yscale('log')
+    name_a, name_b = _source_labels(match)
+    left.set_xlabel(f'{label} in {name_a}')
+    left.set_ylabel(f'{label} in {name_b}')
+    left.set_title(f'{label}, device by device')
+
+    if len(axes) > 1:
+        right = axes[1]
+        f_a = match.matched['f_a']
+        change = vb / va if mode == 'ratio' else vb - va
+        right.plot(f_a[good] / 1e6, change[good], 'o', ms=3.5,
+                   color='#4c72b0', alpha=0.7)
+        reference = 1.0 if mode == 'ratio' else 0.0
+        right.axhline(reference, color='0.6', lw=1.0)
+        if good.sum() > 2:
+            right.axhline(float(np.nanmedian(change[good])), color='#c44e52',
+                          ls='--', lw=1.0,
+                          label=f'median {np.nanmedian(change[good]):.3g}')
+            right.legend(frameon=False, fontsize='small')
+        if log and mode == 'ratio':
+            right.set_yscale('log')
+        right.set_xlabel('frequency (MHz)')
+        right.set_ylabel(f'{label} {"B/A" if mode == "ratio" else "B - A"}')
+        right.set_title(f'change in {label} across the band')
+    fig.tight_layout()
+    return fig
+
+
+def plot_pair(match, a_index, span=None, ax=None, figsize=(9, 5)):
+    """The two raw sweep traces around one matched device, overlaid.
+
+    The check to make before believing a surprising match -- a rescue, or
+    anything flagged ambiguous.  Needs both lists to have come from sweeps.
+
+    Parameters
+    ----------
+    match : ResonanceMatch
+    a_index : int
+        Entry of A, in the order you passed it in.
+    span : float or None, optional
+        Width in Hz to show.  Defaults to forty linewidths.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    traces_a, traces_b = _sweep_traces(match.a), _sweep_traces(match.b)
+    if not traces_a or not traces_b:
+        raise ValueError(
+            "plot_pair needs the underlying sweeps; build the match from "
+            "parsed sweeps, or pass sweep= when constructing the lists.")
+    fig, ax = _new_axes(ax, figsize=figsize)
+    b_index = match.index[a_index]
+    f_a = float(match.a.frequency[np.where(match.a.order == a_index)[0][0]])
+    f_b = float(match.b.frequency[np.where(match.b.order == b_index)[0][0]]) \
+        if b_index >= 0 else np.nan
+    if span is None:
+        widths = [w for w in (match.a.linewidth, match.b.linewidth)
+                  if np.isfinite(w)]
+        span = 40 * max(widths) if widths else 40 * match.tolerance
+
+    name_a, name_b = _source_labels(match)
+    for traces, centre, name, colour in (
+            (traces_a, f_a, name_a, '#4c72b0'),
+            (traces_b, f_b, name_b, '#dd8452')):
+        if not np.isfinite(centre):
+            continue
+        for trace_f, trace_mag in traces:
+            window = np.abs(trace_f - centre) < span / 2
+            if window.sum() < 3:
+                continue
+            mag = trace_mag[window]
+            good = np.isfinite(mag) & (mag > 0)
+            # Plotted against detuning so the two sit on top of each other
+            # however far the device moved.
+            ax.plot((trace_f[window][good] - centre) / 1e3,
+                    20 * np.log10(mag[good]) - np.nanmedian(20 * np.log10(mag[good])),
+                    lw=1.0, color=colour,
+                    label=f'{name} @ {centre / 1e6:.4f} MHz')
+    handles, labels = ax.get_legend_handles_labels()
+    unique = dict(zip(labels, handles))
+    ax.legend(unique.values(), unique.keys(), frameon=False, fontsize='small')
+    ax.set_xlabel('detuning from each fitted centre (kHz)')
+    ax.set_ylabel('|S21| (dB, baseline removed)')
+    ax.set_title(f"A[{a_index}] -> B[{b_index}]"
+                 + (f"   df/f = {(f_b / f_a - 1):+.4g}" if b_index >= 0 else
+                    "   (unmatched)"))
+    return fig
 
 
 def match_index(a, b, **kwargs):

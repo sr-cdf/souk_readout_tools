@@ -1,6 +1,6 @@
 # Changelog & Feature List
 
-## v1.7.1 (in progress)
+## v1.7.1
 
 **Match resonance lists between sweeps — `resonance_matching`**
 - New module answering "which resonance in this sweep is which device in
@@ -28,9 +28,37 @@
   either by parameter name or as arbitrary arrays in each list's own input
   order — and `transfer()` carries per-device information (beam-map
   positions, names, tone powers) onto the other list's ordering.
-- Matches are flagged `ok`/`crossed`/`ambiguous`/`outlier`/`unmatched_*`,
-  written to CSV by `save()`, and read back by `load_match()` with any
-  hand-edited `b_index` honoured.
+- Matches are flagged `ok`/`crossed`/`ambiguous`/`outlier`/`rescued`/
+  `unmatched_*`, written to CSV by `save()`, and read back by `load_match()`
+  with any hand-edited `b_index` honoured.
+- `fingerprint='auto'` measures, per dataset, which resonator properties
+  survived whatever happened between the two sweeps, and uses those to
+  settle pairings frequency cannot. Each feature gets a global offset and a
+  residual scatter just as the frequencies do, so a property that changed
+  the same way for every device still identifies devices — what disqualifies
+  a feature is scatter, not change. Fingerprints only break ties; they can
+  never pull a pair inside the frequency tolerance or push one out.
+- A rescue pass pairs up leftovers with frequency ignored, for devices that
+  moved too far to be found any other way. Whether it may do so is measured
+  rather than assumed: a leave-one-out test scores how often the
+  fingerprints name the right device out of the whole array, and rescue only
+  auto-accepts when that is high enough (93% on fitted parameters, 13% on
+  survey estimates, where it declines and offers a shortlist instead).
+- `groups()` reports N:M clusters, so a blend that resolved into two — or two
+  that merged into one — is visible rather than silently mis-paired.
+- Adjustable by hand: `set()` (by index or by frequency), `unmatch()`,
+  `lock()` and `rematch()`, which re-solves the array optimally around the
+  pinned pairings. Every edit returns a new match, leaving the original
+  alone.
+- Five plots in the same module: `plot()` overlays both sweeps with matched
+  devices joined up, `plot_shift()` checks the shift model against the
+  physics, `plot_quality()` checks the tolerance, `plot_compare()` compares
+  any quantity device by device, and `plot_pair()` overlays one device's two
+  raw traces for confirmation.
+- New `doc/resonance_matching.md`: how it works, every control, the
+  perturbation primitives (global shift, scatter, coupling, loss,
+  degeneracy, observation, trapped flux) and which operations fire which,
+  failure modes, and worked examples in increasing complexity.
 
 ## v1.7.0
 
