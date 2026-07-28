@@ -1,5 +1,90 @@
 # Changelog & Feature List
 
+## v1.6.7
+
+**Power tuning: measured bifurcation, shared sweep windows, and an explicit
+comb planner** (`power_sweep.py` only — no firmware or hardware change)
+
+- `run_power_sweep(direction='both')` takes an up sweep and then a down sweep
+  at each power step, so the bifurcation power is **measured** rather than
+  reached by extrapolating the fitted `anl` to `anl_bif`: above bifurcation a
+  Duffing resonator is bistable and the two directions follow different
+  branches. The up sweep stays the canonical artifact (existing analyses are
+  untouched); the down sweep is saved beside it as `kind='sweep_down'` and
+  appears in the run view as `sweeps_down`. Tones are parked at the edge each
+  sweep starts from, and the down sweep reuses the up sweep's ADC calibration
+  so the pair differs only by direction. `follow_dips` recenters on the down
+  sweep by default (`follow_dips_from`), whose minimum still tracks the driven
+  resonance once the tone is bifurcated.
+- `hysteresis_metrics()` compares the two traces per tone and power — a
+  chi-square z-score against the sweeps' own errors, the mean branch
+  separation as a fraction of the dip depth, the split between the two minima
+  in linewidths, and per-direction jump ratios. A power counts as hysteretic
+  when the difference is both statistically significant and physically large.
+  `hysteresis_onset()` brackets the transition between the highest clean and
+  the lowest hysteretic power. `find_best_power` caps the chosen power at that
+  onset, gains a `hysteresis_onset` fallback for tones whose fits all fail,
+  and flags `bif_hysteresis_mismatch` and `anl_direction_mismatch`. Note the
+  onset is an *upper bound*: just past bifurcation the bistable region can be
+  narrower than the sweep's frequency step.
+- **Parameter outlier check is now detrended.** Qi and fr depend on power, so
+  MAD-clipping them against a constant per-tone median treated physics as a
+  run of outliers — on a 389-tone campaign it excluded 227 tones at −88 dBm
+  and all 389 at −80, which is exactly the end that anchors the ANL slope and
+  `p_bif`. No fixed threshold fixes that, since the deviation keeps growing
+  with however far the sweep runs. Deviations are now measured about a robust
+  Theil–Sen trend in power (log space for Qi/Qc), so only scatter about the
+  trend is clipped: 227 → 16 excluded at −88 dBm, with past-bifurcation rows
+  still rejected. `param_outliers_detrend=False` restores the old form.
+- **Fallback after a rejected ANL fit now uses the array.** Tones that lose
+  the power-law pick are not a random sample — they largely bifurcate early —
+  and the old `anl_threshold` fallback handed them the hottest power in the
+  run (median 18 dB above the array, nine pinned at the top of the sweep).
+  Such a tone is now placed from the tones that did work, via a robust line of
+  chosen power against its own `−30log10(Ql) + 10log10(Qc)` (the scaling
+  `anl ∝ P·Ql³/Qc`) using fit-free empirical Q, falling back to the population
+  median when its Q is outside the line's support. Rescued tones now span
+  −105.9…−99.2 dBm instead of −120…−82.
+- **Shared sweep windows.** `follow_dips` could merge two tones onto one
+  resonance: the conflict guard used a 1 Hz separation floor, so a pair
+  landing 10 Hz apart passed, `clip_overlapping_spans` then collapsed both
+  spans to zero, and every fit failed for both tones for the rest of the run
+  (14 of 389 tones on hardware). The floor is now a fraction of the pair's
+  sweep span (default 0.5), which is the unit that matters since neighbouring
+  tones share the gap between them; `follow_min_separation_hz` overrides it
+  with a plain frequency.
+- **Multi-resonance fitting.** A genuine close pair distorts the
+  single-resonator fit badly — fitted `anl` came out 10–100× too large, so the
+  tone read as near-bifurcation when it was not. `fit_power_sweep` now
+  restricts each fit to the resonance that tone is reading out, cutting at the
+  midpoint to each neighbouring dip (midpoint rather than a ±N-linewidth
+  window, because a second dip inflates the linewidth estimate the window
+  would be built from). Median reduced chi2 10423 → 148; contaminated tones
+  recovering a usable ANL fit 1 → 7 of 15. Each split tone is also fitted
+  unsplit and the better kept, so a split can never make a tone worse. Costs
+  +21% fit time. The fitter itself is untouched: masking writes NaN, which it
+  already drops.
+- `resonator_catalogue()` reports one row per *resonance* rather than per
+  tone, so a shared window is a record rather than a flag nobody reads, with
+  the separation in linewidths and whether the pair could have a tone each.
+- **`plan_tone_comb()`** turns that into the next run's comb, and is the
+  deliberate boundary between discovery and configuration: fitting may find a
+  second resonance, but the comb only changes when asked, because a run that
+  silently changes the tone count invalidates the powers it just measured.
+  `policy='keep'` (default) preserves the count, `'replace'` moves a tone to
+  the better resonance in its window at no cost in power or channels, `'add'`
+  grows the comb subject to admission tests. Separation is the binding
+  constraint, not power: only 2 of 21 close pairs on that campaign could be
+  given a tone each and stay sweepable, and admitting all of them would have
+  raised total comb power by 0.23 dB. Any tone parameter can be overridden per
+  tone (by index or by frequency) or per column, applied last so the user
+  always has the final word.
+- The `power_sweep` module docstring now leads with the recommended pipeline —
+  sweep, analyse, balance, plan — with a runnable example, why each step
+  exists, and a pointer to the stage-by-stage functions underneath.
+- Every part is optional through existing signatures; a single-direction run
+  behaves exactly as before, with no new columns, flags, or caps.
+
 ## v1.6.6
 
 **Server-side FFM tone tracking (auto-recentering), both engines**

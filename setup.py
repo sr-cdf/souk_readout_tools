@@ -123,7 +123,7 @@ if install_server:
 
 setup(
     name='souk_readout_tools',
-    version='1.6.4',
+    version='1.6.7',
     description='Tools for the SOUK readout',
     author='Sam Rowe',
     author_email='sam.rowe@astro.cf.ac.uk',
