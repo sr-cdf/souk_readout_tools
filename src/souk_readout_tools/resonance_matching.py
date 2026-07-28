@@ -924,6 +924,289 @@ def _longest_increasing(values):
     return mask
 
 
+# --- fingerprints -----------------------------------------------------------
+
+# Resonator properties that can help say which device is which, and how to
+# compare two values of each.  'log' for anything positive and spanning
+# decades, 'linear' for quantities already in dB or dimensionless, 'angle'
+# for phases, whose differences wrap.
+#
+# Add your own with, e.g.::
+#
+#     rm.FEATURES['responsivity'] = {'transform': 'log'}
+#
+# Nothing here is assumed to survive any particular perturbation -- which
+# ones actually did is measured per dataset by fingerprint='auto'.
+FEATURES = {
+    'Qc': {'transform': 'log'},
+    'Qi': {'transform': 'log'},
+    'Ql': {'transform': 'log'},
+    'fwhm': {'transform': 'log'},
+    'dip_depth': {'transform': 'linear'},
+    'phi': {'transform': 'angle'},
+    'skew': {'transform': 'linear'},
+    'anl': {'transform': 'log'},
+}
+
+# A feature is worth using when its scatter between matched pairs is small
+# compared with its spread across the array: that ratio is how much it can
+# tell one device from another.  0.5 keeps anything better than a factor two.
+DEFAULT_FINGERPRINT_MAX_RATIO = 0.5
+# Fingerprints break ties inside the frequency tolerance; they never widen
+# it. This caps their say in the main assignment.
+DEFAULT_FINGERPRINT_WEIGHT = 0.1
+# Rescue (matching with frequency ignored) is only trustworthy when the
+# fingerprints demonstrably identify devices on their own.
+DEFAULT_RESCUE_MIN_ACCURACY = 0.8
+DEFAULT_RESCUE_MAX_DISTANCE = 3.0
+DEFAULT_RESCUE_MIN_RATIO = 2.0
+
+
+def _feature_transform(name):
+    """The comparison rule for a feature, defaulting to log for unknown ones."""
+    return FEATURES.get(name, {}).get('transform', 'log')
+
+
+def _feature_values(source, name):
+    """A feature's values from a list, mapped ready for differencing."""
+    if name not in source.params:
+        return None
+    values = np.asarray(source.params[name], dtype=float)
+    kind = _feature_transform(name)
+    if kind == 'log':
+        out = np.full(values.shape, np.nan)
+        good = np.isfinite(values) & (values > 0)
+        out[good] = np.log(values[good])
+        return out
+    return np.where(np.isfinite(values), values, np.nan)
+
+
+def _feature_difference(name, values_a, values_b):
+    """``b - a`` for a feature, wrapping if it is an angle."""
+    diff = values_b - values_a
+    if _feature_transform(name) == 'angle':
+        diff = (diff + np.pi) % (2 * np.pi) - np.pi
+    return diff
+
+
+def calibrate_fingerprint(a, b, ia, ib, features='auto',
+                          max_ratio=DEFAULT_FINGERPRINT_MAX_RATIO):
+    """Measure which resonator properties survived, using confident pairs.
+
+    Each feature gets a global offset and a residual scatter, exactly as the
+    frequencies do: a property that changed the same way for every device
+    (all the Qi values halving under load, say) still identifies devices
+    perfectly well, because the change is common-mode and subtracted.  What
+    disqualifies a feature is *scatter*, not change.
+
+    Parameters
+    ----------
+    a, b : ResonanceList
+        The two lists, frequency-sorted.
+    ia, ib : array-like
+        Indices of pairs confident enough to calibrate on.
+    features : 'auto', list, dict, or None
+        ``'auto'`` tests everything both lists carry and keeps what
+        discriminates.  A list forces a selection, a dict gives weights, and
+        ``None`` disables fingerprinting.
+    max_ratio : float, optional
+        Keep features whose pair scatter is below this fraction of their
+        spread across the array (default 0.5).
+
+    Returns
+    -------
+    dict
+        ``{feature: {'offset', 'scatter', 'spread', 'ratio', 'weight',
+        'used'}}``.
+    """
+    if features is None or features is False or not len(ia):
+        return {}
+    weights = features if isinstance(features, dict) else {}
+    if features == 'auto':
+        names = [n for n in FEATURES if n in a.params and n in b.params]
+    else:
+        names = list(weights) if weights else list(features)
+
+    calibration = {}
+    for name in names:
+        va, vb = _feature_values(a, name), _feature_values(b, name)
+        if va is None or vb is None:
+            continue
+        pair_a, pair_b = va[np.asarray(ia)], vb[np.asarray(ib)]
+        diff = _feature_difference(name, pair_a, pair_b)
+        diff = diff[np.isfinite(diff)]
+        if diff.size < 8:
+            continue
+        offset = float(np.median(diff))
+        scatter = _robust_sigma(diff)
+        spread = _robust_sigma(va[np.isfinite(va)])
+        # A feature that is the same for every device (a fit pinned to a
+        # target, say) has nothing to say about which device is which.
+        if not (np.isfinite(scatter) and np.isfinite(spread)) \
+                or scatter <= 0 or spread <= 0:
+            continue
+        ratio = scatter / spread
+        used = ratio < max_ratio if features == 'auto' else True
+        calibration[name] = {
+            'offset': offset, 'scatter': scatter, 'spread': spread,
+            'ratio': ratio, 'weight': float(weights.get(name, 1.0)),
+            'used': bool(used),
+        }
+    return calibration
+
+
+def describe_fingerprint(calibration):
+    """Lines describing what each feature did, and whether it was used."""
+    lines = []
+    for name, c in sorted(calibration.items(), key=lambda kv: kv[1]['ratio']):
+        verdict = 'USED  ' if c['used'] else 'dropped'
+        lines.append(
+            f"    {name:12s} scatter {c['scatter']:7.3f} vs spread "
+            f"{c['spread']:7.3f}  ratio {c['ratio']:6.2f}  "
+            f"offset {c['offset']:+7.3f}  -> {verdict}")
+    return lines
+
+
+def fingerprint_cost(a, b, calibration):
+    """Fingerprint distance between every pair, in scatters.
+
+    Returns ``None`` when no feature survived, so callers can tell "the
+    fingerprints say these are different devices" from "there are no
+    fingerprints".
+    """
+    used = {n: c for n, c in calibration.items() if c['used']}
+    if not used:
+        return None
+    total = np.zeros((len(a), len(b)))
+    weight = np.zeros((len(a), len(b)))
+    for name, c in used.items():
+        va, vb = _feature_values(a, name), _feature_values(b, name)
+        diff = _feature_difference(name, va[:, None], vb[None, :])
+        z = np.abs(diff - c['offset']) / c['scatter']
+        ok = np.isfinite(z)
+        total[ok] += c['weight'] * z[ok]
+        weight[ok] += c['weight']
+    return np.where(weight > 0, total / np.maximum(weight, 1e-12), np.nan)
+
+
+def fingerprint_power(cost, ia, ib):
+    """How often fingerprints alone name the right device, out of everything.
+
+    A leave-one-out check on the pairs the frequencies already agreed about:
+    hide the frequency, rank every candidate by fingerprint distance, and
+    see where the true partner lands.  This is what decides whether a rescue
+    (matching with no frequency information at all) can be trusted.
+
+    Returns
+    -------
+    dict
+        ``{'rank1', 'top5', 'median_rank', 'n'}``; ``rank1`` is the fraction
+        of devices whose true partner was the single closest candidate.
+    """
+    if cost is None or not len(ia):
+        return {'rank1': 0.0, 'top5': 0.0, 'median_rank': np.nan, 'n': 0}
+    ranks = []
+    for i, j in zip(np.asarray(ia), np.asarray(ib)):
+        row = cost[i]
+        if not np.isfinite(row[j]):
+            continue
+        ranks.append(int(np.sum(row < row[j])))
+    if not ranks:
+        return {'rank1': 0.0, 'top5': 0.0, 'median_rank': np.nan, 'n': 0}
+    ranks = np.array(ranks)
+    return {'rank1': float(np.mean(ranks == 0)),
+            'top5': float(np.mean(ranks < 5)),
+            'median_rank': float(np.median(ranks)),
+            'n': int(len(ranks))}
+
+
+def _rescue(rows, cols, a, b, fp_cost, power, mode, log,
+            min_accuracy=DEFAULT_RESCUE_MIN_ACCURACY,
+            max_distance=DEFAULT_RESCUE_MAX_DISTANCE,
+            min_ratio=DEFAULT_RESCUE_MIN_RATIO):
+    """Pair up the leftovers, ignoring frequency entirely.
+
+    A device that moved a long way -- far enough to land outside any sensible
+    tolerance, perhaps below the bottom of the band -- is invisible to the
+    windowed assignment.  What is still true is that it is missing from one
+    list and unaccounted for in the other, and that its fingerprint has not
+    changed.  Both lines of evidence are used, and neither is trusted
+    further than it has been shown to go.
+
+    Everything here works in the lists' internal frequency-sorted order, the
+    same as ``rows``/``cols``; the caller maps back to input order once.
+
+    Returns ``(rows, cols, rescued, suggested)``.
+    """
+    if mode is False or mode == 'off':
+        return rows, cols, [], []
+    matched_a, matched_b = set(rows.tolist()), set(cols.tolist())
+    left_a = [i for i in range(len(a)) if i not in matched_a]
+    left_b = [j for j in range(len(b)) if j not in matched_b]
+    # Only leftovers the other sweep actually looked for can be rescued.
+    cover_a, cover_b = a.coverage or (-np.inf, np.inf), b.coverage or (-np.inf, np.inf)
+    left_a = [i for i in left_a if cover_b[0] <= a.frequency[i] <= cover_b[1]]
+    left_b = [j for j in left_b if cover_a[0] <= b.frequency[j] <= cover_a[1]]
+    if not left_a or not left_b:
+        return rows, cols, [], []
+
+    accuracy = power.get('rank1', 0.0)
+    usable = fp_cost is not None and accuracy >= min_accuracy and mode != 'count_only'
+    log(f"  rescue: {len(left_a)} leftover in A, {len(left_b)} in B"
+        + (f"; fingerprints name the right device {100 * accuracy:.0f}% of "
+           f"the time" if fp_cost is not None else '; no fingerprints available'))
+
+    rescued, suggested = [], []
+    if usable:
+        sub = fp_cost[np.ix_(left_a, left_b)]
+        for k, i in enumerate(left_a):
+            row = sub[k]
+            if not np.any(np.isfinite(row)):
+                continue
+            best = int(np.nanargmin(row))
+            best_cost = float(row[best])
+            others = np.delete(row, best)
+            runner = float(np.nanmin(others)) if others.size and np.any(np.isfinite(others)) \
+                else np.inf
+            ratio = runner / best_cost if best_cost > 0 else np.inf
+            entry = {'a_index': i, 'b_index': left_b[best], 'distance': best_cost,
+                     'ratio': ratio}
+            if best_cost <= max_distance and ratio >= min_ratio:
+                rescued.append(entry)
+            else:
+                suggested.append(entry)
+        # Never let two rescues claim the same device.
+        taken = set()
+        keep = []
+        for entry in sorted(rescued, key=lambda e: e['distance']):
+            if entry['b_index'] in taken:
+                suggested.append(entry)
+                continue
+            taken.add(entry['b_index'])
+            keep.append(entry)
+        rescued = keep
+    elif len(left_a) == 1 and len(left_b) == 1:
+        # Bookkeeping alone: one device missing here, one unaccounted for
+        # there, and nowhere else for either to have gone.
+        rescued = [{'a_index': left_a[0], 'b_index': left_b[0],
+                    'distance': np.nan, 'ratio': np.nan, 'by_count': True}]
+        log("    one leftover each side: paired by elimination")
+
+    if rescued:
+        rows = np.concatenate([rows, [e['a_index'] for e in rescued]]).astype(int)
+        cols = np.concatenate([cols, [e['b_index'] for e in rescued]]).astype(int)
+    if rescued or suggested:
+        log(f"    {len(rescued)} rescued, {len(suggested)} suggested but not applied")
+        for entry in rescued:
+            log(f"      A {a.frequency[entry['a_index']] / 1e6:10.4f} MHz -> "
+                f"B {b.frequency[entry['b_index']] / 1e6:10.4f} MHz   "
+                f"df/f {(b.frequency[entry['b_index']] / a.frequency[entry['a_index']] - 1):+.3f}"
+                + ('  by elimination' if entry.get('by_count') else
+                   f"  fingerprint {entry['distance']:.2f}, "
+                   f"runner-up {entry['ratio']:.1f}x worse"))
+    return rows, cols, rescued, suggested
+
+
 # --- the match --------------------------------------------------------------
 
 _PAIR_DTYPE = np.dtype([
@@ -950,6 +1233,10 @@ class ResonanceMatch:
     tolerance: float
     settings: dict = field(default_factory=dict)
     trace: list = field(default_factory=list)
+    fingerprint: dict = field(default_factory=dict)
+    fingerprint_power: dict = field(default_factory=dict)
+    rescued: list = field(default_factory=list)
+    suggested: list = field(default_factory=list)
 
     # -- the answer ----------------------------------------------------------
 
@@ -994,8 +1281,120 @@ class ResonanceMatch:
     def flagged(self, *flags):
         """Pairs carrying any of the given flags (default: everything odd)."""
         if not flags:
-            flags = ('ambiguous', 'outlier', 'crossed')
+            flags = ('ambiguous', 'outlier', 'crossed', 'rescued')
         return self.pairs[np.isin(self.pairs['flag'], flags)]
+
+    def candidates(self, a_index, n=5, by='fingerprint'):
+        """Rank the plausible partners for one entry of A.
+
+        For checking a match by hand, and for the cases the matcher declined
+        to decide: it will not guess, but it will show you its shortlist.
+
+        Parameters
+        ----------
+        a_index : int
+            Entry of A, in the order you passed it in.
+        n : int, optional
+            How many candidates to return (default 5).
+        by : {'fingerprint', 'frequency'}, optional
+            What to rank on.  ``'fingerprint'`` ignores frequency entirely,
+            which is the point when a device has moved a long way.
+
+        Returns
+        -------
+        numpy.ndarray
+            Structured array of ``b_index``, ``f_b``, ``df_hz``, ``cost``,
+            best first.
+        """
+        sorted_a = int(np.where(self.a.order == a_index)[0][0])
+        if by == 'fingerprint':
+            cost = fingerprint_cost(self.a, self.b, self.fingerprint)
+            if cost is None:
+                raise ValueError(
+                    "no usable fingerprints; rank by='frequency' instead, or "
+                    "supply lists carrying fitted parameters.")
+            costs = cost[sorted_a]
+        else:
+            f_a = apply_transform(self.transform, self.a.frequency[sorted_a])
+            costs = np.abs(self.b.frequency - f_a) / self.tolerance
+        keep = np.argsort(np.where(np.isfinite(costs), costs, np.inf))[:n]
+        out = np.empty(len(keep), dtype=[
+            ('b_index', np.int64), ('f_b', np.float64),
+            ('df_hz', np.float64), ('cost', np.float64)])
+        for k, j in enumerate(keep):
+            out[k] = (self.b.order[j], self.b.frequency[j],
+                      self.b.frequency[j] - self.a.frequency[sorted_a],
+                      costs[j])
+        return out
+
+    def groups(self, merge_window=None):
+        """Devices grouped into clusters, so N-to-M relationships are visible.
+
+        A blended pair that resolved into two, or two that merged into one,
+        is not an error and not a simple pairing.  Entries close enough to
+        be confusable are collected into clusters labelled ``n_a:n_b``; the
+        one-to-one map in :py:attr:`index` still holds inside each.
+
+        Parameters
+        ----------
+        merge_window : float or None, optional
+            How close (Hz) two entries must be to belong to the same
+            cluster.  Defaults to three linewidths.
+
+        Returns
+        -------
+        list of dict
+            ``{'a_indices', 'b_indices', 'kind'}``, ordered by frequency.
+        """
+        if merge_window is None:
+            widths = [w for w in (self.a.linewidth, self.b.linewidth)
+                      if np.isfinite(w)]
+            merge_window = 3.0 * max(widths) if widths else self.tolerance
+        na, nb = len(self.a), len(self.b)
+        parent = list(range(na + nb))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(x, y):
+            rx, ry = find(x), find(y)
+            if rx != ry:
+                parent[ry] = rx
+
+        # Everything is placed on B's frequency axis so the two lists are
+        # directly comparable.
+        fa = apply_transform(self.transform, self.a.frequency)
+        fb = self.b.frequency
+        nodes = sorted([(f, k) for k, f in enumerate(fa)]
+                       + [(f, na + k) for k, f in enumerate(fb)])
+        for (f1, n1), (f2, n2) in zip(nodes, nodes[1:]):
+            if f2 - f1 < merge_window:
+                union(n1, n2)
+        index = self.index
+        for i in range(na):
+            if index[i] >= 0:
+                sorted_a = int(np.where(self.a.order == i)[0][0])
+                sorted_b = int(np.where(self.b.order == index[i])[0][0])
+                union(sorted_a, na + sorted_b)
+
+        clusters = {}
+        for node in range(na + nb):
+            clusters.setdefault(find(node), []).append(node)
+        out = []
+        for members in clusters.values():
+            a_sorted = [m for m in members if m < na]
+            b_sorted = [m - na for m in members if m >= na]
+            out.append({
+                'a_indices': np.sort(self.a.order[a_sorted]),
+                'b_indices': np.sort(self.b.order[b_sorted]),
+                'kind': f"{len(a_sorted)}:{len(b_sorted)}",
+                'frequency': float(np.min([fa[m] for m in a_sorted] or
+                                          [fb[m - na] for m in members])),
+            })
+        return sorted(out, key=lambda g: g['frequency'])
 
     # -- getting values out --------------------------------------------------
 
@@ -1038,7 +1437,12 @@ class ResonanceMatch:
                 raise KeyError(
                     f"{spec!r} is not in list {which.upper()} "
                     f"(has: {sorted(source.params)}).")
-            values = np.asarray(source.params[spec], dtype=float)
+            values = np.asarray(source.params[spec])
+            if values.dtype.kind not in 'fiub':
+                raise TypeError(
+                    f"{spec!r} is not numeric in list {which.upper()} "
+                    f"(dtype {values.dtype}); it cannot be compared.")
+            values = values.astype(float)
         else:
             values = np.asarray(spec, dtype=float)
             if len(values) != len(source):
@@ -1122,10 +1526,14 @@ class ResonanceMatch:
                 f"expected {len(self.a)} values (list A's input length), "
                 f"got {len(values_a)}.")
         index_b = self.index_b
-        if fill is None or values_a.dtype.kind in 'USO':
+        dtype = values_a.dtype
+        if fill is None or dtype.kind in 'USO':
             out = np.full(len(self.b), fill, dtype=object)
         else:
-            out = np.full(len(self.b), fill, dtype=values_a.dtype)
+            if dtype.kind in 'iub' and isinstance(fill, float) \
+                    and not np.isfinite(fill):
+                dtype = np.float64      # an int array cannot hold the NaN fill
+            out = np.full(len(self.b), fill, dtype=dtype)
         found = index_b >= 0
         out[found] = values_a[index_b[found]]
         return out
@@ -1143,6 +1551,10 @@ class ResonanceMatch:
         for which, source in (('a', self.a), ('b', self.b)):
             idx = self.pairs[f'{which}_index']
             for name in sorted(source.params):
+                # Non-numeric columns (a fit's provenance string, say) are
+                # carried in the list but have no place in a comparison table.
+                if np.asarray(source.params[name]).dtype.kind not in 'fiub':
+                    continue
                 values = self._values(name, which)
                 taken = np.where(idx >= 0, values[np.maximum(idx, 0)], np.nan)
                 columns.append((f'{name}_{which}', taken))
@@ -1259,7 +1671,10 @@ def _rebuild(match, index, flag_manual=()):
             row['flag'] = 'manual'
     return ResonanceMatch(a=match.a, b=match.b, pairs=pairs,
                           transform=match.transform, tolerance=match.tolerance,
-                          settings=match.settings, trace=match.trace)
+                          settings=match.settings, trace=match.trace,
+                          fingerprint=match.fingerprint,
+                          fingerprint_power=match.fingerprint_power,
+                          rescued=match.rescued, suggested=match.suggested)
 
 
 def _build_pairs(a, b, index, transform, tolerance, ambiguity=None,
@@ -1326,9 +1741,13 @@ def _build_pairs(a, b, index, transform, tolerance, ambiguity=None,
 
 
 def match_resonances(a, b, shift_model='auto', tolerance='auto', order='free',
-                     units='auto', coverage_a=None, coverage_b=None,
-                     iterations=3, outlier_sigma=DEFAULT_OUTLIER_SIGMA,
-                     ambiguity_threshold=DEFAULT_AMBIGUITY, verbose=True):
+                     fingerprint='auto', rescue='auto', units='auto',
+                     coverage_a=None, coverage_b=None, iterations=3,
+                     outlier_sigma=DEFAULT_OUTLIER_SIGMA,
+                     ambiguity_threshold=DEFAULT_AMBIGUITY,
+                     fingerprint_max_ratio=DEFAULT_FINGERPRINT_MAX_RATIO,
+                     fingerprint_weight=DEFAULT_FINGERPRINT_WEIGHT,
+                     verbose=True):
     """Match two resonance lists, working out which entry is which device.
 
     Parameters
@@ -1349,6 +1768,23 @@ def match_resonances(a, b, shift_model='auto', tolerance='auto', order='free',
         reorder.  ``'monotonic'`` forbids reordering, which helps in dense
         arrays when you know the order held.  ``'nearest'`` keeps only
         mutual nearest neighbours.
+    fingerprint : 'auto', list, dict, or None, optional
+        Resonator properties used to tell devices apart when frequency
+        cannot.  ``'auto'`` (default) measures which ones survived and keeps
+        those; a list or ``{name: weight}`` dict forces a choice; ``None``
+        matches on frequency alone.  Fingerprints only break ties inside
+        the tolerance -- they never pull in a pair frequency excluded.
+
+        Note that matching on a property and then comparing it biases the
+        comparison towards "nothing changed".  Exclude whatever you are
+        measuring, or check :py:attr:`ResonanceMatch.fingerprint` to see
+        what was used.
+    rescue : {'auto', 'count_only', False}, optional
+        Whether to pair up leftovers with frequency ignored, for devices
+        that moved too far to be found any other way.  ``'auto'`` (default)
+        does so only when the fingerprints are measurably good enough;
+        ``'count_only'`` pairs a lone leftover on each side and nothing
+        else.  Rescued pairs are always flagged, never silently absorbed.
     units : {'auto', 'hz', 'mhz', 'ghz'}, optional
         Units of the inputs, when they are bare numbers.
     coverage_a, coverage_b : tuple or None, optional
@@ -1419,10 +1855,61 @@ def match_resonances(a, b, shift_model='auto', tolerance='auto', order='free',
         log(f"  monotonic cross-check: agrees on {len(rows) - disagree}"
             f"/{len(rows)} pairs")
 
+    # Second pass: work out which resonator properties survived whatever
+    # happened between the two sweeps, and use the ones that did to settle
+    # pairings the frequencies alone cannot.
     amb = _ambiguity(cost, rows, cols)
+    calibration, power, fp_cost = {}, {}, None
+    if fingerprint is not None and fingerprint is not False and len(rows):
+        confident = amb < ambiguity_threshold
+        calibration = calibrate_fingerprint(
+            a, b, rows[confident], cols[confident], features=fingerprint,
+            max_ratio=fingerprint_max_ratio)
+        fp_cost = fingerprint_cost(a, b, calibration)
+        if calibration:
+            log(f"  fingerprint ({fingerprint if isinstance(fingerprint, str) else 'given'}"
+                f", from {int(confident.sum())} confident pairs):")
+            for line in describe_fingerprint(calibration):
+                log(line)
+        if fp_cost is not None:
+            power = fingerprint_power(fp_cost, rows[confident], cols[confident])
+            log(f"    identifies the right device on its own "
+                f"{100 * power['rank1']:.0f}% of the time "
+                f"(top-5 {100 * power['top5']:.0f}%)")
+            # Fingerprints only break ties. Blending as a weighted average of
+            # two costs that both run 0..1 keeps every feasible pair feasible:
+            # a bad fingerprint can lose a pair to a better rival, but it can
+            # never push one outside the frequency tolerance on its own.
+            fp_scaled = np.clip(np.nan_to_num(fp_cost, nan=1.0) / 5.0, 0.0, 1.0)
+            blended = ((1.0 - fingerprint_weight) * cost
+                       + fingerprint_weight * fp_scaled)
+            blended[cost >= _FORBIDDEN] = _FORBIDDEN
+            new_rows, new_cols = _ASSIGNERS[order](blended)
+            changed = len(set(zip(rows.tolist(), cols.tolist()))
+                          - set(zip(new_rows.tolist(), new_cols.tolist())))
+            if changed:
+                log(f"    re-assigned with fingerprints: {changed} pairs changed")
+            rows, cols = new_rows, new_cols
+            amb = _ambiguity(blended, rows, cols)
+
+    n_windowed = len(rows)
+    rows, cols, rescued, suggested = _rescue(rows, cols, a, b, fp_cost, power,
+                                             rescue, log)
+    # A rescue was only tested against the other leftovers, not the whole
+    # array, so carry its own runner-up margin across as its ambiguity.
+    if len(rows) > n_windowed:
+        amb = np.concatenate([amb, [min(1.0, 1.0 / e['ratio'])
+                                    if np.isfinite(e['ratio']) and e['ratio'] > 0
+                                    else 0.0 for e in rescued]])
+
     # Translate sorted-order results back into the caller's input order.
     index = np.full(len(a), -1, dtype=np.int64)
     index[a.order[rows]] = b.order[cols]
+    rescued_a = {int(a.order[e['a_index']]) for e in rescued}
+    for entry in rescued + suggested:
+        entry['a_index'] = int(a.order[entry['a_index']])
+        entry['b_index'] = int(b.order[entry['b_index']])
+
     amb_by_a = dict(zip(a.order[rows].tolist(), amb.tolist()))
     ordered_amb = np.array([amb_by_a.get(int(i), 0.0)
                             for i in np.where(index >= 0)[0]])
@@ -1430,12 +1917,17 @@ def match_resonances(a, b, shift_model='auto', tolerance='auto', order='free',
     pairs = _build_pairs(a, b, index, transform, tol, ambiguity=ordered_amb,
                          outlier_sigma=outlier_sigma,
                          ambiguity_threshold=ambiguity_threshold)
+    for row in pairs:
+        if row['a_index'] in rescued_a and row['b_index'] >= 0:
+            row['flag'] = 'rescued'
     settings = {'shift_model': shift_model, 'tolerance': tolerance,
                 'order': order, 'iterations': iterations,
-                'outlier_sigma': outlier_sigma,
-                'ambiguity_threshold': ambiguity_threshold}
+                'outlier_sigma': outlier_sigma, 'fingerprint': fingerprint,
+                'ambiguity_threshold': ambiguity_threshold, 'rescue': rescue}
     return ResonanceMatch(a=a, b=b, pairs=pairs, transform=transform,
-                          tolerance=tol, settings=settings, trace=trace)
+                          tolerance=tol, settings=settings, trace=trace,
+                          fingerprint=calibration, fingerprint_power=power,
+                          rescued=rescued, suggested=suggested)
 
 
 def match_index(a, b, **kwargs):
