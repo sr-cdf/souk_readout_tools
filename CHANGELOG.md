@@ -1,5 +1,52 @@
 # Changelog & Feature List
 
+## v1.7.0
+
+**Centralised LNA bias service + v2 bias board support**
+- Only one RFSoC per telescope is wired to the LNA bias board, so that
+  machine now runs `souk-lna-service` and every readout server — including
+  the two pipelines on that same machine — reaches the board through it.
+  New `server/lna_service.py`: a TCP service (length-prefixed JSON, same
+  framing as the readout server) that owns the board, serialises access,
+  and serves a background-polled status cache so fourteen servers do not
+  queue on slow I2C reads. Installed like the other single services:
+  `souk-lna-service-install` / `-start` / `-stop` / `-restart` / `-status`
+  / `-remove`, unit `lna-service.service`.
+- New `backend: remote` on `LNABiasController`, resolved from a new
+  per-machine site file `~/.souk_readout_tools/site.yaml`
+  (`lna_service.host`/`.port`), with an optional `cryostat.lna_bias.host`
+  override for bench work. Each server still addresses its own LNA: it
+  sends its configured `lna_channel` explicitly on every request.
+  Client API, mock, and apply-on-config-push are unchanged — the routing
+  happens below them. An unreachable service degrades LNA calls to failure
+  results rather than raising.
+- v2 LNA bias board support. One `_BiasMonitor` subclass now covers both
+  revisions: it builds the v2 U6/U7 output-enable expanders only when they
+  are present (auto-detected by probing for them), batches multi-channel
+  enables into one write per expander, and never disables outputs on
+  construction — the submodule's constructor does, which would cut bias to
+  all 14 LNAs on a service restart.
+- New hard power control on v2: `set_lna_output_enabled(enabled, channel)`
+  and `set_lna_output_enabled_all(enabled)` on the client, server, and
+  controller; `output_enabled` added to status results (`None` on v1).
+  `soft_off` keeps its existing meaning on both revisions and remains the
+  only option on v1.
+- Tracked the submodule's `bias_control_hw2v` branch: retry failures now
+  raise `I2CDeviceError` rather than `ConnectionError` (channel detection
+  updated accordingly, and it now uses the driver's own per-slot failure
+  handling instead of 14 separate probe constructions), and the retry log
+  message changed, which had silently disabled the unpopulated-slot noise
+  filter.
+  The submodule pin moves to `94eb9c8` on that branch. It is unmerged
+  upstream and expected to move, so that commit is also marked by the local
+  tag `souk-readout-tools-v1.7.0` inside the submodule; if upstream ever
+  force-pushes the branch away, recover with
+  `git -C src/souk_readout_tools/server/souk-peripherals-control checkout 94eb9c8`.
+- The shared I2C bus lock moved to `server/i2c_lock.py` and is now taken by
+  `rf_peripherals` too, so RF module traffic cannot interleave with the LNA
+  service's multi-step mux operations on the machine where both boards
+  share bus 0.
+
 ## v1.6.7
 
 **Power tuning: measured bifurcation, shared sweep windows, and an explicit
