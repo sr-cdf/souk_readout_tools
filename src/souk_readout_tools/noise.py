@@ -11,6 +11,11 @@ Public API:
   timestream PSD plotting; takes parsed simultaneous I/Q samples and returns a
   shallow copy with selected regular-tone I/Q rows cleaned using blind
   amplitude/phase modes, optionally with diagnostics.
+- ``remove_iq_common_modes_svd(ts_data, ...)``: Called by notebooks and
+  timestream PSD plotting; takes parsed simultaneous I/Q samples and returns a
+  shallow copy with the selected tone rows cleaned of leading SVD common modes
+  fitted from the tones' own amplitude/phase variations, optionally with
+  diagnostics. Needs no resonance sweep, so it also works on loopback data.
 - ``fractional_frequency_and_dissipation_timestreams(ts_data, sweep_data,
   ...)``: Called by notebooks and timestream PSD plotting; takes parsed I/Q
   samples plus regular-tone calibration sweeps and returns selected tone
@@ -416,6 +421,116 @@ def remove_blind_tone_common_modes(
     return cleaned, info
 
 
+def _default_regular_tones(ts_data):
+    """Return saved regular-tone indices, else every non-blind tone."""
+    metadata = _tone_metadata(ts_data)
+    regular_tones = metadata.get("regular_indices")
+    if regular_tones is not None and len(regular_tones):
+        return regular_tones
+    blind_tones = metadata.get("blind_indices") or []
+    blind_set = {operator.index(tone_index) for tone_index in blind_tones}
+    return [tone_index for tone_index in range(len(ts_data["i_data"]))
+            if tone_index not in blind_set]
+
+
+def remove_iq_common_modes_svd(ts_data, n_modes=1, *, tones=None,
+                               standardise=True, return_info=False):
+    """
+    Remove leading common modes from tone I/Q data using an SVD.
+
+    Modes are fitted from the tones' own normalized amplitude and unwrapped-
+    phase variations -- the coordinates a common gain drift or LO phase drift
+    moves -- and are removed from the amplitude and phase rows separately, in
+    the same way ``remove_common_modes_svd`` treats calibrated
+    frequency/dissipation rows. The cleaned rows are recombined into I/Q.
+
+    Unlike the frequency/dissipation cleaning, this needs no resonance sweep,
+    so it applies to loopback captures and other data without resonators.
+
+    Parameters
+    ----------
+    ts_data : dict
+        Parsed accumulated samples with simultaneous tone I/Q rows.
+    n_modes : int, optional
+        Number of leading SVD modes to subtract. The default is ``1``.
+        Pass ``0`` to return an unchanged copy.
+    tones : iterable of int or None, optional
+        Tone indices used to estimate the modes and cleaned. ``None``
+        (default) uses regular tones from the saved metadata when available,
+        otherwise every non-blind tone.
+    standardise : bool, optional
+        Divide each amplitude/phase row by its standard deviation before the
+        SVD, then restore the original scale. The default is ``True``.
+    return_info : bool, optional
+        Also return the decomposition diagnostics. The default is ``False``.
+
+    Returns
+    -------
+    cleaned : dict
+        Shallow copy of ``ts_data`` with cleaned I/Q arrays for the selected
+        tones. Unselected rows and other metadata are preserved.
+    info : dict, optional
+        Returned only when ``return_info=True``. Contains ``n_modes``,
+        ``tones``, and the ``amplitude`` and ``phase`` diagnostics returned by
+        ``remove_common_modes_svd``.
+
+    Notes
+    -----
+    A common mode fitted from the tones themselves also contains any signal
+    that is common to them, so keep ``n_modes`` small and compare against the
+    uncleaned spectrum.
+    """
+    try:
+        n_modes = operator.index(n_modes)
+    except TypeError as exc:
+        raise TypeError("n_modes must be an integer") from exc
+    if n_modes < 0:
+        raise ValueError("n_modes must be non-negative")
+
+    if tones is None:
+        tones = _default_regular_tones(ts_data)
+    z, tones, selected = _complex_tone_rows(ts_data, tones, "Regular")
+
+    cleaned = dict(ts_data)
+    cleaned["i_data"] = dict(ts_data["i_data"])
+    cleaned["q_data"] = dict(ts_data["q_data"])
+    if n_modes == 0:
+        if return_info:
+            return cleaned, {"n_modes": 0, "tones": tones}
+        return cleaned
+
+    (amplitude_baseline, phase_baseline, amplitude_variation,
+     phase_variation) = _amplitude_phase_variations(z)
+    cleaned_amplitude_variation, amplitude_info = remove_common_modes_svd(
+        amplitude_variation, n_modes, standardise=standardise,
+        return_info=True)
+    cleaned_phase_variation, phase_info = remove_common_modes_svd(
+        phase_variation, n_modes, standardise=standardise, return_info=True)
+
+    cleaned_amplitude = amplitude_baseline * (
+        1.0 + cleaned_amplitude_variation)
+    if np.any(cleaned_amplitude <= 0):
+        raise ValueError(
+            "SVD cleaning produced a non-positive tone amplitude; reduce "
+            "n_modes or inspect the selected tones")
+    cleaned_z = cleaned_amplitude * np.exp(
+        1j * (phase_baseline + cleaned_phase_variation))
+
+    for row, (_, tone_key) in enumerate(selected):
+        cleaned["i_data"][tone_key] = cleaned_z[row].real
+        cleaned["q_data"][tone_key] = cleaned_z[row].imag
+
+    if not return_info:
+        return cleaned
+    info = {
+        "n_modes": n_modes,
+        "tones": tones,
+        "amplitude": amplitude_info,
+        "phase": phase_info,
+    }
+    return cleaned, info
+
+
 def _get_sweep_trace(sweep_data, tone_index):
     """Extract a tone's sweep trace from targeted or wideband sweep data."""
     sweep_f = np.atleast_2d(sweep_data["sweep_f"])
@@ -597,4 +712,5 @@ __all__ = [
     "fractional_frequency_and_dissipation_timestreams",
     "remove_blind_tone_common_modes",
     "remove_common_modes_svd",
+    "remove_iq_common_modes_svd",
 ]

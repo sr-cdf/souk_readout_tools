@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+**Common-mode removal without resonators**
+- `plot_timestream_psd()` now applies `decorrelate_modes` and
+  `blind_tone_modes` to `format='iq'` and `format='magphase'`, not just
+  `'freq_diss'`. Neither needs a sweep, so loopback noise data can be
+  decorrelated.
+- For those formats the SVD modes are fitted from the tones' own normalised
+  amplitude and unwrapped-phase variations — the coordinates a common gain or
+  LO phase drift moves — and removed from the amplitude and phase rows
+  separately, mirroring the freq/diss treatment. Cleaned rows are recombined
+  into I/Q, so `'iq'` and `'magphase'` show the same cleaning.
+- New `noise.remove_iq_common_modes_svd(ts_data, n_modes, tones=...)` does this
+  standalone, returning a shallow copy of the parsed samples with cleaned I/Q
+  rows. `decorrelate_tones` defaults to every non-blind tone here.
+- Documented in [Resonator Noise
+  Workflow](doc/resonator_noise_workflow.md#without-resonators-iq-and-magphase).
+
 **Quantisation-noise test — `scripts/quantisation/`**
 - `quantisation_noise_test.py` measures whether moving digital gain downstream
   costs SNR. Tone amplitude scales before the synthesis filterbank and

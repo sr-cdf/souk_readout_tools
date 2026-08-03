@@ -14,7 +14,8 @@ from collections.abc import Mapping
 
 from ..noise import (fractional_frequency_and_dissipation_timestreams,
                      remove_blind_tone_common_modes,
-                     remove_common_modes_svd)
+                     remove_common_modes_svd,
+                     remove_iq_common_modes_svd)
 from ._common import (_get_pyplot, _compute_mag_phase,
                        _apply_deembed, _apply_phase_center,
                        _resolve_label,
@@ -475,6 +476,55 @@ def _match_y_limits(*axes):
         ax.set_ylim(ymin, ymax)
 
 
+def _cleaning_label(trace_label, blind_tone_modes, decorrelate_modes):
+    """Label a cleaned trace with the cleaning steps that produced it."""
+    steps = []
+    if blind_tone_modes:
+        steps.append(f'Blind N={blind_tone_modes}')
+    if decorrelate_modes:
+        steps.append(f'SVD N={decorrelate_modes}')
+    return f'{trace_label} ({", ".join(steps)})'
+
+
+def _compute_cleaned_iq(ts_data, decorrelate_modes, decorrelate_tones,
+                        blind_tone_modes, blind_tones):
+    """Return cleaned (I, Q) rows keyed by tone index, without a sweep.
+
+    Blind-tone subtraction runs first, then SVD common-mode removal, matching
+    the order used for freq/diss. Both steps work on the raw I/Q, so this path
+    needs no resonance sweep -- it is the one to use for loopback data.
+    """
+    analysis_tones = decorrelate_tones
+    cleaned_ts_data = ts_data
+    if blind_tone_modes:
+        cleaned_ts_data, blind_info = remove_blind_tone_common_modes(
+            ts_data,
+            n_modes=blind_tone_modes,
+            regular_tones=analysis_tones,
+            blind_tones=blind_tones,
+            return_info=True,
+        )
+        analysis_tones = blind_info['regular_tones']
+    if decorrelate_modes:
+        cleaned_ts_data, svd_info = remove_iq_common_modes_svd(
+            cleaned_ts_data,
+            n_modes=decorrelate_modes,
+            tones=analysis_tones,
+            return_info=True,
+        )
+        analysis_tones = svd_info['tones']
+
+    tone_keys = sorted(cleaned_ts_data['i_data'])
+    cleaned = {}
+    for tone_index in analysis_tones:
+        tone_key = tone_keys[int(tone_index)]
+        cleaned[int(tone_key)] = (
+            np.asarray(cleaned_ts_data['i_data'][tone_key], dtype=float),
+            np.asarray(cleaned_ts_data['q_data'][tone_key], dtype=float),
+        )
+    return cleaned
+
+
 def _compute_cleaned_freq_diss(
         ts_data, sweep_data, plotted_tones, decorrelate_modes,
         decorrelate_tones, blind_tone_modes, blind_tones,
@@ -904,23 +954,28 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
             Default ``False`` preserves the raw Welch/periodogram frequencies.
         bins_per_decade: float, optional. Number of log bins per frequency
             decade when ``log_bin=True``. Default 10.
-        decorrelate_modes: int, optional. For ``format='freq_diss'``, remove
-            this many leading SVD modes across the calibrated slow-timestream
-            tone rows. ``0`` (default) disables decorrelation.
+        decorrelate_modes: int, optional. Remove this many leading SVD modes
+            across the slow-timestream tone rows. ``0`` (default) disables
+            decorrelation. For ``format='freq_diss'`` the modes are removed
+            from the calibrated frequency and dissipation rows; for
+            ``'iq'``/``'magphase'`` they are fitted from the tones' own
+            amplitude and unwrapped-phase variations and removed from those,
+            which needs no sweep and so works on loopback data.
         decorrelate_plot: {'overlay', 'replace'}, optional. Plot decorrelated
             spectra alongside the raw spectra or instead of them. The
             cleaned legend records each active cleaning step.
         decorrelate_tones: iterable of int or None, optional. Tones used to
             estimate the SVD common modes. ``None`` (default) uses regular
             tones from the saved metadata when available, otherwise every
-            active tone. Every tone selected for plotting must be included.
-        blind_tone_modes: int, optional. For ``format='freq_diss'``, fit this
-            many temporal modes from simultaneous blind-tone amplitude/phase
-            variations and regress them out of regular-tone I/Q before
-            frequency/dissipation conversion. ``0`` (default) disables
+            active tone (every non-blind tone for ``'iq'``/``'magphase'``).
+            Every tone selected for plotting must be included.
+        blind_tone_modes: int, optional. Fit this many temporal modes from
+            simultaneous blind-tone amplitude/phase variations and regress
+            them out of the regular-tone I/Q -- before frequency/dissipation
+            conversion for ``format='freq_diss'``. ``0`` (default) disables
             blind-tone cleaning. Blind sweep traces are not used. When both
-            cleaning options are enabled, regular-tone SVD cleaning follows
-            blind-tone subtraction and calibration.
+            cleaning options are enabled, SVD cleaning follows blind-tone
+            subtraction (and calibration, for ``'freq_diss'``).
         blind_tones: iterable of int or None, optional. Explicit blind-tone
             indices. ``None`` (default) infers them from saved timestream
             metadata. Use this for older captures without role metadata.
@@ -976,10 +1031,6 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
     if decorrelate_plot not in ('overlay', 'replace'):
         raise ValueError(
             "decorrelate_plot must be either 'overlay' or 'replace'")
-    if (decorrelate_modes or blind_tone_modes) and format != 'freq_diss':
-        raise ValueError(
-            "SVD and blind-tone cleaning are supported only for "
-            "format='freq_diss'")
     if ((decorrelate_modes or blind_tone_modes)
             and format == 'freq_diss' and sweep_data is None):
         raise ValueError(
@@ -1001,31 +1052,67 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
         else:
             ax1, ax2 = fig.axes[:2]
 
+        def _iq_panel_psds(key, i_arr, q_arr):
+            """PSDs of the two panels for one tone's I/Q rows."""
+            if format == 'iq':
+                return _psd(i_arr, key, 'I'), _psd(q_arr, key, 'Q')
+            z = np.asarray(i_arr) + 1j * np.asarray(q_arr)
+            zc = z[keep_idx] if keep_idx is not None else z
+            _warn_if_psd_nan(zc, key, 'magnitude/phase')
+            mag = np.abs(zc)
+            phase = np.unwrap(np.angle(zc))
+            return (compute_psd(mag, psd_sample_rate, **psd_kw),
+                    compute_psd(phase, psd_sample_rate, **psd_kw))
+
+        cleaned_iq = {}
+        if decorrelate_modes or blind_tone_modes:
+            cleaned_iq = _compute_cleaned_iq(
+                ts_data, decorrelate_modes, decorrelate_tones,
+                blind_tone_modes, blind_tones)
+
         for key, i_arr, q_arr in selected:
             trace_label = _resolve_label(ax1, label,
                                          suffix=f'Tone {key}' if len(selected) > 1 else None)
-            z = i_arr + 1j * q_arr
+            tone_index = int(key)
+            raw_color = None
 
-            if precomputed_psd and key in precomputed_psd:
-                f1, p1 = precomputed_psd[key][:2]
-                f2, p2 = precomputed_psd[key][2:4] if len(precomputed_psd[key]) > 2 else (f1, p1)
-            elif format == 'iq':
-                f1, p1 = _psd(i_arr, key, 'I')
-                f2, p2 = _psd(q_arr, key, 'Q')
-            else:  # magphase
-                zc = z[keep_idx] if keep_idx is not None else z
-                _warn_if_psd_nan(zc, key, 'magnitude/phase')
-                mag = np.abs(zc)
-                phase = np.unwrap(np.angle(zc))
-                f1, p1 = compute_psd(mag, psd_sample_rate, **psd_kw)
-                f2, p2 = compute_psd(phase, psd_sample_rate, **psd_kw)
+            if (not (decorrelate_modes or blind_tone_modes)
+                    or decorrelate_plot == 'overlay'):
+                if precomputed_psd and key in precomputed_psd:
+                    f1, p1 = precomputed_psd[key][:2]
+                    f2, p2 = precomputed_psd[key][2:4] if len(precomputed_psd[key]) > 2 else (f1, p1)
+                else:
+                    (f1, p1), (f2, p2) = _iq_panel_psds(key, i_arr, q_arr)
 
-            f1, p1 = _prepare_psd_for_log_plot(
-                f1, p1, include_dc_point, log_bin, bins_per_decade)
-            f2, p2 = _prepare_psd_for_log_plot(
-                f2, p2, include_dc_point, log_bin, bins_per_decade)
-            ax1.loglog(f1, p1, linewidth=0.5, label=trace_label, **kwargs)
-            ax2.loglog(f2, p2, linewidth=0.5, label=trace_label, **kwargs)
+                f1, p1 = _prepare_psd_for_log_plot(
+                    f1, p1, include_dc_point, log_bin, bins_per_decade)
+                f2, p2 = _prepare_psd_for_log_plot(
+                    f2, p2, include_dc_point, log_bin, bins_per_decade)
+                lines = ax1.loglog(
+                    f1, p1, linewidth=0.5, label=trace_label, **kwargs)
+                raw_color = lines[0].get_color()
+                ax2.loglog(f2, p2, linewidth=0.5, label=trace_label, **kwargs)
+
+            if decorrelate_modes or blind_tone_modes:
+                if tone_index not in cleaned_iq:
+                    raise ValueError(
+                        f"Tone {tone_index} selected for plotting is not in "
+                        "the cleaned tone set")
+                (f1, p1), (f2, p2) = _iq_panel_psds(key, *cleaned_iq[tone_index])
+                f1, p1 = _prepare_psd_for_log_plot(
+                    f1, p1, include_dc_point, log_bin, bins_per_decade)
+                f2, p2 = _prepare_psd_for_log_plot(
+                    f2, p2, include_dc_point, log_bin, bins_per_decade)
+                clean_kwargs = dict(kwargs)
+                if decorrelate_plot == 'overlay':
+                    clean_kwargs.setdefault('linestyle', '--')
+                    clean_kwargs.setdefault('color', raw_color)
+                clean_label = _cleaning_label(
+                    trace_label, blind_tone_modes, decorrelate_modes)
+                ax1.loglog(
+                    f1, p1, linewidth=0.5, label=clean_label, **clean_kwargs)
+                ax2.loglog(
+                    f2, p2, linewidth=0.5, label=clean_label, **clean_kwargs)
 
         if format == 'iq':
             ax1.set_ylabel('I PSD')
@@ -1108,12 +1195,8 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                 if decorrelate_plot == 'overlay':
                     clean_kwargs.setdefault('linestyle', '--')
                     clean_kwargs.setdefault('color', raw_color)
-                steps = []
-                if blind_tone_modes:
-                    steps.append(f'Blind N={blind_tone_modes}')
-                if decorrelate_modes:
-                    steps.append(f'SVD N={decorrelate_modes}')
-                clean_label = f'{trace_label} ({", ".join(steps)})'
+                clean_label = _cleaning_label(
+                    trace_label, blind_tone_modes, decorrelate_modes)
                 ax1.loglog(
                     f1, p1, linewidth=0.5, label=clean_label, **clean_kwargs)
                 ax2.loglog(

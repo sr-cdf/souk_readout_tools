@@ -510,7 +510,11 @@ The slow accumulated timestream records all active tones simultaneously. That
 makes it suitable for subtracting correlated readout or environmental noise
 before computing PSDs. `plot_timestream_psd()` can remove the leading SVD
 common modes across the calibrated fractional-frequency and dissipation
-timestreams, then plot the cleaned PSD as an extra line:
+timestreams, then plot the cleaned PSD as an extra line. The same options work
+for `format="iq"` and `format="magphase"`, which need no sweep -- see
+[Without Resonators](#without-resonators-iq-and-magphase) below.
+
+For the calibrated frequency/dissipation case:
 
 ```python
 tone_metadata = samples_on["info"]["tones"]
@@ -585,6 +589,57 @@ without blind monitors.
 This operation applies only to the slow accumulated data. Pre-accumulator
 snapshots are acquired one tone at a time, so they do not contain simultaneous
 tone rows from which to estimate a common mode.
+
+### Without Resonators: `iq` and `magphase`
+
+Both cleaning options also work with `format="iq"` and `format="magphase"`,
+which need no sweep and no resonators. This is the path for loopback noise
+measurements:
+
+```python
+plot_timestream_psd(
+    loopback_samples,
+    format="magphase",
+    tones=[0, 1, 2],
+    decorrelate_modes=1,
+    decorrelate_plot="overlay",
+)
+```
+
+Here the SVD modes are fitted from the tones' own normalized amplitude and
+unwrapped-phase variations -- the coordinates a common gain drift or LO phase
+drift moves -- and removed from the amplitude and phase rows separately. The
+cleaned rows are recombined into I/Q, so `format="iq"` and `format="magphase"`
+show the same cleaning in different projections. `blind_tone_modes` behaves as
+above, subtracting blind-monitor modes from the other tones' I/Q.
+
+With no resonators there is no distinction between a detector-derived mode and
+a readout mode, so `decorrelate_tones` defaults to every non-blind tone. Note
+that a mode fitted from the tones themselves also contains anything common to
+them: with only a few tones, or a real common signal, the subtraction removes
+that too. Keep `decorrelate_modes` small and read the cleaned line against the
+raw overlay.
+
+The underlying helper is available directly for analysis outside the plotting
+functions:
+
+```python
+from souk_readout_tools.noise import remove_iq_common_modes_svd
+
+cleaned_samples, svd_info = remove_iq_common_modes_svd(
+    loopback_samples, n_modes=1, return_info=True)
+```
+
+It returns a shallow copy of the parsed samples with cleaned I/Q rows for the
+selected tones, so it can be fed to any other timestream function.
+
+Do this whenever several tones are plotted in a loop. `decorrelate_modes`
+re-runs the decomposition over every tone on each call, so a loop of eleven
+`plot_timestream_psd()` calls across 1000 tones repeats the same SVD eleven
+times; cleaning once first and passing the cleaned samples gives identical
+PSDs for a fraction of the time. The cost is that the raw overlay and the
+`SVD N=1` legend entry are no longer automatic -- plot the raw and cleaned
+samples in separate passes, with an explicit `label`, to keep them.
 
 ## Cross-Load Analysis
 
