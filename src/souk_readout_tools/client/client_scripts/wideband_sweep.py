@@ -29,6 +29,8 @@ def wideband_sweep(config_file=None, address=None, request_port=None,
                    bandwidth_hz=None, center_freq_hz=None,
                    step_size_hz=10000, num_tones=1024, samples_per_point=10,
                    tone_powers_dbm=None, rx_policy='maximise',
+                   dac_headroom_db=None, adc_headroom_db=None,
+                   filterbank_headroom_db=None,
                    ignore_phase_correction=True,
                    filename=None, filetype='npy',
                    plot_data=True):
@@ -63,6 +65,15 @@ def wideband_sweep(config_file=None, address=None, request_port=None,
             'compensate' mirrors the TX change onto the RX path; 'raise' errors
             on ADC saturation; 'none' leaves the RX path untouched. See
             ReadoutClient.wideband_sweep / set_tone_powers for details.
+        dac_headroom_db (float or None): Margin in dB below true DAC full scale,
+            forwarded to whichever tone-power call the sweep makes. Default None
+            uses the server's firmware_lib.DEFAULT_DAC_HEADROOM_DB.
+        adc_headroom_db (float or None): Margin in dB below ADC full scale, used
+            by the rx_policy and the RX-gain step. Default None uses the
+            server's firmware_lib.DEFAULT_ADC_HEADROOM_DB.
+        filterbank_headroom_db (float or None): Amplitude-word margin in dB for
+            the modulation TX drive restore -- a separate margin from
+            dac_headroom_db. Default None follows the server config.
         ignore_phase_correction (bool): DEPRECATED. Phase correction is no longer needed
                                         following firmware fixes. Default is True (no correction).
         filename (str): Filename to save the data to. Default is tmp_wideband_sweep in cwd.
@@ -96,6 +107,9 @@ def wideband_sweep(config_file=None, address=None, request_port=None,
         samples_per_point=samples_per_point,
         tone_powers_dbm=tone_powers_dbm,
         rx_policy=rx_policy,
+        dac_headroom_db=dac_headroom_db,
+        adc_headroom_db=adc_headroom_db,
+        filterbank_headroom_db=filterbank_headroom_db,
         apply_phase_correction=not ignore_phase_correction,
         verbose=True
     )
@@ -179,6 +193,16 @@ def main():
                              "'maximise' re-optimises the RX chain after the TX power "
                              "change; 'protect' only backs off RX gain on ADC "
                              "saturation; 'none' leaves the RX path untouched.")
+    parser.add_argument('--dac_headroom_db', type=float, default=None,
+                        help='Margin in dB below true DAC full scale for the tone-power '
+                             'call. Default: the server default (1.0 dB).')
+    parser.add_argument('--adc_headroom_db', type=float, default=None,
+                        help='Margin in dB below ADC full scale for the rx_policy and the '
+                             'RX-gain step. Default: the server default (1.0 dB).')
+    parser.add_argument('--filterbank_headroom_db', type=float, default=None,
+                        help='Amplitude-word margin in dB reserved for the modulation TX '
+                             'drive restore — a separate margin from --dac_headroom_db. '
+                             'Default: follow the server filterbank-compensation config.')
     parser.add_argument('-i', '--ignore_phase_correction', action='store_true',
                         help='DEPRECATED (no-op). Phase correction is disabled by default '\
                              'following firmware fixes. Kept for backward compatibility.')
@@ -258,6 +282,9 @@ def main():
             samples_per_point=args.samples_per_point,
             tone_powers_dbm=tone_powers_dbm,
             rx_policy=args.rx_policy,
+            dac_headroom_db=args.dac_headroom_db,
+            adc_headroom_db=args.adc_headroom_db,
+            filterbank_headroom_db=args.filterbank_headroom_db,
             ignore_phase_correction=ignore_correction,
             filename=args.filename,
             filetype=args.filetype,

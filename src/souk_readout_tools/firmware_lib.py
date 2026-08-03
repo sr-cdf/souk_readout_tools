@@ -5,6 +5,7 @@ This module provides a set of functions that are used by the readout server to i
 """
 
 import warnings
+import inspect
 import numpy as np
 import time
 import os
@@ -80,6 +81,93 @@ INIT_SYNC_MRST = True  # master-reset on init/config-time syncs (startup, sync_d
 
 adc_saturation_bits = 16 # note the adc gives 16 bit data but is a 12 or 14 bit converter
 dac_saturation_bits = 16 # note the dac takes 16 bit data but is a 12 or 14 bit converter
+
+# DAC data fills the whole 16-bit word, so after /2**(bits-1) full scale is 1.0.
+# ADC data only fills 15 of the 16 bits, so the same normalisation puts ADC full
+# scale at 0.5.  check_input_saturation divides by this so both converters report
+# levels as a true fraction of full scale -- without it an ADC at 88% of full
+# scale reads 0.44 and looks like 44%.
+ADC_FULL_SCALE = 0.5
+DAC_FULL_SCALE = 1.0
+
+# Both saturation detectors trip at this fraction of full scale, which is itself
+# a margin: SATURATION_MARGIN_DB below clipping.  headroom_db throughout the
+# power optimisers is measured from *true* full scale, so only the excess over
+# this margin needs applying on top (see _effective_headroom_db).
+SATURATION_THRESHOLD_FRAC = 0.90
+SATURATION_MARGIN_DB = float(-20 * np.log10(SATURATION_THRESHOLD_FRAC))  # 0.915 dB
+
+# Default saturation margins for the power optimisers, in dB below full scale.
+# Single source of truth: the client and server forward headroom_db only when
+# the caller sets it, so these defaults are never duplicated downstream.
+DEFAULT_DAC_HEADROOM_DB = 1.0
+DEFAULT_ADC_HEADROOM_DB = 1.0
+
+# Default step sizes for the saturation-recovery loops (dB).
+DEFAULT_ATTEN_STEP_DB = 3.0
+DEFAULT_DSA_STEP_DB = 2.0
+
+
+def _measure_dac_headroom_db(r_fast):
+    """dB between the measured DAC peak and true full scale (inf if muted).
+
+    Measured per component (I and Q are separate converters), matching what
+    ``check_output_saturation`` trips on, so the two numbers are comparable.
+    The complex magnitude would read up to 3 dB less headroom than the level
+    that actually clips.
+    """
+    ss0, ss1 = get_dac_snapshot_fast(r_fast)
+    scale = 2**(dac_saturation_bits - 1) * DAC_FULL_SCALE
+    peak = 0.0
+    for ss in (ss0 / scale, ss1 / scale):
+        peak = max(peak, float(np.max(np.abs(ss.real))),
+                   float(np.max(np.abs(ss.imag))))
+    if peak <= 0:
+        return float('inf')
+    return float(-20 * np.log10(peak))
+
+
+def _sat_reason(levels):
+    """Which condition tripped an ADC saturation check, for the step logs.
+
+    RTS and the snapshot disagree routinely -- RTS watches the full band
+    continuously while the snapshot is a short capture -- so a saturation with
+    clean-looking levels is normal and worth naming rather than hiding.
+    """
+    if levels.get('rts_saturated') and levels.get('level_saturated'):
+        return 'level+RTS'
+    if levels.get('rts_saturated'):
+        return 'RTS flag (transient/out-of-band, not visible in the snapshot)'
+    return 'snapshot level'
+
+
+def _effective_headroom_db(headroom_db, label='', verbose=True):
+    """dB to apply *on top of* the saturation detector's own margin.
+
+    The psb_scale ramps stop where ``check_output_saturation`` trips, which is
+    already ``SATURATION_MARGIN_DB`` below clipping.  ``headroom_db`` is
+    measured from true full scale, so applying it whole would double-count:
+    asking for 1 dB used to give ~1.9 dB.  Only the excess is applied.
+
+    Requests inside the detector's own margin cannot be honoured -- the ramp
+    never goes above the trip point -- so they clamp to 0 and the achieved
+    margin is ``SATURATION_MARGIN_DB``.
+
+    :return: dB to subtract from the ramp result (>= 0).
+    """
+    headroom_db = float(headroom_db)
+    if headroom_db < 0:
+        raise ValueError(f'headroom_db must be non-negative, got {headroom_db}')
+    effective = headroom_db - SATURATION_MARGIN_DB
+    if effective <= 0:
+        if verbose:
+            prefix = f'{label}: ' if label else ''
+            print(f'    {prefix}headroom {headroom_db:.2f} dB is inside the '
+                  f'saturation detector margin ({SATURATION_MARGIN_DB:.2f} dB) '
+                  f'— using the detector floor')
+        return 0.0
+    return effective
+
 
 def _sync_if_requested(r, autosync=False, mrst=False):
     if not autosync:
@@ -314,9 +402,26 @@ FILTERBANK_RX_SCALE_BASE = 0.75
 FILTERBANK_TX_HEADROOM_DB = 1.0
 
 
-def _filterbank_tx_headroom_factor(config_dict):
+def _filterbank_tx_headroom_factor(config_dict, headroom_db=None):
     """Linear factor (<= 1) the amplitude ceiling is scaled by to reserve
-    filterbank-compensation TX boost headroom; 1.0 when compensation is off."""
+    TX boost headroom in the amplitude words.
+
+    This is a different margin from the ``headroom_db`` the power optimisers
+    apply to psb_scale: that one keeps the DAC out of saturation, this one keeps
+    room for the modulation drive restore (base x 1/G) when a probe moves out
+    towards half a bin separation.
+
+    :param headroom_db: explicit reservation in dB.  ``None`` (default) uses
+        FILTERBANK_TX_HEADROOM_DB when filterbank compensation is enabled and
+        reserves nothing when it is off.  An explicit value **overrides that
+        gate**, so modulation room can be reserved whether or not compensation
+        is on -- which is the case the margin exists for.
+    """
+    if headroom_db is not None:
+        headroom_db = float(headroom_db)
+        if headroom_db < 0:
+            raise ValueError('filterbank_headroom_db must be non-negative')
+        return 10 ** (-headroom_db / 20)
     fb_enabled, _ = filterbank_compensation_config(config_dict)
     if fb_enabled:
         return 10 ** (-FILTERBANK_TX_HEADROOM_DB / 20)
@@ -6240,7 +6345,8 @@ def chanselect_get_channel_outmap(r, descramble_input=None):
 
 
 
-def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation_bits,threshold=0.45,check_rts=True,verbose=True):
+def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation_bits,
+                           threshold=SATURATION_THRESHOLD_FRAC,check_rts=True,verbose=True):
     """
     Check to see if the input ADC is saturating.
 
@@ -6248,7 +6354,16 @@ def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation
     flags.  RTS over_range is treated as saturation (warning), while RTS
     over_voltage indicates the signal far exceeded the input range (error).
 
-    Full scale is +/-0.5 so threshold is 0.45.
+    The reported ``*_fs`` levels are a true fraction of ADC full scale: the raw
+    snapshot only fills 15 of the 16 bits, so it is divided by ``ADC_FULL_SCALE``
+    on top of the ``2**(saturation_bits-1)`` normalisation.  Without that an ADC
+    at 88% of full scale reads 0.44 and looks like it has plenty of margin.
+
+    The two trip causes are reported separately -- ``level_saturated`` from the
+    snapshot, ``rts_saturated`` from the hardware flags.  They disagree
+    routinely: the snapshot is a short capture of a decimated view, while RTS
+    watches the full band continuously, so a transient or out-of-band overrange
+    latches RTS while the snapshot looks clean.
 
     Parameters
     ----------
@@ -6291,11 +6406,15 @@ def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation
         _, rts_stale = check_rfdc_rts_events(r, clear=True)
         rts_available = rts_stale.get('rts_available', False)
 
-    ss_0 = get_adc_snapshot_fast(r_fast) / 2**(saturation_bits-1)
+    # ADC data occupies 15 of the 16 bits, so the /2**(bits-1) normalisation
+    # alone puts full scale at 0.5.  Divide by ADC_FULL_SCALE as well so the
+    # reported levels are a true fraction of full scale.
+    fs_norm = 2**(saturation_bits-1) * ADC_FULL_SCALE
+    ss_0 = get_adc_snapshot_fast(r_fast) / fs_norm
     ss=np.zeros((iterations,ss_0.size),dtype=ss_0.dtype)
     ss[0]=ss_0
     for i in range(1,iterations):
-        ss[i]=get_adc_snapshot_fast(r_fast) / 2**(saturation_bits-1)
+        ss[i]=get_adc_snapshot_fast(r_fast) / fs_norm
     imax = np.max(ss.real)
     imin = np.min(ss.real)
     qmax = np.max(ss.imag)
@@ -6304,9 +6423,11 @@ def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation
     i_under = imin <= -1.0*threshold
     q_over = qmax >= 1.0*threshold
     q_under = qmin <= -1.0*threshold
-    any_saturation = bool(i_over|i_under|q_over|q_under)
+    level_saturation = bool(i_over|i_under|q_over|q_under)
     if internal_loopback:
-        any_saturation = False
+        level_saturation = False
+    rts_saturation = False
+    any_saturation = level_saturation
     integration_time = ss.size/r_fast.adc_clk_hz
     details = {'imax_fs':imax,'imin_fs':imin,'qmax_fs':qmax,'qmin_fs':qmin,
                'integration_time':integration_time,
@@ -6320,11 +6441,18 @@ def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation
         if rts_details.get('rts_over_voltage', False):
             if verbose:
                 print('ERROR: ADC RTS over-voltage flag set — signal far exceeded input range')
-            any_saturation = True
+            rts_saturation = True
         elif rts_details.get('rts_over_range', False):
             if verbose:
                 print('WARNING: ADC RTS over-range flag set — signal exceeded full-scale input')
-            any_saturation = True
+            rts_saturation = True
+        any_saturation = level_saturation or rts_saturation
+
+    # Report the two causes separately: RTS can latch on a transient the
+    # snapshot never sees, so "saturating" with clean-looking levels is normal
+    # and callers should be able to say which one moved them.
+    details['level_saturated'] = level_saturation
+    details['rts_saturated'] = rts_saturation
 
     if verbose:
         if internal_loopback:
@@ -6338,13 +6466,20 @@ def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation
 
     return any_saturation, details
 
-def check_output_saturation(r_fast,iterations=25,saturation_bits=dac_saturation_bits,threshold=0.90,verbose=True):
+def check_output_saturation(r_fast,iterations=25,saturation_bits=dac_saturation_bits,
+                            threshold=SATURATION_THRESHOLD_FRAC,verbose=True):
     """
     Check to see if the output DACs are saturating.
 
+    DAC data fills the whole 16-bit word, so after the /2**(bits-1)
+    normalisation full scale is 1.0 and *threshold* is directly a fraction of
+    it.  Tripping below full scale means the detector carries its own
+    SATURATION_MARGIN_DB of margin -- see _effective_headroom_db, which stops
+    the power optimisers from counting that margin twice.
+
     TODO: extend this to check for amplifier saturation
     """
-    scale = 2**(saturation_bits-1)
+    scale = 2**(saturation_bits-1) * DAC_FULL_SCALE
     ss0_0,ss1_0 = get_dac_snapshot_fast(r_fast)
     ss0_0 /= scale
     ss1_0 /= scale
@@ -6990,6 +7125,31 @@ POWER_FORCE_CONTROL_KEYS = (
     'force_pfb_fftshift',
 )
 
+# Margin/step controls the server forwards only when the caller set them, so
+# the firmware_lib defaults above stay the single source of truth and are never
+# duplicated in the server or client.  Not every routine accepts every key --
+# the server filters against each function's signature.
+POWER_HEADROOM_KEYS = (
+    'headroom_db',
+    'filterbank_headroom_db',
+    'adc_headroom_db',
+    'atten_step_db',
+    'dsa_step_db',
+    'intermittent_backoff_db',
+    'rts_as_saturation',
+)
+
+
+def select_headroom_kwargs(message, func):
+    """Pick the POWER_HEADROOM_KEYS *func* accepts out of a request message.
+
+    Keys absent from the message are not passed at all, so the callee's own
+    default applies rather than a copy of it living in the server.
+    """
+    accepted = inspect.signature(func).parameters
+    return {k: message[k] for k in POWER_HEADROOM_KEYS
+            if k in message and k in accepted}
+
 
 def _coerce_forced_bool(value, name):
     """Return a bool for a forced-control value, accepting common strings."""
@@ -7013,6 +7173,26 @@ def _set_adc_dsa_db(r, config_dict, value):
     r.rfdc.core.set_dsa(adc_tile, adc_block, dsa)
     time.sleep(0.1)
     return dsa
+
+
+def set_adc_dsa_db(r, config_dict, value):
+    """Set the ADC digital step attenuator, in dB, and return what was applied.
+
+    The DSA is 0-27 dB in 1 dB steps and sits at the ADC input, downstream of
+    the RF frontend attenuator: the pair of them bracket the RF gain stages, so
+    stepping one and then the other separates noise entering before the
+    frontend from noise entering at the converter.
+    """
+    return _set_adc_dsa_db(r, config_dict, value)
+
+
+def get_adc_dsa_db(r, config_dict):
+    """Return the current ADC digital step attenuator setting in dB."""
+    if config_dict is None:
+        raise ValueError('config_dict is required to read ADC DSA')
+    adc_tile = int(config_dict['firmware']['adc_tile'])
+    adc_block = int(config_dict['firmware']['adc_block'])
+    return float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
 
 
 def _apply_forced_power_controls(
@@ -7251,6 +7431,10 @@ def _enforce_tx_compression_margin(r, config_dict, rf_peripherals,
 
 def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                      tx_power_change_db=None, digital_only=False, rf_only=False,
+                     headroom_db=DEFAULT_ADC_HEADROOM_DB,
+                     atten_step_db=DEFAULT_ATTEN_STEP_DB,
+                     dsa_step_db=DEFAULT_DSA_STEP_DB,
+                     rts_as_saturation=True,
                      force_rx_amp_bypass=None, force_rx_attenuation_db=None,
                      force_adc_dsa_db=None, force_pfb_fftshift=None):
     """Check and optionally protect the RX path after a TX power change.
@@ -7258,6 +7442,12 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
     Called after each incremental TX power change (attenuator step,
     psb_scale change, amp enable, etc.) to ensure the ADC is not
     saturating.  The action taken depends on the rx_policy:
+
+    The ``atten_step_db`` / ``dsa_step_db`` increments and ``headroom_db`` are
+    parameters rather than literals so the whole RX margin is settable, but they
+    are deliberately not threaded out to the client API: the call point is
+    inside firmware_lib, and every TX routine would grow three more arguments
+    for a knob that is only interesting when debugging the protect loop.
 
     Parameters
     ----------
@@ -7342,14 +7532,17 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
 
     if rx_policy == 'maximise':
         dsa, pfb_fftshift, dsp, adc, rx_atten = maximise_rx_power(
-            r, r_fast, config_dict, rf_peripherals=rf_peripherals,
+            r, r_fast, config_dict, headroom_db=headroom_db,
+            rf_peripherals=rf_peripherals,
             digital_only=digital_only, rf_only=rf_only,
+            atten_step_db=atten_step_db,
+            rts_as_saturation=rts_as_saturation,
             force_rx_amp_bypass=force_rx_amp_bypass,
             force_rx_attenuation_db=force_rx_attenuation_db,
             force_adc_dsa_db=force_adc_dsa_db,
             force_pfb_fftshift=force_pfb_fftshift)
         if isinstance(adc, dict):
-            threshold = float(adc.get('threshold', 0.45))
+            threshold = float(adc.get('threshold', SATURATION_THRESHOLD_FRAC))
             peak = max(
                 abs(float(adc.get('imax_fs', 0.0))),
                 abs(float(adc.get('imin_fs', 0.0))),
@@ -7466,16 +7659,19 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
         # a residual.
 
     # --- Saturation check (protect, raise, or compensate fallback) ---
-    saturated, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+    saturated, levels = check_input_saturation(r, r_fast, iterations=250,
+                                               check_rts=rts_as_saturation, verbose=False)
     if not saturated:
         return None
+    why = _sat_reason(levels)
 
     if rx_policy == 'raise':
         raise RuntimeError(
-            'ADC saturation detected after TX power change. '
+            f'ADC saturation detected after TX power change ({why}). '
             'Revert TX settings or switch to rx_policy="protect".')
 
     # protect (or compensate fallback): increase RX attenuation / DSA
+    print(f'    rx_policy: ADC saturating ({why})')
     init_rx_atten = rf_peripherals.get_rx_attenuation() if has_rf else None
     init_dsa = int(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
 
@@ -7485,19 +7681,21 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
         current_atten = init_rx_atten
         while saturated and current_atten < atten_max:
             current_atten = min(
-                round((current_atten + 3.0) / atten_step) * atten_step,
+                round((current_atten + atten_step_db) / atten_step) * atten_step,
                 atten_max)
             rf_peripherals.set_rx_attenuation(current_atten)
             time.sleep(0.1)
-            saturated, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+            saturated, _ = check_input_saturation(r, r_fast, iterations=250,
+                                                  check_rts=rts_as_saturation, verbose=False)
 
     if allow_digital and not force_dsa and saturated:
-        current_dsa = init_dsa
+        current_dsa = float(init_dsa)
         while saturated and current_dsa < DSA_MAX:
-            current_dsa = min(current_dsa + 2, DSA_MAX)
-            r.rfdc.core.set_dsa(adc_tile, adc_block, int(current_dsa))
+            current_dsa = min(current_dsa + dsa_step_db, DSA_MAX)
+            r.rfdc.core.set_dsa(adc_tile, adc_block, int(round(current_dsa)))
             time.sleep(0.1)
-            saturated, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+            saturated, _ = check_input_saturation(r, r_fast, iterations=250,
+                                                  check_rts=rts_as_saturation, verbose=False)
     elif saturated and force_dsa:
         print('    rx_policy: ADC DSA fixed; skipping DSA protection step')
 
@@ -7528,10 +7726,14 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
     }
 
 
-def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
-                      reference_plane='dac', rf_peripherals=None,
+def maximise_tx_power(r, r_fast=None, config_dict=None,
+                      headroom_db=DEFAULT_DAC_HEADROOM_DB,
+                      reference_plane='detector', rf_peripherals=None,
                       power_limit_dbm=None, compression_headroom_db=None,
+                      filterbank_headroom_db=None,
                       rx_policy='protect', digital_only=False, rf_only=False,
+                      adc_headroom_db=DEFAULT_ADC_HEADROOM_DB,
+                      atten_step_db=DEFAULT_ATTEN_STEP_DB,
                       force_tx_amp_bypass=None, force_rx_amp_bypass=None,
                       force_tx_attenuation_db=None,
                       force_rx_attenuation_db=None,
@@ -7552,9 +7754,25 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
     Parameters
     ----------
     headroom_db : float
-        Safety margin in dB below the saturation point (default 1.0).
+        Margin in dB below **true DAC full scale** (default
+        DEFAULT_DAC_HEADROOM_DB).  The ramp stops where the saturation detector
+        trips, which is already SATURATION_MARGIN_DB below full scale, so only
+        the excess is applied on top -- see :func:`_effective_headroom_db`.
+        Requests inside that floor clamp to it.
+    filterbank_headroom_db : float or None
+        Amplitude-word margin in dB reserved for the modulation TX drive
+        restore (see :func:`_filterbank_tx_headroom_factor`).  This is a
+        *separate* margin from ``headroom_db``: it caps the amplitude words
+        rather than psb_scale.  ``None`` (default) follows the filterbank
+        compensation config; an explicit value applies regardless.
+    adc_headroom_db : float
+        Margin passed to the RX path when ``rx_policy='maximise'``.
+    atten_step_db : float
+        Attenuator ramp increment in dB (default DEFAULT_ATTEN_STEP_DB).
     reference_plane : str
-        'dac' (default), 'rf_output', or 'detector'.
+        'detector' (default), 'rf_output', or 'dac'.  Only 'dac' leaves
+        the RF frontend alone; the other two also minimise the TX
+        attenuator and enable the TX amplifier.
     rf_peripherals : RFPeripherals or None
         RF peripheral controller.  Required for reference planes beyond
         'dac'.  If None for 'rf_output'/'detector', the digital chain
@@ -7638,9 +7856,10 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
           f'fftshift={format(init_psb_fftshift, "#016b")}, '
           f'max_amp={np.max(init_amps):.4f}')
 
-    # Reserve filterbank-compensation TX boost headroom in the amplitude words
-    # (the psb_scale ramp below recovers the overall output level).
-    max_amp = (1 - 2**-12) * _filterbank_tx_headroom_factor(config_dict)
+    # Reserve TX boost headroom in the amplitude words for the modulation drive
+    # restore (the psb_scale ramp below recovers the overall output level).
+    max_amp = (1 - 2**-12) * _filterbank_tx_headroom_factor(
+        config_dict, filterbank_headroom_db)
     scalemin = 1 / 256
     scalemax = 255
     tx_compression_state = None
@@ -7658,7 +7877,7 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
                 'DAC is saturating and force_psb_scale prevents automatic recovery')
         if init_dac_saturation:
             print('  DAC saturating — fixing first')
-            fix_dac_saturation(r, r_fast, config_dict)
+            fix_dac_saturation(r, r_fast, config_dict, headroom_db=headroom_db)
 
         # --- Step 1: Mute, maximise amplitudes ---
         if tone_amplitudes_fixed:
@@ -7702,7 +7921,9 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
             print(f'  step 3: psb_scale fixed at {psb_scale:.6f}')
         else:
             print(f'  step 3: psb_scale ramp')
-            headroom_linear = 10**(-headroom_db / 20)
+            effective_headroom_db = _effective_headroom_db(
+                headroom_db, 'maximise_tx_power')
+            headroom_linear = 10**(-effective_headroom_db / 20)
 
             def _is_ok(scale):
                 """Check if a psb_scale value is safe (no overflow, no saturation)."""
@@ -7758,7 +7979,9 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
             psb_scale = float(np.clip(psb_scale, scalemin, scalemax))
             r.psbscale.set_scale(psb_scale)
             time.sleep(0.01)
-            print(f'  psb_scale: {psb_scale:.4f} ({headroom_db} dB headroom)')
+            print(f'  psb_scale: {psb_scale:.4f} ({headroom_db:.2f} dB headroom '
+                  f'below full scale = {SATURATION_MARGIN_DB:.2f} dB detector '
+                  f'+ {effective_headroom_db:.2f} dB applied)')
 
         # Optional RF compression guard.  This compares total multitone power
         # at the TX frontend input with the modelled input-referred P1dB.
@@ -7783,6 +8006,8 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
         _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                          tx_power_change_db=tx_change_db,
                          digital_only=digital_only, rf_only=rf_only,
+                         headroom_db=adc_headroom_db,
+                         atten_step_db=atten_step_db,
                          force_rx_amp_bypass=force_rx_amp_bypass,
                          force_rx_attenuation_db=force_rx_attenuation_db,
                          force_adc_dsa_db=force_adc_dsa_db,
@@ -7823,6 +8048,8 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
                     _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                                      tx_power_change_db=expected_gain_db,
                                      digital_only=digital_only, rf_only=rf_only,
+                                     headroom_db=adc_headroom_db,
+                                     atten_step_db=atten_step_db,
                                      force_rx_amp_bypass=force_rx_amp_bypass,
                                      force_rx_attenuation_db=force_rx_attenuation_db,
                                      force_adc_dsa_db=force_adc_dsa_db,
@@ -7833,8 +8060,8 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
             else:
                 print('    TX amp: not available — skipping')
 
-            # Reduce TX attenuator gradually (3 dB steps), checking the
-            # RX path after each step via _apply_rx_policy.
+            # Reduce TX attenuator gradually, checking the RX path after each
+            # step via _apply_rx_policy.
             current_atten = rf_peripherals.get_tx_attenuation()
             min_atten = rf_peripherals.ATTEN_MIN
             atten_step = rf_peripherals.ATTEN_STEP
@@ -7843,7 +8070,7 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
                 tx_atten_db = current_atten
             elif current_atten > min_atten:
                 atten = current_atten
-                ramp_step = max(3.0, atten_step)
+                ramp_step = max(atten_step_db, atten_step)
                 while atten > min_atten:
                     prev_atten = atten
                     atten = max(atten - ramp_step, min_atten)
@@ -7855,6 +8082,8 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
                     _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                                      tx_power_change_db=step_change_db,
                                      digital_only=digital_only, rf_only=rf_only,
+                                     headroom_db=adc_headroom_db,
+                                     atten_step_db=atten_step_db,
                                      force_rx_amp_bypass=force_rx_amp_bypass,
                                      force_rx_attenuation_db=force_rx_attenuation_db,
                                      force_adc_dsa_db=force_adc_dsa_db,
@@ -7926,13 +8155,29 @@ def maximise_tx_power(r, r_fast=None, config_dict=None, headroom_db=1.0,
 
     return amps, best_fftshift, psb_scale, dsp_overflow_details, dac_saturation_details
 
-def fix_dac_saturation(r, r_fast=None, config_dict=None):
+def fix_dac_saturation(r, r_fast=None, config_dict=None,
+                       headroom_db=DEFAULT_DAC_HEADROOM_DB,
+                       intermittent_backoff_db=3.0):
     """Reduce psb_scale until DAC saturation clears.
 
     Halves psb_scale one step at a time until the DAC snapshot shows no
-    saturation, then applies a 0.9 headroom factor.  If the DAC is not
-    currently saturating (intermittent case), applies a 3 dB safety
-    reduction and returns.
+    saturation, then backs off by *headroom_db*.  If the DAC is not currently
+    saturating (intermittent case), applies *intermittent_backoff_db* and
+    returns.
+
+    Parameters
+    ----------
+    headroom_db : float
+        Margin in dB below true DAC full scale (default
+        DEFAULT_DAC_HEADROOM_DB).  As elsewhere, the saturation detector already
+        provides SATURATION_MARGIN_DB, so only the excess is applied.
+    intermittent_backoff_db : float
+        Flat reduction applied when the check comes back clean but saturation
+        was reported (default 3.0 dB).
+
+    Note: :func:`maximise_tx_power` calls this when it starts from a saturating
+    DAC, and its own psb_scale ramp immediately overwrites the result -- the
+    headroom here only matters when the function is called directly.
     """
     print(f'fix_dac_saturation (psb_scale={r.psbscale.get_scale():.6f})')
     init_psb_scale = r.psbscale.get_scale()
@@ -7940,12 +8185,14 @@ def fix_dac_saturation(r, r_fast=None, config_dict=None):
 
     check, levels = check_output_saturation(r_fast, iterations=250, verbose=False)
     if not check:
-        # Intermittent saturation — apply 3 dB safety reduction
-        psb_scale = init_psb_scale * 0.707
+        # Intermittent saturation — apply a flat safety reduction
+        psb_scale = init_psb_scale * 10**(-intermittent_backoff_db / 20)
+        psb_scale = max(psb_scale, min_value)
         r.psbscale.set_scale(psb_scale)
         time.sleep(0.01)
         check, levels = check_output_saturation(r_fast, iterations=250, verbose=False)
-        print(f'  intermittent saturation — applied 3 dB reduction: psb_scale={psb_scale:.4f}')
+        print(f'  intermittent saturation — applied {intermittent_backoff_db:.1f} dB '
+              f'reduction: psb_scale={psb_scale:.4f}')
         return psb_scale, check_dsp_overflow(r, 0.1, verbose=False)[1], levels
 
     # Halve psb_scale until not saturating
@@ -7961,12 +8208,14 @@ def fix_dac_saturation(r, r_fast=None, config_dict=None):
         print('  WARNING: saturation persists at minimum psb_scale')
         return min_value, check_dsp_overflow(r, 0.1, verbose=False)[1], levels
 
-    # Apply headroom
-    psb_scale *= 0.90
+    # Apply headroom on top of the detector's own margin
+    effective_db = _effective_headroom_db(headroom_db, 'fix_dac_saturation')
+    psb_scale *= 10**(-effective_db / 20)
+    psb_scale = float(np.clip(psb_scale, min_value, 255))
     r.psbscale.set_scale(psb_scale)
     time.sleep(0.01)
     _, levels = check_output_saturation(r_fast, iterations=250, verbose=False)
-    print(f'  resolved at psb_scale={psb_scale:.6f}')
+    print(f'  resolved at psb_scale={psb_scale:.6f} ({headroom_db:.2f} dB headroom)')
     return psb_scale, check_dsp_overflow(r, 0.1, verbose=False)[1], levels
 
 
@@ -8046,7 +8295,8 @@ def fix_dsp_overflow(r, duration_s=0.5, max_iterations=10):
 
 
 def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector',
-                    rf_peripherals=None, headroom_db=1.0,
+                    rf_peripherals=None, headroom_db=DEFAULT_DAC_HEADROOM_DB,
+                    filterbank_headroom_db=None,
                     digital_only=False, rf_only=False,
                     force_tx_amp_bypass=None, force_rx_amp_bypass=None,
                     force_tx_attenuation_db=None,
@@ -8073,7 +8323,13 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
     rf_peripherals : RFPeripherals or None
         RF peripheral controller for analog compensation.
     headroom_db : float
-        DAC headroom in dB below saturation (default 1.0).
+        Margin in dB below **true DAC full scale** (default
+        DEFAULT_DAC_HEADROOM_DB).  The saturation detector already provides
+        SATURATION_MARGIN_DB, so only the excess is applied on top.
+    filterbank_headroom_db : float or None
+        Amplitude-word margin in dB reserved for the modulation TX drive
+        restore -- a separate margin from ``headroom_db``.  See
+        :func:`_filterbank_tx_headroom_factor`.
     digital_only : bool
         If True, only firmware/RFDC parameters are adjusted.  RF frontend
         attenuators and bypass amplifiers are left unchanged.
@@ -8137,7 +8393,8 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
     # --- Step 1: Mute and maximise amplitudes ---
     # Reserve filterbank-compensation TX boost headroom in the amplitude words
     # (the psb_scale ramp below recovers the overall output level).
-    max_amp = (1 - 2**-12) * _filterbank_tx_headroom_factor(config_dict)
+    max_amp = (1 - 2**-12) * _filterbank_tx_headroom_factor(
+        config_dict, filterbank_headroom_db)
     if tone_amplitudes_fixed:
         amps = init_amps
         amps_gain = 1.0
@@ -8181,7 +8438,9 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
             psb_scale = r.psbscale.get_scale()
             print(f'    psb_scale fixed at {psb_scale:.6f}')
         else:
-            headroom_linear = 10**(-headroom_db / 20)
+            effective_headroom_db = _effective_headroom_db(
+                headroom_db, 'optimise_tx_snr')
+            headroom_linear = 10**(-effective_headroom_db / 20)
 
             def _is_ok(scale):
                 scale = float(np.clip(scale, scalemin, scalemax))
@@ -8238,7 +8497,9 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
             psb_scale = float(np.clip(psb_scale, scalemin, scalemax))
             r.psbscale.set_scale(psb_scale)
             time.sleep(0.01)
-            print(f'    psb_scale={psb_scale:.6f} (headroom={headroom_db} dB)')
+            print(f'    psb_scale={psb_scale:.6f} ({headroom_db:.2f} dB headroom '
+                  f'below full scale = {SATURATION_MARGIN_DB:.2f} dB detector '
+                  f'+ {effective_headroom_db:.2f} dB applied)')
 
         # --- Step 4: Compensate with TX attenuator ---
         print('  step 4: compensate with TX attenuator')
@@ -8349,8 +8610,11 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
     return amps, best_fftshift, r.psbscale.get_scale(), dsp_overflow_details, dac_levels
 
 
-def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=None,
+def maximise_rx_power(r, r_fast, config_dict, headroom_db=DEFAULT_ADC_HEADROOM_DB,
+                      rf_peripherals=None,
                       digital_only=False, rf_only=False,
+                      atten_step_db=DEFAULT_ATTEN_STEP_DB,
+                      rts_as_saturation=True,
                       force_tx_amp_bypass=None, force_rx_amp_bypass=None,
                       force_tx_attenuation_db=None,
                       force_rx_attenuation_db=None,
@@ -8364,17 +8628,29 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
 
     Strategy:
       1. If saturated: fix with fix_adc_saturation first.
-      2. Estimate available headroom from ADC snapshot.
-      3. Reduce DSA by headroom estimate, check, step back if saturated.
-      4. Reduce RX attenuator similarly, check, step back if saturated.
-      5. Try enabling RX amp if available.
-      6. Apply headroom.
-      7. Find best PFB FFT shift.
+      2. Estimate available headroom from the ADC snapshot and apply it in one
+         jump (DSA, then RX attenuator), stepping back if that overshoots.
+      3. Try enabling RX amp if available.
+      4. Find best PFB FFT shift.
 
     Parameters
     ----------
     headroom_db : float
-        Safety margin in dB below the saturation point (default 1.0).
+        Target margin in dB below ADC full scale (default
+        DEFAULT_ADC_HEADROOM_DB).  Unlike the TX routines this is measured
+        directly from the snapshot rather than inferred from the saturation
+        detector, so it is used as-is.  The detector still acts as a backstop in
+        the step-back loops, which floors the achievable margin at
+        SATURATION_MARGIN_DB.
+    atten_step_db : float
+        Attenuator ramp and step-back increment in dB (default
+        DEFAULT_ATTEN_STEP_DB).
+    rts_as_saturation : bool
+        If True (default), a latched RFDC RTS over-range/over-voltage flag
+        counts as saturation even when the snapshot levels look clean -- RTS
+        watches the full band continuously while the snapshot is a short
+        capture, so it catches transients the levels never show.  Set False to
+        drive purely off the measured levels.
     digital_only : bool
         If True, only firmware/RFDC parameters are adjusted.  RF frontend
         attenuators and bypass amplifiers are left unchanged.
@@ -8420,6 +8696,9 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
         return val
 
     def _peak_dbfs(levels):
+        # check_input_saturation reports levels as a true fraction of ADC full
+        # scale, so 1.0 is 0 dBFS.  Before that normalisation this read 6.02 dB
+        # low at full scale and every headroom estimate below overshot by 6 dB.
         peak = np.max(np.abs([levels['imax_fs'], levels['imin_fs'],
                               levels['qmax_fs'], levels['qmin_fs']]))
         if peak <= 0:
@@ -8451,13 +8730,16 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
         check_rfdc_rts_events(r, clear=True)
 
     # --- If saturated, fix first ---
-    saturated, levels = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+    saturated, levels = check_input_saturation(r, r_fast, iterations=250,
+                                               check_rts=rts_as_saturation, verbose=False)
     peak_db = _peak_dbfs(levels)
     print(f'  step 1: initial check — saturated={saturated}, peak={peak_db:.1f} dBFS')
     if saturated:
-        print('    ADC saturated — fixing first')
+        print(f'    ADC saturated ({_sat_reason(levels)}) — fixing first')
         fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=rf_peripherals,
                            digital_only=digital_only, rf_only=rf_only,
+                           atten_step_db=atten_step_db,
+                           rts_as_saturation=rts_as_saturation,
                            force_rx_amp_bypass=force_rx_amp_bypass,
                            force_rx_attenuation_db=force_rx_attenuation_db,
                            force_adc_dsa_db=force_adc_dsa_db)
@@ -8467,18 +8749,25 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
         print('  step 2: reduce DSA')
         current_dsa = _get_dsa()
         if current_dsa > 0:
-            _, levels = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+            _, levels = check_input_saturation(r, r_fast, iterations=250,
+                                               check_rts=rts_as_saturation, verbose=False)
             peak_db = _peak_dbfs(levels)
             headroom_available = -peak_db - headroom_db
             decrease = min(headroom_available, current_dsa)
+            print(f'    peak {peak_db:.1f} dBFS, {headroom_available:.1f} dB '
+                  f'available above the {headroom_db:.1f} dB target')
             if decrease >= 1.0:
                 new_dsa = _set_dsa(current_dsa - decrease)
                 print(f'    DSA {current_dsa} -> {new_dsa} dB')
-                sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+                sat, levels = check_input_saturation(r, r_fast, iterations=250,
+                                                     check_rts=rts_as_saturation, verbose=False)
+                # Step back at the 1 dB DSA resolution rather than dsa_step_db:
+                # recovery should give back as little gain as it has to.
                 while sat and new_dsa < current_dsa:
                     new_dsa = _set_dsa(new_dsa + 1)
-                    print(f'    DSA step back to {new_dsa} dB')
-                    sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+                    print(f'    DSA step back to {new_dsa} dB ({_sat_reason(levels)})')
+                    sat, levels = check_input_saturation(r, r_fast, iterations=250,
+                                                         check_rts=rts_as_saturation, verbose=False)
     else:
         reason = 'fixed' if dsa_fixed else 'rf_only=True'
         print(f'  step 2: DSA skipped ({reason})')
@@ -8490,16 +8779,19 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
         atten_min = rf_peripherals.ATTEN_MIN
         atten_step = rf_peripherals.ATTEN_STEP
         if current_atten > atten_min:
-            _, levels = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+            _, levels = check_input_saturation(r, r_fast, iterations=250,
+                                               check_rts=rts_as_saturation, verbose=False)
             peak_db = _peak_dbfs(levels)
             headroom_available = -peak_db - headroom_db
             decrease = min(headroom_available, current_atten - atten_min)
+            print(f'    peak {peak_db:.1f} dBFS, {headroom_available:.1f} dB '
+                  f'available above the {headroom_db:.1f} dB target')
             if decrease >= atten_step:
                 new_atten = max(
                     round((current_atten - decrease) / atten_step) * atten_step,
                     atten_min)
-                # Gradual ramp down in 3 dB steps
-                ramp_step = max(3.0, atten_step)
+                # Gradual ramp down
+                ramp_step = max(atten_step_db, atten_step)
                 step_atten = current_atten
                 while step_atten - new_atten > ramp_step:
                     step_atten = max(
@@ -8511,15 +8803,17 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
                 time.sleep(0.1)
                 print(f'    RX atten {current_atten:.1f} -> {new_atten:.1f} dB')
                 # Check and step back if saturated
-                sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+                sat, levels = check_input_saturation(r, r_fast, iterations=250,
+                                                     check_rts=rts_as_saturation, verbose=False)
                 while sat and new_atten < current_atten:
                     new_atten = min(
-                        round((new_atten + 3.0) / atten_step) * atten_step,
+                        round((new_atten + atten_step_db) / atten_step) * atten_step,
                         rf_peripherals.ATTEN_MAX)
                     rf_peripherals.set_rx_attenuation(new_atten)
                     time.sleep(0.1)
-                    print(f'    RX atten step back to {new_atten:.1f} dB')
-                    sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+                    print(f'    RX atten step back to {new_atten:.1f} dB ({_sat_reason(levels)})')
+                    sat, levels = check_input_saturation(r, r_fast, iterations=250,
+                                                         check_rts=rts_as_saturation, verbose=False)
 
         # --- Try enabling RX amp ---
         if has_bypass_amps and not rx_amp_fixed:
@@ -8543,11 +8837,13 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
                       f'(S21 bypass={s21_bypassed:.1f}, enabled={s21_enabled:.1f} dB) '
                       f'— skipping')
             else:
-                sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+                sat, levels = check_input_saturation(r, r_fast, iterations=250,
+                                                     check_rts=rts_as_saturation, verbose=False)
                 if sat:
                     rf_peripherals.set_rx_amp_bypass(True)
                     time.sleep(0.1)
-                    print('    RX amp causes saturation — keeping bypassed')
+                    print(f'    RX amp causes saturation ({_sat_reason(levels)}) '
+                          f'— keeping bypassed')
                 else:
                     print(f'    RX amplifier enabled ({expected_gain_db:+.1f} dB expected gain)')
     elif has_rf:
@@ -8555,7 +8851,8 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=1.0, rf_peripherals=No
 
     # --- Final assessment ---
     print('  step 5: final assessment and PFB fftshift')
-    saturated, levels = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+    saturated, levels = check_input_saturation(r, r_fast, iterations=250,
+                                               check_rts=rts_as_saturation, verbose=False)
     best_dsa = _get_dsa()
     best_rx_atten = rf_peripherals.get_rx_attenuation() if rf_available else None
     peak_db = _peak_dbfs(levels)
@@ -8587,6 +8884,9 @@ def maximise_rx_dsp_gain(r):
 
 def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
                        digital_only=False, rf_only=False,
+                       atten_step_db=DEFAULT_ATTEN_STEP_DB,
+                       dsa_step_db=DEFAULT_DSA_STEP_DB,
+                       rts_as_saturation=True,
                        force_rx_amp_bypass=None,
                        force_rx_attenuation_db=None,
                        force_adc_dsa_db=None):
@@ -8594,8 +8894,18 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
 
     Steps through controls in order of preference:
       1. Bypass the RX amplifier.
-      2. Step RX attenuator up in 3 dB increments until clear.
-      3. Step ADC DSA up in 2 dB increments until clear.
+      2. Step RX attenuator up by *atten_step_db* until clear.
+      3. Step ADC DSA up by *dsa_step_db* until clear.
+
+    Parameters
+    ----------
+    atten_step_db : float
+        RX attenuator increment in dB (default DEFAULT_ATTEN_STEP_DB).
+    dsa_step_db : float
+        ADC DSA increment in dB (default DEFAULT_DSA_STEP_DB).
+    rts_as_saturation : bool
+        If True (default), a latched RFDC RTS flag counts as saturation even
+        when the snapshot levels look clean.  See :func:`maximise_rx_power`.
 
     Returns
     -------
@@ -8623,7 +8933,8 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
     def _make_result():
         check_rfdc_rts_events(r, clear=True)
         time.sleep(0.1)
-        sat, lvls = check_input_saturation(r, r_fast, iterations=500, verbose=False)
+        sat, lvls = check_input_saturation(r, r_fast, iterations=500,
+                                           check_rts=rts_as_saturation, verbose=False)
         d = float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
         ra = rf_peripherals.get_rx_attenuation() if has_rf else None
         ab = rf_peripherals.get_rx_amp_bypass() if has_bypass_amps else None
@@ -8631,10 +8942,12 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
                 'rx_amp_bypass': ab, 'saturation': sat}
 
     def _check_saturated():
+        """Returns (saturated, why) — 'why' names the condition for the logs."""
         check_rfdc_rts_events(r, clear=True)
         time.sleep(0.1)
-        sat, _ = check_input_saturation(r, r_fast, iterations=500, verbose=False)
-        return sat
+        sat, lvls = check_input_saturation(r, r_fast, iterations=500,
+                                           check_rts=rts_as_saturation, verbose=False)
+        return sat, _sat_reason(lvls)
 
     # --- Handle RTS over-voltage (hidden firmware DSA) ---
     rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
@@ -8654,11 +8967,12 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
         time.sleep(0.1)
 
     # Check if saturation is present
-    if not _check_saturated():
+    saturated, why = _check_saturated()
+    if not saturated:
         print('fix_adc_saturation: no saturation detected')
         return _make_result()
 
-    print('fix_adc_saturation: ADC saturation detected')
+    print(f'fix_adc_saturation: ADC saturation detected ({why})')
 
     # --- Step 1: Bypass RX amplifier ---
     if has_bypass_amps and not rx_amp_fixed and not rf_peripherals.get_rx_amp_bypass():
@@ -8677,27 +8991,28 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
                   f'— skipping')
         else:
             print('  Bypassing RX amplifier...')
-            if not _check_saturated():
+            saturated, why = _check_saturated()
+            if not saturated:
                 print('  Resolved by bypassing RX amplifier')
                 return _make_result()
-            print('  Still saturated after bypassing RX amplifier')
+            print(f'  Still saturated after bypassing RX amplifier ({why})')
     elif has_bypass_amps and rx_amp_fixed:
         print('  RX amplifier bypass fixed — skipping bypass step')
 
-    # --- Step 2: Step RX attenuator up in 3 dB increments ---
+    # --- Step 2: Step RX attenuator up ---
     if has_rf and not rx_atten_fixed:
-        atten_step = 3.0
         atten_max = rf_peripherals.ATTEN_MAX
         hw_step = rf_peripherals.ATTEN_STEP
         current_atten = rf_peripherals.get_rx_attenuation()
         while current_atten < atten_max:
             current_atten = min(
-                round((current_atten + atten_step) / hw_step) * hw_step,
+                round((current_atten + atten_step_db) / hw_step) * hw_step,
                 atten_max)
             rf_peripherals.set_rx_attenuation(current_atten)
             time.sleep(0.1)
-            sat = _check_saturated()
-            print(f'  RX atten: {current_atten:.1f} dB, saturated: {sat}')
+            sat, why = _check_saturated()
+            print(f'  RX atten: {current_atten:.1f} dB, saturated: {sat}'
+                  + (f' ({why})' if sat else ''))
             if not sat:
                 print(f'  Resolved at RX attenuation = {current_atten:.1f} dB')
                 return _make_result()
@@ -8705,18 +9020,18 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
     elif has_rf:
         print(f'  RX attenuator fixed at {rf_peripherals.get_rx_attenuation():.1f} dB')
 
-    # --- Step 3: Step ADC DSA up in 2 dB increments ---
+    # --- Step 3: Step ADC DSA up ---
     if allow_digital and not dsa_fixed:
-        dsa_step = 2
-        current_dsa = int(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
+        current_dsa = float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
         while current_dsa < DSA_MAX:
-            current_dsa = min(current_dsa + dsa_step, DSA_MAX)
-            r.rfdc.core.set_dsa(adc_tile, adc_block, int(current_dsa))
+            current_dsa = min(current_dsa + dsa_step_db, DSA_MAX)
+            r.rfdc.core.set_dsa(adc_tile, adc_block, int(round(current_dsa)))
             time.sleep(0.1)
-            sat = _check_saturated()
-            print(f'  DSA: {current_dsa} dB, saturated: {sat}')
+            sat, why = _check_saturated()
+            print(f'  DSA: {current_dsa:g} dB, saturated: {sat}'
+                  + (f' ({why})' if sat else ''))
             if not sat:
-                print(f'  Resolved at ADC DSA = {current_dsa} dB')
+                print(f'  Resolved at ADC DSA = {current_dsa:g} dB')
                 return _make_result()
     else:
         reason = 'fixed' if dsa_fixed else 'rf_only=True'
@@ -8725,8 +9040,12 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
     print('  WARNING: ADC saturation persists after allowed saturation controls')
     return _make_result()
 
-def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
+def optimise_rx_snr(r, r_fast=None, config_dict=None,
+                    headroom_db=DEFAULT_ADC_HEADROOM_DB,
                     rf_peripherals=None, digital_only=False, rf_only=False,
+                    atten_step_db=DEFAULT_ATTEN_STEP_DB,
+                    dsa_step_db=DEFAULT_DSA_STEP_DB,
+                    rts_as_saturation=True,
                     force_tx_amp_bypass=None, force_rx_amp_bypass=None,
                     force_tx_attenuation_db=None,
                     force_rx_attenuation_db=None,
@@ -8752,8 +9071,18 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
     r : readout interface
     config_dict : dict
     headroom_db : float
-        Safety margin in dB (default 1.0).
+        Attenuation in dB added back once the saturation point is found
+        (default DEFAULT_ADC_HEADROOM_DB).  The saturation detector already
+        trips SATURATION_MARGIN_DB below full scale, so this is on top of that
+        floor.
     rf_peripherals : RFPeripheralController or None
+    atten_step_db : float
+        RX attenuator increment in dB (default DEFAULT_ATTEN_STEP_DB).
+    dsa_step_db : float
+        ADC DSA increment in dB (default DEFAULT_DSA_STEP_DB).
+    rts_as_saturation : bool
+        If True (default), a latched RFDC RTS flag counts as saturation even
+        when the snapshot levels look clean.  See :func:`maximise_rx_power`.
     digital_only : bool
         If True, only firmware/RFDC parameters are adjusted.  RF frontend
         attenuators and bypass amplifiers are left unchanged.
@@ -8788,12 +9117,20 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
 
     print(f'optimise_rx_snr (digital_only={digital_only}, rf_only={rf_only})')
 
+    def _sat_check():
+        """Returns (saturated, why) — 'why' names the condition for the logs."""
+        s, lvls = check_input_saturation(r, r_fast, iterations=250,
+                                         check_rts=rts_as_saturation, verbose=False)
+        return s, _sat_reason(lvls)
+
     # --- Fix existing saturation ---
-    sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+    sat, why = _sat_check()
     if sat:
-        print('  ADC saturated — fixing first')
+        print(f'  ADC saturated ({why}) — fixing first')
         fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=rf_peripherals,
                            digital_only=digital_only, rf_only=rf_only,
+                           atten_step_db=atten_step_db, dsa_step_db=dsa_step_db,
+                           rts_as_saturation=rts_as_saturation,
                            force_rx_amp_bypass=force_rx_amp_bypass,
                            force_rx_attenuation_db=force_rx_attenuation_db,
                            force_adc_dsa_db=force_adc_dsa_db)
@@ -8806,7 +9143,7 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
             r.rfdc.core.set_dsa(adc_tile, adc_block, 0)
             time.sleep(0.1)
 
-            sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+            sat, why = _sat_check()
             if sat and has_rf and not rx_atten_fixed:
                 atten_step = rf_peripherals.ATTEN_STEP
                 atten_max = rf_peripherals.ATTEN_MAX
@@ -8818,32 +9155,35 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
                 time.sleep(0.1)
                 print(f'    transferred DSA to RX atten: {current_atten:.1f} -> {new_atten:.1f} dB')
 
-                sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+                sat, why = _sat_check()
                 while sat and new_atten < atten_max:
                     new_atten = min(
-                        round((new_atten + 3.0) / atten_step) * atten_step,
+                        round((new_atten + atten_step_db) / atten_step) * atten_step,
                         atten_max)
                     rf_peripherals.set_rx_attenuation(new_atten)
                     time.sleep(0.1)
-                    sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
-                    print(f'    RX atten: {new_atten:.1f} dB, saturated={sat}')
+                    sat, why = _sat_check()
+                    print(f'    RX atten: {new_atten:.1f} dB, saturated={sat}'
+                          + (f' ({why})' if sat else ''))
 
                 if sat:
-                    dsa = 0
+                    dsa = 0.0
                     while sat and dsa < 27:
-                        dsa = min(dsa + 2, 27)
-                        r.rfdc.core.set_dsa(adc_tile, adc_block, int(dsa))
+                        dsa = min(dsa + dsa_step_db, 27)
+                        r.rfdc.core.set_dsa(adc_tile, adc_block, int(round(dsa)))
                         time.sleep(0.1)
-                        sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
-                        print(f'    DSA: {dsa} dB, saturated={sat}')
+                        sat, why = _sat_check()
+                        print(f'    DSA: {dsa:g} dB, saturated={sat}'
+                              + (f' ({why})' if sat else ''))
             elif sat:
-                dsa = 0
+                dsa = 0.0
                 while sat and dsa < 27:
-                    dsa = min(dsa + 1, 27)
-                    r.rfdc.core.set_dsa(adc_tile, adc_block, int(dsa))
+                    dsa = min(dsa + dsa_step_db, 27)
+                    r.rfdc.core.set_dsa(adc_tile, adc_block, int(round(dsa)))
                     time.sleep(0.1)
-                    sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
-                    print(f'    DSA: {dsa} dB, saturated={sat}')
+                    sat, why = _sat_check()
+                    print(f'    DSA: {dsa:g} dB, saturated={sat}'
+                          + (f' ({why})' if sat else ''))
             else:
                 print(f'    no saturation at DSA=0')
     else:
@@ -8864,13 +9204,14 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
                     atten_min)
                 rf_peripherals.set_rx_attenuation(test_atten)
                 time.sleep(0.1)
-                sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+                sat, why = _sat_check()
                 if sat:
                     new_atten = min(
                         round((test_atten + headroom_db) / atten_step) * atten_step,
                         rf_peripherals.ATTEN_MAX)
                     rf_peripherals.set_rx_attenuation(new_atten)
                     time.sleep(0.1)
+                    print(f'    saturation at {test_atten:.1f} dB ({why})')
                     print(f'    optimal RX atten: {new_atten:.1f} dB '
                           f'({headroom_db} dB headroom)')
                     break
@@ -8893,11 +9234,11 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
                       f'(S21 bypass={s21_bypassed:.1f}, enabled={s21_enabled:.1f} dB) '
                       f'— skipping')
             else:
-                sat, _ = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+                sat, why = _sat_check()
                 if sat:
                     rf_peripherals.set_rx_amp_bypass(True)
                     time.sleep(0.1)
-                    print('    RX amp causes saturation — keeping bypassed')
+                    print(f'    RX amp causes saturation ({why}) — keeping bypassed')
                 else:
                     print(f'    RX amplifier enabled ({expected_gain_db:+.1f} dB expected gain)')
     elif has_rf:
@@ -8916,7 +9257,8 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None, headroom_db=1.0,
         print(f'  step 3: PFB fftshift unchanged ({reason}): '
               f'{format(best_fftshift, "#016b")}')
 
-    _, levels = check_input_saturation(r, r_fast, iterations=250, verbose=False)
+    _, levels = check_input_saturation(r, r_fast, iterations=250,
+                                       check_rts=rts_as_saturation, verbose=False)
     print(f'  done: PFB fftshift={format(best_fftshift, "#016b")}')
     return best_fftshift, check_dsp_overflow(r, 0.1, verbose=False)[1], levels
 
@@ -9972,6 +10314,9 @@ def get_tone_powers(r, r_fast, config_dict, detailed_output=False, reference_pla
 def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detector',
                     optimise_dynamic_range=False, rf_peripherals=None,
                     rx_policy='protect',
+                    headroom_db=DEFAULT_DAC_HEADROOM_DB,
+                    filterbank_headroom_db=None,
+                    adc_headroom_db=DEFAULT_ADC_HEADROOM_DB,
                     autosync=False,
                     mrst=False,
                     force_tx_amp_bypass=None, force_rx_amp_bypass=None,
@@ -10022,6 +10367,24 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         - ``'none'`` — do not check or touch the RX path.
 
         See :func:`_apply_rx_policy` for full details.
+    headroom_db : float
+        Margin in dB below **true DAC full scale** (default
+        DEFAULT_DAC_HEADROOM_DB), used only when ``optimise_dynamic_range`` is
+        True.
+
+        Note where this does and does not bind.  The psb_scale ramp is followed
+        by an analytic amplitude solve that hits the requested target exactly,
+        so headroom taken off the ramp would simply be handed back as a larger
+        amplitude word -- it is skipped there.  It is applied when the
+        amplitudes are pinned (``force_tone_amplitudes``), and enforced once at
+        the end against the measured DAC level, which is the only place it
+        becomes a real property of the final state.
+    filterbank_headroom_db : float or None
+        Amplitude-word margin in dB reserved for the modulation TX drive
+        restore -- a separate margin from ``headroom_db``.  See
+        :func:`_filterbank_tx_headroom_factor`.
+    adc_headroom_db : float
+        Margin passed to the RX path when ``rx_policy='maximise'``.
     autosync : bool
         If True, trigger firmware sync after tone-amplitude writes.
 
@@ -10132,13 +10495,14 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
                     f'Reduce tone_powers_dbm or num_tones, '
                     f'or use optimise_dynamic_range=True to auto-adjust.')
         # Explicit power requests are honoured up to full scale, but flag when
-        # they eat into the filterbank-compensation TX boost headroom -- the
-        # drive restore will clip out towards the channel edges (modulation).
-        fb_headroom = _filterbank_tx_headroom_factor(config_dict)
+        # they eat into the amplitude-word TX boost headroom -- the drive
+        # restore will clip out towards the channel edges (modulation).
+        fb_headroom = _filterbank_tx_headroom_factor(config_dict, filterbank_headroom_db)
         if fb_headroom < 1.0 and np.any(amps > max_amp * fb_headroom):
+            reserved_db = -20 * np.log10(fb_headroom)
             over_db = 20 * np.log10(float(np.max(amps)) / (max_amp * fb_headroom))
-            msg = (f'strongest tone leaves less than the {FILTERBANK_TX_HEADROOM_DB:.1f} dB '
-                   f'filterbank-compensation headroom (short by {over_db:.2f} dB); the '
+            msg = (f'strongest tone leaves less than the {reserved_db:.1f} dB '
+                   f'amplitude-word headroom (short by {over_db:.2f} dB); the '
                    'modulation TX drive restore will clip at large probe offsets -- '
                    'lower tone_powers_dbm or use optimise_dynamic_range=True')
             print(f'  WARNING: {msg}')
@@ -10172,6 +10536,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         if init_amps_max > 0 and new_amps_max > 0:
             amp_change_db = float(20 * np.log10(new_amps_max / init_amps_max))
             _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
+                             headroom_db=adc_headroom_db,
                              tx_power_change_db=amp_change_db,
                              force_rx_amp_bypass=force_rx_amp_bypass,
                              force_rx_attenuation_db=force_rx_attenuation_db,
@@ -10179,6 +10544,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
                              force_pfb_fftshift=force_pfb_fftshift)
         else:
             _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
+                             headroom_db=adc_headroom_db,
                              tx_power_change_db=None,
                              force_rx_amp_bypass=force_rx_amp_bypass,
                              force_rx_attenuation_db=force_rx_attenuation_db,
@@ -10192,11 +10558,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
             warnings_list.append('DAC output is saturating!')
 
         # Measured DAC headroom from snapshot
-        ss0, ss1 = get_dac_snapshot_fast(r_fast)
-        ss0 = ss0 / 2**(dac_saturation_bits - 1)
-        ss1 = ss1 / 2**(dac_saturation_bits - 1)
-        dac_peak_measured = float(max(np.max(np.abs(ss0)), np.max(np.abs(ss1))))
-        dac_headroom_db = float(-20 * np.log10(dac_peak_measured)) if dac_peak_measured > 0 else float('inf')
+        dac_headroom_db = _measure_dac_headroom_db(r_fast)
         print(f'  DAC headroom (measured): {dac_headroom_db:.1f} dB')
 
         achieved = get_tone_powers(r, r_fast, config_dict, reference_plane=reference_plane,
@@ -10236,14 +10598,20 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
           f'at reference_plane={reference_plane!r}')
     warnings_list = []
 
-    # Reserve filterbank-compensation TX boost headroom in the amplitude words
-    # on top of the per-bin sharing cap (psb_scale absorbs the difference).
+    # Reserve TX boost headroom in the amplitude words for the modulation drive
+    # restore, on top of the per-bin sharing cap (psb_scale absorbs the
+    # difference).
     max_amp = ((1 - 2**-12) / max_tones_per_bin
-               * _filterbank_tx_headroom_factor(config_dict))
+               * _filterbank_tx_headroom_factor(config_dict, filterbank_headroom_db))
     scalemin = 1 / 256
     scalemax = 255
-    headroom_db = 1.0
-    headroom_linear = 10**(-headroom_db / 20)
+
+    # The ramp headroom sets the ceiling on achievable output: the analytic
+    # amplitude solve below scales down from max_amp to hit the target, so a
+    # target under the ceiling satisfies the headroom automatically and one
+    # above it clips and is reported.
+    effective_headroom_db = _effective_headroom_db(headroom_db, 'set_tone_powers')
+    headroom_linear = 10**(-effective_headroom_db / 20)
 
     # --- Step 1: Maximise digital gain ---
     if tone_amplitudes_fixed:
@@ -10361,7 +10729,9 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         optimal_psb_scale = float(np.clip(optimal_psb_scale, scalemin, scalemax))
         r.psbscale.set_scale(optimal_psb_scale)
         time.sleep(0.01)
-        print(f'    psb_scale: {optimal_psb_scale:.4f} ({headroom_db} dB headroom)')
+        print(f'    psb_scale: {optimal_psb_scale:.4f} ({headroom_db:.2f} dB headroom '
+              f'below full scale = {SATURATION_MARGIN_DB:.2f} dB detector '
+              f'+ {effective_headroom_db:.2f} dB applied)')
     ramp_psb_scale = optimal_psb_scale  # before any step-4c reduction
 
     # --- Step 3: Measure achieved power at reference plane ---
@@ -10525,6 +10895,9 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
                 print(f'    WARNING: {msg}')
                 warnings_list.append(msg)
             else:
+                # The ramp already took the headroom off, and this only reduces
+                # further, so reduce by the excess alone -- adding the headroom
+                # again here would double-count it.
                 optimal_psb_scale = r.psbscale.get_scale()
                 optimal_psb_scale *= 10**(-remaining / 20)
                 optimal_psb_scale = float(np.clip(optimal_psb_scale, scalemin, scalemax))
@@ -10561,6 +10934,21 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         set_tone_amplitudes(r, config_dict, final_amps, autosync=autosync)
         time.sleep(0.01)
 
+    # --- Check the requested headroom against the *final* DAC level ---
+    # The ramp headroom above caps the maximum achievable output, so a target
+    # below that maximum satisfies the headroom automatically.  Reducing
+    # psb_scale here would lower the achieved power below the requested target,
+    # so a shortfall is reported rather than corrected -- the caller lowers the
+    # target (or the headroom), we do not silently miss it.
+    dac_headroom_db = _measure_dac_headroom_db(r_fast)
+    if headroom_db - dac_headroom_db > 0.1:
+        msg = (f'DAC headroom is {dac_headroom_db:.2f} dB, below the '
+               f'requested {headroom_db:.2f} dB — the target power needs more '
+               f'of the DAC range than the headroom leaves. Lower '
+               f'tone_powers_dbm or headroom_db.')
+        print(f'  WARNING: {msg}')
+        warnings_list.append(msg)
+
     # RX policy check for the overall TX power change
     init_powers = get_tone_powers(r, r_fast, config_dict, reference_plane=reference_plane,
                                  rf_peripherals=rf_peripherals)
@@ -10583,6 +10971,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         dac_fs_bits=cal['dac_fs_bits'])
     tx_power_change_db = float(np.max(init_powers)) - float(np.max(entry_powers))
     _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
+                     headroom_db=adc_headroom_db,
                      tx_power_change_db=tx_power_change_db,
                      force_rx_amp_bypass=force_rx_amp_bypass,
                      force_rx_attenuation_db=force_rx_attenuation_db,
@@ -10598,13 +10987,6 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         eff_bits = 16 + np.log2(np.where(dac_amp_per_tone > 0, dac_amp_per_tone, np.nan))
         amp_res_bits = np.log2(np.where(
             np.abs(final_amps) > 0, np.abs(final_amps) / 2**-12, np.nan))
-
-    # Measured DAC headroom from snapshot
-    ss0, ss1 = get_dac_snapshot_fast(r_fast)
-    ss0 = ss0 / 2**(dac_saturation_bits - 1)
-    ss1 = ss1 / 2**(dac_saturation_bits - 1)
-    dac_peak_measured = float(max(np.max(np.abs(ss0)), np.max(np.abs(ss1))))
-    dac_headroom_db = float(-20 * np.log10(dac_peak_measured)) if dac_peak_measured > 0 else float('inf')
 
     print(f'  result:')
     print(f'    fftshift: {format(best_fftshift, "#016b")} (popcount {popcount})')

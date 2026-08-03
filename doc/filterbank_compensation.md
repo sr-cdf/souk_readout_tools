@@ -78,6 +78,21 @@ Where control words are prepared, per tone (and per point, for modulation):
   can restore the drive; a clipped boost is reported in the modulation state
   warnings (client-visible), and the software readout correction absorbs the
   readout side of the shortfall.
+
+  That reservation is `FILTERBANK_TX_HEADROOM_DB` (1.0 dB), and it is settable
+  per call as `filterbank_headroom_db` on `maximise_tx_power()`,
+  `optimise_tx_snr()`, `set_tone_powers()`, `wideband_sweep()` and
+  `run_power_sweep()`. `None` (the default) reserves it when compensation is
+  enabled and nothing when it is off; **an explicit value applies either way**,
+  so modulation room can be reserved with compensation disabled:
+
+  ```python
+  client.maximise_tx_power(filterbank_headroom_db=1.0)
+  ```
+
+  This is an amplitude-word margin and is distinct from `headroom_db`, which
+  guards DAC saturation via `psb_scale`. See
+  [Tone Power Notes — The Headroom Margins](tone_power_notes.md#the-headroom-margins).
 - **Beyond ±1.0 bins** a tone has wrapped; no compensation is possible
   (factors are clipped, and arming is refused without `force` as before).
 

@@ -1,5 +1,51 @@
 # Changelog & Feature List
 
+## Unreleased
+
+**Tone-power headroom: correct, and settable everywhere**
+
+More power reaches the device by default: a bare `maximise_tx_power()` now
+drives the RF frontend to maximum and gives ~1.9 dB more digital drive. Pass
+`headroom_db`/`reference_plane` explicitly to keep the old levels.
+
+- `maximise_tx_power()` defaults to `reference_plane='detector'`, matching the
+  rest of the tone-power API, and so also minimises the TX attenuator and
+  enables the TX bypass amp. Use `reference_plane='dac'` or `digital_only=True`
+  for the old digital-only behaviour.
+- `headroom_db` was double-counted: the ramps stop where the saturation
+  detector trips at 90% of full scale (0.92 dB) and then applied `headroom_db`
+  on top, so 1 dB gave ~1.9 dB. Now measured from true full scale; requests
+  inside the 0.92 dB floor clamp to it.
+- Defaults unified at `firmware_lib.DEFAULT_DAC_HEADROOM_DB` /
+  `DEFAULT_ADC_HEADROOM_DB` (1.0 dB), forwarded only when set, so the old
+  firmware-1.0-vs-client-2.0 mismatch cannot recur.
+- ADC snapshot levels are now a true fraction of full scale (they filled 15 of
+  16 bits, so 88% of full scale read `0.44`), which had made
+  `maximise_rx_power`'s headroom arithmetic 6.02 dB optimistic. The trip point
+  is unchanged; `adc_levels` values and the printed threshold (now 90%) change.
+- `dac_headroom_db` is measured per component, matching what
+  `check_output_saturation` trips on; it previously used the complex magnitude.
+- `check_input_saturation()` reports `level_saturated` and `rts_saturated`
+  separately and the RX loops name the cause, so a latched RTS over-range with
+  clean snapshot levels is no longer an unexplained DSA change.
+  `rts_as_saturation=False` uses measured levels only.
+- `filterbank_headroom_db` replaces the fixed `FILTERBANK_TX_HEADROOM_DB`
+  constant. This is amplitude-word room for the modulation drive restore, not
+  DAC-saturation margin; an explicit value applies whether or not filterbank
+  compensation is enabled.
+- Remaining hardcoded margins are now parameters: `set_tone_powers` gains
+  `headroom_db`, `fix_dac_saturation` gains `headroom_db` /
+  `intermittent_backoff_db` (were `0.90` / `0.707`), and `fix_adc_saturation`
+  and the `rx_policy` protect loop gain `atten_step_db` / `dsa_step_db`.
+- `wideband_sweep()` (and its CLI) and `run_power_sweep()` gain
+  `dac_headroom_db`, `adc_headroom_db` and `filterbank_headroom_db`; previously
+  all silently used the library defaults. Single-converter routines keep
+  `headroom_db`, which their own name disambiguates.
+  `wideband_sweep(tone_powers_dbm='auto')` also forwards its own
+  `reference_plane` now.
+- Fixed: `client.set_psb_scale()` cast to `int`, so `set_psb_scale(4 * 0.99)`
+  wrote 3 — a 0.09 dB request became 2.5 dB. The scale is UFix16_8 (1/256).
+
 ## v1.7.1
 
 **Match resonance lists between sweeps — `resonance_matching`**

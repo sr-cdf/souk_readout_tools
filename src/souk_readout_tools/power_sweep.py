@@ -550,7 +550,9 @@ def _nan_placeholder_sweep(centers, spans, points, samples_per_point,
 
 
 def _preflight_feasible_steps(client, power_steps, reference_plane,
-                              optimise_dynamic_range, rx_policy, verbose):
+                              optimise_dynamic_range, rx_policy, verbose,
+                              dac_headroom_db=None, filterbank_headroom_db=None,
+                              adc_headroom_db=None):
     """Find which power steps the hardware can actually reach.
 
     Probes the most demanding step (highest peak tone power) and, if it cannot
@@ -584,7 +586,11 @@ def _preflight_feasible_steps(client, power_steps, reference_plane,
         response = client.set_tone_powers(
             power_steps[idx], reference_plane=reference_plane,
             optimise_dynamic_range=optimise_dynamic_range,
-            rx_policy=rx_policy, verbose=False,
+            rx_policy=rx_policy,
+            headroom_db=dac_headroom_db,
+            filterbank_headroom_db=filterbank_headroom_db,
+            adc_headroom_db=adc_headroom_db,
+            verbose=False,
         )
         failed = isinstance(response, dict) and response.get("status") != "success"
         if not failed:
@@ -650,6 +656,9 @@ def run_power_sweep(
     reference_plane="detector",
     optimise_dynamic_range=False,
     rx_policy="protect",
+    dac_headroom_db=None,
+    filterbank_headroom_db=None,
+    adc_headroom_db=None,
     preflight=True,
     settle_time=0.5,
     refresh_adc_cal=True,
@@ -748,6 +757,21 @@ def run_power_sweep(
           shift.
         - ``'raise'`` — raise an error if the ADC saturates.
         - ``'none'`` — do not touch the RX path.
+    dac_headroom_db : float or None, optional
+        Margin in dB below true DAC full scale, forwarded to every
+        ``set_tone_powers`` call (the preflight probe and each power step).
+        ``None`` (default) uses the server's
+        ``firmware_lib.DEFAULT_DAC_HEADROOM_DB``.  This sets how much of the DAC
+        range each step has to work with, so it also moves the maximum
+        achievable power the preflight probe finds.
+    filterbank_headroom_db : float or None, optional
+        Amplitude-word margin in dB reserved for the modulation TX drive
+        restore — a separate margin from ``dac_headroom_db``.  ``None`` (default)
+        follows the server's filterbank-compensation config.
+    adc_headroom_db : float or None, optional
+        Margin in dB below ADC full scale, used when ``rx_policy='maximise'``.
+        ``None`` (default) uses the server's
+        ``firmware_lib.DEFAULT_ADC_HEADROOM_DB``.
     preflight : bool, optional
         If ``True`` (default), before any sweeps probe the most demanding
         power step against the hardware and, if it cannot be set, the next
@@ -944,6 +968,9 @@ def run_power_sweep(
             step_feasible, feasibility_record = _preflight_feasible_steps(
                 client, power_steps, reference_plane, optimise_dynamic_range,
                 rx_policy, verbose,
+                dac_headroom_db=dac_headroom_db,
+                filterbank_headroom_db=filterbank_headroom_db,
+                adc_headroom_db=adc_headroom_db,
             )
             manifest["metadata"]["feasibility"] = feasibility_record
             n_skip = int(np.sum(~step_feasible))
@@ -1095,6 +1122,9 @@ def run_power_sweep(
                     reference_plane=reference_plane,
                     optimise_dynamic_range=optimise_dynamic_range,
                     rx_policy=rx_policy,
+                    headroom_db=dac_headroom_db,
+                    filterbank_headroom_db=filterbank_headroom_db,
+                    adc_headroom_db=adc_headroom_db,
                     verbose=False,
                 ),
                 "set_tone_powers failed",
@@ -1211,6 +1241,9 @@ def run_power_sweep(
                         reference_plane=reference_plane,
                         optimise_dynamic_range=optimise_dynamic_range,
                         rx_policy=rx_policy,
+                        headroom_db=dac_headroom_db,
+                        filterbank_headroom_db=filterbank_headroom_db,
+                        adc_headroom_db=adc_headroom_db,
                         verbose=False,
                     ),
                     "set_tone_powers failed",

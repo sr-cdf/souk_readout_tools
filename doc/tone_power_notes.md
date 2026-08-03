@@ -48,7 +48,8 @@ Three transmit-side firmware controls set the digital level reaching the DAC:
   filterbank. Fewer shifts increase output level but can cause integer
   overflow.
 - **PSB scale**: global scaling after the synthesis filterbank and before the
-  DAC.
+  DAC. UFix16_8: resolution 1/256, maximum ~255.996 — verified end to end on a
+  v7.11 board.
 
 DSP overflow and DAC saturation are distinct conditions:
 
@@ -197,17 +198,96 @@ Use the highest-level helper that matches the operation:
 
 | Helper | Purpose | Important defaults |
 |---|---|---|
-| `set_tone_powers()` | Apply calibrated per-tone target powers while preserving their relative differences | `optimise_dynamic_range=True`, `rx_policy='protect'` |
-| `maximise_tx_power()` | Raise TX output until the selected limit is reached | `headroom_db=2.0`, `reference_plane='dac'`, `rx_policy='protect'` |
+| `set_tone_powers()` | Apply calibrated per-tone target powers while preserving their relative differences | `optimise_dynamic_range=True`, `rx_policy='protect'`, `headroom_db=1.0` |
+| `maximise_tx_power()` | Raise TX output until the selected limit is reached | `headroom_db=1.0`, `reference_plane='detector'`, `rx_policy='protect'` |
 | `maximise_rx_power()` | Move RX level toward ADC full scale while retaining margin | `headroom_db=1.0` |
-| `optimise_tx_snr()` | Improve TX SNR without intentionally changing the requested output powers | `headroom_db=2.0`, `reference_plane='detector'` |
-| `optimise_rx_snr()` | Improve RX SNR using RX controls while avoiding saturation | Uses the configured RX controls |
-| `fix_dac_saturation()` | Reduce `psb_scale` until DAC saturation clears | Recovery helper |
-| `fix_adc_saturation()` | Adjust RX settings until ADC saturation clears | Recovery helper |
+| `optimise_tx_snr()` | Improve TX SNR without intentionally changing the requested output powers | `headroom_db=1.0`, `reference_plane='detector'` |
+| `optimise_rx_snr()` | Improve RX SNR using RX controls while avoiding saturation | `headroom_db=1.0` |
+| `fix_dac_saturation()` | Reduce `psb_scale` until DAC saturation clears | `headroom_db=1.0`, `intermittent_backoff_db=3.0` |
+| `fix_adc_saturation()` | Adjust RX settings until ADC saturation clears | `atten_step_db=3.0`, `dsa_step_db=2.0` |
 
 The helpers also accept advanced `force_*` controls to pin individual RF or
 firmware settings during an optimisation. See the client method docstrings for
 the complete list.
+
+### The Headroom Margins
+
+Four separate margins are settable at every call point. They guard different
+limits at different points in the chain and are not interchangeable:
+
+| Parameter | Guards | Applied to |
+|---|---|---|
+| `dac_headroom_db` | DAC saturation | `psb_scale` |
+| `adc_headroom_db` | ADC saturation | ADC DSA and RX attenuator |
+| `filterbank_headroom_db` | Modulation TX drive-restore clipping | the amplitude words |
+| `compression_headroom_db` | RF frontend P1dB compression | `psb_scale`, against the modelled frontend input power |
+
+On the single-converter routines the margin is just `headroom_db`, since the
+function name already says which converter it means — `maximise_tx_power()` and
+`set_tone_powers()` take `headroom_db` for the DAC, `maximise_rx_power()` and
+`optimise_rx_snr()` for the ADC. The names above are what the entry points that
+touch both converters use (`wideband_sweep()`, `run_power_sweep()`), plus
+`adc_headroom_db` on the TX routines, where it sets the margin the `rx_policy`
+works to.
+
+**Every headroom is measured from true full scale.** The saturation detectors
+trip at 90% of full scale, which is itself 0.92 dB of margin, so only the
+excess over that is applied on top — ask for 1 dB and the DAC lands 1 dB below
+full scale, not 1.9 dB. Requests inside the 0.92 dB detector floor clamp to it
+with a printed note. The step logs report requested and applied dB separately:
+
+```text
+psb_scale: 3.9570 (1.00 dB headroom below full scale = 0.92 dB detector + 0.08 dB applied)
+```
+
+On the RX side the margin is measured directly from the ADC snapshot rather
+than inferred from the detector, so `headroom_db` is used as-is; the detector
+still acts as a backstop in the step-back loops, which floors the achievable
+margin at ~0.92 dB.
+
+**`filterbank_headroom_db` reserves amplitude-word room** so the modulation TX
+drive restore (base x 1/G) has somewhere to go when a probe moves out towards
+half a bin separation. `None` (the default) follows the filterbank-compensation
+config; an explicit value applies whether or not compensation is enabled, which
+is how to reserve modulation room without turning compensation on:
+
+```python
+client.maximise_tx_power(headroom_db=1.0, filterbank_headroom_db=1.0)
+```
+
+Both margins are forwarded by the higher-level entry points, so a sweep does
+not silently fall back to the library defaults:
+
+```python
+client.wideband_sweep(dac_headroom_db=2.0, adc_headroom_db=1.0,
+                      filterbank_headroom_db=1.0)
+
+run_power_sweep(client, centers, spans, powers, out,
+                dac_headroom_db=2.0, adc_headroom_db=1.0)
+```
+
+Unset parameters are not sent at all, so the single copy of each default lives
+in `firmware_lib` (`DEFAULT_DAC_HEADROOM_DB`, `DEFAULT_ADC_HEADROOM_DB`) and is
+never duplicated downstream.
+
+### Why the DSA Moved
+
+`check_input_saturation()` reports two independent trip causes, and the RX
+routines log which one fired:
+
+- `level_saturated` — the ADC snapshot exceeded the threshold.
+- `rts_saturated` — an RFDC RTS over-range/over-voltage flag latched.
+
+RTS watches the full band continuously while the snapshot is a short capture of
+a decimated view, so a transient or out-of-band overrange latches RTS with
+clean-looking snapshot levels — one reason the DSA can gain a dB or two when
+the reported levels look far from clipping. Pass
+`rts_as_saturation=False` to drive purely off the measured levels.
+
+The reported `*_fs` levels are a true fraction of full scale for both
+converters. ADC snapshots only fill 15 of their 16 bits, so before this was
+normalised an ADC at 88% of full scale read `0.44` and looked like it had
+plenty of margin.
 
 ## Blind Tones
 

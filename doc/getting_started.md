@@ -602,6 +602,8 @@ By default, `set_tone_powers` automatically optimises the dynamic range — it m
 
 The tone powers can be set to the maximum level that avoids saturation of the RF chain by calling ```client.maximise_tx_power()```
 
+This maximises at the detector plane by default, so as well as the digital chain it minimises the TX attenuator and enables the TX amplifier — full available power on the device. Pass `reference_plane='dac'` to stop at the DAC, or `digital_only=True` to leave the RF frontend untouched.
+
 Simlarly, the ADC input level can be maximised by adjusting the RX attenuators and or DSA settings with a call to ```client.maximise_rx_power()```
 
 ### Phases
@@ -1057,14 +1059,30 @@ client.fix_dac_saturation()    # Auto-fix DAC clipping
 client.fix_adc_saturation()    # Auto-fix ADC clipping
 ```
 
-`maximise_tx_power()` and `maximise_rx_power()` accept a `headroom_db`
-parameter that sets the safety margin below saturation. The TX default is
-`2.0 dB`; the RX default is `1.0 dB`:
+Every one of these accepts a `headroom_db` parameter setting the margin below
+**true full scale**, defaulting to `1.0 dB` on both TX and RX:
 
 ```python
-client.maximise_tx_power(headroom_db=3.0)   # 3 dB below saturation
-client.maximise_rx_power(headroom_db=1.0)   # 1 dB below saturation
+client.maximise_tx_power(headroom_db=3.0)   # DAC 3 dB below full scale
+client.maximise_rx_power(headroom_db=1.0)   # ADC 1 dB below full scale
 ```
+
+The saturation detectors trip at 90% of full scale, which is already 0.92 dB of
+margin, so only the excess is applied on top — ask for 1 dB and you get 1 dB,
+not 1.9 dB. Requests inside that 0.92 dB floor clamp to it with a printed note.
+
+A separate `filterbank_headroom_db` reserves amplitude-word room for the
+modulation TX drive restore, and the step sizes of the saturation-recovery loops
+(`atten_step_db`, `dsa_step_db`) are settable too. The sweep entry points
+forward all of these rather than falling back to the defaults:
+
+```python
+client.wideband_sweep(dac_headroom_db=2.0, adc_headroom_db=1.0,
+                      filterbank_headroom_db=1.0)
+```
+
+See [Tone Power Notes — The Headroom Margins](tone_power_notes.md#the-headroom-margins)
+for what each margin guards and how they combine.
 
 ### Tone Power Queries
 

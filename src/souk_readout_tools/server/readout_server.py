@@ -3010,6 +3010,8 @@ class ReadoutServer:
                             rx_policy=rx_pol,
                             autosync=autosync,
                             mrst=mrst,
+                            **firmware_lib.select_headroom_kwargs(
+                                message, firmware_lib.set_tone_powers),
                             **{k: message[k] for k in firmware_lib.POWER_FORCE_CONTROL_KEYS
                                if k in message})
                         if self._tone_state_cache is not None and result is not None:
@@ -3771,8 +3773,7 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success', 'result': result, 'details': details})
 
                 elif request == 'maximise_tx_power':
-                    headroom_db = message.get('headroom_db', 2.0)
-                    reference_plane = message.get('reference_plane', 'dac')
+                    reference_plane = message.get('reference_plane', 'detector')
                     power_limit_dbm = message.get('power_limit_dbm', None)
                     compression_headroom_db = message.get('compression_headroom_db', None)
                     rx_policy = message.get('rx_policy', 'protect')
@@ -3782,13 +3783,17 @@ class ReadoutServer:
                         k: message[k] for k in firmware_lib.POWER_FORCE_CONTROL_KEYS
                         if k in message
                     }
+                    # Margins are forwarded only when the caller set them, so
+                    # firmware_lib holds the one copy of each default.
+                    headroom_kwargs = firmware_lib.select_headroom_kwargs(
+                        message, firmware_lib.maximise_tx_power)
                     amps,psb_fft_shift,psb_scale,dsp,dac = firmware_lib.maximise_tx_power(
-                        self.r, self.r_fast, self.config, headroom_db=headroom_db,
+                        self.r, self.r_fast, self.config,
                         reference_plane=reference_plane, rf_peripherals=self.rf_peripherals,
                         power_limit_dbm=power_limit_dbm,
                         compression_headroom_db=compression_headroom_db,
                         rx_policy=rx_policy, digital_only=digital_only,
-                        rf_only=rf_only, **forced_controls)
+                        rf_only=rf_only, **headroom_kwargs, **forced_controls)
                     result = {'amps': amps.tolist(), 'psb_fft_shift': psb_fft_shift, 'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
                     if isinstance(dac, dict) and 'tx_compression' in dac:
                         result['tx_compression'] = dac['tx_compression']
@@ -3801,12 +3806,12 @@ class ReadoutServer:
                         if rf_cfg.get('connected', False) else None
                     )
                     kwargs = {'rf_peripherals': rf_peripherals}
-                    if 'headroom_db' in message:
-                        kwargs['headroom_db'] = message['headroom_db']
                     if 'digital_only' in message:
                         kwargs['digital_only'] = message['digital_only']
                     if 'rf_only' in message:
                         kwargs['rf_only'] = message['rf_only']
+                    kwargs.update(firmware_lib.select_headroom_kwargs(
+                        message, firmware_lib.maximise_rx_power))
                     for key in firmware_lib.POWER_FORCE_CONTROL_KEYS:
                         if key in message:
                             kwargs[key] = message[key]
@@ -3842,12 +3847,12 @@ class ReadoutServer:
                     kwargs = {'rf_peripherals': self.rf_peripherals}
                     if 'reference_plane' in message:
                         kwargs['reference_plane'] = message['reference_plane']
-                    if 'headroom_db' in message:
-                        kwargs['headroom_db'] = message['headroom_db']
                     if 'digital_only' in message:
                         kwargs['digital_only'] = message['digital_only']
                     if 'rf_only' in message:
                         kwargs['rf_only'] = message['rf_only']
+                    kwargs.update(firmware_lib.select_headroom_kwargs(
+                        message, firmware_lib.optimise_tx_snr))
                     for key in firmware_lib.POWER_FORCE_CONTROL_KEYS:
                         if key in message:
                             kwargs[key] = message[key]
@@ -3857,12 +3862,12 @@ class ReadoutServer:
                 
                 elif request == 'optimise_rx_snr':
                     kwargs = {'rf_peripherals': self.rf_peripherals}
-                    if 'headroom_db' in message:
-                        kwargs['headroom_db'] = message['headroom_db']
                     if 'digital_only' in message:
                         kwargs['digital_only'] = message['digital_only']
                     if 'rf_only' in message:
                         kwargs['rf_only'] = message['rf_only']
+                    kwargs.update(firmware_lib.select_headroom_kwargs(
+                        message, firmware_lib.optimise_rx_snr))
                     for key in firmware_lib.POWER_FORCE_CONTROL_KEYS:
                         if key in message:
                             kwargs[key] = message[key]
@@ -3871,12 +3876,19 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'fix_dac_saturation':
-                    psb_scale, dsp, dac = firmware_lib.fix_dac_saturation(self.r,self.r_fast,self.config)
+                    psb_scale, dsp, dac = firmware_lib.fix_dac_saturation(
+                        self.r, self.r_fast, self.config,
+                        **firmware_lib.select_headroom_kwargs(
+                            message, firmware_lib.fix_dac_saturation))
                     result = {'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
                     await self.send_response(writer, {'status': 'success', 'result': result})
                 
                 elif request == 'fix_adc_saturation':
-                    result = firmware_lib.fix_adc_saturation(self.r,self.r_fast,self.config, rf_peripherals=self.rf_peripherals)
+                    result = firmware_lib.fix_adc_saturation(
+                        self.r, self.r_fast, self.config,
+                        rf_peripherals=self.rf_peripherals,
+                        **firmware_lib.select_headroom_kwargs(
+                            message, firmware_lib.fix_adc_saturation))
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'fix_dsp_overflow':
@@ -3913,6 +3925,16 @@ class ReadoutServer:
 
                 elif request == 'get_rx_attenuation':
                     result = {'rx_attenuation_db': self.rf_peripherals.get_rx_attenuation()}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'set_adc_dsa':
+                    value = float(message.get('value'))
+                    applied = firmware_lib.set_adc_dsa_db(self.r, self.config, value)
+                    result = {'adc_dsa_db': applied}
+                    await self.send_response(writer, {'status': 'success', 'result': result})
+
+                elif request == 'get_adc_dsa':
+                    result = {'adc_dsa_db': firmware_lib.get_adc_dsa_db(self.r, self.config)}
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'set_tx_amp_bypass':
