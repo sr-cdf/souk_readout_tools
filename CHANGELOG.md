@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+**Quantisation-noise test — `scripts/quantisation/`**
+- `quantisation_noise_test.py` measures whether moving digital gain downstream
+  costs SNR. Tone amplitude scales before the synthesis filterbank and
+  `psb_scale` after it, so halving one and doubling the other holds the DAC
+  drive constant while running the filterbank 6 dB closer to its own rounding
+  floor; one FFT shift stage is the same 6 dB taken inside the filterbank.
+- Walks both trades as a ladder at constant DAC drive (amplitude 1, 1/2,
+  1/4, ... against `psb_scale` x1, x2, x4, ...; and the shift schedule one stage
+  hotter then progressively colder), measuring the noise-to-carrier spectral
+  density of a single loopback tone at the accumulator, and reports the slope in
+  dB of noise per dB of gain moved downstream (0 = free, 1 =
+  quantisation-limited). Reports both a broadband floor and a band-integrated
+  statistic, which do not track each other.
+- Measures the reference point first and last so the repeatability floor is
+  explicit, checks DSP overflow and DAC saturation at every point, and pins the
+  RX chain after one optimisation so the test cannot measure the optimiser
+  instead. Defaults to digital loopback; `--loopback rf` repeats it through the
+  real path.
+- `quantisation_noise_test_plot.py` plots the resulting CSV.
+- Documented in [Tone Power and Dynamic Range
+  Notes](doc/tone_power_notes.md#where-the-digital-gain-is-taken).
+
 **Tone-power headroom: correct, and settable everywhere**
 
 More power reaches the device by default: a bare `maximise_tx_power()` now

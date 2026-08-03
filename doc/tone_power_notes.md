@@ -81,6 +81,41 @@ from souk_readout_tools.firmware_lib import estimate_papr_db
 papr_db = estimate_papr_db(freqs, amps, phases, sample_rate)
 ```
 
+### Where the Digital Gain Is Taken
+
+The three controls are not interchangeable, because they sit at different
+points in the chain. Tone amplitude is the mixer/LO scale word **before** the
+synthesis filterbank; `psb_scale` is **after** it. Halving the amplitude and
+doubling `psb_scale` leaves the DAC level unchanged but runs the filterbank
+6 dB closer to its own rounding floor, then amplifies that floor back up along
+with the signal. One fewer FFT shift stage is the same 6 dB in the opposite
+direction, taken inside the filterbank.
+
+Whether that costs SNR depends on which quantisation floor dominates at the
+accumulator, which is a property of the firmware build and the operating
+point, not something to assume. Measure it:
+
+```bash
+python scripts/quantisation/quantisation_noise_test.py -C my_config.yaml
+```
+
+The script holds the DAC drive constant and walks both trades as a ladder
+(amplitude 1, 1/2, 1/4, ... against `psb_scale` x1, x2, x4, ...; and the shift
+schedule one stage hotter then progressively colder), measuring the
+noise-to-carrier spectral density of a single loopback tone at the
+accumulator. It reports the slope in dB of noise per dB of gain moved
+downstream: `0` means the trade is free and the floor is set downstream of the
+PSB, `1` means TX digital quantisation dominates and the amplitude should be
+kept as high as the VACC and PAPR constraints allow. The reference point is
+measured first and last so the repeatability floor is visible before any
+difference is believed.
+
+Run it in the default digital loopback first (no analog noise at all, so it is
+the most sensitive test of the digital chain), then with `--loopback rf` to
+see whether the effect survives the real signal path.
+
+`scripts/quantisation/quantisation_noise_test_plot.py` plots the resulting CSV.
+
 ## DAC and RF Guardrails
 
 The DAC full-scale output depends on firmware scaling, the DUC fine-mixer
