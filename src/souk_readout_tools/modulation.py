@@ -1947,16 +1947,17 @@ def _max_snr_operating_point(cal, n_grid=20001, y_max=8.0):
     The best signal-to-noise operating point for reading a resonator frequency
     shift is where the response moves fastest per Hz of detuning,
     ``argmax |dS21/df|`` of the resonator's own (de-embedded) response. This is
-    the geometric steepest point of the resonance circle. It is displaced from
-    the fitted ``fr`` by the impedance-mismatch asymmetry (``phi``) and, for a
-    driven nonlinear fit, by the Duffing detuning plus the bistable-cliff skew.
-    Cable delay is deliberately excluded: it does not move with the resonator,
-    so it adds responsivity to a probe sweep but none to a detector frequency
-    shift. Gain is a constant scale and does not move the peak.
+    the geometric steepest point of the resonance circle. For a driven nonlinear
+    fit it is displaced from the fitted ``fr`` by the Duffing detuning plus the
+    bistable-cliff skew. Cable delay is deliberately excluded: it does not move
+    with the resonator, so it adds responsivity to a probe sweep but none to a
+    detector frequency shift. Gain is a constant scale and does not move the
+    peak.
 
     Linear (``anl == 0``): the peak is at ``min |D|`` of the notch denominator,
-    which has the closed form ``fr * (1 - frequency_origin_fraction)`` with
-    ``frequency_origin_fraction = Im(1/Qe)/2``.
+    which is ``fr`` itself for any ``phi`` -- the fitted model carries only
+    ``Re(1/Qe)`` there, so the impedance-mismatch asymmetry does not displace
+    the operating point (``frequency_origin_fraction`` is 0).
 
     Nonlinear (``anl > 0``): the driven model is parametrised by the smooth
     Duffing drive coordinate ``y`` rather than by frequency, because the forward

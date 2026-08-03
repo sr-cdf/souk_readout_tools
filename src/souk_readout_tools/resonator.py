@@ -1238,12 +1238,13 @@ class ResonatorCalibration:
         # With Qe = Qc*(1 + j*tan(phi)), the coupling term has phase -phi.
         rotation_angle = getattr(
             fit_result, 'phase_center_rotation_angle', fit_result.phi - np.pi)
-        # The centered-circle Möbius coordinate includes the imaginary part of
-        # the complex coupling. Subtract its value at the fitted fr so df=0
-        # there, including for asymmetric resonators (phi != 0).
+        # Offset that puts df = 0 at the fitted fr. The linear model's
+        # denominator carries only the real part of 1/Qe, so its circle
+        # coordinate is already zero at fr for any phi and no offset is needed;
+        # only the driven model displaces it.
         anl = float(getattr(fit_result, 'anl', 0.0))
         if anl == 0.0:
-            frequency_origin_fraction = np.imag(1.0 / fit_result.Qe) / 2.0
+            frequency_origin_fraction = 0.0
         else:
             # Preserve a zero-at-fr diagnostic circle coordinate. The default
             # physical conversion analytically inverts Duffing instead.

@@ -1,5 +1,32 @@
 # Changelog & Feature List
 
+## v1.7.3
+
+**One notch convention for the linear and driven models**
+- The linear branch of `s21_model` put the full complex `1/Qe` in the notch
+  denominator while the Duffing branch used only its real part `Qr_inv`. Both
+  now use `Qr_inv`, i.e. the asymmetry is a numerator phase throughout
+  (Probst/Swenson), and the two branches are a single expression in the new
+  `_resonator_factor`.
+- Consequences, all verified numerically: `anl -> 0` now reproduces the linear
+  model exactly for `phi != 0` (it did not before), and the fitted `fr` is the
+  frequency of maximum `|dS21/df|` at any `phi`. `Qi`, `Qc`, `phi` and fit
+  quality are unchanged — residual RSS is identical to the last digit on 384
+  measured sweeps; `fr` moves by `fr*Im(1/Qe)/2`, a median 5.9 kHz there.
+- This removes a silent mixing of conventions: `nonlinear='auto'` returns linear
+  fits for some tones and Duffing fits for others, whose `fr` values previously
+  differed by a median 10% of a linewidth (167% worst case) for no physical
+  reason. That gap is now 3e-6 linewidths.
+- `ResonatorCalibration.frequency_origin_fraction` is 0 for a linear fit (the
+  circle coordinate is already zero at `fr`), and the modulation operating point
+  for an undriven fit is `fr` itself. Driven fits are unaffected — they still
+  locate the steepest point on the Duffing drive coordinate.
+- `_s21_linear_jacobian` was re-derived for the new denominator (the `phi`
+  column now carries two terms, since `Qr_inv` depends on `phi` as well) and
+  checked against central differences over 60 random resonators: worst relative
+  error 3e-6 across all seven columns. Linear fits stay at 6 optimiser
+  iterations and ~7 ms.
+
 ## v1.7.2
 
 **Duffing fits can no longer come back worse than their own linear seed**

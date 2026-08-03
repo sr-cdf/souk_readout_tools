@@ -698,17 +698,19 @@ Turn a sweep + (your own) fits into an `enable_modulation` config. **This packag
   skipped blind tones retain their indices. Missing or unsuccessful fits fall
   back to the model-free estimate.
 - `deembed=False`: **model-free estimate** from the sweep (centre = measured peak `|dS21/df|`; linewidth = magnitude-dip FWHM in linear power, ≈ `fr/Ql`); no calibration. Do not pass `fits`.
-- **Centre = geometric steepest point, not `fr`.** The operating point is the
+- **Centre = geometric steepest point.** The operating point is the
   frequency of maximum frequency-shift responsivity (`argmax |dS21/df|` of the
   de-embedded response) — the best-SNR point for reading a resonator frequency
-  shift. It is displaced from the fitted `fr` by the impedance-mismatch
-  asymmetry (`phi`) and, for a driven nonlinear fit, by the Duffing detuning plus
-  the bistable-cliff skew (cable delay is excluded — it does not move with the
-  resonator). Linear: closed form `fr·(1 − Im(1/Qe)/2)`. Nonlinear: located on
-  the smooth Duffing drive coordinate (the forward solver is discontinuous in
-  `f`). Because the demod's `freq_shift_hz` is referenced to `fr`, it reads
-  `center − fr` (see `reference_freqs['offset_from_fr_hz']`) as a constant
-  baseline at the operating point, not ~0; subtract it in tracking/`needs_update`.
+  shift. For an undriven fit this *is* the fitted `fr` at any `phi`: the model's
+  denominator carries only `Re(1/Qe)`, so the impedance-mismatch asymmetry does
+  not displace it. A driven nonlinear fit displaces it by the Duffing detuning
+  plus the bistable-cliff skew (cable delay is excluded — it does not move with
+  the resonator), located on the smooth Duffing drive coordinate because the
+  forward solver is discontinuous in `f`. Because the demod's `freq_shift_hz` is
+  referenced to `fr`, it reads `center − fr` (see
+  `reference_freqs['offset_from_fr_hz']`) as a constant baseline at the operating
+  point — zero for a linear fit, nonzero when driven; subtract it in
+  tracking/`needs_update`.
 - Probe pattern: symmetric base `linspace(-1, 1, n_points)` scaled by
   `delta_linewidths · linewidth` per tone. Default `n_points` is 3. Pass
   `point_sequence` as 1-based base-point indices to repeat/reorder the cycle,

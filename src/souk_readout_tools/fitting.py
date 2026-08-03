@@ -20,7 +20,14 @@ Q conventions
 
 The fitted coupling parameter is the real ``Qc`` in
 ``Qe = Qc * (1 + 1j * tan(phi))``. The loaded quality factor is
-``1 / Ql = 1 / Qi + real(1 / Qe)``. Use ``Qc`` in parameter dictionaries such
+``1 / Ql = 1 / Qi + real(1 / Qe)``, which is also the notch denominator's real
+part: the asymmetry enters as a numerator phase (the Probst/Swenson
+convention), not inside the detuning. Two consequences worth knowing when
+comparing against other codes: ``fr`` is the frequency of maximum ``|dS21/df|``
+for any ``phi``, and the driven model's ``anl -> 0`` limit reproduces the linear
+one exactly. A code writing the asymmetry into the denominator instead reports
+an ``fr`` displaced by ``fr * Im(1 / Qe) / 2``; ``Qi``, ``Qc`` and ``phi`` are
+unaffected. Use ``Qc`` in parameter dictionaries such
 as ``initial_guess``, ``param_bounds`` and ``param_fixed``. ``Qe`` and
 ``Qc_abs = abs(Qe)`` are returned for reporting; ``Qc_abs`` is not itself a
 fit parameter.
@@ -422,6 +429,32 @@ def duffing_y(y0, anl, sweep_direction="up"):
     raise ValueError('sweep_direction must be "up" or "down"')
 
 
+def _resonator_factor(x, Qi, Qe, anl, sweep_direction):
+    """Notch factor shared by the linear and Duffing branches.
+
+    Writing ``Qr_inv = 1/Qi + Re(1/Qe)`` (the loaded ``1/Ql``), the factor is
+
+        1 - (1/Qe) / (Qr_inv + 2j * xd)
+
+    with ``xd = x`` for the linear model and ``xd = y * Qr_inv`` for the driven
+    one, ``y`` being the Duffing coordinate. Only the real part of ``1/Qe``
+    enters the denominator, which is the numerator-phase (Probst/Swenson)
+    convention: since ``Qe = |Qe| exp(1j*phi)`` the factor is equally
+    ``1 - (Qr/|Qe|) exp(-1j*phi) / (1 + 2j*y)``. That keeps the asymmetry out of
+    the detuning the Duffing cubic acts on, and makes ``anl -> 0`` reproduce the
+    linear branch exactly -- including for ``phi != 0``, where the alternative
+    (complex-denominator) convention would instead displace ``fr`` by
+    ``fr * Im(1/Qe) / 2``. In this convention ``fr`` is the frequency of maximum
+    ``|dS21/df|`` for any ``phi``.
+    """
+    Qr_inv = 1.0 / Qi + np.real(1.0 / Qe)
+    if float(anl) == 0.0:
+        xd = x
+    else:
+        xd = duffing_y(x / Qr_inv, anl, sweep_direction) * Qr_inv
+    return 1.0 - (1.0 / Qe) / (Qr_inv + 2j * xd)
+
+
 def s21_model(f, fr, Qi, Qc, phi, a, alpha, tau, anl=0.0, sweep_direction="up"):
     """Evaluate the physical S21 model in returned-parameter coordinates.
 
@@ -452,16 +485,7 @@ def s21_model(f, fr, Qi, Qc, phi, a, alpha, tau, anl=0.0, sweep_direction="up"):
     Qe = complex_coupling_q(Qc, phi)
     x = (f - fr) / fr
     env = a * np.exp(1j * alpha) * np.exp(-2j * np.pi * f * tau)
-    if float(anl) == 0.0:
-        res = 1.0 - (1.0 / Qe) / (1.0 / Qi + 1.0 / Qe + 2j * x)
-    else:
-        # Preserve the established nonlinear fit convention. For phi != 0,
-        # this real-Qr denominator means the anl -> 0 limit is not identical
-        # to the asymmetric linear branch above.
-        Qr_inv = 1.0 / Qi + np.real(1.0 / Qe)
-        y = duffing_y(x / Qr_inv, anl, sweep_direction)
-        res = 1.0 - (1.0 / Qe) / (Qr_inv * (1.0 + 2j * y))
-    return env * res
+    return env * _resonator_factor(x, Qi, Qe, anl, sweep_direction)
 
 
 def s21_model_centered_delay(f, fr, Qi, Qc, phi, a, alpha0, tau,
@@ -478,13 +502,7 @@ def s21_model_centered_delay(f, fr, Qi, Qc, phi, a, alpha0, tau,
     Qe = complex_coupling_q(Qc, phi)
     x = (f - fr) / fr
     env = a * np.exp(1j * alpha0) * np.exp(-2j * np.pi * (f - f0) * tau)
-    if float(anl) == 0.0:
-        res = 1.0 - (1.0 / Qe) / (1.0 / Qi + 1.0 / Qe + 2j * x)
-    else:
-        Qr_inv = 1.0 / Qi + np.real(1.0 / Qe)
-        y = duffing_y(x / Qr_inv, anl, sweep_direction)
-        res = 1.0 - (1.0 / Qe) / (Qr_inv * (1.0 + 2j * y))
-    return env * res
+    return env * _resonator_factor(x, Qi, Qe, anl, sweep_direction)
 
 
 def _s21_linear_jacobian(f, fr, Qi, Qc, phi, a, alpha0, tau, f0=0.0):
@@ -495,9 +513,13 @@ def _s21_linear_jacobian(f, fr, Qi, Qc, phi, a, alpha0, tau, f0=0.0):
     respect to ``fr, Qi, Qc, phi, a, alpha0, tau`` in that order -- the same
     parameter order as :data:`LINEAR_NAMES`.
 
-    Writing ``u = 1/Qe``, ``c = 1/Qi + 2j*x`` and ``g = c + u`` (so the
-    resonator factor is ``res = 1 - u/g = c/g``) the derivatives are all closed
-    form; the optimiser uses this instead of finite-differencing the model.
+    Writing ``u = 1/Qe``, ``c = 1/Qi + 2j*x`` and ``g = c + Re(u)`` (so the
+    resonator factor is ``res = 1 - u/g``; see :func:`_resonator_factor` for why
+    only ``Re(u)`` appears) the derivatives are all closed form; the optimiser
+    uses this instead of finite-differencing the model.
+
+    Both ``u`` and ``g`` depend on ``phi``, via ``du/dphi = -1j*exp(-2j*phi)/Qc``
+    and ``dg/dphi = Re(du/dphi)``, so that column carries two terms.
     """
     f = np.asarray(f, float)
     T = 1.0 + 1j * np.tan(phi)
@@ -506,19 +528,18 @@ def _s21_linear_jacobian(f, fr, Qi, Qc, phi, a, alpha0, tau, f0=0.0):
     x = (f - fr) / fr
     env = a * np.exp(1j * alpha0) * np.exp(-2j * np.pi * (f - f0) * tau)
     c = 1.0 / Qi + 2j * x
-    g = c + u
+    g = c + np.real(u)
     g2 = g * g
-    res = c / g
-    s21 = env * res
-    sec2 = 1.0 / np.cos(phi) ** 2
+    s21 = env * (1.0 - u / g)
+    u_phi = -1j * np.exp(-2j * phi) / Qc               # du/d phi
     d = np.empty((f.size, 7), complex)
-    d[:, 0] = env * (2j * u / g2) * (-f / fr ** 2)   # d/d fr  (via x)
-    d[:, 1] = env * (-u / (Qi * Qi * g2))            # d/d Qi
-    d[:, 2] = env * (c * u / (Qc * g2))              # d/d Qc
-    d[:, 3] = env * (1j * sec2 * c * u / (g2 * T))   # d/d phi
-    d[:, 4] = s21 / a                                # d/d a
-    d[:, 5] = 1j * s21                               # d/d alpha0
-    d[:, 6] = s21 * (-2j * np.pi * (f - f0))         # d/d tau
+    d[:, 0] = env * (2j * u / g2) * (-f / fr ** 2)     # d/d fr  (via x)
+    d[:, 1] = env * (-u / (Qi * Qi * g2))              # d/d Qi
+    d[:, 2] = env * (c * u / (Qc * g2))                # d/d Qc
+    d[:, 3] = env * (-(u_phi * g - u * np.real(u_phi)) / g2)   # d/d phi
+    d[:, 4] = s21 / a                                  # d/d a
+    d[:, 5] = 1j * s21                                 # d/d alpha0
+    d[:, 6] = s21 * (-2j * np.pi * (f - f0))           # d/d tau
     return d
 
 
