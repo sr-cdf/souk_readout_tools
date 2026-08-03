@@ -641,6 +641,79 @@ PSDs for a fraction of the time. The cost is that the raw overlay and the
 `SVD N=1` legend entry are no longer automatic -- plot the raw and cleaned
 samples in separate passes, with an explicit `label`, to keep them.
 
+## Noise-to-Carrier Units
+
+`plot_timestream_psd()` plots the PSD in its native units on a log-log axis by
+default. `psd_units` switches the display:
+
+```python
+plot_timestream_psd(
+    loopback_samples,
+    format="magphase",
+    tones=[0],
+    psd_units="dbc",
+)
+```
+
+- `"linear"` (default) -- native units, log-log axis.
+- `"db"` -- `10*log10` of the same quantity, log-x axis. This is the option
+  for `format="freq_diss"`, where the rows are already fractional.
+- `"dbc"` -- carrier-referenced dBc/Hz, log-x axis. The raw-unit panels are
+  divided by the carrier power `|mean(z)|**2`, and the one-sided density is
+  halved to give the IEEE single-sideband `L(f) = S(f) / 2`. For
+  `format="magphase"` the panels are then AM and PM noise; phase is already
+  carrier-relative, so it is only halved.
+
+Single sideband is the convention a synthesiser datasheet quotes, and is
+3.01 dB below the total density of `dz/z0`.
+[`scripts/quantisation/quantisation_noise_test.py`](../scripts/quantisation/quantisation_noise_test.py)
+reports the same quantity the same way, so its numbers and these plots are
+directly comparable.
+
+`format="iq"` accepts `psd_units="dbc"` too, dividing both panels by the
+carrier power. Note that the quadratures are not rotated onto the carrier, so
+which panel carries the AM and which the PM depends on the tone's own phase --
+`magphase` is that rotation, and is normally what you want. `psd_units="dbc"`
+is rejected for `format="freq_diss"`, whose rows are not carrier-referenced.
+
+One carrier is measured per tone from the raw I/Q and reused for the cleaned
+trace, because both cleaning steps preserve the amplitude and phase baselines.
+Raw and cleaned lines on one plot therefore share a normalisation.
+
+`plot_snapshots_psd()` takes the same argument. Since dBc/Hz divides out the
+raw units, that makes the pre-accumulator snapshots and the accumulated
+timestream directly comparable on one figure -- the `acc_len` scale difference
+between them cancels, where in linear units the two sit decades apart. This is
+the high-f / low-f overlay shown above, in units that can be read across the
+join.
+
+### Tying the Two Panels Together
+
+Comparing the two panels by eye only works if they are on the same scale.
+`sharey=True` ties their y limits:
+
+```python
+plot_timestream_psd(
+    on_res_samples,
+    format="magphase",
+    tones=[0],
+    psd_units="dbc",
+    sharey=True,
+)
+```
+
+For `format="freq_diss"` the panels are tied by default -- both are fractional
+-- so the frequency and dissipation floors can be read against each other. For
+`"iq"` and `"magphase"` the default is untied, since the panels are not in the
+same units; `psd_units="dbc"` or `"db"` puts them on a common scale and makes
+`sharey=True` worth passing. `sharex` (default `True`) does the same for the
+frequency axis. Both are accepted by `plot_timestream()`, `plot_snapshots()`
+and `plot_snapshots_psd()` as well.
+
+Sharing stays live as traces are overlaid with `fig=`, so both panels rescale
+together. It cannot be undone on an existing figure, though -- a later call
+can add sharing but not remove it, so start a fresh figure to go back.
+
 ## Cross-Load Analysis
 
 With the directory convention above, cross-load analysis can iterate over

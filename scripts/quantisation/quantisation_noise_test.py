@@ -59,9 +59,10 @@ the level IS the axis there.  Every step also reports the measured DAC and ADC
 peak levels and the PSB / psb_scale / PFB overflow counters; anything flagged
 means the step clipped and is measuring saturation, not quantisation.
 
-Reported and saved as noise-to-carrier (no calibration needed) for three
-components -- complex (magnitude and phase in quadrature, what sets readout
-SNR), magnitude alone, phase alone:
+Reported and saved as noise-to-carrier (no calibration needed) in the IEEE
+single-sideband convention L(f) = S(f) / 2, for three components -- complex
+(magnitude and phase in quadrature, what sets readout SNR), magnitude alone,
+phase alone:
 
   floor  median in-band density, dBc/Hz -- broadband, spurs excluded
   rms    mean in-band density, dBc/Hz -- the same with spurs included
@@ -200,8 +201,8 @@ print(f'{fs:.6f} Hz accumulator rate, {num_samples} samples per step, band '
       f'{BAND_HZ[0]}-{BAND_HZ[1]} Hz, {n_avg} Welch averages, loopback={LOOPBACK}\n'
       f'sub-bands {edges[0]:.1f}/{edges[1]:.1f}/{edges[2]:.1f}/{edges[3]:.1f} Hz, '
       f'tones {"aligned to" if ALIGN_TO_FS else "NOT aligned to"} the '
-      f'accumulation rate\nfloor/rms in dBc/Hz and band in dBc (bigger is '
-      f'better), peak in dB\nwriting {OUTFILE}')
+      f'accumulation rate\nfloor/rms in dBc/Hz and band in dBc, single '
+      f'sideband (bigger is better), peak in dB\nwriting {OUTFILE}')
 
 
 def analyse(z):
@@ -214,10 +215,13 @@ def analyse(z):
     band = (f >= BAND_HZ[0]) & (f <= BAND_HZ[1])
 
     # dz/z0 = a + i.phi to first order, so the complex noise-to-carrier density
-    # is exactly the quadrature sum of the two, in 1/Hz either way.
+    # is exactly the quadrature sum of the two, in 1/Hz either way.  Halving
+    # each one-sided density gives the IEEE single-sideband L(f) = S(f) / 2,
+    # the convention a synthesiser datasheet quotes and the one
+    # plot_timestream_psd(psd_units='dbc') uses.
     out = {'carrier': np.abs(z0)}
-    for name, s in (('complex', s_mag + s_phase), ('mag', s_mag),
-                    ('phase', s_phase)):
+    for name, s in (('complex', (s_mag + s_phase) / 2), ('mag', s_mag / 2),
+                    ('phase', s_phase / 2)):
         # The median floor reads high by the chi-squared median/mean bias (1.6 dB
         # at one Welch average, ~0.2 dB at ten), so compare floors step to step
         # rather than absolutely; rms is unbiased (checked against synthetic

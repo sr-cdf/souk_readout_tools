@@ -103,7 +103,9 @@ The script holds the DAC drive constant and walks both trades as a ladder
 (amplitude 1, 1/2, 1/4, ... against `psb_scale` x1, x2, x4, ...; and the shift
 schedule one stage hotter then progressively colder), measuring the
 noise-to-carrier spectral density of a single loopback tone at the
-accumulator. It reports the slope in dB of noise per dB of gain moved
+accumulator, as the IEEE single-sideband `L(f) = S(f) / 2` in dBc/Hz -- the
+same convention as `plot_timestream_psd(psd_units='dbc')`. It reports the
+slope in dB of noise per dB of gain moved
 downstream: `0` means the trade is free and the floor is set downstream of the
 PSB, `1` means TX digital quantisation dominates and the amplitude should be
 kept as high as the VACC and PAPR constraints allow. The reference point is

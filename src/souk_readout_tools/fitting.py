@@ -35,7 +35,10 @@ parameters. ``fit_resonance(..., nonlinear=True)`` delegates to
 ``fit_resonance_nonlinear``.
 
 ``fit_resonance_nonlinear`` first performs a linear fit on the full sweep to
-seed the Duffing fit. The nonlinear ``anl`` parameter is optimized internally
+seed the Duffing fit. The refinement is scored against that seed at the end: a
+Duffing fit cannot legitimately be worse than it (``anl -> 0`` reproduces it), so
+when it is, the fit is redone with ``anl`` pinned at the floor and
+``linear_seed_guard`` is set on the result. The nonlinear ``anl`` parameter is optimized internally
 as ``log(anl)`` for stable per-decade sensitivity, then converted back to
 linear units in the returned result. For strongly bistable/high-drive shapes,
 ``try_harder`` and ``try_even_harder`` probe extra ``(fr, Qi, anl)`` seeds and
@@ -234,6 +237,11 @@ _USE_ANALYTIC_LINEAR_JAC = True
 # anl values that sit below the noise floor of any real measurement.
 _ANL_MIN = 1e-8
 
+# How much worse than its own linear seed a Duffing refinement may score before
+# the anl-pinned fallback is tried (see fit_resonance_nonlinear). Just above 1 so
+# optimiser round-off does not trigger a redundant refit.
+_SEED_COST_TOL = 1.0 + 1e-6
+
 # Dip-shape thresholds that trigger the high-anl probe. Raising a value makes the
 # probe fire less often (fewer extra fits, but more risk of missing a strongly
 # bistable resonator); lowering it fires the probe more readily.
@@ -303,6 +311,9 @@ class FitResult:
     # Populated only by nonlinear='auto': the linear-sufficiency diagnostics
     # (dip_excess, asymmetry, ...) and whether the Duffing fit was skipped.
     linear_sufficiency: object = field(default=None, repr=False)
+    # True when the Duffing refinement scored worse than its own linear seed and
+    # the anl-pinned fallback was taken instead; see fit_resonance_nonlinear.
+    linear_seed_guard: bool = False
     anl: float = 0.0
     sweep_direction: str = "up"
     nonlinear_detuning_hz: float = 0.0
@@ -758,6 +769,24 @@ def nonlinear_detuning_hz(fr, Qi, Qc, anl, phi=0.0):
     result is ``fr * Qr_inv * anl``.
     """
     return float(fr * (1.0 / Qi + np.real(1.0 / complex_coupling_q(Qc, phi))) * anl)
+
+
+def _linear_seed_cost(f, z, optimizer_z_error, opt_linear, f0, sweep_direction,
+                      error_weight_power):
+    """Score the linear seed on the points the Duffing refinement actually used.
+
+    ``opt_linear.cost`` is not comparable directly: with ``subsample=True`` the
+    linear pre-fit runs on the full sweep while the refinement runs on the
+    kept points. Re-evaluating the linear solution here puts both costs on the
+    same points and the same optimiser weights.
+    """
+    p = np.r_[np.asarray(opt_linear.x, float), 0.0]
+    d = s21_model_centered_delay(f, *p, f0=f0, sweep_direction=sweep_direction) - z
+    r = np.r_[d.real, d.imag]
+    weights = _error_vector(optimizer_z_error, error_weight_power)
+    if weights is not None:
+        r = r / weights
+    return 0.5 * float(np.sum(r * r))
 
 
 def _circle_fit(z):
@@ -1837,16 +1866,19 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
         nl_guess.setdefault("fr", fr_seed)
         nl_guess.setdefault("anl", anl_seed)
 
-    def _refine(nl_guess_local):
+    def _refine(nl_guess_local, extra_fixed=None):
         p0_local = np.r_[opt_linear.x, 1e-5]
         p0_local = _apply_initial_guess(p0_local, NONLINEAR_NAMES, nl_guess_local, f0)
+        fixed_local = param_fixed
+        if extra_fixed:
+            fixed_local = dict(_parameter_dict(param_fixed) or {}, **extra_fixed)
         # Uncertainties are deferred: a probe grid runs up to ~60 refinements
         # but only one wins, so the SVD covariance is computed once afterwards
         # (see _attach_uncertainties below) instead of on every candidate.
         return _run_optimizer(
             f, z, z_error, opt_error, p0_local, True, sweep_direction, f0, max_nfev, tol,
             param_bounds=_select_names(param_bounds, NONLINEAR_NAMES),
-            param_fixed=param_fixed,
+            param_fixed=fixed_local,
             return_uncertainties=False,
             error_weight_power=error_weight_power,
         )
@@ -1904,6 +1936,29 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
                     if np.isfinite(cand.cost) and cand.cost < best.cost:
                         best = cand
         opt = best
+
+    # A Duffing refinement cannot legitimately be worse than the linear seed it
+    # started from: anl -> 0 reproduces that fit. When it is worse, the
+    # optimiser has wandered out of the basin -- deep bistable dips can strand
+    # it at a large spurious anl -- so refit with anl pinned at the floor, which
+    # recovers linear-quality residuals while still returning an eight-parameter
+    # nonlinear result. Only the fits that need it pay for the extra refinement.
+    seed_guard = False
+    anl_is_user_fixed = "anl" in (_parameter_dict(param_fixed) or {})
+    if not anl_is_user_fixed:
+        seed_cost = _linear_seed_cost(f, z, opt_error, opt_linear, f0,
+                                      sweep_direction, error_weight_power)
+        if np.isfinite(seed_cost) and (
+                not np.isfinite(opt.cost) or opt.cost > seed_cost * _SEED_COST_TOL):
+            # Seed from the linear solution itself, not from nl_guess: the
+            # asymmetry seed's fr override is what pushed the refinement out of
+            # the basin in the first place. User guesses are still honoured.
+            fallback = _refine(_select_names(guess, NONLINEAR_NAMES) or {},
+                               extra_fixed={"anl": _ANL_MIN})
+            total_nonlinear_duration += float(getattr(fallback, "duration_s", 0.0))
+            total_nonlinear_nfev += int(getattr(fallback, "nfev", 0))
+            if np.isfinite(fallback.cost) and not (fallback.cost >= opt.cost):
+                opt, seed_guard = fallback, True
     opt.total_nonlinear_duration_s = total_nonlinear_duration
     opt.total_nonlinear_nfev = total_nonlinear_nfev
     # Refinements deferred their uncertainties; compute them once on the winner.
@@ -1918,6 +1973,7 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
     # Record why 'auto' decided to run the nonlinear fit (None for True/False).
     if sufficiency is not None:
         result.linear_sufficiency = sufficiency
+    result.linear_seed_guard = seed_guard
     return result
 
 

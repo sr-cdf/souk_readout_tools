@@ -16,15 +16,16 @@ from ..noise import (fractional_frequency_and_dissipation_timestreams,
                      remove_blind_tone_common_modes,
                      remove_common_modes_svd,
                      remove_iq_common_modes_svd)
-from ._common import (_get_pyplot, _compute_mag_phase,
+from ._common import (_get_pyplot, _compute_mag_phase, _dual_panels,
                        _apply_deembed, _apply_phase_center,
-                       _resolve_label,
+                       _resolve_label, _legend,
                        _normalise_iq, _compute_mag_phase_units, UNITS,
                        _is_calibrated_magnitude_unit,
                        _canonical_units, _validate_reference_plane,
                        _with_samples_readout_correction,
                        _with_sweep_readout_correction)
-from ._psd import compute_psd, log_bin_psd
+from ._psd import (carrier_power, check_psd_units, compute_psd,
+                   log_bin_psd, psd_display_values)
 
 # PTP clock rate: telescope_time counts per second
 TT_CLOCK_HZ = 30720000
@@ -467,13 +468,26 @@ def _prepare_psd_for_log_plot(f, p, include_dc_point, log_bin, bins_per_decade):
     return f, p
 
 
-def _match_y_limits(*axes):
-    """Set all axes to the combined current y-limits."""
-    limits = [ax.get_ylim() for ax in axes]
-    ymin = min(limit[0] for limit in limits)
-    ymax = max(limit[1] for limit in limits)
-    for ax in axes:
-        ax.set_ylim(ymin, ymax)
+def _plot_psd(ax, f, p, psd_units, carrier=1.0, **kwargs):
+    """Plot one PSD panel in the requested display units."""
+    values = psd_display_values(p, psd_units, carrier)
+    plot = ax.loglog if psd_units == 'linear' else ax.semilogx
+    return plot(f, values, **kwargs)
+
+
+def _psd_axis_labels(format, psd_units, conversion_method):
+    """Return the two panel y-axis labels for a PSD plot."""
+    if psd_units == 'dbc':
+        if format == 'iq':
+            return 'I noise (dBc/Hz, SSB)', 'Q noise (dBc/Hz, SSB)'
+        return 'AM noise (dBc/Hz, SSB)', 'PM noise (dBc/Hz, SSB)'
+    suffix = ' (dB)' if psd_units == 'db' else ''
+    if format == 'iq':
+        return 'I PSD' + suffix, 'Q PSD' + suffix
+    if format == 'magphase':
+        return 'Magnitude PSD' + suffix, 'Phase PSD' + suffix
+    return ('Resonator-frequency noise PSD' + suffix,
+            _dissipation_axis_label(conversion_method, psd=True) + suffix)
 
 
 def _cleaning_label(trace_label, blind_tone_modes, decorrelate_modes):
@@ -594,6 +608,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     x_axis='time', unwrap_phase=True,
                     smooth_window_hz=1000, conversion_method=None,
                     calibrations=None, apply_readout_correction=True,
+                    sharex=True, sharey=False,
                     **kwargs):
     """
     Plot timestream data in various formats.
@@ -674,6 +689,14 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             (False) the filterbank compensation's software readout-flattening
             factors, for modulated captures and any sweep trace used. Toggles
             already-parsed data either way when the factors are available.
+        sharex: bool, optional. Tie the two panels' x limits together in the
+            dual-panel formats. Default ``True``.
+        sharey: bool, optional. Tie the two panels' y limits together, so
+            they can be compared by eye. Default ``False``; most useful for
+            ``'iq_vs_t'`` and ``'freq_diss'``, whose panels share units.
+            Ignored by ``format='iq'`` (a single panel). Plotting onto an
+            existing ``fig`` can add sharing but cannot remove sharing that
+            figure was created with.
         **kwargs: Passed to matplotlib plot calls.
 
     Returns:
@@ -760,17 +783,15 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         ax.set_xlabel(f'I {iq_label}'.strip())
         ax.set_ylabel(f'Q {iq_label}'.strip())
         ax.set_aspect('equal', adjustable='datalim')
-        ax.legend(fontsize='small')
+        _legend(ax)
         ax.set_title(custom_title if custom_title is not None
                      else 'Timestream I vs Q' + suffix)
-        plt.tight_layout()
+        fig.tight_layout()
         return fig
 
     # Dual-axis formats
-    if fig is None:
-        fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(10, 5))
-    else:
-        ax1, ax2 = fig.axes[:2]
+    fig, ax1, ax2 = _dual_panels(fig, sharex=sharex, sharey=sharey,
+                                 figsize=(10, 5))
 
     for key, i_arr, q_arr in selected:
         trace_label = _resolve_label(ax1, label,
@@ -784,8 +805,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                 units=units, info=info, config=config,
                 reference_plane=reference_plane,
                 calibration_cache=calibration_cache)
-            ax1.plot(x_values, z.real, linewidth=0.5, label=trace_label, **kwargs)
-            ax2.plot(x_values, z.imag, linewidth=0.5, label=trace_label, **kwargs)
+            ax1.plot(x_values, z.real, label=trace_label, **kwargs)
+            ax2.plot(x_values, z.imag, label=trace_label, **kwargs)
             ax1.set_ylabel(f'I {iq_label}'.strip())
             ax2.set_ylabel(f'Q {iq_label}'.strip())
 
@@ -801,8 +822,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                 z, units, info=info, config=config,
                 reference_plane=reference_plane, frequencies=tone_f,
                 unwrap=unwrap_phase, calibration_cache=calibration_cache)
-            ax1.plot(x_values, mag_db, linewidth=0.5, label=trace_label, **kwargs)
-            ax2.plot(x_values, phase, linewidth=0.5, label=trace_label, **kwargs)
+            ax1.plot(x_values, mag_db, label=trace_label, **kwargs)
+            ax2.plot(x_values, phase,  label=trace_label, **kwargs)
             ax1.set_ylabel(mag_label)
             ax2.set_ylabel('Phase (rad)')
 
@@ -818,8 +839,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     smooth_window_hz=smooth_window_hz,
                     conversion_method=conversion_method,
                     calibrations=calibrations)
-            ax1.plot(x_values, frac_f, linewidth=0.5, label=trace_label, **kwargs)
-            ax2.plot(x_values, frac_d, linewidth=0.5, label=trace_label, **kwargs)
+            ax1.plot(x_values, frac_f, label=trace_label, **kwargs)
+            ax2.plot(x_values, frac_d, label=trace_label, **kwargs)
             ax1.set_ylabel('Fractional resonator-frequency motion')
             ax2.set_ylabel(_dissipation_axis_label(conversion_method))
 
@@ -829,8 +850,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                 "Use 'iq', 'iq_vs_t', 'magphase', or 'freq_diss'.")
 
     ax2.set_xlabel(x_label)
-    ax1.legend(fontsize='small')
-    ax2.legend(fontsize='small')
+    _legend(ax1)
+    _legend(ax2)
     if custom_title is not None:
         title = custom_title
     else:
@@ -843,7 +864,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         if format != 'freq_diss':
             title += suffix
     fig.suptitle(title)
-    plt.tight_layout()
+    fig.tight_layout()
     return fig
 
 
@@ -907,6 +928,7 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                         include_dc_point=False,
                         log_bin=False,
                         bins_per_decade=20,
+                        psd_units='linear',
                         decorrelate_modes=0,
                         decorrelate_plot='overlay',
                         decorrelate_tones=None,
@@ -914,6 +936,8 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                         blind_tones=None,
                         exclude_settling=False,
                         apply_readout_correction=True,
+                        sharex=True,
+                        sharey=None,
                         **kwargs):
     """
     Plot power spectral density of timestream data.
@@ -954,6 +978,20 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
             Default ``False`` preserves the raw Welch/periodogram frequencies.
         bins_per_decade: float, optional. Number of log bins per frequency
             decade when ``log_bin=True``. Default 10.
+        psd_units: {'linear', 'db', 'dbc'}, optional. Display units.
+            ``'linear'`` (default) plots the PSD in its native units on a
+            log-log axis. ``'db'`` plots ``10*log10(PSD)`` of the same
+            quantity. ``'dbc'`` divides the raw-unit panels by the carrier
+            power ``|mean(z)|**2`` and halves the one-sided density, giving
+            the IEEE single-sideband ``L(f) = S(f) / 2`` in dBc/Hz: AM and PM
+            noise for ``format='magphase'``, per-quadrature noise for
+            ``'iq'``. Phase is already carrier-relative and is only halved.
+            One carrier per tone is taken from the raw I/Q, so cleaned traces
+            share the raw trace's normalisation. Not available for
+            ``format='freq_diss'``, whose rows are already fractional -- use
+            ``'db'`` there. Note that ``'iq'`` splits AM and PM between the
+            panels by the tone's own phase, because the quadratures are not
+            rotated onto the carrier; ``'magphase'`` is that rotation.
         decorrelate_modes: int, optional. Remove this many leading SVD modes
             across the slow-timestream tone rows. ``0`` (default) disables
             decorrelation. For ``format='freq_diss'`` the modes are removed
@@ -987,12 +1025,21 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
             decimated sample rate. Raises if the flag is missing or the kept
             samples are not evenly spaced. Incompatible with SVD / blind-tone
             cleaning. Default ``False``.
+        sharex: bool, optional. Tie the two panels' x limits together.
+            Default ``True``.
+        sharey: bool or None, optional. Tie the two panels' y limits
+            together, so the top and bottom spectra can be compared by eye.
+            ``None`` (default) picks per format: on for ``'freq_diss'``
+            (both panels are fractional and directly comparable), off for
+            ``'iq'`` and ``'magphase'`` (whose panels carry different units).
+            Pass ``True`` to tie a magnitude/phase or I/Q pair anyway.
+            Plotting onto an existing ``fig`` can add sharing but cannot
+            remove sharing that figure was created with.
         **kwargs: Passed to plot calls.
 
     Returns:
         matplotlib.figure.Figure
     """
-    plt = _get_pyplot()
     ts_data = _with_samples_readout_correction(ts_data, apply_readout_correction)
     sweep_data = _with_sweep_readout_correction(sweep_data, apply_readout_correction)
     selected = _get_tone_data(ts_data, tones)
@@ -1031,6 +1078,10 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
     if decorrelate_plot not in ('overlay', 'replace'):
         raise ValueError(
             "decorrelate_plot must be either 'overlay' or 'replace'")
+    if format not in ('iq', 'magphase', 'freq_diss'):
+        raise ValueError(
+            f"Unknown format '{format}'. Use 'iq', 'magphase', or 'freq_diss'.")
+    check_psd_units(psd_units, format)
     if ((decorrelate_modes or blind_tone_modes)
             and format == 'freq_diss' and sweep_data is None):
         raise ValueError(
@@ -1046,11 +1097,13 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
     if conversion_method is None:
         conversion_method = 'linearized'
 
+    if sharey is None:
+        # The freq/diss panels are both fractional, so one scale compares them
+        # directly; I/Q and magnitude/phase panels are not in the same units.
+        sharey = (format == 'freq_diss')
+    fig, ax1, ax2 = _dual_panels(fig, sharex=sharex, sharey=sharey)
+
     if format in ('iq', 'magphase'):
-        if fig is None:
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6),sharex=True)
-        else:
-            ax1, ax2 = fig.axes[:2]
 
         def _iq_panel_psds(key, i_arr, q_arr):
             """PSDs of the two panels for one tone's I/Q rows."""
@@ -1075,6 +1128,12 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                                          suffix=f'Tone {key}' if len(selected) > 1 else None)
             tone_index = int(key)
             raw_color = None
+            # One carrier per tone, from the raw rows: cleaning preserves the
+            # amplitude/phase baselines, so both traces share a normalisation.
+            carrier = (carrier_power(i_arr + 1j * q_arr)
+                       if psd_units == 'dbc' else 1.0)
+            # The phase panel is already carrier-relative (rad^2/Hz).
+            carrier2 = carrier if format == 'iq' else 1.0
 
             if (not (decorrelate_modes or blind_tone_modes)
                     or decorrelate_plot == 'overlay'):
@@ -1088,10 +1147,11 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                     f1, p1, include_dc_point, log_bin, bins_per_decade)
                 f2, p2 = _prepare_psd_for_log_plot(
                     f2, p2, include_dc_point, log_bin, bins_per_decade)
-                lines = ax1.loglog(
-                    f1, p1, linewidth=0.5, label=trace_label, **kwargs)
+                lines = _plot_psd(ax1, f1, p1, psd_units, carrier,
+                                  label=trace_label, **kwargs)
                 raw_color = lines[0].get_color()
-                ax2.loglog(f2, p2, linewidth=0.5, label=trace_label, **kwargs)
+                _plot_psd(ax2, f2, p2, psd_units, carrier2,
+                          label=trace_label, **kwargs)
 
             if decorrelate_modes or blind_tone_modes:
                 if tone_index not in cleaned_iq:
@@ -1109,25 +1169,12 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                     clean_kwargs.setdefault('color', raw_color)
                 clean_label = _cleaning_label(
                     trace_label, blind_tone_modes, decorrelate_modes)
-                ax1.loglog(
-                    f1, p1, linewidth=0.5, label=clean_label, **clean_kwargs)
-                ax2.loglog(
-                    f2, p2, linewidth=0.5, label=clean_label, **clean_kwargs)
+                _plot_psd(ax1, f1, p1, psd_units, carrier,
+                          label=clean_label, **clean_kwargs)
+                _plot_psd(ax2, f2, p2, psd_units, carrier2,
+                          label=clean_label, **clean_kwargs)
 
-        if format == 'iq':
-            ax1.set_ylabel('I PSD')
-            ax2.set_ylabel('Q PSD')
-        else:
-            ax1.set_ylabel('Magnitude PSD')
-            ax2.set_ylabel('Phase PSD')
-
-    elif format == 'freq_diss':
-        if fig is None:
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6),
-                                           sharex=True, sharey=True)
-        else:
-            ax1, ax2 = fig.axes[:2]
-
+    else:
         raw_converted = {}
         cleaned = {}
         if decorrelate_modes or blind_tone_modes:
@@ -1173,11 +1220,11 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                     f1, p1, include_dc_point, log_bin, bins_per_decade)
                 f2, p2 = _prepare_psd_for_log_plot(
                     f2, p2, include_dc_point, log_bin, bins_per_decade)
-                lines = ax1.loglog(
-                    f1, p1, linewidth=0.5, label=trace_label, **kwargs)
+                lines = _plot_psd(ax1, f1, p1, psd_units,
+                                  label=trace_label, **kwargs)
                 raw_color = lines[0].get_color()
-                ax2.loglog(
-                    f2, p2, linewidth=0.5, label=trace_label, **kwargs)
+                _plot_psd(ax2, f2, p2, psd_units,
+                          label=trace_label, **kwargs)
 
             if decorrelate_modes or blind_tone_modes:
                 if tone_index not in cleaned:
@@ -1197,25 +1244,19 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                     clean_kwargs.setdefault('color', raw_color)
                 clean_label = _cleaning_label(
                     trace_label, blind_tone_modes, decorrelate_modes)
-                ax1.loglog(
-                    f1, p1, linewidth=0.5, label=clean_label, **clean_kwargs)
-                ax2.loglog(
-                    f2, p2, linewidth=0.5, label=clean_label, **clean_kwargs)
+                _plot_psd(ax1, f1, p1, psd_units,
+                          label=clean_label, **clean_kwargs)
+                _plot_psd(ax2, f2, p2, psd_units,
+                          label=clean_label, **clean_kwargs)
 
-        ax1.set_ylabel('Resonator-frequency noise PSD')
-        ax2.set_ylabel(_dissipation_axis_label(
-            conversion_method, psd=True))
-        _match_y_limits(ax1, ax2)
-
-    else:
-        raise ValueError(
-            f"Unknown format '{format}'. Use 'iq', 'magphase', or 'freq_diss'.")
-
+    ylabel1, ylabel2 = _psd_axis_labels(format, psd_units, conversion_method)
+    ax1.set_ylabel(ylabel1)
+    ax2.set_ylabel(ylabel2)
     ax2.set_xlabel('Frequency (Hz)')
-    ax1.legend(fontsize='small')
-    ax2.legend(fontsize='small')
+    _legend(ax1)
+    _legend(ax2)
     fig.suptitle('Power Spectral Density')
-    plt.tight_layout()
+    fig.tight_layout()
     return fig
 
 
@@ -1412,7 +1453,7 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
     ax_iq.set_xlabel(f'I {iq_label}'.strip())
     ax_iq.set_ylabel(f'Q {iq_label}'.strip())
     ax_iq.set_aspect('equal', adjustable='datalim')
-    ax_iq.legend(fontsize='small')
+    _legend(ax_iq)
 
     # Right panel: phase vs frequency
     ax_pf.plot(sweep_f, phase_sweep, '-', linewidth=1.5,
@@ -1422,7 +1463,7 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
                color='C1', label=ts_label, zorder=1, **kwargs)
     ax_pf.set_xlabel('Frequency (Hz)')
     ax_pf.set_ylabel('Phase (rad)')
-    ax_pf.legend(fontsize='small')
+    _legend(ax_pf)
 
     # Third panel: magnitude vs frequency
     ax_mf.plot(sweep_f, mag_sweep, '-', linewidth=1.5,
@@ -1432,9 +1473,9 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
                color='C1', label=ts_label, zorder=1, **kwargs)
     ax_mf.set_xlabel('Frequency (Hz)')
     ax_mf.set_ylabel(f'Magnitude {iq_label}'.strip())
-    ax_mf.legend(fontsize='small')
+    _legend(ax_mf)
 
     suffix = _transform_title_suffix(deembed, phase_center)
     fig.suptitle(f'Tone {tone_index} — Resonance Circle' + suffix)
-    plt.tight_layout()
+    fig.tight_layout()
     return fig

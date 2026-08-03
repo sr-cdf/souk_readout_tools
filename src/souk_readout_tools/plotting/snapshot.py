@@ -10,10 +10,13 @@ overlay on shared axes.
 """
 
 import numpy as np
-from ._common import (_get_pyplot, _compute_mag_phase, ERRORBAR_STYLE, _resolve_label,
+from ._common import (_get_pyplot, _compute_mag_phase, _dual_panels,
+                       ERRORBAR_STYLE, _resolve_label, _legend,
                        _apply_deembed, _apply_phase_center,
                        _normalise_iq, _compute_mag_phase_units, UNITS)
-from ._psd import compute_psd, compute_psd_averaged, compute_psd_concatenated
+from ._psd import (carrier_power, check_psd_units, compute_psd,
+                   compute_psd_averaged, compute_psd_concatenated,
+                   psd_display_values)
 
 
 def _snapshot_acc_len(snapshot_data, sweep_data):
@@ -34,9 +37,9 @@ def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
                                reference_tone_frequency, smooth_window_hz,
                                conversion_method, calibrations,
                                deembed, phase_center, units, fig, label,
+                               sharex=False, sharey=False,
                                **kwargs):
     """Time-domain fractional frequency/dissipation panel for snapshots."""
-    plt = _get_pyplot()
     if sweep_data is None:
         raise ValueError("sweep_data is required for format='freq_diss'")
     if units != 'raw':
@@ -77,10 +80,7 @@ def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
             f"Unknown repetitions mode '{repetitions}'. "
             "Use 'concatenate', 'overlay', or 'mean'.")
 
-    if fig is None:
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-    else:
-        ax1, ax2 = fig.axes[:2]
+    fig, ax1, ax2 = _dual_panels(fig, sharex=sharex, sharey=sharey)
 
     for (ff, fd), rep_label in traces:
         t = np.arange(len(ff)) / sample_rate * 1e6
@@ -91,10 +91,10 @@ def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
     ax1.set_ylabel('Fractional resonator-frequency motion')
     ax2.set_ylabel(_dissipation_axis_label(conversion_method))
     ax2.set_xlabel('Time (µs)')
-    ax1.legend(fontsize='small')
-    ax2.legend(fontsize='small')
+    _legend(ax1)
+    _legend(ax2)
     fig.suptitle(f'Tone {tone_index} — {n_snap} snapshots ({repetitions})')
-    plt.tight_layout()
+    fig.tight_layout()
     return fig
 
 
@@ -105,6 +105,7 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
                    units='raw', config=None, system_info=None,
                    unwrap_phase=True, smooth_window_hz=1000,
                    conversion_method='linearized', calibrations=None,
+                   sharex=True, sharey=False,
                    **kwargs):
     """
     Plot snapshot data for a single tone.
@@ -150,6 +151,14 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
         unwrap_phase: bool, optional.  Unwrap the phase in
             ``format='magphase'``.  Default ``True`` preserves the previous
             behaviour; pass ``False`` to show wrapped phase.
+        sharex, sharey: bool, optional. Tie the two panels' x / y limits
+            together in the dual-panel formats. ``sharex`` defaults to
+            ``True`` (both panels are the same time axis); ``sharey``
+            defaults to ``False`` and is most useful for ``'iq_vs_t'`` and
+            ``'freq_diss'``, whose panels share units. Ignored by
+            ``format='iq'`` (a single panel). Plotting onto an existing
+            ``fig`` can add sharing but cannot remove sharing that figure
+            was created with.
         **kwargs: Passed to plot calls.
 
     Returns:
@@ -172,7 +181,8 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             conversion_method=conversion_method,
             calibrations=calibrations,
             deembed=deembed, phase_center=phase_center,
-            units=units, fig=fig, label=label, **kwargs)
+            units=units, fig=fig, label=label,
+            sharex=sharex, sharey=sharey, **kwargs)
 
     # Normalise I/Q label setup
     if units != 'raw':
@@ -229,16 +239,13 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
         ax.set_xlabel(f'I {iq_label}'.strip())
         ax.set_ylabel(f'Q {iq_label}'.strip())
         ax.set_aspect('equal', adjustable='datalim')
-        ax.legend(fontsize='small')
+        _legend(ax)
         ax.set_title(f'Tone {tone_index} — I vs Q')
-        plt.tight_layout()
+        fig.tight_layout()
         return fig
 
     # Dual-axis formats
-    if fig is None:
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6))
-    else:
-        ax1, ax2 = fig.axes[:2]
+    fig, ax1, ax2 = _dual_panels(fig, sharex=sharex, sharey=sharey)
 
     for z, rep_label in zip(z_list, labels):
         n = len(z)
@@ -266,10 +273,10 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             raise ValueError(
                 f"Unknown format '{format}'. Use 'iq', 'iq_vs_t', or 'magphase'.")
 
-    ax1.legend(fontsize='small')
-    ax2.legend(fontsize='small')
+    _legend(ax1)
+    _legend(ax2)
     fig.suptitle(f'Tone {tone_index} — {n_snap} snapshots ({repetitions})')
-    plt.tight_layout()
+    fig.tight_layout()
     return fig
 
 
@@ -279,6 +286,8 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
                        show_errors=True, fig=None, label=None,
                        smooth_window_hz=1000,
                        conversion_method='linearized', calibrations=None,
+                       psd_units='linear',
+                       sharex=True, sharey=None,
                        **kwargs):
     """
     Plot PSD of snapshot data.
@@ -303,15 +312,27 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
         calibrations: Per-tone resonator calibrations or fit results. Required
             by ``conversion_method='mobius'`` and ``'circle'``.
         psd_kwargs: dict passed to compute_psd().
-        show_errors: bool. For 'averaged', show std-dev error bars.
+        show_errors: bool. For 'averaged', show std-dev error bars. In dB the
+            band is asymmetric, and both edges are converted.
         fig: Existing figure.
         label: Legend label. If None, uses an auto-incrementing index.
+        psd_units: {'linear', 'db', 'dbc'}, optional. Display units, as in
+            ``plot_timestream_psd()``: ``'dbc'`` gives carrier-referenced
+            dBc/Hz in the IEEE single-sideband convention. Because that
+            divides out the raw units, snapshot and accumulator-timestream
+            spectra can be overlaid on one figure in dBc/Hz despite the
+            pre-accumulation scale difference. Not available for
+            ``format='freq_diss'`` -- use ``'db'``.
+        sharex: bool, optional. Tie the two panels' x limits together.
+            Default ``True``.
+        sharey: bool or None, optional. Tie the two panels' y limits
+            together, as in ``plot_timestream_psd()``: ``None`` (default) is
+            on for ``'freq_diss'`` and off for ``'iq'`` / ``'magphase'``.
         **kwargs: Passed to plot calls.
 
     Returns:
         matplotlib.figure.Figure
     """
-    plt = _get_pyplot()
     snapshots = snapshot_data['snapshots']
     sample_rate = snapshot_data['sample_rate']
     tone_index = snapshot_data['tone_index']
@@ -320,17 +341,16 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
 
     if format == 'freq_diss' and sweep_data is None:
         raise ValueError("sweep_data is required for format='freq_diss'")
+    check_psd_units(psd_units, format)
 
     if format == 'iq':
         data_top = snapshots.real
         data_bot = snapshots.imag
-        y_top, y_bot = 'I PSD', 'Q PSD'
     elif format == 'magphase':
         data_top = np.abs(snapshots)
         data_bot = np.unwrap(np.angle(snapshots), axis=-1)
-        y_top, y_bot = 'Magnitude PSD', 'Phase PSD'
     elif format == 'freq_diss':
-        from .timestream import _compute_freq_diss, _dissipation_axis_label
+        from .timestream import _compute_freq_diss
         # Snapshots are pre-accumulation; sweep I/Q are sums over acc_len
         # samples. Scale up so both are in the same units.
         acc_len = _snapshot_acc_len(snapshot_data, sweep_data)
@@ -350,55 +370,73 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
             frac_d_list.append(fd)
         data_top = np.array(frac_f_list)
         data_bot = np.array(frac_d_list)
-        y_top = 'Resonator-frequency noise PSD'
-        y_bot = _dissipation_axis_label(conversion_method, psd=True)
     else:
         raise ValueError(
             f"Unknown format '{format}'. "
             "Use 'iq', 'magphase', or 'freq_diss'.")
 
-    if fig is None:
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-    else:
-        ax1, ax2 = fig.axes[:2]
+    if sharey is None:
+        # The freq/diss panels are both fractional, so one scale compares them
+        # directly; I/Q and magnitude/phase panels are not in the same units.
+        sharey = (format == 'freq_diss')
+    fig, ax1, ax2 = _dual_panels(fig, sharex=sharex, sharey=sharey)
 
     trace_label = _resolve_label(ax1, label)
+    # One carrier for the whole capture; the phase and freq/diss panels are
+    # already carrier-relative.
+    carrier = carrier_power(snapshots) if psd_units == 'dbc' else 1.0
+    carrier_bot = carrier if format == 'iq' else 1.0
 
-    def _plot_panel(ax, data2d):
+    def _plot_panel(ax, data2d, panel_carrier):
         """Draw one PSD panel from a (snapshots x samples) array on ``ax``."""
         if method == 'averaged':
             f, p_mean, p_std = compute_psd_averaged(
                 data2d, sample_rate, **psd_kw)
+            values = psd_display_values(p_mean, psd_units, panel_carrier)
             if show_errors and p_std is not None:
-                ax.errorbar(f, p_mean, yerr=p_std, linewidth=0.5,
+                if psd_units == 'linear':
+                    yerr = p_std
+                else:
+                    # A symmetric linear band is asymmetric in dB, so convert
+                    # each edge and give errorbar the two halves.
+                    low = psd_display_values(
+                        np.maximum(p_mean - p_std, np.finfo(float).tiny),
+                        psd_units, panel_carrier)
+                    high = psd_display_values(
+                        p_mean + p_std, psd_units, panel_carrier)
+                    yerr = np.vstack([values - low, high - values])
+                ax.errorbar(f, values, yerr=yerr, linewidth=0.5,
                             label=trace_label,
                             **{**ERRORBAR_STYLE, **kwargs})
             else:
-                ax.plot(f, p_mean, linewidth=0.5,
+                ax.plot(f, values, linewidth=0.5,
                         label=trace_label, **kwargs)
         elif method == 'concatenated':
             f, p = compute_psd_concatenated(
                 data2d, sample_rate, **psd_kw)
-            ax.plot(f, p, linewidth=0.5, label=trace_label, **kwargs)
+            ax.plot(f, psd_display_values(p, psd_units, panel_carrier),
+                    linewidth=0.5, label=trace_label, **kwargs)
         else:
             raise ValueError(
                 f"Unknown method '{method}'. "
                 "Use 'averaged' or 'concatenated'.")
         ax.set_xscale('log')
-        ax.set_yscale('log')
+        ax.set_yscale('log' if psd_units == 'linear' else 'linear')
 
-    _plot_panel(ax1, data_top)
-    _plot_panel(ax2, data_bot)
+    _plot_panel(ax1, data_top, carrier)
+    _plot_panel(ax2, data_bot, carrier_bot)
 
+    from .timestream import _psd_axis_labels
+    y_top, y_bot = _psd_axis_labels(format, psd_units, conversion_method)
     ax1.set_ylabel(y_top)
     ax2.set_ylabel(y_bot)
     ax2.set_xlabel('Frequency (Hz)')
-    ax1.legend(fontsize='small')
-    ax2.legend(fontsize='small')
+    _legend(ax1)
+    _legend(ax2)
     title_method = 'Averaged' if method == 'averaged' else 'Concatenated'
     fig.suptitle(
         f'Tone {tone_index} — {title_method} PSD ({n_snap} reps)')
-    plt.tight_layout()
+    fig.tight_layout()
     return fig
 
 
@@ -457,7 +495,7 @@ def plot_batch_snapshots(batch_data, format='iq_vs_t', repetitions='concatenate'
                     label=_resolve_label(ax, label), **kwargs)
             ax.set_aspect('equal', adjustable='datalim')
             ax.set_ylabel(f'Tone {tidx}\n({freqs[tidx]/1e6:.3f} MHz)')
-            ax.legend(fontsize='small')
+            _legend(ax)
             if row == n_tones - 1:
                 ax.set_xlabel('I')
 
@@ -538,8 +576,8 @@ def plot_batch_snapshots(batch_data, format='iq_vs_t', repetitions='concatenate'
             # Row label + legends
             ax1.set_title(f'Tone {tidx} ({freqs[tidx]/1e6:.3f} MHz)',
                           fontsize='small')
-            ax1.legend(fontsize='small')
-            ax2.legend(fontsize='small')
+            _legend(ax1)
+            _legend(ax2)
             if row == n_tones - 1:
                 ax1.set_xlabel('Time (µs)')
                 ax2.set_xlabel('Time (µs)')
@@ -562,5 +600,5 @@ def plot_batch_snapshots(batch_data, format='iq_vs_t', repetitions='concatenate'
                     ax_psd.set_xlabel('Frequency (Hz)')
 
     fig.suptitle(f'Batch Snapshots — {n_tones} tones, {repetitions}')
-    plt.tight_layout()
+    fig.tight_layout()
     return fig

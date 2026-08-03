@@ -8,7 +8,7 @@ frequency, all with optional deembedding or phase centering and error bars.
 
 import numpy as np
 from ._common import (_get_pyplot, _propagate_errors_mag,
-                       _apply_deembed, ERROR_FILL_STYLE, _resolve_label,
+                       _apply_deembed, ERROR_FILL_STYLE, _resolve_label, _legend,
                        _normalise_iq, _compute_mag_phase_units, UNITS,
                        _convert_tx_power_reference_plane,
                        _tx_tone_powers_from_info, _canonical_units,
@@ -858,13 +858,13 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                 ax.set_ylabel(_iq_axis_text(
                     'Q', axis_iq_label, phase_center=phase_center,
                     phase_rotate=phase_rotate, iq_suffix=iq_suffix))
-                ax.legend(fontsize='small')
+                _legend(ax)
             # Hide unused axes
             for i in range(n_traces, len(axes_flat)):
                 axes_flat[i].set_visible(False)
             if custom_title is not None:
                 fig.suptitle(custom_title)
-            plt.tight_layout()
+            fig.tight_layout()
             return fig
         if format == _MAGPHASE_IQ_FORMAT:
             fig, axis_blocks = _magphase_iq_grid_axes(plt, n_traces, fig=fig)
@@ -897,12 +897,12 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                     calibration_cache=calibration_cache,
                     **kwargs)
                 ax_mag.set_title(f'Tone {tidx}')
-                ax_mag.legend(fontsize='small')
-                ax_phase.legend(fontsize='small')
-                ax_iq.legend(fontsize='small')
+                _legend(ax_mag)
+                _legend(ax_phase)
+                _legend(ax_iq)
             if custom_title is not None:
                 fig.suptitle(custom_title)
-            plt.tight_layout()
+            fig.tight_layout()
             return fig
 
         else:
@@ -937,11 +937,11 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                                    tx_power_dbm=trace_tx_power,
                                    calibration_cache=calibration_cache,
                                    **kwargs)
-                axes[i, 0].legend(fontsize='small')
-                axes[i, 1].legend(fontsize='small')
+                _legend(axes[i, 0])
+                _legend(axes[i, 1])
             if custom_title is not None:
                 fig.suptitle(custom_title)
-            plt.tight_layout()
+            fig.tight_layout()
             return fig
 
     # Overlay or single trace
@@ -974,10 +974,10 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             'Q', axis_iq_label, phase_center=phase_center,
             phase_rotate=phase_rotate, iq_suffix=iq_suffix))
         ax.set_aspect('equal', adjustable='datalim')
-        ax.legend(fontsize='small')
+        _legend(ax)
         ax.set_title(custom_title if custom_title is not None
                      else 'Complex Plane' + suffix)
-        plt.tight_layout()
+        fig.tight_layout()
         return fig
 
     # Combined magnitude/phase plus IQ layout
@@ -1011,9 +1011,9 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                 calibration_cache=calibration_cache,
                 **kwargs)
 
-        ax1.legend(fontsize='small')
-        ax2.legend(fontsize='small')
-        ax3.legend(fontsize='small')
+        _legend(ax1)
+        _legend(ax2)
+        _legend(ax3)
         if custom_title is not None:
             title = custom_title
         else:
@@ -1021,7 +1021,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             title = f'Sweep ({bw/1e6:.1f} MHz)' if bw else 'Sweep'
             title += suffix
         fig.suptitle(title)
-        plt.tight_layout()
+        fig.tight_layout()
         return fig
 
     # Dual-axis formats: magphase or iq_vs_f
@@ -1056,8 +1056,8 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                            calibration_cache=calibration_cache,
                            **kwargs)
 
-    ax1.legend(fontsize='small')
-    ax2.legend(fontsize='small')
+    _legend(ax1)
+    _legend(ax2)
 
     if custom_title is not None:
         title = custom_title
@@ -1066,7 +1066,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         title = f'Sweep ({bw/1e6:.1f} MHz)' if bw else 'Sweep'
         title += suffix
     fig.suptitle(title)
-    plt.tight_layout()
+    fig.tight_layout()
     return fig
 
 
@@ -1935,13 +1935,13 @@ def plot_fits(fit_results, format='magphase', deembed=False,
                     calibration_cache=calibration_cache)
                 ax.set_title(_fit_trace_title(fit, i))
                 if finalize:
-                    ax.legend(fontsize='small')
+                    _legend(ax)
             for i in range(n_traces, len(axes_flat)):
                 axes_flat[i].set_visible(False)
             if finalize and custom_title is not None:
                 fig.suptitle(custom_title)
             if finalize:
-                plt.tight_layout()
+                fig.tight_layout()
             for ax in fig.axes:
                 _disable_axis_offsets(ax)
             return fig
@@ -1984,13 +1984,13 @@ def plot_fits(fit_results, format='magphase', deembed=False,
                     calibration_cache=calibration_cache)
                 ax_mag.set_title(_fit_trace_title(fit, i))
                 if finalize:
-                    ax_mag.legend(fontsize='small')
-                    ax_phase.legend(fontsize='small')
-                    ax_iq.legend(fontsize='small')
+                    _legend(ax_mag)
+                    _legend(ax_phase)
+                    _legend(ax_iq)
             if finalize and custom_title is not None:
                 fig.suptitle(custom_title)
             if finalize:
-                plt.tight_layout()
+                fig.tight_layout()
             for ax in fig.axes:
                 _disable_axis_offsets(ax)
             return fig
@@ -2029,13 +2029,13 @@ def plot_fits(fit_results, format='magphase', deembed=False,
                 tx_power_dbm=trace_tx_power,
                 calibration_cache=calibration_cache)
             if finalize:
-                axes[i, 0].legend(fontsize='small')
-                axes[i, 1].legend(fontsize='small')
+                _legend(axes[i, 0])
+                _legend(axes[i, 1])
             axes[i, 0].set_title(_fit_trace_title(fit, i))
         if finalize and custom_title is not None:
             fig.suptitle(custom_title)
         if finalize:
-            plt.tight_layout()
+            fig.tight_layout()
         for ax in fig.axes:
             _disable_axis_offsets(ax)
         return fig
@@ -2073,10 +2073,10 @@ def plot_fits(fit_results, format='magphase', deembed=False,
                 tx_power_dbm=trace_tx_power,
                 calibration_cache=calibration_cache)
         if finalize:
-            ax.legend(fontsize='small')
+            _legend(ax)
             ax.set_title(custom_title if custom_title is not None
                          else 'Fitted Sweeps' + suffix)
-            plt.tight_layout()
+            fig.tight_layout()
         for ax in fig.axes:
             _disable_axis_offsets(ax)
         return fig
@@ -2114,12 +2114,12 @@ def plot_fits(fit_results, format='magphase', deembed=False,
                 calibration_cache=calibration_cache)
 
         if finalize:
-            ax1.legend(fontsize='small')
-            ax2.legend(fontsize='small')
-            ax3.legend(fontsize='small')
+            _legend(ax1)
+            _legend(ax2)
+            _legend(ax3)
             fig.suptitle(custom_title if custom_title is not None
                          else 'Fitted Sweeps' + suffix)
-            plt.tight_layout()
+            fig.tight_layout()
         for ax in fig.axes:
             _disable_axis_offsets(ax)
         return fig
@@ -2159,11 +2159,11 @@ def plot_fits(fit_results, format='magphase', deembed=False,
             calibration_cache=calibration_cache)
 
     if finalize:
-        ax1.legend(fontsize='small')
-        ax2.legend(fontsize='small')
+        _legend(ax1)
+        _legend(ax2)
         fig.suptitle(custom_title if custom_title is not None
                      else 'Fitted Sweeps' + suffix)
-        plt.tight_layout()
+        fig.tight_layout()
     for ax in fig.axes:
         _disable_axis_offsets(ax)
     return fig
@@ -2225,8 +2225,8 @@ def plot_fit_params(fit_results, x='fr', y='Ql', color=None, fig=None,
     ax.set_xlabel(x)
     ax.set_ylabel(y)
     if label is not None:
-        ax.legend(fontsize='small')
-    plt.tight_layout()
+        _legend(ax)
+    fig.tight_layout()
     return fig
 
 

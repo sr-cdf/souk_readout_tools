@@ -1,6 +1,79 @@
 # Changelog & Feature List
 
-## Unreleased
+## v1.7.2
+
+**Duffing fits can no longer come back worse than their own linear seed**
+- `fit_resonance_nonlinear` picked the lowest-cost *nonlinear* candidate but
+  never compared it against the linear pre-fit it started from. Since `anl -> 0`
+  reproduces that pre-fit, a refinement scoring worse than it has left the
+  basin — on deep bistable dips the optimiser could strand itself at a large
+  spurious `anl` and report residuals hundreds of times worse than the linear
+  fit, with a nonsense nonlinearity attached.
+- The winning refinement is now scored against the linear seed (re-evaluated on
+  the same points, so `subsample=True` stays valid). If it loses, the fit is
+  redone with `anl` pinned at the floor and seeded from the linear solution,
+  which recovers linear-quality residuals in an eight-parameter result. The new
+  `FitResult.linear_seed_guard` flag records when this happened.
+- Measured on a 384-resonator, 16-step (-100 to -70 dBm) power sweep: the guard
+  fires on 1.8% of fits and cuts fits scoring worse than their seed from 103 to
+  12 (>2x worse: 84 to 3), removing 65 of 81 spurious `anl > 1` values. Median
+  cost is unchanged (38 ms/fit) — only the fits that need the fallback pay for
+  it. A user-supplied `param_fixed={'anl': ...}` disables the guard.
+
+**`sharex` / `sharey` on the two-panel timestream and snapshot plots**
+- `plot_timestream_psd()`, `plot_timestream()`, `plot_snapshots_psd()` and
+  `plot_snapshots()` take `sharex` and `sharey`, which tie the top and bottom
+  panels' axis limits together. `sharey=True` is the one to reach for when
+  comparing a magnitude against a phase spectrum, or frequency against
+  dissipation, on the same scale.
+- `sharex` defaults to `True` (it always was, except in `plot_snapshots()`'s
+  `iq_vs_t`/`magphase` panels, which now match everything else). The PSD
+  functions default `sharey=None`, meaning per format: on for `'freq_diss'`
+  — where both panels are fractional, as before — and off for `'iq'` and
+  `'magphase'`, whose panels are not in the same units. `plot_snapshots_psd()`
+  gains the shared freq/diss y axis that `plot_timestream_psd()` already had.
+- Sharing stays live: overlaying more traces onto the figure rescales both
+  panels together, rather than freezing them at the first trace's range.
+  Passing an existing `fig=` can add sharing but cannot remove sharing the
+  figure was created with.
+
+**Legends no longer squash overlaid plots**
+- Building a figure up by passing `fig=` back in adds a legend entry per call,
+  so a loop over many tones could make the legend taller than the axes.
+  `tight_layout` counts the legend as an axes decoration, so it shrank the
+  axes to fit — and since the legend keeps its size, every extra trace shrank
+  them further, ending in a postage-stamp plot in a sea of whitespace.
+- Legends are now excluded from the layout calculation and spill into up to
+  four (smaller) columns once they pass eight entries, so the axes keep full
+  size no matter how many traces are overlaid. Affects every plotting
+  function, not just `plot_timestream_psd()`.
+- `tight_layout` now applies to the figure being drawn rather than to
+  matplotlib's *current* figure, which is what you want when passing `fig=`
+  for a figure that is not the active one.
+
+**PSD display units: dBc/Hz and dB**
+- `plot_timestream_psd(psd_units=...)` selects the y axis: `'linear'`
+  (default, unchanged), `'db'` for `10*log10` of the native quantity, or
+  `'dbc'` for carrier-referenced dBc/Hz. Both dB options switch the axis from
+  log-log to log-x, and the conversion happens after log binning so the
+  averaging still runs in linear power.
+- `'dbc'` divides the raw-unit panels by the carrier power `|mean(z)|**2` and
+  halves the one-sided density, giving the IEEE single-sideband
+  `L(f) = S(f) / 2` — AM and PM noise for `format='magphase'`, per-quadrature
+  noise for `'iq'`. Phase is already carrier-relative, so it is only halved.
+  Rejected for `format='freq_diss'`, whose rows are already fractional; use
+  `'db'` there.
+- `plot_snapshots_psd()` takes the same argument, so pre-accumulator snapshots
+  and the accumulated timestream can be overlaid on one figure in dBc/Hz: the
+  normalisation cancels the `acc_len` scale difference that puts them decades
+  apart in linear units. Error bars are converted edge by edge, since a
+  symmetric linear band is asymmetric in dB.
+- **Convention change:** `scripts/quantisation/quantisation_noise_test.py` now
+  reports the same single-sideband `L(f)`, so its CSVs and these plots agree.
+  Values recorded before this read 3.01 dB noisier. Slopes are unaffected, but
+  do not mix old and new runs on one panel.
+- Documented in [Resonator Noise
+  Workflow](doc/resonator_noise_workflow.md#noise-to-carrier-units).
 
 **Common-mode removal without resonators**
 - `plot_timestream_psd()` now applies `decorrelate_modes` and

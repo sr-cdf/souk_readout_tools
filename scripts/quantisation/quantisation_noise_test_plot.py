@@ -26,9 +26,11 @@ high end of the band" unless you have checked the sub-bands too.
 
 One panel per ladder.  The x axis is the hardware setting that was stepped, in
 its own units; the caption says what else moved to compensate and what was held.
-The y axis is always the same measured quantity: in-band noise-to-carrier in the
-usual dBc/Hz convention -- NEGATIVE, and UP THE PANEL MEANS NOISIER.  (The CSV
-stores it the other way up, as dB below the carrier, so this script flips it.)
+The y axis is always the same measured quantity: in-band noise-to-carrier as the
+IEEE single-sideband L(f) = S(f) / 2, in dBc/Hz -- NEGATIVE, and UP THE PANEL
+MEANS NOISIER.  (The CSV stores it the other way up, as dB below the carrier, so
+this script flips it.)  Runs recorded before the single-sideband change read
+3.01 dB noisier; slopes are unaffected, so do not mix the two on one panel.
 
 The dashed line on each curve starts at that curve's own reference rung and
 shows where the noise would go if the source that ladder attacks were the only
@@ -129,7 +131,7 @@ def curve(comb, ladder, column):
 
 
 def noise(comb, ladder, column=None):
-    """Noise-to-carrier, dBc/Hz, negative: up the panel is noisier."""
+    """Noise-to-carrier, single-sideband dBc/Hz, negative: up is noisier."""
     _, value, low, high = curve(comb, ladder, column or f'{COMPONENT}_{PER_TONE}')
     return -value, -high, -low                     # negating swaps the band ends
 
@@ -253,7 +255,7 @@ def caption(ax, text, title):
             va='bottom')
 
 
-NOISE_LABEL = 'noise-to-carrier (dBc/Hz), up is noisier'
+NOISE_LABEL = 'noise-to-carrier (dBc/Hz, SSB), up is noisier'
 clipped = False
 for ax, (ladder, xcol, xlabel, logx, what) in zip(axes.flat, PANELS):
     xcol = knob_column(ladder, xcol)

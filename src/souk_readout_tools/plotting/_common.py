@@ -480,6 +480,34 @@ def _get_pyplot():
     return plt
 
 
+def _dual_panels(fig, sharex=True, sharey=False, figsize=(10, 6)):
+    """
+    Two stacked panels: a new figure, or the first two axes of an existing one.
+
+    Sharing ties the panels' limits together and keeps them tied as further
+    traces are added.  On an existing figure the two axes are joined in place,
+    so overplotting can add sharing but cannot remove sharing the figure was
+    created with.
+
+    Returns:
+        fig, ax1, ax2
+    """
+    plt = _get_pyplot()
+    if fig is None:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize,
+                                       sharex=sharex, sharey=sharey)
+        return fig, ax1, ax2
+
+    ax1, ax2 = fig.axes[:2]
+    for which, share in (('x', sharex), ('y', sharey)):
+        if not share:
+            continue
+        if getattr(ax1, f'get_shared_{which}_axes')().joined(ax1, ax2):
+            continue
+        getattr(ax1, f'share{which}')(ax2)
+    return fig, ax1, ax2
+
+
 def _compute_mag_phase(z,unwrap=True):
     """
     Compute log magnitude (dB) and phase from a complex response.
@@ -1302,6 +1330,31 @@ ERRORBAR_STYLE = dict(fmt='.', capsize=0, ecolor='red', markersize=2)
 
 # Fill style for fast error-band rendering on large traces
 ERROR_FILL_STYLE = dict(alpha=0.25)
+
+
+def _legend(ax, max_rows=8, **kwargs):
+    """Draw an in-axes legend that never drives the figure layout.
+
+    Plots built up by passing ``fig=`` back in gain a legend entry per call,
+    so a loop over many tones can easily produce a legend taller than the
+    axes.  ``tight_layout`` counts the legend as part of the axes decorations,
+    so once that happens it shrinks the axes to make room -- and since the
+    legend keeps its size, every extra trace shrinks them further, ending in a
+    postage-stamp plot surrounded by whitespace.  ``set_in_layout(False)``
+    keeps the legend out of that calculation, and spilling a long legend into
+    extra (smaller) columns stops it blanketing the data it labels.
+    """
+    handles, labels = ax.get_legend_handles_labels()
+    if not handles:
+        return None
+    kwargs.setdefault('fontsize', 'small')
+    if len(handles) > max_rows:
+        kwargs.setdefault('ncol', min(4, -(-len(handles) // max_rows)))
+    if len(handles) > 2 * max_rows:
+        kwargs['fontsize'] = 'x-small'
+    legend = ax.legend(**kwargs)
+    legend.set_in_layout(False)
+    return legend
 
 
 def _resolve_label(ax, label=None, suffix=None):
