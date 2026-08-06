@@ -144,1248 +144,865 @@ longer hardcoded to `/home/casper`.
 ## v1.7.3
 
 **One notch convention for the linear and driven models**
-- The linear branch of `s21_model` put the full complex `1/Qe` in the notch
-  denominator (`1/Qi + 1/Qe`) while the Duffing branch used the loaded
-  `Qr_inv = 1/Qi + Re(1/Qe)`. Both now use `Qr_inv` — note this is the loaded
-  inverse Q (internal plus the real part of external), not `Re(1/Qe)` itself —
-  i.e. the asymmetry is a numerator phase throughout (Probst/Swenson), and the
-  two branches are a single expression in the new `_resonator_factor`.
-- Consequences, all verified numerically: `anl -> 0` now reproduces the linear
-  model exactly for `phi != 0` (it did not before), and the fitted `fr` is the
-  frequency of maximum `|dS21/df|` at any `phi`. `Qi`, `Qc`, `phi` and fit
-  quality are unchanged — residual RSS is identical to the last digit on 384
-  measured sweeps; `fr` moves by `fr*Im(1/Qe)/2`, a median 5.9 kHz there.
-- This removes a silent mixing of conventions: `nonlinear='auto'` returns linear
-  fits for some tones and Duffing fits for others, whose `fr` values previously
-  differed by a median 10% of a linewidth (167% worst case) for no physical
-  reason. That gap is now 3e-6 linewidths.
-- `ResonatorCalibration.frequency_origin_fraction` is 0 for a linear fit (the
-  circle coordinate is already zero at `fr`), and the modulation operating point
-  for an undriven fit is `fr` itself. Driven fits are unaffected — they still
-  locate the steepest point on the Duffing drive coordinate.
-- `_s21_linear_jacobian` was re-derived for the new denominator (the `phi`
-  column now carries two terms, since `Qr_inv` depends on `phi` as well) and
-  checked against central differences over 60 random resonators: worst relative
-  error 3e-6 across all seven columns. Linear fits stay at 6 optimiser
-  iterations and ~7 ms.
+- `s21_model`'s linear branch put the full complex `1/Qe` in the notch denominator
+  (`1/Qi + 1/Qe`); the Duffing branch used the loaded `Qr_inv = 1/Qi + Re(1/Qe)`.
+  Both now use `Qr_inv` — the loaded inverse Q, not `Re(1/Qe)` itself — so the
+  asymmetry is a numerator phase throughout (Probst/Swenson), in one shared
+  `_resonator_factor`.
+- `anl -> 0` now reproduces the linear model exactly for `phi != 0`, and fitted `fr`
+  is the frequency of maximum `|dS21/df|` at any `phi`.
+- `Qi`, `Qc`, `phi` and fit quality unchanged (residual RSS identical on 384 measured
+  sweeps). `fr` moves by `fr*Im(1/Qe)/2`, median 5.9 kHz. The `nonlinear='auto'`
+  linear-vs-Duffing `fr` gap drops from a median 10% of a linewidth to 3e-6.
+- `ResonatorCalibration.frequency_origin_fraction` is 0 for a linear fit; driven fits
+  are unaffected.
+- `_s21_linear_jacobian` re-derived (the `phi` column now carries two terms); worst
+  relative error 3e-6 against central differences. Linear fits stay ~7 ms.
 
 ## v1.7.2
 
 **Duffing fits can no longer come back worse than their own linear seed**
-- `fit_resonance_nonlinear` picked the lowest-cost *nonlinear* candidate but
-  never compared it against the linear pre-fit it started from. Since `anl -> 0`
-  reproduces that pre-fit, a refinement scoring worse than it has left the
-  basin — on deep bistable dips the optimiser could strand itself at a large
-  spurious `anl` and report residuals hundreds of times worse than the linear
-  fit, with a nonsense nonlinearity attached.
-- The winning refinement is now scored against the linear seed (re-evaluated on
-  the same points, so `subsample=True` stays valid). If it loses, the fit is
-  redone with `anl` pinned at the floor and seeded from the linear solution,
-  which recovers linear-quality residuals in an eight-parameter result. The new
-  `FitResult.linear_seed_guard` flag records when this happened.
-- Measured on a 384-resonator, 16-step (-100 to -70 dBm) power sweep: the guard
-  fires on 1.8% of fits and cuts fits scoring worse than their seed from 103 to
-  12 (>2x worse: 84 to 3), removing 65 of 81 spurious `anl > 1` values. Median
-  cost is unchanged (38 ms/fit) — only the fits that need the fallback pay for
-  it. A user-supplied `param_fixed={'anl': ...}` disables the guard.
+- `fit_resonance_nonlinear` never scored the winning nonlinear candidate against the
+  linear pre-fit it started from, so a strayed optimiser could report a large spurious
+  `anl` with residuals hundreds of times worse.
+- The refinement is now compared against the linear seed; if it loses, the fit is
+  redone with `anl` pinned at the floor. New `FitResult.linear_seed_guard` flag;
+  `param_fixed={'anl': ...}` disables the guard.
+- On a 384-resonator, 16-step (-100 to -70 dBm) sweep: fires on 1.8% of fits, cuts
+  worse-than-seed fits from 103 to 12, removes 65 of 81 spurious `anl > 1`. Median
+  cost unchanged at 38 ms/fit.
 
 **`sharex` / `sharey` on the two-panel timestream and snapshot plots**
 - `plot_timestream_psd()`, `plot_timestream()`, `plot_snapshots_psd()` and
-  `plot_snapshots()` take `sharex` and `sharey`, which tie the top and bottom
-  panels' axis limits together. `sharey=True` is the one to reach for when
-  comparing a magnitude against a phase spectrum, or frequency against
-  dissipation, on the same scale.
-- `sharex` defaults to `True` (it always was, except in `plot_snapshots()`'s
-  `iq_vs_t`/`magphase` panels, which now match everything else). The PSD
-  functions default `sharey=None`, meaning per format: on for `'freq_diss'`
-  — where both panels are fractional, as before — and off for `'iq'` and
-  `'magphase'`, whose panels are not in the same units. `plot_snapshots_psd()`
-  gains the shared freq/diss y axis that `plot_timestream_psd()` already had.
-- Sharing stays live: overlaying more traces onto the figure rescales both
-  panels together, rather than freezing them at the first trace's range.
-  Passing an existing `fig=` can add sharing but cannot remove sharing the
-  figure was created with.
+  `plot_snapshots()` take `sharex` and `sharey`.
+- `sharex` defaults `True`. The PSD functions default `sharey=None`: on for
+  `'freq_diss'`, off for `'iq'` and `'magphase'`.
+- Sharing stays live as traces are overlaid. Passing an existing `fig=` can add
+  sharing but cannot remove it.
 
 **Legends no longer squash overlaid plots**
-- Building a figure up by passing `fig=` back in adds a legend entry per call,
-  so a loop over many tones could make the legend taller than the axes.
-  `tight_layout` counts the legend as an axes decoration, so it shrank the
-  axes to fit — and since the legend keeps its size, every extra trace shrank
-  them further, ending in a postage-stamp plot in a sea of whitespace.
-- Legends are now excluded from the layout calculation and spill into up to
-  four (smaller) columns once they pass eight entries, so the axes keep full
-  size no matter how many traces are overlaid. Affects every plotting
-  function, not just `plot_timestream_psd()`.
-- `tight_layout` now applies to the figure being drawn rather than to
-  matplotlib's *current* figure, which is what you want when passing `fig=`
-  for a figure that is not the active one.
+- Legends are excluded from the layout calculation and spill into up to four columns
+  past eight entries, so axes keep full size however many traces are overlaid.
+  Affects every plotting function.
+- `tight_layout` now applies to the figure being drawn rather than matplotlib's
+  current figure.
 
 **PSD display units: dBc/Hz and dB**
-- `plot_timestream_psd(psd_units=...)` selects the y axis: `'linear'`
-  (default, unchanged), `'db'` for `10*log10` of the native quantity, or
-  `'dbc'` for carrier-referenced dBc/Hz. Both dB options switch the axis from
-  log-log to log-x, and the conversion happens after log binning so the
-  averaging still runs in linear power.
-- `'dbc'` divides the raw-unit panels by the carrier power `|mean(z)|**2` and
-  halves the one-sided density, giving the IEEE single-sideband
-  `L(f) = S(f) / 2` — AM and PM noise for `format='magphase'`, per-quadrature
-  noise for `'iq'`. Phase is already carrier-relative, so it is only halved.
-  Rejected for `format='freq_diss'`, whose rows are already fractional; use
-  `'db'` there.
-- `plot_snapshots_psd()` takes the same argument, so pre-accumulator snapshots
-  and the accumulated timestream can be overlaid on one figure in dBc/Hz: the
-  normalisation cancels the `acc_len` scale difference that puts them decades
-  apart in linear units. Error bars are converted edge by edge, since a
-  symmetric linear band is asymmetric in dB.
-- **Convention change:** `scripts/quantisation/quantisation_noise_test.py` now
-  reports the same single-sideband `L(f)`, so its CSVs and these plots agree.
-  Values recorded before this read 3.01 dB noisier. Slopes are unaffected, but
-  do not mix old and new runs on one panel.
-- Documented in [Resonator Noise
-  Workflow](doc/resonator_noise_workflow.md#noise-to-carrier-units).
+- `plot_timestream_psd(psd_units=...)`: `'linear'` (default), `'db'`, or `'dbc'`. The
+  dB options switch to log-x; conversion happens after log binning.
+- `'dbc'` divides the raw-unit panels by carrier power `|mean(z)|**2` and halves the
+  one-sided density, giving the IEEE single-sideband `L(f) = S(f)/2`. Rejected for
+  `format='freq_diss'` — use `'db'` there.
+- `plot_snapshots_psd()` takes the same argument, so snapshots and the accumulated
+  timestream overlay in dBc/Hz: the normalisation cancels the `acc_len` offset.
+- **Convention change:** `scripts/quantisation/quantisation_noise_test.py` now reports
+  the same single-sideband `L(f)`. Values recorded before read 3.01 dB noisier — do
+  not mix old and new runs on one panel.
+- See [Resonator Noise Workflow](doc/resonator_noise_workflow.md#noise-to-carrier-units).
 
 **Common-mode removal without resonators**
-- `plot_timestream_psd()` now applies `decorrelate_modes` and
-  `blind_tone_modes` to `format='iq'` and `format='magphase'`, not just
-  `'freq_diss'`. Neither needs a sweep, so loopback noise data can be
+- `decorrelate_modes` and `blind_tone_modes` now apply to `format='iq'` and
+  `'magphase'`, not just `'freq_diss'`. Neither needs a sweep, so loopback data can be
   decorrelated.
-- For those formats the SVD modes are fitted from the tones' own normalised
-  amplitude and unwrapped-phase variations — the coordinates a common gain or
-  LO phase drift moves — and removed from the amplitude and phase rows
-  separately, mirroring the freq/diss treatment. Cleaned rows are recombined
-  into I/Q, so `'iq'` and `'magphase'` show the same cleaning.
-- New `noise.remove_iq_common_modes_svd(ts_data, n_modes, tones=...)` does this
-  standalone, returning a shallow copy of the parsed samples with cleaned I/Q
-  rows. `decorrelate_tones` defaults to every non-blind tone here.
-- Documented in [Resonator Noise
-  Workflow](doc/resonator_noise_workflow.md#without-resonators-iq-and-magphase).
+- New `noise.remove_iq_common_modes_svd(ts_data, n_modes, tones=...)`;
+  `decorrelate_tones` defaults to every non-blind tone.
+- See [Resonator Noise Workflow](doc/resonator_noise_workflow.md#without-resonators-iq-and-magphase).
 
 **Quantisation-noise test — `scripts/quantisation/`**
-- `quantisation_noise_test.py` measures whether moving digital gain downstream
-  costs SNR. Tone amplitude scales before the synthesis filterbank and
-  `psb_scale` after it, so halving one and doubling the other holds the DAC
-  drive constant while running the filterbank 6 dB closer to its own rounding
-  floor; one FFT shift stage is the same 6 dB taken inside the filterbank.
-- Walks both trades as a ladder at constant DAC drive (amplitude 1, 1/2,
-  1/4, ... against `psb_scale` x1, x2, x4, ...; and the shift schedule one stage
-  hotter then progressively colder), measuring the noise-to-carrier spectral
-  density of a single loopback tone at the accumulator, and reports the slope in
-  dB of noise per dB of gain moved downstream (0 = free, 1 =
-  quantisation-limited). Reports both a broadband floor and a band-integrated
-  statistic, which do not track each other.
-- Measures the reference point first and last so the repeatability floor is
-  explicit, checks DSP overflow and DAC saturation at every point, and pins the
-  RX chain after one optimisation so the test cannot measure the optimiser
-  instead. Defaults to digital loopback; `--loopback rf` repeats it through the
-  real path.
-- `quantisation_noise_test_plot.py` plots the resulting CSV.
-- Documented in [Tone Power and Dynamic Range
-  Notes](doc/tone_power_notes.md#where-the-digital-gain-is-taken).
+- `quantisation_noise_test.py` measures whether moving digital gain downstream costs
+  SNR, walking tone amplitude against `psb_scale` (and the FFT shift schedule) as a
+  ladder at constant DAC drive. Reports dB of noise per dB of gain moved downstream
+  (0 = free, 1 = quantisation-limited), as both a broadband floor and a
+  band-integrated statistic, which do not track each other.
+- Measures the reference point first and last, checks DSP overflow and DAC saturation
+  at every point, and pins the RX chain. `--loopback rf` repeats through the real path.
+- `quantisation_noise_test_plot.py` plots the CSV.
+- See [Tone Power Notes](doc/tone_power_notes.md#where-the-digital-gain-is-taken).
 
-**Tone-power headroom: correct, and settable everywhere**
-
-More power reaches the device by default: a bare `maximise_tx_power()` now
-drives the RF frontend to maximum and gives ~1.9 dB more digital drive. Pass
-`headroom_db`/`reference_plane` explicitly to keep the old levels.
-
-- `maximise_tx_power()` defaults to `reference_plane='detector'`, matching the
-  rest of the tone-power API, and so also minimises the TX attenuator and
-  enables the TX bypass amp. Use `reference_plane='dac'` or `digital_only=True`
-  for the old digital-only behaviour.
-- `headroom_db` was double-counted: the ramps stop where the saturation
-  detector trips at 90% of full scale (0.92 dB) and then applied `headroom_db`
-  on top, so 1 dB gave ~1.9 dB. Now measured from true full scale; requests
-  inside the 0.92 dB floor clamp to it.
+**Tone-power headroom: correct, and settable everywhere.** A bare
+`maximise_tx_power()` now drives the RF frontend to maximum and gives ~1.9 dB more
+digital drive; pass `headroom_db`/`reference_plane` explicitly to keep the old levels.
+- `maximise_tx_power()` defaults to `reference_plane='detector'`; use
+  `reference_plane='dac'` or `digital_only=True` for the old digital-only behaviour.
+- `headroom_db` was double-counted — the ramps stopped at the 90% saturation trip
+  (0.92 dB) and then applied `headroom_db` on top, so 1 dB gave ~1.9 dB. Now measured
+  from true full scale; requests inside the 0.92 dB floor clamp to it.
 - Defaults unified at `firmware_lib.DEFAULT_DAC_HEADROOM_DB` /
-  `DEFAULT_ADC_HEADROOM_DB` (1.0 dB), forwarded only when set, so the old
-  firmware-1.0-vs-client-2.0 mismatch cannot recur.
-- ADC snapshot levels are now a true fraction of full scale (they filled 15 of
-  16 bits, so 88% of full scale read `0.44`), which had made
-  `maximise_rx_power`'s headroom arithmetic 6.02 dB optimistic. The trip point
-  is unchanged; `adc_levels` values and the printed threshold (now 90%) change.
-- `dac_headroom_db` is measured per component, matching what
-  `check_output_saturation` trips on; it previously used the complex magnitude.
-- `check_input_saturation()` reports `level_saturated` and `rts_saturated`
-  separately and the RX loops name the cause, so a latched RTS over-range with
-  clean snapshot levels is no longer an unexplained DSA change.
-  `rts_as_saturation=False` uses measured levels only.
-- `filterbank_headroom_db` replaces the fixed `FILTERBANK_TX_HEADROOM_DB`
-  constant. This is amplitude-word room for the modulation drive restore, not
-  DAC-saturation margin; an explicit value applies whether or not filterbank
-  compensation is enabled.
-- Remaining hardcoded margins are now parameters: `set_tone_powers` gains
-  `headroom_db`, `fix_dac_saturation` gains `headroom_db` /
-  `intermittent_backoff_db` (were `0.90` / `0.707`), and `fix_adc_saturation`
-  and the `rx_policy` protect loop gain `atten_step_db` / `dsa_step_db`.
-- `wideband_sweep()` (and its CLI) and `run_power_sweep()` gain
-  `dac_headroom_db`, `adc_headroom_db` and `filterbank_headroom_db`; previously
-  all silently used the library defaults. Single-converter routines keep
-  `headroom_db`, which their own name disambiguates.
-  `wideband_sweep(tone_powers_dbm='auto')` also forwards its own
-  `reference_plane` now.
-- Fixed: `client.set_psb_scale()` cast to `int`, so `set_psb_scale(4 * 0.99)`
-  wrote 3 — a 0.09 dB request became 2.5 dB. The scale is UFix16_8 (1/256).
+  `DEFAULT_ADC_HEADROOM_DB` (1.0 dB), forwarded only when set.
+- ADC snapshot levels are now a true fraction of full scale (88% of full scale read
+  `0.44`), which had made `maximise_rx_power`'s headroom 6.02 dB optimistic. Trip
+  point unchanged; `adc_levels` values and the printed threshold (now 90%) change.
+- `dac_headroom_db` is measured per component, not on the complex magnitude.
+- `check_input_saturation()` reports `level_saturated` and `rts_saturated` separately
+  and the RX loops name the cause; `rts_as_saturation=False` uses measured levels only.
+- `filterbank_headroom_db` replaces the fixed `FILTERBANK_TX_HEADROOM_DB` constant —
+  amplitude-word room for the modulation drive restore, not DAC-saturation margin.
+- Remaining hardcoded margins become parameters: `set_tone_powers(headroom_db)`,
+  `fix_dac_saturation(headroom_db, intermittent_backoff_db)` (were `0.90` / `0.707`),
+  and `atten_step_db` / `dsa_step_db` on `fix_adc_saturation` and the `rx_policy`
+  protect loop.
+- `wideband_sweep()` (and its CLI) and `run_power_sweep()` gain `dac_headroom_db`,
+  `adc_headroom_db` and `filterbank_headroom_db`; previously all silently used the
+  library defaults. `wideband_sweep(tone_powers_dbm='auto')` also forwards its own
+  `reference_plane`.
+- Fixed `client.set_psb_scale()` casting to `int`, so `set_psb_scale(4 * 0.99)` wrote
+  3 — a 0.09 dB request became 2.5 dB. The scale is UFix16_8 (1/256).
 
 ## v1.7.1
 
 **Match resonance lists between sweeps — `resonance_matching`**
-- New module answering "which resonance in this sweep is which device in
-  that one?" when the two lists have different lengths, the frequencies
-  have all moved, and some devices were found in one sweep but not the
-  other. `rm.match_index(a, b)` returns a plain A->B index array with `-1`
-  for unmatched; `rm.match_resonances(a, b)` returns the same mapping with
-  the diagnostics attached.
-- Works from anything already lying around: bare frequency lists (Hz/MHz/GHz
-  auto-detected), dicts, structured arrays, `.resonances` files, KIDLAB
-  toneslists, fit-summary CSVs, power-sweep run directories (uses the run's
-  own best-power fits), and parsed sweep dicts — resonances are found in a
-  raw sweep automatically.
-- Three stages: a global shift model chosen automatically from `none`,
-  `constant`, `proportional`, `affine` and `linear_frac` (preferring the
-  simplest that fits, so a process with no global shift is not fitted a
-  spurious one); a tolerance derived from the measured scatter, floored at a
-  linewidth and capped at a fraction of the resonance spacing; then a global
-  one-to-one assignment (`free` by default, `monotonic` or `nearest`
-  available). The order-preserving solution is always run as a cross-check
-  and disagreements are reported.
-- Coverage-aware: devices outside the other sweep's band are reported
-  `out_of_range` rather than counted as lost.
-- `compare()` lines up any per-resonance quantity across the two lists —
-  either by parameter name or as arbitrary arrays in each list's own input
-  order — and `transfer()` carries per-device information (beam-map
-  positions, names, tone powers) onto the other list's ordering.
-- Matches are flagged `ok`/`crossed`/`ambiguous`/`outlier`/`rescued`/
-  `unmatched_*`, written to CSV by `save()`, and read back by `load_match()`
-  with any hand-edited `b_index` honoured.
-- `fingerprint='auto'` measures, per dataset, which resonator properties
-  survived whatever happened between the two sweeps, and uses those to
-  settle pairings frequency cannot. Each feature gets a global offset and a
-  residual scatter just as the frequencies do, so a property that changed
-  the same way for every device still identifies devices — what disqualifies
-  a feature is scatter, not change. Fingerprints only break ties; they can
-  never pull a pair inside the frequency tolerance or push one out.
-- A rescue pass pairs up leftovers with frequency ignored, for devices that
-  moved too far to be found any other way. Whether it may do so is measured
-  rather than assumed: a leave-one-out test scores how often the
-  fingerprints name the right device out of the whole array, and rescue only
-  auto-accepts when that is high enough (93% on fitted parameters, 13% on
-  survey estimates, where it declines and offers a shortlist instead).
-- `groups()` reports N:M clusters, so a blend that resolved into two — or two
-  that merged into one — is visible rather than silently mis-paired.
-- Adjustable by hand: `set()` (by index or by frequency), `unmatch()`,
-  `lock()` and `rematch()`, which re-solves the array optimally around the
-  pinned pairings. Every edit returns a new match, leaving the original
-  alone.
-- Five plots in the same module: `plot()` overlays both sweeps with matched
-  devices joined up, `plot_shift()` checks the shift model against the
-  physics, `plot_quality()` checks the tolerance, `plot_compare()` compares
-  any quantity device by device, and `plot_pair()` overlays one device's two
-  raw traces for confirmation.
-- New `doc/resonance_matching.md`: how it works, every control, the
-  perturbation primitives (global shift, scatter, coupling, loss,
-  degeneracy, observation, trapped flux) and which operations fire which,
-  failure modes, and worked examples in increasing complexity.
+- New module answering "which resonance here is which device there?" when the lists
+  differ in length, the frequencies have moved, and some devices appear in only one
+  sweep. `rm.match_index(a, b)` returns an A→B index array with `-1` for unmatched;
+  `rm.match_resonances(a, b)` returns the same with diagnostics attached.
+- Accepts bare frequency lists (Hz/MHz/GHz auto-detected), dicts, structured arrays,
+  `.resonances` files, KIDLAB toneslists, fit-summary CSVs, power-sweep run
+  directories, and parsed sweep dicts (resonances found automatically).
+- Three stages: a global shift model chosen from `none`/`constant`/`proportional`/
+  `affine`/`linear_frac` (preferring the simplest that fits); a tolerance from the
+  measured scatter, floored at a linewidth and capped at a fraction of the spacing;
+  then a global one-to-one assignment (`free`, `monotonic` or `nearest`). The
+  order-preserving solution is always run as a cross-check.
+- Coverage-aware: devices outside the other sweep's band report `out_of_range` rather
+  than counting as lost. `groups()` reports N:M clusters, so a resolved blend or a
+  merged pair is visible rather than silently mis-paired.
+- `compare()` lines up any per-resonance quantity across the two lists; `transfer()`
+  carries per-device information (beam-map positions, names, tone powers) onto the
+  other list's ordering.
+- Matches flagged `ok`/`crossed`/`ambiguous`/`outlier`/`rescued`/`unmatched_*`,
+  written by `save()` and read by `load_match()` with hand-edited `b_index` honoured.
+  Adjustable by hand with `set()`, `unmatch()`, `lock()` and `rematch()`; every edit
+  returns a new match.
+- `fingerprint='auto'` measures which resonator properties survived between the two
+  sweeps and uses those to settle pairings frequency cannot — what disqualifies a
+  feature is scatter, not change. Fingerprints only break ties. A rescue pass pairs
+  leftovers with frequency ignored, auto-accepted only when a leave-one-out test
+  scores high enough (93% on fitted parameters, 13% on survey estimates, where it
+  declines and offers a shortlist).
+- Five plots: `plot()`, `plot_shift()`, `plot_quality()`, `plot_compare()`,
+  `plot_pair()`. New `doc/resonance_matching.md`.
 
 ## v1.7.0
 
 **Centralised LNA bias service + v2 bias board support**
-- Only one RFSoC per telescope is wired to the LNA bias board, so that
-  machine now runs `souk-lna-service` and every readout server — including
-  the two pipelines on that same machine — reaches the board through it.
-  New `server/lna_service.py`: a TCP service (length-prefixed JSON, same
-  framing as the readout server) that owns the board, serialises access,
-  and serves a background-polled status cache so fourteen servers do not
-  queue on slow I2C reads. Installed like the other single services:
-  `souk-lna-service-install` / `-start` / `-stop` / `-restart` / `-status`
-  / `-remove`, unit `lna-service.service`.
-- New `backend: remote` on `LNABiasController`, resolved from a new
-  per-machine site file `~/.souk_readout_tools/site.yaml`
-  (`lna_service.host`/`.port`), with an optional `cryostat.lna_bias.host`
-  override for bench work. Each server still addresses its own LNA: it
-  sends its configured `lna_channel` explicitly on every request.
-  Client API, mock, and apply-on-config-push are unchanged — the routing
-  happens below them. An unreachable service degrades LNA calls to failure
-  results rather than raising.
-- v2 LNA bias board support. One `_BiasMonitor` subclass now covers both
-  revisions: it builds the v2 U6/U7 output-enable expanders only when they
-  are present (auto-detected by probing for them), batches multi-channel
-  enables into one write per expander, and never disables outputs on
-  construction — the submodule's constructor does, which would cut bias to
+- Only one RFSoC per telescope is wired to the LNA bias board, so that machine runs
+  `souk-lna-service` and every readout server reaches the board through it. New
+  `server/lna_service.py`: TCP service (length-prefixed JSON) owning the board,
+  serialising access and serving a background-polled status cache.
+  `souk-lna-service-install` / `-start` / `-stop` / `-restart` / `-status` /
+  `-remove`, unit `lna-service.service`.
+- New `backend: remote` on `LNABiasController`, resolved from a per-machine
+  `~/.souk_readout_tools/site.yaml` (`lna_service.host`/`.port`), with a
+  `cryostat.lna_bias.host` override for bench work. Each server sends its own
+  `lna_channel` on every request. Client API, mock and apply-on-config-push
+  unchanged; an unreachable service degrades to failure results rather than raising.
+- v2 LNA bias board support. One `_BiasMonitor` subclass covers both revisions:
+  builds the v2 U6/U7 output-enable expanders only when present (auto-detected),
+  batches multi-channel enables into one write per expander, and never disables
+  outputs on construction — the submodule's constructor does, which would cut bias to
   all 14 LNAs on a service restart.
-- New hard power control on v2: `set_lna_output_enabled(enabled, channel)`
-  and `set_lna_output_enabled_all(enabled)` on the client, server, and
-  controller; `output_enabled` added to status results (`None` on v1).
-  `soft_off` keeps its existing meaning on both revisions and remains the
+- New hard power control on v2: `set_lna_output_enabled(enabled, channel)` and
+  `set_lna_output_enabled_all(enabled)` on client, server and controller;
+  `output_enabled` added to status (`None` on v1). `soft_off` unchanged and still the
   only option on v1.
-- Tracked the submodule's `bias_control_hw2v` branch: retry failures now
-  raise `I2CDeviceError` rather than `ConnectionError` (channel detection
-  updated accordingly, and it now uses the driver's own per-slot failure
-  handling instead of 14 separate probe constructions), and the retry log
-  message changed, which had silently disabled the unpopulated-slot noise
-  filter.
-  The submodule pin moves to `94eb9c8` on that branch. It is unmerged
-  upstream and expected to move, so that commit is also marked by the local
-  tag `souk-readout-tools-v1.7.0` inside the submodule; if upstream ever
-  force-pushes the branch away, recover with
+- Tracked the submodule's `bias_control_hw2v` branch: retry failures now raise
+  `I2CDeviceError` rather than `ConnectionError`, and the retry log message changed,
+  which had silently disabled the unpopulated-slot noise filter. Submodule pin moves
+  to `94eb9c8`, also marked by the local tag `souk-readout-tools-v1.7.0` inside the
+  submodule; if upstream force-pushes, recover with
   `git -C src/souk_readout_tools/server/souk-peripherals-control checkout 94eb9c8`.
 - The shared I2C bus lock moved to `server/i2c_lock.py` and is now taken by
-  `rf_peripherals` too, so RF module traffic cannot interleave with the LNA
-  service's multi-step mux operations on the machine where both boards
-  share bus 0.
+  `rf_peripherals` too, so RF module traffic cannot interleave with the LNA service's
+  mux operations where both boards share bus 0.
 
 ## v1.6.7
 
-**Power tuning: measured bifurcation, shared sweep windows, and an explicit
-comb planner** (`power_sweep.py` only — no firmware or hardware change)
-
-- `run_power_sweep(direction='both')` takes an up sweep and then a down sweep
-  at each power step, so the bifurcation power is **measured** rather than
-  reached by extrapolating the fitted `anl` to `anl_bif`: above bifurcation a
-  Duffing resonator is bistable and the two directions follow different
-  branches. The up sweep stays the canonical artifact (existing analyses are
-  untouched); the down sweep is saved beside it as `kind='sweep_down'` and
-  appears in the run view as `sweeps_down`. Tones are parked at the edge each
-  sweep starts from, and the down sweep reuses the up sweep's ADC calibration
-  so the pair differs only by direction. `follow_dips` recenters on the down
-  sweep by default (`follow_dips_from`), whose minimum still tracks the driven
-  resonance once the tone is bifurcated.
-- `hysteresis_metrics()` compares the two traces per tone and power — a
-  chi-square z-score against the sweeps' own errors, the mean branch
-  separation as a fraction of the dip depth, the split between the two minima
-  in linewidths, and per-direction jump ratios. A power counts as hysteretic
-  when the difference is both statistically significant and physically large.
-  `hysteresis_onset()` brackets the transition between the highest clean and
-  the lowest hysteretic power. `find_best_power` caps the chosen power at that
-  onset, gains a `hysteresis_onset` fallback for tones whose fits all fail,
-  and flags `bif_hysteresis_mismatch` and `anl_direction_mismatch`. Note the
-  onset is an *upper bound*: just past bifurcation the bistable region can be
-  narrower than the sweep's frequency step.
-- **Parameter outlier check is now detrended.** Qi and fr depend on power, so
-  MAD-clipping them against a constant per-tone median treated physics as a
-  run of outliers — on a 389-tone campaign it excluded 227 tones at −88 dBm
-  and all 389 at −80, which is exactly the end that anchors the ANL slope and
-  `p_bif`. No fixed threshold fixes that, since the deviation keeps growing
-  with however far the sweep runs. Deviations are now measured about a robust
-  Theil–Sen trend in power (log space for Qi/Qc), so only scatter about the
-  trend is clipped: 227 → 16 excluded at −88 dBm, with past-bifurcation rows
-  still rejected. `param_outliers_detrend=False` restores the old form.
-- **Fallback after a rejected ANL fit now uses the array.** Tones that lose
-  the power-law pick are not a random sample — they largely bifurcate early —
-  and the old `anl_threshold` fallback handed them the hottest power in the
-  run (median 18 dB above the array, nine pinned at the top of the sweep).
-  Such a tone is now placed from the tones that did work, via a robust line of
-  chosen power against its own `−30log10(Ql) + 10log10(Qc)` (the scaling
-  `anl ∝ P·Ql³/Qc`) using fit-free empirical Q, falling back to the population
-  median when its Q is outside the line's support. Rescued tones now span
-  −105.9…−99.2 dBm instead of −120…−82.
-- **Shared sweep windows.** `follow_dips` could merge two tones onto one
-  resonance: the conflict guard used a 1 Hz separation floor, so a pair
-  landing 10 Hz apart passed, `clip_overlapping_spans` then collapsed both
-  spans to zero, and every fit failed for both tones for the rest of the run
-  (14 of 389 tones on hardware). The floor is now a fraction of the pair's
-  sweep span (default 0.5), which is the unit that matters since neighbouring
-  tones share the gap between them; `follow_min_separation_hz` overrides it
-  with a plain frequency.
-- **Multi-resonance fitting.** A genuine close pair distorts the
-  single-resonator fit badly — fitted `anl` came out 10–100× too large, so the
-  tone read as near-bifurcation when it was not. `fit_power_sweep` now
-  restricts each fit to the resonance that tone is reading out, cutting at the
-  midpoint to each neighbouring dip (midpoint rather than a ±N-linewidth
-  window, because a second dip inflates the linewidth estimate the window
-  would be built from). Median reduced chi2 10423 → 148; contaminated tones
-  recovering a usable ANL fit 1 → 7 of 15. Each split tone is also fitted
-  unsplit and the better kept, so a split can never make a tone worse. Costs
-  +21% fit time. The fitter itself is untouched: masking writes NaN, which it
-  already drops.
-- `resonator_catalogue()` reports one row per *resonance* rather than per
-  tone, so a shared window is a record rather than a flag nobody reads, with
+**Power tuning: measured bifurcation, shared sweep windows, and an explicit comb
+planner** (`power_sweep.py` only — no firmware or hardware change)
+- `run_power_sweep(direction='both')` takes an up then a down sweep at each power
+  step, so bifurcation is **measured** rather than reached by extrapolating fitted
+  `anl` to `anl_bif`. The up sweep stays the canonical artifact; the down sweep is
+  saved as `kind='sweep_down'` and appears as `sweeps_down`. Tones park at the edge
+  each sweep starts from, and the down sweep reuses the up sweep's ADC calibration.
+  `follow_dips` recenters on the down sweep by default (`follow_dips_from`).
+- `hysteresis_metrics()` compares the two traces per tone and power (chi-square
+  z-score, mean branch separation as a fraction of dip depth, split between minima in
+  linewidths, per-direction jump ratios). `hysteresis_onset()` brackets the
+  transition. `find_best_power` caps the chosen power at that onset, gains a
+  `hysteresis_onset` fallback, and flags `bif_hysteresis_mismatch` /
+  `anl_direction_mismatch`. The onset is an *upper bound*.
+- **Parameter outlier check is now detrended.** MAD-clipping Qi and fr against a
+  constant per-tone median treated physics as outliers — on a 389-tone campaign it
+  excluded 227 tones at −88 dBm and all 389 at −80. Deviations are now measured about
+  a robust Theil–Sen trend in power (log space for Qi/Qc): 227 → 16 excluded at
+  −88 dBm, past-bifurcation rows still rejected. `param_outliers_detrend=False`
+  restores the old form.
+- **Fallback after a rejected ANL fit now uses the array.** The old `anl_threshold`
+  fallback handed such tones the hottest power in the run (median 18 dB above the
+  array). They are now placed from the tones that did work, via a robust line of
+  chosen power against `−30log10(Ql) + 10log10(Qc)` (from `anl ∝ P·Ql³/Qc`), falling
+  back to the population median. Rescued tones span −105.9…−99.2 dBm instead of
+  −120…−82.
+- **Shared sweep windows.** `follow_dips`'s conflict guard used a 1 Hz separation
+  floor, so a pair landing 10 Hz apart passed, `clip_overlapping_spans` collapsed both
+  spans to zero, and every fit failed for both tones for the rest of the run (14 of
+  389 tones). The floor is now a fraction of the pair's sweep span (default 0.5);
+  `follow_min_separation_hz` overrides it with a plain frequency.
+- **Multi-resonance fitting.** A close pair distorted the single-resonator fit badly —
+  fitted `anl` came out 10–100× too large. `fit_power_sweep` now restricts each fit to
+  the resonance that tone reads out, cutting at the midpoint to each neighbouring dip.
+  Median reduced chi2 10423 → 148; contaminated tones recovering a usable ANL fit 1 →
+  7 of 15. Each split tone is also fitted unsplit and the better kept. Costs +21% fit
+  time; the fitter itself is untouched.
+- `resonator_catalogue()` reports one row per *resonance* rather than per tone, with
   the separation in linewidths and whether the pair could have a tone each.
-- **`plan_tone_comb()`** turns that into the next run's comb, and is the
-  deliberate boundary between discovery and configuration: fitting may find a
-  second resonance, but the comb only changes when asked, because a run that
-  silently changes the tone count invalidates the powers it just measured.
-  `policy='keep'` (default) preserves the count, `'replace'` moves a tone to
-  the better resonance in its window at no cost in power or channels, `'add'`
-  grows the comb subject to admission tests. Separation is the binding
-  constraint, not power: only 2 of 21 close pairs on that campaign could be
-  given a tone each and stay sweepable, and admitting all of them would have
-  raised total comb power by 0.23 dB. Any tone parameter can be overridden per
-  tone (by index or by frequency) or per column, applied last so the user
-  always has the final word.
-- The `power_sweep` module docstring now leads with the recommended pipeline —
-  sweep, analyse, balance, plan — with a runnable example, why each step
-  exists, and a pointer to the stage-by-stage functions underneath.
-- Every part is optional through existing signatures; a single-direction run
-  behaves exactly as before, with no new columns, flags, or caps.
+- **`plan_tone_comb()`** turns that into the next run's comb, the deliberate boundary
+  between discovery and configuration. `policy='keep'` (default) preserves the count,
+  `'replace'` moves a tone to the better resonance in its window, `'add'` grows the
+  comb subject to admission tests. Separation binds, not power: only 2 of 21 close
+  pairs could be given a tone each and stay sweepable. Any tone parameter can be
+  overridden per tone or per column, applied last.
+- The `power_sweep` module docstring leads with the recommended pipeline — sweep,
+  analyse, balance, plan — with a runnable example.
+- Every part is optional; a single-direction run behaves exactly as before.
 
 ## v1.6.6
 
 **Server-side FFM tone tracking (auto-recentering), both engines**
-- New `server/tracking.py` + minimal `readout_server.py` wiring: with
-  frequency modulation running (fw — the default engine, `mode='auto'` —
-  or sw; >= 3 slots/points), the server demodulates the streamed cycles
-  (lean vectorised estimator, unit-tested to match `demodulate`'s
-  model-free maths to 1e-10), filters per-tone detunings (boxcar/EWMA,
-  runtime-configurable), applies a deadband + K-consecutive-window
-  confirmation, and stages clamped centre corrections. The loop picks
-  whichever engine is armed (fw slot tags and sw point tags ride the same
-  flag5 field, so estimation is engine-blind).
-- Two update classes with independent commit policies: `lo` (seamless —
-  fw: inactive mixer slot-buffer flip via `_update_fw_modulation`; sw:
-  LO-word `install_bundle` swap; auto-commit on) and `bin` (bin/map
-  recenter re-arm, staged + on-demand by default). fw commits mirror the
-  fw client handlers (executor-side apply, announced identically); sw
-  commits ride the frame-producer ownership (epoch ->
-  `to_thread(_prepare_modulation)` -> `_pending_modulation`) — either way
-  staging is the executor-side prepare, so the commit moment is a cheap
-  switch.
-- Hot-path cost is one deque append per frame (measured 0.066 us —
-  no stream-rate regression); estimation runs vectorised across all 2048
-  tones in the thread executor (`profiling/tracking_benchmark.py`).
-- Auto-holds during sweep/retune and while streaming/modulation are off;
-  back-off + confirmation restart when an external command lands mid-batch;
-  `dry_run` default on. Commands: `enable_tracking` / `disable_tracking` /
-  `hold_tracking` / `resume_tracking` / `commit_tracking_updates`, plus
-  `get_info('tracking')` and matching `ReadoutClient` methods.
-- **Health monitoring**: `get_info('tracking')` returns
-  `{summary, tones, controller, …}` — a lean array-wide `summary`
-  (per-state tone counts locked/drifting/recenter_pending/unlocked/no_data,
-  n_over_threshold, max/median drift in linewidths and Hz, staged/commit/
-  back-off counts, loop liveness) and per-tone health (lock `state`,
-  running detuning mean+std, `slope_ratio`, invalid-cycle fraction, staged
-  centre). `health_check()` gains the same `summary` block plus
-  `resonators_tracking`/`max_detuning_hz` (previously placeholders) for
-  telescope-control polling. A **lost resonance** ("tracking noise") is
-  flagged by the phase slope collapsing vs its on-resonance baseline
-  (`unlock_slope_ratio`) and/or the invalid-cycle fraction
-  (`unlock_invalid_fraction`) — not by the detuning magnitude, which
-  *compresses* far from resonance and would read deceptively small.
-- **All per-tone tracking work is now off the event loop.** The consumer's
-  single `to_thread` hop per poll now also runs the deadband/confirmation
-  `decide` and rebuilds the health snapshot; only the per-correction commit
-  (which owns the hardware writes) stays on the loop. `get_info('tracking')`
-  and `health_check()` serve that cached snapshot in O(1) — measured ~0.05
-  µs and flat 256→2048 tones, versus the ~14–30 ms an on-loop rebuild cost
-  (and the redundant double per-tone pass in `status()` is removed). So a
-  health poll no longer stalls the stream loop, at any tone count.
-  Benchmark: `profiling/tracking_health_benchmark.py`.
-- `enable_modulation(linewidth_hz=...)` carries `params_from_sweep`'s
-  per-tone linewidths on both engines (fw default first; pure metadata in
-  the armed config), required by tracking unless given to
-  `enable_tracking` directly.
+- New `server/tracking.py` + `readout_server.py` wiring: with frequency modulation
+  running (fw default, or sw; ≥3 slots/points), the server demodulates the streamed
+  cycles, filters per-tone detunings (boxcar/EWMA, runtime-configurable), applies a
+  deadband plus K-consecutive-window confirmation, and stages clamped centre
+  corrections. Engine-blind — fw slot tags and sw point tags share the `flag5` field.
+- Two update classes with independent commit policies: `lo` (seamless — fw inactive
+  mixer slot-buffer flip, sw LO-word `install_bundle` swap; auto-commit on) and `bin`
+  (bin/map recenter re-arm, staged and on-demand by default). Either way staging is
+  the executor-side prepare, so the commit moment is a cheap switch.
+- Hot-path cost is one deque append per frame (measured 0.066 µs); estimation runs
+  vectorised across all 2048 tones in the thread executor
+  (`profiling/tracking_benchmark.py`).
+- Auto-holds during sweep/retune and while streaming/modulation are off; back-off plus
+  confirmation restart when an external command lands mid-batch; `dry_run` default on.
+  Commands: `enable_tracking` / `disable_tracking` / `hold_tracking` /
+  `resume_tracking` / `commit_tracking_updates`, plus `get_info('tracking')`.
+- **Health monitoring:** `get_info('tracking')` returns `{summary, tones, controller,
+  …}` — per-state tone counts, n_over_threshold, max/median drift, staged/commit/
+  back-off counts, loop liveness, and per-tone lock `state`, detuning mean+std,
+  `slope_ratio`, invalid-cycle fraction, staged centre. `health_check()` gains the same
+  `summary` plus `resonators_tracking`/`max_detuning_hz`. A **lost resonance** is
+  flagged by the phase slope collapsing against its on-resonance baseline
+  (`unlock_slope_ratio`) and/or the invalid-cycle fraction (`unlock_invalid_fraction`)
+  — not by detuning magnitude, which *compresses* far from resonance.
+- **All per-tone tracking work is off the event loop.** The consumer's single
+  `to_thread` hop now also runs `decide` and rebuilds the health snapshot; only the
+  per-correction commit stays on the loop. `get_info('tracking')` and `health_check()`
+  serve that cached snapshot in O(1) — ~0.05 µs and flat 256→2048 tones, versus
+  ~14–30 ms for an on-loop rebuild. Benchmark:
+  `profiling/tracking_health_benchmark.py`.
+- `enable_modulation(linewidth_hz=...)` carries `params_from_sweep`'s per-tone
+  linewidths on both engines, required by tracking unless given to `enable_tracking`.
 
 **Typed stream frames (opt-in, in-band tone provenance)**
-- Stream clients may send one JSON line (`{"subscribe": ["tone_updates"]}`)
-  to receive typed frames: `SNAPSHOT` on subscribe (revision + modulation
-  table + tracking status, whichever engine is active) and `TONE_UPDATE`
-  on **every** modulation revision change, any origin — fw revisions
-  announce from the fw enable/update/recenter/disable handlers and
-  tracking commits; sw revisions hook `_apply_pending_modulation_command`
-  (the single place sw revisions land) — with
-  revision/op/kind/engine/source/changed centres/
-  triggering detunings. Typed frames put a nonzero type code in the top
-  byte of the length prefix; unsubscribed clients get a byte-identical
-  legacy stream (asserted byte-for-byte in tests).
+- Stream clients may send `{"subscribe": ["tone_updates"]}` to receive typed frames:
+  `SNAPSHOT` on subscribe and `TONE_UPDATE` on every modulation revision change, any
+  origin, carrying revision/op/kind/engine/source/changed centres/triggering
+  detunings. Typed frames put a nonzero type code in the top byte of the length
+  prefix; unsubscribed clients get a byte-identical legacy stream.
 
 **stream-to-dac: live FFM demodulated output (`--mode ffm`)**
-- `stream_dac.FfmConverter` demodulates the modulated stream per cycle
-  (either engine's flag5 tags): the phase-vs-offset slope is a live,
-  self-calibrating `dphi_df`, and the centre-point phase against a
-  startup baseline gives the linearised frequency shift — no calibration
-  file needed, and valid while tracking keeps the tone in the linear
-  regime.
-- Output is the **absolute resonator shift** across recenters: per-revision
-  centres from the SNAPSHOT/TONE_UPDATE frames (subscribed automatically
-  in ffm mode) are combined as `(center[rev] − center[rev0]) −
-  probe_side_shift` (detector-side sign), so tracking corrections do not
-  step the analog output; the same updates land in the recording's
-  `.updates.jsonl` sidecar for offline reconstruction.
-- New `conversion.average_cycles` / `baseline_cycles` config keys; workflow
-  recipes added to doc/stream_to_dac.md (bench-to-beam analog output) and
-  doc/tone_tracking.md (FFM tracking session).
-- Client: `stream_dac.SocketFrameSource(subscribe_updates=True)` +
-  `.updates.jsonl` sidecar logging in `StreamToDac`;
-  `receive_stream_g3(subscribe_tone_updates=True)` writes a G3 Wiring frame
-  per mid-stream `TONE_UPDATE`. `receive_stream.py` untouched.
-- Mock: status-level tracking requests + `get_info('tracking')` so client
-  paths run end-to-end with `mock=True`.
+- `stream_dac.FfmConverter` demodulates the modulated stream per cycle: the
+  phase-vs-offset slope is a live, self-calibrating `dphi_df`, and the centre-point
+  phase against a startup baseline gives the linearised frequency shift — no
+  calibration file needed.
+- Output is the **absolute resonator shift** across recenters: `(center[rev] −
+  center[rev0]) − probe_side_shift`, so tracking corrections do not step the analog
+  output. The same updates land in the recording's `.updates.jsonl` sidecar.
+- New `conversion.average_cycles` / `baseline_cycles` config keys; recipes in
+  doc/stream_to_dac.md and doc/tone_tracking.md.
+- Client: `stream_dac.SocketFrameSource(subscribe_updates=True)` + `.updates.jsonl`
+  sidecar; `receive_stream_g3(subscribe_tone_updates=True)` writes a G3 Wiring frame
+  per mid-stream `TONE_UPDATE`. Mock: tracking requests + `get_info('tracking')`.
 - `doc/tone_tracking.md`: state machine, config table, staged-commit model,
-  provenance/reconstruction formula, closed-loop response + filter transfer
-  functions, revision-wrap guidance, protocol spec, benchmarks.
+  reconstruction formula, closed-loop response, protocol spec, benchmarks.
 
 ## v1.6.5
 
 **stream-to-dac: live analog output of KID response**
-- New `souk-stream-to-dac` client script + `stream_dac` module: receives the
-  continuous TCP stream, converts a chosen tone's IQ to magnitude / phase /
-  frequency shift and drives a USB DAC (LabJack T-series via optional
-  `labjack-ljm`, or a no-hardware dummy backend) — built for recording KID
-  spectral response on an external analog logger (TOPTICA cw-THz scans).
-- Reader/output thread pair with a bounded drop-oldest queue (bounded
-  latency), boxcar averaging to the DAC update rate, watchdog + safe-state
-  idle voltage on any error/stall/exit, and drop/loop-time diagnostics.
-- Raw stream is always recorded in the `receive_stream` file + JSON-sidecar
-  format; `--replay` plays a recording back through the full pipeline at
-  true rate (end-to-end testing with zero hardware), `--mock` uses the
-  emulated readout server.
+- New `souk-stream-to-dac` script + `stream_dac` module: receives the TCP stream,
+  converts a chosen tone's IQ to magnitude / phase / frequency shift and drives a USB
+  DAC (LabJack T-series via optional `labjack-ljm`, or a dummy backend) — built for
+  recording KID spectral response on an external analog logger (TOPTICA cw-THz scans).
+- Reader/output thread pair with a bounded drop-oldest queue, boxcar averaging to the
+  DAC update rate, watchdog plus safe-state idle voltage on any error/stall/exit, and
+  drop/loop-time diagnostics.
+- Raw stream always recorded in the `receive_stream` format; `--replay` plays a
+  recording back through the full pipeline at true rate, `--mock` uses the emulated
+  server.
 - Stream IQ gets the same software readout-flattening factors as
-  `parse_samples(apply_readout_correction=True)` before conversion (unit
-  test asserts equality on identical raw bytes).
-- Calibrated mode uses `ResonatorCalibration.tone_converter` (exact Möbius
-  inversion); `stream_dac.calibrations_from_sweep` / `save_calibrations` /
-  `load_calibrations` give a sweep → `batch_fit` → portable `.npz`
-  calibration-file workflow.
-- New config template `template_stream_to_dac_config.yaml` (all
-  campaign-unknowns are config keys), `doc/stream_to_dac.md`, and a
-  `--selftest` DAC→AIN loopback latency check for on-hardware use.
+  `parse_samples(apply_readout_correction=True)` before conversion.
+- Calibrated mode uses `ResonatorCalibration.tone_converter` (exact Möbius inversion);
+  `stream_dac.calibrations_from_sweep` / `save_calibrations` / `load_calibrations`
+  give a sweep → `batch_fit` → `.npz` workflow.
+- New `template_stream_to_dac_config.yaml`, `doc/stream_to_dac.md`, and a
+  `--selftest` DAC→AIN loopback latency check.
 
 ## v1.6.4
 
 **Per-point modulation timestreams**
 - New `modulation.point_timestreams()` splits `group_cycles` output into one
-  `parse_samples`-shaped timestream per probe point (with a real sub-cycle
-  time axis), so the standard timestream/PSD plotters work per point.
+  `parse_samples`-shaped timestream per probe point (with a real sub-cycle time axis),
+  so the standard timestream/PSD plotters work per point.
 - `demodulate`/`demodulate_timestream` accept a list of fits/calibrations for
   `calibration=` (matched by `tone_index`) and auto-wrap raw `FitResult`s.
 
 **Timestream plotting: demodulated-stream handling**
-- Plotters honour a producer-supplied `time_s` axis; `conversion_method`
-  defaults to `None` and warns when conversion knobs can't apply to
-  already-demodulated data.
+- Plotters honour a producer-supplied `time_s` axis; `conversion_method` defaults to
+  `None` and warns when conversion knobs cannot apply to already-demodulated data.
 - `plot_timestream_psd(exclude_settling=True)` computes the PSD from only the
   non-settling samples at the decimated rate; non-finite PSDs now warn.
 - `plot_timestream_on_resonance` detects demodulated input and no longer
   double-applies deembed/phase-centering.
 
 **Server: firmware-modulation revision history**
-- `_next_fw_modulation_revision` records center/offsets/dwell/mode per
-  revision (exposed via `state['revision_history']`) so tagged frames can be
-  attributed offline; `purge_revisions` clears fw history and refuses while
-  fw modulation is enabled.
+- `_next_fw_modulation_revision` records center/offsets/dwell/mode per revision
+  (via `state['revision_history']`) so tagged frames can be attributed offline;
+  `purge_revisions` clears fw history and refuses while fw modulation is enabled.
 
 ## v1.6.3
 
 **Fix: stale mixer dwell breaking software modulation after firmware-slot runs**
-- `disable_fw_modulation` left the mixer `dwell` register at the fw
-  `n_dwell`. The dwell gates *all* allowed LO switches — including the
-  ping-pong buffer flips driven by software modulation, sweeps and retunes —
-  so after any fw-mod run, sw modulation showed skipped points and ragged
-  dwells and sweeps averaged stale-frequency accumulations, long after all
-  modulation was reported off (confirmed on hardware: `dwell` read back 11).
-  The dwell is now restored to 1 on fw disable and asserted at sw arm.
+- `disable_fw_modulation` left the mixer `dwell` register at the fw `n_dwell`. The
+  dwell gates *all* allowed LO switches — including the ping-pong flips driven by
+  software modulation, sweeps and retunes — so after any fw-mod run, sw modulation
+  showed skipped points and ragged dwells and sweeps averaged stale-frequency
+  accumulations, long after modulation was reported off (`dwell` read back 11 on
+  hardware). The dwell is now restored to 1 on fw disable and asserted at sw arm.
 
 **Filterbank compensation: applied where you look at the data**
-- The software readout-flattening factors (the RX half the inert fabric
-  scale word cannot apply) are now applied at **parse time** by default:
-  `parse_samples(apply_readout_correction=True)` (per sample via the
-  modulation point tag) and `parse_sweep_data(apply_readout_correction=True)`
-  (per sweep point; the server ships the factors with `get_sweep_data`).
-  Output carries `readout_correction_applied`; `group_cycles` skips its own
-  application when marked. Pass `False` for raw accumulator values.
-- Sweeps/retunes now resolve the standard path group-delay calibration for
-  the image-phase term (previously override-only) and take a per-request
-  `compensate_filterbank` override (`perform_sweep`, `perform_retune`,
-  `wideband_sweep`), matching `enable_modulation`.
-- Plot/fit-time toggle: `plot_sweep`, `plot_timestream`,
-  `plot_timestream_psd`, `plot_timestream_on_resonance` and `batch_fit`
-  take `apply_readout_correction` (default on) and convert already-parsed
-  data either way (parsed sweeps keep the factors; modulated captures
-  re-derive them from the info snapshot).
-- Power optimisers (`maximise_tx_power`, `set_tone_powers(...,
-  optimise_dynamic_range=True)`, `maximise_tx_dsp_gain`) reserve
-  `FILTERBANK_TX_HEADROOM_DB` (1 dB) of amplitude-word headroom for the TX
-  drive-restoring boost when compensation is enabled — the psb_scale ramp
-  recovers the output level, so no power is lost. Explicit `set_tone_powers`
+- The software readout-flattening factors are now applied at **parse time** by
+  default: `parse_samples(apply_readout_correction=True)` (per sample via the
+  modulation point tag) and `parse_sweep_data(apply_readout_correction=True)` (per
+  sweep point). Output carries `readout_correction_applied`; `group_cycles` skips its
+  own application when marked. Pass `False` for raw accumulator values.
+- Sweeps/retunes resolve the standard path group-delay calibration for the image-phase
+  term (previously override-only) and take a per-request `compensate_filterbank`
+  override (`perform_sweep`, `perform_retune`, `wideband_sweep`).
+- `plot_sweep`, `plot_timestream`, `plot_timestream_psd`,
+  `plot_timestream_on_resonance` and `batch_fit` take `apply_readout_correction`
+  (default on) and convert already-parsed data either way.
+- Power optimisers reserve `FILTERBANK_TX_HEADROOM_DB` (1 dB) of amplitude-word
+  headroom for the TX drive-restoring boost when compensation is enabled; the psb_scale
+  ramp recovers the output level, so no power is lost. Explicit `set_tone_powers`
   requests that eat into the reserve warn instead of failing.
 
 ## v1.6.2
 
 **Power-sweep API tidy (breaking)**
-- `power_sweep` now reads as the workflow: `run_power_sweep` /
-  `load_power_sweep` acquire, `analyse_power_sweep` / `load_analysis` (new)
-  analyse, then optional comb balancing — with the pieces grouped per
-  artifact, each with a symmetric `write_*`/`load_*` pair. The module
-  docstring tells the story and the file is ordered to match.
-- Removed the `analyze_power_sweep` alias; the spelling is
-  `analyse_power_sweep`.
+- `power_sweep` now reads as the workflow: `run_power_sweep` / `load_power_sweep`
+  acquire, `analyse_power_sweep` / `load_analysis` (new) analyse, then optional comb
+  balancing — grouped per artifact, each with a symmetric `write_*`/`load_*` pair.
+- Removed the `analyze_power_sweep` alias; the spelling is `analyse_power_sweep`.
 - Renamed `fit_parameter_series` → `parameter_series` and
-  `allocate_balanced_tone_powers` → `balance_tone_powers`; the
-  `include_optimizer` kwarg is now `include_optimiser` and the balancing
-  objective `"maximize_power"` is `"maximise_power"` (matching
-  `rx_policy='maximise'`). `fit_summary_rows` is private —
-  `fit_summary_array` and the CSV are the public views of the table.
-- New `load_analysis(path)`: read-only reload of everything
-  `analyse_power_sweep` wrote (fits, summary CSV, best power, and balanced
-  power if saved).
-- New `load_fit_summary(path)`: the fit-summary CSV back as a structured
-  array, accepted directly by `find_best_power`.
-- `analyse_power_sweep`'s `plot` flag split into `plot_fits` / `plot_best`,
-  so the power selection can be redone from stored fits without
-  re-rendering every per-tone fit plot:
-  `analyse_power_sweep(run, fit=False, plot_fits=False, target_anl=...)`.
-- Writers accept a destination file or run directory, default into
-  `<run>/analysis/` (`write_fit_summary(fit_data)` included), and return
+  `allocate_balanced_tone_powers` → `balance_tone_powers`; `include_optimizer` →
+  `include_optimiser`; the balancing objective `"maximize_power"` →
+  `"maximise_power"`. `fit_summary_rows` is private.
+- New `load_analysis(path)` (everything `analyse_power_sweep` wrote) and
+  `load_fit_summary(path)` (the CSV back as a structured array, accepted directly by
+  `find_best_power`).
+- `analyse_power_sweep`'s `plot` flag split into `plot_fits` / `plot_best`, so power
+  selection can be redone from stored fits without re-rendering every per-tone plot.
+- Writers accept a file or run directory, default into `<run>/analysis/`, and return
   `Path`.
 
 **Sweeps**
-- Overlapping sweep spans are clipped so neighbouring segments do not
-  overlap (`clip_overlapping_spans`, on by default in `perform_sweep` /
-  `perform_retune`); the actually-swept centers/spans are recorded in the
-  sweep metadata.
+- Overlapping sweep spans are clipped so neighbouring segments do not overlap
+  (`clip_overlapping_spans`, on by default); the actually-swept centers/spans are
+  recorded in the sweep metadata.
 
 ## v1.6.1
 
 **Filterbank channel-response compensation**
-- Tones operating away from their filterbank bin centre are now gain- (and
-  optionally phase-) compensated automatically wherever mixer control words
-  are prepared: tone setting, sweeps, and — the motivating case — frequency
-  modulation riding the channel overlap, where the combined TX+RX response
-  reaches −1 dB at 0.70 bin spacings (±211 kHz) and −6 dB at the channel edge.
-- Model: 8-tap DPSS+sinc prototype (single-bank gain `G`) plus the coherent
-  synthesis-image recombination in the analysis bin
-  (`H(δ) = Σₘ G(δ−2m)²·e^{4πjmBτ}`), hardware-validated in digital loopback
-  (≤0.04 dB across the full channel, zero phase) and RF loopback (0.05 dB /
-  2.7 mrad with the fitted 150 ns bench group delay), frequency-independent
-  across 0.6–2.1 GHz. See [filterbank_compensation.md](doc/filterbank_compensation.md).
-- Corrections: TX scaling `× 1/G` (hardware, per point) restores the physical
-  drive on the detector (the drive rolls off with the single bank even though
-  the readout only sags to |H|); the readout-flattening `× G/|H|` part is
-  applied in **software** — the RX LO scale word turned out to be inert in
-  the v7.11 fabric (hardware-verified; raised in souk-firmware#117), so the
-  server reports per-(tone, point) `readout_correction` factors in the
-  modulation state and `modulation.group_cycles` applies them (flip
-  `firmware_lib.FILTERBANK_RX_SCALE_IN_FABRIC` when a firmware connects the
-  multiplier). The RX phase offsets (which do work in hardware) remove the
-  near-edge image phase turn-over per modulation point. A clipped TX boost
+- Tones away from their filterbank bin centre are now gain- (and optionally phase-)
+  compensated wherever mixer control words are prepared: tone setting, sweeps, and —
+  the motivating case — frequency modulation riding the channel overlap, where the
+  combined TX+RX response reaches −1 dB at 0.70 bin spacings (±211 kHz) and −6 dB at
+  the channel edge.
+- Model: 8-tap DPSS+sinc prototype (single-bank gain `G`) plus coherent synthesis-image
+  recombination in the analysis bin (`H(δ) = Σₘ G(δ−2m)²·e^{4πjmBτ}`), validated in
+  digital loopback (≤0.04 dB, zero phase) and RF loopback (0.05 dB / 2.7 mrad),
+  frequency-independent across 0.6–2.1 GHz. See
+  [filterbank_compensation.md](doc/filterbank_compensation.md).
+- Corrections: TX scaling `× 1/G` in hardware restores the physical drive; the
+  readout-flattening `× G/|H|` part is applied in **software** — the RX LO scale word
+  is inert in the v7.11 fabric (hardware-verified; souk-firmware#117), so the server
+  reports per-(tone, point) `readout_correction` factors and `modulation.group_cycles`
+  applies them (flip `firmware_lib.FILTERBANK_RX_SCALE_IN_FABRIC` when a firmware
+  connects the multiplier). RX phase offsets do work in hardware. A clipped TX boost
   is reported in the modulation state warnings.
-- Fixed the server `psb_scale` setter truncating fractional scales to int
-  (the block value is UFix16.8; restoring a read-back 2.77 silently wrote 2).
-- Fixed an intermittent `RuntimeError: delayed modulation preload was not
-  serviced…` killing sw-modulated finite captures near their end: when the
-  read cadence and the dwell grid are phase-shifted (the buffer_id tag lags
-  the commanded flip), the final short dwell advanced the scheduler before
-  the previous preload's reuse delay had elapsed. The scheduler now services
-  a stale preload immediately and logs it (data was never mislabelled —
-  frames are tagged from the firmware buffer_id), and captures no longer
-  advance after their final dwell.
-- The phase term's group delay comes from the standard path-delay calibration
-  (`rf_frontend.path_group_delay_ns`, scalar or frequency-dependent — measure
-  once with `client.measure_path_group_delay(save_to_config=True)`),
-  evaluated per tone; `filterbank_group_delay_override_ns` (firmware
-  defaults) overrides it for testing/loopback work. Master switch:
+- The phase term's group delay comes from `rf_frontend.path_group_delay_ns` (measure
+  once with `client.measure_path_group_delay(save_to_config=True)`), evaluated per
+  tone; `filterbank_group_delay_override_ns` overrides for testing. Master switch
   `filterbank_compensation` (default **on**);
-  `enable_modulation(..., compensate_filterbank=False)` gives a per-request
-  A/B override. Keep base tone amplitudes ~1 dB below full scale so the
-  modulation TX boost has headroom (the preparer warns when it clips).
-- Standalone measurement/verification scripts in `scripts/filterbank/`:
-  channel-response measurement, a compensation acceptance test, and an
-  LO-stepping diagnostic. They configure the system from scratch (single
-  test tone — avoids intermod/alias contamination), guard the digital-gain
-  state around internal-loopback switches, and restore what they change.
+  `enable_modulation(..., compensate_filterbank=False)` gives a per-request A/B. Keep
+  base tone amplitudes ~1 dB below full scale for the modulation TX boost.
+- Fixed the server `psb_scale` setter truncating fractional scales to int (the block
+  value is UFix16.8; restoring a read-back 2.77 silently wrote 2).
+- Fixed an intermittent `RuntimeError: delayed modulation preload was not serviced…`
+  killing sw-modulated finite captures near their end. Data was never mislabelled;
+  captures no longer advance after their final dwell.
+- Standalone scripts in `scripts/filterbank/`: channel-response measurement, a
+  compensation acceptance test, and an LO-stepping diagnostic.
 
 **Other**
-- rfsoc4x2: krc-utils availability checks in the clock status handling.
-- `so3g` is no longer a hard dependency — without it, SO 3G streaming is
-  unavailable (e.g. on Windows) but everything else works.
-- Docs/profiling: README and profiling scripts detail the accumulator
-  read-back geometry and timing metrics.
+- rfsoc4x2: krc-utils availability checks in clock status handling.
+- `so3g` is no longer a hard dependency — without it, SO 3G streaming is unavailable
+  (e.g. on Windows) but everything else works.
+- Docs/profiling: README and profiling scripts detail the accumulator read-back
+  geometry and timing metrics.
 
 ## v1.6.0
 
 **v7.11 multi-LO firmware support (firmware-slot frequency modulation)**
-- Adapted to the v7.11 register map: `acc_len` moves from the accumulator to the
-  mixer (get/set, readiness checks and sample-rate helpers; changing it now
-  needs an mrst sync). `sync_delay` is deprecated — the mixer owns the RX/TX LO
-  delay and sets it during init; config/parameter writes warn and no-op, and
-  `info_pipeline` reports the live mixer `sync_delay`, `tx_rx_skew` and
+- Adapted to the v7.11 register map: `acc_len` moves from the accumulator to the mixer
+  (changing it now needs an mrst sync). `sync_delay` is deprecated — the mixer owns
+  the RX/TX LO delay and sets it during init; config/parameter writes warn and no-op,
+  and `info_pipeline` reports the live mixer `sync_delay`, `tx_rx_skew` and
   `buffer_switch_skew`.
 - Mixer LO control ping-pong buffers are now separate registers
-  (`{lo}_lo{i}_control0/1`), each holding `n_slots` LO slots selected by
-  in-register offset. All slow/fast control-buffer read/write paths gain a
-  `slot` argument (`slot=0` reproduces the pre-v7.11 single-LO behaviour).
-  `accumulator.get_new_spectra` now returns a 5-tuple.
+  (`{lo}_lo{i}_control0/1`), each holding `n_slots` LO slots selected by in-register
+  offset. All control-buffer read/write paths gain a `slot` argument (`slot=0`
+  reproduces pre-v7.11 behaviour). `accumulator.get_new_spectra` returns a 5-tuple.
 
 **Firmware-slot modulation engine (`engine='fw'`, hardware-validated)**
-- New modulation engine using the v7.11 mixer's four LO slots: load up to four
-  full combs (centre + per-slot offset) once and let the firmware switch
-  between them — auto round-robin every `n_dwell` accumulations, or manual
-  slot selection — with no per-sample software writes and no software-timing
-  jitter. Switches land on accumulation edges; the residual transient is well
-  under one accumulation, so `n_settle` of 0 or 1 suffices.
-- Each accumulation is tagged from the firmware `buffer_id` register (live LO
-  slot for fw, ping-pong buffer → point for sw) in the same devmem call as the
-  IQ data, removing the one-sample tag/data lag of the v7.11 edge-latched
-  buffer switch. `get_samples` aligns its first returned sample to the start
-  of a point-1 dwell; settling is edge-detected from tag changes so it
-  self-corrects across dropped samples.
-- Seamless `update_modulation` rides the inactive ping-pong buffer and flips
-  in one step; `recenter_modulation` reloads fresh armed bins. The two engines
-  share the `flag5` tag word and are mutually exclusive; tone/sweep/retune
-  writes invalidate both.
+- New engine using the v7.11 mixer's four LO slots: load up to four full combs once and
+  let the firmware switch between them — auto round-robin every `n_dwell`
+  accumulations, or manual slot selection — with no per-sample software writes and no
+  software-timing jitter. Switches land on accumulation edges; `n_settle` of 0 or 1
+  suffices.
+- Each accumulation is tagged from the firmware `buffer_id` register in the same devmem
+  call as the IQ data, removing the one-sample tag/data lag. `get_samples` aligns its
+  first sample to the start of a point-1 dwell; settling is edge-detected from tag
+  changes so it self-corrects across dropped samples.
+- Seamless `update_modulation` rides the inactive ping-pong buffer;
+  `recenter_modulation` reloads fresh armed bins. The two engines share the `flag5` tag
+  word and are mutually exclusive; tone/sweep/retune writes invalidate both.
 
 **Unified modulation API**
-- One client surface for both engines: `enable_modulation(center, offsets, ...,
-  engine='fw')` defaults to the firmware-slot engine;
-  `update/recenter/disable_modulation` and `get_modulation_state` auto-detect
-  the active engine (`engine=None`), with `set_modulation_slot` for fw manual
-  mode. The sw path is unchanged underneath.
-- `get_info`: the `tone_modulation` section becomes `modulation` — a single
-  payload for whichever engine is active, tagged with an `engine` field and
-  carrying `num_points` / `samples_per_point` / `offsets_hz` aliases so it is
-  drop-in for `group_cycles` / `demodulate`.
-  `modulation.active_modulation_state()` picks the state out of a `get_info`
-  payload for the analysis/plotting helpers.
-- [frequency_modulation.md](doc/frequency_modulation.md) rewritten around the
-  unified API with firmware-slot as the primary engine.
+- `enable_modulation(center, offsets, ..., engine='fw')` defaults to the firmware-slot
+  engine; `update/recenter/disable_modulation` and `get_modulation_state` auto-detect
+  the active engine (`engine=None`), with `set_modulation_slot` for fw manual mode.
+- `get_info`: `tone_modulation` becomes `modulation` — one payload for whichever engine
+  is active, tagged with `engine` and carrying `num_points` / `samples_per_point` /
+  `offsets_hz` aliases so it is drop-in for `group_cycles` / `demodulate`.
+  `modulation.active_modulation_state()` picks it out of a `get_info` payload.
+- [frequency_modulation.md](doc/frequency_modulation.md) rewritten around the unified
+  API with firmware-slot as the primary engine.
 
 **Snapshots (v7.11)**
-- Snapshot blocks latch the telescope time of the first sample;
-  `get_adc/dac_snapshot` requests return it as `timestamp`. New
-  `batch_adc_snapshots` / `batch_dac_snapshots` stream raw timestamped
-  snapshots to the client over one TCP connection via the fast devmem path.
+- Snapshot blocks latch the telescope time of the first sample; `get_adc/dac_snapshot`
+  return it as `timestamp`. New `batch_adc_snapshots` / `batch_dac_snapshots` stream
+  raw timestamped snapshots over one TCP connection via the fast devmem path.
 
 **Server robustness**
-- `set_config` now verifies pipeline readiness after a config push and fails
-  loudly instead of persisting a dead config; a pushed config that changes the
-  firmware image drives the full deprogram/reprogram path instead of a live
-  parameter tweak.
+- `set_config` verifies pipeline readiness after a push and fails loudly instead of
+  persisting a dead config; a pushed config that changes the firmware image drives the
+  full deprogram/reprogram path.
 
 **Misc**
-- Added `resonator_fitter.py` for compatibility with the ukkid_controller OCS
-  agent.
+- Added `resonator_fitter.py` for compatibility with the ukkid_controller OCS agent.
 
 ## v1.5.0
 
 **v7.10-timed-sync firmware support (timed sync & multi-board alignment)**
-- Added support for the v7.10-timed-sync firmware, including TT-targeted syncs so
-  independent RFSoC boards can align timestamps and accumulations to the same epoch.
-- New client controls `timed_sync_needed()` / `timed_sync_ready()` /
-  `timed_sync_arm()` / `timed_sync_check()` and `set_telescope_time()`, backed by
-  firmware alignment/drift helpers. `set_telescope_time()` loads the current Linux
-  time into the firmware TT counter, latched on the next PPS edge so the TT lands on
-  the second boundary; `timed_sync_arm()` then schedules a future PPS-latched resync
-  and only reloads TT when it is missing or has drifted by about 1 s.
-  `timed_sync_check()` / `timed_sync_needed()` verify TT alignment against the
-  Linux clock. These flows require PTP lock and a healthy on-board PPS strobe;
-  see [tsu_strobe_and_timed_sync.md](doc/tsu_strobe_and_timed_sync.md).
-- Board PPS generation now comes from the TSU strobe path (`tsu_strobe.py`,
-  `souk-tsu-strobe`) rather than an external PPS input, with test and
-  verification scripts in `scripts/timed_sync/`.
-- `get_info('sync')` now reports timed-sync state, readiness, alignment, last
-  sync, last TT load and drift; `get_info('timing')` adds `sync_readiness`.
-  The server caches the PPS-aligned TT load second so `timed_sync_check()` is
-  instant by default and only falls back to slow resampling when needed.
-- Timed-sync results now include UTC strings for absolute UNIX times, clearer
-  key names (`last_pps_*`, `pps_boundary_offset_s`, `target_tt_*`, `armed_at_*`),
-  and a shared default alignment tolerance of 0.1 ms
-  (`timing.DEFAULT_ALIGN_TOL_S`, overridable via `align_tol_s`).
-- Added instructions for standing up a lab PTP grandmaster on a Linux workstation
-  in [timing.md](doc/timing.md): checking NIC PHC/hardware-timestamping support,
-  installing the tools, and the chrony/`phc2sys`/`ptp4l` hardware-GM flow (with the
-  deployed `ptp4l-gm`/`phc2sys-gm` services), plus the finding that software-only
-  timestamping did not work with the RFSoCs.
+- TT-targeted syncs so independent RFSoC boards can align timestamps and accumulations
+  to the same epoch.
+- New client controls `timed_sync_needed()` / `timed_sync_ready()` / `timed_sync_arm()`
+  / `timed_sync_check()` and `set_telescope_time()`. `set_telescope_time()` loads the
+  current Linux time into the firmware TT counter, latched on the next PPS edge;
+  `timed_sync_arm()` schedules a future PPS-latched resync and only reloads TT when
+  missing or drifted by ~1 s. Requires PTP lock and a healthy on-board PPS strobe; see
+  [tsu_strobe_and_timed_sync.md](doc/tsu_strobe_and_timed_sync.md).
+- Board PPS generation comes from the TSU strobe path (`tsu_strobe.py`,
+  `souk-tsu-strobe`) rather than an external PPS input, with scripts in
+  `scripts/timed_sync/`.
+- `get_info('sync')` reports timed-sync state, readiness, alignment, last sync, last TT
+  load and drift; `get_info('timing')` adds `sync_readiness`. The server caches the
+  PPS-aligned TT load second so `timed_sync_check()` is instant by default.
+- Results include UTC strings, clearer key names (`last_pps_*`,
+  `pps_boundary_offset_s`, `target_tt_*`, `armed_at_*`), and a shared default alignment
+  tolerance of 0.1 ms (`timing.DEFAULT_ALIGN_TOL_S`, overridable via `align_tol_s`).
+- [timing.md](doc/timing.md) gains instructions for standing up a lab PTP grandmaster
+  on a Linux workstation, plus the finding that software-only timestamping did not work
+  with the RFSoCs.
 
 **TX/RX phase offset fix (firmware)**
-- The v7.10 firmware fixes the TX/RX phase offset seen after mixer/tone
-  control-buffer switches, so post-switch firmware syncs are no longer required.
-  The earlier software workaround is now disabled by default:
-  `compensate_rx_ticks=0`.
+- v7.10 fixes the TX/RX phase offset seen after mixer/tone control-buffer switches, so
+  post-switch firmware syncs are no longer required. The software workaround is
+  disabled by default: `compensate_rx_ticks=0`.
 
 **Sweep & modulation stepping without per-step syncs (v7.10)**
-- With the phase-offset bug fixed, sweeps, retunes and modulation now default to
-  a single start-of-run sync (`setup_sync=True`, `setup_mrst=False`) with no
-  per-step syncs (`autosync=False`). Instead they drop a few accumulations around
-  each step; `settle_accumulations=4` / `chanmap_settle_accumulations=4` are now
-  the defaults for `perform_sweep`, `perform_retune` and `wideband_sweep`.
+- Sweeps, retunes and modulation default to a single start-of-run sync
+  (`setup_sync=True`, `setup_mrst=False`) with no per-step syncs (`autosync=False`),
+  dropping a few accumulations around each step instead;
+  `settle_accumulations=4` / `chanmap_settle_accumulations=4` are the new defaults.
 - Standalone tone setters (`set_tone_frequencies`, `set_tone_amplitudes`,
-  `set_tone_phases`, `apply_tone_frequency_settings`, `set_tone_powers`) also
-  default to `autosync=False`.
-- `enable_modulation` now defaults `buffer_reuse_delay_accs=3` with
-  `samples_per_point=4` to avoid rewriting the inactive mixer-control buffer too
-  early or straddling a buffer switch. Both issues are expected to disappear in
-  a future firmware.
+  `set_tone_phases`, `apply_tone_frequency_settings`, `set_tone_powers`) also default
+  to `autosync=False`.
+- `enable_modulation` defaults `buffer_reuse_delay_accs=3` with `samples_per_point=4`.
 
 **Clock-source safety**
-- Clock health is now checked at initialise/restart and via `get_info`; there is
- no forced clock reconfiguration on every config push now. If a PLL is unlocked 
- or the live source differs from config, the server refuses to touch the clock 
- and reports `reset_required`, because we found that changing clock configuration 
- against a loaded pipeline can stall or crash the board. The fix is to deprogram 
- the firmware before any clock change, so seamless runtime switching between 
- internal and external clock sources is no longer supported. Clock changes now go 
- through a reset-to-base -> deprogram -> clock-init -> reprogram (`hard_reset`) 
- cycle, with new helpers `classify_clock_status`, `apply_clock_config`, 
- `deprogram_fpga`, and `select_clock_source`.
+- Clock health is checked at initialise/restart and via `get_info`; there is no forced
+  clock reconfiguration on every config push. If a PLL is unlocked or the live source
+  differs from config, the server refuses to touch the clock and reports
+  `reset_required` — changing clock configuration against a loaded pipeline can stall
+  or crash the board. Seamless runtime switching between internal and external clock
+  sources is no longer supported; clock changes go through reset-to-base → deprogram →
+  clock-init → reprogram (`hard_reset`). New helpers `classify_clock_status`,
+  `apply_clock_config`, `deprogram_fpga`, `select_clock_source`.
 
 **Modulation / demodulation**
-- Added `modulation.demodulate_timestream()`, which performs sample-aligned
-  demodulation without averaging away retained modulation samples. It supports
-  calibrated Mobius inversion or the model-free basis plus `raw` /
-  `interpolate` / `none` settling fill modes.
-- `group_cycles()` now supports `include_settling` and emits blind / regular /
-  modulated tone-role metadata; `params_from_sweep()` adds mutually exclusive
-  `point_sequence` and `offset_linewidths` inputs.
-- `recenter_modulation()` gains RX-tick phase compensation, client-visible
-  modulation-state warnings, and `purge_modulation_revisions()` for stale
-  revision bookkeeping.
-- `enable_modulation(..., force=True)` now arms even when some tones fall
-  beyond fixed-bin coverage; the response reports
-  `result.tones_beyond_coverage` and warns that those tones will read back
+- Added `modulation.demodulate_timestream()` — sample-aligned demodulation without
+  averaging away retained samples. Supports calibrated Möbius inversion or the
+  model-free basis, plus `raw` / `interpolate` / `none` settling fill modes.
+- `group_cycles()` supports `include_settling` and emits blind / regular / modulated
+  tone-role metadata; `params_from_sweep()` adds mutually exclusive `point_sequence`
+  and `offset_linewidths`.
+- `recenter_modulation()` gains RX-tick phase compensation, client-visible warnings,
+  and `purge_modulation_revisions()`.
+- `enable_modulation(..., force=True)` arms even when some tones fall beyond fixed-bin
+  coverage; `result.tones_beyond_coverage` reports them and warns they read back
   wrapped to the other end of the bin.
 
 **DAC inverse sync filter**
-- Added config-driven DAC inverse-sync-filter control, enabled by default unless
-  explicitly set `False`, directly controllable from the client and reported in
-  `get_info` / config sync.
+- Config-driven DAC inverse-sync-filter control, enabled by default unless explicitly
+  `False`, directly controllable from the client and reported in `get_info` / config
+  sync.
 
 **Plotting & analysis**
-- Added `plotting.log_bin_psd()` for log-spaced PSD binning, timestream
-  plotting for modulated-probe frequencies and precomputed
-  frequency/dissipation columns, plus resonator-fitting uncertainty/model
-  refinements.
+- Added `plotting.log_bin_psd()` for log-spaced PSD binning, timestream plotting for
+  modulated-probe frequencies and precomputed frequency/dissipation columns, plus
+  resonator-fitting uncertainty/model refinements.
 
 **Resonator fitting — automatic nonlinearity estimation (`fitting.py`)**
-- Added `nonlinear='auto'` for `fit_resonance`, `batch_fit` and
-  `fit_sweep_stack`: the fitter tries the fast linear model first and only
-  escalates to the slower Duffing `anl` fit when needed. Diagnostics are stored
-  in `linear_sufficiency`; linear-only results report `anl = 0`.
-- This mode is intentionally not the default and is not suitable for power
-  sweeps or `anl`-versus-power studies, where small but real nonlinearities
-  would be suppressed. `nonlinear` therefore remains `True` by default,
-  including in `fit_power_sweep` / `analyse_power_sweep`.
-- Linear fitting is also faster via a closed-form Jacobian, and
-  `store_optimizer=False` can shrink large parallel-fit results by dropping
-  bulky optimiser objects.
+- `nonlinear='auto'` for `fit_resonance`, `batch_fit` and `fit_sweep_stack`: tries the
+  fast linear model first and escalates to the Duffing `anl` fit only when needed.
+  Diagnostics in `linear_sufficiency`; linear-only results report `anl = 0`.
+- Deliberately not the default and not suitable for power sweeps or `anl`-versus-power
+  studies, where small but real nonlinearities would be suppressed. `nonlinear` remains
+  `True` by default, including in `fit_power_sweep` / `analyse_power_sweep`.
+- Linear fitting is faster via a closed-form Jacobian; `store_optimizer=False` shrinks
+  large parallel-fit results.
 
 **Mock server sample rate**
-- The mock server now derives sample rate from `acc_len`, matching real
-  hardware in both directions (`sample_rate_hz` updates `acc_len`, and vice
-  versa).
-- Mock acquisition is now throttled to approximately real-time using the live
-  sample rate, so G3 streaming, `receive_stream`, and non-burst `get_samples`
-  take realistic wall-clock time and avoid false "streaming finished early"
-  warnings.
+- The mock server derives sample rate from `acc_len` in both directions, and throttles
+  acquisition to approximately real time so G3 streaming, `receive_stream` and
+  non-burst `get_samples` take realistic wall-clock time.
 
 **`get_sweep_data` and `get_info` speedup**
-- `get_sweep_data` and `get_sweep_txt` now serve a cached sweep-time system-info
-  snapshot instead of re-polling hardware on each fetch, cutting fetch time from
-  about 6 s to about 5 ms.
-- `get_info('all')` is also much faster (about 6 s to about 1 s) thanks to fast
+- `get_sweep_data` / `get_sweep_txt` serve a cached sweep-time system-info snapshot
+  instead of re-polling hardware: ~6 s → ~5 ms. `get_info('all')` ~6 s → ~1 s via fast
   control-buffer/channel-map reads and narrower LNA I2C access.
 
 **Parameter-series measurement tools**
-- Reintroduced `measurement.py` in a deliberately simple form: four tools for
-  repeating any measurement across an external parameter —
-  `ParameterSeries` (a list of values), `ParameterGrid` (nested axes),
-  `TimedMeasurement` (on a clock) and `ConditionalMeasurement` (on a condition).
-  You supply set/read callbacks and a `measure_func(client)`; the tools walk the
-  parameter and save each result plus a `measurement.json` manifest as they go.
-  All callbacks receive the active `client` (ignore it for external
-  instruments), and `run(..., client=...)` re-points one tool at another
-  board/pipeline. `ConditionalMeasurement` matches `target_values` in any order,
-  so a drifting quantity (e.g. temperature) need not reach them in sequence.
-- The `measure_func` return value drives saving: a dict is stored as `.npz`,
-  `None` stores nothing (the step is still logged); `save_func` overrides the
-  saver. Saving is opt-in via `save_dir` (relative paths, auto-created folders,
-  resolved path printed); existing run folders are never overwritten (numbered
-  suffix) unless `overwrite=True`.
-- Robust long runs: `resume=True` continues an interrupted run, `retries` /
-  `on_error="skip"` tolerate flaky points, and Ctrl-C finalizes the manifest
-  cleanly. Optional `plot_func` saves a plot per step and `summarise_func`
-  builds a live `summary.csv` digest. Read runs back with `load_run` and plot
-  their summary with `plot_run_summary`. See
+- Reintroduced `measurement.py` in a deliberately simple form: `ParameterSeries`,
+  `ParameterGrid`, `TimedMeasurement` and `ConditionalMeasurement`. You supply set/read
+  callbacks and a `measure_func(client)`; the tools walk the parameter and save each
+  result plus a `measurement.json` manifest as they go. `run(..., client=...)`
+  re-points one tool at another board/pipeline. `ConditionalMeasurement` matches
+  `target_values` in any order.
+- The `measure_func` return value drives saving: a dict is stored as `.npz`, `None`
+  stores nothing; `save_func` overrides. Saving is opt-in via `save_dir`; existing run
+  folders are never overwritten unless `overwrite=True`.
+- Robust long runs: `resume=True`, `retries`, `on_error="skip"`, and clean Ctrl-C
+  finalisation. Optional `plot_func` and `summarise_func` (live `summary.csv`). Read
+  back with `load_run`, plot with `plot_run_summary(ncols=...)`. See
   [measurements.md](doc/measurements.md).
-- Resource guard for large runs (long timestreams, batch snapshots, many-tone
-  grids): after the first step the run projects per-step memory and disk over
-  the whole run. If memory would be exhausted it frees each step after saving
-  (data stays on disk) or warns when nothing can be offloaded; if disk would
-  fill it warns every step. Each step prints what the run is using (RAM held +
-  disk written, with the projected total). The per-run memory budget is a
-  `memory_fraction` constructor argument (default 0.8 of total system memory),
-  so several runs across boards can each be capped (e.g. 0.05). Pass
-  `estimated_step_bytes` for a pre-run check. The guard only adapts/warns - it
-  never aborts a run.
-- `load_run` caches step data only while it fits in free memory (oversized steps
-  are read without caching), so repeated access is cheap yet a run larger than
-  memory never blows up; `run.iter_data()` streams one step at a time without
-  caching, `load_run(cache=False)` / `run.clear_cache()` control it.
-  `plot_run_summary` gained an `ncols` argument to arrange the summary subplots
-  in a grid.
-- The shared manifest/npz helpers now live in `measurement.py` and are imported
-  by `power_sweep.py` (the per-step saver is renamed `_save_npz`/`_load_npz`);
-  the power-sweep run format is unchanged.
+- Resource guard for large runs: after the first step the run projects per-step memory
+  and disk over the whole run, freeing each step after saving if memory would be
+  exhausted and warning if disk would fill. Per-run budget via `memory_fraction`
+  (default 0.8 of total system memory). Pass `estimated_step_bytes` for a pre-run
+  check. The guard only adapts/warns — it never aborts.
+- `load_run` caches step data only while it fits in free memory; `run.iter_data()`
+  streams one step at a time, `load_run(cache=False)` / `run.clear_cache()` control it.
+- Shared manifest/npz helpers now live in `measurement.py` and are imported by
+  `power_sweep.py`; the power-sweep run format is unchanged.
 
 **Removals & housekeeping**
-- Replaced the earlier over-complicated measurement-run framework (`MeasurementRun`
-  / `MeasurementStore` / artifact dataclasses) with the simpler tools above;
-  power-sweep directories remain the on-disk record (`run_power_sweep` /
-  `load_power_sweep`).
-- Also tightened config-push validation, added Windows guards for POSIX-only
-  imports, and introduced `config_utils.get_user_dir()` for resolving the target
-  user's data directory under `sudo`.
+- Replaced the earlier over-complicated measurement-run framework (`MeasurementRun` /
+  `MeasurementStore` / artifact dataclasses) with the tools above.
+- Tightened config-push validation, added Windows guards for POSIX-only imports, and
+  introduced `config_utils.get_user_dir()` for resolving the target user's data
+  directory under `sudo`.
 
 ## v1.4.0
 
 **Fast Frequency Modulation (real-time IQ conversion & resonator tracking)**
-- Modulation is now a mode of the single continuous streamer: each tone is
-  stepped through a small set of probe frequencies (typically 2-3 points) every
-  accumulation, and the samples are returned as ordinary frames tagged per
-  sample with the modulation step and a settling marker (packed into the spare
-  `flag5` word; decode as unsigned). Normal streaming is the modulation-off case.
-- New client controls: `enable_modulation()` / `update_modulation()` /
-  `recenter_modulation()` / `disable_modulation()`, plus `get_modulation_state()`
-  and a `get_info('tone_modulation')` section. Arm is independent of output —
-  start it with `enable_stream()` (continuous) or `get_samples(N)` (finite); both
-  return tagged frames while armed.
-- On/off at any time, and **seamless live updates** of per-tone centres/offsets
-  with no intentionally dropped frames (heavy preparation off the hot path, a
-  single latest-wins command applied by the streamer at a cycle boundary). Tones
-  ride the ~2x filterbank overlap; a bounded `recenter_modulation()` reloads the
-  channel maps when a tone drifts beyond coverage. Per-(tone,point) bin occupancy
-  is reported.
-- Correct double-buffer "ping-pong" scheduler (valid for any N, including odd N
-  across cycles) with an N=2 zero-rewrite fast path; per-point mixer words are
-  computed relative to the armed bins so the phase stays continuous as tones
-  dither/drift.
-- New pure `souk_readout_tools.modulation` toolkit (setup + demodulation):
-  `params_from_sweep` (build a config from your own resonator fits),
-  `group_cycles` (group by step/cycle; `on_missing='notify'|'fill'` handles
-  packet gaps), and `demodulate`. The recommended de-embedded/phase-centred basis
-  (via a per-tone `resonator.ResonatorCalibration`) yields the frequency shift
-  and dissipation directly through the exact Möbius inversion; a model-free
-  raw-phase fallback is also provided.
-- Mock mode emulates modulation (resonator phase model + bin grid) for
-  hardware-free testing; `client_scripts/test_frequency_modulation.py` exercises
-  the whole path. See [Fast Frequency Modulation](doc/frequency_modulation.md).
+- Modulation is a mode of the single continuous streamer: each tone is stepped through
+  a small set of probe frequencies (typically 2–3) every accumulation, returned as
+  ordinary frames tagged per sample with the modulation step and a settling marker
+  (packed into the spare `flag5` word; decode as unsigned).
+- New controls: `enable_modulation()` / `update_modulation()` / `recenter_modulation()`
+  / `disable_modulation()`, plus `get_modulation_state()` and a
+  `get_info('tone_modulation')` section. Arm is independent of output — start with
+  `enable_stream()` or `get_samples(N)`.
+- On/off at any time, and **seamless live updates** of per-tone centres/offsets with no
+  intentionally dropped frames. Tones ride the ~2× filterbank overlap; a bounded
+  `recenter_modulation()` reloads channel maps when a tone drifts beyond coverage.
+  Per-(tone,point) bin occupancy is reported.
+- Correct double-buffer ping-pong scheduler (valid for any N, including odd N across
+  cycles) with an N=2 zero-rewrite fast path; per-point mixer words are computed
+  relative to the armed bins so phase stays continuous as tones drift.
+- New `souk_readout_tools.modulation` toolkit: `params_from_sweep`, `group_cycles`
+  (`on_missing='notify'|'fill'`) and `demodulate`. The recommended de-embedded/
+  phase-centred basis (via `resonator.ResonatorCalibration`) yields frequency shift and
+  dissipation through the exact Möbius inversion; a model-free raw-phase fallback is
+  also provided.
+- Mock mode emulates modulation; `client_scripts/test_frequency_modulation.py`
+  exercises the whole path. See
+  [Fast Frequency Modulation](doc/frequency_modulation.md).
 
 **Power Sweep**
-- `find_best_power` now repairs unphysical negative `chosen_params` (an artifact
-  of linearly extrapolating a fit-summary field past the measured power range) by
-  substituting the cross-tone median of the valid values for that key, so every
-  consumer (including `best_power_arrays`) gets physical values. Signed
-  quantities are left untouched; affected tones remain flagged `extrapolated`.
+- `find_best_power` repairs unphysical negative `chosen_params` (from linearly
+  extrapolating a fit-summary field past the measured range) by substituting the
+  cross-tone median. Signed quantities untouched; affected tones stay flagged
+  `extrapolated`.
 
 ## v1.3.0
 
 Forward-ported the `jl_ocs_devel` branch (PR #10) plus follow-on hardening.
 
 **G3 Streaming Output (so3g)**
-- Added `client.receive_stream_g3()` to record a continuous data stream as
-  an so3g/spt3g G3 file. The output contains an `Observation` frame, a
-  `Wiring` frame describing tone metadata, and `Scan` frames carrying
-  `G3SuperTimestream` payloads for I/Q data, packet counters, and PTP
-  telescope timestamps. Mock mode is also supported.
-- Added the `receive_stream_g3.py` client script for command-line G3
-  capture (connect via config file or address/port). The script is shipped
-  as a module rather than an entry point, matching the existing
-  `receive_stream.py` convention.
-- Client install now requires `so3g` (which pulls in `spt3g`).
+- `client.receive_stream_g3()` records a continuous stream as an so3g/spt3g G3 file:
+  `Observation` frame, `Wiring` frame with tone metadata, and `Scan` frames carrying
+  `G3SuperTimestream` payloads for I/Q, packet counters and PTP timestamps. Mock
+  supported.
+- `receive_stream_g3.py` client script for command-line capture, shipped as a module
+  rather than an entry point. Client install now requires `so3g` (pulls in `spt3g`).
 
 **Mock Server Mode**
-- Added `ReadoutClient(..., mock=True)` for local emulation of the readout
-  server without RFSoC hardware, intended for OCS / controller integration
-  testing. Mock mode swaps socket traffic for an in-process
-  `MockReadoutServer` (`souk_readout_tools.client.mock_readout`) and
-  defaults connection details to `127.0.0.1:10000` when no config or
-  address is supplied.
-- The mock server generates a synthetic resonator catalogue and emulates
-  sweeps, snapshots, streams, the full `get_info()` surface, and the new
-  G3 stream writer.
+- `ReadoutClient(..., mock=True)` emulates the readout server without hardware,
+  swapping socket traffic for an in-process `MockReadoutServer` and defaulting to
+  `127.0.0.1:10000`. Generates a synthetic resonator catalogue and emulates sweeps,
+  snapshots, streams, the full `get_info()` surface and the G3 writer.
 
 **OCS Compatibility Fitting Helpers (`client/res_fns.py`)**
-- Forward-ported `souk_readout_tools.client.res_fns` for `UKKIDController`
-  compatibility. Provides simple resonator-fitting helpers (`s21_model`,
-  etc.). Slated for removal once the core fitting tools in
-  `souk_readout_tools` are fully validated in `UKKIDController`.
+- Forward-ported for `UKKIDController` compatibility (`s21_model`, etc.). Slated for
+  removal once the core fitting tools are validated there.
 
 **Core Resonator Fitting (`fitting.py`)**
-- Reworked the linear and nonlinear resonator fitters around a clearer
-  parameter convention (`fr, Qi, Qc, phi, A, alpha, tau[, anl]`). `Qc` is the
-  fitted real coupling parameter; `Qe` and `Qc_abs` are derived reporting
-  fields. Fit setup now uses explicit `initial_guess`, `param_bounds`, and
-  `param_fixed` dictionaries.
-- Improved nonlinear/Duffing fitting for highly driven resonances. The new
-  seed strategy, high-drive handling, optional subsampling, and fit diagnostics
-  give much better and faster convergence on distorted resonance shapes.
-- Added process-based parallel fitting for `fit_sweep_stack()` and
-  `batch_fit()` via `n_jobs`, with compact verbose progress showing throughput,
-  fit timing, and cumulative function evaluations.
-- Added conservative wideband peak-finder defaults for
-  `client.find_resonances(mode='wideband')` and
-  `batch_fit(find_resonances=True)`: inner 10-90% frequency trim, dip finding,
-  1-100 dB prominence, 1 kHz-10 MHz width, 100 kHz minimum spacing, and
-  lowpass 0.5.
+- Reworked the linear and nonlinear fitters around a clearer convention
+  (`fr, Qi, Qc, phi, A, alpha, tau[, anl]`). `Qc` is the fitted real coupling
+  parameter; `Qe` and `Qc_abs` are derived. Setup uses explicit `initial_guess`,
+  `param_bounds` and `param_fixed` dicts.
+- Better nonlinear/Duffing convergence on distorted shapes via a new seed strategy,
+  high-drive handling, optional subsampling and fit diagnostics.
+- Process-based parallel fitting for `fit_sweep_stack()` and `batch_fit()` via
+  `n_jobs`, with compact verbose progress.
+- Conservative wideband peak-finder defaults for `find_resonances(mode='wideband')` and
+  `batch_fit(find_resonances=True)`: inner 10–90% trim, dip finding, 1–100 dB
+  prominence, 1 kHz–10 MHz width, 100 kHz minimum spacing, lowpass 0.5.
 
 **Resonator Transforms and Plotting**
-- Deembedding, phase-centering, and sweep plotting now propagate optional S21
-  uncertainties (`real=sigma_I`, `imag=sigma_Q`) through the same transforms
-  applied to the data.
-- Updated the phase-centering convention and calibration construction so
-  fitted resonator geometry is handled consistently across fitting, plotting,
-  and frequency/dissipation conversion.
+- Deembedding, phase-centering and sweep plotting propagate optional S21 uncertainties
+  (`real=sigma_I`, `imag=sigma_Q`) through the same transforms.
+- Updated the phase-centering convention and calibration construction so fitted
+  geometry is handled consistently across fitting, plotting and freq/diss conversion.
 
 **Noise Analysis**
-- Added `noise.remove_common_modes_svd()` for NumPy-only common-mode
-  subtraction across slow accumulated detector timestreams, plus
-  `noise.fractional_frequency_and_dissipation_timestreams()` for converting
-  multi-tone I/Q captures with a matching calibration sweep.
-- Added `noise.remove_blind_tone_common_modes()` to fit temporal reference
-  modes from simultaneous blind-tone amplitude/phase variations and regress
-  those modes out of regular-tone I/Q before frequency/dissipation
-  conversion. Blind sweep traces are not used.
-- `plot_timestream_psd(..., format='freq_diss')` can overlay SVD-cleaned
-  and blind-tone-cleaned spectra or plot them in place of the raw spectra.
-  Legends record the number of removed modes.
+- `noise.remove_common_modes_svd()` for NumPy-only common-mode subtraction across slow
+  accumulated timestreams, plus
+  `noise.fractional_frequency_and_dissipation_timestreams()`.
+- `noise.remove_blind_tone_common_modes()` fits temporal reference modes from
+  simultaneous blind-tone amplitude/phase variations and regresses them out of
+  regular-tone I/Q before conversion. Blind sweep traces are not used.
+- `plot_timestream_psd(..., format='freq_diss')` can overlay SVD- and
+  blind-tone-cleaned spectra or plot them in place of the raw ones.
 
 **CSV Import Hardening**
-- `import_sweep` and the equivalent stream/snapshot CSV importers now use
-  `ast.literal_eval` instead of `eval` for metadata parsing. This removes
-  an arbitrary-code-execution sink and fixes a latent crash on values that
-  are valid strings but not valid Python expressions (e.g. `fpg_file`
-  paths, ISO-8601 date strings, free-form text). All three importers now
-  share an identical metadata-parse loop.
+- `import_sweep` and the stream/snapshot CSV importers use `ast.literal_eval` instead
+  of `eval`, removing an arbitrary-code-execution sink and fixing a latent crash on
+  values that are valid strings but not valid Python expressions (`fpg_file` paths,
+  ISO-8601 dates, free text).
 
 **Client API**
-- `ReadoutClient.perform_sweep()` and `perform_retune()` now accept a
-  `wait=False` keyword. Setting `wait=True` blocks until the sweep
-  finishes by calling `wait_for_sweep()` internally after a successful
-  dispatch.
+- `perform_sweep()` and `perform_retune()` accept `wait=False`; `wait=True` blocks via
+  `wait_for_sweep()` after a successful dispatch.
 
 **Power Sweep Workflow Polish**
-- `power_sweep.run_power_sweep()` now defaults to pre-centering before the
-  first saved sweep and following dips between power steps. The initial
-  unsaved center-search sweep uses `search_span_factor=2.0` by default so
-  edge-clipped dips can be pulled back into the saved sweep span. Pass
-  `follow_dips=False` for fixed centers or `search_for_center=False` to skip
-  only the initial search.
-- `power_sweep.run_power_sweep()` now defaults `follow_min_depth_db=0.5`
-  (matching `fit_power_sweep()`'s `min_dip_depth_db` default), so
-  `follow_dips=True` no longer chases shallow noise minima between power
-  steps. Pass `follow_min_depth_db=None` to restore the previous accept-
-  any-depth behaviour.
-- Added `power_sweep.best_power_arrays()`, `write_best_power()`, and
-  `load_best_power()` for extracting the chosen power, `p_bif`, and
-  `p_bif_sub_3db` per tone as 1-D NumPy arrays, and round-tripping the
-  full `find_best_power()` result to `best_power.json`.
-- `plot_fits()` now disables the shared axis offset annotation
-  (`+1.5e9`-style text) on every magnitude/phase/IQ panel it draws.
-- `plot_power_sweep()` and `plot_best_power()` are faster on many-tone runs.
-  Both gained an `n_jobs` argument (joblib convention: `1` serial default,
-  `-1` all CPUs) that renders the independent per-tone PNGs across worker
-  processes; `savefig` is the dominant, CPU-bound cost so this scales toward
-  the core count (`plot_best_power()` is forced serial when `show=True`).
-  `analyse_power_sweep()` forwards its `n_jobs` to both, so the convenience
-  path is parallel by default. The default `dpi` dropped from `100` to `80`
-  (savefig raster time scales with `dpi**2`); raise it for publication
-  figures. Per-tone output is byte-identical between serial and parallel runs.
-- Removed the `UserWarning: ... Axes that are not compatible with
-  tight_layout` emitted (once per tone) by `plot_power_sweep()` and
-  `plot_best_power()` on `mag+phase+iq` layouts. Those figures now lay out via
-  `savefig(bbox_inches='tight')` instead of `tight_layout()`, which also
-  prevents long calibrated axis labels from being clipped.
-- Fixed `analyse_power_sweep(plot=True)` passing an invalid `show=` argument
-  to `plot_power_sweep()` (now `show_overlay=`), which raised `TypeError`.
+- `run_power_sweep()` defaults to pre-centering before the first saved sweep and
+  following dips between power steps; the initial unsaved center-search sweep uses
+  `search_span_factor=2.0`. Pass `follow_dips=False` or `search_for_center=False`.
+- `run_power_sweep()` defaults `follow_min_depth_db=0.5`, so `follow_dips=True` no
+  longer chases shallow noise minima. `None` restores accept-any-depth.
+- New `best_power_arrays()`, `write_best_power()` and `load_best_power()` for the
+  chosen power, `p_bif` and `p_bif_sub_3db` per tone, and round-tripping
+  `find_best_power()` to `best_power.json`.
+- `plot_fits()` disables the shared axis offset annotation on every panel.
+- `plot_power_sweep()` and `plot_best_power()` gained `n_jobs` (joblib convention),
+  rendering per-tone PNGs across worker processes — `savefig` is the dominant CPU cost,
+  so this scales toward the core count. `analyse_power_sweep()` forwards `n_jobs`.
+  Default `dpi` dropped 100 → 80 (savefig time scales with `dpi**2`); raise it for
+  publication figures. Per-tone output is byte-identical serial vs parallel.
+- Removed the per-tone `UserWarning: ... Axes that are not compatible with
+  tight_layout` on `mag+phase+iq` layouts — those figures lay out via
+  `savefig(bbox_inches='tight')`, which also stops long axis labels being clipped.
+- Fixed `analyse_power_sweep(plot=True)` passing an invalid `show=` to
+  `plot_power_sweep()` (now `show_overlay=`), which raised `TypeError`.
 
 ## v1.2.0
 
 **Get Info API**
-- `get_info()` now accepts a single section name, such as
-  `get_info("timing")`, and returns that section dictionary directly rather
-  than requiring callers to pass a one-item list. List requests still work and
-  `get_info(["section_a", "section_b"])` returns a list in the requested order.
-
+- `get_info()` accepts a single section name (`get_info("timing")`) and returns that
+  section directly. List requests still work and return a list in the requested order.
 
 **RFSoC Timing and PTP**
-- Added a packaged `souk-timing-monitor` daemon that polls `ptp4l` via `pmc`
-  and chrony via `chronyc`, tracks timing state, and exposes JSON status on
-  `/run/timing-monitor.sock`.
-- Added packaged timing templates for `ptp4l.service`, `timing-monitor.service`,
-  `ptp4l.conf`, and the chrony PHC refclock drop-in.
-- Added `souk-enable-timing` to install and start the RFSoC timing services
-  from the packaged templates.
-- Added `souk-test-timing-monitor` as a small lab client for `status`, `ping`,
-  and streaming checks against the live timing-monitor socket.
-- Added `client.get_timing_status()` and a `timing` section in `get_info()`.
-  `health_check()` now includes `timing_state` and `timing_ready`.
-- `get_info("timing")` now presents a compact grouped user-facing view with
-  `summary`, `monitor`, `ptp`, `phc`, `ntp`, and `chrony` sections. The
-  summary is intended for regular health logs, while the detailed sections keep
-  concise parsed values plus raw `pmc`/`chronyc` command output for debugging.
-- Timing summaries now expose `ready_for_firmware_sync` as the gate for
-  firmware timestamp syncs.
-- Timing summaries now include the current and last-seen PTP grandmaster
-  identities, compact NTP source error values, and a rough
-  PTP-holdover-vs-NTP comparison for extended holdover decisions. The summary
-  and monitor sections also expose the holdover drift-rate and policy constants
-  used by that estimate.
-- `summary.system_synced` now means actively synchronised to a current external
-  source. It is false during PTP holdover; `chrony.synced` still reports
-  chrony's local `Leap status == Normal` view.
-- NTP source entries now include both the configured source name and the
-  resolved address where chrony exposes both, plus adjusted/measured offsets
-  and the measurement error bound.
-- Timing status now includes `ptp_data_fresh`, `ptp_ingress_time_ns`,
-  `ptp_seconds_since_ingress`, and `ptp_seconds_since_ingress_update`; stale
-  `gmPresent` and `master_offset` values are masked when
-  `TIME_STATUS_NP.ingress_time` shows no recent PTP ingress.
-- Timing status now stores raw `pmc` outputs and raw `chronyc tracking` /
-  `chronyc sources -v` outputs, while keeping parsed values only where the
-  monitor or summary needs them.
-- PTP holdover policy is configurable via `souk-timing-monitor` CLI options and
-  is reported in status as `ptp_holdover_window_s` and
-  `ptp_holdover_error_rate_ppm`. When this monitor has observed PTP lock and
-  chrony remains selected on `PHC0`, the monitor stays in `ptp_holdover` beyond
-  the nominal window and reports `ptp_holdover_expired`.
-- Revised monitor startup and stale-ingress handling: starting with no GM but
-  chrony selected on `PHC0` is now reported as `phc_free_run` until this monitor
-  has observed a PTP lock, and a non-zero `ingress_time` must keep advancing to
-  remain fresh.
-- If the monitor starts and neither PTP, PHC, nor NTP is selected yet, it now
-  reports `initializing` during a configurable startup grace period before
-  falling back to `free_run`.
-- The packaged chrony PHC refclock uses `prefer` but not `trust`, so NTP can
-  reject a free-running PHC if the board starts without a grandmaster and the
-  PHC epoch is wrong.
-- Added timing documentation and a site commissioning checklist. The packaged
-  chrony PHC refclock now defaults to `offset 0`; the lab-only `offset -37`
-  workaround can be installed with `souk-enable-timing --offset=-37`.
+- New packaged `souk-timing-monitor` daemon polling `ptp4l` via `pmc` and chrony via
+  `chronyc`, exposing JSON status on `/run/timing-monitor.sock`, plus packaged
+  templates for `ptp4l.service`, `timing-monitor.service`, `ptp4l.conf` and the chrony
+  PHC refclock drop-in. `souk-enable-timing` installs and starts them;
+  `souk-test-timing-monitor` is a lab client for `status`, `ping` and streaming checks.
+- New `client.get_timing_status()` and a `timing` section in `get_info()`;
+  `health_check()` includes `timing_state` and `timing_ready`.
+- `get_info("timing")` presents a compact grouped view — `summary`, `monitor`, `ptp`,
+  `phc`, `ntp`, `chrony` — with parsed values plus raw `pmc`/`chronyc` output for
+  debugging. `ready_for_firmware_sync` is the gate for firmware timestamp syncs.
+- Summaries include current and last-seen PTP grandmaster identities, compact NTP
+  source errors, and a rough PTP-holdover-vs-NTP comparison, with the holdover
+  drift-rate and policy constants exposed. NTP entries carry configured name and
+  resolved address, adjusted/measured offsets, and the measurement error bound.
+- `summary.system_synced` now means actively synchronised to a current external source
+  — false during PTP holdover. `chrony.synced` still reports chrony's local view.
+- Status includes `ptp_data_fresh`, `ptp_ingress_time_ns`, `ptp_seconds_since_ingress`
+  and `ptp_seconds_since_ingress_update`; stale `gmPresent` and `master_offset` are
+  masked when `TIME_STATUS_NP.ingress_time` shows no recent ingress. Raw `pmc` and
+  `chronyc tracking` / `sources -v` outputs are stored.
+- Holdover policy is configurable via CLI options and reported as
+  `ptp_holdover_window_s` / `ptp_holdover_error_rate_ppm`; once PTP lock has been
+  observed and chrony stays on `PHC0`, the monitor stays in `ptp_holdover` beyond the
+  nominal window and reports `ptp_holdover_expired`.
+- Starting with no GM but chrony on `PHC0` reports `phc_free_run` until a PTP lock has
+  been observed; a non-zero `ingress_time` must keep advancing to stay fresh. With
+  nothing selected yet, the monitor reports `initializing` during a configurable grace
+  period before falling back to `free_run`.
+- The packaged chrony PHC refclock uses `prefer` but not `trust`, so NTP can reject a
+  free-running PHC, and defaults to `offset 0`; the lab-only `offset -37` workaround
+  installs with `souk-enable-timing --offset=-37`. Added timing documentation and a
+  site commissioning checklist.
 
 ## v1.1.1
 
 **Removed Deprecated APIs**
-- `get_system_information()` (client/server/`firmware_lib`) and
-  `get_server_status()` (client/server) have been removed. Use
-  `get_info(sections=...)` for structured system state and
-  `health_check()` for compact polling.
-- Sweep, snapshot, stream, and parsed-data payloads now carry the
-  structured info under the `info` key (replacing the legacy flat
-  `system_information` key). Plotting and parsing helpers read from
-  `data['info']` accordingly.
+- `get_system_information()` and `get_server_status()` removed. Use
+  `get_info(sections=...)` and `health_check()`.
+- Sweep, snapshot, stream and parsed-data payloads carry the structured info under the
+  `info` key, replacing the legacy flat `system_information` key.
 
 **LNA Bias Setting Failure Reporting**
-- `set_lna_bias_voltage()` and `set_lna_bias_voltage_all()` now propagate
-  hardware-side rejections from the upstream `souk-peripherals-control`
-  algorithm as proper `status: 'error'` responses (with the original
-  diagnostic message and full result still attached) rather than burying
-  the failure inside a `status: 'success'` payload.
-- Each per-channel result now carries a `success: bool` flag so callers
-  can branch on it directly.
-- LNA bias config now includes an explicit backend plus `bias_voltage_v`
-  (default 1.5 V), `method`, and `blind`; config application sets the
-  configured LNA channel when the `i2c` backend is enabled.
-- Added explicit `fixed` backends for LNA bias and RF attenuators so
-  non-controllable values are represented deliberately instead of by
-  blank backend leaves.
-- Added `soft_off_lna_bias()` / `soft_off_lna_bias_all()` and the
-  `souk-find-lnas --status` discovery CLI.
+- `set_lna_bias_voltage()` / `set_lna_bias_voltage_all()` propagate hardware-side
+  rejections as proper `status: 'error'` responses rather than burying the failure in a
+  `status: 'success'` payload. Each per-channel result carries a `success: bool`.
+- LNA bias config gains an explicit backend plus `bias_voltage_v` (default 1.5 V),
+  `method` and `blind`; config application sets the configured LNA channel when the
+  `i2c` backend is enabled.
+- Explicit `fixed` backends for LNA bias and RF attenuators, so non-controllable values
+  are deliberate rather than blank backend leaves.
+- Added `soft_off_lna_bias()` / `soft_off_lna_bias_all()` and `souk-find-lnas --status`.
 
 **RF Peripheral Configuration & Discovery**
-- RF frontend config now separates `mixerless_module`, `attenuator`, and
-  `bypass_amps` settings. Attenuator values live at
-  `rf_frontend.attenuator.tx_value_db` / `rx_value_db`; measured bypass-amp
-  S21 values live under `rf_frontend.mixerless_module`.
-- The controller no longer uses a software mimic after hardware init
-  failures. Failed hardware remains unavailable and subsequent set/get calls
-  raise clear errors instead of returning fake-success state.
-- Added `souk-find-bypass-amps` and `souk-rf-peripherals-status`, and
-  extended `souk-find-attenuators` with `--status`.
-- Power-management helpers now distinguish controllable attenuators from
-  bypass-amplifier support, so RUDAT/fixed attenuator setups are not asked to
-  toggle mixerless-module amps.
+- RF frontend config separates `mixerless_module`, `attenuator` and `bypass_amps`.
+  Attenuator values live at `rf_frontend.attenuator.tx_value_db` / `rx_value_db`;
+  measured bypass-amp S21 under `rf_frontend.mixerless_module`.
+- The controller no longer uses a software mimic after hardware init failures — failed
+  hardware stays unavailable and set/get calls raise instead of returning fake success.
+- Added `souk-find-bypass-amps` and `souk-rf-peripherals-status`; extended
+  `souk-find-attenuators` with `--status`. Power-management helpers distinguish
+  controllable attenuators from bypass-amp support.
 
 **Config / Runtime State Split**
-- `pull_config()` (and the `config` section of `get_info()`) now return the
-  active config file only. Runtime hardware changes are reported through the
-  live status/info APIs instead of being patched into config.
-- `sync_config_from_system()` explicitly captures the live state into
-  `client.config` and returns the updated config dict. Use
-  `sync_config_to_local(save_as=...)` as a clearer alias when creating a new
-  local config from the running system.
-- When blind tone metadata is active, `sync_config_from_system()` preserves the
-  regular/blind split and writes `blind_frequencies`, `blind_amplitudes`,
-  `blind_phases`, and `blind_spans` into `firmware.defaults`.
+- `pull_config()` (and `get_info()`'s `config` section) return the active config file
+  only; runtime hardware changes are reported through the live status/info APIs.
+- `sync_config_from_system()` captures live state into `client.config` and returns it;
+  `sync_config_to_local(save_as=...)` is the clearer alias for creating a new local
+  config. With blind tone metadata active it preserves the regular/blind split and
+  writes `blind_frequencies`, `blind_amplitudes`, `blind_phases` and `blind_spans` into
+  `firmware.defaults`.
 
 **Sweep Plotter Speed-up**
-- `plot_sweep()` `show_errors` now defaults to `None`, which auto-disables
-  error fills for wideband sweeps where `fill_between` over hundreds of
-  thousands of points dominates render time.  Per-tone sweeps are
-  unchanged.  Pass `show_errors=True`/`False` to override.
+- `plot_sweep()`'s `show_errors` defaults to `None`, auto-disabling error fills for
+  wideband sweeps where `fill_between` over hundreds of thousands of points dominates
+  render time. Per-tone sweeps unchanged.
 
 **Sweep & Tone Update Robustness**
-- Frequency-only tone updates now preserve existing tone amplitudes and phases
-  when the tone count is unchanged.
-- Fast sweep setup can carry amplitudes/phases through every sweep point, and
-  protects the VACC from shared-bin amplitude overflow by scaling sweep
-  amplitudes and temporarily compensating `psb_scale` when possible.
-- Fast sweep/retune paths use the fast tone-frequency writer and direct
-  channel-map updates for lower overhead.
+- Frequency-only tone updates preserve existing amplitudes and phases when the tone
+  count is unchanged.
+- Fast sweep setup can carry amplitudes/phases through every sweep point, and protects
+  the VACC from shared-bin amplitude overflow by scaling sweep amplitudes and
+  temporarily compensating `psb_scale` when possible.
+- Fast sweep/retune paths use the fast tone-frequency writer and direct channel-map
+  updates.
 
 **Blind Tone Management**
-- Added blind tone support for fixed gain/phase monitor tones.
-  Configs can now set `firmware.defaults.blind_frequencies`,
-  `blind_amplitudes`, `blind_phases`, and `blind_spans` alongside the
-  regular tone list.
-- The firmware is programmed with one combined tone list, so blind tones are
-  included in Newman phase generation, VACC/shared-bin protection, calibrated
-  power setting, dynamic-range optimisation, timestreams, and sweeps.
-- Retune and tracking paths keep blind tones fixed at their configured centers
-  while only updating regular tones.
-- Added interactive client/server helpers:
-  `suggest_blind_frequencies()`, `set_blind_tones()`, `get_blind_tones()`,
-  `remove_blind_tones()`, `get_tone_metadata()`,
-  `get_blind_tone_indices()`, and `get_regular_tone_indices()`.
-- `suggest_blind_frequencies()` now jitters the initially even target positions
-  by default, reducing regular-grid intermodulation spur alignment while still
-  respecting resonance/blind-tone spacing constraints.
+- Blind tone support for fixed gain/phase monitor tones, configured via
+  `firmware.defaults.blind_frequencies`, `blind_amplitudes`, `blind_phases` and
+  `blind_spans`.
+- The firmware is programmed with one combined tone list, so blind tones are included
+  in Newman phase generation, VACC/shared-bin protection, calibrated power setting,
+  dynamic-range optimisation, timestreams and sweeps. Retune and tracking keep blind
+  tones fixed while updating only regular tones.
+- New helpers: `suggest_blind_frequencies()`, `set_blind_tones()`, `get_blind_tones()`,
+  `remove_blind_tones()`, `get_tone_metadata()`, `get_blind_tone_indices()`,
+  `get_regular_tone_indices()`. `suggest_blind_frequencies()` jitters the even target
+  positions by default, reducing regular-grid intermodulation spur alignment.
 
 **Peak Finder Edge Trim**
-- `PeakFinderParams` accepts new `f_low` / `f_high` (Hz) fields to drop
-  peaks outside a chosen band.  Useful for excluding band edges where
-  filtering artefacts can produce spurious peaks.  Filtering happens
-  after `find_peaks` so prominence/width context still uses the full
-  band.
+- `PeakFinderParams` accepts `f_low` / `f_high` (Hz) to drop peaks outside a chosen
+  band, applied after `find_peaks` so prominence/width context still uses the full band.
 
 **Other Fixes & Improvements**
-- `maximise_tx_power()` now accepts `compression_headroom_db` to optionally cap
-  total TX frontend input power below the RF frontend input-referred 1 dB
-  compression point. The RF peripheral wrapper also corrects the mixerless
-  module amplifier P1dB arithmetic without modifying the upstream submodule.
-- Mixerless-module measured calibration overrides can now be supplied under
-  `rf_frontend.mixerless_module`: per-state TX/RX amp S21, bypass delta S21,
-  input-referred P1dB, and module group-delay metadata. S21/group-delay keys
-  accept scalars, inline frequency tables, or calibration filenames.
-- Wideband sweep with `tone_powers=None` no longer reapplies tone powers
-  (preserves whatever the pipeline currently has set).
-- Fix late-import bug in `firmware_lib`.
-- `perform_sweep()` and `perform_retune()` can refresh the ADC calibration
-  before sweeping for improved S21 stability.
-- Group-delay estimation and removal: improved cable-delay fit;
-  `remove_group_delay()` honours frequency-dependent calibrations.
-- Fixed `generate_newman_phases` to return phases in the original frequency 
-  order, not the sorted order. 
+- `maximise_tx_power()` accepts `compression_headroom_db` to cap total TX frontend
+  input power below the input-referred 1 dB compression point. The RF peripheral
+  wrapper corrects the mixerless module amplifier P1dB arithmetic without modifying the
+  upstream submodule.
+- Mixerless-module measured calibration overrides under `rf_frontend.mixerless_module`:
+  per-state TX/RX amp S21, bypass delta S21, input-referred P1dB and module group
+  delay. S21/group-delay keys accept scalars, inline frequency tables or calibration
+  filenames.
+- Wideband sweep with `tone_powers=None` no longer reapplies tone powers.
+- Fixed a late-import bug in `firmware_lib`.
+- `perform_sweep()` / `perform_retune()` can refresh the ADC calibration before
+  sweeping for improved S21 stability.
+- Improved cable-delay fit; `remove_group_delay()` honours frequency-dependent
+  calibrations.
+- Fixed `generate_newman_phases` to return phases in the original frequency order, not
+  the sorted order.
 
 **Structured Info System**
-- `get_info(sections)` provides structured system state in 15 named sections: `server`, `versions`, `clock`, `fpga`, `rfdc`, `pipeline`, `tones`, `rf_frontend`, `lna`, `rfsoc_sensors`, `diagnostics`, `config`, `calibrations`, `resonators`, `registers`.
-- `rfsoc_sensors` section reports on-chip PS/PL SYSMON readings via IIO sysfs: die temperatures (C) and supply voltages (V), keyed by the raw sensor names so PS/PL rails with duplicate short names (e.g. `vccams`, `vccint`) stay distinct.
-- Each section includes a `ready` flag indicating whether its data could be read from hardware.
-- Default call excludes expensive sections (`diagnostics`, `config`, `calibrations`, `resonators`, `registers`); use `'all'` for everything.
-- `health_check()` for compact intermittent polling — returns pass/fail bools for clock lock, ADC/DAC saturation, DSP overflow, RTS events, plus key state indicators.
-- `rf_frontend` section now includes full signal chain description: hardware identity, attenuator backend details (I2C bus/channel or RUDAT serial numbers), live attenuator/amp state, derived gain/compression, and updownconverter characterisation (LO frequency, sideband, mixer/combiner losses, IF/RF S21).
-- `lna` section includes controller status and bias readings (voltage, current) for all 14 channels.
-- `config` section returns the active config file as YAML text; mutable hardware
-  state is reported by the relevant live info sections instead of being patched
-  into the config.  Use `sync_config_from_system()` / `sync_config_to_local()`
-  to explicitly capture live settings into a new local config.
-- `calibrations` section returns resolved per-tone calibration values (after frequency-dependent interpolation).
-- `resonators` section placeholder for future resonator detuning tracking module.
-- `registers` section placeholder for future full firmware register dump.
-- `tone_indices` renamed to `firmware_indices` in `info['tones']`.
-- Server activity flags (`streaming`, `triggered_streaming`, `sweeping`) now exposed in `server` section.
-- `firmware_interface_ready` / `firmware_fast_interface_ready` checks added (verifies blocks are present, not just that the object exists).
+- `get_info(sections)` provides structured system state in 15 named sections:
+  `server`, `versions`, `clock`, `fpga`, `rfdc`, `pipeline`, `tones`, `rf_frontend`,
+  `lna`, `rfsoc_sensors`, `diagnostics`, `config`, `calibrations`, `resonators`,
+  `registers`. Each includes a `ready` flag. The default call excludes the expensive
+  sections; use `'all'` for everything.
+- `rfsoc_sensors` reports on-chip PS/PL SYSMON die temperatures (C) and supply voltages
+  (V) via IIO sysfs, keyed by raw sensor names so duplicate short names (`vccams`,
+  `vccint`) stay distinct.
+- `health_check()` for compact polling — pass/fail bools for clock lock, ADC/DAC
+  saturation, DSP overflow and RTS events, plus key state indicators.
+- `rf_frontend` includes the full signal chain: hardware identity, attenuator backend
+  details, live attenuator/amp state, derived gain/compression, and updownconverter
+  characterisation. `lna` includes controller status and bias readings for all 14
+  channels. `config` returns the active config file as YAML text. `calibrations`
+  returns resolved per-tone values after frequency-dependent interpolation.
+  `resonators` and `registers` are placeholders.
+- `tone_indices` renamed to `firmware_indices` in `info['tones']`. Server activity
+  flags (`streaming`, `triggered_streaming`, `sweeping`) exposed in `server`.
+  `firmware_interface_ready` / `firmware_fast_interface_ready` checks added.
 
 **Pipeline Parameter Access**
-- New client methods: `set_sync_delay()` / `get_sync_delay()`, `set_acc_len()` / `get_acc_len()`, `set_internal_loopback()` / `get_internal_loopback()`, `set_psb_scale()` / `get_psb_scale()`, `set_psb_fftshift()` / `get_psb_fftshift()`, `set_pfb_fftshift()` / `get_pfb_fftshift()`.
-- Previously these could only be set via `apply_config()`.
+- New client methods `set_sync_delay()`/`get_sync_delay()`,
+  `set_acc_len()`/`get_acc_len()`, `set_internal_loopback()`/`get_internal_loopback()`,
+  `set_psb_scale()`/`get_psb_scale()`, `set_psb_fftshift()`/`get_psb_fftshift()`,
+  `set_pfb_fftshift()`/`get_pfb_fftshift()`. Previously settable only via
+  `apply_config()`.
 
 ## v1.1.0
 
