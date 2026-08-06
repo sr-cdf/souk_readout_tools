@@ -123,16 +123,24 @@ see whether the effect survives the real signal path.
 The DAC full-scale output depends on firmware scaling, the DUC fine-mixer
 scale, VOP current and inverse-sinc filter state. The recommended calibration conditions are:
 
-- Use the `0P7` DUC fine-mixer scale rather than `1P0`.
+- Use the `0P7` DUC fine-mixer scale rather than `1P0`. The DAC DUC is
+  complex-to-real, where `1P0` risks overflow.
 - Use `20000 uA` VOP current for gen3 devices with `2.5 V` DAC VTT.
 - Use the same DAC inverse-sinc filter state and Nyquist zone as the
   frequency-dependent DAC calibration.
 - Treat DAC snapshot saturation separately from DSP overflow flags.
 
+The ADC DDC is the other way round: it is real-to-I/Q, so `1P0` is the natural
+scale and is the bundled default (`adc_mixer_scale_1p0: true`). It gains 3 dB of
+digital signal over `0P7` with no analog change, and it must match whatever
+`adc_dbm_to_dbfs` was measured at.
+
 The config template records the hardware-specific warnings for values outside
-those conditions. See [Calibration Guide - Measurement
-Procedure](calibration.md#measurement-procedure) for the measured reference
-conditions.
+those conditions. See [Calibration Guide - Measurement procedure
+(DAC)](calibration.md#measurement-procedure-dac) for the measured reference
+conditions, and [Measurement procedure
+(ADC)](calibration.md#measurement-procedure-adc) for the loopback ADC
+calibration.
 
 When a calibrated TX frontend model includes its input-referred 1 dB
 compression point, `maximise_tx_power()` can reserve an additional margin:
@@ -143,6 +151,34 @@ client.maximise_tx_power(
     compression_headroom_db=10.0,
 )
 ```
+
+### Compression on the RX side
+
+ADC levels say nothing about compression: a compressed amplifier feeding a
+clean-looking -1 dBFS reads as a perfect result. Whenever the frontend model
+provides an RX input P1dB, `maximise_rx_power()` therefore reports the margin to
+it at each stage and refuses settings that eat into
+`compression_headroom_db` (default 3 dB) — the RX amp stays bypassed, or the
+attenuator stops coming down:
+
+```text
+  compression at init: RX input -40.0 dBm total, P1dB 9.9 dBm, margin 49.9 dB (target 3.0 dB)
+  step 3: try enabling RX amp
+    RX amp leaves only 1.9 dB to the input P1dB (target 3.0 dB) — keeping bypassed
+```
+
+This matters most for the RX amp. The module's variable attenuator sits *after*
+the preamp and before the switchable amp, so enabling the amp drops the
+input-referred P1dB by roughly its own gain, and every dB taken out of the
+attenuator afterwards takes another dB with it — while the power arriving at
+the module never changes. When the binding stage is the preamp instead, no RX
+control helps and the log says so; the fix is TX power or cryostat output
+attenuation.
+
+The margin is reported as `result['rx_compression']` (and `['tx_compression']`
+from `maximise_tx_power()`). Pass `compression_check=False` to optimise purely
+on ADC levels. The RX input power is modelled forward from the TX settings, so
+it is only as good as the configured cryostat/loopback S21.
 
 ## Setting Tone Powers
 
@@ -240,7 +276,7 @@ Use the highest-level helper that matches the operation:
 | `maximise_rx_power()` | Move RX level toward ADC full scale while retaining margin | `headroom_db=1.0` |
 | `optimise_tx_snr()` | Improve TX SNR without intentionally changing the requested output powers | `headroom_db=1.0`, `reference_plane='detector'` |
 | `optimise_rx_snr()` | Improve RX SNR using RX controls while avoiding saturation | `headroom_db=1.0` |
-| `fix_dac_saturation()` | Reduce `psb_scale` until DAC saturation clears | `headroom_db=1.0`, `intermittent_backoff_db=3.0` |
+| `fix_dac_saturation()` | Reduce `psb_scale` until DAC saturation clears | `headroom_db=1.0`, `intermittent_backoff_db=3.0`, `backoff_step_db=0.5` |
 | `fix_adc_saturation()` | Adjust RX settings until ADC saturation clears | `atten_step_db=3.0`, `dsa_step_db=2.0` |
 
 The helpers also accept advanced `force_*` controls to pin individual RF or
@@ -257,7 +293,7 @@ limits at different points in the chain and are not interchangeable:
 | `dac_headroom_db` | DAC saturation | `psb_scale` |
 | `adc_headroom_db` | ADC saturation | ADC DSA and RX attenuator |
 | `filterbank_headroom_db` | Modulation TX drive-restore clipping | the amplitude words |
-| `compression_headroom_db` | RF frontend P1dB compression | `psb_scale`, against the modelled frontend input power |
+| `compression_headroom_db` | RF frontend P1dB compression | `psb_scale` on TX; the RX amp and attenuator on RX, against the modelled frontend input power |
 
 On the single-converter routines the margin is just `headroom_db`, since the
 function name already says which converter it means — `maximise_tx_power()` and
@@ -265,7 +301,34 @@ function name already says which converter it means — `maximise_tx_power()` an
 `optimise_rx_snr()` for the ADC. The names above are what the entry points that
 touch both converters use (`wideband_sweep()`, `run_power_sweep()`), plus
 `adc_headroom_db` on the TX routines, where it sets the margin the `rx_policy`
-works to.
+works to. The same rule gives `wideband_sweep()` its
+`tx_compression_headroom_db` / `rx_compression_headroom_db` split: one sweep
+drives both chains, and the two are unrelated knobs — the TX one limits output
+power, the RX one only decides how much RX gain is allowed.
+
+### Every control the sweep touches is settable on the sweep
+
+`wideband_sweep()` makes up to five calls that carry margins —
+`maximise_tx_power()` or `set_tone_powers()`, `maximise_rx_power()`,
+`fix_dac_saturation()`, `fix_adc_saturation()` — and forwards to each of them:
+
+| Sweep argument | Reaches |
+|---|---|
+| `dac_headroom_db` | the tone-power call, and `fix_dac_saturation()` |
+| `dac_saturation_threshold` | the tone-power call |
+| `adc_headroom_db` | the tone-power call's `rx_policy`, and the RX-gain step |
+| `filterbank_headroom_db` | the tone-power call |
+| `atten_step_db` | the tone-power call, the RX-gain step, `fix_adc_saturation()` |
+| `dsa_step_db` | `fix_adc_saturation()` |
+| `rts_as_saturation` | the RX-gain step, `fix_adc_saturation()` |
+| `compression_check` | the tone-power call and the RX-gain step |
+| `tx_compression_headroom_db` | `maximise_tx_power()` |
+| `rx_compression_headroom_db` | the RX-gain step |
+| `intermittent_backoff_db`, `backoff_step_db` | `fix_dac_saturation()` |
+
+Each is `None` by default, meaning "use the server's default", so the one copy
+of every default stays in `firmware_lib`. The same names are available as
+`--flags` on the `wideband_sweep` command-line script.
 
 **Every headroom is measured from true full scale.** The saturation detectors
 trip at 90% of full scale, which is itself 0.92 dB of margin, so only the

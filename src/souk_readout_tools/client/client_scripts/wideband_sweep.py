@@ -24,13 +24,38 @@ import numpy as np
 
 from souk_readout_tools.client.readout_client import ReadoutClient
 
+# Margin and step controls forwarded verbatim to ReadoutClient.wideband_sweep.
+# They all take None for "use the server default", so only the ones actually
+# given on the command line are passed on and the defaults live in one place.
+MARGIN_ARGS = (
+    'dac_saturation_threshold',
+    'atten_step_db',
+    'dsa_step_db',
+    'rts_as_saturation',
+    'compression_check',
+    'tx_compression_headroom_db',
+    'rx_compression_headroom_db',
+    'intermittent_backoff_db',
+    'backoff_step_db',
+)
+
+
+def _bool_arg(value):
+    """Parse a yes/no command-line flag."""
+    text = str(value).strip().lower()
+    if text in ('true', '1', 'yes', 'on'):
+        return True
+    if text in ('false', '0', 'no', 'off'):
+        return False
+    raise argparse.ArgumentTypeError(f'expected yes or no, got {value!r}')
+
 
 def wideband_sweep(config_file=None, address=None, request_port=None,
                    bandwidth_hz=None, center_freq_hz=None,
                    step_size_hz=10000, num_tones=1024, samples_per_point=10,
                    tone_powers_dbm=None, rx_policy='maximise',
                    dac_headroom_db=None, adc_headroom_db=None,
-                   filterbank_headroom_db=None,
+                   filterbank_headroom_db=None, margins=None,
                    ignore_phase_correction=True,
                    filename=None, filetype='npy',
                    plot_data=True):
@@ -48,7 +73,8 @@ def wideband_sweep(config_file=None, address=None, request_port=None,
         address (str): RFSoC IP address (alternative to config_file).
         request_port (int): Request port (required with address).
                             Pipeline 0: 10000, pipeline 1: 10001.
-        bandwidth_hz (float): Total bandwidth to measure. Default is full available bandwidth.
+        bandwidth_hz (float): Total bandwidth to measure. Default is 80% of the
+            available bandwidth, clear of the DAC interpolation filter roll-off.
         center_freq_hz (float): Center frequency of the sweep. Default is band center.
         step_size_hz (float): Step size of the sweep. Number of sweep steps =
                               bandwidth / step_size / num_tones. Default is 10000.
@@ -74,6 +100,9 @@ def wideband_sweep(config_file=None, address=None, request_port=None,
         filterbank_headroom_db (float or None): Amplitude-word margin in dB for
             the modulation TX drive restore -- a separate margin from
             dac_headroom_db. Default None follows the server config.
+        margins (dict or None): Any further margin/step controls to forward
+            verbatim to ReadoutClient.wideband_sweep -- see MARGIN_ARGS for the
+            ones the command line exposes, and that method for what each does.
         ignore_phase_correction (bool): DEPRECATED. Phase correction is no longer needed
                                         following firmware fixes. Default is True (no correction).
         filename (str): Filename to save the data to. Default is tmp_wideband_sweep in cwd.
@@ -111,7 +140,8 @@ def wideband_sweep(config_file=None, address=None, request_port=None,
         adc_headroom_db=adc_headroom_db,
         filterbank_headroom_db=filterbank_headroom_db,
         apply_phase_correction=not ignore_phase_correction,
-        verbose=True
+        verbose=True,
+        **(margins or {})
     )
     
     # Save and optionally plot
@@ -203,6 +233,37 @@ def main():
                         help='Amplitude-word margin in dB reserved for the modulation TX '
                              'drive restore — a separate margin from --dac_headroom_db. '
                              'Default: follow the server filterbank-compensation config.')
+    parser.add_argument('--dac_saturation_threshold', type=float, default=None,
+                        help='Fraction of DAC full scale the saturation detector trips at. '
+                             'Default: the server default (0.90, i.e. ~0.92 dB of margin).')
+    parser.add_argument('--atten_step_db', type=float, default=None,
+                        help='RF attenuator ramp increment in dB. Recovery step-backs use '
+                             "the attenuator's own 0.5 dB resolution regardless. "
+                             'Default: the server default (3.0 dB).')
+    parser.add_argument('--dsa_step_db', type=float, default=None,
+                        help='ADC DSA increment in dB for the ADC saturation fix. '
+                             'Default: the server default (2.0 dB).')
+    parser.add_argument('--rts_as_saturation', type=_bool_arg, default=None,
+                        metavar='yes|no',
+                        help='Count a latched RFDC RTS flag as ADC saturation even when '
+                             'the snapshot looks clean. Default: the server default (yes).')
+    parser.add_argument('--compression_check', type=_bool_arg, default=None,
+                        metavar='yes|no',
+                        help='Report each RF chain\'s margin to its input P1dB, and enforce '
+                             'it on the RX side. Default: the server default (yes).')
+    parser.add_argument('--tx_compression_headroom_db', type=float, default=None,
+                        help='Margin in dB below the TX input P1dB to hold the composite '
+                             'output to, by reducing psb_scale. Default: no TX guard.')
+    parser.add_argument('--rx_compression_headroom_db', type=float, default=None,
+                        help='Margin in dB below the RX input P1dB the RX-gain step keeps. '
+                             'Default: the server default (3.0 dB).')
+    parser.add_argument('--intermittent_backoff_db', type=float, default=None,
+                        help='Ceiling in dB on the reduction the DAC saturation fix applies '
+                             'when the standard capture comes back clean. '
+                             'Default: the server default (3.0 dB).')
+    parser.add_argument('--backoff_step_db', type=float, default=None,
+                        help='Increment in dB the DAC saturation fix steps down in. '
+                             'Default: the server default (0.5 dB).')
     parser.add_argument('-i', '--ignore_phase_correction', action='store_true',
                         help='DEPRECATED (no-op). Phase correction is disabled by default '\
                              'following firmware fixes. Kept for backward compatibility.')
@@ -285,6 +346,8 @@ def main():
             dac_headroom_db=args.dac_headroom_db,
             adc_headroom_db=args.adc_headroom_db,
             filterbank_headroom_db=args.filterbank_headroom_db,
+            margins={name: getattr(args, name) for name in MARGIN_ARGS
+                     if getattr(args, name) is not None},
             ignore_phase_correction=ignore_correction,
             filename=args.filename,
             filetype=args.filetype,

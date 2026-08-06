@@ -425,3 +425,9 @@ result = client.maximise_tx_power(
 )
 print(result['result']['tx_compression'])
 ```
+
+Both routines report how close each chain is running to its input P1dB whenever
+the frontend model provides one, and `maximise_rx_power()` enforces its margin
+(the RX amp stays bypassed, or the attenuator stops coming down) — see
+[Compression on the RX side](tone_power_notes.md#compression-on-the-rx-side).
+Pass `compression_check=False` to ignore compression entirely.

@@ -38,6 +38,17 @@ Tone amplitude (0 to 1.0)
   -> Detector
 ```
 
+and on the way back:
+
+```
+Detector
+  -> [cryostat and RF frontend RX chain, see below]
+  -> ADC DSA (RFDC digital step attenuator)
+  -> ADC (14 physical bits into 15 of a 16-bit word)
+  -> DDC mixer (real-to-I/Q, 1P0 scale by default)
+  -> PFB FFT shift -> RX mixer -> accumulator
+```
+
 Each stage has a corresponding calibration parameter in the config file. Stages that are not connected (`rf_frontend.connected: false`, `cryostat.connected: false`) are automatically excluded from the calibration chain. The analog RF frontend varies by hardware — see [Signal Chain Configurations](#signal-chain-configurations) for the three supported module types.
 
 ---
@@ -196,19 +207,19 @@ capture the running state into a local config. See [RF Peripheral Control](#rf-p
 
 ## DAC and ADC Calibration
 
-### Definition of full-scale output
+### Definition of full-scale output (DAC)
 
 For RFDC calibrations, full-scale output is defined under these conditions:
 
 1. **Digital signal**: Full-scale 16-bit complex signal (I and Q both at +/-32767). Achieved with tone amplitude = 1.0, PSB FFT shift = 0b000000000000, PFBSCALE = 2.0.
-2. **DUC fine mixer scale**: Set to 0P7 (not 1P0). Setting 1P0 gives ~3 dB more power but risks overflow.
+2. **DUC fine mixer scale**: Set to 0P7 (not 1P0). The DUC is complex-to-real, where 1P0 gives ~3 dB more power but risks overflow. `dac_mixer_scale_1p0: false` leaves the RFDC in `MIX_SCALE_AUTO`, which is what the bundled DAC calibrations were measured with — see the note under the ADC procedure before changing it.
 3. **QMC correction**: Disabled, or gain = 1.0 and offset = 0. Maximum gain (1.999) gives ~6 dB more power with distortion.
 4. **VOP current**: 20000 uA. This is the maximum rated value for gen3 devices with 2.5V DAC VTT. Higher values (up to 40500 uA) add nonlinearity and are explicitly not supported for RFSoC4x2 and KRM-4ZU47DR.
 5. **Inverse sinc filter**: On. The bundled config
    enables it by default. A DAC calibration is valid only when used with the
    same inverse-sinc state and Nyquist zone under which it was measured.
 
-### Measurement procedure
+### Measurement procedure (DAC)
 
 1. Set a single tone at a known frequency with all settings as defined above
    (0 dBFS signal).
@@ -216,6 +227,50 @@ For RFDC calibrations, full-scale output is defined under these conditions:
 3. Record the frequency and measured power in a calibration file.
 
 For a broadband calibration, repeat at multiple frequencies across the band.
+
+### Definition of full-scale input (ADC)
+
+`adc_dbm_to_dbfs` is the power in dBm at the ADC SMA connector that produces a
+full-scale sine, i.e. one whose peak reaches the ADC's full-scale input range.
+It is measured under these conditions:
+
+1. **DDC fine mixer scale**: 1P0, the bundled default (`adc_mixer_scale_1p0: true`).
+   The DDC is real-to-I/Q, so 1P0 puts the complex envelope at the same amplitude
+   as the real input — 3 dB above 0P7, with no analog change and no overflow risk
+   until the input itself clips.
+2. **ADC DSA**: 0 dB. The DSA is modelled as a separate stage
+   (`calc_adc_input_power`), so any attenuation left in during the measurement is
+   counted twice.
+3. **QMC correction**: disabled (gain = 1.0, offset = 0).
+4. **Nyquist zone**: the same zone the calibration will be used in.
+
+### Measurement procedure (ADC)
+
+1. Set a single tone at a known frequency and measure its power at the DAC SMA
+   connector with a spectrum analyser (this is the DAC calibration measurement).
+2. Connect the DAC output straight to the ADC input, subtracting cable loss from
+   the known power. Any loss not subtracted makes the derived full-scale power
+   read high.
+3. Read the ADC level with `client.check_input_saturation()['details']`. The
+   `imax_fs` / `imin_fs` / `qmax_fs` / `qmin_fs` values are peak amplitudes as a
+   true fraction of ADC full scale (the raw snapshot fills 15 of 16 bits, and the
+   check divides that out). Take the mean of their magnitudes, `p`.
+4. The signal level is `20*log10(p)` dBFS at 1P0. At 0P7 the DDC output sits
+   `sqrt(2)` below the input, so the input level is `20*log10(sqrt(2)*p)`.
+5. Record `P_dBm - dBFS_measured` — the power that would give 0 dBFS — against
+   frequency in a calibration file.
+
+For a broadband calibration, repeat across the band; the residual frequency
+dependence is the ADC analog response plus loopback cable loss, the DAC roll-off
+having already been removed by step 1.
+
+**Do not rely on `MIX_SCALE_AUTO`.** `get_info()['rfdc']['mixer_scale_1p0_adc']`
+is computed as `FineMixerScale == MIX_SCALE_1P0`, so AUTO reads back as `False`
+and is then modelled as 0P7 — `calc_adc_input_power` and the plotting units apply
+a `sqrt(2)` correction that the hardware may not be doing, for a silent 3 dB
+error in every calibrated RX power. Both scales are therefore programmed
+explicitly on the ADC (`true` -> 1P0, `false` -> 0P7). The DAC keeps AUTO for
+`false` only because the existing DAC calibrations were measured that way.
 
 ---
 
@@ -241,9 +296,9 @@ Example `dac0.txt`:
 # DAC inverse-sinc filter = enabled
 #
 # Frequency_Hz  Power_dBm
-500e6  -5.9
-1000e6 -6.1
-1500e6 -6.5
+500e6  -8.5
+1000e6 -8.9
+1500e6 -9.3
 ```
 
 The same format is used for `adc_dbm_to_dbfs` (ADC calibration) and for any RF chain S21 measurement files.
@@ -254,16 +309,16 @@ The same format is used for `adc_dbm_to_dbfs` (ADC calibration) and for any RF c
 
 There are three ways to specify calibration values:
 
-**1. Single scalar** (flat across frequency):
+**1. Single scalar** (flat across frequency, as in the bundled template):
 ```yaml
 firmware:
-  dac0_dbfs_to_dbm: -6.0
+  dac0_dbfs_to_dbm: -9.0
 ```
 
 **2. Inline frequency-power pairs** (interpolated):
 ```yaml
 firmware:
-  dac0_dbfs_to_dbm: [[500e6, -5.9], [1000e6, -6.1], [1500e6, -6.5]]
+  dac0_dbfs_to_dbm: [[500e6, -8.5], [1000e6, -8.9], [1500e6, -9.3]]
 ```
 
 **3. Path to a calibration file**:

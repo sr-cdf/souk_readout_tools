@@ -384,8 +384,12 @@ def _resolve_tx_power_dbm(tx_power_dbm, tx_power_reference_plane,
 
 
 def _select_tx_power_dbm(tx_power_dbm, *, trace_position=None,
-                         tone_index=None, total=None):
-    """Select a scalar TX power for one plotted trace."""
+                         tone_index=None, total=None, trace_length=None):
+    """Select the TX power for one plotted trace.
+
+    Returns a scalar, or the per-point array when it already matches the
+    trace length (wideband sweeps, where each point has its own tone power).
+    """
     if tx_power_dbm is None:
         return None
     arr = np.asarray(tx_power_dbm, dtype=float).ravel()
@@ -395,6 +399,8 @@ def _select_tx_power_dbm(tx_power_dbm, *, trace_position=None,
         return float(arr[0])
     if total is not None and arr.size == int(total) and trace_position is not None:
         return float(arr[int(trace_position)])
+    if trace_length is not None and arr.size == int(trace_length):
+        return arr
     if tone_index is not None:
         try:
             tone_index = int(tone_index)
@@ -433,6 +439,26 @@ def _sweep_tx_power_dbm(sweep_data, reference_plane='detector',
                     config=config, calibration_cache=calibration_cache)
                 return powers, plane
     return None, None
+
+
+def _wideband_tx_power_per_point(tx_power_dbm, traces):
+    """Expand per-tone TX powers onto a wideband sweep's concatenated axis.
+
+    ``parse_wideband_sweep()`` ravels the sweep tone-major into a single
+    trace, so point ``p`` belongs to tone ``p // points_per_tone``.
+    """
+    if tx_power_dbm is None or len(traces) != 1:
+        return tx_power_dbm
+    arr = np.asarray(tx_power_dbm, dtype=float).ravel()
+    n_points = np.asarray(traces[0][0]).size
+    if arr.size <= 1 or arr.size == n_points:
+        return tx_power_dbm
+    if n_points % arr.size:
+        raise ValueError(
+            f"units='s21' got {arr.size} tone powers for a wideband sweep of "
+            f"{n_points} points, which is not a whole number of points per "
+            "tone. Pass tx_power_dbm explicitly.")
+    return np.repeat(arr, n_points // arr.size)
 
 
 def _apply_transforms(f, z, deembed, phase_center, phase_rotate=False,
@@ -791,6 +817,8 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                 info=info, config=config,
                 calibration_cache=calibration_cache)
         _check_tx_power_reference(reference_plane, tx_power_reference_plane)
+        if sweep_data.get('wideband_sweep', False):
+            tx_power_dbm = _wideband_tx_power_per_point(tx_power_dbm, traces)
 
     # Normalise traces
     if units == 'raw':
@@ -876,7 +904,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                 trace_tx_power = (
                     _select_tx_power_dbm(
                         tx_power_dbm, trace_position=i, tone_index=tidx,
-                        total=n_traces)
+                        total=n_traces, trace_length=np.size(f))
                     if _is_s21_unit(units) else None
                 )
                 _plot_single_trace(
@@ -918,7 +946,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
                 trace_tx_power = (
                     _select_tx_power_dbm(
                         tx_power_dbm, trace_position=i, tone_index=tidx,
-                        total=n_traces)
+                        total=n_traces, trace_length=np.size(f))
                     if _is_s21_unit(units) else None
                 )
                 _plot_single_trace(axes[i, 0], axes[i, 1], f, si, sq, ei, eq,
@@ -990,7 +1018,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             trace_tx_power = (
                 _select_tx_power_dbm(
                     tx_power_dbm, trace_position=i, tone_index=tidx,
-                    total=n_traces)
+                    total=n_traces, trace_length=np.size(f))
                 if _is_s21_unit(units) else None
             )
             _plot_single_trace(
@@ -1036,7 +1064,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         trace_tx_power = (
             _select_tx_power_dbm(
                 tx_power_dbm, trace_position=i, tone_index=tidx,
-                total=n_traces)
+                total=n_traces, trace_length=np.size(f))
             if _is_s21_unit(units) else None
         )
         _plot_single_trace(ax1, ax2, f, si, sq, ei, eq,

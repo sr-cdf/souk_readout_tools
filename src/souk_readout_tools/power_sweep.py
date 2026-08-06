@@ -59,7 +59,7 @@ from one of their own untrusted values.
 **4. Plot** (:py:func:`plot_power_sweep`, :py:func:`plot_best_power`).
 Per-tone fit overlays and the ANL-vs-power selection diagnostic, which is
 where the measured and extrapolated bifurcation powers can be compared by
-eye.
+eye, plus the array-level ``best_power_vs_frequency.png``.
 
 **5. Balance** (:py:func:`balance_tone_powers`).  The per-tone choices are
 preferences; this re-allocates them under hard bifurcation caps and the
@@ -114,6 +114,8 @@ analyse_power_sweep     steps 2-4 in one call
 load_analysis           reload a finished analysis
 plot_power_sweep        per-tone fit overlays and parameter-vs-power PNGs
 plot_best_power         per-tone ANL-vs-power selection diagnostics
+plot_best_power_vs_frequency
+                        chosen power vs frequency, one point per tone
 ======================  =====================================================
 
 On disk a run directory holds ``measurement.json`` (the manifest),
@@ -181,6 +183,15 @@ UNCERTAINTY_KEYS = FIT_UNCERTAINTY_KEYS
 # ``clip_overlapping_spans`` to sweep at all -- see _find_dip_centers.
 DEFAULT_FOLLOW_MIN_SEPARATION_SPANS = 0.5
 
+# The nonlinearity aimed for when choosing a readout power (see
+# ``find_best_power``): 0.1, about 8.9 dB below ``DEFAULT_BIFURCATION_ANL``.
+# Small enough that the resonator is still single-valued and the Duffing
+# distortion is mild, high enough to keep the tone within a few dB of the drive
+# the resonator can take -- 0.01 costs another 10 dB of signal for no gain in
+# stability. Defined here rather than beside the other selection constants
+# because ``analyse_power_sweep`` is defined above them.
+DEFAULT_TARGET_ANL = 0.1
+
 __all__ = [
     # On-disk artifact locations
     "MANIFEST_FILE",
@@ -209,6 +220,7 @@ __all__ = [
     "write_fit_summary",
     "load_fit_summary",
     # Best readout power per tone
+    "DEFAULT_TARGET_ANL",
     "find_best_power",
     "best_power_arrays",
     "best_power_flag_summary",
@@ -223,6 +235,7 @@ __all__ = [
     # Plotting
     "plot_power_sweep",
     "plot_best_power",
+    "plot_best_power_vs_frequency",
 ]
 
 
@@ -4028,7 +4041,7 @@ def analyse_power_sweep(
     nonlinear=True,
     sweep_direction="up",
     n_jobs=-1,
-    target_anl=0.01,
+    target_anl=DEFAULT_TARGET_ANL,
     fit=True,
     save=True,
     plot_fits=True,
@@ -4077,7 +4090,8 @@ def analyse_power_sweep(
         joblib worker count shared by fitting and both plot passes (``-1``
         all CPUs by default; ``1`` is serial).
     target_anl : float, optional
-        Target nonlinearity for :py:func:`find_best_power` (default ``0.01``).
+        Target nonlinearity for :py:func:`find_best_power` (default
+        :data:`DEFAULT_TARGET_ANL`, ``0.1``).
     fit : bool, optional
         Fit the sweeps (``True``) or load an existing fit archive (``False``).
     save : bool, optional
@@ -4089,8 +4103,10 @@ def analyse_power_sweep(
         ones on a big array; disable them when only the power selection has
         changed.
     plot_best : bool, optional
-        Write the ANL-vs-power selection plots via :py:func:`plot_best_power`
-        (default ``True``; requires ``best_power``).
+        Write the per-tone ANL-vs-power selection plots via
+        :py:func:`plot_best_power` (default ``True``; requires
+        ``best_power``).  The array-level ``best_power_vs_frequency.png`` is
+        written either way, whenever powers were chosen.
     best_power : bool, optional
         Run :py:func:`find_best_power` and write ``best_power.json`` (default
         ``True``).
@@ -4114,7 +4130,8 @@ def analyse_power_sweep(
         Extra keyword arguments forwarded to :py:func:`plot_power_sweep`
         (e.g. ``reference_plane``, ``deembed``, ``units``).  ``'show'`` ->
         ``show_overlay`` and ``'verbose'`` / ``'n_jobs'`` here override the
-        top-level defaults for the fit plots.
+        top-level defaults for the fit plots.  The combined all-tones overlay
+        PNG is off by default; pass ``{'save_overlay': True}`` for it.
     best_power_kwargs : dict, optional
         Extra keyword arguments forwarded to :py:func:`find_best_power`
         (e.g. ``param_valid_ranges``, ``use_readback_power``,
@@ -4132,7 +4149,8 @@ def analyse_power_sweep(
     result : dict
         ``{'run', 'fits', 'fit_file', 'summary_csv', 'best_power',
         'best_power_file', 'catalogue', 'balanced_power',
-        'balanced_power_file', 'plots', 'best_power_plots'}``; entries for
+        'balanced_power_file', 'plots', 'best_power_plots',
+        'best_power_vs_frequency'}``; entries for
         disabled stages are ``None``.  The ``balanced_power`` entries are always ``None`` here
         (balancing is a separate step, :py:func:`balance_tone_powers`);
         they exist so the dict is interchangeable with
@@ -4164,6 +4182,7 @@ def analyse_power_sweep(
         "balanced_power_file": None,
         "plots": None,
         "best_power_plots": None,
+        "best_power_vs_frequency": None,
     }
 
     if fit:
@@ -4228,6 +4247,26 @@ def analyse_power_sweep(
             verbose=best_plot_verbose,
             **best_plot_kwargs,
         )
+        result["best_power_vs_frequency"] = result["best_power_plots"].get(
+            "vs_frequency"
+        )
+    elif best:
+        # The array-level view is one cheap figure and the first thing worth
+        # looking at, so it is written whenever powers were chosen -- even
+        # with the per-tone plots switched off.  The output controls from
+        # best_plot_kwargs still apply; the rest of them are per-tone-only.
+        forwarded = {
+            key: best_plot_kwargs[key]
+            for key in ("output_dir", "dpi", "figsize")
+            if key in best_plot_kwargs
+        }
+        forwarded.setdefault("output_dir", root / "plots")
+        result["best_power_vs_frequency"] = plot_best_power_vs_frequency(
+            best,
+            show=best_plot_show,
+            verbose=best_plot_verbose,
+            **forwarded,
+        )
 
     return result
 
@@ -4272,6 +4311,7 @@ def load_analysis(path):
         "balanced_power_file": None,
         "plots": None,
         "best_power_plots": None,
+        "best_power_vs_frequency": None,
     }
 
     fit_file = root / FIT_RESULTS_FILE
@@ -4306,6 +4346,8 @@ def load_analysis(path):
 _MAD_TO_SIGMA = 1.4826
 DEFAULT_BIFURCATION_ANL = 4.0 / (3.0 * np.sqrt(3.0))
 DEFAULT_BIFURCATION_BACKOFF_DB = 3.0
+# ``DEFAULT_TARGET_ANL`` (0.1) belongs with these, but is defined at the top of
+# the module because ``analyse_power_sweep`` takes it as a default too.
 
 # Post-fit guard defaults for ``find_best_power``. All three are expressed in
 # self-calibrating units so nothing is tuned to a particular campaign or system:
@@ -4878,43 +4920,100 @@ _MAD_OUTLIER_LOG_PARAMS = {"Qi", "Qc"}
 # Detrending needs enough points for the robust line to be about the trend
 # rather than about one outlier; below this the constant-median form is used.
 _MAD_DETREND_MIN_POINTS = 5
+# Points per local baseline fit: enough for a robust line, few enough that the
+# line can follow real curvature (Qi's knee as the drive nears bifurcation).
+_MAD_LOCAL_WINDOW = 5
+# Floor on the MAD scale, so an almost perfectly smooth series cannot turn a
+# small physical wiggle into a large sigma count. Read as a fraction for the
+# log-space parameters and as radians for phi: at the default 5-sigma clip a
+# row is only called a bad fit once it departs from its neighbours by >10% in
+# Qi/Qc, or >0.1 rad (~6 deg) in phi. Measured jumps to a neighbouring
+# resonance are several times that; the physical droop is well under it.
+_MAD_MIN_SCALE = 0.02
 
 
-def _param_outlier_deviation(powers, values, eligible, *, detrend, log_space):
+def _local_trend_residual(powers, values, eligible):
+    """Residual of each eligible point about a line through its neighbours.
+
+    The baseline for a point is a Theil-Sen line over the ``_MAD_LOCAL_WINDOW``
+    points nearest it in power, *including itself*.  Including it is the whole
+    trick: a leave-one-out baseline has to extrapolate to reach the top of the
+    sweep, so it under-predicts a curve that is bending downwards there and
+    re-flags exactly the points this is meant to keep.  A single jumped fit
+    still stands out, because one point in five moves the median pairwise
+    slope very little.
+
+    Ineligible rows get ``NaN`` (they are masked out by the caller anyway).
+    """
+    powers = np.asarray(powers, dtype=float)
+    values = np.asarray(values, dtype=float)
+    index = np.flatnonzero(eligible)
+    x = powers[index]
+    y = values[index]
+    window = min(_MAD_LOCAL_WINDOW, index.size)
+    residual = np.full(values.shape, np.nan)
+    for position, row in enumerate(index):
+        near = np.argsort(np.abs(x - x[position]))[:window]
+        slope, intercept = _theil_sen_line(x[near], y[near])
+        if np.isfinite(slope) and np.isfinite(intercept):
+            residual[row] = y[position] - (slope * x[position] + intercept)
+        else:
+            residual[row] = y[position] - float(np.median(y[near]))
+    return residual
+
+
+def _param_outlier_deviation(
+    powers, values, eligible, *, detrend, log_space, min_scale=0.0
+):
     """Robust per-row deviation of one parameter, in MAD-equivalent sigmas.
 
     The point of the check this feeds is to catch a fit that jumped -- to a
     neighbouring resonance, or to a corner of parameter space -- not to
     penalise a parameter for depending on power.  ``Qi`` in particular is
     flat at low power and then falls steeply as the drive approaches
-    bifurcation; measured against a constant median that smooth trend reads
+    bifurcation.  Measured against a constant median that smooth trend reads
     as a growing outlier and takes the whole high-power end of the sweep with
-    it, which is exactly the end that anchors the ANL slope.
+    it; measured against a single straight line it is the *curvature* that is
+    left over, and the last point or two of a sweep still read as outliers --
+    which is exactly the end that anchors the ANL slope.
 
-    So with ``detrend`` (the default) the deviation is measured about a
-    Theil-Sen line in power, and only the scatter *about that trend* is
-    clipped.  ``detrend=False`` restores the constant-median form.
+    So with ``detrend`` (the default) each point is measured against a robust
+    line through its own neighbourhood in power (:py:func:`_local_trend_residual`),
+    which follows the knee, and only what is left over is clipped.  The MAD
+    scale of those residuals is floored at ``min_scale``, because a series
+    that the local baseline tracks almost perfectly has a near-zero MAD, and
+    without a floor every few-percent wiggle becomes tens of sigmas.
+    ``detrend=False`` restores the constant-median form.
     """
     values = np.asarray(values, dtype=float)
     eligible = np.asarray(eligible, dtype=bool)
     reference = values[eligible]
+    min_scale = float(min_scale)
     if log_space:
         positive = eligible & (values > 0.0)
         if np.count_nonzero(positive) != np.count_nonzero(eligible):
             log_space = False          # non-positive values: stay linear
+            # The floor was a fraction; in linear units that is a fraction of
+            # the typical value.
+            median_magnitude = float(np.median(np.abs(reference)))
+            if np.isfinite(median_magnitude):
+                min_scale *= median_magnitude
         else:
             values = np.log(np.where(values > 0.0, values, np.nan))
             reference = values[eligible]
 
     if detrend and np.count_nonzero(eligible) >= _MAD_DETREND_MIN_POINTS:
-        slope, intercept = _theil_sen_line(powers[eligible], reference)
-        if np.isfinite(slope) and np.isfinite(intercept):
-            values = values - (slope * powers + intercept)
+        residual = _local_trend_residual(powers, values, eligible)
+        if np.all(np.isfinite(residual[eligible])):
+            values = residual
             reference = values[eligible]
 
     centre = float(np.median(reference))
     scale = _MAD_TO_SIGMA * float(np.median(np.abs(reference - centre)))
-    if not (np.isfinite(scale) and scale > 0.0):
+    if not np.isfinite(scale):
+        return None
+    scale = max(scale, min_scale)
+    if scale <= 0.0:
         return None
     return np.abs(values - centre) / scale
 
@@ -5126,9 +5225,10 @@ def _find_best_power_for_tone(
             exclude_reason[i] = f"{name} outside ({lo:g}, {hi:g})"
 
     # 1c: per-tone MAD outlier check on parameters that should vary smoothly
-    # (at most) with power -- by default measured about a robust trend, so a
-    # real power dependence is not mistaken for a run of outliers.
-    trend_note = "trend" if param_outliers_detrend else "median"
+    # (at most) with power -- by default measured about a robust local trend,
+    # so a real power dependence, however curved, is not mistaken for a run of
+    # outliers.
+    trend_note = "local trend" if param_outliers_detrend else "median"
     if param_outliers_mad_clip is not None:
         clip_k = float(param_outliers_mad_clip)
         for key in _MAD_OUTLIER_CHECK_PARAMS:
@@ -5140,6 +5240,7 @@ def _find_best_power_for_tone(
                 powers, values, eligible,
                 detrend=param_outliers_detrend,
                 log_space=key in _MAD_OUTLIER_LOG_PARAMS,
+                min_scale=_MAD_MIN_SCALE,
             )
             if deviation is None:
                 continue
@@ -5166,6 +5267,7 @@ def _find_best_power_for_tone(
                 powers, values, eligible,
                 detrend=param_outliers_detrend,
                 log_space=True,
+                min_scale=_MAD_MIN_SCALE,
             )
             if deviation is None:
                 continue
@@ -5690,7 +5792,7 @@ def _find_best_power_for_tone(
 def find_best_power(
     summary,
     *,
-    target_anl=0.01,
+    target_anl=DEFAULT_TARGET_ANL,
     bifurcation_anl=DEFAULT_BIFURCATION_ANL,
     param_valid_ranges=None,
     param_outliers_mad_clip=5.0,
@@ -5720,7 +5822,8 @@ def find_best_power(
     :py:func:`load_fit_summary`), or a CSV written by
     :py:func:`write_fit_summary`.  The single criterion is a least-squares
     fit to ``log(anl) = slope * power_dbm + intercept``, which is solved for
-    ``target_anl`` (default ``0.01``) to return a precise chosen power rather
+    ``target_anl`` (default :data:`DEFAULT_TARGET_ANL`, ``0.1`` -- about
+    8.9 dB below bifurcation) to return a precise chosen power rather
     than the nearest measured sweep point.  By default, the retained
     log-linear refit is weighted by the propagated log-ANL uncertainty
     ``sigma_log_anl ~= anl_err / anl`` when enough finite ``anl_err`` values
@@ -5742,18 +5845,25 @@ def find_best_power(
        disables all.
     3. Per-parameter MAD outlier check on ``Qi``, ``Qc`` and ``phi``: rows
        deviating by more than ``param_outliers_mad_clip`` MAD-equivalent
-       sigmas are dropped.  The deviation is measured about a robust
-       (Theil-Sen) trend in power, *not* about a constant median, because
-       these parameters genuinely depend on power -- ``Qi`` in particular is
-       flat at low power and then falls steeply as the drive approaches
-       bifurcation.  Measured against a constant median that smooth droop
-       reads as a growing outlier and takes the entire high-power end of the
-       sweep with it, which is exactly the end that anchors the ANL slope
-       (on one 389-tone campaign this dropped 227 of 389 tones at one power
-       step; detrending cut it to 16).  ``Qi`` and ``Qc`` are detrended in
-       log space.  Set ``param_outliers_detrend=False`` for the old
-       constant-median form, or ``param_outliers_mad_clip=None`` to disable
-       the check entirely.
+       sigmas are dropped.  It is there to catch a fit that jumped, so the
+       deviation is measured about a robust *local* trend in power -- a
+       Theil-Sen line through each point's five nearest powers -- and not
+       about a constant median or a single global line, because these
+       parameters genuinely depend on power and not linearly: ``Qi`` is flat
+       at low power and then falls steeply as the drive approaches
+       bifurcation.  Against a constant median that droop reads as a growing
+       outlier and takes the entire high-power end of the sweep with it;
+       against one straight line its *curvature* does the same to the last
+       point or two.  Either way it is the end that anchors the ANL slope
+       (on a 384-tone campaign the global-line form dropped the top power
+       step for 230 tones; the local form drops it for 3).  ``Qi`` and ``Qc``
+       are handled in log space.  The MAD scale is floored so that a nearly
+       perfectly smooth series cannot make a few-percent wiggle significant:
+       at the default clip a row has to leave its neighbours by more than
+       ~10% in ``Qi``/``Qc``, or ~0.1 rad in ``phi``, which is well below a
+       jump to a neighbouring resonance and well above the physical trend.
+       Set ``param_outliers_detrend=False`` for the old constant-median form,
+       or ``param_outliers_mad_clip=None`` to disable the check entirely.
     4. Per-parameter uncertainty MAD outlier check: same MAD criterion applied
        to the ``<name>_err`` columns instead of the values, so rows with a
        wildly inflated uncertainty on ``Qi``, ``Qc``, or ``phi`` are dropped.
@@ -7896,7 +8006,7 @@ def plot_power_sweep(
     format="magphase",
     parameters=("fr", "Qi", "Qc", "anl"),
     show_overlay=False,
-    save_overlay=True,
+    save_overlay=False,
     dpi=80,
     fit_figsize=(8.0, 4.8),
     parameter_figsize=None,
@@ -7932,10 +8042,11 @@ def plot_power_sweep(
        by default because this helper is usually used in batch mode for many
        resonators.
 
-    A single combined ``tones_fits_overlay.png`` is also written, with all
-    selected tones overlaid on shared axes and coloured by tone power.  All
-    saved figures are closed after writing, except the overlay when
-    ``show_overlay=True``.
+    A single combined ``tones_fits_overlay.png`` — all selected tones on
+    shared axes, coloured by tone power — can also be written, but is off by
+    default (``save_overlay=True`` to restore it): on a full array it is both
+    the slowest figure in the run and the least readable.  All saved figures
+    are closed after writing, except the overlay when ``show_overlay=True``.
 
     Parameters
     ----------
@@ -7977,9 +8088,9 @@ def plot_power_sweep(
         a script).  Per-tone fit and parameter figures are always closed
         after saving.  Default ``False``.
     save_overlay : bool, optional
-        If ``False``, skip the combined all-tones overlay PNG.  This is useful
-        for large arrays where the overlay is visually crowded and expensive
-        to render.  Default ``True`` preserves the historical output.
+        Write the combined all-tones overlay PNG.  Default ``False``: on a
+        large array the overlay is visually crowded and the most expensive
+        figure in the run.  Set ``True`` to restore it.
     dpi : int or float, optional
         Resolution for saved PNGs.  Default ``80`` keeps batch plot output
         light: ``savefig`` is the dominant per-figure cost and its raster
@@ -9402,7 +9513,7 @@ def plot_best_power(
     *,
     tone_indices=None,
     output_dir=None,
-    target_anl=0.01,
+    target_anl=DEFAULT_TARGET_ANL,
     bifurcation_anl=DEFAULT_BIFURCATION_ANL,
     use_readback_power=True,
     show_anl_errors=True,
@@ -9465,10 +9576,15 @@ def plot_best_power(
     Agreement between them is the check the second sweep direction buys;
     disagreement shows up as the ``bif_hysteresis_mismatch`` flag.
 
+    The array-level ``best_power_vs_frequency.png`` (chosen power vs.
+    resonance frequency, one circle per tone) is always written alongside the
+    per-tone PNGs; see :py:func:`plot_best_power_vs_frequency`.
+
     Returns
     -------
     result : dict
-        ``{'anl': [paths...], 'best_power': best_power}``.
+        ``{'anl': [paths...], 'vs_frequency': path or None,
+        'best_power': best_power}``.
     """
     import matplotlib.pyplot as plt
     from matplotlib import ticker as _mpl_ticker
@@ -9554,7 +9670,7 @@ def plot_best_power(
             )
         )
         _progress(verbose, "  Saved best-power unavailable placeholder")
-        return {"anl": paths, "best_power": best_power}
+        return {"anl": paths, "vs_frequency": None, "best_power": best_power}
 
     plot_start = time.time()
     report_every = _progress_report_every(len(tones))
@@ -9647,6 +9763,14 @@ def plot_best_power(
     for tone_index in tones:
         paths.extend(results_by_tone[tone_index])
 
+    vs_frequency = plot_best_power_vs_frequency(
+        best_power,
+        output_dir=output_dir,
+        show=show,
+        dpi=dpi,
+        verbose=verbose,
+    )
+
     if verbose >= 2 and tones:
         _progress(
             verbose,
@@ -9660,4 +9784,106 @@ def plot_best_power(
             ),
         )
 
-    return {"anl": paths, "best_power": best_power}
+    return {
+        "anl": paths,
+        "vs_frequency": vs_frequency,
+        "best_power": best_power,
+    }
+
+
+def plot_best_power_vs_frequency(
+    best_power,
+    *,
+    output_dir=None,
+    filename="best_power_vs_frequency.png",
+    show=False,
+    dpi=80,
+    figsize=(7.2, 4.2),
+    verbose=True,
+):
+    """Save the array-level picture: chosen power against resonance frequency.
+
+    One PNG, one circle per tone, chosen power (dBm) vs. the tone's fitted
+    resonance frequency (MHz).  This is the plot that shows whether the
+    selected comb is sane at a glance -- a band of points with a slow trend
+    across the array is healthy; isolated tones tens of dB away are the ones
+    to go and read the per-tone ANL plots for.
+
+    Parameters
+    ----------
+    best_power : list of dict, dict, or str or Path
+        Rows from :py:func:`find_best_power`, a single row, or a path to a
+        ``best_power.json`` written by :py:func:`write_best_power`.
+    output_dir : str, Path, or None, optional
+        Directory for the PNG (created if missing).  ``None`` (default) uses
+        ``<json parent>/plots`` when ``best_power`` is a path, else the
+        current directory.
+    filename : str, optional
+        Output file name (default ``'best_power_vs_frequency.png'``).
+    show : bool, optional
+        Leave the figure open instead of closing it after saving.
+    dpi, figsize : optional
+        Standard matplotlib output controls.
+
+    Returns
+    -------
+    path : str or None
+        The written PNG path, or ``None`` when no tone had both a finite
+        frequency and a finite chosen power.
+    """
+    import matplotlib.pyplot as plt
+
+    verbose = _verbose_level(verbose)
+    source_path = None
+    if isinstance(best_power, (str, Path)):
+        source_path = Path(best_power).resolve()
+        best_power = load_best_power(source_path)
+    elif isinstance(best_power, dict):
+        best_power = [best_power]
+    rows = list(best_power or [])
+
+    if output_dir is None:
+        output_dir = (
+            source_path.parent / "plots" if source_path is not None
+            else Path.cwd()
+        )
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    freq_mhz = []
+    powers = []
+    for row in rows:
+        params = row.get("chosen_params") or {}
+        try:
+            fr = float(params.get("fr", np.nan))
+            power = float(row.get("chosen_power_dbm", np.nan))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(fr) and np.isfinite(power):
+            freq_mhz.append(fr / 1e6)
+            powers.append(power)
+
+    if not freq_mhz:
+        warnings.warn(
+            "plot_best_power_vs_frequency: no tone has both a finite "
+            "frequency and a finite chosen power; nothing plotted.",
+            stacklevel=2,
+        )
+        return None
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(freq_mhz, powers, "o", markersize=4, color="tab:blue")
+    ax.set_xlabel("Frequency (MHz)")
+    ax.set_ylabel("Chosen tone power (dBm)")
+    ax.set_title(
+        f"Best tone power vs frequency ({len(freq_mhz)} tones, "
+        f"median {np.median(powers):.1f} dBm)"
+    )
+    ax.grid(True, alpha=0.25)
+
+    path = output_dir / filename
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    if not show:
+        plt.close(fig)
+    _progress(verbose, f"  Saved {path}")
+    return str(path)

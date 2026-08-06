@@ -51,9 +51,15 @@ firmware:
   adc_physical_bits: 14
   # Conversion factors between digital full-scale (dBFS) and analog power (dBm).
   # These can be scalar values or paths to CSV calibration files.
-  dac0_dbfs_to_dbm: -6.0
-  dac1_dbfs_to_dbm: -6.0
-  adc_dbm_to_dbfs: +12
+  # Measured on a KRM-4ZU47DR in DAC->ADC loopback, 2026-08-05, under the
+  # reference conditions in doc/calibration.md: DAC 0P7 DUC scale, inverse-sinc
+  # on, VOP 20000uA; ADC 1P0 DDC scale, DSA 0, QMC off; Nyquist zone 1. Both are
+  # flat approximations to a band that rolls off ~2 dB from 250 MHz to 2.25 GHz,
+  # and the ADC figure ignores loopback cable loss (so it reads slightly high).
+  # Replace with a frequency-dependent calibration file for absolute work.
+  dac0_dbfs_to_dbm: -9.0
+  dac1_dbfs_to_dbm: -9.0
+  adc_dbm_to_dbfs: +3
   vop_current_fullscale: 20000
   defaults:
     # sync_delay is intentionally omitted. As of firmware v7.11 it is deprecated:
@@ -81,8 +87,18 @@ firmware:
     vop: 20000                       # WARNING: not rated above 20000uA in gen3 with 2.5V V_dac_vtt; up to 40500uA adds nonlinearity
     # dac_duc_mixer_frequency_hz: 1228800000   # Not needed when nyquist_zone is set (it overrides these)
     # adc_ddc_mixer_frequency_hz: -1228800000  # Not needed when nyquist_zone is set (it overrides these)
-    dac_mixer_scale_1p0: false       # WARNING: using 1p0 may add nonlinearity
-    adc_mixer_scale_1p0: false       # WARNING: using 1p0 may add nonlinearity
+    dac_mixer_scale_1p0: false       # WARNING: using 1p0 may add nonlinearity. The DAC
+                                     #   DUC is complex-to-real, where 1p0 risks overflow;
+                                     #   keep 0p7 and take the 3 dB hit (see doc/calibration.md).
+    adc_mixer_scale_1p0: true        # The ADC DDC is real-to-I/Q, where 1p0 is the natural
+                                     #   scale: it puts the complex envelope at the same
+                                     #   amplitude as the real input, gaining 3 dB of digital
+                                     #   signal over 0p7 with no analog change. Set it
+                                     #   explicitly rather than relying on MIX_SCALE_AUTO --
+                                     #   the calibration model tests FineMixerScale == 1P0 and
+                                     #   treats anything else (including AUTO) as 0p7, applying
+                                     #   a sqrt(2) correction the hardware may not be doing.
+                                     #   adc_dbm_to_dbfs must be measured at this setting.
     dac_qmc_gain: 1                  # WARNING UNTESTED. Gain correction factor. Range: 0 to 2.0 (Exclusive)
     dac_qmc_offset: 0               # WARNING UNTESTED. Offset correction factor (fixed LSB value added to signal)
     dac_qmc_phase: 0                # WARNING UNTESTED. Phase correction factor. Range: +/- 26.5 degrees (Exclusive)

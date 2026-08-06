@@ -3773,9 +3773,16 @@ class ReadoutServer:
                     await self.send_response(writer, {'status': 'success', 'result': result, 'details': details})
 
                 elif request == 'maximise_tx_power':
+                    if 'headroom_db' in message:
+                        # Renamed, and select_headroom_kwargs would otherwise
+                        # drop it silently and quietly apply the default.
+                        raise ValueError(
+                            "maximise_tx_power: 'headroom_db' is now "
+                            "'dac_headroom_db' (older client)")
                     reference_plane = message.get('reference_plane', 'detector')
                     power_limit_dbm = message.get('power_limit_dbm', None)
-                    compression_headroom_db = message.get('compression_headroom_db', None)
+                    # compression_headroom_db / compression_check ride along in
+                    # headroom_kwargs below.
                     rx_policy = message.get('rx_policy', 'protect')
                     digital_only = message.get('digital_only', False)
                     rf_only = message.get('rf_only', False)
@@ -3791,12 +3798,13 @@ class ReadoutServer:
                         self.r, self.r_fast, self.config,
                         reference_plane=reference_plane, rf_peripherals=self.rf_peripherals,
                         power_limit_dbm=power_limit_dbm,
-                        compression_headroom_db=compression_headroom_db,
                         rx_policy=rx_policy, digital_only=digital_only,
                         rf_only=rf_only, **headroom_kwargs, **forced_controls)
                     result = {'amps': amps.tolist(), 'psb_fft_shift': psb_fft_shift, 'psbscale': psb_scale, 'dsp_ovf': dsp, 'dac_levels': dac}
                     if isinstance(dac, dict) and 'tx_compression' in dac:
                         result['tx_compression'] = dac['tx_compression']
+                    if isinstance(dac, dict) and 'rx_compression' in dac:
+                        result['rx_compression'] = dac['rx_compression']
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'maximise_rx_power':
@@ -3832,6 +3840,8 @@ class ReadoutServer:
                         'rx_attenuation_db': rx_atten,
                         'rx_amp_bypass': rx_amp_bypass
                     }
+                    if isinstance(adc, dict) and 'rx_compression' in adc:
+                        result['rx_compression'] = adc['rx_compression']
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'maximise_rx_dsp_gain':

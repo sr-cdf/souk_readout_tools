@@ -32,6 +32,35 @@ def _snapshot_acc_len(snapshot_data, sweep_data):
         "Provide sweep_data with 'info.pipeline.acc_len' set.")
 
 
+def _single_tone_snapshot(snapshot_data, func_name):
+    """
+    Return the single-tone snapshot dict these plots expect.
+
+    ``batch_snapshots()`` returns one snapshot dict per tone under
+    ``'results'``, so passing the batch dict (or its ``'results'`` mapping)
+    here is an easy slip.  Unwrap it when it holds a single tone, and
+    otherwise say which tone to pick.
+    """
+    if 'snapshots' in snapshot_data:
+        return snapshot_data
+
+    results = snapshot_data.get('results', snapshot_data)
+    tones = sorted(tidx for tidx, snap in results.items()
+                   if isinstance(snap, dict) and 'snapshots' in snap) \
+        if isinstance(results, dict) else []
+    if len(tones) == 1:
+        return results[tones[0]]
+    if tones:
+        raise ValueError(
+            f"{func_name}() plots one tone, but was given batch snapshot data "
+            f"for tones {tones}. Pass a single tone, e.g. "
+            f"batch_data['results'][{tones[0]}], or use "
+            "plot_batch_snapshots() for all of them.")
+    raise KeyError(
+        "'snapshots' — expected snapshot data from "
+        "get_accumulator_snapshots() or batch_snapshots().")
+
+
 def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
                                n_snap, *, repetitions, sweep_data,
                                reference_tone_frequency, smooth_window_hz,
@@ -113,6 +142,9 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
     Args:
         snapshot_data: dict from get_accumulator_snapshots() with keys
             'snapshots' (N_snap, 1024), 'sample_rate', 'tone_index'.
+            A single-tone batch_snapshots() dict is also accepted; for
+            several tones pass one of them, e.g.
+            ``batch_data['results'][3]``.
         format: 'iq' | 'iq_vs_t' | 'magphase' | 'freq_diss'
         repetitions: How to handle multiple snapshots:
             'concatenate': join all end-to-end
@@ -165,6 +197,7 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
         matplotlib.figure.Figure
     """
     plt = _get_pyplot()
+    snapshot_data = _single_tone_snapshot(snapshot_data, 'plot_snapshots')
     snapshots = snapshot_data['snapshots']
     sample_rate = snapshot_data['sample_rate']
     tone_index = snapshot_data['tone_index']
@@ -293,7 +326,9 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
     Plot PSD of snapshot data.
 
     Args:
-        snapshot_data: dict from get_accumulator_snapshots().
+        snapshot_data: dict from get_accumulator_snapshots(). A single-tone
+            batch_snapshots() dict is also accepted; for several tones pass
+            one of them, e.g. ``batch_data['results'][3]``.
         format: 'iq' | 'magphase' | 'freq_diss'
             Selects which quantity to compute PSD of.  Two panels:
             I/Q, magnitude/phase, or fractional frequency/dissipation.
@@ -333,6 +368,7 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
     Returns:
         matplotlib.figure.Figure
     """
+    snapshot_data = _single_tone_snapshot(snapshot_data, 'plot_snapshots_psd')
     snapshots = snapshot_data['snapshots']
     sample_rate = snapshot_data['sample_rate']
     tone_index = snapshot_data['tone_index']

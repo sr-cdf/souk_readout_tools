@@ -643,16 +643,16 @@ DAC power calibration maps the full-scale digital output to an absolute power le
 
 There are three ways to specify calibration values in the config file:
 
-**Single value** (flat across frequency):
+**Single value** (flat across frequency, as in the bundled template):
 ```yaml
 firmware:
-  dac0_dbfs_to_dbm: -6.0
+  dac0_dbfs_to_dbm: -9.0
 ```
 
 **Frequency-power lookup pairs** (inline, linearly interpolated across frequency):
 ```yaml
 firmware:
-  dac0_dbfs_to_dbm: [[500e6, -5.9], [1000e6, -6.1], [1500e6, -6.5]]
+  dac0_dbfs_to_dbm: [[500e6, -8.5], [1000e6, -8.9], [1500e6, -9.3]]
 ```
 
 **Path to a calibration file**:
@@ -665,9 +665,9 @@ Calibration file format is two-column text (frequency in Hz, power in dBm at ful
 
 ```
 # Frequency_Hz  Power_dBm
-500e6  -5.9
-1000e6 -6.1
-1500e6 -6.5
+500e6  -8.5
+1000e6 -8.9
+1500e6 -9.3
 ```
 
 Example calibration files are bundled with the package. On the server, they are copied to `~/.souk_readout_tools/pipeline_0/calibrations/` on first run.
@@ -676,7 +676,7 @@ Calibration files referenced in the config are transferred automatically: `push_
 
 Calibration file paths in the config can be absolute or relative — `push_config()` resolves them locally and rewrites them to the server-relative form. See the [calibration guide](calibration.md) for measurement conditions and file format details.
 
-The same format and specification options apply to `dac1_dbfs_to_dbm` and `adc_dbm_to_dbfs`.
+The same format and specification options apply to `dac1_dbfs_to_dbm` and `adc_dbm_to_dbfs`. `adc_dbm_to_dbfs` is only valid for the ADC DDC fine-mixer scale it was measured at (`firmware.defaults.adc_mixer_scale_1p0`, `true` by default) — changing that setting moves every calibrated RX power by 3 dB.
 
 ---
 

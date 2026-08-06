@@ -607,9 +607,23 @@ class RFPeripheralController:
         self._sync_runtime_state('recv_atten')
 
     def _get_amp_s21(self, dev_name):
-        """Return the current bypass-amp S21 contribution (gain or bypass IL)."""
-        atten_amp = self._mixerless_module._get_atten_amp(self._channel, dev_name)
-        return atten_amp.atten_amp_level.amp.total_gain_il
+        """Return the module S21 in its current bypass state, excluding the
+        variable attenuator.
+
+        This is the plane the calibration chain expects: ``calc_tone_powers``
+        applies ``tx_attenuator_value_db`` as a separate term, so the value
+        here must cover everything else in the module (amp/preamp, filter,
+        equaliser, fixed attenuator) but not the variable attenuator.
+
+        The amplifier's own ``total_gain_il`` is *not* the right quantity --
+        using it drops the module's fixed loss and makes reported tone powers
+        ~16 dB optimistic on TX (and ~5 dB pessimistic on RX).  The config
+        overrides ``{tx,rx}_amp_{enabled,bypassed}_s21_db`` are measured at
+        this same plane and take priority over this model.
+        """
+        level = self._mixerless_module._get_atten_amp(
+            self._channel, dev_name).atten_amp_level
+        return level.total_gain_il - level.variable_atten.total_gain_il
 
     def _mixerless_module_cal_value(self, key):
         """Return a scalar mixerless-module calibration override if set."""

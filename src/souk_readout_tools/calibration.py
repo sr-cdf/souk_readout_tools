@@ -2,6 +2,15 @@
 
 import numpy as np
 
+# DAC data fills the whole 16-bit word, so after /2**(bits-1) full scale is 1.0.
+# ADC data only fills 15 of the 16 bits, so the same normalisation puts ADC full
+# scale at 0.5 and every derived power 6.02 dB low.  check_input_saturation
+# already divides by this, and adc_dbm_to_dbfs is measured through it, so the
+# power model has to use the same normalisation or the two disagree by 2x.
+ADC_FULL_SCALE = 0.5
+DAC_FULL_SCALE = 1.0
+
+
 def calc_tone_powers(amps,
                      psb_fftshift,
                      psb_scale,
@@ -301,16 +310,17 @@ def calc_accumulated_iq_level(adc_input_power_dbm,adc_dbm_to_dbfs,mixer_qmc_gain
 
     adc_dbfs = adc_dbm - adc_dbm_to_dbfs
 
-    sig_rms = 10**(adc_dbfs/20)
-
-    sig_amp = sig_rms * np.sqrt(2)
+    # adc_dbm_to_dbfs is the power of a full-scale *sine* (peak amplitude = full
+    # scale), so dBFS maps straight onto a peak amplitude with no RMS factor --
+    # see doc/calibration.md, 'Definition of full-scale input (ADC)'.
+    sig_amp = 10**(adc_dbfs/20)
 
     ddc_amp = sig_amp * mixer_qmc_gain
 
     if not mixer_scale_is_1p0:
         ddc_amp /= np.sqrt(2)
 
-    adc_amp = ddc_amp * 2**(adc_bits-1)
+    adc_amp = ddc_amp * 2**(adc_bits-1) * ADC_FULL_SCALE
 
     adc_i_amp = adc_q_amp = adc_amp #eg phase=45 deg = pi/4 rad
 
@@ -388,16 +398,16 @@ def calc_adc_input_power(accumulated_iq_level,adc_dbm_to_dbfs,mixer_qmc_gain,mix
     pfb_amp = np.abs(pfb_i_out + 1j * pfb_q_out)
     adc_amp = pfb_amp / 2**(13-bin(pfb_fftshift).count('1'))
 
-    ddc_amp = adc_amp / 2**(adc_bits-1)
+    ddc_amp = adc_amp / (2**(adc_bits-1) * ADC_FULL_SCALE)
 
     if not mixer_scale_is_1p0:
         ddc_amp *= np.sqrt(2)
 
     ddc_amp /= mixer_qmc_gain
 
-    sig_rms = ddc_amp / np.sqrt(2)
-
-    sig_dbfs = 20*np.log10(sig_rms)
+    # Peak-referred dBFS, matching adc_dbm_to_dbfs (full-scale sine) and the
+    # plotting units -- see doc/calibration.md.
+    sig_dbfs = 20*np.log10(ddc_amp)
 
     adc_dbm = sig_dbfs + adc_dbm_to_dbfs
 

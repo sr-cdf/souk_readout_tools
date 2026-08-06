@@ -868,7 +868,7 @@ The wideband sweep covers the full RF bandwidth (or a specified sub-band) using 
 
 ```python
 sweep_data = client.wideband_sweep(
-    bandwidth_hz=None,               # None = defaults to 90% of full bandwidth
+    bandwidth_hz=None,               # None = defaults to 80% of full bandwidth
     center_freq_hz=None,             # None = defaults to center of band
     step_size_hz=10000,              # frequency step size
     num_tones=1024,                  # number of parallel tones

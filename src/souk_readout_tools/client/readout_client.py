@@ -1926,7 +1926,8 @@ class ReadoutClient:
 
     def set_tone_powers(self, tone_powers_dbm, reference_plane='detector',
                         optimise_dynamic_range=True, rx_policy='protect',
-                        headroom_db=None, filterbank_headroom_db=None,
+                        headroom_db=None, dac_saturation_threshold=None,
+                        filterbank_headroom_db=None,
                         adc_headroom_db=None,
                         verbose=True, autosync=False, mrst=False, *,
                         force_tx_amp_bypass=None,
@@ -1971,6 +1972,14 @@ class ReadoutClient:
             maximum achievable output; a target below that cap satisfies the
             headroom automatically, and one above it is reported rather than
             silently missed.
+        dac_saturation_threshold : float or None
+            Fraction of DAC full scale the saturation detector trips at.
+            ``None`` (default) uses the server's
+            ``firmware_lib.SATURATION_THRESHOLD_FRAC`` (0.90), which is itself
+            0.92 dB below full scale — so even ``headroom_db=0`` cannot reach
+            the last ~1 dB, and a target within that of the DAC calibration
+            comes back as "exceeds maximum achievable".  Pass e.g. 0.999 to run
+            the DAC up to clipping.
         filterbank_headroom_db : float or None
             Amplitude-word margin in dB for the modulation TX drive restore --
             a separate margin from ``headroom_db``.  See
@@ -2026,6 +2035,7 @@ class ReadoutClient:
         self._add_power_headroom_controls(
             message,
             headroom_db=headroom_db,
+            dac_saturation_threshold=dac_saturation_threshold,
             filterbank_headroom_db=filterbank_headroom_db,
             adc_headroom_db=adc_headroom_db)
         self._add_power_force_controls(
@@ -2124,11 +2134,13 @@ class ReadoutClient:
     
     # TODO: Add option to save the resulting parameters to the config file after
     #       maximise/optimise/fix operations (requires save_config, see push_config TODO).
-    def maximise_tx_power(self, headroom_db=None, reference_plane='detector',
+    def maximise_tx_power(self, dac_headroom_db=None, reference_plane='detector',
+                          dac_saturation_threshold=None,
                           power_limit_dbm=None, compression_headroom_db=None,
                           filterbank_headroom_db=None, adc_headroom_db=None,
                           atten_step_db=None,
                           rx_policy='protect', digital_only=False, rf_only=False,
+                          compression_check=None,
                           *, force_tx_amp_bypass=None,
                           force_rx_amp_bypass=None,
                           force_tx_attenuation_db=None,
@@ -2141,7 +2153,7 @@ class ReadoutClient:
 
         Parameters
         ----------
-        headroom_db : float or None
+        dac_headroom_db : float or None
             Margin in dB below **true DAC full scale**.  ``None`` (default)
             uses the server's ``firmware_lib.DEFAULT_DAC_HEADROOM_DB``.
 
@@ -2149,11 +2161,18 @@ class ReadoutClient:
             is already ~0.92 dB below full scale, so only the excess is applied
             on top -- ask for 1 dB and you get 1 dB, not 1.9 dB.  Requests
             inside that ~0.92 dB floor clamp to it.
+        dac_saturation_threshold : float or None
+            Fraction of DAC full scale the saturation detector trips at.
+            ``None`` (default) uses the server's 0.90, which is why
+            ``dac_headroom_db=0`` lands ~0.92 dB below full scale rather than at
+            it.  Raise towards 1.0 (e.g. 0.999) to drive the DAC to true full
+            scale for a maximum-output bench test; this gives up the detector's
+            built-in safety margin, so the output can genuinely clip.
         filterbank_headroom_db : float or None
             Amplitude-word margin in dB reserved so the modulation TX drive
             restore has room when a probe moves out towards half a bin
-            separation.  A *separate* margin from ``headroom_db``: it caps the
-            amplitude words rather than psb_scale.  ``None`` (default) follows
+            separation.  A *separate* margin from ``dac_headroom_db``: it caps
+            the amplitude words rather than psb_scale.  ``None`` (default) follows
             the filterbank-compensation config; an explicit value applies
             whether or not compensation is enabled.
         adc_headroom_db : float or None
@@ -2180,15 +2199,24 @@ class ReadoutClient:
               attenuation or DSA to clear it and warn.
             - ``'compensate'`` — mirror TX power changes onto the RX
               path to keep round-trip power constant.
-            - ``'maximise'`` — run ``maximise_rx_power()`` after each TX
-              power change to optimise RX attenuation, DSA, RX amp, and
-              PFB FFT shift.
+            - ``'maximise'`` — run ``maximise_rx_power()`` once the TX side
+              is at its final level, optimising RX attenuation, DSA, RX amp,
+              and PFB FFT shift.  Intermediate TX steps only get the cheap
+              ``'protect'`` saturation check.
             - ``'raise'`` — raise error if ADC saturates.
             - ``'none'`` — don't touch the RX path.
         digital_only : bool
             If True, only firmware/RFDC parameters are adjusted.
         rf_only : bool
             If True, only RF frontend attenuators and bypass amps are adjusted.
+        compression_check : bool or None
+            ``None`` (default) uses the server default, which is on: each
+            chain's margin to its input 1 dB compression point is reported in
+            the server log and returned as ``result['tx_compression']`` /
+            ``result['rx_compression']``, and the check is enforced on the RX
+            side under ``rx_policy='maximise'``.  It never limits TX power on
+            its own -- that is ``compression_headroom_db``.  Set False to
+            ignore compression entirely.
         force_tx_amp_bypass, force_rx_amp_bypass, force_tx_attenuation_db, force_rx_attenuation_db, force_adc_dsa_db, force_tone_amplitudes, force_tone_amplitude, force_psb_fftshift, force_psb_shift, force_psb_scale, force_pfb_fftshift, force_pfb_shift : optional
             Pin individual power-chain controls instead of optimising them; see
             :py:meth:`set_tone_powers` for the full description of each.
@@ -2198,10 +2226,12 @@ class ReadoutClient:
                'digital_only': digital_only, 'rf_only': rf_only}
         self._add_power_headroom_controls(
             msg,
-            headroom_db=headroom_db,
+            dac_headroom_db=dac_headroom_db,
+            dac_saturation_threshold=dac_saturation_threshold,
             filterbank_headroom_db=filterbank_headroom_db,
             adc_headroom_db=adc_headroom_db,
-            atten_step_db=atten_step_db)
+            atten_step_db=atten_step_db,
+            compression_check=compression_check)
         self._add_power_force_controls(
             msg,
             force_tx_amp_bypass=force_tx_amp_bypass,
@@ -2224,6 +2254,7 @@ class ReadoutClient:
 
     def maximise_rx_power(self, headroom_db=None, digital_only=False, rf_only=False,
                           atten_step_db=None, rts_as_saturation=None,
+                          compression_check=None, compression_headroom_db=None,
                           *, force_tx_amp_bypass=None,
                           force_rx_amp_bypass=None,
                           force_tx_attenuation_db=None,
@@ -2255,6 +2286,20 @@ class ReadoutClient:
             If True, only firmware/RFDC parameters are adjusted.
         rf_only : bool, optional
             If True, only RF frontend attenuators and bypass amps are adjusted.
+        compression_check : bool or None
+            ``None`` (default) uses the server default, which is on: the RX
+            chain's margin to its input 1 dB compression point is reported at
+            each stage and returned as ``result['rx_compression']``, and
+            settings that would run the frontend within
+            *compression_headroom_db* of P1dB are refused -- the RX amp stays
+            bypassed, or the attenuator stops coming down.  ADC levels cannot
+            see this: a compressed amplifier feeding a clean-looking -1 dBFS is
+            exactly what it catches.  Set False to optimise purely on ADC
+            levels.  Skipped silently when the RF frontend model provides no
+            compression point.
+        compression_headroom_db : float or None
+            Margin in dB to keep below the RX input P1dB.  ``None`` (default)
+            uses the server's ``firmware_lib.DEFAULT_COMPRESSION_HEADROOM_DB``.
         force_tx_amp_bypass, force_rx_amp_bypass, force_tx_attenuation_db, force_rx_attenuation_db, force_adc_dsa_db, force_tone_amplitudes, force_tone_amplitude, force_psb_fftshift, force_psb_shift, force_psb_scale, force_pfb_fftshift, force_pfb_shift : optional
             Pin individual power-chain controls instead of optimising them; see
             :py:meth:`set_tone_powers` for the full description of each.
@@ -2266,7 +2311,9 @@ class ReadoutClient:
             msg,
             headroom_db=headroom_db,
             atten_step_db=atten_step_db,
-            rts_as_saturation=rts_as_saturation)
+            rts_as_saturation=rts_as_saturation,
+            compression_check=compression_check,
+            compression_headroom_db=compression_headroom_db)
         self._add_power_force_controls(
             msg,
             force_tx_amp_bypass=force_tx_amp_bypass,
@@ -2408,7 +2455,8 @@ class ReadoutClient:
             force_pfb_shift=force_pfb_shift)
         return self.send_request(msg)
 
-    def fix_dac_saturation(self, headroom_db=None, intermittent_backoff_db=None):
+    def fix_dac_saturation(self, headroom_db=None, intermittent_backoff_db=None,
+                           backoff_step_db=None):
         """Ask the server to reduce output drive until DAC saturation clears.
 
         Parameters
@@ -2418,14 +2466,21 @@ class ReadoutClient:
             saturation clears.  ``None`` (default) uses the server's
             ``firmware_lib.DEFAULT_DAC_HEADROOM_DB``.
         intermittent_backoff_db : float or None
-            Flat reduction applied when saturation was reported but the check
-            comes back clean (server default 3.0 dB).
+            Ceiling on the total reduction applied when saturation was reported
+            but the standard capture comes back clean (server default 3.0 dB).
+            The server re-checks over twice the span and steps down only until
+            that comes back clean, so a DAC well below full scale is left
+            alone.
+        backoff_step_db : float or None
+            Increment those steps are taken in.  ``None`` (default) uses the
+            server's ``firmware_lib.DEFAULT_BACKOFF_STEP_DB``.
         """
         msg = {'request': 'fix_dac_saturation'}
         self._add_power_headroom_controls(
             msg,
             headroom_db=headroom_db,
-            intermittent_backoff_db=intermittent_backoff_db)
+            intermittent_backoff_db=intermittent_backoff_db,
+            backoff_step_db=backoff_step_db)
         return self.send_request(msg)
 
     def fix_adc_saturation(self, atten_step_db=None, dsa_step_db=None,
@@ -6554,6 +6609,15 @@ class ReadoutClient:
                        dac_headroom_db=None,
                        adc_headroom_db=None,
                        filterbank_headroom_db=None,
+                       dac_saturation_threshold=None,
+                       atten_step_db=None,
+                       dsa_step_db=None,
+                       rts_as_saturation=None,
+                       compression_check=None,
+                       tx_compression_headroom_db=None,
+                       rx_compression_headroom_db=None,
+                       intermittent_backoff_db=None,
+                       backoff_step_db=None,
                        verbose=True):
         """
         Perform a wideband sweep of the system using multiple tones.
@@ -6562,8 +6626,10 @@ class ReadoutClient:
         the concatenated sweep data covering the full requested bandwidth.
 
         Args:
-            bandwidth_hz (float): Total bandwidth to measure. Default is 90% of the
-                                  available bandwidth (the band edges are lossy).
+            bandwidth_hz (float): Total bandwidth to measure. Default is 80% of the
+                                  available bandwidth, keeping clear of the DAC
+                                  interpolation filter roll-off at the band edges.
+                                  Spans above 90% warn.
             center_freq_hz (float): Center frequency of the sweep. Default is band center.
             step_size_hz (float): Step size of the sweep in Hz. Number of sweep steps =
                                   bandwidth / step_size / num_tones. Default is 10000.
@@ -6654,6 +6720,34 @@ class ReadoutClient:
                 reserved for the modulation TX drive restore — a separate
                 margin from dac_headroom_db. None (default) follows the
                 filterbank-compensation config.
+            dac_saturation_threshold (float or None): Fraction of DAC full
+                scale the saturation detector trips at, forwarded to the
+                tone-power call. None (default) uses the server's 0.90, which
+                is itself ~0.92 dB of margin — the floor dac_headroom_db is
+                measured against.
+            atten_step_db (float or None): RF attenuator ramp increment,
+                forwarded to the tone-power call, the RX-gain step and the
+                ADC saturation fix. Recovery step-backs use the attenuator's
+                own 0.5 dB resolution regardless.
+            dsa_step_db (float or None): ADC DSA increment for the ADC
+                saturation fix.
+            rts_as_saturation (bool or None): Whether a latched RFDC RTS flag
+                counts as ADC saturation, forwarded to the RX-gain step and the
+                ADC saturation fix. None (default) uses the server's True.
+            compression_check (bool or None): Report each RF chain's margin to
+                its input P1dB, and enforce it on the RX side. None (default)
+                uses the server's True. See maximise_rx_power().
+            tx_compression_headroom_db (float or None): Margin below the TX
+                input P1dB to hold the composite output to, by reducing
+                psb_scale. None (default) applies no TX compression guard.
+            rx_compression_headroom_db (float or None): Margin below the RX
+                input P1dB the RX-gain step keeps. None (default) uses the
+                server's firmware_lib.DEFAULT_COMPRESSION_HEADROOM_DB.
+            intermittent_backoff_db (float or None): Ceiling on the reduction
+                the DAC saturation fix applies when saturation was reported but
+                the standard capture is clean.
+            backoff_step_db (float or None): Increment the DAC saturation fix
+                steps down in.
             verbose (bool): Print progress information. Default is True.
 
         Returns:
@@ -6736,7 +6830,10 @@ class ReadoutClient:
         # Set defaults for bandwidth and center frequency
         available_bandwidth_hz = rfmax - rfmin
         if bandwidth_hz is None:
-            bandwidth_hz = available_bandwidth_hz * 0.90
+            # 80%, not 90%: the top decade of the band sits in the DAC
+            # interpolation filter roll-off, so a 90% default put edge tones
+            # close enough to it to skew the sweep.
+            bandwidth_hz = available_bandwidth_hz * 0.80
         if center_freq_hz is None:
             center_freq_hz = (rfmax + rfmin) / 2
         if bandwidth_hz > 0.90 * available_bandwidth_hz:
@@ -6797,11 +6894,16 @@ class ReadoutClient:
         if isinstance(tone_powers_dbm, str) and tone_powers_dbm == 'auto':
             # Maximum power/dynamic-range: set unit amplitudes first, then maximise
             self.set_tone_amplitudes(np.ones(num_tones))
-            result = self.maximise_tx_power(reference_plane=reference_plane,
-                                            rx_policy=tx_rx_policy,
-                                            headroom_db=dac_headroom_db,
-                                            adc_headroom_db=adc_headroom_db,
-                                            filterbank_headroom_db=filterbank_headroom_db)
+            result = self.maximise_tx_power(
+                reference_plane=reference_plane,
+                rx_policy=tx_rx_policy,
+                dac_headroom_db=dac_headroom_db,
+                dac_saturation_threshold=dac_saturation_threshold,
+                adc_headroom_db=adc_headroom_db,
+                filterbank_headroom_db=filterbank_headroom_db,
+                atten_step_db=atten_step_db,
+                compression_check=compression_check,
+                compression_headroom_db=tx_compression_headroom_db)
             if verbose:
                 print(f'  Auto TX power: maximise_tx_power() -> {result}')
         elif tone_powers_dbm is not None:
@@ -6814,6 +6916,7 @@ class ReadoutClient:
                                 optimise_dynamic_range=optimise_tx_dynamic_range,
                                 rx_policy=tx_rx_policy,
                                 headroom_db=dac_headroom_db,
+                                dac_saturation_threshold=dac_saturation_threshold,
                                 adc_headroom_db=adc_headroom_db,
                                 filterbank_headroom_db=filterbank_headroom_db,
                                 verbose=verbose)
@@ -6875,7 +6978,12 @@ class ReadoutClient:
             else:
                 if verbose:
                     print(f'  Optimising RX gain...')
-                rx_result = self.maximise_rx_power(headroom_db=adc_headroom_db)
+                rx_result = self.maximise_rx_power(
+                    headroom_db=adc_headroom_db,
+                    atten_step_db=atten_step_db,
+                    rts_as_saturation=rts_as_saturation,
+                    compression_check=compression_check,
+                    compression_headroom_db=rx_compression_headroom_db)
             if verbose:
                 operation = ('maximise_rx_dsp_gain' if internal_loopback
                              else 'maximise_rx_power')
@@ -6918,7 +7026,12 @@ class ReadoutClient:
         if outps['result']:
             if verbose:
                 print(f'  DAC saturation detected — attempting fix...')
-            self.fix_dac_saturation()
+            # Same margin the sweep asked maximise_tx_power for, or the fix
+            # quietly resets the drive to the server's 1 dB default.
+            self.fix_dac_saturation(
+                headroom_db=dac_headroom_db,
+                intermittent_backoff_db=intermittent_backoff_db,
+                backoff_step_db=backoff_step_db)
             outps = self.check_output_saturation()
             if outps['result']:
                 raise RuntimeError(
@@ -6926,7 +7039,9 @@ class ReadoutClient:
         if inps is not None and inps['result']:
             if verbose:
                 print(f'  ADC saturation detected — attempting fix...')
-            self.fix_adc_saturation()
+            self.fix_adc_saturation(atten_step_db=atten_step_db,
+                                    dsa_step_db=dsa_step_db,
+                                    rts_as_saturation=rts_as_saturation)
             inps = self.check_input_saturation()
             if inps['result']:
                 raise RuntimeError(

@@ -8,6 +8,7 @@ import warnings
 import numpy as np
 
 from souk_readout_tools import config_utils
+from souk_readout_tools.calibration import ADC_FULL_SCALE
 
 
 # Supported units for normalisation. ``s21`` is kept as a backwards-compatible
@@ -227,9 +228,10 @@ def _resolve_cal_value(value, frequencies=None):
     Supported forms:
       - None          → None
       - scalar        → float (no frequencies needed)
-      - [[f, dB], …]  → per-sample nearest-neighbour, shape matches frequencies
+      - [[f, dB], …]  → per-sample linear interpolation (flat outside the
+                        calibrated range), shape matches frequencies
       - str           → CSV filename under ~/.souk_readout_tools/, same
-                        nearest-neighbour interpolation
+                        linear interpolation
 
     Returns None when the value is array-like / file-backed but no
     frequency axis has been provided — callers should treat that as
@@ -281,15 +283,7 @@ def _resolve_cal_value(value, frequencies=None):
     resolved = np.full(flat.shape, np.nan, dtype=float)
     good = np.isfinite(flat)
     if np.any(good):
-        idx = np.searchsorted(cal_f, flat[good], side='left')
-        right = np.clip(idx, 0, cal_f.size - 1)
-        left = np.clip(idx - 1, 0, cal_f.size - 1)
-        choose_right = (
-            np.abs(cal_f[right] - flat[good])
-            < np.abs(flat[good] - cal_f[left])
-        )
-        nearest = np.where(choose_right, right, left)
-        resolved[good] = cal_db[nearest]
+        resolved[good] = np.interp(flat[good], cal_f, cal_db)
     return resolved.reshape(frequencies.shape)
 
 
@@ -941,7 +935,10 @@ def _normalise_iq(si, sq, units, info=None, config=None,
 
     adc_bits = _adc_fullscale_bits(
         info, config, calibration_cache=calibration_cache)
-    half_scale = 2 ** (adc_bits - 1)
+    # ADC data fills 15 of the 16 bits, so full scale sits at ADC_FULL_SCALE of
+    # the register normalisation -- the same factor check_input_saturation
+    # applies, and the one adc_dbm_to_dbfs is measured through.
+    half_scale = 2 ** (adc_bits - 1) * ADC_FULL_SCALE
 
     mixer_qmc_gain = 1.0
     mixer_scale_is_1p0 = False
