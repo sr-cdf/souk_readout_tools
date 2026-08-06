@@ -4,174 +4,132 @@
 
 ### Breaking changes
 
-**`maximise_tx_power`: `headroom_db` renamed to `dac_headroom_db` (breaking).**
-The old name now raises rather than being silently dropped and defaulted. New
-`dac_saturation_threshold` (default 0.90) sets the trip fraction for every check
-the routine makes; pass ~0.999 to run the DAC up to clipping.
+**`maximise_tx_power`: `headroom_db` renamed to `dac_headroom_db`.** The old name
+now raises rather than being silently dropped. New `dac_saturation_threshold`
+(default 0.90) sets the trip fraction for every check the routine makes; pass
+~0.999 to run the DAC up to clipping.
 
-**Default `target_anl` is now 0.1 (breaking).** Was `0.01` in `find_best_power`,
+**Default `target_anl` is now 0.1**, was `0.01` in `find_best_power`,
 `analyse_power_sweep` and `plot_best_power`. Chosen powers move up ~10 dB, into
 the swept window where they belong.
 
 ### Corrected measurements — earlier numbers were wrong
 
-**Every calibrated RX power was 6.02 dB low.** The power model normalised ADC
-data by 2^15, but ADC full scale is 2^14 — the `ADC_FULL_SCALE` factor
-`check_input_saturation` already applies and `adc_dbm_to_dbfs` is measured
-through. Every RX dBm/volts/watts/S21 number rises 6.02 dB; tone powers and the
-saturation/headroom logic are unchanged. Confirmed with a calibrated
-synthesiser: full-scale input measured at +3.37 dBm at 900 MHz.
+**Every calibrated RX power was 6.02 dB low.** The power model normalised ADC data
+by 2^15, but ADC full scale is 2^14. Every RX dBm/volts/watts/S21 number rises
+6.02 dB; tone powers and the saturation/headroom logic are unchanged. Confirmed
+against a calibrated synthesiser: full scale at +3.37 dBm, 900 MHz.
 
 **`calc_adc_input_power` was a further 3.01 dB low**, from a `/sqrt(2)`
-inconsistent with the peak-referred definition of `adc_dbm_to_dbfs`.
-`get_tone_powers(reference_plane='adc_input'|'cryostat_output')` now reads
-3.01 dB higher and `'accumulator'` 3.01 dB lower. No plotted value changes.
+inconsistent with the peak-referred `adc_dbm_to_dbfs`.
+`get_tone_powers(reference_plane='adc_input'|'cryostat_output')` reads 3.01 dB
+higher, `'accumulator'` 3.01 dB lower. No plotted value changes.
 
-**ADC DDC fine-mixer scale defaults to 1P0 and is always programmed
-explicitly.** `adc_mixer_scale_1p0: false` now programs `MIX_SCALE_0P7` rather
-than AUTO, which read back as 0P7 and cost a silent 3 dB in every calibrated RX
-power. Re-measure `adc_dbm_to_dbfs` against the scale in use — `doc/calibration.md`
-gains a full-scale definition and a loopback procedure.
+**ADC DDC fine-mixer scale defaults to 1P0 and is always programmed explicitly.**
+`adc_mixer_scale_1p0: false` now programs `MIX_SCALE_0P7` rather than AUTO, which
+read back as 0P7 and cost a silent 3 dB in every calibrated RX power. Re-measure
+`adc_dbm_to_dbfs` against the scale in use; `doc/calibration.md` gains a
+full-scale definition and a loopback procedure.
 
 **Blank mixerless-module calibration no longer costs ~16 dB of tone power.**
-`rf_peripherals._get_amp_s21` returned the bare amplifier gain as the whole
-module S21; it now returns the module S21 excluding the variable attenuator.
-Model error drops from 5–16 dB to ≤1.2 dB in all four TX/RX × enabled/bypassed
-states. Affects runs whose `system_info` shows
-`tx_bypass_amp_s21_source: peripheral_model` — dBm labels only, raw I/Q, Q
-values and dip depths are unaffected.
+`rf_peripherals._get_amp_s21` returned the bare amplifier gain as the whole module
+S21; it now returns the module S21 excluding the variable attenuator. Model error
+drops from 5–16 dB to ≤1.2 dB across all four TX/RX × enabled/bypassed states.
+Affects runs whose `system_info` shows
+`tx_bypass_amp_s21_source: peripheral_model` — dBm labels only.
+
+**Fast ADC/DAC snapshots no longer come back with sample pairs transposed.** `'<h'`
+unpacking swapped adjacent 16-bit samples, so **every DAC snapshot spectrum was
+mirrored about DC** and ADC spectra were scrambled — treat earlier conclusions from
+them accordingly. Ordered uses only; saturation and headroom results were
+bit-identical. Hardware-confirmed.
 
 **Bundled template converter calibrations replaced with measured values.**
-`dac{0,1}_dbfs_to_dbm` `-6.0` → `-9.0` and `adc_dbm_to_dbfs` `+12` → `+3`, with
-the `calc_*` fallback following. Both are flat approximations across a band that
-rolls off ~2 dB; use a calibration file for absolute work.
+`dac{0,1}_dbfs_to_dbm` `-6.0` → `-9.0`, `adc_dbm_to_dbfs` `+12` → `+3`, with the
+`calc_*` fallback following. Both are flat approximations across a band that rolls
+off ~2 dB; use a calibration file for absolute work.
 
-**Fast ADC/DAC snapshots no longer come back with sample pairs transposed.**
-`'<h'` unpacking swapped adjacent 16-bit samples, so **every DAC snapshot
-spectrum was mirrored about DC** and ADC spectra were scrambled — treat earlier
-conclusions from them accordingly. Ordered uses only (spectra, PSDs, unwrapped
-phase); saturation and headroom results were bit-identical. Hardware-confirmed.
-
-**Frequency-dependent calibrations interpolate linearly.** `[[f, dB], …]`
-entries and CSV cal files were resolved nearest-neighbour, i.e. a staircase;
-both resolvers now use `np.interp`, still clamped outside the calibrated range.
+**Frequency-dependent calibrations interpolate linearly.** `[[f, dB], …]` entries
+and CSV cal files were resolved nearest-neighbour; both now use `np.interp`, still
+clamped outside the calibrated range.
 
 ### RF power optimisation
 
-**The power optimisers report how close each chain runs to compression, and the
-RX side now respects it.** ADC and DAC levels say nothing about compression — a
-compressed amplifier feeding a clean-looking -1 dBFS reads as a perfect result.
-Whenever the frontend model supplies an input P1dB (mixerless module, or a
-`{tx,rx}_input_1db_comp_dbm` override), `maximise_tx_power` and
-`maximise_rx_power` log `compression: RX input -40.0 dBm total, P1dB 9.9 dBm,
-margin 49.9 dB` at each stage and return it as `result['rx_compression']` /
-`result['tx_compression']`. On RX it is also enforced: settings inside the new
-`compression_headroom_db` (default 3 dB) are refused, so the RX amp stays
-bypassed or the attenuator stops coming down. This matters because the module's
-variable attenuator sits *after* the preamp — enabling the amp drops the
-input-referred P1dB by roughly its own gain, and each dB out of the attenuator
-takes another with it, while the power arriving at the module never moves. When
-the preamp is the binding stage instead, no RX control helps and the log says
-so. `compression_check=False` on either routine turns the whole thing off; TX
-power is still only limited by the existing opt-in `compression_headroom_db`.
+**The power optimisers report how close each chain runs to compression, and RX
+enforces it.** Whenever the frontend model supplies an input P1dB,
+`maximise_tx_power` and `maximise_rx_power` log the margin and return it as
+`result['{tx,rx}_compression']`. On RX, settings inside `compression_headroom_db`
+(default 3 dB) are refused — the module's variable attenuator sits *after* the
+preamp, so enabling the amp drops the input-referred P1dB by roughly its own gain.
+`compression_check=False` turns it off; TX remains limited only by the existing
+opt-in `compression_headroom_db`.
 
-**`maximise_rx_power` tries the RX amp before it drops the attenuator.** It did
-the reverse: the attenuator went to its minimum first, so switching the amp on
-could only saturate, and the amp was bypassed again with no control left to
-recover the difference. In loopback that parked the ADC at -6 dBFS (47% of full
-scale) with the attenuator already at 0 dB. The amp is now enabled with the
-attenuator parked at maximum to absorb its gain, and step 4 trades that
-attenuation back — the same order `maximise_tx_power` already used on TX. The
-amp is only tried when the attenuator alone cannot reach the headroom target,
-and reverts to bypass (restoring the previous attenuation) if it saturates even
-at full attenuation. Log steps 3 and 4 swap names accordingly.
+**`maximise_rx_power` tries the RX amp before it drops the attenuator.** It did the
+reverse, so switching the amp on could only saturate and it was bypassed again with
+no control left to recover. In loopback that parked the ADC at -6 dBFS with the
+attenuator already at 0 dB. The amp is now enabled with the attenuator at maximum,
+and step 4 trades that attenuation back — the order TX already used.
 
-**`maximise_tx_power(rx_policy='maximise')` runs one RX optimisation, not a
-dozen.** Every intermediate TX step — psb_scale unmute, TX amp enable, and each
-3 dB of the TX attenuator ramp — called `maximise_rx_power()`, complete with its
-own DSA / attenuator / PFB-fftshift search, only for the next TX step to undo
-it. With an RF frontend attached that was ~12 full passes and ~40 s. Those steps
-now take the cheap `'protect'` saturation check and the full RX pass runs once,
-at the end of step 4, against the final TX level.
+**`maximise_tx_power(rx_policy='maximise')` runs one RX optimisation, not a dozen.**
+Every intermediate TX step called a full `maximise_rx_power()` only for the next
+step to undo it: ~12 passes and ~40 s with an RF frontend. Those now take the cheap
+`'protect'` check, and the full pass runs once against the final TX level.
 
-**The RX attenuator steps back at its own 0.5 dB resolution, not in 3 dB
-jumps.** `maximise_rx_power` sized its first jump by rounding to the nearest
-0.5 dB step, so a 3.3 dB budget became a 3.5 dB drop that saturated by
-construction — and then recovered in `atten_step_db` (3 dB) jumps, stranding
-the ADC 2.8 dB below the target with the attenuator still 20 dB up. The jump now
-rounds towards more attenuation so it never exceeds the headroom that was
-measured, and both the saturation and compression step-backs move one 0.5 dB
-attenuator step at a time, the same reasoning the DSA loop already used at its
-1 dB resolution. On the reported case (21 dB attenuation, peak -3.3 dBFS) this
-lands at 19.0 dB and -1.3 dBFS instead of 20.5 dB and -2.8 dBFS. The DSA jump
-rounds the same way.
+**The RX attenuator steps back at its own 0.5 dB resolution, not in 3 dB jumps.**
+The first jump now rounds towards more attenuation so it never exceeds the measured
+headroom, and both step-backs move one 0.5 dB step at a time. On the reported case
+(21 dB, peak -3.3 dBFS) this lands at 19.0 dB / -1.3 dBFS instead of 20.5 dB /
+-2.8 dBFS. The DSA jump rounds the same way.
 
 **`fix_dac_saturation` sizes the reduction from the measured peak instead of
-halving.** A DAC 0.1 dB over the 90% detector threshold (peak 0.911 FS) was
-halved to clear it — 6 dB of output power gone, and nothing put it back. It now
-halves only while the peak is pinned at full scale, where the snapshot cannot
-say how far over the drive is, then moves straight to `headroom_db` below full
-scale from the measured peak, giving back any halving overshoot (never above the
-level it was called at) and mopping up in `backoff_step_db` steps if the
-detector still trips. The reported case now costs 0.19 dB rather than 6.1 dB.
+halving.** It now halves only while the peak is pinned at full scale, then moves
+straight to `headroom_db` below full scale from the measured peak. The reported
+case costs 0.19 dB rather than 6.1 dB.
 
-**Intermittent DAC saturation is chased in 0.5 dB steps against a longer
-capture, not cut by a flat 3 dB.** When the standard 250-capture check came back
-clean but saturation had been reported, `fix_dac_saturation` applied a flat
-`intermittent_backoff_db` — half the output power gone (psb_scale 4.13 → 2.93)
-whether the DAC was a hair under the threshold or 20 dB below it. It now looks
-again over twice the span (500 captures) first: if that does not reproduce the
-saturation, psb_scale is left alone, and if it does, psb_scale steps down in
-`backoff_step_db` (default 0.5 dB) increments, re-checking over the long
-capture each time and stopping the moment it is clean.
-`intermittent_backoff_db` becomes the ceiling on the total reduction rather than
-the amount, so the recovery costs measurement time instead of output power.
+**Intermittent DAC saturation is chased in 0.5 dB steps against a longer capture,
+not cut by a flat 3 dB.** It re-checks over 500 captures first; if that does not
+reproduce the saturation, psb_scale is left alone. `intermittent_backoff_db`
+becomes the ceiling on the total reduction rather than the amount, so recovery
+costs measurement time instead of output power.
 
 **Measured DAC headroom no longer under-reports.** `_measure_dac_headroom_db`
-averages 250 snapshots like the saturation check instead of one, so the two
-agree on a multitone comb's crest factor. Expect reported headroom to drop by a
-few dB.
+averages 250 snapshots like the saturation check instead of one, so the two agree
+on a multitone comb's crest factor. Expect reported headroom to drop by a few dB.
 
-**`set_tone_powers` takes `dac_saturation_threshold` too.** It was stuck at
-0.90, so asking for a single tone at the DAC calibration power failed with
-*"Target power exceeds maximum achievable by 1.0 dB"*.
+**`set_tone_powers` takes `dac_saturation_threshold` too.** It was stuck at 0.90,
+so asking for a single tone at the DAC calibration power failed with *"Target power
+exceeds maximum achievable by 1.0 dB"*.
 
 ### Wideband sweep
 
-**`wideband_sweep` defaults to 80% of the available bandwidth**, down from 90%.
-On a 2457.6 MHz band that is 1966.1 MHz rather than 2211.8 MHz, keeping the edge
-tones out of the DAC interpolation filter roll-off. Spans above 90% still warn;
-pass `bandwidth_hz` explicitly for the old default.
+**`wideband_sweep` defaults to 80% of the available bandwidth**, down from 90% — on
+a 2457.6 MHz band that is 1966.1 MHz, keeping the edge tones out of the DAC
+interpolation filter roll-off. Spans above 90% still warn; pass `bandwidth_hz`
+explicitly for the old default.
 
-**`wideband_sweep` takes every margin and step control it touches, and passes
-each to the call that honours it.** It accepted three (`dac_headroom_db`,
-`adc_headroom_db`, `filterbank_headroom_db`) and called the saturation fixes
-bare, so a sweep asking for 0.1 dB of DAC headroom had its drive reset to the
-server's 1 dB default the moment saturation was detected. It now also takes
-`dac_saturation_threshold`, `atten_step_db`, `dsa_step_db`,
-`rts_as_saturation`, `compression_check`, `tx_compression_headroom_db`,
-`rx_compression_headroom_db`, `intermittent_backoff_db` and `backoff_step_db`,
-forwarding each to the tone-power call, the RX-gain step, and the DAC/ADC
-saturation fixes as applicable — see the table in `doc/tone_power_notes.md`.
-The compression margin is split TX/RX because one sweep drives both chains and
-the two are unrelated knobs. All default to `None` (use the server default), and
-all are exposed as `--flags` on the `wideband_sweep` script.
+**`wideband_sweep` takes every margin and step control it touches, and forwards
+each to the call that honours it.** It accepted three and called the saturation
+fixes bare, so a sweep asking for 0.1 dB of DAC headroom had its drive reset to the
+server default the moment saturation was detected. Adds `dac_saturation_threshold`,
+`atten_step_db`, `dsa_step_db`, `rts_as_saturation`, `compression_check`,
+`tx_compression_headroom_db`, `rx_compression_headroom_db`,
+`intermittent_backoff_db` and `backoff_step_db`, all defaulting to `None` and all
+exposed as `--flags`. See the table in `doc/tone_power_notes.md`.
 
 ### Power-sweep analysis and plotting
 
 **Parameter outlier clipping follows the physical trend.** `find_best_power`'s
 per-parameter MAD check detrends against the five nearest powers instead of one
-global Theil-Sen line, so the knee near bifurcation no longer clips the top
-power step. Chosen powers move by a median of 0.00 dB.
+global Theil-Sen line, so the knee near bifurcation no longer clips the top power
+step. Chosen powers move by a median of 0.00 dB.
 
 **Power-sweep plot defaults: no all-tones overlay, always a comb-level view.**
 `plot_power_sweep(save_overlay=...)` defaults to `False`. New
-`plot_best_power_vs_frequency` writes `plots/best_power_vs_frequency.png`
-whenever powers were chosen.
+`plot_best_power_vs_frequency` writes `plots/best_power_vs_frequency.png` whenever
+powers were chosen.
 
 **Wideband sweeps plot in S21 units.** Per-tone TX powers are expanded onto the
-concatenated trace instead of raising `ValueError: tx_power_dbm must be a
-scalar, one value per plotted trace, or one value per tone`.
+concatenated trace instead of raising `ValueError`.
 
 **Single-tone snapshot plots accept batch snapshot data.** A one-tone
 `batch_snapshots()` dict is unwrapped automatically; a multi-tone one raises an
@@ -179,18 +137,19 @@ error naming the tones and pointing at `plot_batch_snapshots()`.
 
 ### Other
 
-**`get_info('versions')` reports the git commits again.** `_get_git_commit`
-handles a submodule's gitdir file and root-owned checkouts, and repository paths
-are no longer hardcoded to `/home/casper`.
+**`get_info('versions')` reports the git commits again.** `_get_git_commit` handles
+a submodule's gitdir file and root-owned checkouts, and repository paths are no
+longer hardcoded to `/home/casper`.
 
 ## v1.7.3
 
 **One notch convention for the linear and driven models**
 - The linear branch of `s21_model` put the full complex `1/Qe` in the notch
-  denominator while the Duffing branch used only its real part `Qr_inv`. Both
-  now use `Qr_inv`, i.e. the asymmetry is a numerator phase throughout
-  (Probst/Swenson), and the two branches are a single expression in the new
-  `_resonator_factor`.
+  denominator (`1/Qi + 1/Qe`) while the Duffing branch used the loaded
+  `Qr_inv = 1/Qi + Re(1/Qe)`. Both now use `Qr_inv` — note this is the loaded
+  inverse Q (internal plus the real part of external), not `Re(1/Qe)` itself —
+  i.e. the asymmetry is a numerator phase throughout (Probst/Swenson), and the
+  two branches are a single expression in the new `_resonator_factor`.
 - Consequences, all verified numerically: `anl -> 0` now reproduces the linear
   model exactly for `phi != 0` (it did not before), and the fitted `fr` is the
   frequency of maximum `|dS21/df|` at any `phi`. `Qi`, `Qc`, `phi` and fit
