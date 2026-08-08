@@ -38,7 +38,7 @@ a0 = r.accumulators[0]
 a1 = r.accumulators[1]
 ```
 
-The accumulation length sets how many averages are applied to the upstream data before the result is available. On startup this value is 32768 averages. If the system is clocked at 4915.2MHz, the 8192-point PFB FFT will output one channel at 600kHz, which is reduced to 600kHz/32768 = 18.310546875 Hz by the accumulator. For lab testing and development we typically set the averages to 1000 which gives a data rate of 600Hz.
+The accumulation length sets how many averages are applied to the upstream data before the result is available. On startup this value is 32768 averages. Note that "averages" here counts how many input samples are combined, not a normalisation: **the accumulator sums and does not divide**, so an accumulated sample is `acc_len` times larger than the mean of its inputs. That is why comparing a fast snapshot with an accumulated sample requires scaling the snapshot by `acc_len`. If the system is clocked at 4915.2MHz, the 8192-point PFB FFT will output one channel at 600kHz, which is reduced to 600kHz/32768 = 18.310546875 Hz by the accumulator. For lab testing and development we typically set the averages to 1000 which gives a data rate of 600Hz.
 
 We can get and set the accumulation length like this:
 

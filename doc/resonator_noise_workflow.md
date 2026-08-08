@@ -818,30 +818,18 @@ ax.legend(title="BB load")
 fig.tight_layout()
 ```
 
-Finally, plot the detector frequency-noise estimate at each load. This example
-subtracts the off-resonance PSD from the on-resonance PSD and optionally
-overlays the sequentially cleaned result. Blind-tone amplitude/phase cleaning
-is applied before resonance calibration when monitors are present; regular-tone
-SVD cleaning is then applied to the calibrated frequency-noise rows:
+Finally, plot the detector frequency-noise estimate at each load.
+`timeseries.subtract_psds` takes the off-resonance PSD off the on-resonance one
+and returns a result of the same shape, so the raw and cleaned differences come
+out of one call. Blind-tone amplitude/phase cleaning is applied before resonance
+calibration when monitors are present; regular-tone SVD cleaning is then applied
+to the calibrated frequency-noise rows:
 
 ```python
-from souk_readout_tools.noise import (
-    fractional_frequency_and_dissipation_timestreams,
-    remove_blind_tone_common_modes,
-    remove_common_modes_svd,
-)
-from souk_readout_tools.plotting import compute_psd
+from souk_readout_tools.timeseries import subtract_psds, timestream_psds
 
 SVD_MODES = 1  # Set to 0 to disable the cleaned overlay.
 BLIND_TONE_MODES = 1  # Used only when blind monitors were captured.
-PLOT_RAW = True
-
-
-def plot_positive_psd_difference(ax, f, psd_on, psd_off, **kwargs):
-    detector_psd = psd_on - psd_off
-    keep = (f > 0) & (detector_psd > 0)
-    ax.loglog(f[keep], detector_psd[keep], **kwargs)
-
 
 fig, ax = plt.subplots(figsize=(7, 5))
 
@@ -849,112 +837,58 @@ for row, color in zip(load_rows, colors):
     noise_dir = row["noise_dir"]
     samples_on = client.import_samples(str(noise_dir / "samples_on.npy"))
     samples_off = client.import_samples(str(noise_dir / "samples_off.npy"))
-    reference_frequencies = np.asarray(
-        samples_on["info"]["tones"]["frequencies_hz"]
-    )
     tone_metadata = samples_on["info"]["tones"]
     regular_tones = tone_metadata.get("regular_indices")
     if regular_tones is None or len(regular_tones) == 0:
-        regular_tones = range(samples_on["num_tones"])
-    blind_tones = tone_metadata.get("blind_indices")
-    if blind_tones is None:
-        blind_tones = []
+        regular_tones = list(range(samples_on["num_tones"]))
+    blind_tones = tone_metadata.get("blind_indices") or []
 
-    converted_raw_on = fractional_frequency_and_dissipation_timestreams(
-        samples_on,
-        row["sweep"],
+    # Both captures must be referred to the same responsivity. The
+    # off-resonance tones are parked away from the dip, where |dS21/df| is
+    # small, so letting them convert at their own recorded frequency divides by
+    # a near-zero gradient and inflates the off-resonance noise by orders of
+    # magnitude.
+    common = dict(
+        format="freq_diss",
         tones=regular_tones,
-        reference_tone_frequency=reference_frequencies,
+        sweep_data=row["sweep"],
+        reference_tone_frequency=np.asarray(
+            tone_metadata["frequencies_hz"]
+        ),
+        psd_kwargs={"nperseg": samples_on["num_samples"] // 30},
+        decorrelate_modes=SVD_MODES,
+        decorrelate_tones=regular_tones,
+        blind_tone_modes=BLIND_TONE_MODES if len(blind_tones) else 0,
+        blind_tones=blind_tones if len(blind_tones) else None,
     )
-    converted_raw_off = fractional_frequency_and_dissipation_timestreams(
-        samples_off,
-        row["sweep"],
-        tones=regular_tones,
-        reference_tone_frequency=reference_frequencies,
+    detector = subtract_psds(
+        timestream_psds(samples_on, **common),
+        timestream_psds(samples_off, **common),
     )
-    converted_row = {
-        int(index): offset
-        for offset, index in enumerate(converted_raw_on["tone_indices"])
-    }[tone_index]
-    nperseg = samples_on["num_samples"] // 30
+    plot_row = list(detector["tones"]).index(tone_index)
 
-    f, raw_on = compute_psd(
-        converted_raw_on["frequency"][converted_row],
-        samples_on["sample_rate"],
-        nperseg=nperseg,
+    ax.loglog(
+        detector["f"],
+        detector["psd"]["frequency"][plot_row],
+        color=color,
+        linestyle=":",
+        label=f'{row["load_k"]:g} K raw',
     )
-    _, raw_off = compute_psd(
-        converted_raw_off["frequency"][converted_row],
-        samples_off["sample_rate"],
-        nperseg=nperseg,
-    )
-    if PLOT_RAW:
-        plot_positive_psd_difference(
-            ax,
-            f,
-            raw_on,
-            raw_off,
+    if detector["psd_cleaned"] is not None:
+        steps = [f"SVD N={SVD_MODES}"] if SVD_MODES else []
+        if len(blind_tones) and BLIND_TONE_MODES:
+            steps.insert(0, f"Blind N={BLIND_TONE_MODES}")
+        ax.loglog(
+            detector["f"],
+            detector["psd_cleaned"]["frequency"][plot_row],
             color=color,
-            linestyle=":",
-            label=f'{row["load_k"]:g} K raw',
+            label=f'{row["load_k"]:g} K; {", ".join(steps)}',
         )
-
-    cleaned_samples_on = samples_on
-    cleaned_samples_off = samples_off
-    clean_steps = []
-    if BLIND_TONE_MODES and len(blind_tones):
-        cleaned_samples_on = remove_blind_tone_common_modes(
-            samples_on,
-            BLIND_TONE_MODES,
-            regular_tones=regular_tones,
-            blind_tones=blind_tones,
-        )
-        cleaned_samples_off = remove_blind_tone_common_modes(
-            samples_off,
-            BLIND_TONE_MODES,
-            regular_tones=regular_tones,
-            blind_tones=blind_tones,
-        )
-        clean_steps.append(f"Blind N={BLIND_TONE_MODES}")
-
-    if SVD_MODES or clean_steps:
-        converted_clean_on = fractional_frequency_and_dissipation_timestreams(
-            cleaned_samples_on,
-            row["sweep"],
-            tones=regular_tones,
-            reference_tone_frequency=reference_frequencies,
-        )
-        converted_clean_off = fractional_frequency_and_dissipation_timestreams(
-            cleaned_samples_off,
-            row["sweep"],
-            tones=regular_tones,
-            reference_tone_frequency=reference_frequencies,
-        )
-        clean_on = converted_clean_on["frequency"]
-        clean_off = converted_clean_off["frequency"]
-        if SVD_MODES:
-            clean_on = remove_common_modes_svd(clean_on, SVD_MODES)
-            clean_off = remove_common_modes_svd(clean_off, SVD_MODES)
-            clean_steps.append(f"SVD N={SVD_MODES}")
-
-        _, clean_on_psd = compute_psd(
-            clean_on[converted_row],
-            samples_on["sample_rate"],
-            nperseg=nperseg,
-        )
-        _, clean_off_psd = compute_psd(
-            clean_off[converted_row],
-            samples_off["sample_rate"],
-            nperseg=nperseg,
-        )
-        plot_positive_psd_difference(
-            ax,
-            f,
-            clean_on_psd,
-            clean_off_psd,
-            color=color,
-            label=f'{row["load_k"]:g} K; {", ".join(clean_steps)}',
-        )
+    print(
+        f'{row["load_k"]:g} K: positive in '
+        f'{detector["positive_fraction"]["frequency"][plot_row]:.0%} of '
+        f'{detector["n_points"]["frequency"][plot_row]} bins'
+    )
 
 ax.set_xlabel("Frequency (Hz)")
 ax.set_ylabel("On-res minus off-res frequency-noise PSD (1 / Hz)")
@@ -963,11 +897,40 @@ fig.tight_layout()
 ```
 
 Bins where the off-resonance PSD exceeds the on-resonance PSD are not positive
-detector-noise estimates and cannot be shown on a logarithmic axis. The helper
-above omits those bins rather than clipping them to an arbitrary floor.
+detector-noise estimates and cannot be shown on a logarithmic axis. The default
+`clip="positive"` replaces them with `NaN`, which the line plot then skips,
+rather than clipping them to an arbitrary floor.
+
+`positive_fraction` is the diagnostic that goes with that: it is the fraction of
+each tone's bins that survived. Near 1 the detector noise is resolved across the
+band; near 0.5 the two captures agree to within their own scatter, and the
+honest statement is an upper limit at the readout floor rather than a
+measurement.
+
+To turn the difference into a number, hand it straight to `psd_band_levels` or
+`fit_psd_model` — it has the same shape as a `timestream_psds` result. Use
+`clip=None` for this. Averaging a clipped difference keeps only its upward
+fluctuations, so a tone sitting at the readout floor comes back at roughly
+`0.8 * S_floor * sqrt(2 / n_averages)` — 24% of the floor over 22 Welch
+averages — instead of zero. Both functions warn if they are given a clipped
+result:
+
+```python
+from souk_readout_tools.timeseries import psd_band_levels
+
+detector_unclipped = subtract_psds(
+    timestream_psds(samples_on, **common),
+    timestream_psds(samples_off, **common),
+    clip=None,
+)
+levels = psd_band_levels(detector_unclipped, bands={"science": (1.0, 10.0)})
+print(levels["asd"]["frequency"][plot_row, 0], "1/sqrt(Hz)")
+```
 
 ## Related
 
+- [Timeseries Analysis](timeseries_analysis.md) — band levels, `1/f` + white fits,
+  on-minus-off, cross-spectra, composite wideband PSDs, `tau_qp` and export
 - [Tone Power and Drive Tuning Notes](tone_power_notes.md)
 - [Getting Started - Retuning](getting_started.md#retuning)
 - [Getting Started - Pre-Accumulator Snapshots](getting_started.md#pre-accumulator-snapshots)

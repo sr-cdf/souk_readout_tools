@@ -4197,6 +4197,11 @@ class ReadoutClient:
                 'tone_frequencies': Array of tone frequencies in Hz.
                 'firmware_indices': Firmware LO channel indices for each
                                     tone (from detailed tone frequency query).
+                'info': Structured info dict at time of capture, also copied
+                        into each per-tone dict in 'results' so a single tone
+                        stays self-describing. ``format='freq_diss'`` needs the
+                        parked tone frequencies and ``acc_len`` from here.
+                'date': Capture time.
         """
         freqs = self.get_tone_frequencies()
         n_tones = len(freqs)
@@ -4214,7 +4219,12 @@ class ReadoutClient:
                     raise ValueError(
                         f"Tone index {idx} out of range (0 to {n_tones - 1})")
 
-        acc_len = self.get_info('pipeline')['acc_len']
+        # One structured info snapshot for the whole batch, taken at capture
+        # time. The freq/diss conversion reads the parked tone frequencies and
+        # acc_len from here; without it the conversion falls back to the
+        # midpoint of the sweep range, which is not where the tone sat.
+        info = self.get_info('all')
+        acc_len = info['pipeline']['acc_len']
         accumulated_rate = self.get_sample_rate()
         snapshot_rate = accumulated_rate * acc_len
 
@@ -4277,6 +4287,8 @@ class ReadoutClient:
             'tone_indices': np.asarray(tone_indices, dtype=int),
             'tone_frequencies': freqs,
             'firmware_indices': fw_indices,
+            'info': info,
+            'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
         }
         output = self._normalise_batch_snapshot_data(output)
 
@@ -4310,6 +4322,11 @@ class ReadoutClient:
             snap_dict.setdefault('tone_index', tone_index)
             if 'sample_rate' not in snap_dict and 'sample_rate' in data_dict:
                 snap_dict['sample_rate'] = data_dict['sample_rate']
+            # A single tone's dict is routinely used on its own, so it needs
+            # the batch's info to stay self-describing for the freq/diss
+            # conversion and for acc_len.
+            if 'info' not in snap_dict and data_dict.get('info') is not None:
+                snap_dict['info'] = data_dict['info']
             results[tone_index] = ReadoutClient._normalise_snapshot_data(
                 snap_dict)
 

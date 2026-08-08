@@ -14,9 +14,9 @@ from ._common import (_get_pyplot, _compute_mag_phase, _dual_panels,
                        ERRORBAR_STYLE, _resolve_label, _legend,
                        _apply_deembed, _apply_phase_center,
                        _normalise_iq, _compute_mag_phase_units, UNITS)
-from ._psd import (carrier_power, check_psd_units, compute_psd,
-                   compute_psd_averaged, compute_psd_concatenated,
-                   psd_display_values)
+from ._psd import check_psd_units, psd_display_values
+from ..timeseries import (carrier_power, compute_psd, compute_psd_averaged,
+                          compute_psd_concatenated)
 
 
 def _snapshot_acc_len(snapshot_data, sweep_data):
@@ -324,6 +324,11 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
                        **kwargs):
     """
     Plot PSD of snapshot data.
+
+    The compute half lives in ``souk_readout_tools.timeseries`` as
+    ``snapshot_psds()``, which also reports the true spectral resolution, the
+    bin oversampling and the block-to-block drift. See
+    ``doc/timeseries_analysis.md``.
 
     Args:
         snapshot_data: dict from get_accumulator_snapshots(). A single-tone

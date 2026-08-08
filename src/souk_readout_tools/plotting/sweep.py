@@ -16,8 +16,8 @@ from ._common import (_get_pyplot, _propagate_errors_mag,
                        _magnitude_error_units,
                        _scale_iq_to_magnitude_units,
                        _validate_reference_plane,
-                       _with_sweep_readout_correction,
                        _disable_axis_offsets)
+from ..noise import _with_sweep_readout_correction
 
 
 def _extract_traces(sweep_data, tones=None):

@@ -1,5 +1,293 @@
 # Changelog & Feature List
 
+## v1.7.5
+
+**New `timeseries` module — `timestream_psds()` returns the arrays
+`plot_timestream_psd` draws.** Same arguments, same numbers. Plain dict of `f`,
+`psd` / `psd_cleaned` (2-D, keyed by panel name), `sample_rate`, `tones`,
+`carrier`, `conversion_method`, `cleaning`, `psd_kwargs`, `info`. Takes a
+`parse_samples` dict, a complex array, or an `(i, q)` pair with `sample_rate=`.
+
+**`plot_timestream_psd` gains `return_data=`**, returning `(fig, result)`. Its
+compute loop now delegates to `timeseries.timestream_psds`; plotted output is
+unchanged, verified line-by-line over 55 cases.
+
+**PSD compute moved `plotting/_psd.py` → `timeseries.py`**: `compute_psd`,
+`compute_psd_averaged`, `compute_psd_concatenated`, `log_bin_psd`,
+`carrier_power`. Still re-exported from `plotting`, so
+`from souk_readout_tools.plotting import compute_psd` is unaffected. Dependency
+direction is now `plotting` → `timeseries` → `noise` → `resonator`.
+
+**`_get_sweep_trace` deduplicated** onto the `noise.py` copy; a negative tone
+index now raises instead of indexing from the end.
+
+**Cross spectrum and coherence.** `cross_psd(data, other, sample_rate, ...)`
+returns `cross` (complex `S_xy`), `coherence`, `cross_phase`, the per-bin 2x2
+Hermitian `matrix`, and both auto-spectra. Amplifier and TLS noise are
+uncorrelated between the frequency and dissipation quadratures and drop out,
+leaving the common quasiparticle term — a responsivity-independent measure of
+photon + GR noise. Takes two plain arrays, or a capture dict plus `sweep_data`.
+`conversion_method='circle'` is rejected: `Delta(rho)` is not
+`Im(delta_tilde)`.
+
+**Coherence bias is reported, not left to the caller.** `coherence_bias`
+(`1/n_eff`), `coherence_95` and `coherence_significant`; warns below 30
+segments. `n_eff` corrects the segment count for the correlation between
+overlapping Welch segments (~5% at the default 50% Hann overlap); on the
+August 2026 NEP data it predicts 20.89 against an empirical null of 20.70,
+where the uncorrected `1/n_avg` would have turned a null into a 3.8-sigma
+"detection". Verified against the analytic MSC from 0 to 0.89, and the `1/n_avg`
+floor to 3 significant figures. For the off-resonance leakage acceptance test,
+detecting an amplitude leak `L` needs `n_avg > ~3/L^2` — ~300 segments at 10%,
+~1200 at 5% — so a short capture reading low coherence proves nothing.
+
+**Band levels and the 1/f + white fit.** `psd_band_levels(data, psd, bands,
+statistic=)` returns `level`, `asd` and `n_points` per tone and band.
+`fit_psd_model` fits `S(f) = A f^-alpha + W` in log space, returning `A`,
+`alpha`, `W`, `f_knee`, standard errors, the covariance in the fitted
+`(log10 A, alpha, log10 W)` basis, `rms_residual_dex` and flags.
+
+**`fit_psd_model` flags the A/W degeneracy.** As `alpha` → 0 the 1/f term goes
+flat and only `A + W` is determined, which can put `W` an order of magnitude
+below the true floor on a good-looking fit. Flagged `'white_degenerate'`,
+alongside `'no_1overf_in_range'`, `'no_white_floor_in_range'`,
+`'high_residual'`, `'alpha_at_bound'`, `'fit_failed'`, `'no_data'`.
+
+**On-minus-off detector noise.** `subtract_psds(on, off, f=, clip=)` returns
+`on - off` in a `timestream_psds`-shaped dict, so `psd_band_levels` and
+`fit_psd_model` apply to it unchanged. `positive_fraction` and `n_points` per
+tone say whether the difference is resolved at all: on the August 2026 data
+it is 1.00 on the frequency panel and 0.49 — a coin flip — on the
+amplifier-limited dissipation panel. Replaces the 100-line recipe in
+`doc/resonator_noise_workflow.md`.
+
+**`subtract_psds` guards the two ways an on/off pair goes silently wrong.**
+Captures referred to different responsivities are caught: `timestream_psds`
+now records `reference_tone_frequency` per tone, and letting the off capture
+default to its own parked position (84 kHz away in the August 2026 data)
+inflates its referred noise **1413x**. And only `'phase'` is flagged as
+carrier-relative — additive amplifier noise puts equal power into `i`, `q` and
+`magnitude` whatever the carrier, but enters phase as `S_n/A^2`, so an
+on/off `magphase` difference reports 161x the readout phase noise as detector
+noise at `positive_fraction = 1.00`. Also warns on mismatched `cleaning`.
+
+**Clipping a difference biases any level taken from it.** `clip='positive'`
+NaNs the non-positive bins, so averaging what survives keeps only the upward
+fluctuations: a difference that is truly zero comes back at
+`sqrt(2/pi) * S_floor * sqrt(2/n)` — 6% of the readout floor over 390 Welch
+averages, 24% over 22. `psd_band_levels` and `fit_psd_model` warn when handed
+a clipped result; use `clip=None` to quote a number. They also warn on
+`n_averages=`, whose `chi2_2n` corrections do not apply to a difference.
+
+**Export that reloads without pickle.** `export_psds(result, path)` /
+`load_psds(path)` round-trip any result in this module, and `export_summary`
+tabulates several as one flat CSV keyed by `(tone, panel, band)` so on, off and
+difference land in one table. Results nest arrays one level under a panel name,
+which `np.savez` can only store by pickling — so `export_psds` **flattens on
+write** to `key__panel` and `load_psds` restores the nesting. Files therefore
+open under numpy's default `allow_pickle=False`, with no change to any return
+shape, and a reloaded result feeds straight back into `psd_band_levels` and
+`fit_psd_model`. Verified across all nine result types.
+
+**Four plotting consumers.** `plot_allan_deviation`, `plot_timestream_histogram`,
+`plot_coherence` and `plot_composite_psd`, all thin wrappers over the analysis
+functions and all accepting a precomputed result. Each draws the thing that
+makes its number readable: `tau_min` marked on the Allan trace; the Gaussian
+implied by `mad_std` over the histogram, with `std/mad_std` in the title;
+the `1/n_eff` bias floor shaded and the 95% line drawn under the coherence, so
+a trace is visibly only meaningful above them; and on the composite, the
+uncovered gap and the alias-affected band shaded, the overlap ratio annotated in
+dB, and an optional `gr_fit=` overlay carrying `tau_qp` and the fixed `tau_res`.
+
+**Time-domain views.** `allan_deviation(data, format=, taus=, kind=)` answers
+"how long can I integrate" directly — overlapping by default, with `tau_min`,
+the fitted log-log `slope`, and `n_pairs` so the long-tau points are not read
+as firmer than they are. Verified against theory: white −0.50, flicker −0.04,
+random walk +0.40, and the overlapping estimator gives 35905 differences at the
+longest tau where disjoint bins give 18. `timestream_stats(...)` adds per-tone
+mean/std/ptp/median, MAD-based robust sigma, skew, excess kurtosis, outlier
+count and the drift slope — `std` running above `mad_std` is the cheap signal
+that a PSD has averaged a glitch away. Both share `timestream_psds`'s
+conversion and cleaning path, so the time and frequency views are of the same
+numbers.
+
+**"Readout noise", not "amplifier noise", throughout.** The off-resonance
+capture measures whatever the readout chain contributes; on this instrument
+that may be ADC-limited rather than amplifier-limited. Nothing downstream
+changes — both are additive in the digitised I/Q, so the carrier-scaling
+argument and the isotropy the quadrature combination relies on hold either way
+— but the docs no longer assert a mechanism they cannot distinguish.
+
+**Combining the two quadratures.** `combine_quadratures(data, other, beta=,
+weights=)` refers both channels to a common scale and combines them by GLS.
+`weights='scalar'` uses `w_d = 1/(1+4·beta²)`; `weights='closed_form'` fits the
+private/private/common decomposition `a`, `b`, `c` per bin and applies
+`S_comb = c² + (1/a² + 1/b²)⁻¹`, so common photon/GR noise passes through
+untouched and the result is never worse than the better single channel.
+Verified against theory: the amplifier-limited gain is 3.8% at beta=1.8 and
+0.8% at beta=4, matching `sqrt(1 + 1/(4·beta²))` exactly; where the frequency
+channel is TLS-limited and dissipation is amplifier-limited, `closed_form`
+returned **21×** against 1.03× for the scalar weights. `beta=None` is tier 4,
+frequency-only — a legitimate outcome, not an error.
+
+**The dissipation row is `Im(delta_tilde)`, so the referral factor is `2·beta`.**
+The plan's text sets up in `delta_Qi_inv` while quoting `1/(1+4·beta²)`; the
+latter is the one consistent with the pipeline row, and applying the 1/2 a
+second time would put every combined result out by a factor of 2. `estimate_beta`
+returns `1/(2·slope)` for the same reason, checked by recovering an injected
+beta of 3.0 (not 6.0).
+
+**`beta` sources, all three tiers.** `signal_direction_from_loads(load_k, fr,
+Qi, power_curve=)` regresses fitted `fr` and `1/Qi` against absorbed power to
+give `R_x` and `R_d` **separately** — the only route to an absolute NEP. Pass
+the optical model as a `(temperature_k, power_w)` curve to interpolate, or a
+callable `P(T)`; it warns on extrapolation past the curve and when the response
+curves over the load range. Without a power scale it still returns the ratio,
+and says `has_absolute_scale=False`. `estimate_beta` (tier 2) recovers injected
+ratios of 1.8/3.0/4.0 to within 4% from timestreams alone;
+`beta_from_kernels(Tc, T, fr)` (tier 3) needs no measurement at all. All three
+share one convention, checked end to end: a load ladder giving `beta` = 3.000
+agrees with `estimate_beta`'s 3.013, and `combine_quadratures` applies the
+factor of 2 for the pipeline row itself.
+
+**`estimate_beta`'s default `beta_range` is `(1.5, 20.0)`, not the plan's
+`(1.8, 4.0)`.** `beta` is a strong function of readout frequency *and*
+temperature. For this instrument's Al-Ti-Al film (`Tc` ≈ 1 K) over its 0.5-2 GHz
+resonators the Mattis-Bardeen kernels give 3.1 to 17.4 across 100-300 mK — so
+the plan's band, which corresponds to ~5 GHz readout, would flag almost every
+legitimate measurement. The default is now wide enough to span the whole
+operating space and only catches physically absurd values; narrow it with
+`beta_from_kernels` for a real check. The assumed gap ratio is not a worry:
+`beta` moves only 6.3 to 5.9 across `gap_ratio` 1.4 to 2.2.
+
+**Composite wideband PSD.** `snapshot_psds()` gives the snapshot stream the
+same result dict as `timestream_psds()`, and `stitch_psds()` joins them into
+one trace per tone. At the lab settings the accumulated band stops at 300 Hz
+and the snapshot band starts at 586 Hz, so there is a **gap, not an overlap**;
+it is returned in `gaps` and never interpolated across. Take the accumulated
+stream at `acc_len < 512` to close it and gain a real overlap for
+cross-validation. Mismatched tones, format, conversion, referred frequency or
+cleaning are refused — snapshots are one tone at a time and cannot be
+SVD-cleaned, so cleaning one side only puts a step at the join.
+
+**`accumulator_response()` replaces the deconvolution that an earlier draft
+called for.** Averaging `acc_len` samples and decimating by `acc_len` builds
+consecutive outputs from disjoint inputs, so the measured PSD of white input is
+exactly flat — verified flat to ±0.07 dB where the boxcar's own sinc² is
+−3.92 dB at Nyquist. Dividing by that response would manufacture a spurious
+rise. The function is a **forward** model only: it returns the genuine droop a
+*falling* spectrum suffers (0.91× at the top of the slow band for a 100 µs GR
+roll-off), matching a direct simulation to a median ratio of 1.000.
+
+**`snapshot_psds` reports what concatenation costs.** `f_resolution`
+(`fs/len_snapshot`, not the bin spacing), `bin_oversampling`, `effective_dof`
+and per-panel `block_drift`. Per-block detrending is on by default: an
+inter-block step train raised the sub-2 kHz level **451×**, and the excess falls
+with frequency exactly as the `f^-2` signature predicts.
+
+**`fit_gr_rolloff()` fits `tau_qp` with the resonator pole fixed.** The
+measured shape is two-pole, `S_0 / [(1+(2πf·tau_qp)²)(1+(2πf·tau_res)²)]`, and
+the poles sit in the same decade. Fitting a single Lorentzian to a 100 µs
+lifetime with `tau_res` = 32 µs returns **283 µs, 2.83× high**; the two-pole fit
+with `tau_res` fixed from `Qr/(π·fr)` returns 100.0 µs. Flags
+`poorly_separated`, `corner_in_gap`, `corner_above_band`. Accepts a `cross_psd`
+result, where amplifier and TLS noise have already cancelled.
+
+**`fit_glitch_pulses()` — the independent time-domain `tau_qp`.** Fits the
+two-pole pulse shape per event with `tau_res` fixed, returning a per-event
+catalogue plus acceptance, the arrival-time histogram, the amplitude spectrum
+and the `tau_qp`-versus-amplitude correlation. Window truncation biases
+survivors towards short lifetimes, so it is reported, not corrected. On a
+synthetic 100 µs population the PSD and pulse estimators agree to 100.0 vs
+100.0 µs.
+
+**Composite-path guards, each closing a silent failure.** `stitch_psds` refuses
+to join raw-unit (`iq` / `magphase`) traces across the accumulator — snapshot
+rows are pre-accumulation and accumulated rows are sums, so their units differ
+by `acc_len²`, a **60 dB step** at `acc_len=1000` that passed every other
+check. In an overlap the *higher* trace now wins, since the top of an
+accumulated band is exactly where the alias fold reads low (up to −1.06 dB at
+the recommended `acc_len=256`) while the snapshot bins are unaffected.
+`alias_affected` now reports the top decade of the **highest** accumulated
+trace, which for a three-way stitch is the band next to the join, not the
+slowest trace's. Overlap ratios compare band means rather than per-bin medians,
+which removes a **−1.04 dB** phantom offset between traces of unequal `n_avg`
+that could trip the 1 dB warning on traces agreeing exactly.
+
+**`batch_snapshots()` now records `info` and `date` at capture time**, and
+copies `info` into each per-tone dict in `results` so a single tone stays
+self-describing. It previously carried neither, so `snapshot_psds(...,
+format='freq_diss')` found no parked tone frequency and fell back to the
+midpoint of the sweep range — **41 dB** out — while leaving the `stitch_psds`
+responsivity guard inert, because the recorded reference was `NaN`.
+`snapshot_psds` rebuilds an equivalent `info` from `tone_frequencies` for
+captures saved before this change.
+
+**`fit_gr_rolloff` statistics corrected.** The error inflation is
+`bin_oversampling`, not a bin count divided by a per-bin dof — the latter gave
+**74×** oversized `tau_qp` errors in the oversampled case and 2× where there
+was no oversampling at all. A `cross_psd` result now fits the **cross**-spectrum
+under `'cross'`; it previously fitted the auto-spectra under `'psd'`, so the
+advertised amplifier/TLS rejection never happened (white floor 11.6× too high).
+Log-space chi-square bias is undone per bin from `n_avg`, which matters most on
+a composite where the two bands differ (+0.76 dB at `n_avg=3` against +0.02 dB
+at 100, read as spectral structure otherwise). New flags `low_end_rising` — the
+model has no 1/f term, and an unrestricted composite fit returns 160 µs for a
+true 100 µs — and `tau_at_bound`.
+
+**`fit_glitch_pulses`: energy and peak height are now separate.** The
+unnormalised two-pole shape has unit integral, so its prefactor *is* the
+deposited energy; peak-normalising made the fitted parameter a height that
+scales as `1/tau_qp` and put a spurious `r = −0.97` into `tau_vs_amplitude` for
+a perfectly monoenergetic, perfectly linear detector. Events now carry both
+`energy` and `amplitude`, and the energy spectrum and correlation use `energy`.
+`detect_window` is separated from `window` (one parameter was setting both the
+fit length and the detector's running median, bypassing its edge guard), and
+`min_separation` defaults to `10·tau_res` — without it a resolved pulse crossed
+the threshold repeatedly and 4 injected pulses catalogued as up to 23 events,
+corrupting the rate that separates a Campbell train from real GR.
+
+**Why deglitching is a prerequisite, not a nicety.** By Campbell's theorem a
+glitch train has the *same* Lorentzian and the *same* corner as GR noise.
+Measured: contaminating a spectrum inflates `S_0` **1.60×** while leaving
+`tau_qp` at 1.00× — and no flag fires. `fit_gr_rolloff` therefore warns when no
+`masked_fraction` is recorded.
+
+**Glitch detection and masking.** `find_glitches` — running median then
+`threshold * MAD`, optional `method='matched'`, `min_separation` merging, and
+per-event `n_coincident` across tones. `masked_psd` — `'segment'` rejection by
+default, `'interpolate'` alternative; report `lost_fraction`, not
+`flagged_fraction`, as the deadtime, and it warns past 5%.
+
+`find_glitches` details that matter for the event rate: the matched filter is
+aligned by cross-correlation so arrivals are not reported `(len-1)/2` samples
+late; `amplitude` is always the high-passed excursion, never the
+template-normalised filter output; `min_separation` defaults to one template
+length under `method='matched'` so a decaying pulse is one event, not four;
+the running-median window is capped at an eighth of the record and uses
+`mode='reflect'`, since edge padding otherwise manufactures high-SNR
+detections on the fast stream; and `n_coincident` counts *tones*, so a wide
+single-tone event no longer reads as a 3-tone coincidence.
+
+**`compute_psd_concatenated` gains `detrend_blocks=`, defaulting to
+`'constant'`** (also `True`/`'linear'`/`False`). Blocks captured at different
+times form a step train that Welch's per-segment detrend does not remove; a 3%
+block-to-block offset lifts the sub-`fs/L` level ~1.8x with an `f^-2` skirt
+above it. **This changes snapshot PSD numbers**: `plot_snapshots_psd` and
+`plot_batch_snapshots` now demean each block. Pass
+`psd_kwargs={'detrend_blocks': False}` for the old behaviour.
+
+**Estimator-bias corrections, both off by default via `n_averages=`.**
+`fit_psd_model` on log10 values reads levels low by
+`(ln n - psi(n)) / ln 10` — 0.25 dex, a factor 1.8, for a single-segment
+periodogram; `alpha` and `f_knee` are unaffected. `psd_band_levels`
+with `statistic='median'` reads 31% low in power on one segment (median of
+`chi2_2/2` is `ln 2`). Pass `n_averages` to divide either out.
+
+**Readout correction moved `plotting/_common.py` → `noise.py`**:
+`_with_samples_readout_correction`, `_with_sweep_readout_correction`, so
+`fitting` and `timeseries` no longer reach up into `plotting` for them.
+
 ## v1.7.4
 
 ### Breaking changes

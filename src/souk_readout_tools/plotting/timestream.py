@@ -12,20 +12,20 @@ import warnings
 import numpy as np
 from collections.abc import Mapping
 
-from ..noise import (fractional_frequency_and_dissipation_timestreams,
-                     remove_blind_tone_common_modes,
-                     remove_common_modes_svd,
-                     remove_iq_common_modes_svd)
 from ._common import (_get_pyplot, _compute_mag_phase, _dual_panels,
+                       ERRORBAR_STYLE,
                        _apply_deembed, _apply_phase_center,
                        _resolve_label, _legend,
                        _normalise_iq, _compute_mag_phase_units, UNITS,
                        _is_calibrated_magnitude_unit,
-                       _canonical_units, _validate_reference_plane,
-                       _with_samples_readout_correction,
-                       _with_sweep_readout_correction)
-from ._psd import (carrier_power, check_psd_units, compute_psd,
-                   log_bin_psd, psd_display_values)
+                       _canonical_units, _validate_reference_plane)
+from ._psd import check_psd_units, psd_display_values
+from ..noise import (_get_sweep_trace, _with_samples_readout_correction,
+                     _with_sweep_readout_correction)
+from ..timeseries import (_compute_freq_diss, _get_tone_data,
+                          _has_precomputed_freq_diss, _precomputed_freq_diss,
+                          _prepare_psd_for_log_plot,
+                          _warn_ignored_conversion_args, timestream_psds)
 
 # PTP clock rate: telescope_time counts per second
 TT_CLOCK_HZ = 30720000
@@ -65,31 +65,6 @@ def _build_x_axis(ts_data, x_axis='time'):
         raise ValueError(
             f"Unknown x_axis '{x_axis}'. "
             "Use 'time', 'sample', 'acc_count', or 'telescope_time'.")
-
-
-def _get_tone_data(ts_data, tones=None):
-    """
-    Extract I/Q arrays for selected tones from parsed timestream data.
-
-    Args:
-        ts_data: dict from parse_samples() with 'i_data', 'q_data'.
-        tones: List of tone indices (int) or None for first tone only.
-
-    Returns:
-        List of (tone_key, i_array, q_array) tuples.
-    """
-    i_data = ts_data['i_data']
-    q_data = ts_data['q_data']
-    tone_keys = sorted(i_data.keys())
-
-    if tones is None:
-        tones = [0]
-    selected = []
-    for t in tones:
-        key = tone_keys[t]
-        selected.append((key, np.array(i_data[key], dtype=float),
-                         np.array(q_data[key], dtype=float)))
-    return selected
 
 
 def _get_modulated_probe_frequencies(ts_data, tone_index, fallback_frequency,
@@ -157,215 +132,6 @@ def _visible_modulation_sample_mask(ts_data, n_samples,
     if len(settling) != len(mask):
         return mask
     return settling == 0
-
-
-def _get_sweep_trace(sweep_data, tone_index):
-    """Extract the sweep frequency and I/Q trace for a timestream tone."""
-    sf = np.atleast_2d(sweep_data['sweep_f'])
-    si = np.atleast_2d(sweep_data['sweep_i'])
-    sq = np.atleast_2d(sweep_data['sweep_q'])
-
-    is_wideband = sweep_data.get('wideband_sweep', False)
-    if is_wideband or sf.shape[0] == 1:
-        return sf[0], si[0].copy(), sq[0].copy()
-
-    _, n_tones = sf.shape
-    if tone_index >= n_tones:
-        raise ValueError(
-            f"Tone {tone_index} not in sweep data ({n_tones} tones)")
-    return sf[:, tone_index], si[:, tone_index].copy(), sq[:, tone_index].copy()
-
-
-def _resolve_reference_tone_frequency(ts_data, tone_idx, sweep_f,
-                                       reference_tone_frequency):
-    """Resolve the timestream tone frequency for freq/diss computation.
-
-    reference_tone_frequency:
-        None: look up ``ts_data['info']['tones']['frequencies_hz'][tone_idx]``.
-            Falls back to ``np.mean(sweep_f)`` with a warning if unavailable.
-        scalar: used directly for every tone.
-        mapping: ``{tone_idx: frequency_hz}`` or ``{'0000': frequency_hz}``.
-        array-like: indexed by absolute tone index.
-    """
-    if reference_tone_frequency is None:
-        info = ts_data.get('info')
-        if isinstance(info, dict):
-            tf = info.get('tones', {}).get('frequencies_hz')
-            if tf is not None:
-                try:
-                    return float(np.asarray(tf)[tone_idx])
-                except (IndexError, ValueError, TypeError):
-                    pass
-        import warnings
-        warnings.warn(
-            f"Tone {tone_idx} has no frequency in ts_data['info']; "
-            "falling back to the midpoint of the sweep range. Pass "
-            "reference_tone_frequency to set this explicitly.",
-            stacklevel=3)
-        return float(np.mean(sweep_f))
-    if isinstance(reference_tone_frequency, Mapping):
-        for key in (tone_idx, f"{tone_idx:04d}"):
-            if key in reference_tone_frequency:
-                return float(reference_tone_frequency[key])
-        raise ValueError(
-            f"reference_tone_frequency mapping missing tone {tone_idx}")
-
-    if np.ndim(reference_tone_frequency):
-        try:
-            return float(np.asarray(reference_tone_frequency, dtype=float)[tone_idx])
-        except IndexError as exc:
-            raise ValueError(
-                "array-like reference_tone_frequency is indexed by absolute "
-                f"tone index; tone {tone_idx} is missing. Use a mapping for "
-                "non-contiguous selected tones."
-            ) from exc
-
-    return float(reference_tone_frequency)
-
-
-def _compute_freq_diss(ts_data, tone_key, i_arr, q_arr, sweep_data,
-                       reference_tone_frequency=None, smooth_window_hz=1000,
-                       conversion_method='linearized', calibrations=None):
-    """
-    Compute fractional frequency and dissipation from timestream + sweep.
-
-    Uses the canonical resonator conversion helpers. ``conversion_method``
-    selects the historical local linear estimate or fitted-model inversion.
-    """
-    from ..resonator import (
-        calibration_for_tone,
-        interpolate_complex_trace,
-        linearized_frequency_and_dissipation,
-    )
-
-    z_ts = i_arr + 1j * q_arr
-    tone_idx = int(tone_key)
-
-    sweep_f, sweep_i, sweep_q = _get_sweep_trace(sweep_data, tone_idx)
-    sweep_z = sweep_i + 1j * sweep_q
-
-    tone_freq = _resolve_reference_tone_frequency(
-        ts_data, tone_idx, sweep_f, reference_tone_frequency)
-
-    if conversion_method == 'linearized':
-        frac_f, frac_d = linearized_frequency_and_dissipation(
-            sweep_f, sweep_z, tone_freq, z_ts,
-            smooth_window_hz=smooth_window_hz)
-    elif conversion_method in ('mobius', 'circle'):
-        calibration = calibration_for_tone(calibrations, tone_idx)
-        if calibration is None:
-            raise ValueError(
-                f"conversion_method={conversion_method!r} requires a "
-                f"calibration for tone {tone_idx}")
-        reference_s21 = interpolate_complex_trace(sweep_f, sweep_z, tone_freq)
-        df_hz, frac_d = calibration.convert_referenced_raw_iq(
-            tone_freq, z_ts, reference_s21, method=conversion_method)
-        frac_f = df_hz / tone_freq
-    else:
-        raise ValueError(
-            "conversion_method must be 'linearized', 'mobius', or 'circle'")
-
-    return frac_f, frac_d
-
-
-def _has_precomputed_freq_diss(ts_data):
-    """Return True when a timestream dict already carries demodulated freq/loss."""
-    return any(key in ts_data for key in (
-        'resonance_shift_hz',
-        'frequency_shift_hz',
-        'frequency_hz',
-    ))
-
-
-def _warn_ignored_conversion_args(conversion_method, calibrations):
-    """
-    Warn when plot-time conversion knobs cannot take effect because the
-    timestream already carries demodulated frequency/dissipation.
-    """
-    ignored = []
-    if conversion_method is not None:
-        ignored.append(f'conversion_method={conversion_method!r}')
-    if calibrations is not None:
-        ignored.append('calibrations')
-    if not ignored:
-        return
-    import warnings
-    warnings.warn(
-        'ts_data already carries demodulated frequency/dissipation, so '
-        + ' and '.join(ignored) + ' cannot affect this plot. The '
-        'conversion was chosen when the timestream was demodulated: pass '
-        'calibration= to demodulate_timestream for the calibrated Mobius '
-        'inversion, or omit it for the linearized estimate.',
-        stacklevel=3)
-
-
-def _sample_tone_column(ts_data, key, tone_idx):
-    """Extract a tone column from sample-major or tone-major arrays."""
-    arr = np.asarray(ts_data[key])
-    if arr.ndim == 1:
-        if tone_idx != 0:
-            raise ValueError(f"{key!r} is 1D and contains only tone 0")
-        return arr
-    if arr.ndim != 2:
-        raise ValueError(f"{key!r} must be 1D or 2D, got {arr.ndim}D")
-
-    n_samples = ts_data.get('num_samples')
-    if n_samples is not None and arr.shape[0] == int(n_samples):
-        return arr[:, tone_idx]
-    if tone_idx < arr.shape[0]:
-        return arr[tone_idx]
-    if tone_idx < arr.shape[1]:
-        return arr[:, tone_idx]
-    raise ValueError(f"Tone {tone_idx} not present in {key!r} shape {arr.shape}")
-
-
-def _precomputed_freq_diss(ts_data, tone_key, reference_tone_frequency=None):
-    """Read demodulated fractional frequency and dissipation from ``ts_data``."""
-    tone_idx = int(tone_key)
-    freq_key = next(
-        key for key in ('resonance_shift_hz', 'frequency_shift_hz', 'frequency_hz')
-        if key in ts_data)
-    freq_hz = _sample_tone_column(ts_data, freq_key, tone_idx)
-
-    info = ts_data.get('info') if isinstance(ts_data, dict) else None
-    tone_freq = None
-    if reference_tone_frequency is None and isinstance(info, dict):
-        freqs = info.get('tones', {}).get('frequencies_hz')
-        if freqs is not None:
-            try:
-                tone_freq = float(np.asarray(freqs, dtype=float)[tone_idx])
-            except (IndexError, TypeError, ValueError):
-                tone_freq = None
-    elif reference_tone_frequency is not None:
-        if isinstance(reference_tone_frequency, Mapping):
-            for key in (tone_idx, tone_key):
-                if key in reference_tone_frequency:
-                    tone_freq = float(reference_tone_frequency[key])
-                    break
-        elif np.ndim(reference_tone_frequency):
-            try:
-                tone_freq = float(np.asarray(reference_tone_frequency, dtype=float)[tone_idx])
-            except IndexError as exc:
-                raise ValueError(
-                    "array-like reference_tone_frequency is indexed by absolute "
-                    f"tone index; tone {tone_idx} is missing. Use a mapping for "
-                    "non-contiguous selected tones."
-                ) from exc
-        else:
-            tone_freq = float(reference_tone_frequency)
-
-    if tone_freq is None or tone_freq == 0.0:
-        raise ValueError(
-            "Precomputed frequency timestreams need tone frequencies in "
-            "ts_data['info']['tones']['frequencies_hz'] or an explicit "
-            "reference_tone_frequency to plot fractional frequency.")
-
-    frac_f = freq_hz / tone_freq
-    if 'dissipation' in ts_data:
-        frac_d = _sample_tone_column(ts_data, 'dissipation', tone_idx)
-    else:
-        frac_d = np.full_like(frac_f, np.nan, dtype=float)
-    return frac_f, frac_d
 
 
 def _dissipation_axis_label(conversion_method, *, psd=False):
@@ -449,25 +215,6 @@ def _transform_title_suffix(deembed, phase_center):
     return f' ({", ".join(parts)})' if parts else ''
 
 
-def _filter_psd_dc_point(f, p, include_dc_point):
-    """Drop the zero-frequency PSD point for log-x plotting by default."""
-    if include_dc_point:
-        return f, p
-
-    f = np.asarray(f)
-    p = np.asarray(p)
-    non_dc = f != 0
-    return f[non_dc], p[non_dc]
-
-
-def _prepare_psd_for_log_plot(f, p, include_dc_point, log_bin, bins_per_decade):
-    """Apply PSD display filters shared by all PSD panels."""
-    f, p = _filter_psd_dc_point(f, p, include_dc_point)
-    if log_bin:
-        f, p = log_bin_psd(f, p, bins_per_decade=bins_per_decade)
-    return f, p
-
-
 def _plot_psd(ax, f, p, psd_units, carrier=1.0, **kwargs):
     """Plot one PSD panel in the requested display units."""
     values = psd_display_values(p, psd_units, carrier)
@@ -498,106 +245,6 @@ def _cleaning_label(trace_label, blind_tone_modes, decorrelate_modes):
     if decorrelate_modes:
         steps.append(f'SVD N={decorrelate_modes}')
     return f'{trace_label} ({", ".join(steps)})'
-
-
-def _compute_cleaned_iq(ts_data, decorrelate_modes, decorrelate_tones,
-                        blind_tone_modes, blind_tones):
-    """Return cleaned (I, Q) rows keyed by tone index, without a sweep.
-
-    Blind-tone subtraction runs first, then SVD common-mode removal, matching
-    the order used for freq/diss. Both steps work on the raw I/Q, so this path
-    needs no resonance sweep -- it is the one to use for loopback data.
-    """
-    analysis_tones = decorrelate_tones
-    cleaned_ts_data = ts_data
-    if blind_tone_modes:
-        cleaned_ts_data, blind_info = remove_blind_tone_common_modes(
-            ts_data,
-            n_modes=blind_tone_modes,
-            regular_tones=analysis_tones,
-            blind_tones=blind_tones,
-            return_info=True,
-        )
-        analysis_tones = blind_info['regular_tones']
-    if decorrelate_modes:
-        cleaned_ts_data, svd_info = remove_iq_common_modes_svd(
-            cleaned_ts_data,
-            n_modes=decorrelate_modes,
-            tones=analysis_tones,
-            return_info=True,
-        )
-        analysis_tones = svd_info['tones']
-
-    tone_keys = sorted(cleaned_ts_data['i_data'])
-    cleaned = {}
-    for tone_index in analysis_tones:
-        tone_key = tone_keys[int(tone_index)]
-        cleaned[int(tone_key)] = (
-            np.asarray(cleaned_ts_data['i_data'][tone_key], dtype=float),
-            np.asarray(cleaned_ts_data['q_data'][tone_key], dtype=float),
-        )
-    return cleaned
-
-
-def _compute_cleaned_freq_diss(
-        ts_data, sweep_data, plotted_tones, decorrelate_modes,
-        decorrelate_tones, blind_tone_modes, blind_tones,
-        reference_tone_frequency, smooth_window_hz, conversion_method,
-        calibrations):
-    """Return reusable raw rows and sequentially cleaned freq/diss rows."""
-    analysis_tones = plotted_tones
-    if decorrelate_modes:
-        info = ts_data.get('info')
-        metadata = info.get('tones', {}) if isinstance(info, dict) else {}
-        regular_tones = metadata.get('regular_indices')
-        analysis_tones = decorrelate_tones
-        if analysis_tones is None:
-            analysis_tones = regular_tones if (
-                regular_tones is not None and len(regular_tones)
-            ) else None
-
-    cleaned_ts_data = ts_data
-    if blind_tone_modes:
-        cleaned_ts_data, blind_info = remove_blind_tone_common_modes(
-            ts_data,
-            n_modes=blind_tone_modes,
-            regular_tones=analysis_tones,
-            blind_tones=blind_tones,
-            return_info=True,
-        )
-        if analysis_tones is None:
-            analysis_tones = blind_info['regular_tones']
-
-    converted = fractional_frequency_and_dissipation_timestreams(
-        cleaned_ts_data,
-        sweep_data,
-        tones=analysis_tones,
-        reference_tone_frequency=reference_tone_frequency,
-        smooth_window_hz=smooth_window_hz,
-        method=conversion_method,
-        calibrations=calibrations,
-    )
-    if decorrelate_modes:
-        frequency = remove_common_modes_svd(
-            converted['frequency'], decorrelate_modes)
-        dissipation = remove_common_modes_svd(
-            converted['dissipation'], decorrelate_modes)
-    else:
-        frequency = converted['frequency']
-        dissipation = converted['dissipation']
-
-    raw = {}
-    if not blind_tone_modes:
-        raw = {
-            int(tone_index): (converted['frequency'][row],
-                              converted['dissipation'][row])
-            for row, tone_index in enumerate(converted['tone_indices'])
-        }
-    cleaned = {
-        int(tone_index): (frequency[row], dissipation[row])
-        for row, tone_index in enumerate(converted['tone_indices'])
-    }
-    return raw, cleaned
 
 
 def plot_timestream(ts_data, format='iq_vs_t', tones=None,
@@ -868,56 +515,6 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
     return fig
 
 
-def _nonsettling_decimation(ts_data, sample_rate):
-    """Non-settling sample indices + the decimated sample rate for a PSD.
-
-    ``demodulate_timestream`` leaves ``modulation_settling`` samples in place (as
-    NaN when ``fill_settling='none'``), so a PSD of that stream is all-NaN.
-    Dropping the flagged samples only yields a well-defined spectrum if the
-    survivors are uniformly spaced -- true when each slot dwell keeps a single
-    run of good samples (e.g. ``dwell - n_settle == 1``). Returns
-    ``(keep_idx, decimated_rate)``; raises if the flag is missing or the
-    survivors are not uniformly spaced.
-    """
-    settling = ts_data.get('modulation_settling')
-    if settling is None:
-        raise ValueError(
-            "exclude_settling=True but ts_data has no 'modulation_settling' flag; "
-            "pass a demodulated/parsed modulation timestream, or exclude_settling=False.")
-    settling = np.asarray(settling, dtype=int)
-    keep_idx = np.flatnonzero(settling == 0)
-    if keep_idx.size < 2:
-        raise ValueError(
-            f"exclude_settling kept {keep_idx.size} non-settling samples; need >= 2.")
-    strides = np.unique(np.diff(keep_idx))
-    if strides.size != 1:
-        raise ValueError(
-            "non-settling samples are not uniformly spaced "
-            f"(sample strides {strides.tolist()}), so their PSD is not well "
-            "defined. Use a dwell / n_settle split that keeps one run of good "
-            "samples per slot (e.g. dwell - n_settle == 1), or fill the settling "
-            "samples (fill_settling='interpolate') instead of dropping them.")
-    return keep_idx, sample_rate / float(strides[0])
-
-
-def _warn_if_psd_nan(arr, tone_key, quantity):
-    """Warn (instead of silently drawing nothing) when a PSD input is non-finite."""
-    finite = np.isfinite(np.asarray(arr))
-    if finite.size == 0 or not np.any(finite):
-        warnings.warn(
-            f"tone {tone_key}: {quantity} timestream is entirely non-finite; "
-            "nothing will be plotted. For a demodulated modulation timestream the "
-            "settling samples are NaN -- pass exclude_settling=True, or demodulate "
-            "with fill_settling='interpolate'.", stacklevel=3)
-    elif not np.all(finite):
-        n_bad = int(np.sum(~finite))
-        warnings.warn(
-            f"tone {tone_key}: {quantity} timestream has {n_bad} non-finite "
-            "sample(s); the Welch PSD will be NaN. Drop or fill them "
-            "(exclude_settling=True, or fill_settling='interpolate').",
-            stacklevel=3)
-
-
 def plot_timestream_psd(ts_data, format='iq', tones=None,
                         sweep_data=None, reference_tone_frequency=None,
                         psd_kwargs=None,
@@ -938,9 +535,16 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                         apply_readout_correction=True,
                         sharex=True,
                         sharey=None,
+                        return_data=False,
                         **kwargs):
     """
     Plot power spectral density of timestream data.
+
+    The compute half of this lives in ``souk_readout_tools.timeseries`` as
+    ``timestream_psds()``: same arguments, same numbers, returned as arrays
+    rather than drawn. Pass ``return_data=True`` here to get both, or see
+    ``doc/timeseries_analysis.md`` for band levels, fits, on-minus-off and the
+    rest of the quantitative tools.
 
     Args:
         ts_data: dict from parse_samples().
@@ -1035,67 +639,38 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
             Pass ``True`` to tie a magnitude/phase or I/Q pair anyway.
             Plotting onto an existing ``fig`` can add sharing but cannot
             remove sharing that figure was created with.
+        return_data: bool, optional. Also return the computed arrays, so the
+            plotted numbers can be used quantitatively. Default ``False``.
         **kwargs: Passed to plot calls.
 
     Returns:
-        matplotlib.figure.Figure
+        matplotlib.figure.Figure, or ``(fig, result)`` when
+        ``return_data=True``. ``result`` is the dict returned by
+        :func:`souk_readout_tools.timeseries.timestream_psds`, which computes
+        everything drawn here.
     """
-    ts_data = _with_samples_readout_correction(ts_data, apply_readout_correction)
-    sweep_data = _with_sweep_readout_correction(sweep_data, apply_readout_correction)
-    selected = _get_tone_data(ts_data, tones)
-    sample_rate = ts_data['sample_rate']
-    psd_kw = psd_kwargs or {}
-
-    keep_idx = None
-    psd_sample_rate = sample_rate
-    if exclude_settling:
-        if decorrelate_modes or blind_tone_modes:
-            raise ValueError(
-                "exclude_settling is not supported together with SVD / blind-tone "
-                "cleaning (those operate on the full-rate stream).")
-        keep_idx, psd_sample_rate = _nonsettling_decimation(ts_data, sample_rate)
-
-    def _psd(arr, tone_key=None, quantity=None):
-        """compute_psd, dropping settling samples first when exclude_settling."""
-        a = np.asarray(arr)
-        if keep_idx is not None:
-            a = a[keep_idx]
-        if quantity is not None:
-            _warn_if_psd_nan(a, tone_key, quantity)
-        return compute_psd(a, psd_sample_rate, **psd_kw)
-
-    precomputed_freq_diss = _has_precomputed_freq_diss(ts_data)
-    if format == 'freq_diss' and sweep_data is None and not precomputed_freq_diss:
-        raise ValueError("sweep_data is required for format='freq_diss'")
-    if not isinstance(decorrelate_modes, (int, np.integer)):
-        raise TypeError("decorrelate_modes must be an integer")
-    if decorrelate_modes < 0:
-        raise ValueError("decorrelate_modes must be non-negative")
-    if not isinstance(blind_tone_modes, (int, np.integer)):
-        raise TypeError("blind_tone_modes must be an integer")
-    if blind_tone_modes < 0:
-        raise ValueError("blind_tone_modes must be non-negative")
+    check_psd_units(psd_units, format)
     if decorrelate_plot not in ('overlay', 'replace'):
         raise ValueError(
             "decorrelate_plot must be either 'overlay' or 'replace'")
-    if format not in ('iq', 'magphase', 'freq_diss'):
-        raise ValueError(
-            f"Unknown format '{format}'. Use 'iq', 'magphase', or 'freq_diss'.")
-    check_psd_units(psd_units, format)
-    if ((decorrelate_modes or blind_tone_modes)
-            and format == 'freq_diss' and sweep_data is None):
-        raise ValueError(
-            "SVD and blind-tone cleaning require sweep_data; precomputed "
-            "modulation demodulation can be plotted only without these "
-            "cleaning modes.")
-    # With cleaning modes active the freq/diss is recomputed from raw I/Q, so
-    # the conversion knobs do apply; otherwise a precomputed (demodulated)
-    # timestream is plotted as-is and they cannot.
-    if (format == 'freq_diss' and precomputed_freq_diss
-            and not (decorrelate_modes or blind_tone_modes)):
-        _warn_ignored_conversion_args(conversion_method, calibrations)
-    if conversion_method is None:
-        conversion_method = 'linearized'
+
+    result = timestream_psds(
+        ts_data, format=format, tones=tones, sweep_data=sweep_data,
+        reference_tone_frequency=reference_tone_frequency,
+        psd_kwargs=psd_kwargs, smooth_window_hz=smooth_window_hz,
+        conversion_method=conversion_method, calibrations=calibrations,
+        include_dc_point=include_dc_point, log_bin=log_bin,
+        bins_per_decade=bins_per_decade,
+        decorrelate_modes=decorrelate_modes,
+        decorrelate_tones=decorrelate_tones,
+        blind_tone_modes=blind_tone_modes, blind_tones=blind_tones,
+        exclude_settling=exclude_settling,
+        apply_readout_correction=apply_readout_correction)
+
+    f = result['f']
+    panel1, panel2 = result['panels']
+    cleaned = result['psd_cleaned']
+    cleaning_on = cleaned is not None
 
     if sharey is None:
         # The freq/diss panels are both fractional, so one scale compares them
@@ -1103,153 +678,59 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
         sharey = (format == 'freq_diss')
     fig, ax1, ax2 = _dual_panels(fig, sharex=sharex, sharey=sharey)
 
-    if format in ('iq', 'magphase'):
+    # The legend names tones by the capture's own dict keys ('0000', ...);
+    # result['tones'] carries the same selection as integers.
+    tone_keys = sorted(ts_data['i_data'])
+    n_tones = len(result['tones'])
 
-        def _iq_panel_psds(key, i_arr, q_arr):
-            """PSDs of the two panels for one tone's I/Q rows."""
-            if format == 'iq':
-                return _psd(i_arr, key, 'I'), _psd(q_arr, key, 'Q')
-            z = np.asarray(i_arr) + 1j * np.asarray(q_arr)
-            zc = z[keep_idx] if keep_idx is not None else z
-            _warn_if_psd_nan(zc, key, 'magnitude/phase')
-            mag = np.abs(zc)
-            phase = np.unwrap(np.angle(zc))
-            return (compute_psd(mag, psd_sample_rate, **psd_kw),
-                    compute_psd(phase, psd_sample_rate, **psd_kw))
+    for row, tone_index in enumerate(result['tones']):
+        key = tone_keys[int(tone_index)]
+        trace_label = _resolve_label(
+            ax1, label, suffix=f'Tone {key}' if n_tones > 1 else None)
+        raw_color = None
+        # One carrier per tone, from the raw rows: cleaning preserves the
+        # amplitude/phase baselines, so both traces share a normalisation.
+        carrier = 1.0
+        if psd_units == 'dbc':
+            carrier = float(result['carrier'][row])
+            if not carrier > 0:
+                raise ValueError(
+                    "psd_units='dbc' needs a carrier, but the mean I/Q is zero")
+        # The phase panel is already carrier-relative (rad^2/Hz).
+        carrier2 = carrier if format == 'iq' else 1.0
 
-        cleaned_iq = {}
-        if decorrelate_modes or blind_tone_modes:
-            cleaned_iq = _compute_cleaned_iq(
-                ts_data, decorrelate_modes, decorrelate_tones,
-                blind_tone_modes, blind_tones)
-
-        for key, i_arr, q_arr in selected:
-            trace_label = _resolve_label(ax1, label,
-                                         suffix=f'Tone {key}' if len(selected) > 1 else None)
-            tone_index = int(key)
-            raw_color = None
-            # One carrier per tone, from the raw rows: cleaning preserves the
-            # amplitude/phase baselines, so both traces share a normalisation.
-            carrier = (carrier_power(i_arr + 1j * q_arr)
-                       if psd_units == 'dbc' else 1.0)
-            # The phase panel is already carrier-relative (rad^2/Hz).
-            carrier2 = carrier if format == 'iq' else 1.0
-
-            if (not (decorrelate_modes or blind_tone_modes)
-                    or decorrelate_plot == 'overlay'):
-                if precomputed_psd and key in precomputed_psd:
-                    f1, p1 = precomputed_psd[key][:2]
-                    f2, p2 = precomputed_psd[key][2:4] if len(precomputed_psd[key]) > 2 else (f1, p1)
-                else:
-                    (f1, p1), (f2, p2) = _iq_panel_psds(key, i_arr, q_arr)
-
+        if not cleaning_on or decorrelate_plot == 'overlay':
+            f1, p1 = f, result['psd'][panel1][row]
+            f2, p2 = f, result['psd'][panel2][row]
+            if (precomputed_psd and format in ('iq', 'magphase')
+                    and key in precomputed_psd):
+                f1, p1 = precomputed_psd[key][:2]
+                f2, p2 = (precomputed_psd[key][2:4]
+                          if len(precomputed_psd[key]) > 2 else (f1, p1))
                 f1, p1 = _prepare_psd_for_log_plot(
                     f1, p1, include_dc_point, log_bin, bins_per_decade)
                 f2, p2 = _prepare_psd_for_log_plot(
                     f2, p2, include_dc_point, log_bin, bins_per_decade)
-                lines = _plot_psd(ax1, f1, p1, psd_units, carrier,
-                                  label=trace_label, **kwargs)
-                raw_color = lines[0].get_color()
-                _plot_psd(ax2, f2, p2, psd_units, carrier2,
-                          label=trace_label, **kwargs)
+            lines = _plot_psd(ax1, f1, p1, psd_units, carrier,
+                              label=trace_label, **kwargs)
+            raw_color = lines[0].get_color()
+            _plot_psd(ax2, f2, p2, psd_units, carrier2,
+                      label=trace_label, **kwargs)
 
-            if decorrelate_modes or blind_tone_modes:
-                if tone_index not in cleaned_iq:
-                    raise ValueError(
-                        f"Tone {tone_index} selected for plotting is not in "
-                        "the cleaned tone set")
-                (f1, p1), (f2, p2) = _iq_panel_psds(key, *cleaned_iq[tone_index])
-                f1, p1 = _prepare_psd_for_log_plot(
-                    f1, p1, include_dc_point, log_bin, bins_per_decade)
-                f2, p2 = _prepare_psd_for_log_plot(
-                    f2, p2, include_dc_point, log_bin, bins_per_decade)
-                clean_kwargs = dict(kwargs)
-                if decorrelate_plot == 'overlay':
-                    clean_kwargs.setdefault('linestyle', '--')
-                    clean_kwargs.setdefault('color', raw_color)
-                clean_label = _cleaning_label(
-                    trace_label, blind_tone_modes, decorrelate_modes)
-                _plot_psd(ax1, f1, p1, psd_units, carrier,
-                          label=clean_label, **clean_kwargs)
-                _plot_psd(ax2, f2, p2, psd_units, carrier2,
-                          label=clean_label, **clean_kwargs)
+        if cleaning_on:
+            clean_kwargs = dict(kwargs)
+            if decorrelate_plot == 'overlay':
+                clean_kwargs.setdefault('linestyle', '--')
+                clean_kwargs.setdefault('color', raw_color)
+            clean_label = _cleaning_label(
+                trace_label, blind_tone_modes, decorrelate_modes)
+            _plot_psd(ax1, f, cleaned[panel1][row], psd_units, carrier,
+                      label=clean_label, **clean_kwargs)
+            _plot_psd(ax2, f, cleaned[panel2][row], psd_units, carrier2,
+                      label=clean_label, **clean_kwargs)
 
-    else:
-        raw_converted = {}
-        cleaned = {}
-        if decorrelate_modes or blind_tone_modes:
-            raw_converted, cleaned = _compute_cleaned_freq_diss(
-                ts_data,
-                sweep_data,
-                [int(key) for key, _, _ in selected],
-                decorrelate_modes,
-                decorrelate_tones,
-                blind_tone_modes,
-                blind_tones,
-                reference_tone_frequency,
-                smooth_window_hz,
-                conversion_method,
-                calibrations,
-            )
-
-        for key, i_arr, q_arr in selected:
-            trace_label = _resolve_label(ax1, label,
-                                         suffix=f'Tone {key}' if len(selected) > 1 else None)
-            tone_index = int(key)
-            raw_color = None
-            if (not (decorrelate_modes or blind_tone_modes)
-                    or decorrelate_plot == 'overlay'):
-                if precomputed_freq_diss and not (decorrelate_modes or blind_tone_modes):
-                    frac_f, frac_d = _precomputed_freq_diss(
-                        ts_data, key,
-                        reference_tone_frequency=reference_tone_frequency)
-                elif ((decorrelate_modes or blind_tone_modes)
-                        and tone_index in raw_converted):
-                    frac_f, frac_d = raw_converted[tone_index]
-                else:
-                    frac_f, frac_d = _compute_freq_diss(
-                        ts_data, key, i_arr, q_arr, sweep_data,
-                        reference_tone_frequency=reference_tone_frequency,
-                        smooth_window_hz=smooth_window_hz,
-                        conversion_method=conversion_method,
-                        calibrations=calibrations)
-                f1, p1 = _psd(frac_f, key, 'frequency')
-                f2, p2 = _psd(frac_d, key, 'dissipation')
-
-                f1, p1 = _prepare_psd_for_log_plot(
-                    f1, p1, include_dc_point, log_bin, bins_per_decade)
-                f2, p2 = _prepare_psd_for_log_plot(
-                    f2, p2, include_dc_point, log_bin, bins_per_decade)
-                lines = _plot_psd(ax1, f1, p1, psd_units,
-                                  label=trace_label, **kwargs)
-                raw_color = lines[0].get_color()
-                _plot_psd(ax2, f2, p2, psd_units,
-                          label=trace_label, **kwargs)
-
-            if decorrelate_modes or blind_tone_modes:
-                if tone_index not in cleaned:
-                    raise ValueError(
-                        f"Tone {tone_index} selected for plotting is not in "
-                        "the cleaned tone set")
-                frac_f, frac_d = cleaned[tone_index]
-                f1, p1 = compute_psd(frac_f, sample_rate, **psd_kw)
-                f2, p2 = compute_psd(frac_d, sample_rate, **psd_kw)
-                f1, p1 = _prepare_psd_for_log_plot(
-                    f1, p1, include_dc_point, log_bin, bins_per_decade)
-                f2, p2 = _prepare_psd_for_log_plot(
-                    f2, p2, include_dc_point, log_bin, bins_per_decade)
-                clean_kwargs = dict(kwargs)
-                if decorrelate_plot == 'overlay':
-                    clean_kwargs.setdefault('linestyle', '--')
-                    clean_kwargs.setdefault('color', raw_color)
-                clean_label = _cleaning_label(
-                    trace_label, blind_tone_modes, decorrelate_modes)
-                _plot_psd(ax1, f1, p1, psd_units,
-                          label=clean_label, **clean_kwargs)
-                _plot_psd(ax2, f2, p2, psd_units,
-                          label=clean_label, **clean_kwargs)
-
-    ylabel1, ylabel2 = _psd_axis_labels(format, psd_units, conversion_method)
+    ylabel1, ylabel2 = _psd_axis_labels(
+        format, psd_units, result['conversion_method'])
     ax1.set_ylabel(ylabel1)
     ax2.set_ylabel(ylabel2)
     ax2.set_xlabel('Frequency (Hz)')
@@ -1257,7 +738,7 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
     _legend(ax2)
     fig.suptitle('Power Spectral Density')
     fig.tight_layout()
-    return fig
+    return (fig, result) if return_data else fig
 
 
 def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
@@ -1477,5 +958,327 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
 
     suffix = _transform_title_suffix(deembed, phase_center)
     fig.suptitle(f'Tone {tone_index} — Resonance Circle' + suffix)
+    fig.tight_layout()
+    return fig
+
+
+def plot_allan_deviation(data, format='freq_diss', tones=None, sweep_data=None,
+                         taus=None, kind='overlapping', show_errors=True,
+                         fig=None, label=None, result=None, **kwargs):
+    """
+    Plot the Allan deviation of a timestream, one panel per quantity.
+
+    A thin consumer of ``timeseries.allan_deviation()``: it takes the same
+    arguments, and the ``tau_min`` of each trace is marked so the useful
+    integration time is readable off the figure.
+
+    Args:
+        data: parsed timestream dict, complex array, or (i, q) pair.
+        format: 'iq' | 'magphase' | 'freq_diss'.
+        tones: tone indices to plot. None selects tone 0.
+        sweep_data: required for format='freq_diss'.
+        taus: averaging times in seconds. None gives octave spacing.
+        kind: 'overlapping' (default) or 'standard'.
+        show_errors: draw the ``adev/sqrt(n_pairs)`` error bars. The long-tau
+            end rests on very few differences, so this is worth leaving on.
+        fig: existing figure to overplot onto.
+        label: legend label. None auto-increments.
+        result: a precomputed ``allan_deviation()`` result to plot instead of
+            recomputing. Its ``format`` and ``kind`` win over the arguments.
+        **kwargs: passed to the plot calls. Also accepts any
+            ``allan_deviation()`` keyword (``sample_rate``, cleaning options,
+            conversion options).
+
+    Returns:
+        matplotlib.figure.Figure
+    """
+    from ..timeseries import allan_deviation
+
+    if result is None:
+        result = allan_deviation(
+            data, format=format, tones=tones, sweep_data=sweep_data,
+            taus=taus, kind=kind,
+            **{k: kwargs.pop(k) for k in list(kwargs)
+               if k in ('sample_rate', 'reference_tone_frequency',
+                        'smooth_window_hz', 'conversion_method',
+                        'calibrations', 'decorrelate_modes',
+                        'decorrelate_tones', 'blind_tone_modes',
+                        'blind_tones')})
+    panels = result['panels']
+    fig, ax1, ax2 = _dual_panels(fig, sharex=True, sharey=False)
+    tau = result['tau']
+
+    for ax, panel in zip((ax1, ax2), panels):
+        for row, tone in enumerate(result['tones']):
+            trace_label = _resolve_label(ax1, label, suffix=f'tone {tone}')
+            y = result['adev'][panel][row]
+            if show_errors:
+                ax.errorbar(tau, y, yerr=result['adev_err'][panel][row],
+                            label=trace_label,
+                            **{**ERRORBAR_STYLE, **kwargs})
+            else:
+                ax.plot(tau, y, '.-', label=trace_label, **kwargs)
+            t_min = result['tau_min'][panel][row]
+            if np.isfinite(t_min):
+                ax.axvline(t_min, linestyle=':', linewidth=0.8, alpha=0.5,
+                           color=ax.lines[-1].get_color() if ax.lines else None)
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.set_ylabel(f'{panel} Allan deviation')
+        _legend(ax)
+
+    ax2.set_xlabel('Averaging time (s)')
+    slopes = ', '.join(
+        f'{p} {np.nanmedian(result["slope"][p]):+.2f}' for p in panels)
+    fig.suptitle(f'Allan deviation ({result["kind"]}) — log-log slope {slopes}')
+    fig.tight_layout()
+    return fig
+
+
+def plot_timestream_histogram(data, format='freq_diss', tones=None,
+                              sweep_data=None, bins=100, show_gaussian=True,
+                              fig=None, label=None, **kwargs):
+    """
+    Histogram a timestream against the Gaussian its robust sigma implies.
+
+    The visual companion to ``timeseries.timestream_stats()``: where the
+    histogram departs from the overlaid Gaussian is where ``std`` and
+    ``mad_std`` disagree, which is what a PSD averages away.
+
+    Args:
+        data: parsed timestream dict, complex array, or (i, q) pair.
+        format: 'iq' | 'magphase' | 'freq_diss'.
+        tones: tone indices. None selects tone 0.
+        sweep_data: required for format='freq_diss'.
+        bins: histogram bins.
+        show_gaussian: overlay a Gaussian of the same median and MAD-based
+            sigma. Departures from it are the point of the plot.
+        fig: existing figure to overplot onto.
+        label: legend label. None auto-increments.
+        **kwargs: passed to the plot calls; also accepts
+            ``timestream_stats()`` keywords.
+
+    Returns:
+        matplotlib.figure.Figure
+    """
+    from ..timeseries import _panel_time_rows, timestream_stats
+
+    passthrough = {k: kwargs.pop(k) for k in list(kwargs)
+                   if k in ('sample_rate', 'reference_tone_frequency',
+                            'smooth_window_hz', 'conversion_method',
+                            'calibrations', 'decorrelate_modes',
+                            'decorrelate_tones', 'blind_tone_modes',
+                            'blind_tones')}
+    rows, panels, tone_idx, _ = _panel_time_rows(
+        data, format, tones, sweep_data,
+        passthrough.get('sample_rate'),
+        passthrough.get('reference_tone_frequency'),
+        passthrough.get('smooth_window_hz', 1000),
+        passthrough.get('conversion_method'),
+        passthrough.get('calibrations'),
+        passthrough.get('decorrelate_modes', 0),
+        passthrough.get('decorrelate_tones'),
+        passthrough.get('blind_tone_modes', 0),
+        passthrough.get('blind_tones'))
+    stats = timestream_stats(data, format=format, tones=tones,
+                             sweep_data=sweep_data, **passthrough)
+
+    fig, ax1, ax2 = _dual_panels(fig, sharex=False, sharey=False)
+    for ax, panel in zip((ax1, ax2), panels):
+        for row, tone in enumerate(tone_idx):
+            x = rows[panel][row]
+            x = x[np.isfinite(x)]
+            trace_label = _resolve_label(ax1, label, suffix=f'tone {tone}')
+            ax.hist(x, bins=bins, histtype='step', density=True,
+                    label=trace_label, **kwargs)
+            if show_gaussian:
+                med = stats['median'][panel][row]
+                sig = stats['mad_std'][panel][row]
+                if np.isfinite(sig) and sig > 0:
+                    grid = np.linspace(x.min(), x.max(), 300)
+                    ax.plot(grid,
+                            np.exp(-0.5 * ((grid - med) / sig) ** 2)
+                            / (sig * np.sqrt(2 * np.pi)),
+                            linestyle='--', linewidth=0.8, alpha=0.7)
+        ax.set_yscale('log')
+        ratio = np.nanmedian(stats['std'][panel] / stats['mad_std'][panel])
+        ax.set_ylabel(f'{panel} density')
+        ax.set_title(f'std / mad_std = {ratio:.2f}', fontsize='small')
+        _legend(ax)
+
+    ax2.set_xlabel('Value')
+    fig.suptitle('Timestream distribution vs the Gaussian its MAD implies')
+    fig.tight_layout()
+    return fig
+
+
+def plot_coherence(data, other=None, sample_rate=None, tones=None,
+                   sweep_data=None, fig=None, label=None, result=None,
+                   show_bias=True, **kwargs):
+    """
+    Plot frequency/dissipation coherence against its own significance floor.
+
+    A thin consumer of ``timeseries.cross_psd()``. The point of the figure is
+    the floor: magnitude-squared coherence is biased up by ``1/n_eff`` even for
+    completely independent channels, so a trace is only meaningful where it
+    rises above the shaded band.
+
+    Args:
+        data: a ``cross_psd()`` result, a parsed timestream dict (with
+            ``sweep_data``), or the first row as an array.
+        other: second row, when ``data`` is an array.
+        sample_rate: required for plain arrays.
+        tones: tone indices.
+        sweep_data: required to convert a raw capture.
+        fig: existing figure to overplot onto.
+        label: legend label. None auto-increments.
+        result: a precomputed ``cross_psd()`` result to plot.
+        show_bias: shade the bias floor and draw the 95% significance line.
+        **kwargs: passed to the plot calls, and to ``cross_psd()``.
+
+    Returns:
+        matplotlib.figure.Figure
+    """
+    from ..timeseries import cross_psd
+
+    if result is None:
+        result = data if (isinstance(data, Mapping) and 'coherence' in data) \
+            else cross_psd(data, other, sample_rate=sample_rate, tones=tones,
+                           sweep_data=sweep_data,
+                           **{k: kwargs.pop(k) for k in list(kwargs)
+                              if k in ('psd_kwargs', 'panels',
+                                       'reference_tone_frequency',
+                                       'smooth_window_hz', 'conversion_method',
+                                       'calibrations',
+                                       'apply_readout_correction')})
+    fig, ax1, ax2 = _dual_panels(fig, sharex=True, sharey=False)
+    f = result['f']
+
+    for row, tone in enumerate(result['tones']):
+        trace_label = _resolve_label(ax1, label, suffix=f'tone {tone}')
+        ax1.plot(f, np.atleast_2d(result['coherence'])[row],
+                 linewidth=0.7, label=trace_label, **kwargs)
+        ax2.plot(f, np.degrees(np.atleast_2d(result['cross_phase'])[row]),
+                 linewidth=0.7, label=trace_label, **kwargs)
+
+    if show_bias:
+        bias = result.get('coherence_bias')
+        c95 = result.get('coherence_95')
+        if bias is not None:
+            ax1.axhspan(0, float(bias), color='grey', alpha=0.2,
+                        label=f'bias floor 1/n_eff = {float(bias):.3f}')
+        if c95 is not None:
+            ax1.axhline(float(c95), linestyle='--', linewidth=0.8,
+                        color='k', alpha=0.6,
+                        label=f'95% significance = {float(c95):.3f}')
+
+    ax1.set_xscale('log')
+    ax1.set_ylim(0, 1)
+    ax1.set_ylabel('Magnitude-squared coherence')
+    ax2.set_xscale('log')
+    ax2.set_ylabel('Cross phase (deg)')
+    ax2.set_xlabel('Frequency (Hz)')
+    _legend(ax1)
+    _legend(ax2)
+    n_eff = result.get('n_eff')
+    fig.suptitle(
+        'Frequency/dissipation coherence'
+        + (f' — n_eff = {float(n_eff):.1f}' if n_eff is not None else ''))
+    fig.tight_layout()
+    return fig
+
+
+def plot_composite_psd(traces, panel=None, tone=None, fig=None, label=None,
+                       gr_fit=None, show_gap=True, show_alias=True, **kwargs):
+    """
+    Plot a stitched wideband PSD with its gap and alias-affected band marked.
+
+    A thin consumer of ``timeseries.stitch_psds()``. The shading is the
+    substance: the accumulated and snapshot bands do not overlap at the usual
+    ``acc_len``, and nothing is interpolated across the gap.
+
+    Args:
+        traces: a ``stitch_psds()`` result, or a sequence of
+            ``timestream_psds()`` / ``snapshot_psds()`` results to stitch here.
+        panel: panel name to plot. None takes the first.
+        tone: absolute tone index. None plots every tone in the result.
+        fig: existing figure to overplot onto.
+        label: legend label. None auto-increments.
+        gr_fit: a ``fit_gr_rolloff()`` result to overlay, with ``tau_qp`` and
+            the fixed ``tau_res`` in the legend.
+        show_gap: shade the uncovered bands.
+        show_alias: shade the top of the accumulated band, where a falling
+            spectrum reads low to the accumulator's alias fold.
+        **kwargs: passed to the plot calls, and to ``stitch_psds()``.
+
+    Returns:
+        matplotlib.figure.Figure
+    """
+    from ..timeseries import _gr_model, stitch_psds
+
+    if isinstance(traces, Mapping) and 'gaps' in traces:
+        result = traces
+    else:
+        result = stitch_psds(
+            traces, **{k: kwargs.pop(k) for k in list(kwargs)
+                       if k in ('overlap', 'allow_cleaning_mismatch',
+                                'panels')})
+    panel = panel or result['panels'][0]
+    plt = _get_pyplot()
+    if fig is None:
+        fig, ax = plt.subplots(figsize=(9, 5))
+    else:
+        ax = fig.axes[0]
+
+    f = result['f']
+    rows = np.atleast_2d(result['psd'][panel])
+    tone_list = list(result['tones'])
+    for row, t in enumerate(tone_list):
+        if tone is not None and t != tone:
+            continue
+        trace_label = _resolve_label(ax, label, suffix=f'tone {t}')
+        ax.loglog(f, rows[row], linewidth=0.7, label=trace_label, **kwargs)
+
+    if show_gap:
+        for n, (lo, hi) in enumerate(result['gaps']):
+            ax.axvspan(lo, hi, color='grey', alpha=0.25,
+                       label='no coverage' if n == 0 else None)
+    if show_alias and result.get('alias_affected'):
+        lo, hi = result['alias_affected']
+        ax.axvspan(lo, hi, color='orange', alpha=0.15,
+                   label='alias-affected (falling spectra read low)')
+
+    if gr_fit is not None:
+        gp = panel if panel in gr_fit['tau_qp'] else list(gr_fit['tau_qp'])[0]
+        for row, t in enumerate(tone_list):
+            if tone is not None and t != tone:
+                continue
+            tq = gr_fit['tau_qp'][gp][row]
+            if not np.isfinite(tq):
+                continue
+            grid = np.logspace(np.log10(np.nanmin(f[f > 0])),
+                               np.log10(np.nanmax(f)), 400)
+            # tau_res may be one value per tone; take this tone's.
+            tr = np.atleast_1d(np.asarray(gr_fit['tau_res'], dtype=float))
+            tr = float(tr[row if tr.size > 1 else 0])
+            ax.loglog(grid,
+                      _gr_model(grid, gr_fit['S_0'][gp][row], tq,
+                                gr_fit['white'][gp][row], tr),
+                      linestyle='--', linewidth=1.0,
+                      label=f'GR fit: tau_qp {tq * 1e6:.0f} us, '
+                            f'tau_res {tr * 1e6:.0f} us (fixed)')
+
+    for record in result.get('overlaps', []):
+        ratio = record['ratio'].get(panel)
+        if ratio is not None and np.isfinite(ratio):
+            lo, hi = record['band']
+            ax.annotate(f'{10 * np.log10(ratio):+.1f} dB',
+                        xy=(np.sqrt(lo * hi), ax.get_ylim()[1]),
+                        ha='center', va='top', fontsize='small', alpha=0.7)
+
+    ax.set_xlabel('Frequency (Hz)')
+    ax.set_ylabel(f'{panel} PSD (1/Hz)')
+    _legend(ax)
+    fig.suptitle('Composite wideband PSD')
     fig.tight_layout()
     return fig

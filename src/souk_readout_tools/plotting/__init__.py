@@ -11,7 +11,9 @@ Sweep plots:
     plot_sweep_magphase_iq, plot_sweep_iq_vs_f, plot_fits, plot_fit_params
 
 Timestream plots:
-    plot_timestream, plot_timestream_psd, plot_timestream_on_resonance
+    plot_timestream, plot_timestream_psd, plot_timestream_on_resonance,
+    plot_allan_deviation, plot_timestream_histogram, plot_coherence,
+    plot_composite_psd
 
 Snapshot plots:
     plot_snapshots, plot_snapshots_psd, plot_batch_snapshots
@@ -33,6 +35,10 @@ from .timestream import (
     plot_timestream,
     plot_timestream_psd,
     plot_timestream_on_resonance,
+    plot_allan_deviation,
+    plot_timestream_histogram,
+    plot_coherence,
+    plot_composite_psd,
     TT_CLOCK_HZ,
 )
 from .snapshot import (
@@ -40,7 +46,7 @@ from .snapshot import (
     plot_snapshots_psd,
     plot_batch_snapshots,
 )
-from ._psd import (
+from ..timeseries import (
     compute_psd,
     compute_psd_averaged,
     compute_psd_concatenated,
