@@ -3027,7 +3027,7 @@ def write_control_buffer_data(r,buf,v,slot=0):
                                     context=f'buf={buf} slot={slot} {lo} lo{i}')
     return
 
-def write_control_buffer_data_fast(r_fast,buf,v,indices,slot=0):
+def write_control_buffer_data_fast(r_fast,buf,v,indices,slot=0,sparse_write=None):
     """
     Write a formatted control buffer to the firmware via the devmem fast path.
 
@@ -3066,10 +3066,24 @@ def write_control_buffer_data_fast(r_fast,buf,v,indices,slot=0):
             r_fast.mixer.host.transport.axil_mm[int(start):int(start+length)] = v[lo].astype('<u4').tobytes()
     else:
         # Convert byte addresses to word offsets (divide by 4)
-        start_tx = (addrs[('tx', buf)] + buf_size * slot) // 4
-        start_rx = (addrs[('rx', buf)] + buf_size * slot) // 4
-        r_fast.mixer.tx_lo_control_buffer[start_tx+indices['tx']] = v['tx'].astype('<u4')
-        r_fast.mixer.rx_lo_control_buffer[start_rx+indices['rx']] = v['rx'].astype('<u4')
+        starts = {'tx': (addrs[('tx', buf)] + buf_size * slot) // 4,
+                  'rx': (addrs[('rx', buf)] + buf_size * slot) // 4}
+        views = {'tx': r_fast.mixer.tx_lo_control_buffer,
+                 'rx': r_fast.mixer.rx_lo_control_buffer}
+        mm = r_fast.mixer.host.transport.axil_mm
+        for lo in ('tx', 'rx'):
+            idx = np.asarray(indices[lo])
+            vals = v[lo].astype('<u4')
+            span = plan_control_buffer_write(idx, sparse_write)
+            if span is None:
+                views[lo][starts[lo] + idx] = vals       # one MMIO store per word
+            else:
+                # Same words, but scattered in RAM and pushed as one slice.
+                first, n_words = span
+                staged = np.empty(n_words, dtype='<u4')
+                staged[idx - first] = vals
+                a = (starts[lo] + first) * 4
+                mm[a:a + n_words * 4] = staged.tobytes()
 
     return
 
@@ -9908,6 +9922,12 @@ def get_fast_read_params(r_fast):
     # buffer IDs in a single 'buffer_id' register (slot in low byte, ping-pong
     # buffer in byte 2). Cache its address for firmware-slot modulation reads.
     buffer_id_addr = acc.host.transport._get_device_address(f'{acc.prefix}buffer_id')
+    # acc.get_acc_cnt() is read_uint('acc_cnt') through the full casperfpga block
+    # path, measured at 27.5 us on hardware against 2.0 us for a bare devmem
+    # slice. It is read twice per sample (the wait, then the straddle check) and
+    # polled while waiting, so caching its address is worth more than any other
+    # single change to this path.
+    acc_cnt_addr = acc.host.transport._get_device_address(f'{acc.prefix}acc_cnt')
     params = {'acc':acc,
               'addrs':addrs,
               'nbytes':nbytes,
@@ -9915,7 +9935,8 @@ def get_fast_read_params(r_fast):
               'base_addr':addrs[0],
               'tt_msb_addr':tt_msb_addr,
               'tt_lsb_addr':tt_lsb_addr,
-              'buffer_id_addr':buffer_id_addr}
+              'buffer_id_addr':buffer_id_addr,
+              'acc_cnt_addr':acc_cnt_addr}
 
     return params
 
@@ -9934,6 +9955,44 @@ def read_tt_fast(fast_read_params):
     (msb,) = struct.unpack('<I', mm[tt_msb_addr:tt_msb_addr+4])
     (lsb,) = struct.unpack('<I', mm[tt_lsb_addr:tt_lsb_addr+4])
     return (msb << 32) + lsb
+
+
+def read_acc_cnt_fast(fast_read_params):
+    """Read the accumulation counter over devmem instead of katcp.
+
+    Equivalent to ``acc.get_acc_cnt()`` but ~14x cheaper (2.0 us vs 27.5 us
+    measured on hardware), because it skips the casperfpga block layer and does
+    a single 4-byte mmap read of the cached address.
+
+    :param fast_read_params: Parameters from get_fast_read_params()
+    :return: Free-running accumulation count, wraps at 2**32
+    """
+    mm = fast_read_params['acc'].host.transport.axil_mm
+    a = fast_read_params['acc_cnt_addr']
+    (cnt,) = struct.unpack('<I', mm[a:a+4])
+    return cnt
+
+
+def _blocking_wait_for_acc_fast(fast_read_params, poll_period_s=0.00001, timeout=1):
+    """``_blocking_wait_for_acc`` using the devmem counter.
+
+    The 10 us poll period only means anything once the counter itself is cheap:
+    with the katcp read each iteration cost 27.5 us, so the loop could not
+    resolve better than that however small the period was set.
+    """
+    t0 = 0
+    cnt0 = read_acc_cnt_fast(fast_read_params)
+    cnt1 = read_acc_cnt_fast(fast_read_params)
+    if cnt1 < cnt0:
+        cnt1 += 2**32
+    while cnt1 < ((cnt0 + 1) % (2**32)):
+        _blocking_sleep(poll_period_s)
+        t0 += poll_period_s
+        if t0 > timeout:
+            raise TimeoutError(f'Timeout waiting for accumulation '
+                               f'(firmware_lib._blocking_wait_for_acc_fast: {timeout}s)')
+        cnt1 = read_acc_cnt_fast(fast_read_params)
+    return cnt1
 
 
 def read_buf_id_fast(fast_read_params):
@@ -10245,8 +10304,220 @@ def get_dac_snapshot_fast(r_fast, with_tt=False):
     return dac0, dac1
 
 
+# Measured cost model for one devmem access, from profiling/access_size_scaling.py
+# on the v7.12.1 board (2026-09-14):  t[us] = _DEVMEM_FIXED_US + n_words * W/1000.
+# The fixed cost dominates -- an 8-byte read costs 8.16 us, a 128-byte read 8.22 --
+# so the only thing that makes a partial read worthwhile is reading FEWER SEPARATE
+# RANGES, not fewer bytes. A full 2048-channel read is ~100 us.
+#
+# ZDMA (phase 2) will have a much smaller fixed cost (~2-3 us for repeat same-size
+# transfers), which moves both thresholds a long way. Re-run the profiler and
+# update these two numbers; the planner arithmetic does not change.
+# Refit 2026-09-14 against a bare mmap slice on hardware: 2.0 us for 64 B and
+# 93.4 us for 16384 B. An earlier fit gave F = 8.31 because it timed
+# np.frombuffer too, which costs ~6 us by itself and is paid once per call
+# regardless of how many ranges are read -- so it must NOT be in the per-range
+# term or multi-range plans look worse than they are.
+_DEVMEM_FIXED_US = 1.64
+_DEVMEM_NS_PER_WORD = 22.4
+# Require a partial read to be meaningfully cheaper, not merely cheaper: the
+# measured crossover is ~14 scattered tones and the model is conservative, so
+# 0.9 cuts over at ~11 while keeping dense combs on the bulk path.
+_SPARSE_READ_MARGIN = 0.9
+# Partial reads MUST be snapped to this many channels (8 chans = 64 bytes).
+# `mm[a:b]` is a memcpy, and glibc's aarch64 memcpy finishes an odd-length copy
+# with overlapping unaligned 16-byte vector loads. That is fine on cached memory
+# and raises SIGBUS on the uncached Device mapping /dev/mem hands out -- reading
+# 341 channels (2728 B) bus-errors on hardware while 64 channels (512 B) does
+# not. Snapping start and end keeps every access 64-byte aligned with a
+# 64-byte-multiple length. Costs at most 7 extra channels per range (~1.3 us
+# against a fixed cost of 8.31 us), so it is far cheaper than it looks.
+_READ_ALIGN_CHANS = 8
+
+# Control-buffer write costs, same rig, same run. A contiguous slice write
+# streams at ~4.7 ns/word; a scattered fancy-index store into the same uncached
+# mapping costs ~18.3 ns/word, so staging in RAM and issuing ONE slice write
+# beats scattering above ~16 tones (3.4x at 1000 tones).
+# MEASURED ON HARDWARE 2026-09-14: staging loses at every size. Scatter vs
+# staged, tx+rx, us:  4 tones 50/136, 64 66/175, 1000 244/378, 2048 430/579.
+# A raw bulk slice write really is ~4x faster per word than scattered stores,
+# but the staged path has to BUILD the payload first (index offsetting, a RAM
+# scatter, then tobytes()), and that construction costs more than the streaming
+# saves. So `sparse_write=None` always scatters; `sparse_write=True` is kept
+# only so the staged path can be re-tested if the construction is ever made
+# cheap (e.g. by caching the staging buffer across calls, since the tone map is
+# stable between retunes).
+
+
+def plan_control_buffer_write(indices, sparse_write=None):
+    """Decide between one staged slice write and a scattered store.
+
+    The control words for a tone set are written by fancy-indexing a numpy view
+    of the uncached mapping, which issues one MMIO store per word. When the
+    written words happen to cover a *contiguous* span -- which they do whenever
+    the LO indices are contiguous, i.e. whenever no two tones share a TX PSB bin
+    (`compute_vacc_tone_indices` returns ``arange`` in that case) -- the same
+    result can be had by scattering into a RAM buffer and issuing a single slice
+    write, which streams ~4x faster per word.
+
+    A non-contiguous span is refused rather than bridged: the gap words belong to
+    other tones whose current values we do not have, and writing them would
+    clobber. Read-modify-write is not an option either -- the read alone costs
+    more than the scatter it would save.
+
+    Parameters
+    ----------
+    indices : ndarray of int
+        Word offsets being written, relative to the buffer start.
+    sparse_write : bool or None, optional
+        ``False`` forces the scattered store, ``True`` forces the staged write
+        where it is legal, ``None`` picks whichever the cost model prefers.
+
+    Returns
+    -------
+    tuple or None
+        ``(first_word, n_words)`` to stage and write in one slice, or ``None``
+        to keep the scattered store.
+    """
+    if sparse_write is False or indices is None:
+        return None
+    idx = np.asarray(indices)
+    if idx.size == 0:
+        return None
+    first, last = int(idx.min()), int(idx.max())
+    span = last - first + 1
+    if span != idx.size:
+        return None                      # gaps we are not allowed to overwrite
+    if sparse_write is True:
+        return first, span
+    return None          # measured slower at every size -- see the note above
+
+
+
+def plan_accumulator_reads(tone_indices, n_chans, fixed_us=_DEVMEM_FIXED_US,
+                           ns_per_word=_DEVMEM_NS_PER_WORD, force=False,
+                           margin=_SPARSE_READ_MARGIN):
+    """Group requested tone channels into contiguous accumulator read ranges.
+
+    Reading the whole accumulator costs one access; reading only the channels you
+    want costs one access per contiguous run. Bridging a gap between two runs
+    costs ``2 * gap * ns_per_word`` (two int32 words per complex channel), while
+    opening another read costs ``fixed_us``, so runs are merged whenever the gap
+    is cheaper to read than to skip -- about 184 channels at the measured values.
+
+    Returns ``None`` when reading the whole buffer is cheaper (which is the case
+    for a dense, band-spanning comb), so the caller keeps its existing bulk path.
+
+    Parameters
+    ----------
+    tone_indices : array_like of int or None
+        Output channel indices wanted. ``None`` means "everything".
+    n_chans : int
+        Total complex channels in the accumulator.
+    fixed_us, ns_per_word : float, optional
+        Transport cost model; defaults are the measured devmem values.
+    force : bool, optional
+        Skip the "is the full read cheaper?" test and always return ranges.
+    margin : float, optional
+        Only use a plan predicted to cost less than ``margin`` x the full read.
+        A dense comb coalesces to one range covering nearly the whole buffer,
+        which "wins" by a rounding error while still paying for an extra copy;
+        the margin keeps those on the unchanged bulk path.
+
+    Returns
+    -------
+    dict or None
+        ``{'ranges': [(start_chan, n_chans), ...], 'take': ndarray,
+        'plan_us': float, 'full_us': float}``. ``take`` indexes the concatenated
+        ranges to give the interleaved re/im values in ``tone_indices`` order.
+
+    Examples
+    --------
+    >>> plan = plan_accumulator_reads([5, 7, 9], 2048)
+    >>> plan['ranges']
+    [(5, 5)]
+    >>> plan_accumulator_reads(np.arange(2048), 2048) is None
+    True
+    """
+    if tone_indices is None:
+        return None
+    ti = np.asarray(tone_indices, dtype=int)
+    if ti.size == 0:
+        return None
+    idx = np.unique(ti)
+    max_gap = max(1, int((fixed_us * 1000.0) / (2.0 * ns_per_word)))
+
+    raw_ranges = []
+    start = prev = int(idx[0])
+    for c in idx[1:]:
+        c = int(c)
+        if c - prev > max_gap:
+            raw_ranges.append((start, prev - start + 1))
+            start = c
+        prev = c
+    raw_ranges.append((start, prev - start + 1))
+
+    # Snap out to aligned boundaries (see _READ_ALIGN_CHANS), then re-merge any
+    # ranges the snapping pushed into each other.
+    a = _READ_ALIGN_CHANS
+    ranges = []
+    for s, n in raw_ranges:
+        s2 = (s // a) * a
+        e2 = min(-(-(s + n) // a) * a, n_chans)
+        if ranges and s2 <= ranges[-1][0] + ranges[-1][1]:
+            ps, pn = ranges[-1]
+            ranges[-1] = (ps, max(ps + pn, e2) - ps)
+        else:
+            ranges.append((s2, e2 - s2))
+
+    def _cost(n_reads, n_chan_total):
+        return n_reads * fixed_us + n_chan_total * 2 * ns_per_word / 1000.0
+
+    plan_us = _cost(len(ranges), sum(n for _, n in ranges))
+    full_us = _cost(1, n_chans)
+    if not force and plan_us >= margin * full_us:
+        return None
+
+    # Word offset of every requested tone inside the concatenated ranges.
+    offsets, off = [], 0
+    for _, n in ranges:
+        offsets.append(off)
+        off += 2 * n
+    bounds = np.array([s for s, _ in ranges])
+    which = np.searchsorted(bounds, ti, side='right') - 1
+    base = np.asarray(offsets)[which] + 2 * (ti - bounds[which])
+    take = np.empty(2 * ti.size, dtype=int)
+    take[0::2] = base
+    take[1::2] = base + 1
+    return {'ranges': ranges, 'take': take, 'plan_us': plan_us, 'full_us': full_us}
+
+
+def _cached_read_plan(fast_read_params, tone_indices, sparse_read):
+    """Plan once per tone set, not once per sample.
+
+    The channel map is stable while the resonances are, so the plan is cached on
+    ``fast_read_params`` and only recomputed when a different ``tone_indices`` is
+    passed -- an identity check first (the streaming loop reuses one array), then
+    a content compare.
+    """
+    if sparse_read is False or tone_indices is None:
+        return None
+    if fast_read_params['nbranch'] != 1:
+        return None      # branch-interleaved layout; not handled, read it all
+    cached = fast_read_params.get('_read_plan')
+    if cached is not None:
+        prev_idx, prev_sparse, plan = cached
+        if prev_sparse == sparse_read and (prev_idx is tone_indices
+                                           or np.array_equal(prev_idx, tone_indices)):
+            return plan
+    plan = plan_accumulator_reads(tone_indices, fast_read_params['acc'].n_chans,
+                                  force=bool(sparse_read))
+    fast_read_params['_read_plan'] = (tone_indices, sparse_read, plan)
+    return plan
+
+
 def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=None,
-                               get_buf_id=False):
+                               get_buf_id=False, sparse_read=None):
     """
     Read one sample of accumulated data from the RFSOC
     utilising the faster katcp local memory transport.
@@ -10273,9 +10544,20 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
     err = False
 
     # acc._wait_for_acc(0.00001)
-    start_acc_cnt = _blocking_wait_for_acc(acc,0.00001)
+    start_acc_cnt = _blocking_wait_for_acc_fast(fast_read_params, 0.00001)
 
-    if nbranch==1:
+    # Partial read: one access per contiguous run of wanted channels. Worth it
+    # only for a handful of tones -- the plan returns None (and we fall through
+    # to the bulk read) whenever reading everything is cheaper.
+    plan = _cached_read_plan(fast_read_params, tone_indices, sparse_read)
+    if plan is not None:
+        mm = acc.host.transport.axil_mm
+        bpc = nbytes // acc._n_serial_chans          # bytes per complex channel
+        chunks = [mm[base_addr + s*bpc: base_addr + (s + n)*bpc]
+                  for s, n in plan['ranges']]
+        dout = np.frombuffer(chunks[0] if len(chunks) == 1 else b''.join(chunks),
+                             dtype='<i4')
+    elif nbranch==1:
         raw = acc.host.transport.axil_mm[base_addr:base_addr + nbytes]
         dout = np.frombuffer(raw, dtype='<i4')
     else:
@@ -10287,12 +10569,16 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
     # Read the slot/ping-pong tag inside the same acc_cnt window as the data so
     # the tag belongs to the sample we just read.
     buf_slot = read_buf_id_fast(fast_read_params) if get_buf_id else None
-    stop_acc_cnt = acc.get_acc_cnt()
+    stop_acc_cnt = read_acc_cnt_fast(fast_read_params)
     if start_acc_cnt != stop_acc_cnt:
         acc.logger.warning('Accumulation counter changed while reading data!')
         err=True
 
-    if tone_indices is not None:
+    if tone_indices is not None and plan is not None:
+        # dout holds only the planned ranges; 'take' maps tones into it, already
+        # interleaved [real0, imag0, ...] in the caller's tone order.
+        out = (start_acc_cnt, dout[plan['take']], err, tt)
+    elif tone_indices is not None:
         # Extract real and imaginary parts at specific output channel indices
         # Data is interleaved as [real0, imag0, real1, imag1, ...]
         tone_indices = np.asarray(tone_indices)

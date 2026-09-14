@@ -1,5 +1,38 @@
 # Changelog & Feature List
 
+## Unreleased
+
+**The accumulation counter is read over devmem, not katcp.** `acc.get_acc_cnt()`
+is `read_uint('acc_cnt')` through the full casperfpga block path -- 27.1 us
+against 3.7 us for a cached mmap read, and it runs twice per sample. New
+`read_acc_cnt_fast` / `_blocking_wait_for_acc_fast` save **46.8 us on every
+accumulation, at every tone count**, and make the 10 us poll period in
+`_blocking_wait_for_acc` meaningful for the first time (each iteration
+previously cost 27 us, so the period was inoperative).
+
+**Partial accumulator reads for small tone sets.** `plan_accumulator_reads`
+groups requested channels into contiguous runs, merging runs closer than
+~37 channels (where bridging is cheaper than another transaction), and
+`read_accumulated_data_fast` reads only those. Falls back to the unchanged bulk
+read whenever that is cheaper, so a full 2048-channel comb is untouched.
+`sparse_read=None|True|False`; the plan is cached per tone set.
+
+Both together, measured on v7.12.1: 1 tone 224 -> 36 us (6.2x), 64 -> 41 (5.5x),
+341 -> 65 (3.8x), 1000 -> 109 (2.6x), 2048 -> 278 (1.2x, counter only).
+
+Partial reads are snapped to 64-byte boundaries. `mm[a:b]` is a memcpy, and
+glibc's aarch64 memcpy finishes odd-length copies with overlapping unaligned
+vector loads, which SIGBUS on the uncached `/dev/mem` mapping -- reading 341
+channels (2728 B) bus-errors where 64 channels does not.
+
+**Staged control-buffer writes measured and rejected.** A bulk slice write
+streams ~4x faster per word than scattered stores, but constructing the payload
+costs more than that saves: scatter vs staged, tx+rx, 4 tones 50/136 us, 1000
+244/378, 2048 430/579. `sparse_write=None` always scatters; `True` keeps the
+staged path for re-testing if the construction is ever made cheap. New
+`profiling/access_size_scaling.py` measures the fixed/per-word cost model these
+decisions rest on.
+
 ## v1.8.0
 
 **Validated against firmware v7.12.1.** The minor version tracks the firmware
