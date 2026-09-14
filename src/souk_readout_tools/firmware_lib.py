@@ -786,6 +786,48 @@ def _blocking_wait_for_acc(acc,poll_period_s=0.1,timeout=1):
     return cnt1
 
 
+#: UIO device covering the AXI-lite window (``user_io``, 0xa0000000 + 0x20000000
+#: on v7.12). Reading it needs membership of the ``uio`` group rather than root,
+#: and measures identically to /dev/mem (2.0 us at 64 B, 93.2 us at 16 KiB) --
+#: it buys permissions, not latency.
+UIO_AXIL_DEVICE = '/dev/uio0'
+
+
+def use_uio_for_localmem(device=UIO_AXIL_DEVICE):
+    """Point casperfpga's LocalMemTransport at a UIO device instead of /dev/mem.
+
+    Call BEFORE creating the fast interface. The readout server needs root only
+    for ``/dev/mem``; with this it can run as a normal user in the ``uio`` group.
+    (``server/tsu_strobe.py`` maps PS GEM2 directly and still needs root, but it
+    is already a separate service.)
+
+    Why this is a patch rather than a parameter: casperfpga uses its
+    ``AXIL_OFFSET`` for two different jobs -- the mmap offset in
+    ``LocalMemTransport.__init__`` *and* the address rebase in
+    ``_get_device_address``. A UIO device exposes ``map0`` at mmap offset **0**,
+    not at its physical address, so only the first needs redirecting; the second
+    must keep 0xa0000000. Upstream should separate the two, at which point this
+    can go away.
+
+    Idempotent. Raises nothing if the device is missing -- the failure surfaces
+    when the transport tries to open it, with a clearer message than anything
+    this could invent.
+    """
+    from casperfpga import transport_localmem as tlm
+    if getattr(tlm, '_souk_uio_device', None) == device:
+        return device
+    real_mmap = tlm.mmap
+
+    def _uio_mmap(fd, length, *args, **kwargs):
+        kwargs['offset'] = 0
+        return real_mmap(fd, length, *args, **kwargs)
+
+    tlm.mmap = _uio_mmap
+    tlm.MEM_DEV = device
+    tlm._souk_uio_device = device
+    return device
+
+
 def create_standard_readout_interface(fw_config_file,pipeline_id=0):
     try:
         r = SoukMkidReadout('localhost',configfile=fw_config_file,pipeline_id=pipeline_id)
@@ -793,7 +835,15 @@ def create_standard_readout_interface(fw_config_file,pipeline_id=0):
         raise RuntimeError('souk_mkid_readout module not imported, cannot create readout interface')
     return r
 
-def create_fast_readout_interface(fw_config_file,pipeline_id=0):
+def create_fast_readout_interface(fw_config_file,pipeline_id=0,uio=False):
+    """Create the devmem-backed interface.
+
+    ``uio``: map the AXI window through a UIO device instead of ``/dev/mem``, so
+    the process does not need root. Pass True for the default device or a path.
+    See :func:`use_uio_for_localmem`.
+    """
+    if uio:
+        use_uio_for_localmem(uio if isinstance(uio, str) else UIO_AXIL_DEVICE)
     try:
         r_fast = SoukMkidReadout('localhost',configfile=fw_config_file,local=True,pipeline_id=pipeline_id)
     except NameError:

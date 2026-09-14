@@ -12,6 +12,20 @@ accumulation, at every tone count**, and make the 10 us poll period in
 `_blocking_wait_for_acc` meaningful for the first time (each iteration
 previously cost 27 us, so the period was inoperative).
 
+**The AXI window can be mapped through UIO instead of `/dev/mem`.**
+`create_fast_readout_interface(..., uio=True)` (or `use_uio_for_localmem()`)
+points casperfpga's `LocalMemTransport` at `/dev/uio0`, which is `root:uio`
+rather than root-only. Verified reading the accumulator **as a normal user in
+the `uio` group**. Timing is identical to `/dev/mem` (2.0 us at 64 B, 93.2 us at
+16 KiB) -- it buys permissions, not latency, which is the whole point: the
+readout server needs root *only* for `/dev/mem`. `server/tsu_strobe.py` maps PS
+GEM2 directly and still needs root, but it is already a separate service.
+
+Implemented as a patch because casperfpga uses `AXIL_OFFSET` both as the mmap
+offset and as the address rebase in `_get_device_address`; a UIO device exposes
+map0 at mmap offset 0, so only the former needs redirecting. Upstream should
+separate the two.
+
 **ZDMA reads the accumulator for large tone sets.** New
 `souk_readout_tools/zdma.py` (vendored from souk-firmware v7.12.1's own
 hardware-validated reference) DMAs into a cached `u-dma-buf` instead of reading
