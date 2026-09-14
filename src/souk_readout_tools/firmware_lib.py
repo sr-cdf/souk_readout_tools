@@ -4,6 +4,7 @@ This module provides a set of functions that are used by the readout server to i
 
 """
 
+import contextlib
 import warnings
 import inspect
 import numpy as np
@@ -787,45 +788,70 @@ def _blocking_wait_for_acc(acc,poll_period_s=0.1,timeout=1):
 
 
 #: UIO device covering the AXI-lite window (``user_io``, 0xa0000000 + 0x20000000
-#: on v7.12). Reading it needs membership of the ``uio`` group rather than root,
-#: and measures identically to /dev/mem (2.0 us at 64 B, 93.2 us at 16 KiB) --
-#: it buys permissions, not latency.
+#: on v7.12). It is ``root:uio`` rather than root-only, and measures identically
+#: to /dev/mem (2.0 us at 64 B, 93.2 us at 16 KiB) -- it buys permissions, not
+#: latency.
 UIO_AXIL_DEVICE = '/dev/uio0'
 
 
-def use_uio_for_localmem(device=UIO_AXIL_DEVICE):
-    """Point casperfpga's LocalMemTransport at a UIO device instead of /dev/mem.
+def _uio_localmem_transport(device=UIO_AXIL_DEVICE):
+    """Build a LocalMemTransport subclass that maps the window through UIO.
 
-    Call BEFORE creating the fast interface. The readout server needs root only
-    for ``/dev/mem``; with this it can run as a normal user in the ``uio`` group.
-    (``server/tsu_strobe.py`` maps PS GEM2 directly and still needs root, but it
-    is already a separate service.)
+    casperfpga's ``LocalMemTransport`` opens ``/dev/mem`` (root-only) and mmaps
+    at ``AXIL_OFFSET``. A UIO device exposes the *same* window at mmap offset
+    **0**, so only ``__init__`` differs: ``_get_device_address``, ``read`` and
+    ``blindwrite`` are inherited untouched, and they keep rebasing against
+    ``AXIL_OFFSET``, which is still the right value for that job.
 
-    Why this is a patch rather than a parameter: casperfpga uses its
-    ``AXIL_OFFSET`` for two different jobs -- the mmap offset in
-    ``LocalMemTransport.__init__`` *and* the address rebase in
-    ``_get_device_address``. A UIO device exposes ``map0`` at mmap offset **0**,
-    not at its physical address, so only the first needs redirecting; the second
-    must keep 0xa0000000. Upstream should separate the two, at which point this
-    can go away.
-
-    Idempotent. Raises nothing if the device is missing -- the failure surfaces
-    when the transport tries to open it, with a clearer message than anything
-    this could invent.
+    Subclassing rather than patching casperfpga: the upstream class is left
+    exactly as it is for every other user, and ``CasperFpga`` already accepts a
+    ``transport=`` argument, so this is the mechanism it was designed for. The
+    body below mirrors the parent's ``__init__`` because there is no hook
+    between "set up the parent" and "open the device"; if upstream grows one, or
+    accepts a device/offset argument, this can be deleted.
     """
     from casperfpga import transport_localmem as tlm
-    if getattr(tlm, '_souk_uio_device', None) == device:
-        return device
-    real_mmap = tlm.mmap
+    from mmap import mmap, PROT_READ, PROT_WRITE, MAP_SHARED
 
-    def _uio_mmap(fd, length, *args, **kwargs):
-        kwargs['offset'] = 0
-        return real_mmap(fd, length, *args, **kwargs)
+    class UioLocalMemTransport(tlm.LocalMemTransport):
+        _uio_device = device
 
-    tlm.mmap = _uio_mmap
-    tlm.MEM_DEV = device
-    tlm._souk_uio_device = device
-    return device
+        def __init__(self, **kwargs):
+            tlm.Transport.__init__(self, **kwargs)
+            try:
+                self.parent = kwargs['parent_fpga']
+                self.logger = self.parent.logger
+            except KeyError:
+                raise RuntimeError(
+                    'parent_fpga argument not supplied when creating transport')
+            self._mem_dev = self._uio_device
+            self.logger.debug(f'*** NEW CONNECTION MADE TO {self.host} (uio) ***')
+            self.fd = os.open(self._mem_dev, os.O_RDWR)
+            # offset 0, not AXIL_OFFSET: UIO presents map0 at the start of the
+            # device's own address space.
+            self.axil_mm = mmap(self.fd, tlm.MAP_SIZE, offset=0,
+                                flags=MAP_SHARED, prot=PROT_READ | PROT_WRITE)
+
+    return UioLocalMemTransport
+
+
+@contextlib.contextmanager
+def _local_transport(device):
+    """Make ``SoukMkidReadout(local=True)`` pick up our UIO transport.
+
+    ``SoukMkidReadout.__init__`` hardcodes ``casperfpga.LocalMemTransport`` for
+    the local case and takes no ``transport=`` argument of its own, so the class
+    is substituted for the duration of the construction and restored afterwards.
+    A one-line ``transport=`` passthrough upstream would remove the need for
+    this; worth asking for.
+    """
+    import casperfpga
+    original = casperfpga.LocalMemTransport
+    casperfpga.LocalMemTransport = _uio_localmem_transport(device)
+    try:
+        yield
+    finally:
+        casperfpga.LocalMemTransport = original
 
 
 def create_standard_readout_interface(fw_config_file,pipeline_id=0):
@@ -842,13 +868,14 @@ def create_fast_readout_interface(fw_config_file,pipeline_id=0,uio=False):
     the process does not need root. Pass True for the default device or a path.
     See :func:`use_uio_for_localmem`.
     """
-    if uio:
-        use_uio_for_localmem(uio if isinstance(uio, str) else UIO_AXIL_DEVICE)
     try:
-        r_fast = SoukMkidReadout('localhost',configfile=fw_config_file,local=True,pipeline_id=pipeline_id)
+        if uio:
+            with _local_transport(uio if isinstance(uio, str) else UIO_AXIL_DEVICE):
+                return SoukMkidReadout('localhost',configfile=fw_config_file,
+                                       local=True,pipeline_id=pipeline_id)
+        return SoukMkidReadout('localhost',configfile=fw_config_file,local=True,pipeline_id=pipeline_id)
     except NameError:
         raise RuntimeError('souk_mkid_readout module not imported, cannot create readout interface')
-    return r_fast
 
 def _configured_image_is_dual(r):
     """Whether the configured .fpg is a dual-pipeline image.

@@ -21,10 +21,14 @@ the `uio` group**. Timing is identical to `/dev/mem` (2.0 us at 64 B, 93.2 us at
 readout server needs root *only* for `/dev/mem`. `server/tsu_strobe.py` maps PS
 GEM2 directly and still needs root, but it is already a separate service.
 
-Implemented as a patch because casperfpga uses `AXIL_OFFSET` both as the mmap
-offset and as the address rebase in `_get_device_address`; a UIO device exposes
-map0 at mmap offset 0, so only the former needs redirecting. Upstream should
-separate the two.
+Implemented as a `LocalMemTransport` **subclass** in this package, not a patch of
+casperfpga: only `__init__` differs (open the UIO device, mmap at offset 0 rather
+than `AXIL_OFFSET`), and `_get_device_address` / `read` / `blindwrite` are
+inherited unchanged. `CasperFpga` already accepts `transport=`, so this is the
+mechanism it was designed for; the class is substituted only for the duration of
+`SoukMkidReadout(local=True)` construction, which hardcodes the local transport
+and takes no `transport=` of its own. A one-line passthrough upstream would
+remove even that.
 
 **ZDMA reads the accumulator for large tone sets.** New
 `souk_readout_tools/zdma.py` (vendored from souk-firmware v7.12.1's own
