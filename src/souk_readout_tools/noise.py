@@ -20,6 +20,11 @@ Public API:
   ...)``: Called by notebooks and timestream PSD plotting; takes parsed I/Q
   samples plus regular-tone calibration sweeps and returns selected tone
   indices with calibrated fractional-frequency and dissipation rows.
+- ``rx_gain_ratio(sweep_data, ts_data, ...)``: Takes a calibration sweep and a
+  timestream captured at different ADC drive and returns the per-tone
+  amplitude ratio that puts the sweep on the timestream's RX scale, either
+  measured from the carrier or computed from the recorded chain state. Feeds
+  ``fractional_frequency_and_dissipation_timestreams(match_rx_gain=...)``.
 
 Private helpers:
 - ``_remove_temporal_modes(data, temporal_modes)``: Called by blind-tone
@@ -585,9 +590,160 @@ def _resolve_reference_frequency(ts_data, tone_index, sweep_f,
     return float(reference_tone_frequency)
 
 
+def _rx_chain_gain_db(info):
+    """Analog RX gain in dB from a capture's recorded chain state, or None.
+
+    Only the analog part -- the RF frontend total (attenuator and bypass amp
+    together) and the ADC DSA, which sits at the converter.  The PFB fftshift
+    is deliberately excluded: it is downstream of the ADC and its per-stage
+    convention has bitten this codebase before, so a mismatch there is raised
+    rather than silently modelled.
+    """
+    if not isinstance(info, Mapping):
+        return None, None
+    frontend = info.get("rf_frontend")
+    rfdc = info.get("rfdc")
+    if not isinstance(frontend, Mapping) or not isinstance(rfdc, Mapping):
+        return None, None
+    try:
+        total = float(frontend["rx_total_gain_db"])
+        dsa = float(rfdc.get("dsa", 0.0))
+    except (KeyError, TypeError, ValueError):
+        return None, None
+    pipeline = info.get("pipeline")
+    digital = (
+        pipeline.get("pfb_fftshift") if isinstance(pipeline, Mapping) else None
+    )
+    return total - dsa, digital
+
+
+def rx_gain_ratio(sweep_data, ts_data, method="carrier", *, tones=None):
+    """Amplitude ratio to put a calibration sweep on the timestream's RX scale.
+
+    A sweep and a timestream taken at different ADC drive -- different RX
+    attenuation or DSA -- differ by one complex scale factor on the I/Q plane.
+    That is recoverable, and recovering it is what lets the ADC fill be raised
+    for a science capture while the calibration sweep is taken cold enough not
+    to clip.  Note this is *RX* gain only: a sweep taken at a different **tone
+    power** cannot be rescaled to serve a timestream, because the drive changes
+    ``anl``, ``Qi`` and ``fr`` and the resonance is a different shape, not the
+    same shape scaled.
+
+    Parameters
+    ----------
+    sweep_data : dict
+        Calibration sweep.
+    ts_data : dict
+        Parsed timestream whose scale the sweep should be matched to.
+    method : {'carrier', 'chain'}, optional
+        ``'carrier'`` (default) measures the ratio directly, as the
+        timestream's median ``|z|`` over the sweep's ``|z|`` at the same tone
+        frequency.  Model-free, and it absorbs any gain difference including
+        ones nothing here models.  It assumes the resonator itself did not
+        move between the two captures -- a real shift in loading would be
+        absorbed as a fake gain change.
+
+        ``'chain'`` computes it from the recorded RF frontend gain and ADC
+        DSA.  Use it when the two captures share no common operating point.
+        It raises if the digital (PFB) settings differ, rather than guessing
+        at a per-stage convention.
+    tones : iterable of int or None, optional
+        Tone indices; ``None`` (default) does every tone in ``ts_data``.
+
+    Returns
+    -------
+    dict
+        ``ratio`` (per tone, multiply the sweep's complex trace by this),
+        ``ratio_db`` (``20*log10``), ``tone_indices``, ``valid``, ``method``.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from souk_readout_tools import noise
+    >>> f = np.linspace(0.999e9, 1.001e9, 201)
+    >>> z = 1.0 - 0.5 / (1.0 + 2j * 5e4 * (f - 1e9) / 1e9)
+    >>> sweep = {"sweep_f": f[:, None], "sweep_i": z.real[:, None],
+    ...          "sweep_q": z.imag[:, None]}
+    >>> ts = {"i_data": {"0000": 2.0 * z.real[:3]},
+    ...       "q_data": {"0000": 2.0 * z.imag[:3]},
+    ...       "info": {"tones": {"frequencies_hz": [f[1]]}}}
+    >>> out = noise.rx_gain_ratio(sweep, ts)
+    >>> round(float(out["ratio"][0]), 2)
+    2.0
+    """
+    import warnings
+
+    method = str(method).lower()
+    if method not in ("carrier", "chain"):
+        raise ValueError("method must be 'carrier' or 'chain'")
+
+    tone_keys = sorted(ts_data["i_data"])
+    if tones is None:
+        tones = range(len(tone_keys))
+    indices = [operator.index(t) for t in tones]
+
+    if method == "chain":
+        sweep_gain, sweep_digital = _rx_chain_gain_db(sweep_data.get("info"))
+        ts_gain, ts_digital = _rx_chain_gain_db(ts_data.get("info"))
+        if sweep_gain is None or ts_gain is None:
+            raise ValueError(
+                "method='chain' needs rf_frontend and rfdc sections in both "
+                "captures' info; use method='carrier' instead."
+            )
+        if sweep_digital != ts_digital:
+            raise ValueError(
+                f"PFB fftshift differs between the captures "
+                f"({sweep_digital} vs {ts_digital}); its per-stage gain "
+                "convention is not modelled here. Use method='carrier'."
+            )
+        ratio = np.full(len(indices), 10.0 ** ((ts_gain - sweep_gain) / 20.0))
+        valid = np.ones(len(indices), dtype=bool)
+    else:
+        ratio = np.full(len(indices), np.nan)
+        valid = np.zeros(len(indices), dtype=bool)
+        outside = []
+        for row, tone_index in enumerate(indices):
+            tone_key = tone_keys[tone_index]
+            sweep_f, sweep_i, sweep_q = _get_sweep_trace(sweep_data, tone_index)
+            tone_frequency = _resolve_reference_frequency(
+                ts_data, tone_index, sweep_f, None)
+            lo, hi = np.nanmin(sweep_f), np.nanmax(sweep_f)
+            if not (lo <= tone_frequency <= hi):
+                outside.append(tone_index)
+                continue
+            sweep_mag = np.interp(
+                tone_frequency, sweep_f, np.abs(sweep_i + 1j * sweep_q))
+            ts_mag = np.median(np.abs(
+                np.asarray(ts_data["i_data"][tone_key], dtype=float)
+                + 1j * np.asarray(ts_data["q_data"][tone_key], dtype=float)
+            ))
+            if sweep_mag > 0 and np.isfinite(ts_mag):
+                ratio[row] = float(ts_mag / sweep_mag)
+                valid[row] = True
+        if outside:
+            warnings.warn(
+                f"{len(outside)} tone(s) sit outside their sweep range, so "
+                "the carrier ratio is undefined for them (an off-resonance "
+                "capture parked beyond the sweep span does this). Pass "
+                "method='chain' or an explicit ratio.",
+                stacklevel=2,
+            )
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio_db = 20.0 * np.log10(np.where(ratio > 0, ratio, np.nan))
+    return {
+        "ratio": ratio,
+        "ratio_db": ratio_db,
+        "tone_indices": np.asarray(indices, dtype=int),
+        "valid": valid,
+        "method": method,
+    }
+
+
 def fractional_frequency_and_dissipation_timestreams(
         ts_data, sweep_data, tones=None, reference_tone_frequency=None,
-        smooth_window_hz=1000, method="linearized", calibrations=None):
+        smooth_window_hz=1000, method="linearized", calibrations=None,
+        match_rx_gain=False):
     """
     Convert parsed I/Q timestreams into calibrated fractional shifts.
 
@@ -617,6 +773,13 @@ def fractional_frequency_and_dissipation_timestreams(
     calibrations : mapping or sequence, optional
         Per-tone ``resonator.ResonatorCalibration`` objects or fit results.
         Required by ``method="mobius"`` and ``method="circle"``.
+    match_rx_gain : bool, float, or array-like, optional
+        Rescale the sweep onto the timestream's RX gain before converting,
+        for when the two were taken at different ADC drive.  ``False``
+        (default) does nothing; ``True`` measures the ratio with
+        ``rx_gain_ratio``; a scalar or per-tone array applies it directly.
+        This corrects RX gain only -- a sweep taken at a different *tone
+        power* is a different resonance and cannot be rescaled.
 
     Returns
     -------
@@ -661,12 +824,31 @@ def fractional_frequency_and_dissipation_timestreams(
     if not selected:
         raise ValueError("tones must select at least one timestream tone")
 
+    gain_ratio = None
+    if match_rx_gain is not False and match_rx_gain is not None:
+        if match_rx_gain is True:
+            gain_ratio = rx_gain_ratio(
+                sweep_data, ts_data,
+                tones=[index for index, _ in selected])["ratio"]
+        else:
+            gain_ratio = np.asarray(match_rx_gain, dtype=float).ravel()
+            if gain_ratio.size == 1:
+                gain_ratio = np.full(len(selected), float(gain_ratio[0]))
+            if gain_ratio.size != len(selected):
+                raise ValueError(
+                    "match_rx_gain must be True, False, a scalar, or one "
+                    "ratio per selected tone.")
+        gain_ratio = np.where(np.isfinite(gain_ratio), gain_ratio, 1.0)
+
     first_tone_key = selected[0][1]
     n_samples = len(ts_data["i_data"][first_tone_key])
     frequency = np.empty((len(selected), n_samples), dtype=float)
     dissipation = np.empty_like(frequency)
     for row, (tone_index, tone_key) in enumerate(selected):
         sweep_f, sweep_i, sweep_q = _get_sweep_trace(sweep_data, tone_index)
+        if gain_ratio is not None:
+            sweep_i = sweep_i * gain_ratio[row]
+            sweep_q = sweep_q * gain_ratio[row]
         tone_frequency = _resolve_reference_frequency(
             ts_data, tone_index, sweep_f, reference_tone_frequency)
         timestream_z = (
@@ -710,6 +892,7 @@ def fractional_frequency_and_dissipation_timestreams(
 
 __all__ = [
     "fractional_frequency_and_dissipation_timestreams",
+    "rx_gain_ratio",
     "remove_blind_tone_common_modes",
     "remove_common_modes_svd",
     "remove_iq_common_modes_svd",

@@ -1,5 +1,51 @@
 # Changelog & Feature List
 
+## v1.7.7
+
+**Tone powers can be allocated from measured sensitivity instead of power.**
+`transducer_gain()` measures `|dz/dx|` from the sweeps a power sweep already
+takes, `carrier_levels()` each tone's ADC level. On a 379-tone array `|dz/dx|`
+predicts the measured noise floor at r = -0.91, tone power at r = -0.13.
+
+**`optimise_tone_powers(run, epsilon=, max_loss_db=)` chooses the powers**, and
+`allocation_metrics()` / `plot_allocation()` score a comb before it is run.
+`max_loss_db` limits how far any one tone may be sacrificed; bifurcation caps
+override it, listing those tones in `loss_floor_overridden`. Powers past the
+swept range are held at the nearest measured point and flagged in
+`outside_swept_range`, not extrapolated. `objective='inverse_variance'`
+maximises mapping speed but left 305 of 379 tones worse off; default
+`'mean_db'` weights every detector equally.
+
+**`epsilon` — dB of readout noise per dB of ADC fill — is measured per system,
+never assumed**, and is a local slope, not a constant.
+`scripts/adc_headroom/01_attenuation_ladder.py` measures it,
+`02_analyse_ladder.py` reduces it, `adc_fill_response()` fits it, returning
+`epsilon_high_fill` / `epsilon_low_fill` and warning when they differ. The
+quantisation `adc_level` ladders give 0.57 over the first 12 dB of attenuation
+and 0.97 over the last 12 for a 1000-tone comb, 0.07/0.64 for 10 tones.
+
+**Compressed ladder steps are detected and refused.** `check_input_saturation`
+cannot see them; the giveaway is noise-to-carrier that *improves* with added
+attenuation. `adc_fill_response(level_db=...)` drops steps whose fill response
+falls below `min_fill_response` (0.8 dB/dB).
+
+**About 5 dB of ADC range is wasted on every on-resonance capture**, because the
+RX optimiser runs with the tones parked off their dips. Measured 4.7-6.5 dB
+across a 15-point blackbody ladder; reported as `unused_headroom_db`.
+
+**Driving harder only helps if the tone is read off the dip centre.** At the dip
+minimum `|dz/dx|` flattens and then falls approaching bifurcation; at the
+steepest-phase point it keeps climbing. `transducer_gain(at='max')` (default)
+follows the steepest point, `at='tone'` the dip centre — different best combs.
+
+**`noise.rx_gain_ratio()` and `match_rx_gain=`** let one calibration sweep serve
+a timestream taken at a different ADC drive; an injected 6 dB mismatch corrupts
+the conversion by 53 sigma uncorrected, 0.19 corrected. A sweep taken at a
+different *tone power* cannot be reused: a different shape, not the same shape
+scaled.
+
+Details and worked calls in `doc/tone_power_notes.md`.
+
 ## v1.7.6
 
 **Streaming no longer dies once the accumulation counter passes 2\*\*31.**

@@ -494,6 +494,74 @@ constraints, with `write_balanced_power()` / `load_balanced_power()` for
 persistence and `balanced_power_arrays()` for per-tone arrays. The module
 docstring (`help(ps)`) lists every piece of the pipeline in order.
 
+## Allocating on Measured Sensitivity
+
+`balance_tone_powers()` works in tone-power space. What actually sets a tone's
+readout-limited noise is its transducer gain `|dz/dx|` — carrier amplitude,
+dip depth and Duffing steepening together — and that is measured, not modelled:
+
+```python
+gain   = ps.transducer_gain(run)     # |dz/dx|, counts per unit fractional freq
+levels = ps.carrier_levels(run)      # ADC level, on and off resonance
+```
+
+Tone power is a poor proxy for either. On a 379-tone array the RX accumulator
+level predicts the off-resonance `dx` noise floor at r = -0.13; `|dz/dx|`
+predicts it at r = -0.91.
+
+The tones share one RX attenuator, so raising the aggregate ADC level forces
+that attenuator up and costs *every* tone `epsilon` dB, where
+
+    epsilon = -d(referred noise, dB) / d(ADC fill, dB)
+
+`epsilon = 1` is a noise floor fixed at the ADC; `epsilon = 0` is one entering
+before the attenuator, which rides down with the carrier so the ADC constraint
+costs nothing but clipping. It is a property of the readout chain, not the
+array, so nothing here assumes it.
+
+It is also a *local* slope rather than a constant. Writing the noise-to-carrier
+as `N_after/C + N_before/C`, only the first term moves with the carrier, so at
+high fill the before-the-attenuator noise dominates and `epsilon` tends to 0,
+while at low fill the ADC term takes over and it tends to 1. It depends on comb
+size too. Fit it over the fill you actually run at, with the comb you actually
+use, and check `epsilon_high_fill` against `epsilon_low_fill` in the result.
+
+Measure it once per system with
+`scripts/adc_headroom/01_attenuation_ladder.py`, reduce it with
+`02_analyse_ladder.py`, and pass the number in:
+
+```python
+alloc = ps.optimise_tone_powers(run, epsilon=0.6, max_loss_db=6.0)
+ps.plot_allocation(run, alloc["allocated_power_dbm"], metrics=alloc)
+```
+
+`optimise_tone_powers()` gives every tone the same price for ADC power and
+lets each maximise its own gain against it — a water-fill generalised to
+arbitrary measured curves, so it needs no assumption that gain follows power.
+`max_loss_db` is the "I will sacrifice some tones, but not switch them off"
+knob; bifurcation caps override it and the tones that hit that are listed in
+`loss_floor_overridden`.
+
+To score an allocation without running it, `allocation_metrics()` returns
+per-tone `delta_noise_db = -delta_gain_db + epsilon * delta_aggregate_db`.
+Both terms come back separately, so a different `epsilon` can be applied
+afterwards without recomputing anything.
+
+Two things worth reading off the report before changing any powers:
+
+- `aggregate_excess_db` — how much ADC budget the loud tones take beyond a flat
+  comb of the same total, i.e. the dB every ordinary tone is paying for them.
+- `unused_headroom_db` — the RX optimiser normally runs with the comb parked
+  off-dip, so it sets the attenuator for a level the comb never reaches on
+  resonance. Measured 4.7–6.5 dB on a SOUK BB ladder, and recovering it helps
+  every tone at once rather than trading between them.
+
+Where a tone is read matters as much as how hard it is driven. At the dip
+centre the Duffing gain is exactly 1 at any drive, and measured `|dz/dx|`
+saturates and turns over; at the steepest-`dphi/df` point it keeps climbing,
+with `d(gain)/dP` rising from 0.98 to 1.90 dB/dB approaching bifurcation. Pass
+`at='max'` (default) or `at='tone'` to match how the tones are actually parked.
+
 For the full acquisition sequence and the recommended data layout, continue
 with [Resonator Drive Tuning and Noise
 Measurements](resonator_noise_workflow.md).

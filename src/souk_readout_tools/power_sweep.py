@@ -109,6 +109,12 @@ balanced_power_arrays   balanced result -> per-tone arrays
 write_balanced_power /  the balanced powers (``analysis/balanced_power.json``)
 load_balanced_power
 accumulator_level_db    per-tone RX levels (``rx_offsets_db`` for balancing)
+transducer_gain         measured ``|dz/dx|`` -- the readout-limited noise scale
+carrier_levels          per-tone ADC level on and off resonance
+allocation_metrics      score an allocation: gain, ADC share, who pays
+optimise_tone_powers    allocate by maximising measured array sensitivity
+adc_fill_response       measure ``epsilon``, the dB of noise per dB of fill
+plot_allocation         the four-panel picture of that score
 plan_tone_comb          catalogue + choices -> the next run's comb
 analyse_power_sweep     steps 2-4 in one call
 load_analysis           reload a finished analysis
@@ -232,6 +238,13 @@ __all__ = [
     "write_balanced_power",
     "load_balanced_power",
     "accumulator_level_db",
+    # ADC dynamic range and allocation reporting
+    "transducer_gain",
+    "carrier_levels",
+    "allocation_metrics",
+    "optimise_tone_powers",
+    "adc_fill_response",
+    "plot_allocation",
     # Plotting
     "plot_power_sweep",
     "plot_best_power",
@@ -7550,6 +7563,1200 @@ def accumulator_level_db(
     return levels
 
 
+# --- ADC dynamic range and allocation reporting ------------------------------
+#
+# ``balance_tone_powers`` allocates in tone-power space.  The quantities that
+# actually decide readout-limited noise are measured here instead, straight
+# from the sweeps a power sweep already takes:
+#
+#   transducer_gain   |dz/dx|, counts per unit fractional frequency.  Readout-
+#                     limited noise is S_x = S_n / |dz/dx|**2, so this is the
+#                     whole story for one tone at fixed RX gain -- carrier
+#                     amplitude, dip depth and Duffing steepening included, and
+#                     no model in between.
+#   carrier_levels    what the tone puts into the ADC, on and off resonance.
+#                     The tones share one RX attenuator, so it is the aggregate
+#                     of these that sets every tone's fill.
+#
+# The exchange rate between the two is one scalar, ``epsilon`` (see
+# ``adc_fill_response``): the dB of referred noise won per dB of ADC fill.  It
+# is a property of the system, not of the array, so it is always an input here
+# and never assumed.
+
+
+def _as_sweep_stack(sweep_data, z=None):
+    """Normalise sweep input to ``(f, z, powers_dbm)``.
+
+    ``f`` and ``z`` come back with shape ``(n_step, n_point, n_tone)`` and
+    ``powers_dbm`` with shape ``(n_step, n_tone)`` or ``None``.  Accepts plain
+    arrays, one sweep dict, or a whole :py:func:`run_power_sweep` result.
+    """
+    if z is not None:
+        f_arr = np.asarray(sweep_data, dtype=float)
+        z_arr = np.asarray(z)
+        if f_arr.ndim == 1:
+            f_arr = f_arr[:, None]
+        if z_arr.ndim == 1:
+            z_arr = z_arr[:, None]
+        if f_arr.shape != z_arr.shape:
+            raise ValueError("f and z must have the same shape.")
+        return f_arr[None], z_arr[None], None
+
+    if isinstance(sweep_data, (str, Path)):
+        sweep_data = load_power_sweep(sweep_data)
+    if not isinstance(sweep_data, dict):
+        raise TypeError(
+            "sweep_data must be a sweep dict, a power-sweep run, or f and z "
+            "arrays."
+        )
+
+    if "sweeps" in sweep_data:
+        sweeps = list(sweep_data["sweeps"])
+        if not sweeps:
+            raise ValueError("run contains no sweeps.")
+        powers = sweep_data.get("powers_dbm")
+        powers = None if powers is None else np.atleast_2d(
+            np.asarray(powers, dtype=float)
+        )
+    elif "sweep_f" in sweep_data:
+        sweeps = [sweep_data]
+        powers = None
+    else:
+        raise ValueError("sweep_data has neither 'sweeps' nor 'sweep_f'.")
+
+    f_steps, z_steps = [], []
+    for sweep in sweeps:
+        f_step = np.atleast_2d(np.asarray(sweep["sweep_f"], dtype=float))
+        i_step = np.atleast_2d(np.asarray(sweep["sweep_i"], dtype=float))
+        q_step = np.atleast_2d(np.asarray(sweep["sweep_q"], dtype=float))
+        f_steps.append(f_step)
+        z_steps.append(i_step + 1j * q_step)
+    shapes = {arr.shape for arr in f_steps}
+    if len(shapes) != 1:
+        raise ValueError(f"sweep steps have inconsistent shapes: {sorted(shapes)}")
+    return np.asarray(f_steps), np.asarray(z_steps), powers
+
+
+def _smooth_complex(z, points):
+    """Moving-average a complex sweep trace along axis 0, NaN-safe."""
+    points = int(points)
+    if points <= 1:
+        return z
+    if points % 2 == 0:
+        points += 1
+    kernel = np.ones(points, dtype=float) / points
+    good = np.isfinite(z.real) & np.isfinite(z.imag)
+    filled = np.where(good, z, 0.0)
+    out = np.empty_like(filled)
+    for col in range(z.shape[1]):
+        num = np.convolve(filled[:, col], kernel, mode="same")
+        den = np.convolve(good[:, col].astype(float), kernel, mode="same")
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out[:, col] = num / den
+    return np.where(good, out, np.nan)
+
+
+def _operating_index(f, z, at, tone_frequencies, smooth_points):
+    """Index of each tone's readout point, plus |dz/dx| along the trace.
+
+    ``at='max'`` is the steepest-|dz/df| point, which is where a phase readout
+    parks; ``at='tone'`` is the sweep point nearest the tone frequency.
+    """
+    n_point, n_tone = f.shape
+    zs = _smooth_complex(z, smooth_points)
+    gain = np.full((n_point, n_tone), np.nan, dtype=float)
+    for col in range(n_tone):
+        f_col = f[:, col]
+        if np.count_nonzero(np.isfinite(f_col)) < 2:
+            continue
+        with np.errstate(invalid="ignore", divide="ignore"):
+            slope = np.gradient(zs[:, col], f_col)
+        gain[:, col] = np.abs(slope) * np.abs(f_col)
+
+    idx = np.zeros(n_tone, dtype=int)
+    if at == "max":
+        for col in range(n_tone):
+            col_gain = gain[:, col]
+            idx[col] = (
+                int(np.nanargmax(col_gain))
+                if np.any(np.isfinite(col_gain)) else 0
+            )
+    elif at == "tone":
+        if tone_frequencies is None:
+            raise ValueError("at='tone' needs tone_frequencies.")
+        tone_frequencies = np.asarray(tone_frequencies, dtype=float).ravel()
+        if tone_frequencies.size == 1:
+            tone_frequencies = np.full(n_tone, float(tone_frequencies[0]))
+        if tone_frequencies.size != n_tone:
+            raise ValueError("tone_frequencies must have one value per tone.")
+        for col in range(n_tone):
+            idx[col] = int(np.nanargmin(np.abs(f[:, col] - tone_frequencies[col])))
+    else:
+        raise ValueError("at must be 'max' or 'tone'.")
+    return idx, gain
+
+
+def _resolve_tone_frequencies(sweep_data, tone_frequencies, n_tone, n_step):
+    """Tone centres as ``(n_step, n_tone)``, or ``None`` if unavailable.
+
+    ``follow_dips`` recentres between power steps, so a run's per-step
+    ``centers_by_step_hz`` is preferred over its single ``centers_hz`` --
+    using one fixed centre would evaluate ``at='tone'`` at the wrong place for
+    every step but the first.
+    """
+    def _broadcast(value):
+        arr = np.asarray(value, dtype=float)
+        if arr.ndim == 2 and arr.shape == (n_step, n_tone):
+            return arr
+        arr = arr.ravel()
+        if arr.size == 1:
+            return np.full((n_step, n_tone), float(arr[0]))
+        if arr.size == n_tone:
+            return np.broadcast_to(arr, (n_step, n_tone)).copy()
+        raise ValueError("tone_frequencies must have one value per tone.")
+
+    if tone_frequencies is not None:
+        return _broadcast(tone_frequencies)
+    if not isinstance(sweep_data, dict):
+        return None
+    for key in ("centers_by_step_hz", "centers", "centers_hz", "frequencies_hz"):
+        value = sweep_data.get(key)
+        if value is None:
+            continue
+        arr = np.asarray(value, dtype=float)
+        if arr.shape == (n_step, n_tone) or arr.ravel().size in (1, n_tone):
+            return _broadcast(arr)
+    return None
+
+
+def transducer_gain(
+    sweep_data,
+    z=None,
+    *,
+    at="max",
+    tone_frequencies=None,
+    smooth_points=1,
+):
+    """Per-tone ``|dz/dx|`` from sweep data -- the readout-limited noise scale.
+
+    ``x`` is fractional frequency, so ``|dz/dx| = |dz/df| * f`` and the result
+    is in raw I/Q counts per unit ``x``.  For additive readout noise of PSD
+    ``S_n`` (counts^2/Hz) the referred noise is ``S_x = S_n / |dz/dx|**2``, so
+    a tone's readout-limited noise is set by this one number.  It already
+    contains the carrier amplitude, the dip depth and any Duffing steepening,
+    which is why it -- and not the tone power -- is what an allocation should
+    be judged on.
+
+    Parameters
+    ----------
+    sweep_data : dict or array-like or str or Path
+        A sweep dict (``sweep_f``/``sweep_i``/``sweep_q``), a
+        :py:func:`run_power_sweep` result or run directory, or a frequency
+        array with ``z`` supplied.
+    z : array-like or None, optional
+        Complex sweep values, when ``sweep_data`` is a frequency array.  Both
+        may be 1-D (one tone) or 2-D ``(n_point, n_tone)``.
+    at : {'max', 'tone'}, optional
+        Where to evaluate.  ``'max'`` (default) is the steepest-``|dz/df|``
+        point, which is where a phase readout parks; on a noisy trace it is
+        biased high, so raise ``smooth_points`` rather than trusting a single
+        sample.  ``'tone'`` evaluates at the sweep point nearest each tone's
+        frequency and is unbiased.
+    tone_frequencies : array-like or None, optional
+        One frequency per tone, required by ``at='tone'`` unless the input
+        carries its own ``centers``.
+    smooth_points : int, optional
+        Moving-average window (samples) applied to the complex trace before
+        differentiating; ``1`` (default) disables it.  This is a *sample*
+        count, so what it costs depends on the sweep's points-per-linewidth:
+        on a coarse sweep even a few samples flatten the resonance and read
+        low, and it bites hardest exactly where the trace is sharpest, at the
+        Duffing-steepened top of a power sweep.  Raise it only to tame a noisy
+        ``at='max'``, and check the result against ``at='tone'``.
+
+    Returns
+    -------
+    dict
+        ``gain`` (counts per unit ``x``), ``gain_db`` (``20*log10``),
+        ``frequency_hz`` and ``detuning_hz`` of the evaluation point,
+        ``tone_index``, and ``powers_dbm`` when the input was a multi-step run.
+        Array shape is ``(n_tone,)`` for one sweep and
+        ``(n_step, n_tone)`` for a run.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from souk_readout_tools import power_sweep as ps
+    >>> f = np.linspace(0.9999e9, 1.0001e9, 401)
+    >>> z = 1.0 - 0.5 / (1.0 + 2j * 5e4 * (f - 1e9) / 1e9)
+    >>> out = ps.transducer_gain(f, z)
+    >>> round(float(out["gain"][0]) / 1e3)          # 2 * (Qr/Qc) * Qr = 5e4
+    50
+    """
+    f_all, z_all, powers = _as_sweep_stack(sweep_data, z)
+    n_step, _, n_tone = f_all.shape
+    tone_frequencies = _resolve_tone_frequencies(
+        sweep_data, tone_frequencies, n_tone, n_step
+    )
+
+    gain = np.full((n_step, n_tone), np.nan, dtype=float)
+    freq = np.full((n_step, n_tone), np.nan, dtype=float)
+    for step in range(n_step):
+        idx, profile = _operating_index(
+            f_all[step],
+            z_all[step],
+            at,
+            None if tone_frequencies is None else tone_frequencies[step],
+            smooth_points,
+        )
+        rows = np.arange(n_tone)
+        gain[step] = profile[idx, rows]
+        freq[step] = f_all[step][idx, rows]
+
+    if tone_frequencies is None:
+        detuning = np.full_like(freq, np.nan)
+    else:
+        detuning = freq - tone_frequencies
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        gain_db = 20.0 * np.log10(np.where(gain > 0, gain, np.nan))
+
+    single = n_step == 1 and powers is None
+    squeeze = (lambda a: a[0]) if single else (lambda a: a)
+    out = {
+        "gain": squeeze(gain),
+        "gain_db": squeeze(gain_db),
+        "frequency_hz": squeeze(freq),
+        "detuning_hz": squeeze(detuning),
+        "tone_index": np.arange(n_tone, dtype=int),
+        "at": str(at),
+    }
+    if powers is not None:
+        out["powers_dbm"] = powers
+    return out
+
+
+def carrier_levels(
+    sweep_data,
+    z=None,
+    *,
+    at="max",
+    tone_frequencies=None,
+    smooth_points=1,
+    off_fraction=0.1,
+):
+    """Per-tone carrier level at the ADC, on and off resonance, in dB.
+
+    The tones share one RX attenuator, so what sets every tone's ADC fill is
+    the *aggregate* of these levels -- see :py:func:`allocation_metrics`.
+    ``on_db`` is taken at the readout point (so it is what loads the ADC while
+    streaming) and ``off_db`` from the sweep edges (what loads it while
+    sweeping or retuning, which is the state the RX optimiser usually sees).
+    Levels are relative I/Q magnitudes in dB, not referred to an RF plane;
+    only their differences are meaningful, which is all the allocation uses.
+
+    Parameters
+    ----------
+    sweep_data, z, at, tone_frequencies, smooth_points
+        As for :py:func:`transducer_gain`.
+    off_fraction : float, optional
+        Fraction of the sweep taken from each end as the off-resonance
+        reference (default ``0.1``).
+
+    Returns
+    -------
+    dict
+        ``on_db``, ``off_db``, ``depth_db`` (``off_db - on_db``, the dip
+        suppression), ``tone_index``, and ``powers_dbm`` for a run.  Shapes
+        follow :py:func:`transducer_gain`.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from souk_readout_tools import power_sweep as ps
+    >>> f = np.linspace(0.9999e9, 1.0001e9, 401)
+    >>> z = 1.0 - 0.5 / (1.0 + 2j * 5e4 * (f - 1e9) / 1e9)
+    >>> out = ps.carrier_levels(f, z)
+    >>> bool(out["depth_db"][0] > 0)
+    True
+    """
+    f_all, z_all, powers = _as_sweep_stack(sweep_data, z)
+    n_step, n_point, n_tone = f_all.shape
+    tone_frequencies = _resolve_tone_frequencies(
+        sweep_data, tone_frequencies, n_tone, n_step
+    )
+    try:
+        off_fraction = float(off_fraction)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("off_fraction must be a number in (0, 0.5].") from exc
+    if not 0.0 < off_fraction <= 0.5:
+        raise ValueError("off_fraction must be in (0, 0.5].")
+    edge = max(1, int(round(off_fraction * n_point)))
+
+    on = np.full((n_step, n_tone), np.nan, dtype=float)
+    off = np.full((n_step, n_tone), np.nan, dtype=float)
+    for step in range(n_step):
+        idx, _ = _operating_index(
+            f_all[step],
+            z_all[step],
+            at,
+            None if tone_frequencies is None else tone_frequencies[step],
+            smooth_points,
+        )
+        mag = np.abs(z_all[step])
+        on[step] = mag[idx, np.arange(n_tone)]
+        edges = np.concatenate([mag[:edge], mag[-edge:]], axis=0)
+        off[step] = np.nanmedian(edges, axis=0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        on_db = 20.0 * np.log10(np.where(on > 0, on, np.nan))
+        off_db = 20.0 * np.log10(np.where(off > 0, off, np.nan))
+
+    single = n_step == 1 and powers is None
+    squeeze = (lambda a: a[0]) if single else (lambda a: a)
+    out = {
+        "on_db": squeeze(on_db),
+        "off_db": squeeze(off_db),
+        "depth_db": squeeze(off_db - on_db),
+        "tone_index": np.arange(n_tone, dtype=int),
+    }
+    if powers is not None:
+        out["powers_dbm"] = powers
+    return out
+
+
+def _as_power_vector(powers, tone_count, name):
+    """Accept a plain array, a best-power result, or a balanced-power result."""
+    if isinstance(powers, (str, Path)):
+        powers = load_best_power(powers)
+    if isinstance(powers, dict):
+        for key in ("allocated_power_dbm", "chosen_power_dbm"):
+            if key in powers:
+                powers = powers[key]
+                break
+        else:
+            raise ValueError(
+                f"{name} dict has neither 'allocated_power_dbm' nor "
+                "'chosen_power_dbm'."
+            )
+    elif isinstance(powers, (list, tuple)) and powers and isinstance(powers[0], dict):
+        powers = best_power_arrays(powers, tone_count=tone_count)["chosen_power_dbm"]
+    return _as_tone_array(powers, tone_count, name)
+
+
+def _interp_along_power(values, powers, targets):
+    """Per-tone interpolation of a (n_step, n_tone) grid onto one power each.
+
+    Returns ``(interpolated, outside)``; ``outside`` marks tones whose target
+    power falls beyond the powers actually swept for them, where the value is
+    held at the nearest measured end rather than extrapolated.
+    """
+    n_step, n_tone = values.shape
+    out = np.full(n_tone, np.nan, dtype=float)
+    outside = np.zeros(n_tone, dtype=bool)
+    for k in range(n_tone):
+        good = np.isfinite(values[:, k]) & np.isfinite(powers[:, k])
+        if not np.any(good) or not np.isfinite(targets[k]):
+            outside[k] = True
+            continue
+        x, y = powers[good, k], values[good, k]
+        order = np.argsort(x)
+        x, y = x[order], y[order]
+        out[k] = float(np.interp(targets[k], x, y))
+        outside[k] = bool(targets[k] < x[0] - 1e-9 or targets[k] > x[-1] + 1e-9)
+    return out, outside
+
+
+def allocation_metrics(
+    run,
+    powers_dbm,
+    *,
+    reference_powers_dbm=None,
+    epsilon=1.0,
+    at="max",
+    tone_frequencies=None,
+    smooth_points=1,
+):
+    """Score a per-tone power allocation against the sweeps that measured it.
+
+    Answers "what would this comb actually buy me" without running it, using
+    only a power sweep already on disk.  For each tone it interpolates the
+    measured transducer gain (:py:func:`transducer_gain`) and ADC level
+    (:py:func:`carrier_levels`) onto the allocated power, then combines them:
+
+    ``delta_noise_db = -delta_gain_db + epsilon * delta_aggregate_db``
+
+    The first term is per-tone and comes from the sweep.  The second is
+    shared: the tones pass through one RX attenuator, so raising the aggregate
+    forces that attenuator up and costs *every* tone ``epsilon`` dB per dB.
+    Both terms are returned separately, so a different ``epsilon`` can be
+    applied afterwards without recomputing anything.
+
+    Parameters
+    ----------
+    run : dict or str or Path
+        A :py:func:`run_power_sweep` result or run directory.
+    powers_dbm : array-like or dict
+        The allocation to score: one power per tone, or a
+        :py:func:`balance_tone_powers` / :py:func:`find_best_power` result.
+    reference_powers_dbm : array-like or dict or None, optional
+        The allocation to compare against; ``None`` (default) uses the run's
+        stored ``best_power`` if it has one, else the deltas are ``NaN``.
+    epsilon : float, optional
+        dB of referred noise won per dB of ADC fill (default ``1.0``).  ``1``
+        is a fixed ADC-referred floor, ``0`` a floor that rides the RX gain
+        (an LNA-dominated chain), and real systems land in between.  It is a
+        property of the readout chain, not the array -- measure it with
+        :py:func:`adc_fill_response` rather than assuming.
+    at : {'max', 'tone'}, optional
+        Readout point, passed through.  This is not cosmetic: parked at the
+        dip centre (``'tone'``) the gain saturates once the resonance starts
+        to distort, while at the steepest point (``'max'``, default) it keeps
+        climbing toward bifurcation.  The two give different optimal combs.
+    tone_frequencies, smooth_points
+        Passed through to :py:func:`transducer_gain`.
+
+    Returns
+    -------
+    dict
+        Per-tone: ``powers_dbm``, ``transducer_gain_db``, ``rx_level_db``
+        (on resonance), ``rx_level_off_db``, ``adc_share_db`` (level minus
+        aggregate), ``delta_gain_db``, ``delta_noise_db``,
+        ``outside_swept_range``.  Scalars: ``aggregate_db``,
+        ``aggregate_off_db``, ``unused_headroom_db``,
+        ``reference_aggregate_db``, ``delta_aggregate_db``,
+        ``aggregate_excess_db``, ``epsilon``, ``n_outside``.
+
+        ``aggregate_excess_db`` is ``10*log10(mean linear level) - median
+        level``: how much ADC budget the loud tones take beyond a flat comb of
+        the same total, i.e. the dB every ordinary tone is paying for them.
+
+        ``unused_headroom_db`` is the off-resonance aggregate minus the
+        on-resonance one.  The RX optimiser normally runs with the comb parked
+        off-dip, so it sets the attenuator for the larger number and the ADC
+        then sits this far below its intended fill for the whole capture.
+
+    Notes
+    -----
+    Powers beyond a tone's swept range are held at the nearest measured end
+    and flagged in ``outside_swept_range`` rather than extrapolated -- the
+    gain curve steepens near bifurcation, so extrapolating it is the one thing
+    guaranteed to overstate what an aggressive allocation buys.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from souk_readout_tools import power_sweep as ps
+    >>> run = ps.load_power_sweep("kid_power_sweep")           # doctest: +SKIP
+    >>> m = ps.allocation_metrics(run, np.full(379, -95.0))    # doctest: +SKIP
+    >>> m["aggregate_excess_db"]                               # doctest: +SKIP
+    2.98
+    """
+    if isinstance(run, (str, Path)):
+        run = load_power_sweep(run)
+    gain = transducer_gain(
+        run, at=at, tone_frequencies=tone_frequencies, smooth_points=smooth_points
+    )
+    levels = carrier_levels(
+        run, at=at, tone_frequencies=tone_frequencies, smooth_points=smooth_points
+    )
+    gain_grid = np.atleast_2d(gain["gain_db"])
+    level_grid = np.atleast_2d(levels["on_db"])
+    power_grid = np.atleast_2d(np.asarray(run["powers_dbm"], dtype=float))
+    n_tone = gain_grid.shape[1]
+    if power_grid.shape != gain_grid.shape:
+        power_grid = np.broadcast_to(
+            power_grid.reshape(-1, 1), gain_grid.shape
+        ).copy()
+
+    try:
+        epsilon = float(epsilon)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("epsilon must be a finite number.") from exc
+    if not np.isfinite(epsilon):
+        raise ValueError("epsilon must be finite.")
+
+    targets = _as_power_vector(powers_dbm, n_tone, "powers_dbm")
+    if reference_powers_dbm is None and run.get("root"):
+        # The run directory usually carries the choice this allocation is
+        # meant to improve on; missing best_power.json is not an error.
+        try:
+            reference_powers_dbm = load_best_power(run["root"])
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            reference_powers_dbm = None
+    reference = (
+        None if reference_powers_dbm is None
+        else _as_power_vector(reference_powers_dbm, n_tone, "reference_powers_dbm")
+    )
+
+    off_grid = np.atleast_2d(levels["off_db"])
+    g_now, outside = _interp_along_power(gain_grid, power_grid, targets)
+    l_now, _ = _interp_along_power(level_grid, power_grid, targets)
+    l_off, _ = _interp_along_power(off_grid, power_grid, targets)
+
+    def _aggregate(level_db):
+        finite = level_db[np.isfinite(level_db)]
+        if finite.size == 0:
+            return float("nan")
+        return float(10.0 * np.log10(np.sum(10.0 ** (finite / 10.0))))
+
+    aggregate = _aggregate(l_now)
+    aggregate_off = _aggregate(l_off)
+    finite_levels = l_now[np.isfinite(l_now)]
+    excess = (
+        float(
+            10.0 * np.log10(np.mean(10.0 ** (finite_levels / 10.0)))
+            - np.median(finite_levels)
+        )
+        if finite_levels.size else float("nan")
+    )
+
+    if reference is None:
+        g_ref = np.full(n_tone, np.nan)
+        l_ref = np.full(n_tone, np.nan)
+        reference_aggregate = float("nan")
+    else:
+        g_ref, _ = _interp_along_power(gain_grid, power_grid, reference)
+        l_ref, _ = _interp_along_power(level_grid, power_grid, reference)
+        reference_aggregate = _aggregate(l_ref)
+
+    delta_gain = g_now - g_ref
+    delta_aggregate = aggregate - reference_aggregate
+    delta_noise = -delta_gain + epsilon * delta_aggregate
+
+    return {
+        "tone_index": np.arange(n_tone, dtype=int),
+        "powers_dbm": targets,
+        "reference_powers_dbm": reference,
+        "transducer_gain_db": g_now,
+        "rx_level_db": l_now,
+        "rx_level_off_db": l_off,
+        "adc_share_db": l_now - aggregate,
+        "delta_gain_db": delta_gain,
+        "delta_noise_db": delta_noise,
+        "outside_swept_range": outside,
+        "aggregate_db": aggregate,
+        "aggregate_off_db": aggregate_off,
+        "unused_headroom_db": aggregate_off - aggregate,
+        "reference_aggregate_db": reference_aggregate,
+        "delta_aggregate_db": delta_aggregate,
+        "aggregate_excess_db": excess,
+        "epsilon": epsilon,
+        "at": str(at),
+        "n_outside": int(np.count_nonzero(outside)),
+    }
+
+
+def _fine_power_grid(gain_grid, level_grid, power_grid, step_db):
+    """Resample the measured gain/level curves onto a fine per-tone power axis.
+
+    The sweep's power steps are coarse (2 dB is typical), and an allocator that
+    can only return swept powers quantises everything it does.  Interpolation
+    stays strictly inside each tone's measured range -- the gain curve steepens
+    toward bifurcation, so extrapolating it would overstate exactly the
+    allocations that are already the riskiest.
+    """
+    n_tone = gain_grid.shape[1]
+    axes, gains, levels = [], [], []
+    for k in range(n_tone):
+        good = (
+            np.isfinite(gain_grid[:, k])
+            & np.isfinite(level_grid[:, k])
+            & np.isfinite(power_grid[:, k])
+        )
+        if np.count_nonzero(good) < 2:
+            axes.append(np.array([]))
+            gains.append(np.array([]))
+            levels.append(np.array([]))
+            continue
+        x = power_grid[good, k]
+        order = np.argsort(x)
+        x = x[order]
+        g = gain_grid[good, k][order]
+        l = level_grid[good, k][order]
+        n = max(2, int(np.ceil((x[-1] - x[0]) / float(step_db))) + 1)
+        axis = np.linspace(x[0], x[-1], n)
+        axes.append(axis)
+        gains.append(np.interp(axis, x, g))
+        levels.append(np.interp(axis, x, l))
+    return axes, gains, levels
+
+
+def optimise_tone_powers(
+    run,
+    *,
+    epsilon=1.0,
+    objective="mean_db",
+    best_power=None,
+    power_caps_dbm=None,
+    cap_key="p_bif_sub_3db",
+    cap_margin_db=0.0,
+    adc_budget_db=None,
+    max_loss_db=None,
+    reference_powers_dbm=None,
+    at="max",
+    power_step_db=0.1,
+    max_iter=200,
+    tol=1e-9,
+):
+    """Allocate tone powers by maximising measured array sensitivity.
+
+    The counterpart to :py:func:`balance_tone_powers`, which enforces limits in
+    tone-power space.  This one optimises the quantity those limits exist to
+    protect, using the gain and level curves the power sweep already measured
+    (:py:func:`transducer_gain`, :py:func:`carrier_levels`) rather than a model
+    of them.
+
+    The shared RX attenuator charges ``epsilon`` dB to every tone for each dB
+    of aggregate ADC level, so with ``C_j`` tone *j*'s linear ADC power the
+    objective is a per-tone benefit against that one shared cost:
+
+    ``J = <benefit> - epsilon * 10*log10(sum_j C_j)``
+
+    Setting ``dJ/dP_i = 0`` makes every tone independently maximise
+    ``benefit_i - lam * C_i`` for a single shared price ``lam``, solved here by
+    bisection.  That is a water-fill generalised to arbitrary measured curves:
+    it assumes nothing about how gain follows power, so it handles the Duffing
+    steepening near bifurcation and the saturation that sets in when a tone is
+    read at its dip centre, both of which are already in the data.
+
+    The limits are the interesting cases and both fall out of the same price:
+
+    - ``epsilon = 0`` (an LNA-dominated chain) gives ``lam = 0``, so every tone
+      simply climbs to its own best power and there is no balancing problem.
+    - ``epsilon = 1`` (a floor fixed at the ADC) makes ADC power fully costed,
+      and tones whose gain curve has gone flat are pulled back hard because
+      they are spending budget for nothing.
+
+    Parameters
+    ----------
+    run : dict or str or Path
+        A :py:func:`run_power_sweep` result or run directory.
+    epsilon : float, optional
+        dB of referred noise won per dB of ADC fill (default ``1.0``).
+        Measure it with :py:func:`adc_fill_response`; it is a property of the
+        readout chain, and the answer here genuinely depends on it.
+    objective : {'mean_db', 'inverse_variance'}, optional
+        What "best" means for the array.
+
+        ``'mean_db'`` (default) maximises the mean transducer gain in dB --
+        the geometric mean of the referred noise -- so every detector counts
+        equally and the result is scale-free.
+
+        ``'inverse_variance'`` maximises ``sum_i |dz/dx|_i**2``, which is
+        mapping speed if every pixel is co-added.  Use it deliberately: the
+        sum is dominated by whichever tones happen to have the largest gain,
+        and on a real array that tail is partly artifacts.  On one 379-tone
+        campaign a single tone carried 31% of the sum and the top ten carried
+        55%, four of them with failed fits, and optimising it left 305 of 379
+        tones worse off than they started.
+    best_power : list of dict or str or Path or None, optional
+        A :py:func:`find_best_power` result supplying the bifurcation caps.
+        ``None`` (default) loads the run's own ``best_power.json`` if present.
+    power_caps_dbm : array-like or None, optional
+        Hard upper power limit per tone, overriding ``cap_key``.
+    cap_key : str, optional
+        Which :py:func:`best_power_arrays` column to cap with (default
+        ``'p_bif_sub_3db'``).
+    cap_margin_db : float, optional
+        Extra margin subtracted from every cap (default ``0``).
+    adc_budget_db : float or None, optional
+        Hard ceiling on the aggregate ADC level.  ``None`` (default) lets
+        ``epsilon`` set the trade on its own.  When given and the free optimum
+        exceeds it, the price is raised by bisection until the aggregate fits.
+    max_loss_db : float or None, optional
+        Refuse to cost any tone more than this many dB of transducer gain
+        relative to ``reference_powers_dbm``.  This is the knob for "I will
+        sacrifice some tones, but not to the point of switching them off":
+        without it the optimum can flatten a minority by tens of dB.
+    reference_powers_dbm : array-like or dict or None, optional
+        Allocation that ``max_loss_db`` and the reported deltas are measured
+        against; ``None`` (default) uses the run's stored best powers.
+    at : {'max', 'tone'}, optional
+        Readout point, passed to :py:func:`transducer_gain`.  Not cosmetic --
+        see :py:func:`allocation_metrics`.
+    power_step_db : float, optional
+        Resolution of the interpolated power axis (default ``0.1`` dB).
+    max_iter, tol : optional
+        Fixed-point iteration controls.
+
+    Returns
+    -------
+    dict
+        ``allocated_power_dbm`` plus every key of
+        :py:func:`allocation_metrics` for the result, and ``power_cap_dbm``,
+        ``loss_floor_overridden`` (tones whose bifurcation cap forced them
+        below ``max_loss_db`` -- the cap wins, and these are worth reading the
+        ANL plots for, since it means ``find_best_power`` chose a power above
+        the tone's own cap), ``price``, ``converged``, ``n_iter``,
+        ``objective``, ``objective_db``,
+        ``objective_gain_db``/``objective_aggregate_db`` (the two terms of
+        ``J``), and ``constraints`` recording what was applied.
+
+    See Also
+    --------
+    balance_tone_powers : constraint satisfaction in tone-power space.
+    allocation_metrics : score any allocation, including this one.
+    adc_fill_response : measure ``epsilon``.
+    """
+    if isinstance(run, (str, Path)):
+        run = load_power_sweep(run)
+    gain = transducer_gain(run, at=at)
+    levels = carrier_levels(run, at=at)
+    gain_grid = np.atleast_2d(gain["gain_db"])
+    level_grid = np.atleast_2d(levels["on_db"])
+    power_grid = np.atleast_2d(np.asarray(run["powers_dbm"], dtype=float))
+    n_tone = gain_grid.shape[1]
+    if power_grid.shape != gain_grid.shape:
+        power_grid = np.broadcast_to(
+            power_grid.reshape(-1, 1), gain_grid.shape
+        ).copy()
+
+    try:
+        epsilon = float(epsilon)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("epsilon must be a finite number.") from exc
+    if not np.isfinite(epsilon) or epsilon < 0.0:
+        raise ValueError("epsilon must be finite and non-negative.")
+    objective = str(objective).lower()
+    if objective not in {"mean_db", "inverse_variance"}:
+        raise ValueError("objective must be 'mean_db' or 'inverse_variance'.")
+
+    if best_power is None and run.get("root"):
+        try:
+            best_power = load_best_power(run["root"])
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            best_power = None
+    if power_caps_dbm is not None:
+        caps = _as_tone_array(power_caps_dbm, n_tone, "power_caps_dbm")
+    elif best_power is not None:
+        arrays = best_power_arrays(best_power, tone_count=n_tone)
+        if cap_key not in arrays:
+            raise ValueError(
+                f"cap_key must be one of {sorted(arrays)}, got {cap_key!r}."
+            )
+        caps = np.asarray(arrays[cap_key], dtype=float).ravel()
+    else:
+        caps = np.full(n_tone, np.inf)
+    caps = caps - float(cap_margin_db)
+
+    reference = None
+    if reference_powers_dbm is not None:
+        reference = _as_power_vector(
+            reference_powers_dbm, n_tone, "reference_powers_dbm"
+        )
+    elif best_power is not None:
+        reference = _as_power_vector(best_power, n_tone, "best_power")
+
+    axes, gains, lvls = _fine_power_grid(
+        gain_grid, level_grid, power_grid, power_step_db
+    )
+
+    # Normalise both curves so the price is O(1) and the exponentials cannot
+    # overflow; a common scaling on each term leaves the argmax untouched.
+    finite_gain = gain_grid[np.isfinite(gain_grid)]
+    finite_level = level_grid[np.isfinite(level_grid)]
+    gain_ref = float(np.median(finite_gain)) if finite_gain.size else 0.0
+    level_ref = float(np.median(finite_level)) if finite_level.size else 0.0
+
+    allowed = []
+    overridden = np.zeros(n_tone, dtype=bool)
+    for k in range(n_tone):
+        axis = axes[k]
+        if axis.size == 0:
+            allowed.append(np.zeros(0, dtype=bool))
+            continue
+        # The bifurcation cap is a hard safety limit; max_loss_db is only a
+        # preference.  When they conflict -- a tone whose cap sits below its
+        # reference power -- the cap has to win, and the tone takes the best
+        # gain still under it.  Falling back to the lowest swept power instead
+        # would hand the tone tens of dB of loss while appearing to honour a
+        # 3 dB floor.
+        capped = np.ones(axis.size, dtype=bool)
+        if np.isfinite(caps[k]):
+            capped &= axis <= caps[k] + 1e-9
+        if not np.any(capped):
+            capped[0] = True                       # cap below everything swept
+        mask = capped.copy()
+        if (
+            max_loss_db is not None
+            and reference is not None
+            and np.isfinite(reference[k])
+        ):
+            floor = np.interp(reference[k], axis, gains[k]) - float(max_loss_db)
+            mask &= gains[k] >= floor - 1e-9
+        if not np.any(mask):
+            mask = capped
+            overridden[k] = True
+        allowed.append(mask)
+
+    u = [
+        10.0 ** ((gains[k] - gain_ref) / 10.0) if axes[k].size else np.zeros(0)
+        for k in range(n_tone)
+    ]
+    c = [
+        10.0 ** ((lvls[k] - level_ref) / 10.0) if axes[k].size else np.zeros(0)
+        for k in range(n_tone)
+    ]
+
+    n_valid = sum(1 for k in range(n_tone) if axes[k].size)
+    benefit = u if objective == "inverse_variance" else gains
+
+    def _allocate(price):
+        """Each tone independently maximises ``benefit - price * c``."""
+        chosen = np.full(n_tone, np.nan)
+        u_total = 0.0
+        c_total = 0.0
+        for k in range(n_tone):
+            if axes[k].size == 0:
+                continue
+            mask = allowed[k]
+            score = benefit[k] - price * c[k]
+            idx = np.flatnonzero(mask)[int(np.argmax(score[mask]))]
+            chosen[k] = axes[k][idx]
+            u_total += float(u[k][idx])
+            c_total += float(c[k][idx])
+        return chosen, u_total, c_total
+
+    def _self_consistent_price(price):
+        """The price implied by the allocation that ``price`` produces."""
+        _, u_total, c_total = _allocate(price)
+        if c_total <= 0:
+            return 0.0
+        if objective == "inverse_variance":
+            return epsilon * u_total / c_total
+        return epsilon * n_valid * (10.0 / np.log(10.0)) / c_total
+
+    # Solve price = f(price) by bracket-and-bisect rather than fixed-point
+    # iteration: the per-tone argmax is a step function of price, so iterating
+    # can cycle between two allocations and never settle.
+    price = 0.0
+    converged = True
+    n_iter = 0
+    if epsilon > 0.0:
+        lo = 0.0
+        hi = max(_self_consistent_price(0.0), 1e-12)
+        converged = False
+        for _ in range(int(max_iter)):
+            n_iter += 1
+            if hi - _self_consistent_price(hi) >= 0.0:
+                converged = True
+                break
+            lo, hi = hi, hi * 4.0
+        for _ in range(80):
+            n_iter += 1
+            mid = 0.5 * (lo + hi)
+            if mid - _self_consistent_price(mid) >= 0.0:
+                hi = mid
+            else:
+                lo = mid
+            if hi - lo <= float(tol) * max(1.0, hi):
+                break
+        price = hi
+    chosen, u_total, c_total = _allocate(price)
+
+    budget_applied = False
+    if adc_budget_db is not None:
+        budget = float(adc_budget_db)
+        aggregate = 10.0 * np.log10(c_total) + level_ref
+        if aggregate > budget:
+            budget_applied = True
+            lo, hi = price, max(price, 1.0)
+            for _ in range(200):                       # grow until it fits
+                _, _, c_hi = _allocate(hi)
+                if 10.0 * np.log10(c_hi) + level_ref <= budget:
+                    break
+                lo, hi = hi, hi * 4.0 + 1.0
+            for _ in range(200):                       # then bisect
+                mid = 0.5 * (lo + hi)
+                _, _, c_mid = _allocate(mid)
+                if 10.0 * np.log10(c_mid) + level_ref <= budget:
+                    hi = mid
+                else:
+                    lo = mid
+            price = hi
+            chosen, u_total, c_total = _allocate(price)
+
+    metrics = allocation_metrics(
+        run,
+        chosen,
+        reference_powers_dbm=reference,
+        epsilon=epsilon,
+        at=at,
+    )
+    objective_agg = float(10.0 * np.log10(c_total) + level_ref) if c_total > 0 else np.nan
+    if objective == "inverse_variance":
+        objective_gain = (
+            float(10.0 * np.log10(u_total) + gain_ref) if u_total > 0 else np.nan
+        )
+    else:
+        finite_now = metrics["transducer_gain_db"]
+        finite_now = finite_now[np.isfinite(finite_now)]
+        objective_gain = float(np.mean(finite_now)) if finite_now.size else np.nan
+    result = dict(metrics)
+    result.update({
+        "allocated_power_dbm": chosen,
+        "power_cap_dbm": caps,
+        "loss_floor_overridden": overridden,
+        "n_loss_floor_overridden": int(np.count_nonzero(overridden)),
+        "price": float(price),
+        "converged": bool(converged),
+        "n_iter": int(n_iter),
+        "objective": objective,
+        "objective_gain_db": objective_gain,
+        "objective_aggregate_db": objective_agg,
+        "objective_db": objective_gain - epsilon * objective_agg,
+        "constraints": {
+            "epsilon": epsilon,
+            "objective": objective,
+            "cap_key": None if power_caps_dbm is not None else str(cap_key),
+            "cap_margin_db": float(cap_margin_db),
+            "adc_budget_db": None if adc_budget_db is None else float(adc_budget_db),
+            "adc_budget_applied": bool(budget_applied),
+            "max_loss_db": None if max_loss_db is None else float(max_loss_db),
+            "at": str(at),
+            "power_step_db": float(power_step_db),
+        },
+    })
+    return result
+
+
+def _linear_fill_steps(fill_db, level_db, min_fill_response):
+    """Steps over which the accumulated fill still tracks the level knob.
+
+    A comb that compresses at the ADC keeps a raw snapshot peak that tracks
+    the attenuator 1:1 while the *per-tone* accumulated level stops responding,
+    because clipping scatters power out of the tone bins.  That flattens the
+    fill axis and drags any fitted ``epsilon`` toward zero, so the hot steps
+    have to be found and dropped -- a saturation flag from a short snapshot
+    does not catch it.  Returns a boolean mask over steps, keeping the
+    contiguous run that ends at the coldest step.
+    """
+    level = np.asarray(level_db, dtype=float).ravel()
+    if level.size != fill_db.shape[0]:
+        raise ValueError("level_db must have one value per step.")
+    order = np.argsort(level)                      # hot (low attenuation) first
+    median_fill = np.nanmedian(fill_db, axis=1)[order]
+    sorted_level = level[order]
+
+    keep_sorted = np.ones(level.size, dtype=bool)
+    for i in range(level.size - 2, -1, -1):
+        step = sorted_level[i + 1] - sorted_level[i]
+        if step <= 0:
+            continue
+        response = (median_fill[i] - median_fill[i + 1]) / step
+        if response < float(min_fill_response):
+            keep_sorted[: i + 1] = False           # this step and everything hotter
+            break
+    keep = np.zeros(level.size, dtype=bool)
+    keep[order] = keep_sorted
+    return keep
+
+
+def _fit_epsilon(fill, noise, clip_sigma, min_points):
+    """Per-tone least-squares of ``noise = c - epsilon * fill``, MAD-clipped."""
+    n_tone = fill.shape[1]
+    epsilon = np.full(n_tone, np.nan, dtype=float)
+    epsilon_err = np.full(n_tone, np.nan, dtype=float)
+    intercept = np.full(n_tone, np.nan, dtype=float)
+    residual = np.full(n_tone, np.nan, dtype=float)
+    n_used = np.zeros(n_tone, dtype=int)
+    lever = np.full(n_tone, np.nan, dtype=float)
+
+    for k in range(n_tone):
+        good = np.isfinite(fill[:, k]) & np.isfinite(noise[:, k])
+        for _ in range(2 if clip_sigma else 1):
+            if np.count_nonzero(good) < min_points:
+                break
+            x, y = fill[good, k], noise[good, k]
+            if np.ptp(x) <= 0:
+                good[:] = False
+                break
+            slope, offset = np.polyfit(x, y, 1)
+            if clip_sigma is None:
+                break
+            res = y - (slope * x + offset)
+            scale = 1.4826 * np.median(np.abs(res - np.median(res)))
+            if not np.isfinite(scale) or scale <= 0:
+                break
+            keep = np.abs(res - np.median(res)) <= float(clip_sigma) * scale
+            if keep.all():
+                break
+            idx = np.flatnonzero(good)
+            good[idx[~keep]] = False
+
+        if np.count_nonzero(good) < min_points:
+            continue
+        x, y = fill[good, k], noise[good, k]
+        if np.ptp(x) <= 0:
+            continue
+        slope, offset = np.polyfit(x, y, 1)
+        res = y - (slope * x + offset)
+        var = np.sum(res ** 2) / max(1, x.size - 2)
+        sxx = np.sum((x - x.mean()) ** 2)
+        epsilon[k] = -float(slope)
+        epsilon_err[k] = float(np.sqrt(var / sxx)) if sxx > 0 else np.nan
+        intercept[k] = float(offset)
+        residual[k] = float(np.sqrt(np.mean(res ** 2)))
+        n_used[k] = int(x.size)
+        lever[k] = float(np.ptp(x))
+    return epsilon, epsilon_err, intercept, residual, n_used, lever
+
+
+def adc_fill_response(fill_db, noise_db, *, level_db=None,
+                      min_fill_response=0.8, clip_sigma=3.0, min_points=3):
+    """Fit ``epsilon``: dB of referred noise won per dB of ADC fill.
+
+    This is what couples the tones to each other.  They share
+    one RX attenuator, so raising the aggregate forces that attenuator up and
+    every tone loses ``epsilon`` dB.  ``epsilon = 1`` means the noise floor is
+    fixed at the ADC and the fill is worth having; ``epsilon = 0`` means the
+    floor rides the RX gain (an LNA-dominated chain) and the ADC constraint
+    costs nothing but clipping.  It is a property of the readout chain, so it
+    has to be measured per system -- see
+    ``scripts/adc_headroom/01_attenuation_ladder.py``, which steps the RX
+    attenuation with everything else held fixed.
+
+    The fit is ``noise_db = intercept - epsilon * fill_db``, so ``epsilon`` is
+    minus the slope.  Both inputs must come from the *same* ladder: the
+    referred noise has to be divided by that step's own ``|dz/dx|``, or the
+    carrier scaling cancels the effect being measured.
+
+    Parameters
+    ----------
+    fill_db : array-like
+        ADC fill per ladder step, in dB.  Shape ``(n_step,)`` for one common
+        axis, or ``(n_step, n_tone)`` for a per-tone one (the measured
+        accumulator level is the natural choice).
+    noise_db : array-like
+        Referred noise PSD in dB, ``10*log10(S_x)``, same shape.  Off
+        resonance, so it is the readout floor with no detector noise diluting
+        it -- on resonance a detector-limited tone reads ``epsilon`` toward 0
+        and you measure the array instead of the chain.
+    level_db : array-like or None, optional
+        The level-knob setting per step (attenuation in dB, higher = colder).
+        Supplying it enables the compression check below, and it is strongly
+        recommended: without it a ladder run too hot returns a confident
+        ``epsilon`` near zero with no indication anything is wrong.
+    min_fill_response : float, optional
+        dB of accumulated fill required per dB of ``level_db`` for a step to
+        count as linear (default ``0.8``).  Steps at and above the first one
+        that fails are dropped as ADC-compressed.  Ignored when ``level_db``
+        is ``None``.
+    clip_sigma : float or None, optional
+        One pass of MAD outlier rejection on the residuals at this many
+        sigma-equivalents (default ``3.0``); ``None`` disables it.  A clipped
+        or mistuned step is the usual outlier.
+    min_points : int, optional
+        Steps required after clipping for a tone to be fitted (default ``3``).
+
+    Returns
+    -------
+    dict
+        ``epsilon`` (per tone), ``epsilon_median``, ``epsilon_err``,
+        ``intercept``, ``residual_rms_db``, ``n_used``, ``valid``,
+        ``lever_arm_db`` -- the span of fill actually covered, which is what
+        sets whether the answer means anything -- and ``linear_steps`` /
+        ``n_compressed`` when ``level_db`` was given.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from souk_readout_tools import power_sweep as ps
+    >>> fill = np.array([0.0, 2.0, 4.0, 6.0, 8.0])
+    >>> noise = 12.0 - 0.5 * fill                    # a half-and-half chain
+    >>> out = ps.adc_fill_response(fill, noise)
+    >>> round(float(out["epsilon_median"]), 3)
+    0.5
+    """
+    fill = np.asarray(fill_db, dtype=float)
+    noise = np.asarray(noise_db, dtype=float)
+    if fill.ndim == 1:
+        fill = fill[:, None]
+    if noise.ndim == 1:
+        noise = noise[:, None]
+    if fill.shape[0] != noise.shape[0]:
+        raise ValueError("fill_db and noise_db must have the same step count.")
+    if fill.shape[1] == 1 and noise.shape[1] > 1:
+        fill = np.broadcast_to(fill, noise.shape).copy()
+    if noise.shape[1] == 1 and fill.shape[1] > 1:
+        noise = np.broadcast_to(noise, fill.shape).copy()
+    if fill.shape != noise.shape:
+        raise ValueError("fill_db and noise_db must have the same shape.")
+    min_points = max(2, int(min_points))
+
+    linear = None
+    if level_db is not None:
+        linear = _linear_fill_steps(fill, level_db, min_fill_response)
+        if np.count_nonzero(linear) < min_points:
+            raise ValueError(
+                f"only {np.count_nonzero(linear)} of {fill.shape[0]} steps have "
+                f"the accumulated fill tracking the level knob at >= "
+                f"{min_fill_response} dB/dB; the rest are ADC-compressed and "
+                "would fit a spuriously low epsilon. Re-run the ladder with "
+                "the comb backed further off."
+            )
+        fill = fill[linear]
+        noise = noise[linear]
+
+    epsilon, epsilon_err, intercept, residual, n_used, lever = _fit_epsilon(
+        fill, noise, clip_sigma, min_points
+    )
+    n_tone = fill.shape[1]
+    valid = np.isfinite(epsilon)
+
+    # epsilon is a *local* slope, not a constant of the system.  Writing the
+    # noise-to-carrier as N_after/C + N_before/C, only the first term moves
+    # with the carrier: at high fill the before-the-attenuator noise dominates
+    # and epsilon tends to 0, at low fill the ADC term takes over and it tends
+    # to 1.  Measured on a 1000-tone comb in RF loopback it ran 0.57 over the
+    # first 12 dB of attenuation and 0.97 over the last 12.  Fit each half so a
+    # ladder that spans the bend cannot be read as a single number.
+    step_fill = np.nanmedian(fill, axis=1)
+    order = np.argsort(step_fill)[::-1]              # high fill first
+    split = max(2, int(np.ceil(order.size / 2)))
+    halves = {}
+    for name, idx in (("epsilon_high_fill", order[:split]),
+                      ("epsilon_low_fill", order[-split:])):
+        if idx.size >= 2:
+            sub = _fit_epsilon(fill[idx], noise[idx], clip_sigma, 2)[0]
+            halves[name] = (
+                float(np.median(sub[np.isfinite(sub)]))
+                if np.any(np.isfinite(sub)) else float("nan")
+            )
+        else:
+            halves[name] = float("nan")
+    spread = halves["epsilon_low_fill"] - halves["epsilon_high_fill"]
+    if np.isfinite(spread) and abs(spread) > 0.3:
+        warnings.warn(
+            f"epsilon varies across the ladder "
+            f"({halves['epsilon_high_fill']:.2f} at high fill, "
+            f"{halves['epsilon_low_fill']:.2f} at low fill): the single fitted "
+            "value is an average over a bend, not a constant. Use the half "
+            "that brackets your operating fill, or re-run a shorter ladder "
+            "centred on it.",
+            stacklevel=2,
+        )
+
+    extra = dict(halves)
+    if linear is not None:
+        extra.update({
+            "linear_steps": linear,
+            "n_compressed": int(np.count_nonzero(~linear)),
+        })
+    return {
+        **extra,
+        "epsilon": epsilon,
+        "epsilon_median": float(np.median(epsilon[valid])) if np.any(valid) else np.nan,
+        "epsilon_err": epsilon_err,
+        "intercept": intercept,
+        "residual_rms_db": residual,
+        "n_used": n_used,
+        "lever_arm_db": lever,
+        "valid": valid,
+    }
+
+
 # --- Plotting ----------------------------------------------------------------
 
 def _plot_transform_title(title, deembed, phase_center, phase_rotate=False):
@@ -9881,6 +11088,163 @@ def plot_best_power_vs_frequency(
     )
     ax.grid(True, alpha=0.25)
 
+    path = output_dir / filename
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    if not show:
+        plt.close(fig)
+    _progress(verbose, f"  Saved {path}")
+    return str(path)
+
+
+def plot_allocation(
+    run,
+    powers_dbm,
+    *,
+    reference_powers_dbm=None,
+    epsilon=1.0,
+    at="max",
+    metrics=None,
+    output_dir=None,
+    filename="allocation.png",
+    show=False,
+    dpi=80,
+    figsize=(11.0, 7.4),
+    verbose=True,
+):
+    """Save the four-panel picture of what a power allocation costs and buys.
+
+    The panels answer the four questions an allocation has to survive:
+
+    1. *Is the drive doing anything?*  Measured transducer gain against power,
+       one thin line per tone, with the allocation marked.  A tone whose line
+       has gone flat is one where more power is pure ADC budget for no gain.
+    2. *Who wins and who pays?*  Per-tone ``delta_noise_db`` against tone
+       frequency.  Below zero is better off.
+    3. *Who is hogging the ADC?*  Sorted on-resonance levels with the mean and
+       median marked; the gap between them is ``aggregate_excess_db``.
+    4. *How bad is the worst case?*  Sorted ``delta_noise_db``, so a loss floor
+       can be read straight off ("N tones lose more than X dB").
+
+    Parameters
+    ----------
+    run, powers_dbm, reference_powers_dbm, epsilon, at
+        As for :py:func:`allocation_metrics`.
+    metrics : dict or None, optional
+        A precomputed :py:func:`allocation_metrics` result to plot instead of
+        recomputing.  The other scoring arguments are then ignored.
+    output_dir : str, Path, or None, optional
+        Directory for the PNG (created if missing).  ``None`` (default) uses
+        the run's ``plots/`` directory when known, else the current directory.
+    filename, show, dpi, figsize, verbose
+        Standard output controls, as elsewhere in this module.
+
+    Returns
+    -------
+    path : str or None
+        The written PNG path, or ``None`` when nothing finite could be drawn.
+    """
+    import matplotlib.pyplot as plt
+
+    verbose = _verbose_level(verbose)
+    if isinstance(run, (str, Path)):
+        run = load_power_sweep(run)
+    if metrics is None:
+        metrics = allocation_metrics(
+            run,
+            powers_dbm,
+            reference_powers_dbm=reference_powers_dbm,
+            epsilon=epsilon,
+            at=at,
+        )
+
+    gain = transducer_gain(run, at=metrics.get("at", at))
+    gain_grid = np.atleast_2d(gain["gain_db"])
+    power_grid = np.atleast_2d(np.asarray(run["powers_dbm"], dtype=float))
+    if power_grid.shape != gain_grid.shape:
+        power_grid = np.broadcast_to(
+            power_grid.reshape(-1, 1), gain_grid.shape
+        ).copy()
+
+    allocated = metrics["powers_dbm"]
+    gain_at = metrics["transducer_gain_db"]
+    level = metrics["rx_level_db"]
+    delta = metrics["delta_noise_db"]
+    freq_hz = np.atleast_2d(gain["frequency_hz"])[-1]
+
+    if not np.any(np.isfinite(gain_at)) and not np.any(np.isfinite(level)):
+        _progress(verbose, "  plot_allocation: nothing finite to draw")
+        return None
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    ax1, ax2, ax3, ax4 = axes.ravel()
+
+    for k in range(gain_grid.shape[1]):
+        ax1.plot(power_grid[:, k], gain_grid[:, k], color="0.75", lw=0.4, zorder=1)
+    ax1.plot(allocated, gain_at, "o", ms=2.5, color="tab:red", zorder=3,
+             label="allocated")
+    ax1.set_xlabel("tone power (dBm)")
+    ax1.set_ylabel(r"transducer gain $20\log_{10}|dz/dx|$ (dB)")
+    ax1.set_title("1. measured gain vs drive")
+    ax1.legend(fontsize="small", loc="upper left")
+
+    finite_delta = np.isfinite(delta)
+    if np.any(finite_delta):
+        colours = np.where(delta[finite_delta] > 0, "tab:red", "tab:blue")
+        ax2.scatter(freq_hz[finite_delta] / 1e6, delta[finite_delta],
+                    s=6, c=colours)
+    ax2.axhline(0.0, color="0.4", lw=0.8)
+    ax2.set_xlabel("tone frequency (MHz)")
+    ax2.set_ylabel(r"$\Delta$ referred noise (dB)")
+    ax2.set_title(
+        f"2. per-tone cost/benefit  ($\\epsilon$={metrics['epsilon']:g}, "
+        f"below 0 is better)"
+    )
+
+    finite_level = level[np.isfinite(level)]
+    if finite_level.size:
+        ax3.plot(np.sort(finite_level)[::-1], lw=1.0, color="tab:purple")
+        mean_db = 10.0 * np.log10(np.mean(10.0 ** (finite_level / 10.0)))
+        ax3.axhline(mean_db, color="tab:red", lw=0.9,
+                    label=f"linear mean ({mean_db:.1f})")
+        ax3.axhline(np.median(finite_level), color="tab:blue", lw=0.9, ls="--",
+                    label=f"median ({np.median(finite_level):.1f})")
+        ax3.legend(fontsize="small", loc="upper right")
+    ax3.set_xlabel("tone, loudest first")
+    ax3.set_ylabel("on-resonance ADC level (dB)")
+    ax3.set_title(
+        f"3. ADC loading  (excess {metrics['aggregate_excess_db']:.2f} dB, "
+        f"unused headroom {metrics['unused_headroom_db']:.2f} dB)"
+    )
+
+    if np.any(finite_delta):
+        ordered = np.sort(delta[finite_delta])[::-1]
+        ax4.plot(np.arange(1, ordered.size + 1), ordered, lw=1.2,
+                 color="tab:green")
+        ax4.axhline(0.0, color="0.4", lw=0.8)
+        n_worse = int(np.count_nonzero(ordered > 0))
+        ax4.set_title(
+            f"4. worst case  ({n_worse} of {ordered.size} tones worse off, "
+            f"median {np.median(ordered):+.1f} dB)"
+        )
+    ax4.set_xlabel("tones ranked by loss")
+    ax4.set_ylabel(r"$\Delta$ referred noise (dB)")
+
+    for ax in (ax1, ax2, ax3, ax4):
+        ax.grid(alpha=0.3)
+    if metrics["n_outside"]:
+        fig.text(
+            0.5, 0.005,
+            f"{metrics['n_outside']} tone(s) allocated outside the swept "
+            "power range: held at the nearest measured point, not extrapolated",
+            ha="center", fontsize="small", color="tab:red",
+        )
+    fig.tight_layout()
+
+    if output_dir is None:
+        root = run.get("root")
+        output_dir = Path(root) / "plots" if root else Path(".")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / filename
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     if not show:
