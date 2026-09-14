@@ -85,13 +85,17 @@ python3 fpg_addrs.py \
 Then run both profilers with those offsets (root required for /dev/mem):
 
 ```bash
+# offsets below are v7.12; they change EVERY firmware generation -- always
+# take them from fpg_addrs.py above rather than copying these.
 sudo ./devmem_profile --dev /dev/mem \
-    --write-addr 0x050000 --read-addr 0x090000 \
-    --tones 1000 --read-chans 1000 --out devmem_profile_c_hw.txt
+    --write-addr 0x13000000 --read-addr 0x10000000 \
+    --steps 10000 --tones 1000 --read-chans 1000 --bulk \
+    --out devmem_profile_c_hw_bulk.txt
 
 sudo ~/py3.12-venv/bin/python devmem_profile.py --dev /dev/mem \
-    --write-addr 0x050000 --read-addr 0x090000 \
-    --tones 1000 --read-chans 1000 --out devmem_profile_py_hw.txt
+    --write-addr 0x13000000 --read-addr 0x10000000 \
+    --steps 10000 --tones 1000 --read-chans 1000 \
+    --out devmem_profile_py_hw.txt
 ```
 
 For the dual-pipeline krm firmware, pipeline 0 is control buffer
@@ -178,6 +182,108 @@ serialized reads resist scheduler interruption). The bulk modes are 2.5× faster
 in the median but show a handful of sub-millisecond scheduler-jitter outliers
 per 10000 steps. Speed wins; the determinism tradeoff is noted only.
 
+## Results (real hardware, RFSOC ARM, /dev/mem) — firmware v7.12.1
+
+Same rig, same invocation: pipeline 0, 1000 tones / 1000 read-chans, 10000
+steps, medians. Only the addresses change —
+`--write-addr 0x13000000 --read-addr 0x10000000`, from `fpg_addrs.py`.
+
+**What is different in the hardware.** v7.12 moves the accumulator output and
+the eight LO control buffers off 32-bit AXI4-Lite onto **128-bit AXI4 BRAMs at
+`0xB000_0000`+**, and doubles the AXI control clock **100 → 200 MHz**
+(`PL0_REF_CTRL` divisor `0xa → 0x5`, in `psu_init` inside `BOOT.BIN`). Nothing
+in the profilers changed except `MAP_SIZE` (32 MiB → 512 MiB, since the new
+region sits at offsets above `0x10000000`).
+
+| mode | write(posted) | write(sync) | read | step | read ns/word | read MB/s |
+|------|------|------|------|------|------|------|
+| Python bulk (`mm[a:b]`) | 16.77 µs | 19.08 µs | 53.40 µs | 72.48 µs | 26.7 | 149.3 |
+| **C bulk (`--bulk` memcpy)** | **14.91 µs** | **15.36 µs** | **44.49 µs** | **59.85 µs** | **22.2** | **179.3** |
+
+Against the v7.11 rows above:
+
+| | v7.11 | v7.12 | gain |
+|---|---|---|---|
+| Python read | 168 µs | 53.40 µs | **3.15×** |
+| C-bulk read | 163 µs | 44.49 µs | **3.66×** |
+| Python write (posted, like-for-like) | 207 µs | 16.77 µs | **12.3×** |
+| C-bulk write (posted) | 196 µs | 14.91 µs | **13.1×** |
+| Python step | 375 µs | 72.48 µs | **5.2×** |
+| C-bulk step | 359 µs | 59.85 µs | **6.0×** |
+
+Two caveats on that table. The v7.11 `write` column is the *posted* time (that
+run predates the posted/sync split), so the write rows compare posted-to-posted;
+the v7.12 `step` uses the honest `write(sync)`, which makes the step gain
+slightly *understated* — posted-to-posted it is 5.34× for Python. And the
+in-RAM backing-file floor is still ~17 µs/step, so hardware is now only ~3.5×
+the RAM floor where it was ~21×: **the bus is no longer the overwhelming term.**
+
+**The write gain was not predicted and dominates the step.** The plan for this
+upgrade forecast a ~4× improvement on the *read* path and said little about
+writes. Reads came in slightly under that (3.2–3.7×) because they are blocking
+round-trips and remain latency-bound. Writes improved **12–13×** because they
+are posted and stream: a 32-bit port at 100 MHz became a 128-bit port at
+200 MHz, 8× the theoretical bandwidth, with better coalescing on top.
+
+C-bulk's **22.2 ns/word / 179.3 MB/s is 94% of the ~190 MB/s uncached-Device
+ceiling** quoted for this SoC, so the read path is now essentially at the limit
+of what the CPU's uncached mapping can do. Getting past it needs DMA, not
+firmware (see TBD below). A read near ~42 ns/word instead would indicate the
+AXI clock is still at 100 MHz, i.e. a stale `BOOT.BIN`.
+
+### The language gap reopened: 3% → 21%
+
+| ratio | v7.11 | v7.12 |
+|---|---|---|
+| Python ÷ C-bulk, read | 1.03× | **1.20×** |
+| Python ÷ C-bulk, step | 1.045× | **1.21×** |
+
+Nothing about Python got slower. Its fixed per-operation overhead (~9 µs on the
+read: the `bytes` allocation behind `mm[a:b]`, then `np.frombuffer`) is
+unchanged — but when the bus took 163 µs that cost was invisible, and now the
+bus takes 44 µs it is a fifth of the total. **The bottleneck has moved from the
+bus into software.**
+
+This weakens, but does not overturn, the v7.11 conclusion below. Still true:
+per-word `volatile` C remains far worse than bulk anything, so any rewrite must
+stay bulk. Against it: 12.6 µs/step is second-order next to the 303 µs/step the
+upgrade already delivered, and these profilers measure *only* the devmem
+operations — a real sweep step also builds frames and computes tone parameters
+in Python, so the in-situ share is smaller than 21%. Measure `get_sweep_data`
+end-to-end before deciding.
+
+### Still TBD
+
+This measures the **CPU-mapped `/dev/mem` path on v7.12.1 with the 200 MHz
+clock and the AXI4 BRAMs**. Four things are not covered:
+
+- **UIO (dropping root).** The new device tree exposes `user_io@a0000000`;
+  `/dev/uio0`, `/dev/uio1` and `/dev/udmabuf0..7` are present and
+  `uio_pdrv_genirq.of_id=generic-uio` survives in `/proc/cmdline`. Expected to
+  be the *same speed* as `/dev/mem` — it buys permissions, not latency — but
+  unmeasured here.
+- **DMA-style reads (ZDMA into a cached u-dma-buf).** The only route past the
+  ~190 MB/s uncached ceiling, since that ceiling is a property of the CPU
+  mapping rather than the fabric. `software/rfsoc_scripts/zdma_read_example.py`
+  on `v7.12` is a hardware-validated reference. Not attempted.
+- **Sweeps are not broken.** These profilers write and read the *right
+  addresses* but not meaningful *values* — they never exercise the tone map,
+  channel map or fitter. Confirming a sweep still fits a known resonator to the
+  same `fr`/`Qi`/`Qc` as v7.11 is a separate, and stronger, check.
+- **Timestream *integrity* at high rate is already better; the rate *ceiling*
+  is a separate question.** `packet_error` is set when the accumulation counter
+  advances during the read, i.e. a straddled, possibly torn read — so it is a
+  straddle probability, and the read shrinking 168 → 53 µs cuts it directly. At
+  2000 Hz the accumulation window is 500 µs, so the read went from **34% of the
+  window to 11%**. Post-upgrade, `packet_error` is **0 at every rate up to
+  2000 Hz**, which was *not* the case on v7.11. That much is a real win and is
+  attributable to this change. What is **not** established is whether the
+  achievable sample *rate* rises: the residual loss at 1800–2000 Hz shows up as
+  gaps in `packet_counter` with `packet_error` still 0, i.e. the loop returning
+  late rather than the read overrunning — that points at the per-sample framing
+  and `await writer.drain()` path in `readout_server.get_samples`. Needs a
+  like-for-like rate scan against v7.11 numbers to quantify.
+
 ## Conclusions
 
 1. **It's bus-bound, not CPU-bound.** A sweep step is ~360–620 µs on hardware
@@ -196,14 +302,17 @@ per 10000 steps. Speed wins; the determinism tradeoff is noted only.
    read-chans, and at ~82 ns/word the bus is the language-independent limit. A
    burst/DMA-capable transport is the only thing that could beat the bulk read.
 
-> **Firmware v7.12 is that transport.** It moves the accumulator and LO control
-> buffers onto burst-capable 128-bit AXI4 BRAMs and doubles the AXI control clock
-> to 200 MHz, which should take CPU reads to the ~190 MB/s uncached-Device-memory
-> ceiling (~21 ns/word, a ~4× read improvement). That ceiling belongs to the CPU's
-> uncached mapping rather than the fabric, so beating it needs ZDMA into a cached
-> `u-dma-buf` — see `software/rfsoc_scripts/zdma_read_example.py` in souk-firmware.
-> Re-run the table above after the v7.12 upgrade and keep the v7.11 rows for
-> comparison.
+> **Firmware v7.12 is that transport, and it delivered.** Measured on v7.12.1:
+> read 3.2× (Python) / 3.7× (C-bulk), write 12–13×, **step 5.2× / 6.0×** — see the
+> v7.12.1 results section above. C-bulk reaches 22.2 ns/word, 94% of the ~190 MB/s
+> uncached ceiling, so the read path is now near the limit of the CPU's uncached
+> mapping. Conclusions 2 and 3 above are **v7.11-era**: at v7.12 speeds the
+> Python-vs-C gap widened from 3% to 21%, because fixed interpreter overhead no
+> longer hides behind a slow bus. Conclusion 4's premise also weakens — the bus is
+> now ~3.5× the RAM floor rather than ~21×. Beating the remaining ceiling still
+> needs ZDMA into a cached `u-dma-buf`
+> (`software/rfsoc_scripts/zdma_read_example.py` in souk-firmware), which is
+> untried — see **Still TBD** above.
 
 ## Files
 

@@ -1,5 +1,27 @@
 # Changelog & Feature List
 
+## v1.8.0
+
+**Validated against firmware v7.12.1.** The minor version tracks the firmware
+generation. v7.12 code support shipped in v1.7.10; this release marks it verified
+on hardware. Sweep step **375 us -> 72 us (5.2x; 6.0x in C)**, read 84 -> 26.7
+ns/word, write 12.3x. The 16-bit `synth_input_reorder` map needs **no** byte swap,
+and sparse 32-bit writes into the 128-bit AXI4 BRAM lines do not clobber their
+neighbours (byte-write strobes confirmed on hardware). `packet_error` is now 0 at
+sample rates up to 2000 Hz, where v7.11 showed errors.
+
+**The board needs more than a new `.fpg`:** casperfpga `a89480c`, control_sw
+`7.12.1`, souk_readout_tools >= 1.7.10, plus `BOOT.BIN`, `top.bit` and `image.ub`.
+`BOOT.BIN` is a performance dependency (200 MHz AXI clock), not a correctness gate.
+New `doc/v712-notes.md` carries the register moves, the boot-source finding, the
+in-place update procedure and the measured numbers; `profiling/README.md` gains the
+v7.12.1 results table alongside the v7.11 rows.
+
+**`timing.format_timing_status()` renders `get_info('timing')` as seven lines.**
+The raw dict is ~60 keys across six sub-dicts. Surfaces the TAI/UTC offset
+explicitly: PTP runs on TAI, so `telescope_time` is `currentUtcOffset` (37 s) ahead
+of UTC, which is why chrony reports PHC0 as a falseticker unless given `offset=-37`.
+
 ## v1.7.10
 
 **Firmware v7.12: the reorder map word width now comes from the firmware.**

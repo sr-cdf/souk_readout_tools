@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import socket
 import time
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -510,3 +511,93 @@ def report_sync_readiness(summary: dict[str, Any]) -> dict[str, Any]:
         "can_sync": ptp_ready and pps_active,
         "reasons": reasons,
     }
+
+
+def format_timing_status(status: dict[str, Any]) -> str:
+    """Render ``get_info('timing')`` as a short human-readable report.
+
+    The raw dict is ~60 keys across six sub-dicts, which buries the handful of
+    facts a user actually needs: is it locked, is absolute time trustworthy, and
+    what timescale are the frame timestamps on.
+
+    The TAI line is the one that surprises people. PTP runs on TAI
+    (``ptpTimescale 1``), so the PHC -- and therefore ``telescope_time`` in every
+    frame header -- sits ``currentUtcOffset`` seconds ahead of UTC (37 s at
+    present). chrony compares PHC0 against UTC-based NTP servers, sees that
+    offset and marks it a falseticker. That is correct behaviour, not a fault,
+    and it is why a board can be genuinely locked to a grandmaster while chrony
+    reports ``ntp`` as the active source.
+
+    Parameters
+    ----------
+    status : dict
+        The dict returned by ``client.get_info('timing')``.
+
+    Returns
+    -------
+    str
+        Multi-line report. ``print()`` it.
+
+    Examples
+    --------
+    >>> print(format_timing_status(client.get_info('timing')))   # doctest: +SKIP
+    """
+    s = status.get("summary", {}) or {}
+    ptp = status.get("ptp", {}) or {}
+    phc = status.get("phc", {}) or {}
+    strobe = status.get("strobe", {}) or {}
+    ready = status.get("sync_readiness", {}) or {}
+
+    def _ns(v):
+        return "-" if v is None else f"{v * 1e9:,.0f} ns"
+
+    lines = [
+        f"state       : {s.get('state')}  -- {s.get('condition')}",
+        f"can sync    : {ready.get('can_sync')}   ptp_ready={ready.get('ptp_ready')}"
+        f"  pps_active={ready.get('pps_active')}"
+        + (f"  reasons={ready['reasons']}" if ready.get("reasons") else ""),
+        "",
+        f"PTP         : {ptp.get('port_state')}  gm={ptp.get('gm_identity')}"
+        f"  offset={ptp.get('master_offset_ns')} ns"
+        f"  healthy={ptp.get('healthy')} fresh={ptp.get('fresh')} stable={ptp.get('stable')}",
+        f"absolute    : verified={s.get('absolute_time_verified')}"
+        f"  err={_ns(s.get('estimated_abs_error_s'))}"
+        f"  via {s.get('active_source_type')} ({s.get('active_source_name')})",
+        f"strobe      : running={strobe.get('running')} healthy={strobe.get('healthy')}"
+        f"  rearms={strobe.get('rearms')}  tsu_sec={strobe.get('tsu_sec')}",
+    ]
+
+    # The TAI/UTC discrepancy, stated rather than left to be rediscovered.
+    #
+    # Key this off the TSU, NOT off chrony's PHC offset. Setting `offset=-37` on
+    # chrony's PHC0 refclock fixes the *system* clock but leaves the PHC -- and
+    # so the TSU, and so telescope_time -- on TAI. Keying off the chrony offset
+    # would make this warning vanish exactly when it is still needed.
+    utc_offset, ptp_timescale = _ptp_utc_offset(ptp)
+    tsu, now = strobe.get("tsu_sec"), s.get("updated_unix_s")
+    skew = (tsu - now) if (tsu is not None and now is not None) else None
+    if skew is not None and abs(skew) > 1.0:
+        n = utc_offset if utc_offset is not None else round(skew)
+        lines += [
+            "",
+            f"timescale   : telescope_time is TAI, ~{n} s ahead of UTC"
+            + ("  (ptpTimescale=1)" if ptp_timescale else "")
+            + f"  [measured skew {skew:+.0f} s]",
+            f"              Subtract {n} from telescope_time / tsu_sec for UTC."
+            " The system clock is separate and may already be correct.",
+        ]
+    return "\n".join(lines)
+
+
+def _ptp_utc_offset(ptp: dict[str, Any]) -> tuple[int | None, bool]:
+    """Pull ``currentUtcOffset`` and ``ptpTimescale`` out of the pmc text blob.
+
+    ``timing_public_view`` passes the raw ``pmc`` output through as strings, so
+    these two authoritative numbers are only available by parsing them back out.
+    Returns ``(None, False)`` if the blob is missing or unparsable.
+    """
+    text = (ptp.get("pmc") or {}).get("time_properties_data_set") or ""
+    m = re.search(r"currentUtcOffset\s+(-?\d+)", text)
+    offset = int(m.group(1)) if m else None
+    scale = bool(re.search(r"ptpTimescale\s+1", text))
+    return offset, scale
