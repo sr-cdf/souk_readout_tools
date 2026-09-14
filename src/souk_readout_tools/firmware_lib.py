@@ -10500,6 +10500,11 @@ def _cached_read_plan(fast_read_params, tone_indices, sparse_read):
     passed -- an identity check first (the streaming loop reuses one array), then
     a content compare.
     """
+    if sparse_read is None:
+        # No per-call choice: use whatever was set on the params dict, which is
+        # how the server carries a client's override without threading it
+        # through prepare_frame's ten call sites.
+        sparse_read = fast_read_params.get('sparse_read')
     if sparse_read is False or tone_indices is None:
         return None
     if fast_read_params['nbranch'] != 1:

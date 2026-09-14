@@ -2721,10 +2721,10 @@ class ReadoutClient:
             'enabled': bool(enabled),
         })
 
-    def enable_stream(self):
+    def enable_stream(self, sparse_read=None):
         """Enable continuous sample streaming on the server."""
         self._warn_zero_phases()
-        message = {'request': 'enable_stream'}
+        message = {'request': 'enable_stream', 'sparse_read': sparse_read}
         return self.send_request(message)
 
     def disable_stream(self):
@@ -3415,7 +3415,7 @@ class ReadoutClient:
         """
         return self.get_parameter('clock_status')
 
-    def get_samples(self, num_samples,incl_system_info=True,burst=False):
+    def get_samples(self, num_samples,incl_system_info=True,burst=False,sparse_read=None):
         """
         Acquire num_samples samples from the readout server and return concatenated raw data.
 
@@ -3432,6 +3432,13 @@ class ReadoutClient:
         burst : bool, optional
             Use a single burst transfer instead of streaming frames (default
             ``False``).
+        sparse_read : bool or None, optional
+            How the server reads the accumulator. ``None`` (default) lets it
+            read only the active channels when that is cheaper than the whole
+            buffer and fall back automatically when it is not -- which is the
+            right choice essentially always. ``False`` forces the full-buffer
+            read, ``True`` forces the partial one; both exist to diagnose a
+            suspected read problem rather than to be set routinely.
         """
         if self.mock:
             return self._mock_server.get_samples(num_samples, incl_system_info, burst)
@@ -3439,7 +3446,8 @@ class ReadoutClient:
         self._warn_zero_phases()
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((self.request_server_address, self.request_server_port))
-            message = {'request': 'get_samples', 'num_samples': num_samples, 'burst': burst}
+            message = {'request': 'get_samples', 'num_samples': num_samples, 'burst': burst,
+                       'sparse_read': sparse_read}
             # Send message length
             message_data = json.dumps(message).encode()
             message_len = struct.pack('>I', len(message_data))

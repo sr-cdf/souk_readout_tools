@@ -141,7 +141,7 @@ def _format_request_log(message):
 
     request_log_fields = {
         'get_info': ('sections',),
-        'get_samples': ('num_samples', 'burst'),
+        'get_samples': ('num_samples', 'burst', 'sparse_read'),
         'get_accumulator_snapshots': ('tone_index', 'num_snapshots', 'fast'),
         'batch_accumulator_snapshots': ('tone_indices', 'num_snapshots'),
         'batch_adc_snapshots': ('num_snapshots',),
@@ -3093,6 +3093,7 @@ class ReadoutServer:
 
 
                 elif request == 'enable_stream':
+                    self.stream_sparse_read = message.get('sparse_read')
                     self.e_triggered_stream_enabled.clear()
                     self.e_stream_enabled.set()
                     print('Stream enabled, clients:', self.stream_clients)
@@ -4095,7 +4096,9 @@ class ReadoutServer:
                 elif request == 'get_samples':
                     num_samples = message.get('num_samples')
                     burst = message.get('burst', False)
-                    task = asyncio.create_task(self.get_samples(writer, num_samples, burst=burst))
+                    task = asyncio.create_task(self.get_samples(
+                        writer, num_samples, burst=burst,
+                        sparse_read=message.get('sparse_read')))
                     self.tasks.append(task)
 
                 elif request == 'get_accumulator_snapshots':
@@ -5147,7 +5150,7 @@ class ReadoutServer:
         return payload,cnt,err
     
 
-    async def get_samples(self, writer, num_samples, burst=False):
+    async def get_samples(self, writer, num_samples, burst=False, sparse_read=None):
         """
         Get a fixed number of samples over the request channel.
 
@@ -5165,6 +5168,11 @@ class ReadoutServer:
             Number of accumulator samples to return.
         burst : bool, optional
             Single-burst transfer. Incompatible with modulation (rejected).
+        sparse_read : bool or None, optional
+            ``None`` (default) lets the reader decide whether to read only the
+            active channels or the whole accumulator, whichever is cheaper.
+            ``False`` forces the full-buffer read, ``True`` forces the partial
+            one. Only worth setting to diagnose a suspected read problem.
         """
         try:
             pending_op = None
@@ -5213,6 +5221,7 @@ class ReadoutServer:
                 self._modulation_owner = 'samples'
 
             fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
+            fast_read_params['sparse_read'] = sparse_read
             rate = firmware_lib.get_sample_rate(self.r_fast)
 
             if modulating:
@@ -6371,6 +6380,7 @@ class ReadoutServer:
         """
         err_count=0
         fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
+        fast_read_params['sparse_read'] = getattr(self, 'stream_sparse_read', None)
         while True:
             try:
                 if not self.e_stream_enabled.is_set():
@@ -6472,6 +6482,7 @@ class ReadoutServer:
         """
         # err_count=0
         fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
+        fast_read_params['sparse_read'] = getattr(self, 'stream_sparse_read', None)
         while True:
             try:
                 if self.e_triggered_stream_enabled.is_set():

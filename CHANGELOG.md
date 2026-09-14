@@ -10,6 +10,13 @@ accumulation, at every tone count**, and make the 10 us poll period in
 `_blocking_wait_for_acc` meaningful for the first time (each iteration
 previously cost 27 us, so the period was inoperative).
 
+**`sparse_read` is selectable from the client.** `get_samples(...,
+sparse_read=)` and `enable_stream(sparse_read=)` carry the override to the
+server, which records it on `fast_read_params` rather than threading it through
+`prepare_frame`'s ten call sites. `None` (default) auto-selects, `False` forces
+the full-buffer read, `True` forces the partial one; the explicit values exist
+to diagnose a suspected read problem, not for routine use.
+
 **Partial accumulator reads for small tone sets.** `plan_accumulator_reads`
 groups requested channels into contiguous runs, merging runs closer than
 ~37 channels (where bridging is cheaper than another transaction), and
