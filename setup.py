@@ -47,7 +47,11 @@ gui_dependencies = [
 # (spt3g needs a C++ toolchain / nmake). They are exposed as the optional
 # [g3] extra instead; the client imports them lazily and only receive_stream_g3()
 # requires them.
-client_dependencies = []
+client_dependencies = [
+    # Board management (souk-find-boards / -board-status / -board-power)
+    # talks to the carrier BMC over USB serial from the control PC.
+    'pyserial',
+]
 
 # Define server-specific dependencies
 server_dependencies = [
@@ -86,6 +90,9 @@ if install_client:
         'souk-batch-snapshots=souk_readout_tools.client.client_scripts.batch_snapshots:main',
         'souk-find-resonances=souk_readout_tools.client.client_scripts.find_resonances:main',
         'souk-stream-to-dac=souk_readout_tools.client.client_scripts.stream_to_dac:main',
+        'souk-find-boards=souk_readout_tools.board_management:_cli_find_boards',
+        'souk-board-status=souk_readout_tools.board_management:_cli_status',
+        'souk-board-power=souk_readout_tools.board_management:_cli_power',
         'souk-mkid-finder-app=souk_readout_tools.mkid_finder_app:main'
     ])
     entry_points['gui_scripts'].extend([
@@ -130,7 +137,7 @@ if install_server:
 
 setup(
     name='souk_readout_tools',
-    version='1.7.8',
+    version='1.7.9',
     description='Tools for the SOUK readout',
     author='Sam Rowe',
     author_email='sam.rowe@astro.cf.ac.uk',
@@ -146,6 +153,7 @@ setup(
         'data/calibrations/*',
         'data/daemon/*',
         'data/timing/*',
+        'data/udev/*',
         'server/souk-peripherals-control/*.py',
     ]},
     install_requires=install_requires,

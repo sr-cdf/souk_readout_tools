@@ -4,6 +4,7 @@ import importlib.util as _importlib_util
 
 # Submodules available for lazy import.
 _SUBMODULES = [
+    "board_management",
     "calibration",
     "firmware_lib",
     "tone_list_tools",

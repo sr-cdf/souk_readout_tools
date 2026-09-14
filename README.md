@@ -151,6 +151,9 @@ For full installation details (including server setup, SD card imaging, and daem
 | `souk-mkid-finder-app` | Launch the interactive MKID resonance finder GUI |
 | `souk-batch-snapshots` | Acquire pre-accumulator snapshots across tones |
 | `souk-find-resonances` | Find resonances from sweep data |
+| `souk-find-boards` | List attached RFSoC USB serial bridges and identify the board-management port |
+| `souk-board-status` | Read and health-check the board management controller (read-only) |
+| `souk-board-power` | Report or change the RFSoC board power state via the BMC |
 
 **Server** (installed on the RFSoC):
 
@@ -187,6 +190,7 @@ For full installation details (including server setup, SD card imaging, and daem
 | [RF Peripherals](doc/rf_peripherals.md) | RF attenuator, bypass amplifier, and discovery tooling |
 | [LNA Bias](doc/lna_bias.md) | Cryostat LNA bias control, soft-off, and status monitoring |
 | [Dual Pipeline](doc/dual_pipeline.md) | Dual-pipeline setup, initialisation model, and multi-server operation |
+| [Board Management](doc/board_management.md) | RFSoC board management controller (BMC) over USB serial: power on/off, board health, boot and clock settings |
 | [Clock Source](doc/clock_source.md) | PL reference clock selection (internal/external) and PLL status |
 | [Timing and PTP](doc/timing.md) | `ptp4l`, chrony, timing-monitor setup, standalone monitoring, and firmware-sync readiness |
 | [Timing Site Checklist](doc/timing_site_checklist.md) | Site commissioning checks for PTP GM, chrony, monitor state, and holdover behaviour |

@@ -1,5 +1,21 @@
 # Changelog & Feature List
 
+## v1.7.9
+
+**Board management over USB serial: `souk-find-boards`, `souk-board-status`,
+`souk-board-power`.** New `board_management` module reaches the KRM-4ZU47DR
+carrier BMC from the control PC (pyserial, a new client dependency). Read-only
+by construction: `_send()` accepts only `READ_COMMANDS`, and `power_on()` /
+`power_off()` are the only writers, each needing `confirm=True` and an
+explicitly named board. Boards are selected by USB serial, device name, or the
+board serial the BMC reports.
+
+**Board selection is cross-platform**; udev aliases and `dialout` are not.
+`_looks_like_device()` accepts `COM7` / `\\.\COM10` as well as `/dev/ttyUSB1`,
+and `--udev` (rules template in `data/udev/99-souk-rfsoc-serial.rules`) refuses
+to run off Linux, pointing at USB-serial selection instead. See
+`doc/board_management.md`.
+
 ## v1.7.8
 
 **Sound card as a stream-to-dac output: `alsa` backend.** New

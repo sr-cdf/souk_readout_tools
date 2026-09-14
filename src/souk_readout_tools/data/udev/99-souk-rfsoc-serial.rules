@@ -1,0 +1,44 @@
+# SOUK RFSoC USB serial aliases
+#
+# Each KRM-4ZU47DR board reaches the control PC through a single Silicon
+# Labs CP2105 dual UART bridge (USB 10c4:ea70). Its two UARTs enumerate as
+# two ttyUSB nodes sharing one USB serial number:
+#
+#   interface 00 -- "Enhanced Com Port" (SCI)
+#   interface 01 -- "Standard Com Port" (ECI)
+#
+# One is the ARM Linux console, the other is the board management
+# controller (BMC). Their ttyUSB numbering depends on plug order -- and a
+# control PC may have dozens of other serial devices -- so pin them to
+# stable names using the bridge's serial number plus the USB interface
+# number, which does NOT move.
+#
+# 1. Find the serial numbers and which interface is which:
+#        souk-find-boards
+#        souk-find-boards --udev > 99-souk-rfsoc-serial.rules   # generated
+#    or by hand:
+#        python3 -m serial.tools.list_ports -v
+#        udevadm info -a -n /dev/ttyUSB0 | grep -m1 '{serial}'
+#        udevadm info -q property -n /dev/ttyUSB0 | grep ID_USB_INTERFACE_NUM
+#
+# 2. Edit the serial numbers and board names below.
+#
+# 3. Install:
+#        sudo cp 99-souk-rfsoc-serial.rules /etc/udev/rules.d/
+#        sudo udevadm control --reload && sudo udevadm trigger
+#
+# 4. Add yourself to the dialout group so sudo is not needed:
+#        sudo usermod -aG dialout $USER      # log out and back in
+#
+# The result is /dev/souk/<board>-console and /dev/souk/<board>-bmc.
+#
+# WARNING: confirm which interface really is the BMC on your boards before
+# trusting these aliases. `souk-find-boards` probes for it safely.
+
+# --- board 'rfsoc01' (replace 01449C3F with your bridge's serial) ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea70", ATTRS{serial}=="01449C3F", ENV{ID_USB_INTERFACE_NUM}=="00", SYMLINK+="souk/rfsoc01-console", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea70", ATTRS{serial}=="01449C3F", ENV{ID_USB_INTERFACE_NUM}=="01", SYMLINK+="souk/rfsoc01-bmc",     GROUP="dialout", MODE="0660"
+
+# --- board 'rfsoc02' ---
+#SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea70", ATTRS{serial}=="0144A017", ENV{ID_USB_INTERFACE_NUM}=="00", SYMLINK+="souk/rfsoc02-console", GROUP="dialout", MODE="0660"
+#SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea70", ATTRS{serial}=="0144A017", ENV{ID_USB_INTERFACE_NUM}=="01", SYMLINK+="souk/rfsoc02-bmc",     GROUP="dialout", MODE="0660"
