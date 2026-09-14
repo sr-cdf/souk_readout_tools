@@ -1,5 +1,21 @@
 # Changelog & Feature List
 
+## v1.7.8
+
+**Sound card as a stream-to-dac output: `alsa` backend.** New
+`stream_dac.AlsaDac` (optional `pyalsaaudio`) drives any ALSA playback device;
+`DAC0`/`DAC1` map to the first two audio channels, so LabJack configs port over.
+The card owns the clock: `write()` only sets a target level and a writer thread
+emits one ramped period per `pcm.write`. Config `dac.alsa` (`device`, `rate`,
+`channels`, `period_size`, `full_scale_volts`); `make_dac_backend`'s second
+argument is now `options`, not `labjack_options`. Linux only: the guarded
+import falls back to `dummy` on Windows and macOS.
+
+**Line outputs are AC-coupled** — no DC, so `idle_voltage` and `v_offset` are
+inert there. `--backend alsa --selftest` (`stream_dac.alsa_selftest`) measures
+`full_scale_volts` and the coupling corner; `--list-audio-devices` finds the
+device string. See `doc/stream_to_dac.md`.
+
 ## v1.7.7
 
 **Tone powers can be allocated from measured sensitivity instead of power.**

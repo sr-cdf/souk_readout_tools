@@ -12,7 +12,7 @@ RFSoC readout server ──TCP stream──▶ souk-stream-to-dac (client machin
                                           │
                        IQ → df conversion (resonator calibration)
                                           │
-                              USB DAC (LabJack T-series)
+                     USB DAC (LabJack) or sound card (ALSA)
                                           │
                               TOPTICA analog input
 ```
@@ -182,14 +182,71 @@ just a channel name (`TDAC0`) with wider `v_min`/`v_max`. Match
   also settle slowly: expect ~0.1 V of ripple/settling lag at these rates
   (loopback error ≈0.11 V rms), so add RC filtering on the AO line if the
   TOPTICA needs a cleaner control voltage.
+- `alsa` — a sound card via `pyalsaaudio`. **Linux only**: ALSA is the Linux
+  sound API, so on Windows and macOS the guarded import fails and the backend
+  falls back to `dummy` with a warning (the LabJack backends are the portable
+  option there). Install with `sudo apt install libasound2-dev` then
+  `pip install pyalsaaudio`. Cheap, fast and multichannel, and the
+  fallback when no LabJack is available — but line outputs are **AC-coupled**,
+  which changes what the output means. Read
+  [Sound card as DAC](#sound-card-as-dac-ac-coupling) before using it.
+  Options live in `dac.alsa` (`device`, `rate`, `channels`, `period_size`,
+  `full_scale_volts`); channels `DAC0`/`DAC1` map to the first two audio
+  channels, so a LabJack config ports over unchanged.
 - `dummy` — no hardware; remembers/prints writes. Default fallback when the
-  selected LabJack driver is not installed, and what all development and
-  tests use.
+  selected LabJack or ALSA driver is not installed, and what all development
+  and tests use.
 
 Optional AIN sampling (`dac.ain_channels`) reads listed analog inputs once
 per output update and logs them with host time plus the `tt` of the nearest
 stream frame — reserved for a future TOPTICA frequency-monitor or
-step-trigger line. Off by default.
+step-trigger line. Off by default, and always zeros on the `alsa` backend
+(there is no live capture path; the selftest opens capture separately).
+
+## Sound card as DAC: AC coupling
+
+A sound card is an excellent DAC in every respect but one: its line output is
+capacitively coupled, so it **cannot emit a static level**. DC is blocked
+outright and everything below the coupling corner `f_c` is high-passed — a
+step decays back to zero with time constant `tau = 1/(2 pi f_c)`. The
+stream-to-dac output is a slowly-varying, near-DC control voltage, so this is
+not a detail: whether the backend is usable depends entirely on where `f_c`
+sits relative to the timescale of the features in your scan.
+
+`idle_voltage` is therefore physically 0 V on this backend whatever it is set
+to (the safe-state write still happens, it just decays away), and per-channel
+`v_offset` does nothing.
+
+**Measure `f_c` before trusting a slow scan.** `souk-stream-to-dac --backend
+alsa --selftest` runs three stages (about 90 s in total):
+
+1. lists the ALSA cards and playback PCMs, so you can pick `dac.alsa.device`
+   (`--list-audio-devices` alone does just this). Prefer an explicit `hw:`
+   device — it bypasses PipeWire/PulseAudio volume and resampling, which would
+   otherwise sit inside your voltage calibration;
+2. plays a 1 kHz sine at half of digital full scale. Read it with a DMM in AC
+   volts and set `dac.alsa.full_scale_volts = sqrt(2) * V_rms / 0.5`. The
+   mixer gain is inside that number — set the mixer once, then leave it alone
+   (and check it is not muted);
+3. plays a 0.1 Hz square wave, then a sine ladder from 0.2 Hz to 100 Hz. Scope
+   the output: the square wave's exponential droop gives `tau` directly, and
+   the ladder gives the −3 dB point. Passing a capture device measures the
+   ladder automatically, but line-**in** is AC-coupled too, so a loopback
+   corner is only an upper bound on the output's own.
+
+If the measured corner is too high for your scan, in order of preference:
+
+- **chop the source.** If the THz source is chopped (or the TOPTICA detects at
+  a modulation frequency), the information is already AC well above `f_c` and
+  AC coupling costs nothing.
+- **use a DC-coupled interface.** Expert Sleepers ES-8/ES-9, MOTU and similar
+  interfaces have DC-coupled outputs designed for control voltages. The same
+  `alsa` backend drives them with no code change — only `full_scale_volts` and
+  the device name differ.
+- **software pre-emphasis** (`v + (1/tau) * integral(v)`) inverts the measured
+  single pole exactly. Small to add, but the integrator has finite headroom, so
+  it buys a bounded scan length rather than true DC. Not implemented — measure
+  first, then decide whether it is worth it.
 
 ## Latency budget and measurement
 
@@ -201,6 +258,7 @@ Contributions per update, all bounded:
 | boxcar window | N/sample_rate = 1/update_rate | `dac.update_rate_hz` |
 | queue staleness (worst case) | queue_depth/sample_rate | `stream.queue_depth` |
 | USB DAC write | ≈1 ms (T-series) / ≈16 ms (U12) | backend/rate |
+| ALSA output buffer | buffer_size/rate (≈21 ms at the defaults) | `dac.alsa.period_size` |
 
 **Bench check** — `souk-stream-to-dac --selftest` (real LabJack, wire DAC0 →
 AIN0): toggles the output 100 times and reports the write+read transaction
@@ -223,6 +281,9 @@ Parameters not yet pinned down are config options, not assumptions:
 | TOPTICA logging rate | `dac.update_rate_hz` |
 | chop / lock-in scheme | `conversion.mode` + `channels[].gain` (chop ref via `dac.ain_channels` later) |
 | exact LabJack model | `dac.labjack.device_type` / `connection_type` / `identifier` |
+| which sound card / ALSA device | `dac.alsa.device` (`--list-audio-devices`) |
+| sound-card output volts at full scale | `dac.alsa.full_scale_volts` (`--selftest`) |
+| sound-card coupling corner | measured with `--selftest`; see [Sound card as DAC](#sound-card-as-dac-ac-coupling) |
 | ±10 V needed (LJTick-DAC) | `channels[].dac_channel` (`TDAC0`) + `v_min`/`v_max` |
 | Toptica frequency-monitor / trigger line | `dac.ain_channels` (+ `recording.ain_log`) |
 | which KID(s) | `channels[].tone_index` or `tone_frequency_hz` |
@@ -233,7 +294,10 @@ Parameters not yet pinned down are config options, not assumptions:
 
 A full session, assuming a working readout config (`my_readout.yaml`) and a
 LabJack on the client machine. Steps 1–3 are one-time preparation; 4–7 are
-the observing loop.
+the observing loop. On the `alsa` backend the same recipe applies, but step 1
+is the card characterisation instead of the loopback selftest — and read
+[Sound card as DAC](#sound-card-as-dac-ac-coupling) first, because an
+AC-coupled output changes what a slow scan looks like.
 
 **1. Prepare the DAC + config (no readout needed).**
 

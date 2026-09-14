@@ -4,10 +4,10 @@
 Stream a chosen KID tone's response to an analog DAC output in real time.
 
 Receives the readout server's continuous TCP stream, converts one or more
-tones' IQ into a scalar (magnitude / phase / frequency shift) and drives a
-USB DAC (LabJack T-series, or a no-hardware dummy backend) so external
-instruments can record a live analog voltage proportional to the KID
-response. See doc/stream_to_dac.md and
+tones' IQ into a scalar (magnitude / phase / frequency shift) and drives an
+analog output (LabJack USB DAC, a sound card via ALSA, or a no-hardware dummy
+backend) so external instruments can record a live analog voltage proportional
+to the KID response. See doc/stream_to_dac.md and
 src/souk_readout_tools/data/config/template_stream_to_dac_config.yaml.
 """
 
@@ -38,7 +38,7 @@ DEFAULT_CONFIG = {
                   'tone_frequency_hz': None, 'gain': 1.0, 'x_offset': 0.0,
                   'v_offset': 0.0, 'v_min': 0.0, 'v_max': 5.0}],
     'dac': {'backend': 'dummy', 'update_rate_hz': 200.0, 'idle_voltage': 0.0,
-            'labjack': {}, 'ain_channels': []},
+            'labjack': {}, 'alsa': {}, 'ain_channels': []},
     'stream': {'queue_depth': None, 'watchdog_s': 5.0,
                'apply_readout_correction': True,
                'subscribe_updates': False},
@@ -85,13 +85,22 @@ def make_client(config, args, parser):
                  'unless --mock or --replay is used')
 
 
+def dac_options(config):
+    """The driver-options block for the configured backend."""
+    backend = config['dac']['backend']
+    return config['dac'].get('alsa' if backend == 'alsa' else 'labjack')
+
+
 def selftest(config):
-    """DAC0 -> AIN0 loopback latency check (needs a real LabJack + a wire)."""
+    """Backend bench check: the ALSA card characterisation, or the LabJack
+    DAC0 -> AIN0 loopback (which needs a real LabJack and a wire)."""
     import time
     import numpy as np
+    backend = config['dac']['backend']
+    if backend == 'alsa':
+        return stream_dac.alsa_selftest(config['dac'].get('alsa'))
     # Use the configured LabJack backend so --selftest --backend labjack_u12
     # exercises the U12; a bare --selftest still defaults to the T-series.
-    backend = config['dac']['backend']
     if backend not in ('labjack', 'labjack_u12'):
         backend = 'labjack'
     dac = stream_dac.make_dac_backend(backend, config['dac'].get('labjack'))
@@ -159,9 +168,10 @@ def main():
     parser.add_argument('--rate', type=float, default=None,
                         help='Override: DAC update rate in Hz.')
     parser.add_argument('--backend', type=str, default=None,
-                        choices=['dummy', 'labjack', 'labjack_u12'],
+                        choices=['dummy', 'labjack', 'labjack_u12', 'alsa'],
                         help='Override: DAC backend (labjack = T-series/LJM, '
-                             'labjack_u12 = U12/LabJackPython).')
+                             'labjack_u12 = U12/LabJackPython, alsa = sound '
+                             'card via pyalsaaudio).')
     parser.add_argument('--replay', type=str, default=None,
                         help='Replay a recorded stream file (with .json '
                              'sidecar) instead of connecting to a server.')
@@ -171,8 +181,13 @@ def main():
     parser.add_argument('--max-updates', type=int, default=None,
                         help='Stop after this many DAC updates (testing).')
     parser.add_argument('--selftest', action='store_true',
-                        help='LabJack DAC->AIN loopback latency check, then '
-                             'exit (see doc/stream_to_dac.md).')
+                        help='Backend bench check, then exit: card '
+                             'characterisation for --backend alsa, LabJack '
+                             'DAC->AIN loopback otherwise (see '
+                             'doc/stream_to_dac.md).')
+    parser.add_argument('--list-audio-devices', action='store_true',
+                        help='List the ALSA cards and playback devices, then '
+                             'exit (finds the dac.alsa.device string).')
     parser.add_argument('-q', '--quiet', action='store_true',
                         help='Suppress the ~1 Hz status line.')
 
@@ -189,6 +204,18 @@ def main():
     if args.tone is not None:
         config['channels'][0]['tone_index'] = args.tone
         config['channels'][0]['tone_frequency_hz'] = None
+
+    if args.list_audio_devices:
+        try:
+            import alsaaudio
+        except ImportError:
+            print("Listing audio devices needs the 'pyalsaaudio' package "
+                  '(sudo apt install libasound2-dev; pip install pyalsaaudio)')
+            sys.exit(1)
+        print(f'cards: {alsaaudio.cards()}')
+        for name in alsaaudio.pcms(alsaaudio.PCM_PLAYBACK):
+            print(f'  playback: {name}')
+        sys.exit(0)
 
     if args.selftest:
         sys.exit(selftest(config))
@@ -243,7 +270,7 @@ def main():
             v_max=channel_config.get('v_max', 5.0)))
 
     dac = stream_dac.make_dac_backend(config['dac']['backend'],
-                                      config['dac'].get('labjack'))
+                                      dac_options(config))
 
     recording = config['recording']
     recording_path = None

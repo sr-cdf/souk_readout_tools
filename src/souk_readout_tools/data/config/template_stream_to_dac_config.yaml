@@ -56,7 +56,11 @@ conversion:
 #   volts = clip(gain * (x - x_offset) + v_offset, v_min, v_max)
 # where x is the converter output (counts / rad / Hz depending on mode).
 # Match v_min/v_max to the TOPTICA analog input range once known. With an
-# LJTick-DAC (+/-10 V) use e.g. dac_channel: TDAC0 and v_min: -10.0.
+# LJTick-DAC (+/-10 V) use e.g. dac_channel: TDAC0 and v_min: -10.0. On the
+# alsa backend the range is symmetric about zero (v_min: -1.0, v_max: 1.0 for
+# a 1 V full scale) and v_offset does nothing -- the coupling capacitor blocks
+# any standing offset. Channel names DAC0/DAC1 map to the first two audio
+# channels, so a LabJack config ports over unchanged.
 channels:
   - dac_channel: DAC0
     tone_index: 0
@@ -85,8 +89,18 @@ channels:
 #                  Measured: ~16 ms/transaction (~62 writes/s); a tick that
 #                  also samples ain_channels adds another ~16 ms (~31/s). Keep
 #                  update_rate_hz <= 50 (output-only) or <= 25 (with AIN).
+#   'alsa'         a sound card via pyalsaaudio. LINUX ONLY -- on Windows and
+#                  macOS this falls back to the dummy backend; use a LabJack
+#                  there. (sudo apt install libasound2-dev; pip install
+#                  pyalsaaudio.) Cheap, fast and
+#                  multichannel, but line outputs are AC-COUPLED: they cannot
+#                  hold a DC level, and everything below the coupling corner
+#                  is high-passed. Run --selftest to measure that corner and
+#                  full_scale_volts before trusting a slow scan; see
+#                  doc/stream_to_dac.md. A DC-coupled interface (Expert
+#                  Sleepers ES-8/ES-9, MOTU) works with the same backend.
 #   'dummy'        no hardware; also the automatic fallback when the selected
-#                  LabJack driver is not installed.
+#                  LabJack or ALSA driver is not installed.
 # update_rate_hz: DAC updates per second. USB command-response writes cost
 #   ~1 ms (T-series) to ~20 ms (U12) each. The stream is boxcar-averaged over
 #   N = round(sample_rate / update_rate_hz) samples per update.
@@ -95,7 +109,16 @@ channels:
 #   with host time + nearest frame tt — reserved for a future TOPTICA
 #   frequency-monitor or step-trigger line. Empty list disables.
 # labjack: driver options for the selected LabJack backend (keys differ by
-#   backend, see below). Ignored for the dummy backend.
+#   backend, see below). Ignored for the dummy and alsa backends.
+# alsa: driver options for backend: alsa. Ignored otherwise.
+#   device: ALSA PCM name. Prefer an explicit 'hw:' device -- it bypasses
+#     PipeWire/PulseAudio volume and resampling, both of which would sit
+#     inside the voltage calibration. --list-audio-devices prints the choices.
+#   period_size: frames per ALSA period. Set it to about rate/update_rate_hz
+#     so each output update is ramped across one period instead of stepped.
+#   full_scale_volts: output volts at digital full scale, measured with
+#     --selftest. The mixer gain is inside this number, so set the mixer once
+#     and then leave it alone.
 dac:
   backend: dummy
   update_rate_hz: 200.0
@@ -107,7 +130,14 @@ dac:
     # U12 (backend: labjack_u12) uses these instead — delete the three above:
     # id: -1               #   local device id; -1 opens the first U12 found
     # serial_number: null  #   open a specific device by serial (null = any)
-  ain_channels: []         # e.g. [AIN0] (T-series) or [AI0] (U12)
+  alsa:                    # sound card (backend: alsa):
+    device: default        #   e.g. hw:CARD=PCH,DEV=0 (see --list-audio-devices)
+    rate: 48000            #   sample rate, Hz
+    channels: 2            #   audio channels to open (most cards refuse mono)
+    period_size: 256       #   frames per period; ~= rate / update_rate_hz
+    full_scale_volts: 1.0  #   volts at digital full scale; measure it first
+  ain_channels: []         # e.g. [AIN0] (T-series) or [AI0] (U12); the alsa
+                           # backend always reads zeros (no capture path)
 
 # --- Stream handling ---
 # queue_depth: reader->output queue depth in frames; bounds the worst-case

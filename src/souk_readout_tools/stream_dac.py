@@ -5,9 +5,9 @@ This module supports the ``souk-stream-to-dac`` client script
 (:mod:`souk_readout_tools.client.client_scripts.stream_to_dac`): it receives
 the readout server's continuous TCP stream, converts a chosen tone's IQ into
 a scalar (magnitude, phase, or frequency shift via this package's resonator
-calibrations) and drives an analog output on a USB DAC (LabJack T-series) so
-external instruments (e.g. the TOPTICA cw-THz control software) can record a
-live voltage proportional to the KID response.
+calibrations) and drives an analog output -- a USB DAC (LabJack T-series) or a
+sound card via ALSA -- so external instruments (e.g. the TOPTICA cw-THz control
+software) can record a live voltage proportional to the KID response.
 
 Signal chain::
 
@@ -29,8 +29,10 @@ Contents
   :class:`FfmConverter` (live fast-frequency-modulation demodulation with
   recenter-proof absolute output; see ``doc/frequency_modulation.md``).
 - DAC backends: :class:`DummyDac` (default, no hardware),
-  :class:`LabJackDac` (T-series, optional ``labjack-ljm`` dependency) and
-  :class:`LabJackU12Dac` (U12, optional ``LabJackPython`` + Exodriver).
+  :class:`LabJackDac` (T-series, optional ``labjack-ljm`` dependency),
+  :class:`LabJackU12Dac` (U12, optional ``LabJackPython`` + Exodriver) and
+  :class:`AlsaDac` (sound card, optional ``pyalsaaudio`` -- AC-coupled, so
+  characterise it with :func:`alsa_selftest` before trusting a slow scan).
 - Calibration persistence: :func:`save_calibrations`,
   :func:`load_calibrations`, :func:`calibrations_from_sweep`.
 - The application: :class:`StreamToDac`.
@@ -839,17 +841,371 @@ class LabJackU12Dac(DacBackend):
                 self._u12 = None
 
 
-def make_dac_backend(backend, labjack_options=None, print_writes=False):
-    """Build a DAC backend by name ('dummy', 'labjack', or 'labjack_u12').
+# Peak of the signed 32-bit sample format the ALSA backend writes.
+_INT32_PEAK = 2 ** 31 - 1
 
-    'labjack' (T-series via LJM) and 'labjack_u12' (U12 via LabJackPython/
-    Exodriver) fall back to :class:`DummyDac` with a warning when their driver
-    is unavailable, so development machines still run the full pipeline.
+
+class AlsaDac(DacBackend):
+    """Sound-card backend via ALSA (optional dependency: ``pyalsaaudio``).
+
+    A sound card is a fast, cheap, multichannel DAC, and this backend makes
+    one usable where no USB DAC is available. Two things differ from the
+    LabJack backends and both matter:
+
+    **AC coupling.** Line outputs are capacitively coupled, so they cannot
+    emit a static level: DC is blocked and everything below the coupling
+    corner is high-passed. The stream-to-dac output is a slowly-varying,
+    near-DC control voltage, so measure the corner before trusting a slow
+    scan -- :func:`alsa_selftest` does exactly that. ``idle_voltage`` is
+    physically 0 V here whatever it is set to (the safe-state write is still
+    honoured, it just decays away). A DC-coupled interface (Expert Sleepers
+    ES-8/ES-9, MOTU) removes the limitation and needs no code change.
+
+    **The card owns the clock.** ALSA wants a continuous sample stream, while
+    :meth:`DacBackend.write` is a sparse non-blocking push. ``write``
+    therefore only updates a target level; a writer thread emits one period at
+    a time, ramping linearly from the previous targets to the current ones,
+    and blocks in ``pcm.write`` so the card paces it. Set ``period_size`` to
+    about ``rate / update_rate_hz`` and each ramp spans one update interval,
+    which keeps the output smooth instead of stepped.
+
+    Linux only -- ALSA is the Linux sound API, so on Windows and macOS the
+    guarded import fails and :func:`make_dac_backend` falls back to
+    :class:`DummyDac`; the LabJack backends are the portable option there.
+    Needs pyalsaaudio >= 0.9 (the keyword ``PCM`` constructor).
+
+    Parameters
+    ----------
+    device : str, optional
+        ALSA PCM name (default 'default'). Prefer an explicit ``hw:`` device
+        (e.g. 'hw:CARD=PCH,DEV=0') to bypass PipeWire/PulseAudio volume and
+        resampling; :func:`alsa_selftest` lists what is available.
+    rate : int, optional
+        Sample rate in Hz (default 48000).
+    channels : int, optional
+        Audio channels to open (default 2; most cards refuse mono).
+    period_size : int, optional
+        Frames per ALSA period (default 256, i.e. 5.3 ms at 48 kHz).
+    full_scale_volts : float, optional
+        Output volts at digital full scale (default 1.0). Measure it with
+        :func:`alsa_selftest`; it includes the mixer gain, so set the mixer
+        once and then leave it alone.
     """
-    labjack_classes = {'labjack': LabJackDac, 'labjack_u12': LabJackU12Dac}
-    if backend in labjack_classes:
+
+    def __init__(self, device='default', rate=48000, channels=2,
+                 period_size=256, full_scale_volts=1.0):
         try:
-            return labjack_classes[backend](**(labjack_options or {}))
+            import alsaaudio
+        except ImportError as exc:
+            raise ImportError(
+                "ALSA backend needs the 'pyalsaaudio' package (sudo apt "
+                "install libasound2-dev; pip install pyalsaaudio)") from exc
+        self._alsaaudio = alsaaudio
+        self.device = str(device)
+        self.rate = int(rate)
+        self.nchannels = int(channels)
+        self.period_size = int(period_size)
+        self.full_scale_volts = float(full_scale_volts)
+        self.underruns = 0
+        self.write_count = 0
+        self.last_values = {}
+        self.writer_error = None
+        self._pcm = alsaaudio.PCM(
+            type=alsaaudio.PCM_PLAYBACK, mode=alsaaudio.PCM_NORMAL,
+            device=self.device, channels=self.nchannels, rate=self.rate,
+            format=alsaaudio.PCM_FORMAT_S32_LE, periodsize=self.period_size)
+        buffer_frames = self.period_size
+        try:      # pcm.info() needs a newer pyalsaaudio
+            buffer_frames = int(self._pcm.info().get('buffer_size',
+                                                     buffer_frames))
+        except Exception:
+            pass
+        print(f"AlsaDac: opened '{self.device}' at {self.rate} Hz, "
+              f'{self.nchannels} ch, period {self.period_size} frames'
+              f' ({1e3 * self.period_size / self.rate:.1f} ms), buffer '
+              f'{buffer_frames} frames ({1e3 * buffer_frames / self.rate:.1f} '
+              f'ms), full scale {self.full_scale_volts} V')
+        self._targets = np.zeros(self.nchannels)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._writer, name='alsa-dac',
+                                        daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _channel_index(name):
+        """Map an output channel name to an audio channel index.
+
+        Accepts 'DAC0'/'DAC1' (so LabJack configs port over unchanged),
+        'AO0'/'AO1', and 'CH0'..'CHn'.
+        """
+        key = name.strip().upper()
+        for prefix in ('DAC', 'AO', 'CH'):
+            rest = key[len(prefix):]
+            if key.startswith(prefix) and rest.isdigit():
+                return int(rest)
+        raise ValueError("ALSA output channel must be DAC0../AO0../CH0.. "
+                         f"(got '{name}')")
+
+    def _writer(self):
+        """Emit one period at a time, ramping between targets. The blocking
+        ``pcm.write`` is what paces this thread -- the card is the clock."""
+        scale = _INT32_PEAK / self.full_scale_volts
+        ramp = np.linspace(0.0, 1.0, self.period_size, endpoint=False)[:, None]
+        last = np.zeros(self.nchannels)
+        while not self._stop.is_set():
+            with self._lock:
+                target = self._targets.copy()
+            block = last + (target - last) * ramp
+            last = target
+            samples = np.clip(block * scale, -_INT32_PEAK, _INT32_PEAK)
+            try:
+                self._pcm.write(samples.astype('<i4').tobytes())
+            except self._alsaaudio.ALSAAudioError:
+                # Underrun (or a transient device error): count it and let
+                # ALSA re-prepare on the next write instead of spinning hot.
+                self.underruns += 1
+                time.sleep(self.period_size / self.rate)
+            except Exception as exc:
+                # The device is gone: say so rather than freezing the output
+                # at its last value with no explanation.
+                self.writer_error = exc
+                print(f'\nWARNING: AlsaDac writer stopped: {exc!r}; the '
+                      'analog output is no longer being driven')
+                return
+
+    def write(self, values):
+        """Set the target voltage of each named channel (no device I/O)."""
+        with self._lock:
+            for name, volts in values.items():
+                index = self._channel_index(name)
+                if index >= self.nchannels:
+                    raise ValueError(
+                        f"channel '{name}' is beyond the {self.nchannels} "
+                        'audio channels opened (dac.alsa.channels)')
+                self._targets[index] = float(volts)
+        self.last_values = dict(values)
+        self.write_count += 1
+
+    def read_ain(self, channels):
+        """Always zeros: a sound card's line-in is AC-coupled and is not
+        wired into the live path (:func:`alsa_selftest` opens capture
+        separately for the bench loopback)."""
+        return [0.0] * len(channels)
+
+    def close(self):
+        if self._pcm is None:
+            return
+        with self._lock:
+            self._targets[:] = 0.0
+        # Let the writer ramp to zero and flush a couple of periods so the
+        # output does not stop on a step.
+        time.sleep(3 * self.period_size / self.rate)
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        if self.underruns:
+            print(f'AlsaDac: {self.underruns} underrun(s)')
+        if self._thread.is_alive():
+            print('WARNING: AlsaDac writer thread did not stop; leaving the '
+                  'device open')
+            return
+        try:
+            self._pcm.close()
+        finally:
+            self._pcm = None
+
+
+# Sine-ladder frequencies for the low-frequency response stage of
+# alsa_selftest, highest last so it can serve as the 0 dB reference.
+_ALSA_LADDER_HZ = (0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
+
+
+def _alsa_play(pcm, waveform, nchannels, period_size, capture=None):
+    """Play a mono waveform (units of digital full scale) on every channel.
+
+    Writes one period at a time, zero-padding the last one. When ``capture``
+    is an open non-blocking capture PCM, drains it between periods and returns
+    the recorded mono signal (first channel) in units of its own full scale;
+    otherwise returns an empty array.
+    """
+    recorded = []
+    for start in range(0, len(waveform), period_size):
+        block = waveform[start:start + period_size]
+        if len(block) < period_size:
+            block = np.concatenate([block, np.zeros(period_size - len(block))])
+        frame = np.repeat(np.clip(block, -1.0, 1.0)[:, None] * _INT32_PEAK,
+                          nchannels, axis=1)
+        pcm.write(frame.astype('<i4').tobytes())
+        if capture is not None:
+            length, data = capture.read()
+            if length > 0:
+                recorded.append(np.frombuffer(data, dtype='<i4'))
+    if not recorded:
+        return np.zeros(0)
+    return np.concatenate(recorded)[::nchannels] / _INT32_PEAK
+
+
+def _lockin_amplitude(signal, frequency, rate):
+    """Single-bin DFT amplitude of ``signal`` at ``frequency`` (same units)."""
+    if len(signal) < 2:
+        return float('nan')
+    t = np.arange(len(signal)) / rate
+    phasor = np.exp(-2j * np.pi * frequency * t)
+    return float(2.0 * np.abs(np.sum(signal * phasor)) / len(signal))
+
+
+def alsa_selftest(options=None, seconds=20.0, capture_device=None,
+                  droop_hz=0.1, droop_cycles=3):
+    """Bench characterisation of a sound card used as the analog output.
+
+    Three stages, printed as they run:
+
+    1. **Devices** -- the ALSA cards and playback PCMs available, so the right
+       ``dac.alsa.device`` string can be found.
+    2. **Full scale** -- a 1 kHz sine at half of digital full scale, held for
+       ``seconds``. Measure it with a DMM in AC volts and set
+       ``dac.alsa.full_scale_volts = sqrt(2) * V_rms / 0.5``. The mixer gain is
+       inside that number, so set the mixer once and then leave it alone.
+    3. **Low-frequency response** -- a slow square wave (scope the output: the
+       exponential droop time constant ``tau`` gives the coupling corner
+       ``f_c = 1 / (2 pi tau)``), then a sine ladder from 0.2 Hz to 100 Hz.
+       With ``capture_device`` set the ladder is recorded and each amplitude
+       is reported in dB relative to the 100 Hz point.
+
+    A loopback capture passes through an AC-coupled *input* as well, so the
+    corner it reports is an upper bound on the output's own. A scope (or a DMM
+    on the slow square wave) on the output itself is the ground truth.
+
+    Parameters
+    ----------
+    options : dict or None, optional
+        The config's ``dac.alsa`` block (device, rate, channels, period_size,
+        full_scale_volts); missing keys take the :class:`AlsaDac` defaults.
+    seconds : float, optional
+        Duration of the full-scale calibration tone (default 20).
+    capture_device : str or None, optional
+        ALSA capture PCM for the optional loopback measurement, e.g.
+        'hw:CARD=PCH,DEV=0' with line-out wired to line-in (default None).
+    droop_hz, droop_cycles : float, int, optional
+        Frequency and cycle count of the square wave (default 0.1 Hz, 3).
+
+    Returns
+    -------
+    int
+        0 on success, 1 if pyalsaaudio is not installed.
+    """
+    try:
+        import alsaaudio
+    except ImportError:
+        print("selftest: the ALSA backend needs the 'pyalsaaudio' package "
+              '(sudo apt install libasound2-dev; pip install pyalsaaudio)')
+        return 1
+
+    options = dict(options or {})
+    device = options.get('device', 'default')
+    rate = int(options.get('rate', 48000))
+    nchannels = int(options.get('channels', 2))
+    period_size = int(options.get('period_size', 256))
+
+    print('--- ALSA devices ---')
+    print(f'cards: {alsaaudio.cards()}')
+    for name in alsaaudio.pcms(alsaaudio.PCM_PLAYBACK):
+        print(f'  playback: {name}')
+    print("Pick a 'hw:' device for dac.alsa.device: it bypasses "
+          'PipeWire/PulseAudio volume and resampling.\n')
+
+    pcm = alsaaudio.PCM(
+        type=alsaaudio.PCM_PLAYBACK, mode=alsaaudio.PCM_NORMAL, device=device,
+        channels=nchannels, rate=rate, format=alsaaudio.PCM_FORMAT_S32_LE,
+        periodsize=period_size)
+    capture = None
+    if capture_device is not None:
+        capture = alsaaudio.PCM(
+            type=alsaaudio.PCM_CAPTURE, mode=alsaaudio.PCM_NONBLOCK,
+            device=capture_device, channels=nchannels, rate=rate,
+            format=alsaaudio.PCM_FORMAT_S32_LE, periodsize=period_size)
+        print(f"loopback capture open on '{capture_device}'")
+
+    try:
+        # -- 2. full-scale calibration tone --------------------------------
+        amplitude = 0.5
+        print(f'--- Full scale: 1 kHz sine at {amplitude} of digital full '
+              f'scale for {seconds:.0f} s ---')
+        print('Measure it with a DMM in AC volts across the output, then set')
+        print(f'  dac.alsa.full_scale_volts = sqrt(2) * V_rms / {amplitude}')
+        print('The mixer gain is inside that number: set the mixer now and '
+              'leave it alone.')
+        t = np.arange(int(seconds * rate)) / rate
+        _alsa_play(pcm, amplitude * np.sin(2 * np.pi * 1000.0 * t), nchannels,
+                   period_size)
+
+        # -- 3a. slow square wave: the droop measurement --------------------
+        print(f'\n--- Droop: {droop_hz} Hz square wave, {droop_cycles} '
+              'cycles ---')
+        print('Scope the output. A flat top means DC gets through; an '
+              'exponential decay')
+        print('with time constant tau means the coupling corner is '
+              'f_c = 1 / (2 pi tau).')
+        t = np.arange(int(droop_cycles / droop_hz * rate)) / rate
+        _alsa_play(pcm, amplitude * np.sign(np.sin(2 * np.pi * droop_hz * t)),
+                   nchannels, period_size)
+
+        # -- 3b. sine ladder ------------------------------------------------
+        print('\n--- Low-frequency response: sine ladder ---')
+        measured = {}
+        for frequency in _ALSA_LADDER_HZ:
+            duration = max(4.0 / frequency, 1.0)
+            print(f'  {frequency:6.2f} Hz for {duration:5.1f} s', end='',
+                  flush=True)
+            t = np.arange(int(duration * rate)) / rate
+            recorded = _alsa_play(
+                pcm, amplitude * np.sin(2 * np.pi * frequency * t), nchannels,
+                period_size, capture=capture)
+            if capture is not None:
+                # Drop the first half: the capture starts mid-transient.
+                half = len(recorded) // 2
+                measured[frequency] = _lockin_amplitude(
+                    recorded[half:], frequency, rate)
+                print(f'   captured {measured[frequency]:.4g} FS')
+            else:
+                print()
+        if measured:
+            reference = measured[_ALSA_LADDER_HZ[-1]]
+            print(f'\n  relative to {_ALSA_LADDER_HZ[-1]:.0f} Hz '
+                  f'({reference:.4g} FS):')
+            for frequency, value in measured.items():
+                ratio = value / reference if reference > 0 else float('nan')
+                print(f'    {frequency:6.2f} Hz  {20 * np.log10(ratio):+6.2f} '
+                      f'dB' + ('   <- -3 dB corner is near here'
+                               if 0.6 < ratio < 0.79 else ''))
+            print('  NOTE: the capture input is AC-coupled too, so this '
+                  "corner is an upper\n        bound on the output's own -- "
+                  'scope the output for the real number.')
+        else:
+            print('\n  No capture device configured: read the amplitudes off '
+                  'a scope or a DMM\n  in AC volts, and take the -3 dB point '
+                  'as the coupling corner.')
+    finally:
+        if capture is not None:
+            capture.close()
+        pcm.close()
+    return 0
+
+
+def make_dac_backend(backend, options=None, print_writes=False):
+    """Build a DAC backend by name ('dummy', 'labjack', 'labjack_u12', 'alsa').
+
+    ``options`` is the matching driver-options block from the config
+    (``dac.labjack`` or ``dac.alsa``). The hardware backends fall back to
+    :class:`DummyDac` with a warning when their driver is not installed, so
+    development machines still run the full pipeline; a driver that is present
+    but fails to open (e.g. a wrong ALSA device name) raises, as it should.
+    """
+    driver_classes = {'labjack': LabJackDac, 'labjack_u12': LabJackU12Dac,
+                      'alsa': AlsaDac}
+    if backend in driver_classes:
+        try:
+            return driver_classes[backend](**(options or {}))
         except ImportError as exc:
             print(f'WARNING: {exc}; falling back to dummy DAC backend')
             return DummyDac(print_writes=print_writes)
