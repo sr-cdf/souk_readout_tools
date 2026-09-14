@@ -456,6 +456,7 @@ class MockReadoutServer:
     def _info_versions(self):
         return {
             'ready': True,
+            'host': 'mock',
             'souk_readout_tools_version': self._package_version(),
             'souk_mkid_readout_sw_version': 'mock',
             'souk_mkid_readout_fw_version': 'mock',

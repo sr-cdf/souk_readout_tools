@@ -1,5 +1,44 @@
 # Changelog & Feature List
 
+## v1.7.10
+
+**Firmware v7.12: the reorder map word width now comes from the firmware.**
+v7.12 narrows `VaccReorderMultiSampleIn._map_format` to `>i2` (the
+`p*_synth_input_reorder_map*_map1` registers halve, `0x2000` -> `0x1000`), but
+`psb_chanselect_set_channel_inmap` / `psb_chanselect_get_channel_inmap` pinned
+`_fast_inmap_fast_nbytes` / `_fast_inmap_fast_dtype` to 4-byte words and took only
+the byte order from `_map_format`. Both now derive the itemsize too; behaviour on
+v7.11 (`>i4`) is unchanged.
+
+**v7.12 also needs, on the board:** casperfpga `a89480c` (`transport_localmem.MAP_SIZE`
+32 MiB -> 512 MiB), control_sw `7.12.1`, and the new `BOOT.BIN` (`psu_init` enables
+HPM1 at 128 bits and doubles the AXI control clock to 200 MHz) — a new `.fpg` alone is
+not enough. `p*_acc0_dout0` and `p*_mix_{rx,tx}_lo0_control{0,1}` move to AXI4 BRAMs at
+`0xB000_0000`+; all 224 register names are unchanged. `tcpborphserver3` needs no rebuild
+(it sizes its own window from the `.fpg`).
+
+**Fast tone writes no longer rebuild the whole-map view on every call.**
+`prepare_control_buffer_data_fast` tested `tx_lo_control_buffer_mv` /
+`rx_lo_control_buffer_mv` but assigned `tx_lo_control_buffer` / `rx_lo_control_buffer`.
+
+**Profilers reach the v7.12 BRAM region.** `profiling/devmem_profile.{py,c}` `MAP_SIZE`
+32 MiB -> `0x20000000`; `fpg_addrs.py` finds the v7.11 `..._lo0_control0` rename;
+`dump_addrs.py` uses the `(lo, buf)` key. Both were already broken on v7.11.
+
+**`souk_readout_tools.__version__` exists.** Read from the install metadata
+(`importlib.metadata`), so `setup.py` stays the only place the version is written;
+`'unknown'` when imported from a source tree with no `.egg-info`/`.dist-info`.
+
+**`get_info('versions')` says which machine it describes.** The section is the
+board's install, never the client host's; it gains a `host` key (the board's
+nodename), and `info_versions` / `ReadoutClient.get_info` docstrings say so.
+`souk_readout_tools_commit` is None on a non-editable pip install (no `.git`).
+
+**A board deployed without `.git` can still report its commit.** `data/COMMIT`,
+written by `git describe --tags --always --dirty` in the checkout before
+deploying, is read back by `info_versions` when no repo is found (a live `.git`
+still wins). Gitignored, shipped by `package_data`; see `doc/installation.md`.
+
 ## v1.7.9
 
 **Board management over USB serial: `souk-find-boards`, `souk-board-status`,

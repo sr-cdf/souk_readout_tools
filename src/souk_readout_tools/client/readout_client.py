@@ -984,6 +984,11 @@ class ReadoutClient:
             this docstring. A string returns that section directly; a list
             returns a list of section dictionaries in the same order.
 
+        Every section describes the *server* (the RFSoC), including
+        ``'versions'``: ``souk_readout_tools_version`` there is the board's
+        installed version, not this host's. Compare it against the local
+        ``souk_readout_tools.__version__`` to check the two are in step.
+
         Returns
         -------
         dict or list

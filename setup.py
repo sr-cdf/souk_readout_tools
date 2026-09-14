@@ -137,7 +137,7 @@ if install_server:
 
 setup(
     name='souk_readout_tools',
-    version='1.7.9',
+    version='1.7.10',
     description='Tools for the SOUK readout',
     author='Sam Rowe',
     author_email='sam.rowe@astro.cf.ac.uk',
@@ -149,6 +149,7 @@ setup(
         'mkid_finder_app.png',
         'mkid_finder_app.ico',
         'data/readme',
+        'data/COMMIT',
         'data/config/*',
         'data/calibrations/*',
         'data/daemon/*',

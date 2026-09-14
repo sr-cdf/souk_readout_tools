@@ -83,7 +83,8 @@ def main():
     pp = f"p{args.pipeline}"
     write_name, (write_abs, write_size) = find_one(
         regs,
-        [f"{pp}_mix_{args.lo}_lo0_control"],
+        [f"{pp}_mix_{args.lo}_lo0_control0",   # v7.11+: ping-pong split into two regs
+         f"{pp}_mix_{args.lo}_lo0_control"],   # pre-v7.11
         f"{args.lo} control buffer for pipeline {args.pipeline}")
     read_name, (read_abs, read_size) = find_one(
         regs,
@@ -96,11 +97,11 @@ def main():
     print(f"\n=== fpg: {args.fpg} ===")
     print(f"registers parsed : {len(regs)}")
     print(f"write target     : {write_name}")
-    print(f"  abs=0x{write_abs:08x}  offset=0x{write_off:06x}  size=0x{write_size:x}")
+    print(f"  abs=0x{write_abs:08x}  offset=0x{write_off:08x}  size=0x{write_size:x}")
     print(f"read target      : {read_name}")
-    print(f"  abs=0x{read_abs:08x}  offset=0x{read_off:06x}  size=0x{read_size:x}")
+    print(f"  abs=0x{read_abs:08x}  offset=0x{read_off:08x}  size=0x{read_size:x}")
     print("\n--- ready-to-paste profiler args ---")
-    print(f"--dev /dev/mem --write-addr 0x{write_off:06x} --read-addr 0x{read_off:06x}\n")
+    print(f"--dev /dev/mem --write-addr 0x{write_off:08x} --read-addr 0x{read_off:08x}\n")
 
 
 if __name__ == "__main__":

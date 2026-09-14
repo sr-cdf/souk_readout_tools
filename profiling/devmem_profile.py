@@ -24,7 +24,7 @@ pure Python/mmap mechanics on any machine. Pass --dev /dev/mem (needs root and
 the real board) to measure against actual hardware AXI-lite.
 
 Underlying mmap parameters match casperfpga LocalMemTransport:
-    AXIL_OFFSET = 0xA0000000 ; MAP_SIZE = 32 MiB
+    AXIL_OFFSET = 0xA0000000 ; MAP_SIZE = 512 MiB
 (transport_localmem.py:13-14). On a backing file we map from offset 0.
 """
 
@@ -39,7 +39,8 @@ import numpy as np
 
 # --- mmap parameters, mirroring casperfpga LocalMemTransport ----------------
 AXIL_OFFSET = 0xA0000000        # offset into /dev/mem for the AXI-lite region
-MAP_SIZE = 32 * 1024 * 1024     # 32 MiB
+MAP_SIZE = 0x20000000           # 512 MiB -- must cover the v7.12 AXI4 BRAMs
+                                # at 0xB000_0000 as well as AXI-lite at 0xA000_0000
 
 # --- firmware control-buffer geometry (realistic defaults) ------------------
 # These mirror the per-tone layout the mixer uses. One tone occupies

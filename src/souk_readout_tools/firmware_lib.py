@@ -230,7 +230,8 @@ def _warn_sync_delay_deprecated(value):
 
     The RX/TX LO delay used to live in the sync block (``r.sync.set_delay``). From
     v7.11 it is owned by the mixer and configured automatically by
-    ``initialize_pipeline_blocks()``: ``mixer.set_rx_sync_delay(SYNC_DELAY=5752)``
+    ``initialize_pipeline_blocks()``: ``mixer.set_rx_sync_delay(SYNC_DELAY)``, whose
+    value is firmware-defined (``souk_mkid_readout.SYNC_DELAY``; 5754 as of v7.12),
     followed by an automatic RX/TX skew match. This knob is therefore ignored.
 
     To repoint/override the RX sync delay manually after init (rarely needed)::
@@ -1666,6 +1667,28 @@ def _get_git_commit(*repo_paths):
     return None
 
 
+def _read_commit_stamp():
+    """Commit recorded in `data/COMMIT` at deploy time, or None.
+
+    The board's copy usually has no `.git` to interrogate: `pip install` does not
+    copy it, and the tree is often rsync'd across without it. Writing the stamp
+    in the source checkout before deploying is then the only record of what is
+    running:
+
+        git describe --tags --always --dirty > src/souk_readout_tools/data/COMMIT
+
+    It is only as honest as the last run of that command, so `--dirty` is worth
+    keeping: a stamp regenerated after every edit cannot silently claim a clean
+    commit for a modified tree. A live `.git` always wins over the stamp.
+    """
+    stamp = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'COMMIT')
+    try:
+        with open(stamp) as fh:
+            return fh.readline().strip() or None
+    except OSError:
+        return None
+
+
 def _find_repo_root(*candidates):
     """First of `candidates` that looks like a git checkout (a `.git` directory
     for a normal clone, or a `.git` file for a submodule), or None."""
@@ -1683,8 +1706,26 @@ def _find_repo_root(*candidates):
 # ---------------------------------------------------------------------------
 
 def info_versions():
-    """Software versions and git commit IDs."""
+    """Software versions and git commit IDs *of the code running on the board*.
+
+    This section is produced by the server, so every version and commit here
+    describes the RFSoC's install, not the client host's. `host` names the board
+    it was read from. The host-side package version is
+    `souk_readout_tools.__version__` (or `importlib.metadata.version`), and the
+    two differ whenever the board has not been updated from the same checkout.
+
+    `souk_readout_tools_commit` / `souk_peripherals_commit` are None when the
+    board's copy is an ordinary (non-editable) pip install and no checkout is
+    found at the fallback paths below: pip does not copy `.git`, so there is no
+    commit to report. For a board deployed that way, write the `data/COMMIT`
+    stamp before deploying (see `_read_commit_stamp`) and the tools commit is
+    reported from that instead.
+    """
     info = {}
+    try:
+        info['host'] = os.uname().nodename
+    except (AttributeError, OSError):
+        info['host'] = None
     try:
         import importlib.metadata
         info['souk_readout_tools_version'] = importlib.metadata.version('souk_readout_tools')
@@ -1706,7 +1747,8 @@ def info_versions():
         '/home/casper/souk_readout_tools', '~/souk_readout_tools',
         '/home/casper/src/souk_readout_tools',
     )
-    info['souk_readout_tools_commit'] = _get_git_commit(tools_repo)
+    info['souk_readout_tools_commit'] = (_get_git_commit(tools_repo)
+                                         or _read_commit_stamp())
     info['souk_firmware_commit'] = _get_git_commit(
         # souk-firmware is normally cloned alongside souk_readout_tools.
         os.path.join(os.path.dirname(tools_repo), 'souk-firmware') if tools_repo else None,
@@ -2895,9 +2937,9 @@ def prepare_control_buffer_data_fast(r_fast, buf, lo_control_values, tone_indice
     # addressed by absolute word index (resolved via _get_control_buffer_addresses),
     # so this view is layout-independent across firmware versions. (v7.11 moved the
     # control buffers; do not hardcode byte ranges here.)
-    if not hasattr(r_fast.mixer,'tx_lo_control_buffer_mv'):
+    if not hasattr(r_fast.mixer,'tx_lo_control_buffer'):
         r_fast.mixer.tx_lo_control_buffer = np.frombuffer(memoryview(r_fast.mixer.host.transport.axil_mm),dtype='<u4')
-    if not hasattr(r_fast.mixer,'rx_lo_control_buffer_mv'):
+    if not hasattr(r_fast.mixer,'rx_lo_control_buffer'):
         r_fast.mixer.rx_lo_control_buffer = np.frombuffer(memoryview(r_fast.mixer.host.transport.axil_mm),dtype='<u4')
     v={}
     i={}
@@ -5827,9 +5869,13 @@ def psb_chanselect_set_channel_inmap(r, inmap):
         psb._fast_inmap_offset_to_outchan = offset_to_outchan
         psb._fast_inmap_input_idx = np.arange(psb.n_chans_in)
         psb._fast_inmap_map_regs = map_regs
-        psb._fast_inmap_fast_nbytes = reorder_depth * 4
-        psb._fast_inmap_fast_dtype = np.dtype('<u4')
-        psb._fast_inmap_slow_dtype = np.dtype('u4').newbyteorder(np.dtype(psb._map_format).byteorder)
+        # Word width and byte order both come from the firmware block (v7.11 '>i4';
+        # v7.12 narrows the vacc reorder map to '>i2'). Unsigned: the map holds an
+        # address plus a discard bit, and DISCARD_BIT does not fit a signed word.
+        _map_itemsize = np.dtype(psb._map_format).itemsize
+        psb._fast_inmap_fast_nbytes = reorder_depth * _map_itemsize
+        psb._fast_inmap_fast_dtype = np.dtype(f'<u{_map_itemsize}')
+        psb._fast_inmap_slow_dtype = np.dtype(f'u{_map_itemsize}').newbyteorder(np.dtype(psb._map_format).byteorder)
         try:
             psb._fast_inmap_mm = psb.host.transport.axil_mm
             psb._fast_inmap_map_addrs = [
@@ -5931,9 +5977,13 @@ def psb_chanselect_get_channel_inmap(r):
         psb._fast_inmap_offset_to_outchan = offset_to_outchan
         psb._fast_inmap_input_idx = np.arange(psb.n_chans_in)
         psb._fast_inmap_map_regs = map_regs
-        psb._fast_inmap_fast_nbytes = reorder_depth * 4
-        psb._fast_inmap_fast_dtype = np.dtype('<u4')
-        psb._fast_inmap_slow_dtype = np.dtype('u4').newbyteorder(np.dtype(psb._map_format).byteorder)
+        # Word width and byte order both come from the firmware block (v7.11 '>i4';
+        # v7.12 narrows the vacc reorder map to '>i2'). Unsigned: the map holds an
+        # address plus a discard bit, and DISCARD_BIT does not fit a signed word.
+        _map_itemsize = np.dtype(psb._map_format).itemsize
+        psb._fast_inmap_fast_nbytes = reorder_depth * _map_itemsize
+        psb._fast_inmap_fast_dtype = np.dtype(f'<u{_map_itemsize}')
+        psb._fast_inmap_slow_dtype = np.dtype(f'u{_map_itemsize}').newbyteorder(np.dtype(psb._map_format).byteorder)
         try:
             psb._fast_inmap_mm = psb.host.transport.axil_mm
             psb._fast_inmap_map_addrs = [

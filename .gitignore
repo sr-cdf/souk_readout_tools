@@ -6,6 +6,9 @@ venv/
 env/
 
 tests/
+
+# deploy-time commit stamp (regenerated per deployment, see _read_commit_stamp)
+src/souk_readout_tools/data/COMMIT
 .pytest_cache/
 
 build/

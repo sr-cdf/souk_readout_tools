@@ -177,6 +177,19 @@ git submodule init && git submodule update
 pip install .
 ```
 
+If you deploy by copying the tree across instead (`rsync`, `scp`), record the
+commit first — with no `.git` on the board nothing else says what is running:
+
+```bash
+# on the control PC, in the checkout, before copying
+git describe --tags --always --dirty > src/souk_readout_tools/data/COMMIT
+```
+
+`pip install .` on the board carries that stamp into the install, and
+`get_info('versions')['souk_readout_tools_commit']` reports it when there is no
+`.git` to read. The file is gitignored and only as current as its last run, so
+regenerate it on every deployment; `--dirty` marks a tree with uncommitted edits.
+
 The installer will auto-detect the Xilinx platform and install the server components. To install the server and the client at the same time (e.g. for scripted measurements on the board), use:
 ```bash
 INSTALL_SERVER=true INSTALL_CLIENT=true pip install .

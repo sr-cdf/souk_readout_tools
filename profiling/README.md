@@ -27,8 +27,10 @@ These mirror the real code:
 | `np.frombuffer(axil_mm[a:b], '<i4')` (read) | `read_accumulated_data_fast` (firmware_lib.py) |
 
 The mmap parameters match casperfpga `LocalMemTransport`
-(`transport_localmem.py:13-14`): `/dev/mem`, offset `0xA0000000`, 32 MiB,
-`MAP_SHARED`.
+(`transport_localmem.py:13-14`): `/dev/mem`, offset `0xA0000000`, 512 MiB,
+`MAP_SHARED`. The window was 32 MiB until firmware v7.12 moved the accumulator
+and LO control buffers to AXI4 BRAMs at `0xB000_0000`; casperfpga widened
+`MAP_SIZE` to `0x20000000` to reach them, and these profilers follow.
 
 ## Build & run
 
@@ -67,8 +69,11 @@ buffer is exactly what a real sweep overwrites each step, and the accumulator
 `dout0` is what it reads, so aiming there reproduces a real sweep.
 
 Get the offsets straight from the `.fpg` header (no board, no readout object
-needed) — the header has `?register <name> <abs_addr> <size>` lines anchored
-at `0xa0000000`, so `offset = abs_addr - 0xa0000000`:
+needed) — the header has `?register <name> <abs_addr> <size>` lines and the
+mmap is based at `0xa0000000`, so `offset = abs_addr - 0xa0000000`. Note the
+registers are no longer all in the AXI-lite region: from v7.12 the accumulator
+and LO control buffers live at `0xB000_0000`+, i.e. offsets above `0x10000000`
+(which is why the map must be 512 MiB):
 
 ```bash
 python3 fpg_addrs.py \
@@ -90,12 +95,14 @@ sudo ~/py3.12-venv/bin/python devmem_profile.py --dev /dev/mem \
 ```
 
 For the dual-pipeline krm firmware, pipeline 0 is control buffer
-`p0_mix_tx_lo0_control` (offset `0x050000`, 64 KiB register) and accumulator
-`p0_acc0_dout0` (offset `0x090000`, 16 KiB register). Both are sized for the
-design maximum of `N_TONE = 2048` tones:
+`p0_mix_tx_lo0_control0` and accumulator `p0_acc0_dout0`. Do not hardcode their
+offsets — they have moved every firmware generation (v7.11 split the ping-pong
+buffers into `control0`/`control1`; v7.12 relocated both to `0xB000_0000`+), so
+always take them from `fpg_addrs.py` above. Sizes are set by the design maximum
+of `N_TONE = 2048` tones:
 
-- control buffer: 2048 tones × 4 int32 words/tone × 4 B = 32 KiB of live
-  control data; the 64 KiB register backs the two ping-pong buffers (2 × 32 KiB).
+- control buffer: 2048 tones × 4 int32 words/tone × 4 B = 32 KiB per LO slot;
+  the 128 KiB register backs the slots.
 - accumulator: 2048 complex channels × 2 int32 (real/imag) × 4 B = 16 KiB.
 
 Defaults of 1000 tones fit comfortably. The profilers only ever touch
@@ -134,7 +141,7 @@ The C profiler has both: per-word `volatile` (default) and a `--bulk` mode that
 does a single `memcpy` like Python. Running all three on hardware separates the
 *access pattern* effect from the *language* effect — see Results below.
 
-## Results (real hardware, RFSOC ARM, /dev/mem)
+## Results (real hardware, RFSOC ARM, /dev/mem) — firmware v7.11
 
 Pipeline 0, `--write-addr 0x050000 --read-addr 0x090000`, 1000 tones / 1000
 read-chans, 10000 steps. Medians, reproducible to the microsecond across runs:
@@ -188,6 +195,15 @@ per 10000 steps. Speed wins; the determinism tradeoff is noted only.
    (already done) and read fewer channels — read cost scales linearly with
    read-chans, and at ~82 ns/word the bus is the language-independent limit. A
    burst/DMA-capable transport is the only thing that could beat the bulk read.
+
+> **Firmware v7.12 is that transport.** It moves the accumulator and LO control
+> buffers onto burst-capable 128-bit AXI4 BRAMs and doubles the AXI control clock
+> to 200 MHz, which should take CPU reads to the ~190 MB/s uncached-Device-memory
+> ceiling (~21 ns/word, a ~4× read improvement). That ceiling belongs to the CPU's
+> uncached mapping rather than the fabric, so beating it needs ZDMA into a cached
+> `u-dma-buf` — see `software/rfsoc_scripts/zdma_read_example.py` in souk-firmware.
+> Re-run the table above after the v7.12 upgrade and keep the v7.11 rows for
+> comparison.
 
 ## Files
 

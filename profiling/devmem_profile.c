@@ -41,7 +41,9 @@
 #include <unistd.h>
 
 #define AXIL_OFFSET 0xA0000000UL
-#define MAP_SIZE    (32UL * 1024 * 1024)   /* 32 MiB */
+#define MAP_SIZE    (0x20000000UL)         /* 512 MiB: covers AXI-lite at
+                                            * 0xA000_0000 and the v7.12 AXI4
+                                            * BRAMs at 0xB000_0000 */
 #define CONTROL_N_WORDS 4                  /* words per tone (write side) */
 /* accumulator read-back: one channel = 1 complex sample = 2 * 4-byte int32
  * (real, imag), interleaved [re0, im0, re1, im1, ...]. */

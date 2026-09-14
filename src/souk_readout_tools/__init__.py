@@ -1,6 +1,14 @@
 
 import importlib as _importlib
 import importlib.util as _importlib_util
+import importlib.metadata as _importlib_metadata
+
+# Version is declared in setup.py only; read it back from the install metadata.
+try:
+    __version__ = _importlib_metadata.version(__name__)
+except _importlib_metadata.PackageNotFoundError:
+    # Imported straight from a source checkout (PYTHONPATH=src), not installed.
+    __version__ = 'unknown'
 
 # Submodules available for lazy import.
 _SUBMODULES = [

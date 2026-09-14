@@ -48,7 +48,8 @@ def main():
 
     # write target: control buffer base (buffer 0)
     addrs = firmware_lib._get_control_buffer_addresses(r_fast)
-    write_addr = int(addrs[args.lo])
+    # v7.11+: keys are (lo, buf) tuples, one register per ping-pong buffer
+    write_addr = int(addrs[(args.lo, 0)])
     n_tones = int(r_fast.mixer.n_chans)
     control_n_words = int(r_fast.mixer._CONTROL_N_WORDS)
     n_serial = int(r_fast.mixer._n_serial_chans)
