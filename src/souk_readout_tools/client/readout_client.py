@@ -3634,12 +3634,14 @@ class ReadoutClient:
             all_data = np.frombuffer(data_raw[packet_offset:packet_offset+datalen], dtype='<i4')
             i_data[j] = all_data[::2][:num_tones]
             q_data[j] = all_data[1::2][:num_tones]
-            err[j] = all_data[-1]
-            cnt[j] = all_data[-2]
-            tt_lsb = int(all_data[-3]) & 0xFFFFFFFF
-            tt_msb = int(all_data[-4]) & 0xFFFFFFFF
-            tt[j] = (tt_msb << 32) + tt_lsb
-            flags[j] = all_data[-10:-4]
+            # Header words are unsigned 32-bit on the wire (see
+            # ReadoutServer.prepare_frame), so read them through an unsigned
+            # view: no masking, and acc_cnt stays correct past 2**31.
+            hdr = all_data[-num_headers:].view('<u4')
+            err[j] = hdr[-1]
+            cnt[j] = hdr[-2]
+            tt[j] = (int(hdr[-4]) << 32) + int(hdr[-3])
+            flags[j] = hdr[-10:-4]
         # Fast-modulation tag lives in flag5 (frame[-5]); decode as UNSIGNED
         # because the revision (bits 17..31) can set the int32 sign bit:
         #   bits 0..15  = active point (0 = modulation off, 1..N = the point)
@@ -5904,11 +5906,9 @@ class ReadoutClient:
 
                             all_data = np.frombuffer(data[:datalen], dtype='<i4')
                             iq_words = all_data[:2*num_tones].astype(np.int64)
-                            tail = all_data[-num_headers:].astype(np.int64)
+                            tail = all_data[-num_headers:].view('<u4').astype(np.int64)
                             flags = tail[:6]
-                            tt_msb = int(tail[6]) & 0xFFFFFFFF
-                            tt_lsb = int(tail[7]) & 0xFFFFFFFF
-                            tt = (tt_msb << 32) + tt_lsb
+                            tt = (int(tail[6]) << 32) + int(tail[7])
                             cnt = int(tail[8])
                             err = int(tail[9])
                             full_row = np.concatenate(
@@ -6165,19 +6165,23 @@ class ReadoutClient:
         index_flag_5 = metadata.get('index_flag_5', metadata.get('index_flag_7', index_flag_0 + 5))
         info = metadata['info']
 
-        data = np.fromfile(filename,dtype=format)
-        data = data.reshape(-1,2*num_tones+10).swapaxes(0,1)
+        raw = np.fromfile(filename,dtype=format)
+        data = raw.reshape(-1,2*num_tones+10).swapaxes(0,1)
         num_samples = data.shape[1]
 
-        err = data[index_err]
-        cnt = data[index_cnt]
+        # The I/Q payload is signed, the header words are unsigned (see
+        # ReadoutServer.prepare_frame): read those rows from an unsigned view
+        # of the same buffer rather than masking each one.
+        udata = raw.view('<u4').reshape(-1,2*num_tones+10).swapaxes(0,1)
+        err = udata[index_err]
+        cnt = udata[index_cnt].astype(np.int64)
         if index_tt_msb is not None and index_tt_lsb is not None:
-            tt_msb = data[index_tt_msb].astype(np.int64) & 0xFFFFFFFF
-            tt_lsb = data[index_tt_lsb].astype(np.int64) & 0xFFFFFFFF
+            tt_msb = udata[index_tt_msb].astype(np.int64)
+            tt_lsb = udata[index_tt_lsb].astype(np.int64)
             tt = (tt_msb << 32) + tt_lsb
         else:
             tt = np.zeros(num_samples, dtype=np.uint64)
-        flags = data[index_flag_0:index_flag_5+1]
+        flags = udata[index_flag_0:index_flag_5+1]
 
         i_data = data[:2*num_tones:2]
         q_data = data[1:2*num_tones:2]

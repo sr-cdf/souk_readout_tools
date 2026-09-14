@@ -5111,28 +5111,32 @@ class ReadoutServer:
             cnt,data,err,tt = firmware_lib.read_accumulated_data_fast(
                 fast_read_params, tone_indices=self.active_tone_indices)
 
-        tt_msb = np.uint32((tt >> 32) & 0xFFFFFFFF).view(np.int32)
-        tt_lsb = np.uint32(tt & 0xFFFFFFFF).view(np.int32)
-
         frame = np.zeros(len(data)+num_headers,dtype='<i4')
         frame[:len(data)] = data
-        frame[-1] = err
-        frame[-2] = cnt
-        frame[-3] = tt_lsb
-        frame[-4] = tt_msb
+        # Only the I/Q payload is signed. Every header word is a counter, a
+        # half of the 64-bit telescope time, the packed modulation tag or a
+        # flag -- all unsigned 32-bit -- so write them through an unsigned view
+        # of the header block instead of casting each one into int32 (which
+        # NumPy 2 refuses once acc_cnt passes 2**31). Same negative indices,
+        # same wire bytes; hdr[-k] is frame[-k].
+        hdr = frame[-num_headers:].view('<u4')
+        hdr[-1] = err
+        hdr[-2] = cnt & 0xFFFFFFFF          # free-running, wraps at 2**32
+        hdr[-3] = tt & 0xFFFFFFFF
+        hdr[-4] = (tt >> 32) & 0xFFFFFFFF
         if mod_point > 0:
             tag = (int(mod_point) & 0xFFFF) | (int(bool(settling)) << 16) | ((int(revision) & 0x7FFF) << 17)
-            frame[-5] = np.uint32(tag).view(np.int32)
+            hdr[-5] = tag
             # keep FLAG_SET_FREQS high during the transient window for older consumers
             set_freqs = int(self.stream_flags[FLAG_SET_FREQS].is_set() or settling)
         else:
-            frame[-5] = int(self.stream_flags[5].is_set())
+            hdr[-5] = int(self.stream_flags[5].is_set())
             set_freqs = int(self.stream_flags[FLAG_SET_FREQS].is_set())
-        frame[-6] = int(self.stream_flags[FLAG_CAL_FREEZE].is_set())
-        frame[-7] = int(self.stream_flags[FLAG_SET_PHASES].is_set())
-        frame[-8] = int(self.stream_flags[FLAG_SET_AMPS].is_set())
-        frame[-9] = set_freqs
-        frame[-10] = int(self.stream_flags[FLAG_SERVER_REQUEST].is_set())
+        hdr[-6] = int(self.stream_flags[FLAG_CAL_FREEZE].is_set())
+        hdr[-7] = int(self.stream_flags[FLAG_SET_PHASES].is_set())
+        hdr[-8] = int(self.stream_flags[FLAG_SET_AMPS].is_set())
+        hdr[-9] = set_freqs
+        hdr[-10] = int(self.stream_flags[FLAG_SERVER_REQUEST].is_set())
 
         data_bytes = frame.tobytes()
 

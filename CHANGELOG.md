@@ -1,5 +1,19 @@
 # Changelog & Feature List
 
+## v1.7.6
+
+**Streaming no longer dies once the accumulation counter passes 2\*\*31.**
+`acc_cnt` free-runs since FPGA programming and overflows int32 after 24.9 days
+at 1 kHz (4 hours at `acc_len` 4); NumPy 2 then raised `OverflowError: Python
+integer ... out of bounds for int32` in `prepare_frame` on every frame and no
+data was sent.
+
+**Stream header words are read and written unsigned.** All 10 (counters, both
+halves of the telescope time, the modulation tag, flags) go through one `<u4`
+view of the header block in `prepare_frame`, `parse_samples`, `stream_data` and
+`parse_stream_data`; only the I/Q payload is signed. Wire format unchanged, and
+3 us/frame cheaper than the per-word int32 casts it replaces.
+
 ## v1.7.5
 
 **New `timeseries` module.** Timestream and PSD analysis as a flat set of tools,
