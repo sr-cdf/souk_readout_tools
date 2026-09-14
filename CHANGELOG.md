@@ -2,13 +2,30 @@
 
 ## Unreleased
 
-**The accumulation counter is read over devmem, not katcp.** `acc.get_acc_cnt()`
-is `read_uint('acc_cnt')` through the full casperfpga block path -- 27.1 us
-against 3.7 us for a cached mmap read, and it runs twice per sample. New
+**The accumulation counter skips the casperfpga block path.**
+`acc.get_acc_cnt()` was already reading over devmem -- `LocalMemTransport.read`
+is an mmap slice -- but through `Block.read_uint` -> `CasperFpga.read_uint` ->
+name resolution -> `struct.unpack`, which costs **27.1 us against 3.7 us** for a
+slice at a cached address. It runs twice per sample. New
 `read_acc_cnt_fast` / `_blocking_wait_for_acc_fast` save **46.8 us on every
 accumulation, at every tone count**, and make the 10 us poll period in
 `_blocking_wait_for_acc` meaningful for the first time (each iteration
 previously cost 27 us, so the period was inoperative).
+
+**ZDMA reads the accumulator for large tone sets.** New
+`souk_readout_tools/zdma.py` (vendored from souk-firmware v7.12.1's own
+hardware-validated reference) DMAs into a cached `u-dma-buf` instead of reading
+through the uncached mapping, inverting the cost model: **21.94 us fixed +
+1.4 ns/word** against devmem's 1.64 us + 22.4 ns/word. The two are complementary,
+so the read planner picks by size -- devmem below ~335 channels, ZDMA above.
+Measured through `read_accumulated_data_fast`: 2048 tones **277 -> 115 us
+(2.4x)**, 1000 tones 110 -> 86, unchanged below the crossover, values identical
+throughout.
+
+Opt-in via `ZDMA_ENABLED` or `get_fast_read_params(zdma='udmabuf0')`, and it
+degrades to the mmap path with a warning if u-dma-buf or a DMA channel is
+unavailable. One reader is cached per transport: each PROCESS needs its own
+landing buffer, since every transfer overwrites the whole thing.
 
 **`sparse_read` is selectable from the client.** `get_samples(...,
 sparse_read=)` and `enable_stream(sparse_read=)` carry the override to the
@@ -59,8 +76,11 @@ v7.12.1 results table alongside the v7.11 rows.
 
 **`timing.format_timing_status()` renders `get_info('timing')` as seven lines.**
 The raw dict is ~60 keys across six sub-dicts. Surfaces the TAI/UTC offset
-explicitly: PTP runs on TAI, so `telescope_time` is `currentUtcOffset` (37 s) ahead
-of UTC, which is why chrony reports PHC0 as a falseticker unless given `offset=-37`.
+explicitly: PTP runs on TAI, so the PHC and the TSU's `tsu_sec` sit
+`currentUtcOffset` (37 s) ahead of UTC, which is why chrony reports PHC0 as a
+falseticker unless given `offset=-37`. `telescope_time` is NOT that clock -- it is
+the firmware TT counter in fabric ticks, free-running until `set_telescope_time`
+latches the (UTC) system clock into it.
 
 ## v1.7.10
 

@@ -521,12 +521,19 @@ def format_timing_status(status: dict[str, Any]) -> str:
     what timescale are the frame timestamps on.
 
     The TAI line is the one that surprises people. PTP runs on TAI
-    (``ptpTimescale 1``), so the PHC -- and therefore ``telescope_time`` in every
-    frame header -- sits ``currentUtcOffset`` seconds ahead of UTC (37 s at
+    (``ptpTimescale 1``), so the PHC -- and the TSU strobe's ``tsu_sec`` that
+    follows it -- sit ``currentUtcOffset`` seconds ahead of UTC (37 s at
     present). chrony compares PHC0 against UTC-based NTP servers, sees that
     offset and marks it a falseticker. That is correct behaviour, not a fault,
     and it is why a board can be genuinely locked to a grandmaster while chrony
     reports ``ntp`` as the active source.
+
+    ``telescope_time`` in the frame headers is a **different clock** and is not
+    covered by that offset: it is the firmware TT counter, in fabric-clock ticks
+    at ``adc_clk_hz / 8`` (307.2 MHz), free-running from whenever it was last
+    loaded. It only represents wall-clock time once ``set_telescope_time`` has
+    latched the system clock into it on a PPS edge -- and the system clock is
+    UTC, not TAI.
 
     Parameters
     ----------
@@ -571,8 +578,8 @@ def format_timing_status(status: dict[str, Any]) -> str:
     #
     # Key this off the TSU, NOT off chrony's PHC offset. Setting `offset=-37` on
     # chrony's PHC0 refclock fixes the *system* clock but leaves the PHC -- and
-    # so the TSU, and so telescope_time -- on TAI. Keying off the chrony offset
-    # would make this warning vanish exactly when it is still needed.
+    # so the TSU, and so tsu_sec -- on TAI. Keying off the chrony offset would
+    # make this warning vanish exactly when it is still needed.
     utc_offset, ptp_timescale = _ptp_utc_offset(ptp)
     tsu, now = strobe.get("tsu_sec"), s.get("updated_unix_s")
     skew = (tsu - now) if (tsu is not None and now is not None) else None
@@ -580,11 +587,13 @@ def format_timing_status(status: dict[str, Any]) -> str:
         n = utc_offset if utc_offset is not None else round(skew)
         lines += [
             "",
-            f"timescale   : telescope_time is TAI, ~{n} s ahead of UTC"
+            f"timescale   : the PHC/TSU runs on TAI, ~{n} s ahead of UTC"
             + ("  (ptpTimescale=1)" if ptp_timescale else "")
             + f"  [measured skew {skew:+.0f} s]",
-            f"              Subtract {n} from telescope_time / tsu_sec for UTC."
-            " The system clock is separate and may already be correct.",
+            f"              Subtract {n} from strobe tsu_sec for UTC. NOTE"
+            " telescope_time is a different clock: firmware TT in fabric ticks,",
+            "              free-running until set_telescope_time loads the"
+            " (UTC) system clock into it.",
         ]
     return "\n".join(lines)
 

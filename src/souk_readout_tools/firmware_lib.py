@@ -9904,7 +9904,7 @@ def read_accumulated_data(r, num_tones=None, tone_indices=None):
         # Legacy behavior: assume contiguous indices
         return data[:num_tones]
 
-def get_fast_read_params(r_fast):
+def get_fast_read_params(r_fast, zdma=None):
     """
     Get the parameters required to perform fast readout of the RFSOC.
     """
@@ -9922,12 +9922,25 @@ def get_fast_read_params(r_fast):
     # buffer IDs in a single 'buffer_id' register (slot in low byte, ping-pong
     # buffer in byte 2). Cache its address for firmware-slot modulation reads.
     buffer_id_addr = acc.host.transport._get_device_address(f'{acc.prefix}buffer_id')
-    # acc.get_acc_cnt() is read_uint('acc_cnt') through the full casperfpga block
-    # path, measured at 27.5 us on hardware against 2.0 us for a bare devmem
-    # slice. It is read twice per sample (the wait, then the straddle check) and
-    # polled while waiting, so caching its address is worth more than any other
-    # single change to this path.
+    # acc.get_acc_cnt() already reads over devmem -- LocalMemTransport.read is an
+    # mmap slice -- but reaches it through Block.read_uint -> CasperFpga.read_uint
+    # -> name resolution -> struct.unpack, which measures 27.1 us against 3.7 us
+    # for a slice at a cached address. It is read twice per sample (the wait, then
+    # the straddle check) and polled while waiting, so caching the address is
+    # worth more than any other single change to this path.
+    #
+    # Note the byte order differs by transport: katcp carries network order and
+    # localmem gives ARM-native, so this path unpacks '<I' (as read_tt_fast
+    # already does) while CasperFpga.read_uint unpacks '>I'.
     acc_cnt_addr = acc.host.transport._get_device_address(f'{acc.prefix}acc_cnt')
+    # ZDMA addresses physical memory, while _get_device_address returns offsets
+    # into the AXI-lite window; AXIL_OFFSET is the transport's own constant, so
+    # take it from there rather than restating 0xA0000000 here.
+    reader = _get_zdma_reader(acc.host.transport, ZDMA_ENABLED if zdma is None else zdma)
+    phys_base = None
+    if reader is not None:
+        from casperfpga import transport_localmem as _tlm
+        phys_base = _tlm.AXIL_OFFSET + addrs[0]
     params = {'acc':acc,
               'addrs':addrs,
               'nbytes':nbytes,
@@ -9936,7 +9949,9 @@ def get_fast_read_params(r_fast):
               'tt_msb_addr':tt_msb_addr,
               'tt_lsb_addr':tt_lsb_addr,
               'buffer_id_addr':buffer_id_addr,
-              'acc_cnt_addr':acc_cnt_addr}
+              'acc_cnt_addr':acc_cnt_addr,
+              'zdma':reader,
+              'phys_base':phys_base}
 
     return params
 
@@ -9958,11 +9973,16 @@ def read_tt_fast(fast_read_params):
 
 
 def read_acc_cnt_fast(fast_read_params):
-    """Read the accumulation counter over devmem instead of katcp.
+    """Read the accumulation counter without the casperfpga block layer.
 
-    Equivalent to ``acc.get_acc_cnt()`` but ~14x cheaper (2.0 us vs 27.5 us
-    measured on hardware), because it skips the casperfpga block layer and does
-    a single 4-byte mmap read of the cached address.
+    Equivalent to ``acc.get_acc_cnt()`` but ~7x cheaper (3.7 us vs 27.1 us
+    measured on hardware). Both read devmem -- ``LocalMemTransport.read`` is an
+    mmap slice -- but this one goes straight to a cached address instead of
+    through ``Block.read_uint`` -> ``CasperFpga.read_uint`` -> name resolution
+    -> ``struct.unpack``.
+
+    Unpacks ``'<I'``: katcp carries network byte order, localmem gives
+    ARM-native. ``read_tt_fast`` makes the same assumption.
 
     :param fast_read_params: Parameters from get_fast_read_params()
     :return: Free-running accumulation count, wraps at 2**32
@@ -9974,7 +9994,7 @@ def read_acc_cnt_fast(fast_read_params):
 
 
 def _blocking_wait_for_acc_fast(fast_read_params, poll_period_s=0.00001, timeout=1):
-    """``_blocking_wait_for_acc`` using the devmem counter.
+    """``_blocking_wait_for_acc`` using the cheap counter read.
 
     The 10 us poll period only means anything once the counter itself is cheap:
     with the katcp read each iteration cost 27.5 us, so the loop could not
@@ -10334,6 +10354,43 @@ _SPARSE_READ_MARGIN = 0.9
 # against a fixed cost of 8.31 us), so it is far cheaper than it looks.
 _READ_ALIGN_CHANS = 8
 
+# ZDMA lands the data in a *cached* u-dma-buf and inverts the cost model: the
+# fixed cost is ~13x the devmem one but the per-word cost is ~16x lower
+# (measured 2026-09-14, souk_readout_tools/zdma.py). The two transports are
+# complementary -- devmem wins below ~335 channels, ZDMA above, 3.6x at 2048.
+_ZDMA_FIXED_US = 21.94
+_ZDMA_NS_PER_WORD = 1.4
+
+#: Opt-in until the DMA path has run in the server. Set True, or pass
+#: ``zdma=`` to :func:`get_fast_read_params`, to enable it. Each PROCESS needs
+#: its own landing buffer: every transfer overwrites the whole thing.
+ZDMA_ENABLED = False
+ZDMA_UDMABUF = 'udmabuf0'
+
+
+def _get_zdma_reader(transport, zdma):
+    """Lazily attach one ZdmaReader per transport, or None if unavailable.
+
+    Returns None rather than raising when the DMA path cannot be set up (no
+    u-dma-buf module, no permission, no free channel) so the caller silently
+    keeps the mmap path -- the same capability-probe style the transports
+    already use.
+    """
+    if not zdma:
+        return None
+    cached = getattr(transport, '_zdma_reader', None)
+    if cached is not None:
+        return cached
+    name = zdma if isinstance(zdma, str) else ZDMA_UDMABUF
+    try:
+        from .zdma import UdmabufBuffer, ZdmaReader
+        reader = ZdmaReader(cached_buf=UdmabufBuffer(name))
+    except Exception as exc:
+        warnings.warn(f'ZDMA unavailable ({exc}); falling back to the mmap read')
+        return None
+    transport._zdma_reader = reader
+    return reader
+
 # Control-buffer write costs, same rig, same run. A contiguous slice write
 # streams at ~4.7 ns/word; a scattered fancy-index store into the same uncached
 # mapping costs ~18.3 ns/word, so staging in RAM and issuing ONE slice write
@@ -10515,8 +10572,24 @@ def _cached_read_plan(fast_read_params, tone_indices, sparse_read):
         if prev_sparse == sparse_read and (prev_idx is tone_indices
                                            or np.array_equal(prev_idx, tone_indices)):
             return plan
-    plan = plan_accumulator_reads(tone_indices, fast_read_params['acc'].n_chans,
-                                  force=bool(sparse_read))
+    n_chans = fast_read_params['acc'].n_chans
+    plan = plan_accumulator_reads(tone_indices, n_chans, force=bool(sparse_read))
+    if plan is not None:
+        plan = dict(plan, transport='devmem')
+
+    # ZDMA is cheap per word and expensive to start, so its only sensible plan
+    # is a single read. Compare it against whatever devmem offers (a partial
+    # read, or the full bulk read when the planner declined).
+    if fast_read_params.get('zdma') is not None:
+        dev_us = plan['plan_us'] if plan is not None else (
+            _DEVMEM_FIXED_US + n_chans * 2 * _DEVMEM_NS_PER_WORD / 1000.0)
+        z = plan_accumulator_reads(tone_indices, n_chans,
+                                   fixed_us=_ZDMA_FIXED_US,
+                                   ns_per_word=_ZDMA_NS_PER_WORD,
+                                   force=True, margin=1.0)
+        if z is not None and z['plan_us'] < dev_us:
+            plan = dict(z, transport='zdma')
+
     fast_read_params['_read_plan'] = (tone_indices, sparse_read, plan)
     return plan
 
@@ -10556,12 +10629,20 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
     # to the bulk read) whenever reading everything is cheaper.
     plan = _cached_read_plan(fast_read_params, tone_indices, sparse_read)
     if plan is not None:
-        mm = acc.host.transport.axil_mm
         bpc = nbytes // acc._n_serial_chans          # bytes per complex channel
-        chunks = [mm[base_addr + s*bpc: base_addr + (s + n)*bpc]
-                  for s, n in plan['ranges']]
-        dout = np.frombuffer(chunks[0] if len(chunks) == 1 else b''.join(chunks),
-                             dtype='<i4')
+        if plan['transport'] == 'zdma':
+            # One DMA into the cached landing buffer. The view is only valid
+            # until the next read, and 'take' indexes it directly.
+            s, n = plan['ranges'][0]
+            dout = np.frombuffer(
+                fast_read_params['zdma'].read_view(
+                    fast_read_params['phys_base'] + s*bpc, n*bpc), dtype='<i4')
+        else:
+            mm = acc.host.transport.axil_mm
+            chunks = [mm[base_addr + s*bpc: base_addr + (s + n)*bpc]
+                      for s, n in plan['ranges']]
+            dout = np.frombuffer(chunks[0] if len(chunks) == 1 else b''.join(chunks),
+                                 dtype='<i4')
     elif nbranch==1:
         raw = acc.host.transport.axil_mm[base_addr:base_addr + nbytes]
         dout = np.frombuffer(raw, dtype='<i4')
