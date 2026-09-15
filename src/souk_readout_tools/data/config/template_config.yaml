@@ -45,6 +45,15 @@ firmware:
   dac1_block: 2
   adc_tile: 2
   adc_block: 0
+  # Read the accumulator by ZDMA into a cached u-dma-buf instead of a CPU read
+  # through the uncached mapping. Complementary cost models -- devmem is cheap to
+  # start and expensive per word, ZDMA the reverse -- so the reader picks per
+  # read: devmem below ~335 channels, ZDMA above (2048 chans: 277 -> 115 us).
+  # Needs root, the u-dma-buf module loaded, and a free FPD GDMA channel; falls
+  # back to the CPU read with a warning if any of that is missing. Each PROCESS
+  # needs its own buffer, so give pipeline 1 a different one (e.g. udmabuf1).
+  zdma: false
+  zdma_udmabuf: "udmabuf0"
   dac_fullscale_bits: 16
   adc_fullscale_bits: 16
   dac_physical_bits: 14

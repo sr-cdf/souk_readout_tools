@@ -12,6 +12,12 @@ accumulation, at every tone count**, and make the 10 us poll period in
 `_blocking_wait_for_acc` meaningful for the first time (each iteration
 previously cost 27 us, so the period was inoperative).
 
+**ZDMA is selectable from the server config.** `firmware.zdma: true` (with
+`firmware.zdma_udmabuf`, default `udmabuf0`) enables the DMA read path, which
+was previously reachable only by editing `firmware_lib.ZDMA_ENABLED`. Give each
+pipeline its own buffer -- every transfer overwrites the whole thing. Falls back
+to the CPU read with a warning if the buffer or a DMA channel is unavailable.
+
 **A stream client disconnecting no longer logs an unhandled exception.**
 `handle_stream_client` caught only `ConnectionResetError`, but a write to a
 departed peer raises `BrokenPipeError`, which asyncio delivers through whichever

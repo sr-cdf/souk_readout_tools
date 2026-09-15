@@ -1155,6 +1155,16 @@ class ReadoutServer:
             fw_config_file, pipeline_id)
         self.r_fast = firmware_lib.create_fast_readout_interface(
             fw_config_file, pipeline_id)
+        # Opt-in DMA read path. Recorded on the module so every
+        # get_fast_read_params() call in this process picks it up; the reader
+        # falls back to the CPU mapping (with a warning) if the buffer or a DMA
+        # channel is unavailable, so a wrong setting degrades rather than fails.
+        fw_cfg = self.config.get('firmware', {})
+        if fw_cfg.get('zdma'):
+            firmware_lib.ZDMA_ENABLED = True
+            firmware_lib.ZDMA_UDMABUF = fw_cfg.get('zdma_udmabuf', 'udmabuf0')
+            _server_log(f"accumulator reads may use ZDMA via "
+                        f"{firmware_lib.ZDMA_UDMABUF}", source='firmware')
 
         # Advise when the interface did not come up against the loaded image.
         # _require_clocks_locked above already ruled out a PLL/reference fault, so
