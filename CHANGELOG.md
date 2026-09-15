@@ -12,6 +12,15 @@ accumulation, at every tone count**, and make the 10 us poll period in
 `_blocking_wait_for_acc` meaningful for the first time (each iteration
 previously cost 27 us, so the period was inoperative).
 
+**A stream client disconnecting no longer logs an unhandled exception.**
+`handle_stream_client` caught only `ConnectionResetError`, but a write to a
+departed peer raises `BrokenPipeError`, which asyncio delivers through whichever
+await is pending -- so it escaped into `client_connected_cb` and was logged with
+a full traceback for what is a routine disconnect. Now catches `ConnectionError`
+(covering reset, broken pipe and abort) and deregisters the writer in a
+`finally`: previously an escaping exception left the dead writer in
+`stream_clients` and the streamer kept writing to a closed socket.
+
 **A partially-populated RF mixerless module no longer disables the whole
 frontend.** `_mixerless_module_hw_config_list()` declares two channels;
 `SOUKRFMixerlessModule.__init__` probes every channel it is given and raises on

@@ -4438,27 +4438,42 @@ class ReadoutServer:
         self.stream_clients.append(writer)
 
         reader_eof = False
-        while writer in self.stream_clients:
-            try:
-                writer.write(b'\x00\x00\x00\x00')
-                await writer.drain()
-                if reader_eof:
-                    await asyncio.sleep(1)
-                    continue
-                # The 1 s wait doubles as the keepalive pacing and the poll
-                # for an optional subscribe line (legacy clients never write).
+        try:
+            while writer in self.stream_clients:
                 try:
-                    line = await asyncio.wait_for(reader.readline(), timeout=1)
-                except asyncio.TimeoutError:
-                    continue
-                if not line:
-                    reader_eof = True
-                    continue
-                self._handle_stream_subscribe(writer, line)
-            except ConnectionResetError:
-                print(f"Stream client disconnected: {addr} (ConnectionResetError)")
+                    writer.write(b'\x00\x00\x00\x00')
+                    await writer.drain()
+                    if reader_eof:
+                        await asyncio.sleep(1)
+                        continue
+                    # The 1 s wait doubles as the keepalive pacing and the poll
+                    # for an optional subscribe line (legacy clients never write).
+                    try:
+                        line = await asyncio.wait_for(reader.readline(), timeout=1)
+                    except asyncio.TimeoutError:
+                        continue
+                    if not line:
+                        reader_eof = True
+                        continue
+                    self._handle_stream_subscribe(writer, line)
+                except ConnectionError as exc:
+                    # A client going away mid-stream is routine -- a capture
+                    # script stopping, a Ctrl-C, a dropped link. Catch the whole
+                    # ConnectionError family, not ConnectionResetError alone:
+                    # a failed write raises BrokenPipeError, and asyncio
+                    # delivers it through whichever await is pending (usually
+                    # the readline above), so it used to escape into
+                    # client_connected_cb and be logged as an unhandled
+                    # exception with a full traceback.
+                    print(f"Stream client disconnected: {addr} "
+                          f"({type(exc).__name__})")
+                    break
+        finally:
+            # Must happen on every exit path. When the BrokenPipeError escaped,
+            # the writer was left in stream_clients and the streamer kept
+            # writing to a dead socket.
+            if writer in self.stream_clients:
                 self.stream_clients.remove(writer)
-                break
 
     def _handle_stream_subscribe(self, writer, line):
         """Parse a stream client's JSON subscribe line and mark the writer.
