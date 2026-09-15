@@ -12,6 +12,18 @@ accumulation, at every tone count**, and make the 10 us poll period in
 `_blocking_wait_for_acc` meaningful for the first time (each iteration
 previously cost 27 us, so the period was inoperative).
 
+**A partially-populated RF mixerless module no longer disables the whole
+frontend.** `_mixerless_module_hw_config_list()` declares two channels;
+`SOUKRFMixerlessModule.__init__` probes every channel it is given and raises on
+the first that does not answer, so on a one-channel card the exception escaped
+and `RFPeripherals` abandoned the module entirely -- losing the channel that
+*was* present and leaving `hardware=no` with all attenuator/bypass calls
+failing. The channels are now probed first (`_populated_hw_config_list`) and
+only the ones that answer are passed in; a missing channel is logged at WARNING,
+since on a board meant to be fully populated it is a fault rather than a choice.
+Raises if *no* channel answers. Verified on a one-channel card: ch0
+(recv 0x3b / transmit 0x3a) kept, ch1 (0x39 / 0x38) skipped.
+
 **The AXI window can be mapped through UIO instead of `/dev/mem`.**
 `create_fast_readout_interface(..., uio=True)` (or `use_uio_for_localmem()`)
 points casperfpga's `LocalMemTransport` at `/dev/uio0`, which is `root:uio`

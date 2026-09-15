@@ -49,7 +49,9 @@ try:
     from souk_rf_mixerless_module import (
         SOUKRFMixerlessModule,
         SOUKRFMixerlessModuleChnHWConfig,
+        GPIO_ADDR_RESISTOR_MAP,
     )
+    from max732_8_9 import DEV_ADDRS_MAP
     _HW_AVAILABLE = True
 except ImportError:
     _HW_AVAILABLE = False
@@ -62,6 +64,66 @@ try:
     _RUDAT_AVAILABLE = True
 except ImportError:
     _RUDAT_AVAILABLE = False
+
+
+def _channel_i2c_addresses(hw_config):
+    """The (recv, transmit) i2c addresses a channel's strap config implies.
+
+    Mirrors the lookup ``MAX732_8_9.__init__`` does: the resistor choices in
+    ``hw_config`` select ad2/ad1/ad0 levels via ``GPIO_ADDR_RESISTOR_MAP``, and
+    those levels pick an address out of ``DEV_ADDRS_MAP`` for the fitted part.
+    Returns ``None`` for an address that cannot be resolved, so a caller can
+    treat it as "not probeable" rather than crashing.
+    """
+    out = []
+    for role, straps, part in (
+        ('recv', ('r8_r13', 'r9_r14', 'r12_r17'), hw_config.u4_type),
+        ('transmit', ('r18_r21', 'r19_r22', 'r20_r23'), hw_config.u8_type),
+    ):
+        levels = {}
+        for pin, attr in zip(('ad0', 'ad1', 'ad2'), straps):
+            chosen = getattr(hw_config, attr)
+            levels[pin] = GPIO_ADDR_RESISTOR_MAP[role][pin][chosen]
+        addr = next((a for a, info in DEV_ADDRS_MAP.items()
+                     if info.get(part) == levels), None)
+        out.append(addr)
+    return tuple(out)
+
+
+def _populated_hw_config_list(bus, configs):
+    """Keep only the channels whose devices actually answer on the bus.
+
+    Boards are not always fully populated -- a one-channel card is legitimate --
+    but ``SOUKRFMixerlessModule.__init__`` probes every channel it is given and
+    raises on the first that does not answer, which previously abandoned the
+    whole module and took the working channels down with it.
+
+    A channel that is absent is logged at WARNING rather than passed over
+    silently: on a board that is *meant* to be fully populated, a missing
+    channel is a fault worth seeing.
+    """
+    kept = []
+    for idx, cfg in enumerate(configs):
+        addrs = _channel_i2c_addresses(cfg)
+        missing = []
+        for role, addr in zip(('recv', 'transmit'), addrs):
+            if addr is None:
+                missing.append(f'{role}=unresolvable')
+                continue
+            try:
+                bus.read_byte(addr)
+            except OSError:
+                missing.append(f'{role}@0x{addr:02x}')
+        if missing:
+            logger.warning(
+                'SOUK mixerless module channel %d not populated (%s) -- '
+                'skipping it. If this board is meant to have %d channels, '
+                'that is a hardware fault, not a configuration choice.',
+                idx, ', '.join(missing), len(configs),
+            )
+        else:
+            kept.append(cfg)
+    return kept
 
 
 def _mixerless_module_hw_config_list():
@@ -210,9 +272,13 @@ class RFPeripheralController:
                 try:
                     with i2c_bus_lock(purpose='RF module init'):
                         bus = SMBus(0)
-                        self._mixerless_module = SOUKRFMixerlessModule(
-                            bus, _mixerless_module_hw_config_list(),
-                        )
+                        present = _populated_hw_config_list(
+                            bus, _mixerless_module_hw_config_list())
+                        if not present:
+                            raise RuntimeError(
+                                'no SOUK mixerless module channels responded on '
+                                'i2c bus 0 -- card absent, unpowered or on another bus')
+                        self._mixerless_module = SOUKRFMixerlessModule(bus, present)
                     logger.info(
                         'SOUK mixerless module %r initialised, rf_channel %d',
                         self.hardware_id, self._channel,
