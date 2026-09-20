@@ -1565,13 +1565,16 @@ class ReadoutClient:
             'tone_frequencies', tone_frequencies, autosync=bool(autosync), mrst=bool(mrst),
             compensate_rx_ticks=int(compensate_rx_ticks))
 
-    def get_tone_frequencies(self,detailed_output=False):
+    def get_tone_frequencies(self,detailed_output=False,refresh_shadow_copy=False):
         """Return active tone frequencies; with ``detailed_output=True`` return
-        the per-tone metadata dict instead of the bare frequency array."""
+        the per-tone metadata dict instead of the bare frequency array.
+        ``refresh_shadow_copy=True`` first re-reads the server's RAM copy of the
+        LO control registers from the firmware, so words written outside the
+        server are kept by later tone writes rather than put back."""
         if detailed_output:
-            return self.get_parameter('tone_frequencies_detailed')
+            return self.get_parameter('tone_frequencies_detailed', refresh_shadow_copy=refresh_shadow_copy)
         else:
-            return np.atleast_1d(self.get_parameter('tone_frequencies'))
+            return np.atleast_1d(self.get_parameter('tone_frequencies', refresh_shadow_copy=refresh_shadow_copy))
 
     def get_tone_metadata(self):
         """Return tone role metadata, including regular/blind indices."""
@@ -1691,9 +1694,12 @@ class ReadoutClient:
         return self.set_parameter(
             'tone_amplitudes', tone_amplitudes, autosync=bool(autosync), mrst=bool(mrst))
 
-    def get_tone_amplitudes(self):
-        """Return per-tone amplitude scale factors."""
-        return np.atleast_1d(self.get_parameter('tone_amplitudes'))
+    def get_tone_amplitudes(self, refresh_shadow_copy=False):
+        """Return per-tone amplitude scale factors.
+        ``refresh_shadow_copy=True`` first re-reads the server's RAM copy of the
+        LO control registers from the firmware, so words written outside the
+        server are kept by later tone writes rather than put back."""
+        return np.atleast_1d(self.get_parameter('tone_amplitudes', refresh_shadow_copy=refresh_shadow_copy))
 
     def set_tone_phases(self, tone_phases, autosync=False, mrst=False):
         """Set the per-tone phase offsets (radians) from ``tone_phases``."""
@@ -1701,9 +1707,12 @@ class ReadoutClient:
         return self.set_parameter(
             'tone_phases', tone_phases, autosync=bool(autosync), mrst=bool(mrst))
 
-    def get_tone_phases(self):
-        """Return per-tone phase offsets in radians."""
-        return np.atleast_1d(self.get_parameter('tone_phases'))
+    def get_tone_phases(self, refresh_shadow_copy=False):
+        """Return per-tone phase offsets in radians.
+        ``refresh_shadow_copy=True`` first re-reads the server's RAM copy of the
+        LO control registers from the firmware, so words written outside the
+        server are kept by later tone writes rather than put back."""
+        return np.atleast_1d(self.get_parameter('tone_phases', refresh_shadow_copy=refresh_shadow_copy))
 
     def _warn_zero_phases(self):
         """Check if all tone phases are zero and warn about crest factor.
@@ -2077,7 +2086,8 @@ class ReadoutClient:
                               f'{np.min(valid):.1f} — {np.max(valid):.1f} (of 16)')
         return response
 
-    def get_tone_powers(self,detailed_output=False,reference_plane='detector'):
+    def get_tone_powers(self,detailed_output=False,reference_plane='detector',
+                        refresh_shadow_copy=False):
         """Get current tone powers at the specified reference plane.
 
         Parameters
@@ -2100,6 +2110,10 @@ class ReadoutClient:
             If a detector/resonator is present, include its per-tone S21 in the
             configured model or apply it separately. This method does not
             acquire accumulator samples.
+        refresh_shadow_copy : bool
+            Re-read the server's RAM copy of the LO control registers from the
+            firmware first, so words written outside the server are kept by
+            later tone writes rather than put back (default False).
 
         Returns
         -------
@@ -2109,9 +2123,11 @@ class ReadoutClient:
             per-stage values across the full TX and RX chain.
         """
         if detailed_output:
-            return self.get_parameter('tone_powers_detailed', reference_plane=reference_plane)
+            return self.get_parameter('tone_powers_detailed', reference_plane=reference_plane,
+                                      refresh_shadow_copy=refresh_shadow_copy)
         else:
-            return np.atleast_1d(self.get_parameter('tone_powers', reference_plane=reference_plane))
+            return np.atleast_1d(self.get_parameter('tone_powers', reference_plane=reference_plane,
+                                                    refresh_shadow_copy=refresh_shadow_copy))
 
     def check_input_saturation(self,iterations=250):
         """Check whether the ADC/input path is saturating.

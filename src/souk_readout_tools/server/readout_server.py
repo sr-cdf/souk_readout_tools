@@ -2887,6 +2887,10 @@ class ReadoutServer:
 
                 elif request == 'get':
                     param_name = message.get('param')
+                    # Adopt control words written outside the server before reading
+                    # (firmware_lib.get_control_shadow); off unless the client asks.
+                    if message.get('refresh_shadow_copy') and self.r_fast is not None:
+                        firmware_lib.get_control_shadow(self.r_fast, refresh=True)
                     response = {'status': 'error', 'message': f'Invalid parameter name {param_name}'}
                     if param_name == 'sample_rate_hz':
                         value = firmware_lib.get_sample_rate(self.r)
