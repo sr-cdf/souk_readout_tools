@@ -3590,6 +3590,35 @@ class ReadoutClient:
         return info
 
     @staticmethod
+    def _warn_on_dropped_accumulations(cnt, source):
+        """
+        Warn when the accumulation counter skips.
+
+        A gap means the server missed accumulations at the source, so the
+        returned samples are **not uniformly spaced**. Nothing downstream reads
+        ``packet_counter`` -- a PSD will happily treat a gapped record as a
+        continuous timebase -- so an unflagged gap is silently wrong rather
+        than obviously wrong.
+        """
+        import warnings
+        cnt = np.asarray(cnt)
+        if cnt.size < 2:
+            return
+        d = np.diff(cnt.astype(np.int64))
+        gaps = np.flatnonzero(d > 1)
+        if not gaps.size:
+            return
+        lost = int((d[gaps] - 1).sum())
+        total = cnt.size + lost
+        first = int(gaps[0])
+        warnings.warn(
+            f"{source}: {lost} of {total} accumulations missing "
+            f"({100.0 * lost / total:.3f}%) in {gaps.size} gap(s), first at "
+            f"sample {first}. Samples are NOT uniformly spaced; inspect "
+            f"np.diff(packet_counter) before computing a PSD.",
+            stacklevel=3)
+
+    @staticmethod
     def parse_samples(sample_data, num_tones=None, apply_readout_correction=True):
         """
         Parse raw sample data into per-tone I/Q arrays.
@@ -3706,6 +3735,7 @@ class ReadoutClient:
                     'modulation_revision': modulation_revision,
                     'readout_correction_applied': readout_correction_applied,
                     }
+        ReadoutClient._warn_on_dropped_accumulations(cnt, 'parse_samples')
 
         return data_dict
 
@@ -6214,6 +6244,7 @@ class ReadoutClient:
                      'telescope_time':tt,
                      'stream_flags':{f'flag{i}':flags[i] for i in range(flags.shape[0])}
                      }
+        ReadoutClient._warn_on_dropped_accumulations(cnt, 'parse_stream')
         return data_dict
 
     @staticmethod
