@@ -12353,6 +12353,10 @@ def set_telescope_time(r_fast):
     # BLOCKS ~3-4 s on PPS. sync_period=clk_hz forces a 1 s period (the auto-detect
     # can mis-read it; the load is identical either way).
     sync.update_internal_time(clk_hz=clk_hz, sync_period=clk_hz)
+    # ext_sync_tt holds the TT latched *at* a sync, and the load takes effect on
+    # the sync update_internal_time waits for -- so reading now returns the old
+    # counter and reports the load as failed. Wait one more PPS (test 8).
+    sync.wait_for_sync()
     result = timed_sync_alignment(r_fast)
     result['loaded'] = True
     result['aligned'] = bool(abs(result['pps_boundary_offset_s']) < DEFAULT_ALIGN_TOL_S)
