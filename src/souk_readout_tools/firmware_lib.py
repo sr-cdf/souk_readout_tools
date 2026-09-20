@@ -10785,7 +10785,9 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
     buf_slot = read_buf_id_fast(fast_read_params) if get_buf_id else None
     stop_acc_cnt = read_acc_cnt_fast(fast_read_params)
     if start_acc_cnt != stop_acc_cnt:
-        acc.logger.warning('Accumulation counter changed while reading data!')
+        # Torn read: flagged in the return value, not logged. Every caller
+        # records the flag (packet_error in frames, acc_errs in sweeps), and one
+        # log line costs ~0.5 ms on the ARM -- often another lost accumulation.
         err=True
 
     if tone_indices is not None and plan is not None:

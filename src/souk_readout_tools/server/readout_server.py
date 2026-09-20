@@ -6601,7 +6601,10 @@ class ReadoutServer:
                     
                     await asyncio.sleep(0)  
                 else:
-                    await asyncio.sleep(0.1)
+                    # Sleep until triggered streaming is enabled. A 0.1 s poll
+                    # here woke the event loop every ~106 ms, which at 2400 Hz
+                    # cost the frame producer an accumulation each time.
+                    await self.e_triggered_stream_enabled.wait()
             except asyncio.CancelledError:
                 break
             except Exception as e:
