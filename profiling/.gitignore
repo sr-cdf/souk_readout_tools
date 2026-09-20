@@ -4,3 +4,6 @@ devmem_profile
 # generated profiler output / backing files
 devmem_backing*.bin
 devmem_profile_*.txt
+
+# per-stage results from run_stage.sh (copied back to the host, not committed)
+stages/

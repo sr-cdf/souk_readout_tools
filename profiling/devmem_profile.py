@@ -21,7 +21,10 @@ apples-to-apples partner of devmem_profile.c.
 
 By default it runs against an ordinary backing file so you can profile the
 pure Python/mmap mechanics on any machine. Pass --dev /dev/mem (needs root and
-the real board) to measure against actual hardware AXI-lite.
+the real board) to measure against actual hardware, or --dev /dev/uio0 for the
+same window without root (v7.12 image.ub only). --read-transport zdma replaces
+the accumulator read with a PS-DMA copy into a cached u-dma-buf (root, v7.12),
+keeping the write identical, so the step is directly comparable.
 
 Underlying mmap parameters match casperfpga LocalMemTransport:
     AXIL_OFFSET = 0xA0000000 ; MAP_SIZE = 512 MiB
@@ -73,6 +76,10 @@ def make_mmap(dev_path):
                        flags=mmap.MAP_SHARED,
                        prot=mmap.PROT_READ | mmap.PROT_WRITE)
         return mm, fd, 0
+    if dev_path.startswith("/dev/uio"):
+        # UIO map0 is the same 0xA0000000 window, selected by mmap offset 0
+        fd = os.open(dev_path, os.O_RDWR)
+        return mmap.mmap(fd, MAP_SIZE, mmap.MAP_SHARED, offset=0), fd, 0
     # regular backing file: create and size to MAP_SIZE
     fd = os.open(dev_path, os.O_RDWR | os.O_CREAT, 0o644)
     if os.fstat(fd).st_size < MAP_SIZE:
@@ -82,8 +89,16 @@ def make_mmap(dev_path):
     return mm, fd, 0
 
 
+def make_zdma_read(udmabuf):
+    """read(offset, nbytes) through PS DMA, as firmware_lib's ZDMA path does."""
+    from souk_readout_tools.zdma import UdmabufBuffer, ZdmaReader
+    rdr = ZdmaReader(cached_buf=UdmabufBuffer(udmabuf))
+    return lambda a, n: rdr.read_view(AXIL_OFFSET + a, n)
+
+
 def run(dev_path, n_steps, n_tones, n_read_chans, warmup, out_path,
-        write_addr, read_addr, sync_writes=True):
+        write_addr, read_addr, sync_writes=True, read_transport="mmap",
+        udmabuf="udmabuf1"):
     if n_read_chans > MAX_TONES:
         print(f"warning: --read-chans {n_read_chans} exceeds the design maximum "
               f"of {MAX_TONES} complex channels (N_TONE)", file=sys.stderr)
@@ -94,6 +109,7 @@ def run(dev_path, n_steps, n_tones, n_read_chans, warmup, out_path,
     read_bytes = n_read_chans * 2 * READ_BYTES_PER_COMPONENT
 
     mm, fd, base = make_mmap(dev_path)
+    zdma_read = make_zdma_read(udmabuf) if read_transport == "zdma" else None
 
     # Pre-build the payload once (we are profiling the devmem access, not the
     # numpy formatting). firmware writes v.astype('<u4').tobytes().
@@ -127,7 +143,10 @@ def run(dev_path, n_steps, n_tones, n_read_chans, warmup, out_path,
         wb = mm[write_addr + write_bytes - 4:write_addr + write_bytes]
         tw_sync = time.perf_counter()
         # accumulator read: pull the interleaved int32 real/imag pairs back out
-        raw = mm[read_addr:read_addr + read_bytes]   # read always after completion
+        if zdma_read is None:
+            raw = mm[read_addr:read_addr + read_bytes]   # read always after completion
+        else:
+            raw = zdma_read(read_addr, read_bytes)
         dout = np.frombuffer(raw, dtype=READ_DTYPE)
         t2 = time.perf_counter()
         # touch results so neither access is optimised away
@@ -155,7 +174,7 @@ def run(dev_path, n_steps, n_tones, n_read_chans, warmup, out_path,
 
     # flush() is meaningless (and errors with EINVAL) on a /dev/mem mapping —
     # there is no backing file to write back. Only flush a real backing file.
-    if dev_path != "/dev/mem":
+    if not dev_path.startswith("/dev/"):
         mm.flush()
     mm.close()
     os.close(fd)
@@ -179,7 +198,7 @@ def run(dev_path, n_steps, n_tones, n_read_chans, warmup, out_path,
                     p99_us=us(p99), max_us=us(mx), mb_per_s=thru)
 
     print(f"\n=== Python devmem profile ===")
-    print(f"device           : {dev_path}")
+    print(f"device           : {dev_path}  (accumulator read via {read_transport})")
     print(f"step total uses  : "
           f"{'completion-forced (sync)' if sync_writes else 'posted'} write")
     print(f"steps            : {n_steps} (warmup {warmup})")
@@ -200,7 +219,8 @@ def run(dev_path, n_steps, n_tones, n_read_chans, warmup, out_path,
     # --- dump raw per-step samples for inspection ---------------------------
     with open(out_path, "w") as f:
         f.write("# Python devmem profile\n")
-        f.write(f"# device={dev_path} steps={n_steps} warmup={warmup} "
+        f.write(f"# device={dev_path} read_transport={read_transport} "
+                f"steps={n_steps} warmup={warmup} "
                 f"step_write={'sync' if sync_writes else 'posted'}\n")
         f.write(f"# tones_per_write={n_tones} write_bytes={write_bytes} "
                 f"read_chans={n_read_chans} read_bytes={read_bytes} "
@@ -251,12 +271,19 @@ def main():
                         "write times are always measured and reported; this only "
                         "selects which feeds the step total. Use --no-sync-writes "
                         "to make the step total use the (unphysical) posted time.")
+    p.add_argument("--read-transport", choices=["mmap", "zdma"], default="mmap",
+                   help="accumulator read: slice of the mmap (default) or PS DMA "
+                        "into a cached u-dma-buf (root, v7.12 image.ub)")
+    p.add_argument("--udmabuf", default="udmabuf1",
+                   help="landing buffer for --read-transport zdma (default "
+                        "udmabuf1, leaving udmabuf0 to the readout server)")
     args = p.parse_args()
     if args.write_addr == args.read_addr:
         p.error("--write-addr and --read-addr must differ (the write would "
                 "clobber the region being read)")
     run(args.dev, args.steps, args.tones, args.read_chans, args.warmup,
-        args.out, args.write_addr, args.read_addr, args.sync_writes)
+        args.out, args.write_addr, args.read_addr, args.sync_writes,
+        args.read_transport, args.udmabuf)
 
 
 if __name__ == "__main__":
