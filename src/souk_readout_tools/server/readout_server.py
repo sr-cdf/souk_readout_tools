@@ -226,6 +226,16 @@ FLAG_CAL_FREEZE = 4
 FLAG_5 = 5
 FLAG_6 = 6
 FLAG_7 = 7
+# How often an *idle* stream client's handler wakes to send its zero-length
+# heartbeat and poll for a subscribe line. The client blocks in recv(4) with no
+# socket timeout and needs the heartbeat to get control back. While frames are
+# flowing there is no timed wake at all (see handle_stream_client): the data
+# proves liveness, and each wake cost the streamer a whole accumulation -- 72
+# gaps/60 s at 2 kHz when it woke every second, and at 2400 Hz nearly every one
+# of the 120 wakes an hour when it woke every 30 s. Dead peers are still caught
+# by TCP keepalive (see stream_keepalive).
+STREAM_KEEPALIVE_IDLE_S = 1
+
 
 
 #Because we need sudo to access /dev/mem (setcap not effective)
@@ -926,6 +936,8 @@ class ReadoutServer:
         self.stream_task = None
         self.triggered_stream_task = None
         self.e_stream_enabled = asyncio.Event()
+        self.e_stream_stopped = asyncio.Event()     # the inverse, for waiters
+        self.e_stream_stopped.set()
         self.e_triggered_stream_enabled = asyncio.Event()
         self.tasks = []
         self.fake_trigger_event = asyncio.Event()
@@ -1271,6 +1283,8 @@ class ReadoutServer:
         self.stream_task = None
         self.triggered_stream_task = None
         self.e_stream_enabled = asyncio.Event()
+        self.e_stream_stopped = asyncio.Event()     # the inverse, for waiters
+        self.e_stream_stopped.set()
         self.e_triggered_stream_enabled = asyncio.Event()
         self.tasks = []
         self.stream_flags = [asyncio.Event() for _ in range(8)]
@@ -3756,7 +3770,7 @@ class ReadoutServer:
                         await self.send_response(writer, {'status': 'error', 'message': str(e)})
 
                 elif request == 'enable_triggered_stream':
-                    self.e_stream_enabled.clear()
+                    self._set_streaming(False)
                     self.e_triggered_stream_enabled.set()
                     await self.send_response(writer, {'status': 'success'})
 
@@ -4423,6 +4437,15 @@ class ReadoutServer:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, max_fails)
 
 
+    def _set_streaming(self, on):
+        """Start/stop the frame producer, keeping ``e_stream_stopped`` in step.
+
+        A stream client handler waits on both a subscribe line and
+        ``e_stream_stopped``, so it never wakes on a timer while frames flow.
+        """
+        (self.e_stream_enabled.set if on else self.e_stream_enabled.clear)()
+        (self.e_stream_stopped.clear if on else self.e_stream_stopped.set)()
+
     async def handle_stream_client(self, reader, writer):
         """
         Handle a new stream client connection.
@@ -4448,20 +4471,47 @@ class ReadoutServer:
         self.stream_clients.append(writer)
 
         reader_eof = False
+        read_task = None
         try:
             while writer in self.stream_clients:
                 try:
-                    writer.write(b'\x00\x00\x00\x00')
-                    await writer.drain()
+                    # Skip the heartbeat while the streamer is running: the data
+                    # frames already prove liveness, and this loop's wake costs
+                    # the streamer an accumulation (see STREAM_KEEPALIVE_IDLE_S).
+                    streaming = self.e_stream_enabled.is_set()
+                    if not streaming:
+                        writer.write(b'\x00\x00\x00\x00')
+                        await writer.drain()
                     if reader_eof:
                         await asyncio.sleep(1)
                         continue
-                    # The 1 s wait doubles as the keepalive pacing and the poll
-                    # for an optional subscribe line (legacy clients never write).
-                    try:
-                        line = await asyncio.wait_for(reader.readline(), timeout=1)
-                    except asyncio.TimeoutError:
-                        continue
+                    # One long-lived read for the optional subscribe line
+                    # (legacy clients never write), so no buffered line is lost
+                    # when this loop goes round.
+                    if read_task is None:
+                        read_task = asyncio.ensure_future(reader.readline())
+                    if streaming:
+                        # No timer while frames flow: every wake here costs the
+                        # frame producer an accumulation (at 2400 Hz nearly all
+                        # of the 120 wakes an hour did). Wake on a subscribe
+                        # line, or when the stream stops and the heartbeat is
+                        # due again.
+                        stopped = asyncio.ensure_future(self.e_stream_stopped.wait())
+                        try:
+                            done, _ = await asyncio.wait(
+                                {read_task, stopped}, return_when=asyncio.FIRST_COMPLETED)
+                        finally:
+                            stopped.cancel()
+                        if read_task not in done:
+                            continue
+                    else:
+                        try:
+                            await asyncio.wait_for(asyncio.shield(read_task),
+                                                   timeout=STREAM_KEEPALIVE_IDLE_S)
+                        except asyncio.TimeoutError:
+                            continue
+                    line = read_task.result()
+                    read_task = None
                     if not line:
                         reader_eof = True
                         continue
@@ -4482,6 +4532,8 @@ class ReadoutServer:
             # Must happen on every exit path. When the BrokenPipeError escaped,
             # the writer was left in stream_clients and the streamer kept
             # writing to a dead socket.
+            if read_task is not None:
+                read_task.cancel()
             if writer in self.stream_clients:
                 self.stream_clients.remove(writer)
 
