@@ -96,7 +96,14 @@ ZDMA_CH_CTRL2     = 0x200  # [0] EN: start the programmed transfer
 # ZDMA_CH_ISR bits. [UG1087] ZDMA_CH_ISR; [embeddedsw] XZDMA_IXR_*_MASK.
 IXR_DMA_DONE = 0x400
 IXR_ALL      = 0xFFF
-IXR_ERRORS   = IXR_ALL & ~(0x400 | 0x800)  # everything but DONE and PAUSE
+# BYTE_CNT_OVRFL is not a transfer error: ZDMA_CH_TOTAL_BYTE is a 32-bit count
+# of every byte the channel has moved, so it wraps every 4 GiB. Treating it as
+# an error aborted a read whenever the wrap was polled before DONE -- every few
+# minutes of streaming at kHz rates. [embeddedsw] XZDMA_IXR_BYTE_CNT_OVRFL_MASK.
+IXR_BYTE_CNT_OVRFL = 0x008
+IXR_ERRORS   = IXR_ALL & ~(0x400 | 0x800 | IXR_BYTE_CNT_OVRFL)  # not DONE, PAUSE, OVRFL
+ZDMA_CH_TOTAL_BYTE = 0x188  # bytes moved since last clear; clear by writing back
+                            # its value ([embeddedsw] XZDma_TotalByteClear)
 
 
 class ZdmaReader(object):
@@ -134,6 +141,7 @@ class ZdmaReader(object):
 
         # one-time channel setup
         self._wr(ZDMA_CH_IDS, IXR_ALL)   # no interrupts; we poll ISR (raw status)
+        self._wr(ZDMA_CH_TOTAL_BYTE, self._rd(ZDMA_CH_TOTAL_BYTE))  # clear byte count
         self._wr(ZDMA_CH_ISR, IXR_ALL)   # clear stale status
         # simple mode, normal R/W, over-fetch OFF so the DMA never reads past
         # the end of the BRAM's assigned address segment ([UG1085] OVR_FETCH)
@@ -206,6 +214,7 @@ class ZdmaReader(object):
         self._wr(ZDMA_CH_DST_WORD1, (self.dst_phys >> 32) & 0x1FFFF)
         self._wr(ZDMA_CH_DST_WORD2, nbytes)
         self._wr(ZDMA_CH_DST_WORD3, 0)
+        self._wr(ZDMA_CH_TOTAL_BYTE, self._rd(ZDMA_CH_TOTAL_BYTE))  # clear byte count
         self._programmed = (src, nbytes)
 
     def _xfer(self, src, nbytes, timeout_s):
