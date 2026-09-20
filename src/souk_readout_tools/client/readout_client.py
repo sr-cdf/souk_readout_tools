@@ -3444,6 +3444,14 @@ class ReadoutClient:
             return self._mock_server.get_samples(num_samples, incl_system_info, burst)
 
         self._warn_zero_phases()
+        # Pre-allocate the receive buffer (conservative upper bound) BEFORE
+        # sending the request. Filling it takes ~190 ms for 30 000 samples;
+        # done after the request, the server's send buffer (capped by
+        # net.core.wmem_max, ~50 frames) filled meanwhile and it dropped
+        # accumulations at the start of every capture above ~600 Hz.
+        max_frame_bytes = 2048*2*4 + 10*4
+        data_raw = bytearray(max_frame_bytes*num_samples)
+        view = memoryview(data_raw)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((self.request_server_address, self.request_server_port))
             message = {'request': 'get_samples', 'num_samples': num_samples, 'burst': burst,
@@ -3467,11 +3475,6 @@ class ReadoutClient:
                             f'({received}/{nbytes} bytes received)')
                     received += n
                 return buf
-
-            # Pre-allocate bytearray (conservative upper bound)
-            max_frame_bytes = 2048*2*4 + 10*4
-            data_raw = bytearray(max_frame_bytes*num_samples)
-            view = memoryview(data_raw)
 
             t0=time.time()
             frame_bytes = 0
