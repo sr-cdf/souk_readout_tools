@@ -25,7 +25,9 @@ Version: 1.2.0
 
 
 import asyncio, contextvars, functools
+import concurrent.futures
 import gc
+import threading
 import copy
 import datetime
 import importlib.metadata
@@ -227,6 +229,30 @@ FLAG_CAL_FREEZE = 4
 FLAG_5 = 5
 FLAG_6 = 6
 FLAG_7 = 7
+
+# Frame producers drain their clients and hand control back to the event loop
+# every few frames rather than every frame. Measured on the ARM at 1000 tones:
+# drain + sleep(0) per frame costs ~83 us against a ~78 us frame, and that --
+# not the accumulator read -- is what set the ~2950 frames/s ceiling. Capped so
+# the unflushed backlog stays inside asyncio's 64 KiB high-water mark (past it
+# drain() blocks and the saving is lost), and bounded in wall time so low
+# sample rates stay responsive to commands.
+#
+# If you re-benchmark these, write to a REMOTE sink, not loopback: the identical
+# pattern measured 78.4 us/frame over 127.0.0.1 and 96.1 us over the NIC, so a
+# loopback bench flatters the result and over-predicts the achievable rate.
+#
+# Do NOT batch the frames into one write() per drain. It was tried and measured:
+# it cuts the mean cost (96.1 -> 69.4 us/frame over the NIC) but concentrates it
+# into a burst at the flush, which overruns the accumulation deadline. On
+# hardware that cost one lost sample per flush -- 3000 Hz went 0.385% -> 15.0%
+# loss and 3509 Hz 0.796% -> 13.0%, with one gap every ~7.5 frames against a
+# batch of 8. The deadline is per accumulation, not per batch, so a lower
+# average does not help if one iteration in eight is long.
+STREAM_YIELD_MAX_FRAMES = 8
+STREAM_YIELD_MAX_BYTES = 65536
+STREAM_YIELD_MAX_SECONDS = 0.002
+
 # How often an *idle* stream client's handler wakes to send its zero-length
 # heartbeat and poll for a subscribe line. The client blocks in recv(4) with no
 # socket timeout and needs the heartbeat to get control back. While frames are
@@ -237,6 +263,33 @@ FLAG_7 = 7
 # by TCP keepalive (see stream_keepalive).
 STREAM_KEEPALIVE_IDLE_S = 1
 
+# Pinned socket send buffer (see _size_send_buffer). The kernel autotunes from a
+# 16 KiB default, which is two frames at 1000 tones; the ramp costs a burst of
+# dropped accumulations at the start of every get_samples capture.
+STREAM_SEND_BUFFER_BYTES = 1 << 20
+
+# CPU isolation for streaming, set through the systemd unit by
+# profiling/rt_tuning.sh: the event-loop thread, which builds and sends every
+# frame, runs alone on SOUK_STREAM_CPUS; all other threads of the server
+# (executor workers serving requests, katcp I/O) on SOUK_WORKER_CPUS, so they
+# cannot preempt it. Unset: no change.
+def _cpus_from_env(name):
+    value = os.environ.get(name, '').strip()
+    return {int(c) for c in value.split(',') if c.strip()} if value else None
+
+
+def _pin_worker_thread():
+    cpus = _cpus_from_env('SOUK_WORKER_CPUS')
+    if cpus:
+        os.sched_setaffinity(0, cpus)      # 0 = the calling thread
+
+
+# Per-frame timing of the frame producers (get_info section 'loop_timing'). One
+# row per prepare_frame call in a preallocated ring buffer, reset at the start of
+# each capture; ~1 us per frame. 131072 frames is ~65 s at 2 kHz. Not a deque of
+# tuples: keeping one new object per frame made Python's garbage collector run
+# every ~700 frames, a ~0.2-0.5 ms pause that itself cost accumulations.
+LOOP_TIMING_FRAMES = 1 << 17
 
 
 #Because we need sudo to access /dev/mem (setcap not effective)
@@ -969,6 +1022,12 @@ class ReadoutServer:
         self._fw_modulation_revision_history = {}       # revision -> {center, slot_offsets, mod_indices, n_dwell, n_settle, mode, ts}
         self._mod_dwell_tag = -1                        # last slot seen by prepare_frame
         self._mod_dwell_pos = 0                          # accumulations into the current dwell
+        self._frame_cache = None                        # (n_data, frame, hdr view, length prefix)
+        self._frames_since_yield = 0                    # frames written since the last drain/yield
+        self._last_yield = 0.0                          # time.monotonic() of the last drain/yield
+        self.loop_timing = np.zeros((LOOP_TIMING_FRAMES, 6))   # ring buffer, see _info_loop_timing
+        self._loop_timing_n = 0                         # rows written since the capture began
+        self._loop_timing_last = None                   # (perf_counter at last prepare_frame exit, cnt)
 
         #FFM tone tracking (doc/tone_tracking.md): off by default -- zero
         # behavioural change while None. The TrackingRuntime owns the ring
@@ -1331,6 +1390,12 @@ class ReadoutServer:
         self._fw_modulation_revision_history = {}       # revision -> {center, slot_offsets, mod_indices, n_dwell, n_settle, mode, ts}
         self._mod_dwell_tag = -1                        # last slot seen by prepare_frame
         self._mod_dwell_pos = 0                          # accumulations into the current dwell
+        self._frame_cache = None                        # (n_data, frame, hdr view, length prefix)
+        self._frames_since_yield = 0                    # frames written since the last drain/yield
+        self._last_yield = 0.0                          # time.monotonic() of the last drain/yield
+        self.loop_timing = np.zeros((LOOP_TIMING_FRAMES, 6))   # ring buffer, see _info_loop_timing
+        self._loop_timing_n = 0                         # rows written since the capture began
+        self._loop_timing_last = None                   # (perf_counter at last prepare_frame exit, cnt)
 
         #FFM tone tracking (doc/tone_tracking.md): off by default -- zero
         # behavioural change while None. The TrackingRuntime owns the ring
@@ -1799,7 +1864,7 @@ class ReadoutServer:
     ]
     ALL_INFO_SECTIONS = DEFAULT_INFO_SECTIONS + [
         'diagnostics', 'config', 'calibrations', 'resonators', 'registers',
-        'modulation', 'tracking',
+        'modulation', 'tracking', 'loop_timing', 'control_shadow',
     ]
 
     # Sections that only read PS-side state (clock chips over I2C/SPI, sysmon,
@@ -1845,6 +1910,8 @@ class ReadoutServer:
             'registers':    self._info_registers,
             'modulation': self._info_modulation,
             'tracking': self._info_tracking,
+            'loop_timing': self._info_loop_timing,
+            'control_shadow': self._info_control_shadow,
         }
         if sections == 'list':
             # Catalogue of available sections (derived from what's actually
@@ -2478,6 +2545,7 @@ class ReadoutServer:
         """
         addr = writer.get_extra_info('peername')
         print(f"request client connected: {addr}")
+        self._size_send_buffer(writer.get_extra_info('socket'))
         self.request_clients.append(writer)
 
         try:
@@ -3140,16 +3208,18 @@ class ReadoutServer:
 
 
                 elif request == 'enable_stream':
+                    self._isolate_frame_thread()       # catch threads started since
+                    self._reset_loop_timing()
                     self.stream_sparse_read = message.get('sparse_read')
                     self.e_triggered_stream_enabled.clear()
-                    self.e_stream_enabled.set()
+                    self._set_streaming(True)
                     print('Stream enabled, clients:', self.stream_clients)
                     await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'disable_stream':
                     if self.e_modulation_enabled.is_set():
                         self._pending_modulation = {'op': 'rest'}
-                    self.e_stream_enabled.clear()
+                    self._set_streaming(False)
                     await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'enable_modulation':
@@ -4145,7 +4215,8 @@ class ReadoutServer:
                     burst = message.get('burst', False)
                     task = asyncio.create_task(self.get_samples(
                         writer, num_samples, burst=burst,
-                        sparse_read=message.get('sparse_read')))
+                        sparse_read=message.get('sparse_read'),
+                        warmup=message.get('warmup')))
                     self.tasks.append(task)
 
                 elif request == 'get_accumulator_snapshots':
@@ -4447,6 +4518,30 @@ class ReadoutServer:
             writer.close()
             await writer.wait_closed()
 
+    def _size_send_buffer(self, sock):
+        """
+        Pin the socket send buffer instead of letting the kernel autotune it up
+        from its 16 KiB default -- only two frames at 1000 tones.
+
+        A frame producer must finish inside one accumulation period, so it
+        cannot wait out the autotuning ramp: ``drain()`` blocks until the buffer
+        grows and the accumulations missed meanwhile appear as a burst of
+        startup gaps at fixed sample positions whose size grows with rate
+        (measured on ``get_samples``: none at 600 Hz, 23 samples at 1 kHz, 366
+        at 2 kHz, always around samples 25/43/46-82). The continuous stream does
+        not show them because its socket is long-lived and has already grown.
+
+        Capped at ``net.core.wmem_max`` by the kernel unless SO_SNDBUFFORCE is
+        used, so a request for more silently lands lower -- that is fine, any
+        pinned size beats ramping from 16 KiB.
+        """
+        if sock is None:            # get_extra_info returns None on a closed transport
+            return
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, STREAM_SEND_BUFFER_BYTES)
+        except OSError as exc:
+            print(f"Could not set send buffer: {exc}")
+
     def stream_keepalive(self, sock, after_idle_sec=1, interval_sec=3, max_fails=5):
         """
         Enable TCP keepalive on the open socket ``sock``.
@@ -4500,6 +4595,7 @@ class ReadoutServer:
         print(f"Stream client connected: {addr}")
         sock = writer.get_extra_info('socket')
         self.stream_keepalive(sock) # Enable TCP keepalive so we can detect when the client disconnects
+        self._size_send_buffer(sock)
         writer.addr = addr
         writer.typed_updates = False
         self.stream_clients.append(writer)
@@ -5193,6 +5289,7 @@ class ReadoutServer:
         keeps its legacy ``stream_flags[5]`` boolean meaning.
         """
         num_headers = 10
+        t_enter = time.perf_counter()
 
         read_tag = fw_modulation or (sw_buf_point_map is not None)
         if read_tag:
@@ -5224,16 +5321,27 @@ class ReadoutServer:
         else:
             cnt,data,err,tt = firmware_lib.read_accumulated_data_fast(
                 fast_read_params, tone_indices=self.active_tone_indices)
+        t_read = time.perf_counter()
 
-        frame = np.zeros(len(data)+num_headers,dtype='<i4')
-        frame[:len(data)] = data
+        n_data = len(data)
         # Only the I/Q payload is signed. Every header word is a counter, a
         # half of the 64-bit telescope time, the packed modulation tag or a
         # flag -- all unsigned 32-bit -- so write them through an unsigned view
         # of the header block instead of casting each one into int32 (which
         # NumPy 2 refuses once acc_cnt passes 2**31). Same negative indices,
         # same wire bytes; hdr[-k] is frame[-k].
-        hdr = frame[-num_headers:].view('<u4')
+        #
+        # The array, that view and the length prefix are reused across calls --
+        # allocating and re-viewing them per frame costs ~15 us of a ~40 us
+        # frame build on the ARM. Every element is rewritten below (payload plus
+        # all ten header words), so nothing stale survives. Rebuilt whenever the
+        # active tone count changes.
+        if self._frame_cache is None or self._frame_cache[0] != n_data:
+            buf = np.zeros(n_data + num_headers, dtype='<i4')
+            self._frame_cache = (n_data, buf, buf[-num_headers:].view('<u4'),
+                                 struct.pack('>I', (n_data + num_headers) * 4))
+        _, frame, hdr, data_len = self._frame_cache
+        frame[:n_data] = data
         hdr[-1] = err
         hdr[-2] = cnt & 0xFFFFFFFF          # free-running, wraps at 2**32
         hdr[-3] = tt & 0xFFFFFFFF
@@ -5252,16 +5360,30 @@ class ReadoutServer:
         hdr[-9] = set_freqs
         hdr[-10] = int(self.stream_flags[FLAG_SERVER_REQUEST].is_set())
 
-        data_bytes = frame.tobytes()
+        # A fresh bytes per frame: tracking.tap() and burst mode retain the
+        # payload without copying, so a shared output buffer would alias frames
+        # already queued.
+        payload = data_len + frame.tobytes()
 
-        data_len = struct.pack('>I', len(data_bytes))
-
-        payload = data_len+data_bytes
+        # Loop timing: where this frame's time went, and whether accumulations
+        # were missed since the last one. 'outside' is everything between the
+        # previous frame and this call -- sending, yielding, other event-loop work.
+        t_exit = time.perf_counter()
+        t_seen = (fast_read_params or {}).get('t_acc_seen', t_enter)
+        last = self._loop_timing_last
+        if last is None:
+            outside, missed = 0.0, 0
+        else:
+            outside, missed = t_enter - last[0], (int(cnt) - last[1] - 1) & 0xFFFFFFFF
+        self.loop_timing[self._loop_timing_n % len(self.loop_timing)] = (
+            t_seen - t_enter, t_read - t_seen, t_exit - t_read, outside, missed, int(err))
+        self._loop_timing_n += 1
+        self._loop_timing_last = (t_exit, int(cnt))
 
         return payload,cnt,err
     
 
-    async def get_samples(self, writer, num_samples, burst=False, sparse_read=None):
+    async def get_samples(self, writer, num_samples, burst=False, sparse_read=None, warmup=None):
         """
         Get a fixed number of samples over the request channel.
 
@@ -5284,8 +5406,12 @@ class ReadoutServer:
             active channels or the whole accumulator, whichever is cheaper.
             ``False`` forces the full-buffer read, ``True`` forces the partial
             one. Only worth setting to diagnose a suspected read problem.
+        warmup : int or None, optional
+            Accumulations read and discarded before the first returned sample
+            (above 100 Hz, not in burst mode). ``None`` keeps the default of 50.
         """
         try:
+            self._reset_loop_timing()
             pending_op = None
             if self._pending_modulation is not None:
                 pending_op = self._pending_modulation.get('op')
@@ -5428,18 +5554,22 @@ class ReadoutServer:
                             skip_budget -= 1
                             continue
                     writer.write(payload)
-                    await writer.drain()
+                    if self._yield_due(len(payload)):
+                        await writer.drain()
                     emitted += 1
+                await writer.drain()
             else:
                 # Plain path (unchanged): warm up a bit to avoid initial delays.
                 if (rate > 100) and not burst:
-                    for j in range(50):
+                    for j in range(50 if warmup is None else int(warmup)):
                         payload, cnt, err = self.prepare_frame(fast_read_params)
                         continue
                 for _ in range(num_samples):
                     payload, cnt, err = self.prepare_frame(fast_read_params)
                     writer.write(payload)
-                    await writer.drain()
+                    if self._yield_due(len(payload)):
+                        await writer.drain()
+                await writer.drain()
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -6021,6 +6151,75 @@ class ReadoutServer:
                         f"differ from the firmware", source='info')
         return report
 
+    def _reset_loop_timing(self):
+        self._loop_timing_n = 0
+        self._loop_timing_last = None
+
+    def _info_loop_timing(self):
+        """Per-frame timing of the frame producers since the current capture began.
+
+        Components, in us (percentiles p50 / p90 / p99 / p99.9 / max):
+
+        - ``wait``: blocking wait for the next accumulation.
+        - ``read``: accumulator read plus the counter, TT and buffer-id reads.
+        - ``frame``: building the payload.
+        - ``outside``: time between frames outside ``prepare_frame`` -- sending,
+          yielding, and any other event-loop work.
+        - ``busy``: read + frame + the following ``outside``: from seeing an
+          accumulation to waiting for the next. Above one period, the next
+          accumulation is lost.
+
+        ``gap_frames`` repeats the components for only the frames that arrived
+        after lost accumulations, which shows where the time that cost them went.
+
+        ``events`` lists the first 32 gaps of 4+ or torn reads and the first 8 smaller gaps, with the raw row of
+        the frame before and of the frame itself, ``[wait, read, frame, outside]``
+        in us then ``missed, torn``. A read lasting the whole gap on the torn frame
+        means the bus held the CPU off; a huge ``missed`` means the counter
+        stepped backwards.
+        """
+        n, size = self._loop_timing_n, len(self.loop_timing)
+        # oldest row first; after a wrap, frame numbers continue from n - size
+        rows = self.loop_timing[:n] if n <= size else np.roll(self.loop_timing, -(n % size), axis=0)
+        first_frame = max(n - size, 0)
+        try:
+            period_us = 1e6 / float(firmware_lib.get_sample_rate(self.r_fast))
+        except Exception:
+            period_us = None
+        out = {'frames': int(len(rows)), 'period_us': period_us,
+               'missed_accumulations': int(rows[:, 4].sum()) if len(rows) else 0,
+               'frames_after_gap': int((rows[:, 4] > 0).sum()) if len(rows) else 0,
+               'torn_reads': int(rows[:, 5].sum()) if len(rows) else 0}
+        # large gaps and torn reads first, so frequent 1-sample overruns cannot
+        # crowd out the rare events
+        if len(rows):
+            big = np.flatnonzero((rows[:, 4] >= 4) | (rows[:, 5] > 0))[:32]
+            small = np.flatnonzero((rows[:, 4] > 0) & (rows[:, 4] < 4) & (rows[:, 5] == 0))[:8]
+            ev = np.sort(np.concatenate([big, small]))
+        else:
+            ev = []
+        out['events'] = [{'frame': int(k) + first_frame,
+                          'rows': [[round(float(1e6 * v), 1) for v in rows[j, :4]] + [int(rows[j, 4]), int(rows[j, 5])]
+                                   for j in range(max(k - 1, 0), k + 1)]}
+                         for k in ev]
+        if len(rows) < 2:
+            return out
+
+        def pct(x):
+            x = 1e6 * np.asarray(x)
+            return {k: float(v) for k, v in zip(('p50', 'p90', 'p99', 'p999', 'max'),
+                                                (*np.percentile(x, (50, 90, 99, 99.9)), x.max()))}
+        names = ('wait', 'read', 'frame', 'outside')
+        for i, n in enumerate(names):
+            out[n] = pct(rows[1:, i] if n == 'outside' else rows[:, i])
+        busy = rows[:-1, 1] + rows[:-1, 2] + rows[1:, 3]
+        out['busy'] = pct(busy)
+        gap = np.flatnonzero(rows[:, 4] > 0)
+        gap = gap[gap > 0]
+        if gap.size:
+            out['gap_frames'] = {n: pct(rows[gap, i]) for i, n in enumerate(names)}
+            out['gap_frames']['busy_before'] = pct(busy[gap - 1])
+        return out
 
     # ----- firmware-slot frequency modulation (v7.11) -----------------------
     # The slot analog of the software-modulation engine above. Software
@@ -6401,6 +6600,41 @@ class ReadoutServer:
                 print(traceback.format_exc())
                 self.stream_clients.remove(client)
 
+    def _yield_due(self, frame_bytes):
+        """
+        True when the frame producer should drain and yield, counting the frame
+        just written and resetting the counters whenever it says yes.
+
+        Trips on whichever of the frame, byte or wall-time bound comes first
+        (see ``STREAM_YIELD_MAX_FRAMES``).
+        """
+        self._frames_since_yield += 1
+        due = (self._frames_since_yield >= STREAM_YIELD_MAX_FRAMES
+               # drain before one more frame would cross the mark, not after
+               or (self._frames_since_yield + 1) * frame_bytes > STREAM_YIELD_MAX_BYTES
+               or time.monotonic() - self._last_yield >= STREAM_YIELD_MAX_SECONDS)
+        if due:
+            self._frames_since_yield = 0
+            self._last_yield = time.monotonic()
+        return due
+
+    async def _drain_stream_clients(self):
+        """
+        Drain every connected stream client, dropping any whose socket has
+        failed, then hand control back to the event loop.
+
+        This is the frame producer's only yield point, so it is also where new
+        commands and connections get serviced.
+        """
+        for client in list(self.stream_clients):
+            try:
+                await client.drain()
+            except ConnectionResetError:
+                print(f"Stream client disconnected {getattr(client, 'addr', '?')} (ConnectionResetError)")
+                if client in self.stream_clients:
+                    self.stream_clients.remove(client)
+        await asyncio.sleep(0)
+
     def _apply_pending_modulation_command(self):
         """
         Apply a queued modulation command at a cycle boundary. The frame producer
@@ -6506,7 +6740,8 @@ class ReadoutServer:
         This single coroutine is "one streamer to rule them all" — normal
         streaming is just the modulation-off case.
         """
-        err_count=0
+        # Torn reads are not printed here (~0.5 ms per line, longer than a frame):
+        # each frame carries packet_error, and get_info('loop_timing') counts them.
         fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
         fast_read_params['sparse_read'] = getattr(self, 'stream_sparse_read', None)
         while True:
@@ -6564,37 +6799,19 @@ class ReadoutServer:
                     n_settle = int(self.fw_modulation_cfg.get('n_settle', 0)) if self.fw_modulation_cfg else 0
                     payload, cnt, err = self.prepare_frame(
                         fast_read_params, fw_modulation=True, revision=rev, fw_n_settle=n_settle)
-                    if err:
-                        err_count += 1
-                        print('Packet error:', cnt, err_count)
                     self._write_to_stream_clients(payload)
                     if self.tracking is not None and self.tracking.enabled:
                         # Tone-tracking tap (fw engine): O(1) append of the
                         # already-built payload, same as the sw branch.
                         self.tracking.tap(payload)
-                    for client in list(self.stream_clients):
-                        try:
-                            await client.drain()
-                        except ConnectionResetError:
-                            print(f"Stream client disconnected {getattr(client, 'addr', '?')} (ConnectionResetError)")
-                            if client in self.stream_clients:
-                                self.stream_clients.remove(client)
-                    await asyncio.sleep(0)
+                    if self._yield_due(len(payload)):
+                        await self._drain_stream_clients()
                 else:
                     self._modulation_owner = None
                     payload, cnt, err = self.prepare_frame(fast_read_params)
-                    if err:
-                        err_count += 1
-                        print('Packet error:', cnt, err_count)
                     self._write_to_stream_clients(payload)
-                    for client in list(self.stream_clients):
-                        try:
-                            await client.drain()
-                        except ConnectionResetError:
-                            print(f"Stream client disconnected {getattr(client, 'addr', '?')} (ConnectionResetError)")
-                            if client in self.stream_clients:
-                                self.stream_clients.remove(client)
-                    await asyncio.sleep(0)  # release control to other tasks
+                    if self._yield_due(len(payload)):
+                        await self._drain_stream_clients()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -7139,10 +7356,26 @@ class ReadoutServer:
         func_call = functools.partial(ctx.run, func, *args, **kwargs)
         return await loop.run_in_executor(None, func_call)
 
+    def _isolate_frame_thread(self):
+        """Pin this (event-loop) thread to SOUK_STREAM_CPUS and every other
+        thread of the process to SOUK_WORKER_CPUS. No-op unless both are set."""
+        stream, workers = _cpus_from_env('SOUK_STREAM_CPUS'), _cpus_from_env('SOUK_WORKER_CPUS')
+        if not (stream and workers):
+            return
+        me = threading.get_native_id()
+        for tid in os.listdir('/proc/self/task'):
+            try:
+                os.sched_setaffinity(int(tid), stream if int(tid) == me else workers)
+            except (ProcessLookupError, OSError):
+                pass                           # thread exited meanwhile
+
     async def async_main(self):
         """
         Main function that starts the request server, stream server, and tasks for streaming and triggered streaming.
         """
+        asyncio.get_running_loop().set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(initializer=_pin_worker_thread))
+        self._isolate_frame_thread()
         request_server = await asyncio.start_server(self.handle_request_client, self.server_address, self.request_server_port)
         stream_server = await asyncio.start_server(self.handle_stream_client, self.server_address, self.stream_server_port)
         
