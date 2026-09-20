@@ -5963,9 +5963,12 @@ def psb_chanselect_set_channel_inmap(r, inmap):
         # Word width and byte order both come from the firmware block (v7.11 '>i4';
         # v7.12 narrows the vacc reorder map to '>i2'). Unsigned: the map holds an
         # address plus a discard bit, and DISCARD_BIT does not fit a signed word.
+        # devmem must reproduce katcp's layout: the entries as a big-endian byte
+        # stream, carried in 32-bit bus words. For 16-bit entries that puts entry
+        # 2k in the HIGH half of word k -- a plain '<u2' view swaps every pair
+        # (measured 2026-09-16: DAC tone amplitudes came out pair-swapped).
         _map_itemsize = np.dtype(psb._map_format).itemsize
         psb._fast_inmap_fast_nbytes = reorder_depth * _map_itemsize
-        psb._fast_inmap_fast_dtype = np.dtype(f'<u{_map_itemsize}')
         psb._fast_inmap_slow_dtype = np.dtype(f'u{_map_itemsize}').newbyteorder(np.dtype(psb._map_format).byteorder)
         try:
             psb._fast_inmap_mm = psb.host.transport.axil_mm
@@ -6015,11 +6018,11 @@ def psb_chanselect_set_channel_inmap(r, inmap):
 
     if psb._fast_inmap_use_devmem:
         mm = psb._fast_inmap_mm
-        fast_dtype = psb._fast_inmap_fast_dtype
+        slow_dtype = psb._fast_inmap_slow_dtype
         fast_nbytes = psb._fast_inmap_fast_nbytes
         for i, addr in enumerate(psb._fast_inmap_map_addrs):
-            data = serial_maps[i].astype(fast_dtype, copy=False).tobytes()
-            mm[addr:addr + fast_nbytes] = data
+            stream = serial_maps[i].astype(slow_dtype).tobytes()   # what katcp would send
+            mm[addr:addr + fast_nbytes] = np.frombuffer(stream, '>u4').astype('<u4').tobytes()
     else:
         slow_dtype = psb._fast_inmap_slow_dtype
         for i, reg in enumerate(psb._fast_inmap_map_regs):
@@ -6071,9 +6074,12 @@ def psb_chanselect_get_channel_inmap(r):
         # Word width and byte order both come from the firmware block (v7.11 '>i4';
         # v7.12 narrows the vacc reorder map to '>i2'). Unsigned: the map holds an
         # address plus a discard bit, and DISCARD_BIT does not fit a signed word.
+        # devmem must reproduce katcp's layout: the entries as a big-endian byte
+        # stream, carried in 32-bit bus words. For 16-bit entries that puts entry
+        # 2k in the HIGH half of word k -- a plain '<u2' view swaps every pair
+        # (measured 2026-09-16: DAC tone amplitudes came out pair-swapped).
         _map_itemsize = np.dtype(psb._map_format).itemsize
         psb._fast_inmap_fast_nbytes = reorder_depth * _map_itemsize
-        psb._fast_inmap_fast_dtype = np.dtype(f'<u{_map_itemsize}')
         psb._fast_inmap_slow_dtype = np.dtype(f'u{_map_itemsize}').newbyteorder(np.dtype(psb._map_format).byteorder)
         try:
             psb._fast_inmap_mm = psb.host.transport.axil_mm
@@ -6094,11 +6100,11 @@ def psb_chanselect_get_channel_inmap(r):
     serial_maps = np.empty((n_exp, reorder_depth), dtype=np.uint32)
     if psb._fast_inmap_use_devmem:
         mm = psb._fast_inmap_mm
-        fast_dtype = psb._fast_inmap_fast_dtype
+        slow_dtype = psb._fast_inmap_slow_dtype
         fast_nbytes = psb._fast_inmap_fast_nbytes
         for i, addr in enumerate(psb._fast_inmap_map_addrs):
-            raw = mm[addr:addr + fast_nbytes]
-            serial_maps[i] = np.frombuffer(raw, dtype=fast_dtype).copy()
+            stream = np.frombuffer(mm[addr:addr + fast_nbytes], '<u4').astype('>u4').tobytes()
+            serial_maps[i] = np.frombuffer(stream, dtype=slow_dtype)
     else:
         slow_dtype = psb._fast_inmap_slow_dtype
         nbytes = reorder_depth * slow_dtype.itemsize
