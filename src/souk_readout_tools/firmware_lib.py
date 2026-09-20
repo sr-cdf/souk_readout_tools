@@ -10662,6 +10662,11 @@ def _cached_read_plan(fast_read_params, tone_indices, sparse_read):
         prev_idx, prev_sparse, plan = cached
         if prev_sparse == sparse_read and (prev_idx is tone_indices
                                            or np.array_equal(prev_idx, tone_indices)):
+            if prev_idx is not tone_indices:
+                # Same tones in a new array (the server makes one per tone set):
+                # remember it, or every later call pays the content compare
+                # (35 us on the ARM) instead of the identity check.
+                fast_read_params['_read_plan'] = (tone_indices, sparse_read, plan)
             return plan
     n_chans = fast_read_params['acc'].n_chans
     plan = plan_accumulator_reads(tone_indices, n_chans, force=bool(sparse_read))
@@ -10712,13 +10717,17 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
     base_addr=fast_read_params['base_addr']
     err = False
 
-    # acc._wait_for_acc(0.00001)
-    start_acc_cnt = _blocking_wait_for_acc_fast(fast_read_params, 0.00001)
-
     # Partial read: one access per contiguous run of wanted channels. Worth it
     # only for a handful of tones -- the plan returns None (and we fall through
-    # to the bulk read) whenever reading everything is cheaper.
+    # to the bulk read) whenever reading everything is cheaper. Planned before
+    # waiting: a new tone set rebuilds the plan (~3 ms on the ARM), which between
+    # seeing an accumulation and reading it tore the first read of every
+    # get_samples and of a stream after retuning.
     plan = _cached_read_plan(fast_read_params, tone_indices, sparse_read)
+
+    # acc._wait_for_acc(0.00001)
+    start_acc_cnt = _blocking_wait_for_acc_fast(fast_read_params, 0.00001)
+    fast_read_params['t_acc_seen'] = time.perf_counter()   # for the server's loop timing
     if plan is not None:
         bpc = nbytes // acc._n_serial_chans          # bytes per complex channel
         if plan['transport'] == 'zdma':
