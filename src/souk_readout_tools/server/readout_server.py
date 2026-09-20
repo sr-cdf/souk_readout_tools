@@ -25,6 +25,7 @@ Version: 1.2.0
 
 
 import asyncio, contextvars, functools
+import gc
 import copy
 import datetime
 import importlib.metadata
@@ -4445,6 +4446,17 @@ class ReadoutServer:
         """
         (self.e_stream_enabled.set if on else self.e_stream_enabled.clear)()
         (self.e_stream_stopped.clear if on else self.e_stream_stopped.set)()
+        # Garbage collection while frames flow: a collection runs inside the
+        # frame loop and, at 2400 Hz, ~130 us of slack per period is not enough
+        # to absorb it. Freeze what is already alive and stop collecting; the
+        # frame path itself allocates no cycles, and a full collection runs when
+        # the stream stops. Under test for the 4 s loss comb (doc/v712-notes.md).
+        if on:
+            gc.freeze()
+            gc.disable()
+        else:
+            gc.enable()
+            gc.collect()
 
     async def handle_stream_client(self, reader, writer):
         """
