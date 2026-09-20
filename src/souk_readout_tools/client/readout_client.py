@@ -3431,7 +3431,7 @@ class ReadoutClient:
         """
         return self.get_parameter('clock_status')
 
-    def get_samples(self, num_samples,incl_system_info=True,burst=False,sparse_read=None):
+    def get_samples(self, num_samples,incl_system_info=True,burst=False,sparse_read=None,warmup=None):
         """
         Acquire num_samples samples from the readout server and return concatenated raw data.
 
@@ -3455,6 +3455,9 @@ class ReadoutClient:
             right choice essentially always. ``False`` forces the full-buffer
             read, ``True`` forces the partial one; both exist to diagnose a
             suspected read problem rather than to be set routinely.
+        warmup : int or None, optional
+            Accumulations the server reads and discards before the first sample
+            (default ``None``: the server's 50). For diagnosing start-up loss.
         """
         if self.mock:
             return self._mock_server.get_samples(num_samples, incl_system_info, burst)
@@ -3472,6 +3475,8 @@ class ReadoutClient:
             s.connect((self.request_server_address, self.request_server_port))
             message = {'request': 'get_samples', 'num_samples': num_samples, 'burst': burst,
                        'sparse_read': sparse_read}
+            if warmup is not None:
+                message['warmup'] = int(warmup)
             # Send message length
             message_data = json.dumps(message).encode()
             message_len = struct.pack('>I', len(message_data))
@@ -5600,7 +5605,7 @@ class ReadoutClient:
         return sweep_dict
 
 
-    def receive_stream(self, num_tones=None, filename=None, print_data=False):
+    def receive_stream(self, num_tones=None, filename=None, print_data=False, info=None):
         """Receive continuous stream frames from the stream socket and write them to disk.
 
         Parameters
@@ -5612,6 +5617,12 @@ class ReadoutClient:
             Output basename; defaults to ``tmp_stream`` in the cwd.
         print_data : bool, optional
             Print frames as they arrive (default ``False``).
+        info : dict or None, optional
+            Server info saved with the capture. ``None`` (default) fetches
+            ``get_info('all')`` here, before connecting, so the ~0.7 s it holds
+            the server's frame producer loses nothing recorded. Pass a snapshot
+            taken before ``enable_stream()`` to keep that stall out of the
+            stream altogether (``profiling/rate_ladder.py`` does).
         """
         if self.mock:
             return self._mock_server.receive_stream(num_tones, filename, print_data)
@@ -5620,7 +5631,8 @@ class ReadoutClient:
         if filename is None:
             filename = os.path.join(os.getcwd(), 'tmp_stream')
             print(f"No filename specified, writing to {filename}")
-        info = self.get_info('all')
+        if info is None:
+            info = self.get_info('all')
 
         # Determine num_tones from info (server sends only active tones)
         tone_indices = info.get('tones', {}).get('firmware_indices')

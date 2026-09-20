@@ -5535,7 +5535,7 @@ class ReadoutServer:
                 n_settle = int(self.fw_modulation_cfg.get('n_settle', 0)) if self.fw_modulation_cfg else 0
                 n_slots = int(self.fw_modulation_state['n_slots']) if self.fw_modulation_state else 1
                 if rate > 100:
-                    for _ in range(50):
+                    for _ in range(50 if warmup is None else int(warmup)):
                         self.prepare_frame(fast_read_params, fw_modulation=True,
                                            revision=rev, fw_n_settle=n_settle)
                 # Align: begin emitting at the first accumulation that STARTS a
