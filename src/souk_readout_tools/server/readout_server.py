@@ -1855,7 +1855,7 @@ class ReadoutServer:
     def health_check(self):
         """Compact health summary for intermittent polling."""
         # Initialisation level
-        programmed = self.r is not None and self.r.fpga.is_programmed()
+        programmed = self.r is not None and firmware_lib.fpga_programmed(self.r)
         shared_ready = programmed and hasattr(self.r, 'autocorr')
         pipeline_ready = (shared_ready and hasattr(self.r, 'accumulators')
                           and len(self.r.accumulators) > 0
@@ -1954,7 +1954,7 @@ class ReadoutServer:
     # -- Section helpers for get_info --
 
     def _info_server(self):
-        programmed = self.r is not None and self.r.fpga.is_programmed()
+        programmed = self.r is not None and firmware_lib.fpga_programmed(self.r)
         shared_ready = programmed and hasattr(self.r, 'autocorr')
         pipeline_ready = (shared_ready and hasattr(self.r, 'accumulators')
                           and len(self.r.accumulators) > 0
@@ -2103,7 +2103,7 @@ class ReadoutServer:
         }
 
     def _info_fpga(self):
-        return firmware_lib.info_fpga(self.r)
+        return firmware_lib.info_fpga(self.r, self.r_fast)
 
     def _info_rfdc(self):
         return firmware_lib.info_rfdc(self.r, self.config)

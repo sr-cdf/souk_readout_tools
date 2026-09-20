@@ -1855,15 +1855,43 @@ def info_clock():
     }
 
 
-def info_fpga(r):
-    """FPGA programming state and base parameters."""
-    programmed = r is not None and r.fpga.is_programmed()
+FPGA_MANAGER_STATE = '/sys/class/fpga_manager/fpga0/state'
+
+
+def fpga_programmed(r):
+    """
+    Whether the PL holds a bitstream. On the board this is the kernel FPGA
+    manager's state (``'operating'``), a file read that touches no fabric;
+    elsewhere, or without that file, control_sw's katcp ``fpga.is_programmed()``.
+
+    The katcp check (``?fpgastatus`` + ``?listdev``) holds the processor-to-fabric
+    bus ~2 ms per call, stalling both pipelines' accumulator reads
+    (doc/v712-notes.md, test 12). A register read cannot answer this safely:
+    reading an unprogrammed or unclocked fabric hangs the processor.
+    """
+    local = r is not None and getattr(getattr(r.fpga, 'host', None), 'host', None) == 'localhost'
+    if local and os.path.exists(FPGA_MANAGER_STATE):
+        with open(FPGA_MANAGER_STATE) as f:
+            return f.read().strip() == 'operating'
+    return r is not None and r.fpga.is_programmed()
+
+
+def info_fpga(r, r_fast=None):
+    """FPGA programming state and base parameters.
+
+    With ``r_fast`` the status registers (firmware version, type, build time) are
+    read over the fast path: same values and format as katcp, without its bus
+    stall. ``programmed`` comes from :func:`fpga_programmed`.
+    """
+    programmed = r is not None and fpga_programmed(r)
     if not programmed:
         return {'ready': False, 'fpga_status': None, 'fpg_file': None,
                 'pipeline_id': None, 'adc_clk_hz': None}
+    status = (r_fast if r_fast is not None else r).fpga.get_status()[0]
+    status['programmed'] = programmed
     return {
         'ready': True,
-        'fpga_status': r.fpga.get_status()[0],
+        'fpga_status': status,
         'fpg_file': r.fpgfile,
         'pipeline_id': r.pipeline_id,
         'adc_clk_hz': r.adc_clk_hz,
