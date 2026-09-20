@@ -36,6 +36,7 @@ import asyncio
 import ctypes
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field, asdict
@@ -85,6 +86,102 @@ def parse_seconds(value: Optional[str]) -> Optional[float]:
     return number * scale
 
 
+class _Timex(ctypes.Structure):
+    """struct timex, for ntp_adjtime(2)."""
+    _fields_ = [("modes", ctypes.c_uint), ("offset", ctypes.c_long), ("freq", ctypes.c_long),
+                ("maxerror", ctypes.c_long), ("esterror", ctypes.c_long), ("status", ctypes.c_int),
+                ("constant", ctypes.c_long), ("precision", ctypes.c_long),
+                ("tolerance", ctypes.c_long), ("time_sec", ctypes.c_long),
+                ("time_usec", ctypes.c_long), ("tick", ctypes.c_long), ("ppsfreq", ctypes.c_long),
+                ("jitter", ctypes.c_long), ("shift", ctypes.c_int), ("stabil", ctypes.c_long),
+                ("jitcnt", ctypes.c_long), ("calcnt", ctypes.c_long), ("errcnt", ctypes.c_long),
+                ("stbcnt", ctypes.c_long), ("tai", ctypes.c_int), ("_pad", ctypes.c_int * 11)]
+
+
+class _PtpClockTime(ctypes.Structure):
+    _fields_ = [("sec", ctypes.c_int64), ("nsec", ctypes.c_uint32), ("reserved", ctypes.c_uint32)]
+
+
+class _PtpSysOffsetPrecise(ctypes.Structure):
+    _fields_ = [("device", _PtpClockTime), ("sys_realtime", _PtpClockTime),
+                ("sys_monoraw", _PtpClockTime), ("_rsv", ctypes.c_uint32 * 4)]
+
+
+STA_UNSYNC = 0x0040
+PTP_SYS_OFFSET_PRECISE = 0xC0403D08   # _IOWR('=', 8, struct ptp_sys_offset_precise)
+PHC_DEVICE = "/dev/ptp0"
+
+
+def kernel_clock_status() -> dict:
+    """
+    The kernel's own view of the system clock, from ntp_adjtime(2): ~7 us and no
+    subprocess, against ~4 ms to spawn `chronyc tracking` for the same facts.
+    Returns synced (STA_UNSYNC clear), freq_ppm, esterror_s and maxerror_s, or
+    an empty dict if the call fails.
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        t = _Timex()
+        rc = libc.ntp_adjtime(ctypes.byref(t))
+        if rc < 0:
+            return {}
+        return {"synced": rc != 5 and not (t.status & STA_UNSYNC),   # 5 = TIME_ERROR
+                "freq_ppm": t.freq / 65536.0,
+                "esterror_s": t.esterror / 1e6,
+                "maxerror_s": t.maxerror / 1e6}
+    except Exception:
+        return {}
+
+
+class _Timespec(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_int64), ("tv_nsec", ctypes.c_int64)]
+
+
+CLOCK_REALTIME = 0
+
+
+def _fd_to_clockid(fd: int) -> int:
+    """The dynamic POSIX clock id of an open /dev/ptpN (FD_TO_CLOCKID)."""
+    return (~fd << 3) | 3
+
+
+def phc_sys_offset_s(fd: int) -> Optional[float]:
+    """
+    System clock minus PHC, measuring the two clocks instead of reporting what
+    chrony believes about them. Needs an open /dev/ptp0 (root); None if neither
+    method works.
+
+    Uses PTP_SYS_OFFSET_PRECISE where the driver cross-timestamps both clocks in
+    hardware (~15 us), else reads the PHC between two system-clock reads and
+    takes the midpoint -- three clock_gettime calls, a few microseconds, with an
+    error bounded by the time the sandwich took.
+    """
+    if fd is None or fd < 0:
+        # FD_TO_CLOCKID(-1) is CLOCK_THREAD_CPUTIME_ID, which would succeed and
+        # return a plausible-looking number, so refuse a bad fd outright.
+        return None
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        o = _PtpSysOffsetPrecise()
+        if libc.ioctl(fd, ctypes.c_ulong(PTP_SYS_OFFSET_PRECISE), ctypes.byref(o)) == 0:
+            phc_ns = o.device.sec * 10**9 + o.device.nsec
+            sys_ns = o.sys_realtime.sec * 10**9 + o.sys_realtime.nsec
+            return (sys_ns - phc_ns) / 1e9
+
+        before, phc, after = _Timespec(), _Timespec(), _Timespec()
+        clockid = _fd_to_clockid(fd)
+        if (libc.clock_gettime(CLOCK_REALTIME, ctypes.byref(before)) != 0
+                or libc.clock_gettime(clockid, ctypes.byref(phc)) != 0
+                or libc.clock_gettime(CLOCK_REALTIME, ctypes.byref(after)) != 0):
+            return None
+        b = before.tv_sec * 10**9 + before.tv_nsec
+        a = after.tv_sec * 10**9 + after.tv_nsec
+        p = phc.tv_sec * 10**9 + phc.tv_nsec
+        return ((b + a) / 2 - p) / 1e9
+    except Exception:
+        return None
+
+
 def set_proc_comm(name: str) -> None:
     """Set kernel comm name (max 15 chars). Affects /proc/PID/comm."""
     try:
@@ -132,6 +229,24 @@ PTP_HOLDOVER_ERROR_RATE_PPM = 1.0
 # Subprocess timeouts
 PMC_TIMEOUT_S = 2.0
 CHRONYC_TIMEOUT_S = 2.0
+# How often the slow-changing detail is refreshed. Every poll runs two
+# subprocesses -- pmc PORT_DATA_SET and TIME_STATUS_NP, the PTP link and
+# grandmaster offset -- plus two syscalls for the system clock itself
+# (kernel_clock_status, phc_sys_offset_s), which is what the lock and readiness
+# logic needs live. Everything chrony reports is identity or history that only
+# changes when the source does (ref name/id, leap status, the source listings),
+# so it moves here, as do the grandmaster parent data and UTC properties.
+# Nine spawns a second cost a streaming pipeline 2.5 accumulations a second at
+# 2400 Hz (doc/v712-notes.md); a spawn is ~4 ms against ~7 us for the syscalls.
+# Status carries `detail_age_s` so the slow fields are never read as live.
+DETAIL_INTERVAL_S = 30.0
+# How often the two pmc queries run. They are the only per-poll subprocesses
+# left, and what costs a streaming pipeline is the spawn itself -- page tables
+# built and torn down, TLB-shootdown IPIs to other cores, the cluster's L2
+# polluted -- not the CPU time. Only pmc can say whether ptp4l still has the
+# grandmaster (if it loses it, the PHC free-runs and the system clock follows it
+# happily, so no syscall notices), so this is the detection latency for that.
+PTP_INTERVAL_S = 5.0
 
 log = logging.getLogger("timing-monitor")
 
@@ -204,6 +319,15 @@ class Status:
     chrony_freq_ppm: Optional[float] = None
     chrony_tracking_text: str = ""
     chrony_sources_text: str = ""
+    detail_age_s: Optional[float] = None   # age of the slow-cadence fields above
+    ptp_age_s: Optional[float] = None      # age of the pmc fields (PTP_INTERVAL_S)
+
+    # Measured every poll by syscall, no subprocess (see kernel_clock_status,
+    # phc_sys_offset_s). system_clock_synced is the kernel's own sync flag;
+    # phc_sys_offset_s is the system clock against the PHC, latched together.
+    system_clock_synced: Optional[bool] = None
+    system_clock_freq_ppm: Optional[float] = None
+    phc_sys_offset_s: Optional[float] = None
 
     # Derived / tracked
     seconds_since_ptp_lock: Optional[float] = None
@@ -369,13 +493,10 @@ class ChronycClient:
         # CSV: ref_id, ref_name, stratum, ref_time, sys_time, last_offset,
         #      rms_offset, freq, resid_freq, skew, root_delay, root_disp,
         #      update_int, leap_status
-        text, plain_text = await asyncio.gather(
-            cls._get("tracking"),
-            cls._get_plain("tracking"),
-        )
+        text = await cls._get("tracking")
         parts = text.strip().split(",")
         if len(parts) < 14:
-            return {"_text": plain_text}
+            return {}
         try:
             return {
                 "ref_id":            parts[0],
@@ -389,10 +510,14 @@ class ChronycClient:
                 "root_dispersion_s": float(parts[11]),
                 "root_distance_s":   float(parts[10]) / 2 + float(parts[11]),
                 "leap_status":       parts[13],
-                "_text":             plain_text,
             }
         except (ValueError, IndexError):
-            return {"_text": plain_text}
+            return {}
+
+    @classmethod
+    async def tracking_text(cls) -> str:
+        """The human-readable `chronyc tracking`, for the detail cadence."""
+        return await cls._get_plain("tracking")
 
     @staticmethod
     def _parse_sources_csv(text: str) -> list[dict]:
@@ -520,6 +645,8 @@ class TimingMonitor:
         ptp_ingress_stale_after_s: float = PTP_INGRESS_STALE_AFTER_S,
         ptp_lock_offset_threshold_ns: int = PTP_LOCK_OFFSET_THRESHOLD_NS,
         initializing_grace_s: float = INITIALIZING_GRACE_S,
+        detail_interval_s: float = DETAIL_INTERVAL_S,
+        ptp_interval_s: float = PTP_INTERVAL_S,
         time_func=time.time,
         monotonic_func=time.monotonic,
     ) -> None:
@@ -543,31 +670,52 @@ class TimingMonitor:
         self._last_ingress_time_ns: Optional[int] = None
         self._last_ingress_change_monotonic: Optional[float] = None
         self._lock = asyncio.Lock()
+        self.detail_interval_s = float(detail_interval_s)
+        self.ptp_interval_s = float(ptp_interval_s)
+        self._ptp: Optional[tuple] = None             # last pmc results
+        self._ptp_monotonic: Optional[float] = None
+        try:                                  # root-only; None elsewhere
+            self._phc_fd: Optional[int] = os.open(PHC_DEVICE, os.O_RDONLY)
+        except OSError:
+            self._phc_fd = None
+        self._detail: Optional[tuple] = None          # last slow-query results
+        self._detail_monotonic: Optional[float] = None
 
     async def poll_once(self) -> None:
         now = self._time_func()
         monotonic_now = self._monotonic_func()
         monitor_uptime_s = max(0.0, monotonic_now - self._start_monotonic)
 
-        results = await asyncio.gather(
-            PMCClient.get_port_data_set(),
-            PMCClient.get_time_status(),
-            PMCClient.get_parent(),
-            PMCClient.get_time_properties(),
-            ChronycClient.tracking(),
-            ChronycClient.sources(),
-            ChronycClient.sources_text(),
-            return_exceptions=False,
-        )
-        (
-            port_data,
-            time_status,
-            parent,
-            time_props,
-            tracking,
-            chrony_sources,
-            chrony_sources_text,
-        ) = results
+        # pmc is the only spawning query left on the regular path.
+        if (self._ptp is None or self._ptp_monotonic is None
+                or monotonic_now - self._ptp_monotonic >= self.ptp_interval_s):
+            self._ptp = await asyncio.gather(
+                PMCClient.get_port_data_set(),
+                PMCClient.get_time_status(),
+                return_exceptions=False,
+            )
+            self._ptp_monotonic = monotonic_now
+        port_data, time_status = self._ptp
+        ptp_age_s = monotonic_now - self._ptp_monotonic
+        # The detail refreshes on its own, slower, cadence (DETAIL_INTERVAL_S).
+        detail_due = (self._detail is None or self._detail_monotonic is None
+                      or monotonic_now - self._detail_monotonic >= self.detail_interval_s)
+        if detail_due:
+            self._detail = await asyncio.gather(
+                PMCClient.get_parent(),
+                PMCClient.get_time_properties(),
+                ChronycClient.tracking(),
+                ChronycClient.sources(),
+                ChronycClient.sources_text(),
+                ChronycClient.tracking_text(),
+                return_exceptions=False,
+            )
+            self._detail_monotonic = monotonic_now
+        (parent, time_props, tracking, chrony_sources, chrony_sources_text,
+         tracking_text) = self._detail
+        detail_age_s = monotonic_now - self._detail_monotonic
+        clock = kernel_clock_status()
+        phc_offset = phc_sys_offset_s(self._phc_fd) if self._phc_fd is not None else None
         port_state = (port_data.get("port_state") or "UNKNOWN").upper()
         selected = next(
             (source.get("name", "") for source in chrony_sources
@@ -700,8 +848,13 @@ class TimingMonitor:
             s.chrony_freq_ppm          = tracking.get("freq_ppm")
             s.chrony_selected_source   = selected
             s.chrony_sources           = chrony_sources
-            s.chrony_tracking_text     = tracking.get("_text", "")
+            s.chrony_tracking_text     = tracking_text
             s.chrony_sources_text      = chrony_sources_text
+            s.detail_age_s             = detail_age_s
+            s.ptp_age_s                = ptp_age_s
+            s.system_clock_synced      = clock.get("synced")
+            s.system_clock_freq_ppm    = clock.get("freq_ppm")
+            s.phc_sys_offset_s         = phc_offset
 
             # ---- Lock quality tracking ----
             ptp_link_up = (port_state == "SLAVE" and s.ptp_gm_present)
@@ -967,6 +1120,8 @@ async def handle_client(
 async def async_main(
     socket_path: str = SOCKET_PATH,
     poll_interval_s: float = POLL_INTERVAL_S,
+    detail_interval_s: float = DETAIL_INTERVAL_S,
+    ptp_interval_s: float = PTP_INTERVAL_S,
     ptp_holdover_window_s: float = PTP_HOLDOVER_WINDOW_S,
     ptp_holdover_error_rate_ppm: float = PTP_HOLDOVER_ERROR_RATE_PPM,
     ptp_ingress_stale_after_s: float = PTP_INGRESS_STALE_AFTER_S,
@@ -985,6 +1140,8 @@ async def async_main(
         ptp_ingress_stale_after_s=ptp_ingress_stale_after_s,
         ptp_lock_offset_threshold_ns=ptp_lock_offset_threshold_ns,
         initializing_grace_s=initializing_grace_s,
+        detail_interval_s=detail_interval_s,
+        ptp_interval_s=ptp_interval_s,
     )
 
     # Bind the Unix socket
@@ -1031,6 +1188,27 @@ def main() -> None:
         type=float,
         default=POLL_INTERVAL_S,
         help=f"Status poll interval in seconds (default: {POLL_INTERVAL_S})",
+    )
+    parser.add_argument(
+        "--detail-interval",
+        type=float,
+        default=DETAIL_INTERVAL_S,
+        help=(
+            "How often to refresh the slow-changing detail (grandmaster parent "
+            "data, UTC properties, source listings, tracking text) in seconds. "
+            "Every poll always refreshes what the lock and readiness logic "
+            f"needs (default: {DETAIL_INTERVAL_S})"
+        ),
+    )
+    parser.add_argument(
+        "--ptp-interval",
+        type=float,
+        default=PTP_INTERVAL_S,
+        help=(
+            "How often to run the two pmc queries, in seconds -- the detection "
+            "latency for losing the grandmaster, and the only subprocesses on "
+            f"the regular path (default: {PTP_INTERVAL_S})"
+        ),
     )
     parser.add_argument(
         "--ptp-holdover-window",
@@ -1086,6 +1264,8 @@ def main() -> None:
         async_main(
             socket_path=args.socket_path,
             poll_interval_s=args.poll_interval,
+            detail_interval_s=args.detail_interval,
+            ptp_interval_s=args.ptp_interval,
             ptp_holdover_window_s=args.ptp_holdover_window,
             ptp_holdover_error_rate_ppm=args.ptp_holdover_error_rate_ppm,
             ptp_ingress_stale_after_s=args.ptp_ingress_stale_after,
