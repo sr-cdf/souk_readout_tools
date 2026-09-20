@@ -1181,8 +1181,10 @@ class ReadoutServer:
         if fw_cfg.get('zdma'):
             firmware_lib.ZDMA_ENABLED = True
             firmware_lib.ZDMA_UDMABUF = fw_cfg.get('zdma_udmabuf', 'udmabuf0')
+            firmware_lib.ZDMA_CHANNEL = int(fw_cfg.get('zdma_channel', 0))
             _server_log(f"accumulator reads may use ZDMA via "
-                        f"{firmware_lib.ZDMA_UDMABUF}", source='firmware')
+                        f"{firmware_lib.ZDMA_UDMABUF}, channel "
+                        f"{firmware_lib.ZDMA_CHANNEL}", source='firmware')
 
         # Advise when the interface did not come up against the loaded image.
         # _require_clocks_locked above already ruled out a PLL/reference fault, so

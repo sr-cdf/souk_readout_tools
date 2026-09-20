@@ -10576,6 +10576,7 @@ _ZDMA_NS_PER_WORD = 1.4
 #: its own landing buffer: every transfer overwrites the whole thing.
 ZDMA_ENABLED = False
 ZDMA_UDMABUF = 'udmabuf0'
+ZDMA_CHANNEL = 0          # FPD DMA channel 0-7; one per process, like the buffer
 
 
 def _get_zdma_reader(transport, zdma):
@@ -10594,71 +10595,20 @@ def _get_zdma_reader(transport, zdma):
     name = zdma if isinstance(zdma, str) else ZDMA_UDMABUF
     try:
         from .zdma import UdmabufBuffer, ZdmaReader
-        reader = ZdmaReader(cached_buf=UdmabufBuffer(name))
+        reader = ZdmaReader(cached_buf=UdmabufBuffer(name),
+                            dma_base=0xFD500000 + ZDMA_CHANNEL * 0x10000)
     except Exception as exc:
         warnings.warn(f'ZDMA unavailable ({exc}); falling back to the mmap read')
         return None
     transport._zdma_reader = reader
     return reader
 
-# Control-buffer write costs, same rig, same run. A contiguous slice write
-# streams at ~4.7 ns/word; a scattered fancy-index store into the same uncached
-# mapping costs ~18.3 ns/word, so staging in RAM and issuing ONE slice write
-# beats scattering above ~16 tones (3.4x at 1000 tones).
-# MEASURED ON HARDWARE 2026-09-14: staging loses at every size. Scatter vs
-# staged, tx+rx, us:  4 tones 50/136, 64 66/175, 1000 244/378, 2048 430/579.
-# A raw bulk slice write really is ~4x faster per word than scattered stores,
-# but the staged path has to BUILD the payload first (index offsetting, a RAM
-# scatter, then tobytes()), and that construction costs more than the streaming
-# saves. So `sparse_write=None` always scatters; `sparse_write=True` is kept
-# only so the staged path can be re-tested if the construction is ever made
-# cheap (e.g. by caching the staging buffer across calls, since the tone map is
-# stable between retunes).
-
-
-def plan_control_buffer_write(indices, sparse_write=None):
-    """Decide between one staged slice write and a scattered store.
-
-    The control words for a tone set are written by fancy-indexing a numpy view
-    of the uncached mapping, which issues one MMIO store per word. When the
-    written words happen to cover a *contiguous* span -- which they do whenever
-    the LO indices are contiguous, i.e. whenever no two tones share a TX PSB bin
-    (`compute_vacc_tone_indices` returns ``arange`` in that case) -- the same
-    result can be had by scattering into a RAM buffer and issuing a single slice
-    write, which streams ~4x faster per word.
-
-    A non-contiguous span is refused rather than bridged: the gap words belong to
-    other tones whose current values we do not have, and writing them would
-    clobber. Read-modify-write is not an option either -- the read alone costs
-    more than the scatter it would save.
-
-    Parameters
-    ----------
-    indices : ndarray of int
-        Word offsets being written, relative to the buffer start.
-    sparse_write : bool or None, optional
-        ``False`` forces the scattered store, ``True`` forces the staged write
-        where it is legal, ``None`` picks whichever the cost model prefers.
-
-    Returns
-    -------
-    tuple or None
-        ``(first_word, n_words)`` to stage and write in one slice, or ``None``
-        to keep the scattered store.
-    """
-    if sparse_write is False or indices is None:
-        return None
-    idx = np.asarray(indices)
-    if idx.size == 0:
-        return None
-    first, last = int(idx.min()), int(idx.max())
-    span = last - first + 1
-    if span != idx.size:
-        return None                      # gaps we are not allowed to overwrite
-    if sparse_write is True:
-        return first, span
-    return None          # measured slower at every size -- see the note above
-
+# Control-word write costs (v7.12.1, UIO, one LO, 1000 tones = 4000 words, p50):
+# scattered per-word stores 98.6 us; a slice write 17.4 us. Staging in a fresh
+# RAM buffer lost (99.8 us) only because of the numpy scatter and tobytes() it
+# needed (82 us) -- numpy costs ~6-9 us per call on the ARM whatever the size,
+# and a fancy index ~13 ns/word on top. get_control_shadow keeps one RAM copy
+# instead and places each field with one strided copy (~9 us per field).
 
 
 def plan_accumulator_reads(tone_indices, n_chans, fixed_us=_DEVMEM_FIXED_US,

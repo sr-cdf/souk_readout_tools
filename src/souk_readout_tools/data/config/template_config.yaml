@@ -51,9 +51,12 @@ firmware:
   # read: devmem below ~335 channels, ZDMA above (2048 chans: 277 -> 115 us).
   # Needs root, the u-dma-buf module loaded, and a free FPD GDMA channel; falls
   # back to the CPU read with a warning if any of that is missing. Each PROCESS
-  # needs its own buffer, so give pipeline 1 a different one (e.g. udmabuf1).
+  # needs its own buffer and its own channel, so give pipeline 1 different ones
+  # (e.g. udmabuf1, channel 1). Channels 0-7 are the FPD DMA at 0xFD500000 +
+  # N*0x10000; all eight are in the v7.12.1 device tree.
   zdma: false
   zdma_udmabuf: "udmabuf0"
+  zdma_channel: 0
   dac_fullscale_bits: 16
   adc_fullscale_bits: 16
   dac_physical_bits: 14
