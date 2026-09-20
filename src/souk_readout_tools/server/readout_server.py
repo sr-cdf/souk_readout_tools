@@ -1168,6 +1168,11 @@ class ReadoutServer:
             fw_config_file, pipeline_id)
         self.r_fast = firmware_lib.create_fast_readout_interface(
             fw_config_file, pipeline_id)
+        # The software-modulation scheduler keeps its own r_fast; move it to this
+        # one, or it would write through a second, soon stale, copy of the LO
+        # control registers (firmware_lib.get_control_shadow).
+        if getattr(self, 'modulation_sched', None) is not None:
+            self.modulation_sched.r_fast = self.r_fast
         # Opt-in DMA read path. Recorded on the module so every
         # get_fast_read_params() call in this process picks it up; the reader
         # falls back to the CPU mapping (with a warning) if the buffer or a DMA
@@ -1188,6 +1193,15 @@ class ReadoutServer:
         # "FPGA is not clocking" cascade; the caller (ensure_ready/set_config)
         # reprograms with the configured image to recover.
         ok, reason = firmware_lib.interface_is_healthy(self.r)
+        if ok:
+            # Every fast tone write goes through a RAM copy of the LO control
+            # registers; start it from the firmware's current words (~3 ms).
+            # Only on a healthy interface: reading an unclocked fabric hangs the PS.
+            try:
+                firmware_lib.get_control_shadow(self.r_fast, refresh=True)
+            except Exception as e:
+                _server_log(f'_create_firmware_interfaces: control-register copy not read ({e})',
+                            source=source)
         if not ok and self.r is not None and getattr(self.r, 'fpga', None) is not None:
             try:
                 programmed = self.r.fpga.is_programmed()
@@ -2985,7 +2999,8 @@ class ReadoutServer:
                             param_value, firmware_lib.get_tone_amplitudes,
                             plan_values_key='amplitudes', default_value=1.0)
                         firmware_lib.set_tone_amplitudes(
-                            self.r, self.config, param_value, autosync=autosync, mrst=mrst)
+                            self.r, self.config, param_value, autosync=autosync, mrst=mrst,
+                            r_fast=self.r_fast)
                         if self._tone_state_cache is not None:
                             self._set_tone_state_cache(
                                 self._tone_state_cache['frequencies'],
@@ -3004,7 +3019,8 @@ class ReadoutServer:
                             param_value, firmware_lib.get_tone_phases,
                             plan_values_key='phases', default_value=0.0)
                         firmware_lib.set_tone_phases(
-                            self.r, self.config, param_value, autosync=autosync, mrst=mrst)
+                            self.r, self.config, param_value, autosync=autosync, mrst=mrst,
+                            r_fast=self.r_fast)
                         if self._tone_state_cache is not None:
                             self._set_tone_state_cache(
                                 self._tone_state_cache['frequencies'],
@@ -5982,6 +5998,23 @@ class ReadoutServer:
         if self.tracking is None:
             return {'enabled': False}
         return self.tracking.status()
+
+    def _info_control_shadow(self):
+        """The fast path's RAM copy of the LO control registers against the
+        firmware (``firmware_lib.check_control_shadow``). Stale words mean
+        something else wrote the control buffers, and the next fast write to
+        those tones will undo it; ``ensure_ready`` re-reads the copy."""
+        if self.r_fast is None:
+            return {'available': False}
+        try:
+            report = firmware_lib.check_control_shadow(self.r_fast)
+        except Exception as e:          # e.g. a half-built interface
+            return {'available': False, 'error': str(e)}
+        if report['stale']:
+            _server_log(f"control-register copy is stale: {report['stale_words']} words "
+                        f"differ from the firmware", source='info')
+        return report
+
 
     # ----- firmware-slot frequency modulation (v7.11) -----------------------
     # The slot analog of the software-modulation engine above. Software

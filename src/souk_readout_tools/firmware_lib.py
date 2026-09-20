@@ -1683,9 +1683,9 @@ def initialise_pipeline_resources(r,r_fast,config_dict):
                 r, config_dict, frequencies,
                 tone_amplitudes=amplitudes, tone_phases=phases)
     if amplitudes is not None and len(amplitudes) > 0:
-        set_tone_amplitudes(r, config_dict, amplitudes)
+        set_tone_amplitudes(r, config_dict, amplitudes, r_fast=r_fast)
     if phases is not None and len(phases) > 0:
-        set_tone_phases(r,config_dict, phases)
+        set_tone_phases(r, config_dict, phases, r_fast=r_fast)
 
     # #check signal levels -- does not work anymore during init because r_fast has no blocks yet
     # dac_saturation = check_output_saturation(r_fast,iterations=25,saturation_bits=dac_saturation_bits)
@@ -2521,13 +2521,13 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
         amplitudes = tone_plan['amplitudes']
         if amplitudes is not None and len(amplitudes) > 0:
             print(f'apply_config: setting amplitudes ({len(amplitudes)} values)')
-            set_tone_amplitudes(r, new_config_dict, amplitudes)
+            set_tone_amplitudes(r, new_config_dict, amplitudes, r_fast=r_fast)
 
     if tone_phases_changed and not tone_frequencies_changed:
         phases = tone_plan['phases']
         if phases is not None and len(phases) > 0:
             print(f'apply_config: setting phases ({len(phases)} values)')
-            set_tone_phases(r, new_config_dict, phases)
+            set_tone_phases(r, new_config_dict, phases, r_fast=r_fast)
 
 
 def read_parameter(r, param_name):
@@ -3016,88 +3016,61 @@ def prepare_control_buffer_data(r,buf,lo_control_values):
 
 def prepare_control_buffer_data_fast(r_fast, buf, lo_control_values, tone_indices=None):
     """
-    Faster version of prepare_control_buffer
+    Format tone parameters for :func:`write_control_buffer_data_fast`.
 
-    Does not prepare the full buffer, only returns the given formatted values and their indices
+    Only the fields given are formatted; the write leaves the others as they are.
 
     Parameters:
     r_fast: readout object (fast interface)
-    buf: int, index of buffer to write to, 0 or 1.
+    buf: int, unused -- the formatted words suit either ping-pong buffer.
     lo_control_values: dictionary with keys 'tx' and 'rx'
      - 'tx': dictionary with optional keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
      - 'rx': dictionary with optional keys 'phase_steps', 'ri_steps', 'phase_offsets', 'scaling'
+     Every field given must have one value per tone.
     tone_indices: array of LO indices for the tones. If None, assumes contiguous indices starting from 0.
                   With VACC, these may be non-contiguous.
 
     Returns:
-    v: dictionary with keys 'tx' and 'rx'
-     - 'tx': numpy array of the formatted control buffer for tx
-     - 'rx': numpy array of the formatted control buffer for rx
-    i: dictionary with keys 'tx' and 'rx'
-     - 'tx': numpy array of the indices for the formatted control buffer for tx
-     - 'rx': numpy array of the indices for the formatted control buffer for rx
+    v: dictionary with keys 'tx' and 'rx', each a dictionary of the fields given
+       -> '<u4' words, one per tone
+    rows: the tones' LO indices -- a ``slice`` when they are contiguous (the
+          normal comb, so each field goes in with one strided copy), otherwise
+          an int array
 
     """
-    # Flat little-endian u32 view of the whole AXI-lite map. The control buffers are
-    # addressed by absolute word index (resolved via _get_control_buffer_addresses),
-    # so this view is layout-independent across firmware versions. (v7.11 moved the
-    # control buffers; do not hardcode byte ranges here.)
-    if not hasattr(r_fast.mixer,'tx_lo_control_buffer'):
-        r_fast.mixer.tx_lo_control_buffer = np.frombuffer(memoryview(r_fast.mixer.host.transport.axil_mm),dtype='<u4')
-    if not hasattr(r_fast.mixer,'rx_lo_control_buffer'):
-        r_fast.mixer.rx_lo_control_buffer = np.frombuffer(memoryview(r_fast.mixer.host.transport.axil_mm),dtype='<u4')
-    v={}
-    i={}
+    m = r_fast.mixer
+    v = {}
+    n_tones = None
     for lo in ['tx','rx']:
         if lo not in lo_control_values.keys():
             raise ValueError(f"Only LOs 'rx' and 'tx' are understood. Not {lo}.")
-        phase_steps = lo_control_values[lo].get('phase_steps')
-        ri_steps = lo_control_values[lo].get('ri_steps')
-        phase_offsets = lo_control_values[lo].get('phase_offsets')
-        scaling = lo_control_values[lo].get('scaling')
+        given = lo_control_values[lo]
+        v[lo] = {}
+        # '<i4' fields are cast to the register's '<u4'; negative values wrap.
+        if given.get('phase_steps') is not None:
+            v[lo]['phase_steps'] = _format_phase_steps(given['phase_steps'], m._phase_bp, fmt='<i4').astype('<u4')
+        if given.get('ri_steps') is not None:
+            v[lo]['ri_steps'] = _format_ri_steps(given['ri_steps'], m._n_ri_step_bits, fmt='<u4')
+        if given.get('phase_offsets') is not None:
+            v[lo]['phase_offsets'] = _format_phase_offsets(given['phase_offsets'], m._phase_offset_bp, fmt='<i4').astype('<u4')
+        if given.get('scaling') is not None:
+            v[lo]['scaling'] = _format_amp_scale(given['scaling'], m._n_scale_bits, fmt='<u4')
+        for field, words in v[lo].items():
+            if n_tones is None:
+                n_tones = len(words)
+            elif len(words) != n_tones:
+                raise ValueError(f'{lo} {field} has {len(words)} values, expected one per tone ({n_tones})')
 
-        phase_steps_formatted = _format_phase_steps(phase_steps, r_fast.mixer._phase_bp,fmt='<i4') if phase_steps is not None else []
-        phase_offsets_formatted = _format_phase_offsets(phase_offsets, r_fast.mixer._phase_offset_bp,fmt='<i4') if phase_offsets is not None else []
-        ri_steps_formatted = _format_ri_steps(ri_steps,r_fast.mixer._n_ri_step_bits,fmt='<u4') if ri_steps is not None else []
-        scaling_formatted = _format_amp_scale(scaling, r_fast.mixer._n_scale_bits,fmt='<u4') if scaling is not None else []
-
-        n_phase_steps = len(phase_steps_formatted)
-        n_phase_offsets = len(phase_offsets_formatted)
-        n_ri_steps = len(ri_steps_formatted)
-        n_scaling = len(scaling_formatted)
-
-        # v[lo] = np.zeros(int(np.ceil(n_tone / r.mixer._n_parallel_chans)) * r.mixer._CONTROL_N_WORDS, dtype='>u4')
-        # for i in range(min(r.mixer._n_parallel_chans, n_tone)):
-        #     v[lo][r.mixer._SCALE_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = scaling_formatted[i::r.mixer._n_parallel_chans]
-        #     v[lo][r.mixer._PHASE_INC_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = phase_steps_formatted[i::r.mixer._n_parallel_chans]
-        #     v[lo][r.mixer._PHASE_OFFSET_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = phase_offsets_formatted[i::r.mixer._n_parallel_chans]
-        #     v[lo][r.mixer._RI_STEP_WORD_OFFSET :: r.mixer._CONTROL_N_WORDS] = ri_steps_formatted[i::r.mixer._n_parallel_chans]
-
-        v[lo] = np.empty(n_phase_steps+n_phase_offsets+n_ri_steps+n_scaling, dtype='>u4')
-        v[lo][0:n_phase_steps] = phase_steps_formatted
-        v[lo][n_phase_steps:n_phase_steps+n_phase_offsets] = phase_offsets_formatted
-        v[lo][n_phase_steps+n_phase_offsets:n_phase_steps+n_phase_offsets+n_ri_steps] = ri_steps_formatted
-        v[lo][n_phase_steps+n_phase_offsets+n_ri_steps:n_phase_steps+n_phase_offsets+n_ri_steps+n_scaling] = scaling_formatted
-
-        # Use tone_indices if provided, otherwise fall back to contiguous indices
-        # With VACC, tone_indices may be non-contiguous (e.g., [0, 5, 10] instead of [0, 1, 2])
-        if tone_indices is not None:
-            idx_phase_steps = np.asarray(tone_indices[:n_phase_steps]) if n_phase_steps > 0 else np.array([], dtype=int)
-            idx_phase_offsets = np.asarray(tone_indices[:n_phase_offsets]) if n_phase_offsets > 0 else np.array([], dtype=int)
-            idx_ri_steps = np.asarray(tone_indices[:n_ri_steps]) if n_ri_steps > 0 else np.array([], dtype=int)
-            idx_scaling = np.asarray(tone_indices[:n_scaling]) if n_scaling > 0 else np.array([], dtype=int)
-        else:
-            idx_phase_steps = np.arange(n_phase_steps)
-            idx_phase_offsets = np.arange(n_phase_offsets)
-            idx_ri_steps = np.arange(n_ri_steps)
-            idx_scaling = np.arange(n_scaling)
-
-        i[lo] = np.empty(n_phase_steps+n_phase_offsets+n_ri_steps+n_scaling, dtype=int)
-        i[lo][0:n_phase_steps] = idx_phase_steps*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._PHASE_INC_WORD_OFFSET
-        i[lo][n_phase_steps:n_phase_steps+n_phase_offsets] = idx_phase_offsets*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._PHASE_OFFSET_WORD_OFFSET
-        i[lo][n_phase_steps+n_phase_offsets:n_phase_steps+n_phase_offsets+n_ri_steps] = idx_ri_steps*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._RI_STEP_WORD_OFFSET
-        i[lo][n_phase_steps+n_phase_offsets+n_ri_steps:n_phase_steps+n_phase_offsets+n_ri_steps+n_scaling] = idx_scaling*r_fast.mixer._CONTROL_N_WORDS+r_fast.mixer._SCALE_WORD_OFFSET
-    return v, i
+    n_tones = n_tones or 0
+    if tone_indices is None:
+        return v, slice(0, n_tones)
+    rows = np.asarray(tone_indices)[:n_tones]
+    if len(rows) != n_tones:
+        raise ValueError(f'{len(rows)} tone_indices for {n_tones} tones')
+    first = int(rows[0]) if n_tones else 0
+    if np.array_equal(rows, np.arange(first, first + n_tones)):
+        rows = slice(first, first + n_tones)
+    return v, rows
 
 def write_control_buffer_data(r,buf,v,slot=0):
     """
@@ -3132,65 +3105,158 @@ def write_control_buffer_data(r,buf,v,slot=0):
                                     context=f'buf={buf} slot={slot} {lo} lo{i}')
     return
 
-def write_control_buffer_data_fast(r_fast,buf,v,indices,slot=0,sparse_write=None):
+def get_control_shadow(r_fast, refresh=False):
     """
-    Write a formatted control buffer to the firmware via the devmem fast path.
+    RAM copy of the four LO control registers (tx/rx x ping-pong buffer 0/1),
+    read from the firmware on first use, or again when ``refresh`` is True.
+
+    Every fast control-word write goes through this copy
+    (:func:`write_control_buffer_data_fast`): the words are placed here, then
+    the tones they belong to are pushed to the firmware as one slice. On v7.12 a
+    slice is far cheaper than a store per word (one LO, 1000 tones: 17 us vs
+    99 us), because a 16-byte copy is a single 128-bit AXI4 write.
+
+    This is only correct while the copy is the sole writer. A write from
+    anywhere else -- katcp (``write_control_buffer_data``), control_sw's
+    ``mixer.set_freqs``/``set_amplitude_scale``, another process -- leaves the
+    copy stale, and the next fast write to those tones puts the old words back.
+    :func:`check_control_shadow` reports this. The copy lives on
+    ``r_fast.mixer``, so a new fast interface (e.g. after reprogramming) starts
+    from a fresh read.
+
+    Returns a dict ``(lo, buf) -> '<u4'`` array of shape
+    ``(n_slots, n_serial_chans, _CONTROL_N_WORDS)``, 128 KiB each.
+    """
+    m = r_fast.mixer
+    if refresh or not hasattr(m, '_control_shadow'):
+        shape = (m.n_slots, m._n_serial_chans, m._CONTROL_N_WORDS)
+        nbytes = 4 * int(np.prod(shape))
+        mm = m.host.transport.axil_mm
+        m._control_shadow = {
+            key: np.frombuffer(mm[a:a + nbytes], dtype='<u4').reshape(shape).copy()
+            for key, a in _get_control_buffer_addresses(r_fast).items()}
+    return m._control_shadow
+
+
+def _fast_control_path(r_fast):
+    """``r_fast`` if it reaches the control registers by memory map, else None (use katcp)."""
+    try:
+        r_fast.mixer.host.transport.axil_mm
+    except AttributeError:
+        return None
+    return r_fast
+
+
+def _flush_control_shadow(r_fast, lo, buf, slot, first_tone, stop_tone):
+    """Push tones ``[first_tone, stop_tone)`` of one slot from the RAM copy to
+    the firmware in one slice write."""
+    m = r_fast.mixer
+    tone_bytes = 4 * m._CONTROL_N_WORDS
+    # Whole 64-byte chunks (4 tones): memcpy finishes an odd length with
+    # unaligned vector moves, which bus-error on the uncached mapping.
+    per_chunk = 64 // tone_bytes
+    t0 = first_tone // per_chunk * per_chunk
+    t1 = min(-(-stop_tone // per_chunk) * per_chunk, m._n_serial_chans)
+    if t1 <= t0:
+        return
+    a = _get_control_buffer_addresses(r_fast)[(lo, buf)] + tone_bytes * (slot * m._n_serial_chans + t0)
+    m.host.transport.axil_mm[a:a + tone_bytes * (t1 - t0)] = m._control_shadow[(lo, buf)][slot, t0:t1]
+
+
+def write_control_buffer_data_fast(r_fast,buf,v,rows,slot=0):
+    """
+    Write formatted tone parameters into one ping-pong buffer via the devmem fast path.
+
+    The words go into the RAM copy of the control registers
+    (:func:`get_control_shadow`), and the tones they belong to are then pushed
+    to the firmware as one slice -- which also rewrites those tones' other words,
+    with the values the copy already holds.
 
     v7.11: the ping-pong buffer is selected by register (``control0``/``control1``)
     and the slot is an offset within the register. ``slot=0`` reproduces the
     pre-v7.11 single-LO behaviour.
 
     Parameters:
-    r: readout object
+    r_fast: readout object (fast interface)
     buf: int, index of ping-pong buffer to write to, 0 or 1.
-    v: dictionary with keys 'tx' and 'rx'
-        - 'tx': numpy array of the formatted control buffer values for tx
-        - 'rx': numpy array of the formatted control buffer values for rx
-
-    indices: dictionary with keys 'tx' and 'rx'
-        - 'tx': numpy array of the indices for the formatted control buffer for tx
-        - 'rx': numpy array of the indices for the formatted control buffer for rx
+    v: dictionary with keys 'tx' and 'rx', each a dictionary of field -> '<u4' words
+    rows: the tones' LO indices, a slice or an int array
+       (both as returned by prepare_control_buffer_data_fast)
     slot: int, LO slot to write (0..n_slots-1). Default 0.
 
     """
-    n_tone = r_fast.mixer.n_chans
+    m = r_fast.mixer
     if buf not in [0,1]:
         raise ValueError(f"Buffer index must be 0 or 1. Not {buf}.")
-    if not 0 <= slot < r_fast.mixer.n_slots:
-        raise ValueError(f"Slot must be in 0..{r_fast.mixer.n_slots-1}. Not {slot}.")
+    if not 0 <= slot < m.n_slots:
+        raise ValueError(f"Slot must be in 0..{m.n_slots-1}. Not {slot}.")
 
-    # Get the dynamically-looked-up base addresses for the control buffers
-    addrs = _get_control_buffer_addresses(r_fast)
-    # One slot's worth in bytes: n_serial_chans * _CONTROL_N_WORDS * 4 (also the slot stride)
-    buf_size = r_fast.mixer._n_serial_chans * r_fast.mixer._CONTROL_N_WORDS * 4
-
-    if indices is None:
-        for lo in ['tx','rx']:
-            start = addrs[(lo, buf)] + buf_size * slot
-            length = buf_size
-            r_fast.mixer.host.transport.axil_mm[int(start):int(start+length)] = v[lo].astype('<u4').tobytes()
+    shadow = get_control_shadow(r_fast)
+    columns = {'phase_steps': m._PHASE_INC_WORD_OFFSET,
+               'ri_steps': m._RI_STEP_WORD_OFFSET,
+               'phase_offsets': m._PHASE_OFFSET_WORD_OFFSET,
+               'scaling': m._SCALE_WORD_OFFSET}
+    if isinstance(rows, slice):
+        first, stop = rows.start, rows.stop
     else:
-        # Convert byte addresses to word offsets (divide by 4)
-        starts = {'tx': (addrs[('tx', buf)] + buf_size * slot) // 4,
-                  'rx': (addrs[('rx', buf)] + buf_size * slot) // 4}
-        views = {'tx': r_fast.mixer.tx_lo_control_buffer,
-                 'rx': r_fast.mixer.rx_lo_control_buffer}
-        mm = r_fast.mixer.host.transport.axil_mm
-        for lo in ('tx', 'rx'):
-            idx = np.asarray(indices[lo])
-            vals = v[lo].astype('<u4')
-            span = plan_control_buffer_write(idx, sparse_write)
-            if span is None:
-                views[lo][starts[lo] + idx] = vals       # one MMIO store per word
-            else:
-                # Same words, but scattered in RAM and pushed as one slice.
-                first, n_words = span
-                staged = np.empty(n_words, dtype='<u4')
-                staged[idx - first] = vals
-                a = (starts[lo] + first) * 4
-                mm[a:a + n_words * 4] = staged.tobytes()
-
+        # Non-contiguous tones: push the whole slot (8192 words, ~36 us) rather
+        # than find their extent (min + max cost ~37 us on the ARM).
+        first, stop = 0, m._n_serial_chans
+    for lo in ('tx', 'rx'):
+        if not v[lo]:
+            continue
+        words = shadow[(lo, buf)]
+        for field, values in v[lo].items():
+            words[slot, rows, columns[field]] = values
+        _flush_control_shadow(r_fast, lo, buf, slot, first, stop)
     return
+
+
+def check_control_shadow(r_fast, max_listed=8):
+    """
+    Compare the RAM copy of the LO control registers with the firmware.
+
+    A difference means something other than the fast write path changed the
+    control words since the copy was read (see :func:`get_control_shadow`), and
+    the next fast write to those tones will undo that change. Re-read the copy
+    with ``get_control_shadow(r_fast, refresh=True)``; the server does so on
+    ``ensure_ready``. A write landing during the check can also show up briefly.
+
+    Parameters:
+    r_fast: readout object (fast interface)
+    max_listed: int, how many differing words to list per register.
+
+    Returns a dictionary:
+    - 'stale': True if any word differs
+    - 'stale_words': number of differing words, all registers
+    - 'tx0', 'tx1', 'rx0', 'rx1': per register (LO + ping-pong buffer)
+        - 'stale_words', 'stale_tones' (distinct slot/tone pairs)
+        - 'by_field': differing words per field
+        - 'first': up to max_listed differences as slot, tone, field, shadow, firmware
+    """
+    m = r_fast.mixer
+    fields = {m._PHASE_INC_WORD_OFFSET: 'phase_steps',
+              m._RI_STEP_WORD_OFFSET: 'ri_steps',
+              m._PHASE_OFFSET_WORD_OFFSET: 'phase_offsets',
+              m._SCALE_WORD_OFFSET: 'scaling'}
+    addrs = _get_control_buffer_addresses(r_fast)
+    mm = m.host.transport.axil_mm
+    out = {'stale': False, 'stale_words': 0}
+    for (lo, buf), words in get_control_shadow(r_fast).items():
+        a = addrs[(lo, buf)]
+        firmware = np.frombuffer(mm[a:a + words.nbytes], dtype='<u4').reshape(words.shape)
+        slot, tone, col = np.nonzero(firmware != words)
+        out[f'{lo}{buf}'] = {
+            'stale_words': int(len(col)),
+            'stale_tones': len(set(zip(slot.tolist(), tone.tolist()))),
+            'by_field': {name: int(np.sum(col == c)) for c, name in fields.items()},
+            'first': [{'slot': int(s), 'tone': int(t), 'field': fields[int(c)],
+                       'shadow': int(words[s, t, c]), 'firmware': int(firmware[s, t, c])}
+                      for s, t, c in zip(slot[:max_listed], tone[:max_listed], col[:max_listed])],
+        }
+        out['stale_words'] += int(len(col))
+    out['stale'] = out['stale_words'] > 0
+    return out
 
 
 def write_phase_offsets_both_buffers_fast(r_fast, phase_offsets, tone_indices=None,
@@ -5695,7 +5761,7 @@ def get_tone_amplitudes(r, r_fast, config_dict):
     # index by psb_tones_active (not :num_tones) since tone indices may be non-contiguous with VACC
     return scaling_tx[psb_tones_active]
 
-def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=False, mrst=False):
+def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=False, mrst=False, r_fast=None):
     """
     Set the TX tone amplitude scale factors in the RFSOC.
 
@@ -5703,11 +5769,16 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=False, mrst=Fal
     scaling stays at maximum while TX power is controlled independently.
 
     Currently updates both halves of the double buffer.
+
+    With ``r_fast`` the words go through the fast path's RAM copy of the control
+    registers (~0.2 ms, against ~1 s over katcp). Without it they go over katcp,
+    which leaves any fast interface's copy stale (see get_control_shadow).
     """
     tone_amplitudes = np.atleast_1d(tone_amplitudes)
+    r_fast = _fast_control_path(r_fast)
 
     # Get active tone indices - with VACC these may be non-contiguous
-    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
+    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r_fast if r_fast is not None else r)
     psb_discard_bit = r.psb_chanselect.DISCARD_BIT
     psb_tones_active = np.nonzero((chanmap_psb_inmap & psb_discard_bit) == 0)[0]
 
@@ -5719,6 +5790,14 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=False, mrst=Fal
     scaling_rx_full = np.zeros(r.mixer.n_chans, dtype=float)
     scaling_tx_full[psb_tones_active] = tone_amplitudes
     scaling_rx_full[psb_tones_active] = 1.0
+
+    if r_fast is not None:
+        v, rows = prepare_control_buffer_data_fast(r_fast, 0, {'tx': {'scaling': scaling_tx_full},
+                                                               'rx': {'scaling': scaling_rx_full}})
+        for buf in [0,1]:
+            write_control_buffer_data_fast(r_fast, buf, v, rows)
+        _sync_if_requested(r, autosync=autosync, mrst=mrst)
+        return
 
     # buf = get_control_buffer_idx(r)
     for buf in [0,1]:
@@ -5768,14 +5847,18 @@ def get_tone_phases(r, r_fast, config_dict):
     # index by psb_tones_active (not :num_tones) since tone indices may be non-contiguous with VACC
     return phase_offsets_tx[psb_tones_active]
 
-def set_tone_phases(r, config_dict, tone_phases, autosync=False, mrst=False):
+def set_tone_phases(r, config_dict, tone_phases, autosync=False, mrst=False, r_fast=None):
     """
     Set the tone phase offsets in the RFSOC.
+
+    With ``r_fast`` the words go through the fast path's RAM copy of the control
+    registers; without it, over katcp (see set_tone_amplitudes).
     """
     tone_phases = np.atleast_1d(tone_phases)
+    r_fast = _fast_control_path(r_fast)
 
     # Get active tone indices - with VACC these may be non-contiguous
-    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r)
+    chanmap_psb_inmap = psb_chanselect_get_channel_inmap(r_fast if r_fast is not None else r)
     psb_discard_bit = r.psb_chanselect.DISCARD_BIT
     psb_tones_active = np.nonzero((chanmap_psb_inmap & psb_discard_bit) == 0)[0]
 
@@ -5785,6 +5868,14 @@ def set_tone_phases(r, config_dict, tone_phases, autosync=False, mrst=False):
     # Create full-sized array and place values at correct LO indices
     phase_offsets_full = np.zeros(r.mixer.n_chans, dtype=float)
     phase_offsets_full[psb_tones_active] = tone_phases
+
+    if r_fast is not None:
+        v, rows = prepare_control_buffer_data_fast(r_fast, 0, {'tx': {'phase_offsets': phase_offsets_full},
+                                                               'rx': {'phase_offsets': phase_offsets_full}})
+        for buf in [0,1]:
+            write_control_buffer_data_fast(r_fast, buf, v, rows)
+        _sync_if_requested(r, autosync=autosync, mrst=mrst)
+        return
 
     # buf = get_control_buffer_idx(r)
     for buf in [0,1]:
@@ -7516,7 +7607,7 @@ def get_adc_dsa_db(r, config_dict):
 
 
 def _apply_forced_power_controls(
-        r, config_dict, rf_peripherals=None,
+        r, config_dict, rf_peripherals=None, r_fast=None,
         force_tx_amp_bypass=None, force_rx_amp_bypass=None,
         force_tx_attenuation_db=None, force_rx_attenuation_db=None,
         force_adc_dsa_db=None, force_tone_amplitudes=None,
@@ -7587,7 +7678,7 @@ def _apply_forced_power_controls(
         current_amplitudes = get_tone_amplitudes(r, None, config_dict)
         if amplitudes.size == 1 and current_amplitudes.size > 1:
             amplitudes = np.full(current_amplitudes.size, amplitudes[0], dtype=float)
-        set_tone_amplitudes(r, config_dict, amplitudes)
+        set_tone_amplitudes(r, config_dict, amplitudes, r_fast=r_fast)
         time.sleep(0.01)
         applied['tone_amplitudes'] = amplitudes
         print(f'  forced tone amplitudes ({len(amplitudes)} tone(s))')
@@ -8295,7 +8386,7 @@ def maximise_tx_power(r, r_fast=None, config_dict=None,
                          f"got '{reference_plane}'")
 
     _apply_forced_power_controls(
-        r, config_dict, rf_peripherals=rf_peripherals,
+        r, config_dict, rf_peripherals=rf_peripherals, r_fast=r_fast,
         force_tx_amp_bypass=force_tx_amp_bypass,
         force_rx_amp_bypass=force_rx_amp_bypass,
         force_tx_attenuation_db=force_tx_attenuation_db,
@@ -8374,7 +8465,7 @@ def maximise_tx_power(r, r_fast=None, config_dict=None,
                 time.sleep(0.01)
             amps = init_amps * amps_gain
             amps = _apply_per_bin_scaling(r, config_dict, amps)
-            set_tone_amplitudes(r, config_dict, amps)
+            set_tone_amplitudes(r, config_dict, amps, r_fast=r_fast)
             time.sleep(0.01)
             print(f'  step 1: amplitudes maximised (x{amps_gain:.4f})')
 
@@ -8925,7 +9016,7 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
                          f"got '{reference_plane}'")
 
     _apply_forced_power_controls(
-        r, config_dict, rf_peripherals=rf_peripherals,
+        r, config_dict, rf_peripherals=rf_peripherals, r_fast=r_fast,
         force_tx_amp_bypass=force_tx_amp_bypass,
         force_rx_amp_bypass=force_rx_amp_bypass,
         force_tx_attenuation_db=force_tx_attenuation_db,
@@ -8992,7 +9083,7 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
             time.sleep(0.01)
         amps = init_amps * amps_gain
         amps = _apply_per_bin_scaling(r, config_dict, amps)
-        set_tone_amplitudes(r, config_dict, amps)
+        set_tone_amplitudes(r, config_dict, amps, r_fast=r_fast)
         time.sleep(0.01)
         print(f'    amplitudes scaled by {amps_gain:.4f}')
 
@@ -9171,7 +9262,7 @@ def optimise_tx_snr(r, r_fast=None, config_dict=None, reference_plane='detector'
     if (dsp_overflow_details['psbscale_ovf_delta'] or
             dsp_overflow_details['psb_ovf_delta'] or dac_saturation):
         print('  WARNING: overflow/saturation detected — reverting')
-        set_tone_amplitudes(r, config_dict, init_amps)
+        set_tone_amplitudes(r, config_dict, init_amps, r_fast=r_fast)
         r.psb.set_fftshift(init_psb_fftshift)
         r.psbscale.set_scale(init_psb_scale)
         if has_rf and not tx_atten_fixed:
@@ -9262,7 +9353,7 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=DEFAULT_ADC_HEADROOM_D
     print(f'maximise_rx_power (digital_only={digital_only}, rf_only={rf_only})')
 
     _apply_forced_power_controls(
-        r, config_dict, rf_peripherals=rf_peripherals,
+        r, config_dict, rf_peripherals=rf_peripherals, r_fast=r_fast,
         force_tx_amp_bypass=force_tx_amp_bypass,
         force_rx_amp_bypass=force_rx_amp_bypass,
         force_tx_attenuation_db=force_tx_attenuation_db,
@@ -9652,7 +9743,7 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
     dsa_fixed = force_adc_dsa_db is not None
 
     _apply_forced_power_controls(
-        r, config_dict, rf_peripherals=rf_peripherals,
+        r, config_dict, rf_peripherals=rf_peripherals, r_fast=r_fast,
         force_rx_amp_bypass=force_rx_amp_bypass,
         force_rx_attenuation_db=force_rx_attenuation_db,
         force_adc_dsa_db=force_adc_dsa_db)
@@ -9822,7 +9913,7 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None,
     allow_rf = not digital_only
 
     _apply_forced_power_controls(
-        r, config_dict, rf_peripherals=rf_peripherals,
+        r, config_dict, rf_peripherals=rf_peripherals, r_fast=r_fast,
         force_tx_amp_bypass=force_tx_amp_bypass,
         force_rx_amp_bypass=force_rx_amp_bypass,
         force_tx_attenuation_db=force_tx_attenuation_db,
@@ -11527,7 +11618,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
     powers_dbm = np.atleast_1d(powers_dbm).astype(float)
 
     _apply_forced_power_controls(
-        r, config_dict, rf_peripherals=rf_peripherals,
+        r, config_dict, rf_peripherals=rf_peripherals, r_fast=r_fast,
         force_tx_amp_bypass=force_tx_amp_bypass,
         force_rx_amp_bypass=force_rx_amp_bypass,
         force_tx_attenuation_db=force_tx_attenuation_db,
@@ -11652,7 +11743,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
               f'reference_plane={reference_plane!r}')
         init_amps_max = float(np.max(get_tone_amplitudes(r, r_fast, config_dict)))
         if not tone_amplitudes_fixed:
-            set_tone_amplitudes(r, config_dict, amps, autosync=autosync, mrst=mrst)
+            set_tone_amplitudes(r, config_dict, amps, autosync=autosync, mrst=mrst, r_fast=r_fast)
         new_amps_max = float(np.max(np.abs(amps)))
         if init_amps_max > 0 and new_amps_max > 0:
             amp_change_db = float(20 * np.log10(new_amps_max / init_amps_max))
@@ -11773,7 +11864,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
         else:
             r.psbscale.set_scale(0)
             time.sleep(0.01)
-        set_tone_amplitudes(r, config_dict, amps, autosync=autosync, mrst=mrst)
+        set_tone_amplitudes(r, config_dict, amps, autosync=autosync, mrst=mrst, r_fast=r_fast)
         time.sleep(0.01)
         print(f'  step 1: maximise digital — amplitudes at max')
 
@@ -12062,7 +12153,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
             cryostat_input_s21_db=cal['cryostat_input_s21_db'],
             dac_fs_bits=cal['dac_fs_bits'])
         final_amps = np.clip(final_amps, 0, max_amp)
-        set_tone_amplitudes(r, config_dict, final_amps, autosync=autosync)
+        set_tone_amplitudes(r, config_dict, final_amps, autosync=autosync, r_fast=r_fast)
         time.sleep(0.01)
 
     # --- Check the requested headroom against the *final* DAC level ---
