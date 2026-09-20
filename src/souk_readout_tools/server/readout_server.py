@@ -7195,6 +7195,10 @@ def main():
     from souk_readout_tools import firmware_lib
     from souk_readout_tools.server.rf_peripherals import RFPeripheralController
     from souk_readout_tools.server.lna_controller import LNABiasController
+    # The filterbank-compensation prototype imports scipy.signal on first use,
+    # ~8.5 s on the board; build it here rather than in the first
+    # set_tone_frequencies after a restart.
+    firmware_lib._filterbank_prototype()
 
     readout_server = ReadoutServer(config_file=args.config, pipeline_id=args.pipeline)
     asyncio.run(readout_server.async_main())
