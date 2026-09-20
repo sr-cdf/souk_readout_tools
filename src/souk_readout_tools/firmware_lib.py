@@ -10072,8 +10072,16 @@ def read_acc_cnt_fast(fast_read_params):
     """
     mm = fast_read_params['acc'].host.transport.axil_mm
     a = fast_read_params['acc_cnt_addr']
+    # Read until two consecutive reads agree. On v7.12.1 a read that lands on
+    # an increment can return a mix of old and new bits (e.g. 0x..8af -> 0x..8a0
+    # -> 0x..8b0; measured ~1 in 30-70k increments at 6 kHz), which looked like
+    # lost accumulations and torn reads. The bad value is never repeated.
     (cnt,) = struct.unpack('<I', mm[a:a+4])
-    return cnt
+    while True:
+        (again,) = struct.unpack('<I', mm[a:a+4])
+        if again == cnt:
+            return cnt
+        cnt = again
 
 
 def _blocking_wait_for_acc_fast(fast_read_params, poll_period_s=0.00001, timeout=1):
