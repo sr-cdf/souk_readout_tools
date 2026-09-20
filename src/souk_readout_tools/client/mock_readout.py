@@ -139,12 +139,10 @@ class MockReadoutServer:
         """Nearest valid ``acc_len`` for a requested sample rate.
 
         Matches firmware_lib.set_sample_rate: round to an integer, force a
-        multiple of 4, and clamp to the 1..2**16-1 register range.
+        multiple of 4, and clamp to the 4..65532 aligned register range.
         """
         acc_len = int(round(self._fft_bw_hz / sample_rate_hz))
-        if acc_len % 4 != 0:
-            acc_len = 4 * int(np.ceil(acc_len / 4))
-        return int(min(max(acc_len, 1), 2**16 - 1))
+        return min(max(4 * ((acc_len + 3) // 4), 4), 65532)
 
     def _init_tone_state(self):
         defaults = (self.config or {}).get('firmware', {}).get('defaults', {})
@@ -954,11 +952,28 @@ class MockReadoutServer:
         ``param_name`` / ``param_value`` follow
         :py:meth:`ReadoutClient.set_parameter` (the names handled below).
         """
-        if param_name == 'sample_rate_hz':
-            # Mirror the real server: store the derived acc_len, not the rate.
-            self.acc_len = self._acc_len_for_rate(float(param_value))
-        elif param_name == 'acc_len':
-            self.acc_len = int(param_value)
+        if param_name in ('sample_rate_hz', 'acc_len'):
+            try:
+                requested = float(param_value)
+                if not np.isfinite(requested) or requested <= 0:
+                    raise ValueError(f'{param_name} must be finite and positive')
+                if param_name == 'acc_len' and requested != int(requested):
+                    raise ValueError('acc_len must be an integer')
+                if param_name == 'sample_rate_hz':
+                    self.acc_len = self._acc_len_for_rate(float(param_value))
+                else:
+                    self.acc_len = min(max(4 * ((int(param_value) + 3) // 4), 4), 65532)
+                value = self.sample_rate if param_name == 'sample_rate_hz' else self.acc_len
+                warnings = []
+                if value != requested:
+                    warnings.append(f'Requested {param_name}={param_value}; applied {value}')
+                return {
+                    'status': 'success', 'requested_value': param_value,
+                    'value': value, 'acc_len': self.acc_len,
+                    'sample_rate_hz': self.sample_rate, 'warnings': warnings,
+                }
+            except (ValueError, TypeError, OverflowError) as exc:
+                return {'status': 'error', 'message': str(exc)}
         elif param_name == 'tone_frequencies':
             self.tone_frequencies = np.atleast_1d(param_value).astype(float).tolist()
             self._resize_tone_state(len(self.tone_frequencies))

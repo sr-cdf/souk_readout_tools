@@ -1540,7 +1540,13 @@ class ReadoutClient:
             return response
 
     def set_sample_rate(self, sample_rate_hz):
-        """Set the accumulator sample rate to ``sample_rate_hz`` (Hz)."""
+        """Set the accumulator rate (Hz).
+
+        On success, return requested_value, applied value, acc_len,
+        sample_rate_hz and warnings (empty for an exact setting). Applied
+        values come from register readback, not a cadence measurement.
+        On failure, return status='error' and a message.
+        """
         return self.set_parameter('sample_rate_hz',sample_rate_hz)
 
     def get_sample_rate(self):
@@ -1828,8 +1834,13 @@ class ReadoutClient:
         return self.get_parameter('sync_delay')
 
     def set_acc_len(self, value):
-        """Set the accumulation length to integer ``value``."""
-        return self.set_parameter('acc_len', int(value))
+        """Set a positive integer accumulation length, rounded up to a multiple
+        of four parallel samples and clamped to 4..65532.
+
+        Return the same status/readback/warnings fields as set_sample_rate;
+        value and requested_value are accumulation lengths in this response.
+        """
+        return self.set_parameter('acc_len', value)
 
     def get_acc_len(self):
         """Get the current accumulation length."""

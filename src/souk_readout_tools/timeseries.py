@@ -9,6 +9,7 @@ arrays itself. Nothing here requires a prior call to anything else here.
 ============================================  ==============================
 I want to...                                  Use
 ============================================  ==============================
+fill missing timestream samples              ``fill_gaps``
 compute a PSD of one signal                   ``compute_psd``
 compute PSDs of a whole timestream capture    ``timestream_psds``
 compute PSDs of pre-accumulation snapshots    ``snapshot_psds``
@@ -63,6 +64,7 @@ from .noise import (_get_sweep_trace,
                     remove_iq_common_modes_svd)
 
 __all__ = [
+    'fill_gaps',
     'compute_psd',
     'compute_psd_averaged',
     'compute_psd_concatenated',
@@ -97,6 +99,157 @@ PSD_PANELS = {
     'magphase': ('magnitude', 'phase'),
     'freq_diss': ('frequency', 'dissipation'),
 }
+
+
+def fill_gaps(samples, method='nan', *, max_missing=1_000_000,
+              noise_window=128, rng=None):
+    """Return an independent parsed-samples copy with counter gaps inserted.
+
+    Parameters
+    ----------
+    samples : dict
+        Output of ``ReadoutClient.parse_samples``. I/Q arrays and all standard
+        per-sample metadata must have length ``num_samples``.
+    method : {'nan', 'interpolate', 'noise'}
+        Fill inserted I/Q samples with NaN (default), or interpolate linearly
+        between the immediately surrounding received samples. Existing NaNs
+        are preserved, not repaired. ``'noise'`` draws Gaussian I/Q pairs
+        with the local mean and covariance of received samples around each
+        gap, independently for each tone. This matches local moments in
+        expectation, not coloured spectral density or cross-tone correlation.
+        Synthetic fills change noise statistics; they do not recover missing
+        measurements. For modulated captures, use ``modulation.group_cycles``
+        for interpolation within each point; noise filling is not supported.
+    max_missing : int
+        Maximum number of samples to insert, guarding against corrupt counters
+        or unexpectedly large gaps. Increase explicitly for larger captures.
+    noise_window : int
+        For noise filling, use up to this many received samples on each side
+        of each gap (default 128). At least two finite I/Q pairs are required.
+    rng : int or numpy.random.Generator or None
+        Seed or generator for reproducible noise filling.
+
+    Returns
+    -------
+    dict
+        Deep copy with expanded I/Q, counters, metadata and ``num_samples``.
+        ``packet_missing`` marks inserted samples (including earlier fills).
+        Missing ``packet_error`` entries are 1, telescope timestamps are 0
+        (unknown), and stream flags/modulation tags are -1 (unknown). These
+        metadata values are never interpolated. Other metadata is copied.
+        ``sample_rate`` is unchanged. No leading/trailing losses are inferred.
+
+        Signed or unsigned 32-bit counter wraps are supported and retained in
+        the input convention. Duplicate/backward counters are rejected.
+
+    Examples
+    --------
+    >>> filled = fill_gaps(samples)  # doctest: +SKIP
+    >>> filled = fill_gaps(samples, method='interpolate')  # doctest: +SKIP
+    >>> filled = fill_gaps(samples, method='noise', rng=42)  # doctest: +SKIP
+    >>> inserted = filled['packet_missing']  # doctest: +SKIP
+    """
+    import copy
+
+    if method not in ('nan', 'interpolate', 'noise'):
+        raise ValueError("method must be 'nan', 'interpolate' or 'noise'")
+    if method == 'noise':
+        if not isinstance(noise_window, (int, np.integer)) or noise_window < 1:
+            raise ValueError('noise_window must be a positive integer')
+        rng = np.random.default_rng(rng)
+    if not isinstance(max_missing, (int, np.integer)) or max_missing < 0:
+        raise ValueError('max_missing must be a nonnegative integer')
+    counter = np.asarray(samples['packet_counter'])
+    if counter.ndim != 1 or (counter.size and counter.dtype.kind not in 'iu'):
+        raise ValueError('packet_counter must be a 1D integer array')
+    n = len(counter)
+    if samples['num_samples'] != n:
+        raise ValueError('num_samples does not match packet_counter')
+    if n and (np.any(counter < -(2**31)) or np.any(counter > 2**32 - 1)):
+        raise ValueError('packet_counter must contain 32-bit counter values')
+    pc = counter.astype(np.int64)
+    steps = np.diff(pc) % (2**32)
+    if np.any((steps == 0) | (steps >= 2**31)):
+        raise ValueError('duplicate, backward or ambiguous packet_counter jump')
+    missing_count = sum(int(step) - 1 for step in steps)
+    if missing_count > max_missing:
+        raise ValueError(f'{missing_count} missing samples exceeds max_missing={max_missing}')
+    positions = np.concatenate(([0], np.cumsum(steps))) if n else np.array([], dtype=int)
+    size = n + missing_count
+    inserted = np.ones(size, dtype=bool)
+    inserted[positions] = False
+
+    def expand(values, field, fill, interpolate=False):
+        arr = np.asarray(values)
+        if arr.ndim != 1 or len(arr) != n:
+            raise ValueError(f'{field} must be a 1D array of length num_samples')
+        if not missing_count:
+            return arr.copy()
+        dtype = np.result_type(arr.dtype, np.float64) if interpolate else arr.dtype
+        if fill == -1:
+            dtype = np.int64  # unknown flags must not wrap to unsigned values
+        out = np.full(size, fill, dtype=dtype)
+        out[positions] = arr
+        if interpolate and method == 'interpolate' and n:
+            targets = np.flatnonzero(inserted)
+            out[targets] = np.interp(targets, positions, arr)
+        return out
+
+    if method in ('interpolate', 'noise') and missing_count:
+        points = np.asarray(samples.get('modulation_point', []))
+        if np.any(points != 0):
+            raise ValueError('Synthetic filling of modulated samples is not supported; '
+                             'use modulation.group_cycles for per-point interpolation')
+
+    result = copy.deepcopy(samples)
+    for field in ('i_data', 'q_data'):
+        result[field] = {
+            tone: expand(values, f'{field}[{tone}]', np.nan, interpolate=True)
+            for tone, values in samples[field].items()
+        }
+    if method == 'noise' and missing_count:
+        if samples['i_data'].keys() != samples['q_data'].keys():
+            raise ValueError('i_data and q_data must contain the same tones')
+        prior = np.asarray(samples.get('packet_missing', np.zeros(n, dtype=bool)))
+        if prior.shape != (n,):
+            raise ValueError('packet_missing must have length num_samples')
+        for tone in samples['i_data']:
+            iq = np.column_stack((samples['i_data'][tone], samples['q_data'][tone]))
+            for left in np.flatnonzero(steps > 1):
+                lo = max(0, left + 1 - noise_window)
+                hi = min(n, left + 1 + noise_window)
+                neighbours = iq[lo:hi]
+                good = np.all(np.isfinite(neighbours), axis=1) & ~prior[lo:hi].astype(bool)
+                neighbours = neighbours[good]
+                if len(neighbours) < 2:
+                    raise ValueError(f'Not enough finite received I/Q pairs near gap for tone {tone}')
+                start, stop = int(positions[left]) + 1, int(positions[left + 1])
+                draws = rng.multivariate_normal(
+                    neighbours.mean(axis=0), np.cov(neighbours, rowvar=False),
+                    size=stop - start)
+                result['i_data'][tone][start:stop] = draws[:, 0]
+                result['q_data'][tone][start:stop] = draws[:, 1]
+    for field, fill in (('packet_error', 1), ('telescope_time', 0),
+                        ('modulation_point', -1), ('modulation_settling', -1),
+                        ('modulation_revision', -1)):
+        if field in samples:
+            result[field] = expand(samples[field], field, fill)
+    if 'stream_flags' in samples:
+        result['stream_flags'] = {
+            flag: expand(values, f'stream_flags[{flag}]', -1)
+            for flag, values in samples['stream_flags'].items()
+        }
+    if missing_count:
+        counters = (int(pc[0]) + np.arange(size, dtype=np.int64)) % (2**32)
+        if np.any(pc < 0) or counter.dtype == np.dtype('int32'):
+            counters = (counters + 2**31) % (2**32) - 2**31
+        result['packet_counter'] = counters
+    else:
+        result['packet_counter'] = counter.copy()
+    prior_missing = np.asarray(samples.get('packet_missing', np.zeros(n, dtype=bool)))
+    result['packet_missing'] = expand(prior_missing, 'packet_missing', True).astype(bool)
+    result['num_samples'] = size
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -2557,17 +2557,12 @@ def set_sample_rate(r,sample_rate_hz):
     acc_len = fft_bw / sample_rate_hz
     print(sample_rate_hz,r.adc_clk_hz,fft_bw, acc_len)
     if acc_len % 1 != 0:
-        nearest_int = int(round(acc_len))
+        nearest_int = max(1, int(round(acc_len)))
         nearest_rate = fft_bw / float(nearest_int)
         print(f'Accumulation length {acc_len} must be an integer, trying {nearest_int} = {nearest_rate} Hz')
         acc_len = nearest_int
-    if acc_len %4 != 0:
-        print(f'Accumulation length {acc_len} must be a multiple of 4, rounding up')
-        acc_len = 4 * int(np.ceil(acc_len / 4))
-    if acc_len < 1:
-        acc_len = 1
-    if acc_len > 2**16-1:
-        acc_len = 2**16-1
+    # The accumulator window spans four parallel samples, not channels.
+    acc_len = min(max(4 * ((int(acc_len) + 3) // 4), 4), 65532)
     acc_freq = fft_bw / float(acc_len)
     acc_len = int(acc_len)
     print(f'setting acc len {acc_len} = {acc_freq} Hz')

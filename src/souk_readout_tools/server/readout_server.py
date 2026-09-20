@@ -3041,10 +3041,32 @@ class ReadoutServer:
                     # relevant when setting tones without a sync (autosync=False).
                     compensate_rx_ticks = int(message.get('compensate_rx_ticks', 0))
                     response = {'status': 'error', 'message': f'Invalid parameter name {param_name}'}
-                    if param_name == 'sample_rate_hz':
-                        firmware_lib.set_sample_rate(self.r, param_value)
-                        response = {'status': 'success'}
-                    
+                    if param_name in ('sample_rate_hz', 'acc_len'):
+                        requested = float(param_value)
+                        if not np.isfinite(requested) or requested <= 0:
+                            raise ValueError(f'{param_name} must be finite and positive')
+                        if param_name == 'sample_rate_hz':
+                            firmware_lib.set_sample_rate(self.r, requested)
+                        else:
+                            if requested != int(requested):
+                                raise ValueError('acc_len must be an integer')
+                            # The window spans four parallel samples, independently
+                            # of mixer channel parallelism. Keep the limits aligned.
+                            acc_len = min(max(4 * ((int(param_value) + 3) // 4), 4), 65532)
+                            self.r.mixer.set_acc_len(acc_len)
+                            self.r.sync.sw_sync(mrst=True)
+                        acc_len = self.r.mixer.get_acc_len()
+                        sample_rate_hz = firmware_lib.get_sample_rate(self.r)
+                        value = sample_rate_hz if param_name == 'sample_rate_hz' else acc_len
+                        warnings = []
+                        if value != requested:
+                            warnings.append(f'Requested {param_name}={param_value}; applied {value}')
+                        response = {
+                            'status': 'success', 'requested_value': param_value,
+                            'value': value, 'acc_len': acc_len,
+                            'sample_rate_hz': sample_rate_hz, 'warnings': warnings,
+                        }
+
                     elif param_name == 'tone_frequencies':
                         self._begin_exclusive_frequency_operation('set_tone_frequencies')
                         self.stream_flags[FLAG_SET_FREQS].set()
@@ -3181,10 +3203,6 @@ class ReadoutServer:
                         # v7.11: sync_delay is deprecated; the mixer owns RX/TX delay and
                         # sets it during init. See firmware_lib._warn_sync_delay_deprecated.
                         firmware_lib._warn_sync_delay_deprecated(param_value)
-                        response = {'status': 'success'}
-                    elif param_name == 'acc_len':
-                        self.r.mixer.set_acc_len(int(param_value))  # v7.11: acc_len in mixer
-                        self.r.sync.sw_sync(mrst=True)  # acc_len change needs master-reset + sync
                         response = {'status': 'success'}
                     elif param_name == 'internal_loopback':
                         if param_value:
