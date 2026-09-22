@@ -20,10 +20,19 @@ and array health monitoring are other plausible consumers); the estimator
 separable from the controller and from the server wiring.
 
 Performance contract (see doc/tone_tracking.md): the only work added to the
-``stream_data`` per-sample hot path is one O(1) append of the already-built
-frame payload to a bounded ring (:meth:`TrackingRuntime.tap`). All parsing,
-cycle assembly and estimation run in a consumer task, vectorised across all
-tones, in a thread executor.
+per-accumulation hot path is one coherent add of the I/Q words into the
+running average (:meth:`TrackingRuntime.tap`, called from ``prepare_frame``
+while the data is still hot) -- 33.1 us per accumulation at 1000 tones for a
+boxcar, 51.9 for an EWMA, against ~161 us of typical spare at 2500 Hz.
+``frame_stride`` halves or quarters that (17.4 / 10.3 us) for a sqrt(N) noise
+penalty that is negligible against thousands of averaged cycles. Estimation, the controller and the health snapshot run in a
+consumer task in a thread executor, on ``(blocks, points, tones)`` arrays of a
+few tens of kB.
+
+The averaging deliberately happens in the stream task rather than in the
+consumer. Handing raw frames across to another core instead moves megabytes
+through the L2 that all four A53s share, which loses accumulations on **both**
+pipelines -- including ones that are not tracking at all (doc/v712-notes.md).
 
 Everything above the runtime is numpy-only and server-free, so it is unit
 testable off the RFSoC.
@@ -37,6 +46,8 @@ import warnings
 from collections import deque
 
 import numpy as np
+
+from souk_readout_tools import modulation
 
 # Number of int32 trailer words at the end of every stream frame
 # (flags 0-5, tt_msb, tt_lsb, cnt, err) -- matches prepare_frame.
@@ -88,8 +99,11 @@ def parse_frame_batch(payloads, num_tones):
         return None
     words = np.frombuffer(b''.join(good), dtype='<i4').reshape(n, -1)
     words = words[:, 1:]                       # drop the 4-byte length prefix
-    iq = words[:, :2 * num_tones]
-    z = iq[:, 0::2].astype(np.float64) + 1j * iq[:, 1::2].astype(np.float64)
+    # I and Q are already interleaved, so one contiguous cast plus a view beats
+    # two strided gathers into complex128: 27 ms -> a few ms for a 0.2 s batch
+    # at 1000 tones. float32 carries the 32-bit accumulator words exactly (they
+    # fit in the 24-bit mantissa at these scales) and halves the memory traffic.
+    z = words[:, :2 * num_tones].astype(np.float32).view(np.complex64)
     tail = words[:, -STREAM_TRAILER_WORDS:].view('<u4')
     f5 = tail[:, 5].astype(np.uint32)
     return {
@@ -139,9 +153,12 @@ def assemble_cycles(batch, num_points, carry=None):
     if not np.any(usable):
         return None, {k: batch[k][:0] for k in keys}
     # Work only on modulated samples; unmodulated (point 0) samples are rare
-    # here (the tap only runs in the modulated branch) and are dropped.
-    batch = {k: batch[k][usable] for k in keys}
-    point = batch['point']
+    # here (the tap only runs in the modulated branch) and are dropped. The
+    # mask copies every array, ~8 MB of complex z for a 0.2 s batch at 1000
+    # tones, so skip it when nothing would be dropped.
+    if not usable.all():
+        batch = {k: batch[k][usable] for k in keys}
+        point = batch['point']
 
     # Cycle index: increments where the point sequence wraps (point decreases).
     wraps = np.zeros(len(point), dtype=int)
@@ -168,15 +185,45 @@ def assemble_cycles(batch, num_points, carry=None):
     keep = ~settling & (point_sel <= num_points)
     flat_k = flat[keep]
     minlength = n_cycles * num_points
-    counts = np.bincount(flat_k, minlength=minlength).astype(float)
-    zk = z[keep]
-    sums_r = np.zeros((minlength, n_tones))
-    sums_i = np.zeros((minlength, n_tones))
-    np.add.at(sums_r, flat_k, zk.real)
-    np.add.at(sums_i, flat_k, zk.imag)
-    with np.errstate(invalid='ignore', divide='ignore'):
-        mean = (sums_r + 1j * sums_i) / counts[:, None]
-    mean[counts == 0] = np.nan
+    zk = z if keep.all() else z[keep]
+    mean = None
+    if flat_k.size:
+        # flat_k is nondecreasing by construction -- cycles ascend, and points
+        # ascend within a cycle because a decrease is what starts a new one --
+        # so each (cycle, point) group is a contiguous run and reduceat sums
+        # them in one pass. np.add.at, which does not need that, is an
+        # unbuffered scatter and cost 150 ms of a 200 ms batch on the ARM.
+        if np.all(np.diff(flat_k) >= 0):
+            starts = np.flatnonzero(np.r_[True, np.diff(flat_k) != 0])
+            groups = flat_k[starts]
+            if starts.size == flat_k.size:
+                # One sample per point (samples_per_point=1): the rows already
+                # are the per-point means, so skip the reduction and the
+                # divide -- both are passes over ~8 MB.
+                group_means = zk
+            else:
+                group_sums = np.add.reduceat(zk, starts, axis=0)
+                group_counts = np.diff(np.r_[starts, flat_k.size]).astype(float)
+                group_means = group_sums / group_counts[:, None]
+            if groups.size == minlength and np.array_equal(groups, np.arange(minlength)):
+                # Every point of every cycle present and in order, which is the
+                # normal case: use the sums as they are rather than allocating
+                # and scattering into an 8 MB NaN array.
+                mean = group_means
+            else:
+                mean = np.full((minlength, n_tones), np.nan, dtype=complex)
+                mean[groups] = group_means
+        else:                                   # not expected; correct but slow
+            counts = np.bincount(flat_k, minlength=minlength).astype(float)
+            sums_r = np.zeros((minlength, n_tones))
+            sums_i = np.zeros((minlength, n_tones))
+            np.add.at(sums_r, flat_k, zk.real)
+            np.add.at(sums_i, flat_k, zk.imag)
+            with np.errstate(invalid='ignore', divide='ignore'):
+                mean = (sums_r + 1j * sums_i) / counts[:, None]
+            mean[counts == 0] = np.nan
+    if mean is None:                            # nothing kept: all points empty
+        mean = np.full((minlength, n_tones), np.nan, dtype=complex)
     z_cycles = mean.reshape(n_cycles, num_points, n_tones)
 
     # Cycle-level metadata: last sample of each cycle.
@@ -189,20 +236,54 @@ def assemble_cycles(batch, num_points, carry=None):
     return cycles, carry_out
 
 
+# Cycles behind one coherently averaged block, at most.
+MAX_CYCLES_PER_BLOCK = 32
+
+
+
+def average_cycles(z, blocks):
+    """Coherently average ``(n_cycles, N, n_tones)`` cycles into ``blocks`` rows.
+
+    The detuning estimate is nonlinear in the cycle data (phase unwrap, then a
+    curvature/slope ratio), so averaging I/Q *before* it both costs far less and
+    is better statistically than averaging noisy per-cycle ratios afterwards.
+    A handful of blocks per batch keeps a scatter estimate for the health
+    statistics; one block would leave none.
+
+    Returns ``(min(blocks, n_cycles), N, n_tones)``. Whole cycles only: a
+    remainder shorter than a block is dropped, and comes back in the next batch
+    through the carry.
+    """
+    n_cycles = z.shape[0]
+    blocks = max(1, min(int(blocks), n_cycles))
+    per = n_cycles // blocks
+    if per < 1:
+        return z
+    usable = per * blocks
+    return z[:usable].reshape(blocks, per, *z.shape[1:]).mean(axis=1)
+
+
 def estimate_detunings(z, offsets, linewidth_hz):
     """Model-free per-cycle detuning estimate, vectorised across all tones.
 
-    Implements the same maths as :func:`souk_readout_tools.modulation.
-    demodulate`'s model-free ``method='fast'`` path (finite-difference phase
-    slope and curvature; detuning from the curvature/slope ratio), as one
-    set of whole-array operations -- no Python loop over tones. Numerical
-    agreement with ``demodulate`` is asserted by a unit test.
+    The maths of :func:`souk_readout_tools.modulation.demodulate`'s
+    model-free ``method='fast'`` path -- finite-difference phase slope and
+    curvature, detuning from their ratio -- on the lowest, middle and highest
+    probe offsets of each tone, whatever order the slots are in. Points that
+    share an offset are averaged coherently first, so the firmware default
+    ``[-d, 0, +d, 0]`` uses both centre dwells. (Taking the first, middle and
+    last *slots* instead -- as both this and ``demodulate('fast')`` did before
+    2026-09-22 -- reads that pattern as ~+37 linewidths whatever the true
+    detuning.)
+
+    Phase differences are the angles of products of neighbouring points, so
+    there is no unwrap: they are small whenever the probe offsets are small
+    against the linewidth, which the estimate assumes anyway.
 
     Parameters
     ----------
     z : numpy.ndarray
-        ``(n_cycles, N, n_tones)`` complex per-point cycle means (from
-        :func:`assemble_cycles`).
+        ``(n_cycles, N, n_tones)`` complex per-point means.
     offsets : numpy.ndarray
         ``(N, n_tones)`` per-point probe offsets in Hz.
     linewidth_hz : numpy.ndarray
@@ -213,22 +294,46 @@ def estimate_detunings(z, offsets, linewidth_hz):
     -------
     dict
         ``detuning_linewidths`` and ``detuning_hz``: ``(n_cycles, n_tones)``
-        (NaN where not estimable); ``dphi_df`` the phase slope (rad/Hz).
+        (NaN where not estimable, including tones with fewer than three
+        distinct offsets); ``dphi_df`` the phase slope (rad/Hz).
+
+    Examples
+    --------
+    A tone 0.05 linewidths above an arctan-phase resonance reads about
+    x / (1 + 4 x**2) = 0.0495, the documented compression (a little less
+    here, from the finite +/-2 kHz differences):
+
+    >>> lw = np.array([5e4]); off = np.array([-2e3, 0, 2e3, 0])[:, None]
+    >>> z = np.exp(-2j * np.arctan(2 * (0.05 * lw + off) / lw))[None]
+    >>> round(float(estimate_detunings(z, off, lw)['detuning_linewidths'][0, 0]), 4)
+    0.0493
     """
     n_cycles, N, n_tones = z.shape
     if N < 3:
         raise ValueError('tracking needs >= 3 modulation points for the '
                          'curvature-based detuning estimate')
-    offsets = np.asarray(offsets, dtype=float)
+    offsets = np.broadcast_to(np.asarray(offsets, dtype=float), (N, n_tones))
     lw = np.asarray(linewidth_hz, dtype=float)
 
-    phi = np.unwrap(np.angle(z), axis=1)             # (n_cycles, N, n_tones)
-    span = offsets[-1] - offsets[0]                  # (n_tones,)
-    half = span / 2.0
-    mid = N // 2
+    # Lowest, highest and most central offset of each tone, and the coherent
+    # mean of the points at each (weights are 1/count at those points, else 0).
+    f_lo = offsets.min(axis=0)
+    f_hi = offsets.max(axis=0)
+    dist = np.abs(offsets - 0.5 * (f_lo + f_hi))
+    f_mid = offsets[np.argmin(dist, axis=0), np.arange(n_tones)]
+
+    def mean_at(f):
+        w = (offsets == f).astype(float)
+        return np.einsum('cnt,nt->ct', z, w / w.sum(axis=0))
+
+    z_lo, z_mid, z_hi = mean_at(f_lo), mean_at(f_mid), mean_at(f_hi)
+    d_lo = np.angle(z_mid * np.conj(z_lo))           # phi_mid - phi_lo
+    d_hi = np.angle(z_hi * np.conj(z_mid))           # phi_hi - phi_mid
     with np.errstate(divide='ignore', invalid='ignore'):
-        slope = (phi[:, -1, :] - phi[:, 0, :]) / span
-        d2 = (phi[:, -1, :] - 2.0 * phi[:, mid, :] + phi[:, 0, :]) / half ** 2
+        slope = (d_lo + d_hi) / (f_hi - f_lo)
+        # Second difference for (possibly) unequal spacing; for a symmetric
+        # pattern it is (phi_hi - 2 phi_mid + phi_lo) / half**2.
+        d2 = 2.0 * (d_hi / (f_hi - f_mid) - d_lo / (f_mid - f_lo)) / (f_hi - f_lo)
         detuning_linewidths = -(d2 / slope * lw) / 8.0
     bad = ~np.isfinite(detuning_linewidths)
     detuning_linewidths = np.where(bad, np.nan, detuning_linewidths)
@@ -357,7 +462,8 @@ class TrackingController:
 
     def __init__(self, n_tones, mod_indices, linewidth_hz,
                  threshold_linewidths=0.3, confirm_windows=3, gain=1.0,
-                 max_step_linewidths=0.5, enable_mask=None):
+                 max_step_linewidths=0.5, enable_mask=None,
+                 min_detuning_snr=1.0):
         self.n_tones = int(n_tones)
         self.mod_indices = [int(i) for i in mod_indices]
         self.linewidth_hz = np.asarray(linewidth_hz, dtype=float)
@@ -367,6 +473,7 @@ class TrackingController:
         self.confirm_windows = max(1, int(confirm_windows))
         self.gain = float(gain)
         self.max_step_linewidths = float(max_step_linewidths)
+        self.min_detuning_snr = float(min_detuning_snr)
         mask = np.zeros(self.n_tones, dtype=bool)
         mask[self.mod_indices] = True
         if enable_mask is not None:
@@ -391,7 +498,8 @@ class TrackingController:
         self.staged = {'lo': {}, 'bin': {}}
         self.staged_detunings = {}
 
-    def decide(self, filtered_lw, centers_hz, lo_headroom_hz):
+    def decide(self, filtered_lw, centers_hz, lo_headroom_hz, unlocked=None,
+               sigma_lw=None):
         """Run one decision window on the filtered detunings.
 
         Parameters
@@ -401,10 +509,25 @@ class TrackingController:
         centers_hz : numpy.ndarray
             Current per-tone centres (Hz) the detunings were measured
             against.
-        lo_headroom_hz : numpy.ndarray
+        lo_headroom_hz : numpy.ndarray or callable
             ``(n_tones,)`` per-tone |centre shift| beyond which the update
             needs a bin/map change (classification only; the commit path
             re-verifies with the prepared bundle's ``needs_recenter``).
+        unlocked : numpy.ndarray or None
+            ``(n_tones,)`` bool from
+            :meth:`TrackingRuntime.unlocked_mask`. These tones are skipped
+            and their confirmation count reset, so a tone reading noise
+            never stages a correction and re-locking starts the count again.
+        sigma_lw : numpy.ndarray or None
+            ``(n_tones,)`` scatter of the detuning estimate (linewidths). A
+            reading over threshold must also exceed ``min_detuning_snr``
+            times its own scatter to stage anything. This is what catches a
+            tone -- or a whole pipeline -- that never had a resonator to lock
+            to: ``unlocked`` is measured against a baseline captured once the
+            filter settles, so if the tone was reading noise then, the
+            baseline is noise too and the ratio never trips. Significance
+            needs no baseline. A centred tone is unaffected because it is
+            not over threshold in the first place.
 
         Returns
         -------
@@ -415,17 +538,37 @@ class TrackingController:
         self.last_decision_ts = time.time()
         over = (np.abs(filtered_lw) > self.threshold_linewidths) \
             & self.enable_mask & np.isfinite(filtered_lw)
+        if unlocked is not None:
+            over &= ~np.asarray(unlocked, dtype=bool)
+        if sigma_lw is not None and self.min_detuning_snr:
+            sig = np.asarray(sigma_lw, dtype=float)
+            over &= ~(np.isfinite(sig)
+                      & (np.abs(filtered_lw) < self.min_detuning_snr * sig))
         self.over_count = np.where(over, self.over_count + 1, 0)
         ready = self.over_count >= self.confirm_windows
 
         staged_now = []
-        for tone in np.flatnonzero(ready):
+        self.headroom_ms = 0.0
+        # The per-tone arithmetic is done for all ready tones at once; the loop
+        # below only does the bookkeeping. With no resonators every tone can be
+        # over threshold, and the arithmetic in Python cost 14.6 ms a batch.
+        ready_idx = np.flatnonzero(ready)
+        if callable(lo_headroom_hz):
+            if ready_idx.size == 0:
+                lo_headroom_hz = None       # nothing to classify: skip the cost
+            else:
+                _t0 = time.perf_counter()
+                lo_headroom_hz = lo_headroom_hz()
+                self.headroom_ms = 1e3 * (time.perf_counter() - _t0)
+        if lo_headroom_hz is None:
+            lo_headroom_hz = np.full(self.n_tones, np.inf)
+        if ready_idx.size:
+            lw_r = self.linewidth_hz[ready_idx]
+            clamp_r = self.max_step_linewidths * lw_r
+            step_r = np.clip(self.gain * filtered_lw[ready_idx] * lw_r, -clamp_r, clamp_r)
+        for k, tone in enumerate(ready_idx):
             tone = int(tone)
-            lw = self.linewidth_hz[tone]
-            detuning_hz = filtered_lw[tone] * lw
-            step = self.gain * detuning_hz
-            clamp = self.max_step_linewidths * lw
-            step = float(np.clip(step, -clamp, clamp))
+            step = float(step_r[k])
             base = self.staged['lo'].get(
                 tone, self.staged['bin'].get(tone, centers_hz[tone]))
             new_center = float(base - step)
@@ -479,6 +622,201 @@ class TrackingController:
             'corrections_suppressed': dict(self.corrections_suppressed),
             'last_decision_ts': self.last_decision_ts,
         }
+
+
+# ---------------------------------------------------------------------------
+# The per-accumulation I/Q average (the only tracking work in the stream loop)
+# ---------------------------------------------------------------------------
+
+class IQAccumulator:
+    """Coherent per-(block, point) I/Q sums, fed one accumulation at a time.
+
+    This is the tap: ``tap()`` is called for every accumulation the stream loop
+    reads, with its interleaved I/Q words, and adds them into the average for
+    that accumulation's modulation point. The consumer takes the finished
+    window every poll and never sees a raw frame (doc/tone_tracking.md, "Data
+    path and performance").
+
+    Both averaging shapes are the real filter, not a first stage:
+
+    - ``'boxcar'``: an int64 sum over the window, then a fresh one -- an int64
+      sum *is* a boxcar. Two buffers alternate: ``take_window`` hands one to
+      the consumer and taps into the other, and the consumer zeroes the one it
+      was given (``TrackingRuntime.window_iq``) before the next take.
+    - ``'ewma'``: ``S = (1-a) S + x`` with a per-point normaliser, so the
+      average has memory set by ``alpha`` and can be read at any time.
+
+    int64, not an int32 partial folded now and then: the RX chain's FFT shift
+    schedule is biased for SNR, so accumulator words can approach full int32
+    scale, and an int32 sum would then wrap after two frames -- silently, into
+    plausible-looking detunings. ``frame_stride`` keeps one accumulation in N
+    instead, for a sqrt(N) noise penalty.
+
+    Parameters
+    ----------
+    blocks, num_points, n_tones : int
+        Interleaved averages per window, modulation points, active tones.
+    iq_filter : {'boxcar', 'ewma'}
+    frame_stride : int
+        Average one accumulation in this many.
+    alpha : float
+        EWMA weight per update (``'ewma'`` only).
+    buffer : buffer or None
+        Memory to put the sums in (the stream process passes shared memory);
+        ``None`` allocates. :meth:`nbytes` gives the size needed.
+    """
+
+    def __init__(self, blocks, num_points, n_tones, iq_filter='boxcar',
+                 frame_stride=1, alpha=0.0, buffer=None):
+        if iq_filter not in ('boxcar', 'ewma'):
+            raise ValueError("iq_filter must be 'boxcar' or 'ewma'")
+        self.shape = (int(blocks), int(num_points), 2 * int(n_tones))
+        self.num_points = int(num_points)
+        self.iq_filter = iq_filter
+        self.frame_stride = max(1, int(frame_stride))
+        self.alpha = float(alpha)
+        # A new buffer starts zeroed -- a bytearray, or a shared file fresh from
+        # ftruncate -- so it is not written here: in the stream process that
+        # would fault in every page of it at once, on the frame loop's time.
+        if buffer is None:
+            buffer = bytearray(self.nbytes(blocks, num_points, n_tones, iq_filter))
+        if iq_filter == 'boxcar':
+            self.sets = np.ndarray((2,) + self.shape, dtype=np.int64, buffer=buffer)
+            self.sums = None
+        else:
+            self.sets = None
+            self.sums = np.ndarray(self.shape, dtype=np.float64, buffer=buffer)
+        self.current = 0                   # boxcar set being tapped into
+        self.enabled = True
+        self.revision = None
+        self.frames_tapped = 0
+        self.frames_skipped = 0
+        self._tap_i = 0
+        self._block = 0
+        self._bind()
+
+    @staticmethod
+    def nbytes(blocks, num_points, n_tones, iq_filter='boxcar'):
+        """Bytes of memory the sums need."""
+        words = int(blocks) * int(num_points) * 2 * int(n_tones)
+        return 8 * words * (2 if iq_filter == 'boxcar' else 1)
+
+    def _bind(self):
+        """Cache per-(block, point) row views and plain-int counters.
+
+        ``tap`` runs once per accumulation, so its Python overhead is not
+        negligible: indexing a 3-D array to get the row and keeping the counts
+        in a numpy array cost more than the add itself. Binding the rows once
+        and counting in Python ints saves ~14 us per accumulation.
+        """
+        b, N, _ = self.shape
+        if not hasattr(self, '_row_sets'):
+            # Views of every row of every buffer, made once: a window swap then
+            # only picks the other set (made per swap they cost ~15 numpy
+            # calls, and a swap in the stream process lands between frames).
+            bases = [self.sums] if self.sums is not None else [self.sets[0], self.sets[1]]
+            self._row_sets = [[[base[i, j] for j in range(N)] for i in range(b)]
+                              for base in bases]
+        self._rows = self._row_sets[self.current if self.sums is None else 0]
+        self._counts = [[0] * N for _ in range(b)]
+        self._weights = [[0.0] * N for _ in range(b)]
+        self._decay = 1.0 - self.alpha
+
+    def tap(self, data, point, settling=False, revision=0):
+        """Add one accumulation's interleaved I/Q words into the average."""
+        if settling or point < 1 or point > self.num_points:
+            return
+        self._tap_i += 1
+        if self.frame_stride > 1 and self._tap_i % self.frame_stride:
+            self.frames_skipped += 1
+            return
+        if revision != self.revision:
+            self.reset(revision)
+        if point == 1:
+            self._block = (self._block + 1) % len(self._counts)
+        b, k = self._block, point - 1
+        if data.shape[0] != self.shape[2]:
+            return                      # tone count changed under us
+        row = self._rows[b][k]
+        if self.sums is None:
+            np.add(row, data, out=row, casting='unsafe')
+        else:
+            decay = self._decay
+            row *= decay
+            np.add(row, data, out=row, casting='unsafe')
+            w = self._weights[b]
+            w[k] = w[k] * decay + 1.0
+        self._counts[b][k] += 1
+        self.frames_tapped += 1
+
+    @property
+    def counts(self):
+        """Per-(block, point) sample counts of the current window."""
+        return np.asarray(self._counts, dtype=np.int64)
+
+    def reset(self, revision=None):
+        """Drop the part-built average (revision change, hold, tone change)."""
+        if self.sums is None:
+            self.sets[self.current] = 0
+        else:
+            self.sums[:] = 0.0
+        self._bind()
+        self._block = 0
+        if revision is not None:
+            self.revision = revision
+
+    def take_window(self):
+        """Hand the finished window over; None if nothing has been tapped.
+
+        Returns ``('boxcar', sums, counts, revision)`` -- ``sums`` is one of the
+        two buffers, which the consumer must zero before the next take -- or
+        ``('ewma', sums copy, weights, counts, revision)``. In the server this
+        runs on the event loop, like ``tap``, so the two never interleave and
+        no lock is needed; it costs O(1) for a boxcar.
+        """
+        counts = self.counts
+        if not counts.any():
+            return None
+        if self.sums is not None:
+            # Always current: the consumer reads a copy and the filter keeps
+            # running -- nothing is reset.
+            return ('ewma', self.sums.copy(),
+                    np.asarray(self._weights, dtype=float), counts, self.revision)
+        window = ('boxcar', self.sets[self.current], counts, self.revision)
+        self.current ^= 1
+        self._bind()
+        return window
+
+    def take_window_info(self):
+        """``take_window`` for a consumer in another process, which reads the
+        sums from the shared buffer itself: which buffer, and the counts.
+
+        Same hand-over as ``take_window`` (a boxcar switches buffers), but the
+        sums are not copied -- in the stream process that would be a copy of
+        the whole window on the frame loop's core, for nothing.
+        """
+        counts = self._counts              # plain lists: no numpy on this path
+        if not any(any(row) for row in counts):
+            return None
+        info = {'mode': self.iq_filter, 'counts': counts,
+                'revision': self.revision, 'frames_tapped': self.frames_tapped,
+                'frames_skipped': self.frames_skipped}
+        if self.sums is not None:
+            info['weights'] = [list(w) for w in self._weights]
+            info['counts'] = [list(c) for c in counts]   # these keep running
+        else:
+            info['set'] = self.current
+            self.current ^= 1
+            self._bind()
+        return info
+
+    async def next_window(self):
+        """``take_window`` for the consumer task (the remote one awaits)."""
+        return self.take_window()
+
+    def stop(self):
+        """Nothing to release in-process (the remote one tells the streamer)."""
+        self.enabled = False
 
 
 # ---------------------------------------------------------------------------
@@ -559,18 +897,73 @@ class TrackingRuntime:
             confirm_windows=params['confirm_windows'],
             gain=params['gain'],
             max_step_linewidths=params['max_step_linewidths'],
-            enable_mask=params.get('enable_mask'))
+            enable_mask=params.get('enable_mask'),
+            min_detuning_snr=params.get('min_detuning_snr', 1.0))
+        # The filter is fed one row per averaged block, so its window counts
+        # blocks and its EWMA alpha follows the block period, not the cycle.
+        self.filter_blocks_per_batch = max(1, int(params.get('filter_blocks_per_batch') or 4))
+        window_s = float(params['poll_interval_s'])
+        blocks_per_s = max(1e-6, self.filter_blocks_per_batch / window_s)
         self.filter = DetuningFilter(
             params['filter'], self.n_tones,
             window=params['filter_window'],
             tau_s=params['filter_tau_s'],
-            cycle_period_s=cycle_period)
+            cycle_period_s=1.0 / blocks_per_s)
 
-        # Ring buffer: the producer appends raw frame payloads; deque with
-        # maxlen gives O(1) drop-oldest. Depth defaults to ~2 s of samples.
-        depth = int(params['ring_depth'] or max(1024, int(2 * sample_rate)))
-        self.ring = deque(maxlen=depth)
-        self._carry = None
+        # Coherent I/Q averaging, done by the stream task as it reads each
+        # accumulation, while the data is still hot. A second pass over the
+        # frames from another core costs BOTH pipelines dearly -- the four
+        # A53s share a 1 MB L2 (doc/v712-notes.md) -- so the averaging happens
+        # once, here, and the consumer only ever sees (blocks, points, tones).
+        #
+        # Both modes are the real filter, not a first stage:
+        #   boxcar  sum over `iq_average_s`, then reset -- 33.1 us per frame
+        #           at 1000 tones, because an int64 sum *is* a boxcar.
+        #   ewma    S = (1-a)S + x with a per-point normaliser, so the average
+        #           has memory `iq_average_s` and is readable at any time --
+        #           51.9 us per frame (float64). Use `frame_stride` to trade
+        #           noise for stream-loop time (stride 2 -> 17.4 / 26.8 us).
+        # A *sliding* boxcar is deliberately not offered: it would need every
+        # frame of the window kept (100 MB at 5 s and 2500 Hz).
+        self.iq_filter = params.get('iq_filter') or 'boxcar'
+        if self.iq_filter not in ('boxcar', 'ewma'):
+            raise ValueError("iq_filter must be 'boxcar' or 'ewma'")
+        self.iq_average_s = float(params.get('iq_average_s') or window_s)
+        self.frame_stride = max(1, int(params.get('frame_stride') or 1))
+        alpha = 0.0
+        if self.iq_filter == 'ewma':
+            # One update per point per cycle, so the decay is per cycle; with
+            # `blocks` interleaved averages a given block sees every b'th cycle.
+            cycle_s = self.num_points * self.frame_stride / max(1e-9, sample_rate)
+            alpha = 1.0 - np.exp(-cycle_s * self.filter_blocks_per_batch
+                                 / self.iq_average_s)
+        spec = dict(blocks=self.filter_blocks_per_batch,
+                    num_points=self.num_points, n_tones=self.n_tones,
+                    iq_filter=self.iq_filter, frame_stride=self.frame_stride,
+                    alpha=alpha)
+        # With the stream loop in its own process the tap runs there, on
+        # shared memory, and this side only takes the finished windows.
+        stream_process = getattr(server, 'stream_process', None)
+        self.acc = (stream_process.start_tracking(spec) if stream_process
+                    else IQAccumulator(**spec))
+        self.tap = self.acc.tap            # bound once: it runs per accumulation
+        self.acc_peak = 0                  # largest |accumulated sum| seen
+        # Wall time of each off-loop step, so the cost of tracking to the
+        # stream loop is visible in get_info('tracking') instead of inferred.
+        self.consume_ms = self.consume_ms_max = 0.0
+        self.stage_ms = {}
+        self.snapshot_ms = self.commit_ms = 0.0
+        # Comparing against modulation.demodulate is a diagnostic, not free:
+        # it loops over tones in Python, so at 1000 tones method='accurate'
+        # costs 1064 ms and 'fast' 537 ms on this ARM -- held GIL, which loses
+        # accumulations on both pipelines. Off by default; set a small tone
+        # count to sample it (32 tones ~ 34 ms). The real comparison belongs
+        # offline, on a recorded stream.
+        self.estimator_compare_tones = int(params.get('estimator_compare_tones') or 0)
+        self.estimator_diff = None
+        # Longest the cached health snapshot may go unrefreshed when nobody is
+        # reading it; a read marks it stale and the next poll rebuilds it.
+        self.snapshot_max_age_s = float(params.get('snapshot_max_age_s') or 60.0)
 
         self.enabled = True
         self.dry_run = bool(params['dry_run'])
@@ -590,7 +983,7 @@ class TrackingRuntime:
         self.last_estimate_ts = None
 
         # Per-tone running health statistics (exponentially weighted over
-        # cycles, ~20-cycle memory). Written by process_batch and read by
+        # cycles, ~20-cycle memory). Written by process_window and read by
         # tone_health()/_build_snapshot -- all in the consumer's off-loop
         # to_thread, so the sole writer is also the sole reader and there is
         # no cross-thread race. The model-free detuning estimate COMPRESSES
@@ -608,6 +1001,8 @@ class TrackingRuntime:
         # health poll before the first consumer iteration still returns a
         # well-formed payload.
         self._snapshot = self._build_snapshot()
+        self._snapshot_ts = time.time()
+        self._snapshot_wanted = False
 
     # -- setup helpers -------------------------------------------------------
 
@@ -635,7 +1030,9 @@ class TrackingRuntime:
         elif values.size == len(self.mod_indices):
             full[self.mod_indices] = values
         elif values.size == 1:
-            full[self.mod_indices] = float(values)
+            # .item(): NumPy 2 refuses float() of a one-element array, and a
+            # single linewidth arrives from the client as [value].
+            full[self.mod_indices] = values.item()
         else:
             raise ValueError(
                 f'linewidth_hz has {values.size} entries; expected '
@@ -700,24 +1097,24 @@ class TrackingRuntime:
         return headroom
 
     # -- hot path -------------------------------------------------------------
+    # ``tap`` itself is bound in __init__ straight to ``self.acc.tap``: it runs
+    # once per accumulation, so it should not pay for a second method call.
 
-    def tap(self, payload):
-        """Producer-side hook: O(1) append of one frame payload.
+    def reset_accumulator(self, revision=None):
+        """Drop the part-built average (revision change, hold, tone change)."""
+        self.acc.reset(revision)
 
-        Called from ``stream_data``'s modulated branch for every emitted
-        frame while tracking is enabled. ``payload`` is the already-built
-        frame bytes (length prefix included), so no copy is made here.
-        """
-        self.ring.append(payload)
+    def take_window(self):
+        """Hand the finished window to the consumer (in-process accumulator)."""
+        return self.acc.take_window()
 
-    def drain(self):
-        """Consumer-side: remove and return all buffered payloads."""
-        payloads = []
-        while True:
-            try:
-                payloads.append(self.ring.popleft())
-            except IndexError:
-                return payloads
+    @property
+    def frames_tapped(self):
+        return self.acc.frames_tapped
+
+    @property
+    def frames_skipped(self):
+        return self.acc.frames_skipped
 
     # -- consumer ------------------------------------------------------------
 
@@ -729,11 +1126,17 @@ class TrackingRuntime:
         ok = np.isfinite(target) & np.isfinite(value)
         target[ok] += alpha * (value[ok] - target[ok])
 
-    def _update_stats(self, estimate):
-        """Fold one batch's per-cycle estimates into the running health
-        statistics (see ``__init__``)."""
+    def _update_stats(self, estimate, n_cycles=None):
+        """Fold one batch's estimates into the running health statistics
+        (see ``__init__``).
+
+        ``estimate`` now holds one row per averaged block, so the variance is
+        the scatter between blocks; ``n_cycles`` is how many cycles they stand
+        for, which is what the exponential weight follows.
+        """
         detunings = estimate['detuning_linewidths']
-        n_cycles = detunings.shape[0]
+        if n_cycles is None:
+            n_cycles = detunings.shape[0]
         valid = np.isfinite(detunings)
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', RuntimeWarning)
@@ -751,42 +1154,105 @@ class TrackingRuntime:
             # relative to this is the lost-resonance signature.
             self.slope_baseline = self.stat_abs_slope.copy()
 
-    def process_batch(self, payloads):
-        """Parse + assemble + estimate + filter one drained batch.
+    def window_iq(self, window):
+        """Turn one accumulated window into ``(blocks, points, tones)`` I/Q.
 
-        Runs in the thread executor (numpy releases the GIL for the heavy
-        parts). Returns ``None`` when no complete cycle was available, else
-        a dict with the filtered detunings and batch metadata.
+        Divides the sums by the per-point sample counts and views the
+        interleaved words as complex. Blocks that saw no sample come back NaN.
+        A boxcar's buffer is zeroed here, whatever happens, because the tap
+        will switch back to it at the next take (``IQAccumulator``).
         """
-        batch = parse_frame_batch(payloads, self.n_tones)
-        if batch is None:
-            return None
-        cycles, self._carry = assemble_cycles(
-            batch, self.num_points, self._carry)
-        if cycles is None:
-            return None
-        revisions = cycles['revision']
-        estimate = estimate_detunings(
-            cycles['z'], self.offsets, self.linewidth_hz)
+        mode = window[0]
+        if mode == 'ewma':
+            _, s, w, counts, revision = window
+            w = w.copy()
+            w[w == 0] = np.nan
+            return (s / w[..., None]).view(complex), revision, int(counts.sum())
+        _, acc64, counts, revision = window
+        try:
+            n = counts.astype(float)
+            n[n == 0] = np.nan
+            z = (acc64 / n[..., None]).view(complex)
+            n_frames = int(counts.sum())
+            self.acc_peak = max(self.acc_peak, int(np.abs(acc64).max()))
+        finally:
+            acc64[:] = 0
+        return z, revision, n_frames
+
+    def process_window(self, window):
+        """Estimate from the averaged I/Q. Runs off the loop.
+
+        The coherent average is already complete -- the stream task did it
+        over `iq_average_s` while the data was hot -- so this only divides
+        out the counts and works on ``(blocks, points, tones)``, a few tens
+        of kB whatever the sample rate.
+        """
+        _t = time.perf_counter
+        _t0 = _t()
+        blocks, revision, n_frames = self.window_iq(window)
+        self.stage_ms['window_iq'] = 1e3 * (_t() - _t0); _t0 = _t()
+        n_cycles = n_frames // self.num_points
+        estimate = estimate_detunings(blocks, self.offsets, self.linewidth_hz)
+        self.stage_ms['estimate'] = 1e3 * (_t() - _t0); _t0 = _t()
+        if self.estimator_compare_tones:
+            self.estimator_diff = self._compare_estimators(blocks, estimate)
         filtered = self.filter.update(estimate['detuning_linewidths'])
-        self._update_stats(estimate)
-        self.cycles_seen += cycles['z'].shape[0]
+        self.stage_ms['filter'] = 1e3 * (_t() - _t0); _t0 = _t()
+        self._update_stats(estimate, n_cycles)
+        self.stage_ms['stats'] = 1e3 * (_t() - _t0)
+        self.cycles_seen += n_cycles
         self.last_filtered_lw = filtered
         self.last_estimate_ts = time.time()
+        rev = int(revision or 0)
         return {
-            'n_cycles': cycles['z'].shape[0],
-            'revision_first': int(revisions[0]),
-            'revision_last': int(revisions[-1]),
+            'n_cycles': n_cycles,
+            'revision_first': rev,
+            'revision_last': rev,
             'filtered_linewidths': filtered,
         }
 
-    def _consume_batch(self, payloads, centers):
+    def _compare_estimators(self, blocks, estimate):
+        """Run the quadratic-fit demodulator on the same averaged I/Q and
+        report the difference, without letting it drive any decision.
+
+        ``estimate_detunings`` is ``demodulate(method='fast')`` by
+        construction -- a unit test pins them to 1e-10 -- so the comparison
+        worth making is against ``method='accurate'``, which fits a quadratic
+        to phase against offset instead of using only the extreme points. That
+        matters for a pattern like ``[0, +d, 0, -d]``, whose repeated centre
+        point 'fast' does not use. At one window per ``poll_interval_s`` the
+        extra cost no longer matters, so both can be carried until one is
+        chosen on evidence.
+        """
+        try:
+            n = min(self.estimator_compare_tones, self.n_tones)
+            idx = np.linspace(0, self.n_tones - 1, n).astype(int)
+            other = modulation.demodulate(
+                {'z': blocks[..., idx], 'offsets_hz': self.offsets[:, idx]},
+                method='accurate', linewidth_hz=self.linewidth_hz[idx])
+            ref = np.asarray(estimate['detuning_linewidths'], dtype=float)[:, idx]
+            alt = np.asarray(other['detuning_linewidths'], dtype=float)
+            d = np.abs(alt - ref)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                return {
+                    'method': 'accurate',
+                    'tones_sampled': int(n),
+                    'n_compared': int(np.sum(np.isfinite(d))),
+                    'median_abs_diff_lw': float(np.nanmedian(d)),
+                    'max_abs_diff_lw': float(np.nanmax(d)),
+                    'median_abs_ref_lw': float(np.nanmedian(np.abs(ref))),
+                }
+        except Exception as e:                      # never break tracking
+            return {'error': f'{type(e).__name__}: {e}'}
+
+    def _consume_window(self, window, centers):
         """Off-loop consumer step: estimate + decision-gate + decide.
 
-        Runs entirely in the ``to_thread`` executor -- the whole per-tone
-        pipeline (parse, cycle assembly, estimation, filtering, running
-        stats and the controller's deadband/confirmation ``decide``) is
-        kept off the event loop so the stream loop is never charged for it.
+        Runs entirely in the ``to_thread`` executor -- the I/Q filter,
+        estimation, the estimator comparison, the detuning filter, running
+        stats and the controller's deadband/confirmation ``decide`` -- so the
+        stream loop is charged only for the per-frame sum in ``tap``.
         Performs **no** hardware writes and never touches
         ``_pending_modulation``; it only mutates this runtime's own
         controller/filter/stat state (the consumer is their sole writer).
@@ -797,7 +1263,7 @@ class TrackingRuntime:
         no live server modulation state beyond the benign, commit-revalidated
         headroom pre-check.
         """
-        result = self.process_batch(payloads)
+        result = self.process_window(window)
         if result is None:
             return False
         applied = self._applied_revision()
@@ -815,20 +1281,39 @@ class TrackingRuntime:
             return False
         if not self.filter.settled:
             return False
+        # Tones reading noise never reach the controller: they would stage a
+        # correction every window, which is both wrong (the estimate is
+        # meaningless off resonance) and expensive.
+        # Headroom is a per-tone Python loop (12.6 ms at 1000 tones) and is
+        # only needed to classify tones that have passed confirmation, which
+        # is normally none -- so pass the callable and let decide() call it
+        # only if it has something to classify.
+        _t = time.perf_counter
+        _t0 = _t()
         self.controller.decide(result['filtered_linewidths'],
-                               centers, self._lo_headroom_hz())
+                               centers, self._lo_headroom_hz,
+                               unlocked=self.unlocked_mask(
+                                   result['filtered_linewidths']),
+                               sigma_lw=np.sqrt(self.stat_detuning_var))
+        self.stage_ms['decide'] = 1e3 * (_t() - _t0)
+        self.stage_ms['headroom'] = round(self.controller.headroom_ms, 2)
         return True
 
     async def run(self):
-        """Consumer task: poll the ring; estimate/decide off-loop; commit.
+        """Consumer task: take each finished average; estimate/decide off-loop.
 
-        The heavy per-tone work (``_consume_batch``) and the health-snapshot
-        rebuild both run in the ``to_thread`` executor; only the commit --
-        which must own the modulation hardware writes -- runs on the event
-        loop. So neither tracking estimation nor health reporting adds
-        per-tone work to the stream loop.
+        The estimation (``_consume_window``) and the health-snapshot rebuild
+        run in the ``to_thread`` executor; only taking the window and the
+        commit -- which owns the modulation hardware writes -- run on the
+        event loop. Taking the window is O(1): the stream task and this
+        coroutine share the loop and so never interleave, which is why the
+        buffer swap needs no lock.
         """
+        # A boxcar average is only complete after `iq_average_s`, so the
+        # estimator cannot run faster than that; an EWMA is always current.
         poll = float(self.params['poll_interval_s'])
+        if self.iq_filter == 'boxcar':
+            poll = max(poll, self.iq_average_s)
         server = self.server
         while not self._stop:
             try:
@@ -836,24 +1321,39 @@ class TrackingRuntime:
                 if not self.enabled:
                     continue
                 if self._interlocked():
-                    # Drop buffered frames while held so stale data never
-                    # feeds a decision, and restart confirmation.
-                    self.drain()
-                    self._carry = None
+                    # Drop the part-built average while held so stale data
+                    # never feeds a decision, and restart confirmation.
+                    self.reset_accumulator()
                     self.controller.reset_confirmation()
                 else:
-                    payloads = self.drain()
-                    if payloads:
+                    window = await self.acc.next_window()
+                    if window is not None:
                         centers = np.asarray(self._mod_cfg()['center'],
                                              dtype=float)
+                        t0 = time.perf_counter()
                         decided = await server.to_thread(
-                            self._consume_batch, payloads, centers)
+                            self._consume_window, window, centers)
+                        self.consume_ms = 1e3 * (time.perf_counter() - t0)
+                        self.consume_ms_max = max(self.consume_ms_max,
+                                                  self.consume_ms)
                         if decided:
+                            t0 = time.perf_counter()
                             await self._auto_commit()
+                            self.commit_ms = 1e3 * (time.perf_counter() - t0)
                 # Refresh the cached health snapshot off-loop (after any
-                # commit, so its staged counts are current). Keeps held /
-                # liveness fields fresh even on idle/held polls.
-                self._snapshot = await server.to_thread(self._build_snapshot)
+                # commit, so its staged counts are current), but only when
+                # someone is actually reading it. It builds a dict per tone --
+                # 75 ms at 1000 tones on the ARM -- and that is Python holding
+                # the GIL, which costs the stream loop ~190 accumulations at
+                # 2500 Hz. Rebuilding it every poll for nobody was the largest
+                # remaining source of tracking loss.
+                if (self._snapshot_wanted or
+                        time.time() - self._snapshot_ts >= self.snapshot_max_age_s):
+                    t0 = time.perf_counter()
+                    self._snapshot = await server.to_thread(self._build_snapshot)
+                    self.snapshot_ms = 1e3 * (time.perf_counter() - t0)
+                    self._snapshot_ts = time.time()
+                    self._snapshot_wanted = False
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -973,9 +1473,37 @@ class TrackingRuntime:
         self.enabled = False
         if self._task is not None:
             self._task.cancel()
-        self.ring.clear()
+        self.reset_accumulator()
+        self.acc.stop()
 
     # -- health ---------------------------------------------------------------
+
+    def unlocked_mask(self, filtered=None):
+        """``(n_tones,)`` bool: tones whose reading cannot be trusted.
+
+        One definition, used both by :meth:`tone_health` for reporting and by
+        the consumer to gate corrections. A tone reading noise -- a lost
+        resonator, or a whole pipeline with none -- must neither be corrected
+        (the model-free estimate is meaningless there) nor cost the system
+        anything, so these tones are excluded before the controller's
+        deadband and confirmation ever see them.
+        """
+        p = self.params
+        if filtered is None:
+            filtered = self.last_filtered_lw
+        filtered = np.asarray(filtered, dtype=float)
+        if self.slope_baseline is not None:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ratio = self.stat_abs_slope / self.slope_baseline
+        else:
+            ratio = np.full(self.n_tones, np.nan)
+        bad = np.isfinite(ratio) & (ratio < p['unlock_slope_ratio'])
+        bad |= (np.isfinite(self.stat_invalid_frac)
+                & (self.stat_invalid_frac > p['unlock_invalid_fraction']))
+        unlock_lw = p.get('unlock_detuning_linewidths')
+        if unlock_lw is not None:
+            bad |= np.isfinite(filtered) & (np.abs(filtered) > float(unlock_lw))
+        return bad
 
     def tone_health(self):
         """Per-tone tracking health and a lock state for each tracked tone.
@@ -1006,53 +1534,49 @@ class TrackingRuntime:
             staged_center_hz}}`` for every tracked tone. ``counts``: number
             of tones in each state.
         """
-        p = self.params
-        filtered = self.last_filtered_lw
+        filtered = np.asarray(self.last_filtered_lw, dtype=float)
         with np.errstate(invalid='ignore', divide='ignore'):
             std = np.sqrt(self.stat_detuning_var)
             slope_ratio = (self.stat_abs_slope / self.slope_baseline
                            if self.slope_baseline is not None
                            else np.full(self.n_tones, np.nan))
-        unlock_lw = p.get('unlock_detuning_linewidths')
+        staged_lo = self.controller.staged['lo']
+        staged_bin = self.controller.staged['bin']
+
+        # The states for all tones at once, first match wins; only building
+        # the per-tone dicts below is Python-per-tone (75 ms at 1000 tones on
+        # the ARM when the states were worked out tone by tone too).
+        finite = np.isfinite(filtered)
+        pending = np.zeros(self.n_tones, dtype=bool)
+        pending[list(staged_bin)] = True
+        over = finite & (np.abs(filtered) > self.controller.threshold_linewidths)
+        names = ('unlocked', 'recenter_pending', 'drifting', 'locked')
+        state = np.select([self.unlocked_mask(filtered), pending, over, finite],
+                          names, 'no_data')
+        idx = np.flatnonzero(self.controller.enable_mask)
+        state = state[idx]
+        counts = {k: int(np.count_nonzero(state == k))
+                  for k in names + ('no_data',)}
+
+        def column(values):
+            """Tracked tones' values as floats, None where not finite."""
+            v = values[idx]
+            return [x if ok else None
+                    for x, ok in zip(v.tolist(), np.isfinite(v).tolist())]
+
         tones = {}
-        counts = {'locked': 0, 'drifting': 0, 'recenter_pending': 0,
-                  'unlocked': 0, 'no_data': 0}
-
-        def _value(x):
-            return float(x) if np.isfinite(x) else None
-
-        for i in np.flatnonzero(self.controller.enable_mask):
-            i = int(i)
-            f = filtered[i]
-            bad_slope = (np.isfinite(slope_ratio[i])
-                         and slope_ratio[i] < p['unlock_slope_ratio'])
-            bad_invalid = (np.isfinite(self.stat_invalid_frac[i])
-                           and self.stat_invalid_frac[i]
-                           > p['unlock_invalid_fraction'])
-            bad_reading = (unlock_lw is not None and np.isfinite(f)
-                           and abs(f) > float(unlock_lw))
-            if bad_slope or bad_invalid or bad_reading:
-                state = 'unlocked'
-            elif i in self.controller.staged['bin']:
-                state = 'recenter_pending'
-            elif np.isfinite(f) and \
-                    abs(f) > self.controller.threshold_linewidths:
-                state = 'drifting'
-            elif np.isfinite(f):
-                state = 'locked'
-            else:
-                state = 'no_data'
-            counts[state] += 1
-            staged = self.controller.staged['lo'].get(
-                i, self.controller.staged['bin'].get(i))
+        for i, s, f, sd, sr, inv in zip(idx.tolist(), state.tolist(),
+                                        column(filtered), column(std),
+                                        column(slope_ratio),
+                                        column(self.stat_invalid_frac)):
+            staged = staged_lo.get(i, staged_bin.get(i))
             tones[i] = {
-                'state': state,
-                'detuning_linewidths': _value(f),
-                'detuning_std_linewidths': _value(std[i]),
-                'slope_ratio': _value(slope_ratio[i]),
-                'invalid_fraction': _value(self.stat_invalid_frac[i]),
-                'staged_center_hz': (None if staged is None
-                                     else float(staged)),
+                'state': s,
+                'detuning_linewidths': f,
+                'detuning_std_linewidths': sd,
+                'slope_ratio': sr,
+                'invalid_fraction': inv,
+                'staged_center_hz': None if staged is None else float(staged),
             }
         return tones, counts
 
@@ -1145,8 +1669,19 @@ class TrackingRuntime:
             'last_estimate_ts': self.last_estimate_ts,
             'decision_revision': self.decision_revision,
             'applied_revision': self._applied_revision(),
-            'ring_depth': self.ring.maxlen,
-            'ring_fill': len(self.ring),
+            'iq_filter': self.iq_filter,
+            'iq_average_s': self.iq_average_s,
+            'frame_stride': self.frame_stride,
+            'frames_tapped': self.frames_tapped,
+            'frames_skipped': self.frames_skipped,   # dropped by frame_stride
+            'stage_ms': {k: round(v, 2) for k, v in self.stage_ms.items()},
+            'consume_ms': round(self.consume_ms, 2),
+            'consume_ms_max': round(self.consume_ms_max, 2),
+            'snapshot_ms': round(self.snapshot_ms, 2),
+            'commit_ms': round(self.commit_ms, 2),
+            'acc_peak': self.acc_peak,               # largest |accumulated sum|
+            'acc_headroom': (2**63 / self.acc_peak) if self.acc_peak else None,
+            'estimator_diff': self.estimator_diff,
         }
 
     def status(self):
@@ -1159,4 +1694,6 @@ class TrackingRuntime:
         poll (``poll_interval_s``) stale, which is far finer than any health
         cadence. Call :meth:`_build_snapshot` directly for a synchronous
         fresh build (tests)."""
+        # Asking for it marks it stale, so the next poll rebuilds it off-loop.
+        self._snapshot_wanted = True
         return self._snapshot

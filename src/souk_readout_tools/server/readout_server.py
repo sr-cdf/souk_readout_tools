@@ -5412,6 +5412,14 @@ class ReadoutServer:
         # copying, so a shared output buffer would alias frames already queued.
         payload = b''.join((data_len, data, header))
 
+        # Tone tracking averages each accumulation here, where `data` is still
+        # hot from the read. Handing raw frames to a consumer on another core
+        # instead costs BOTH pipelines dearly: the four A53s share a 1 MB L2,
+        # and streaming the frames through it evicts what the stream loops
+        # need (doc/v712-notes.md, "What tracking actually costs").
+        if self.tracking is not None and self.tracking.enabled:
+            self.tracking.tap(data, mod_point, settling, revision)
+
         # Loop timing: where this frame's time went, and whether accumulations
         # were missed since the last one. 'outside' is everything between the
         # previous frame and this call -- sending, yielding, other event-loop work.
@@ -6026,12 +6034,32 @@ class ReadoutServer:
         'confirm_windows': 3,             # consecutive windows over threshold
         'gain': 1.0,                      # new_center = center - gain*detuning
         'max_step_linewidths': 0.5,       # per-decision step clamp
+        # An over-threshold reading must also beat this many times its own
+        # scatter before anything is staged. Catches a tone -- or a whole
+        # pipeline -- reading noise, which the slope-baseline unlock test
+        # cannot (that baseline is captured from noise too).
+        'min_detuning_snr': 1.0,
         'enable_mask': None,              # tones allowed corrections (None=all)
         'filter': 'boxcar',               # 'boxcar' | 'ewma'
         'filter_window': 10,              # boxcar length (cycles)
         'filter_tau_s': 1.0,              # EWMA time constant (s)
-        'poll_interval_s': 0.2,           # consumer-task poll period
-        'ring_depth': None,               # tap ring frames (None ~ 2 s)
+        'poll_interval_s': 5.0,           # how often the estimator runs
+        # Coherent I/Q averaging, done in the stream task as each accumulation
+        # is read (see tracking.TrackingRuntime.tap). 'boxcar' sums over
+        # iq_average_s then resets (33.1 us/frame at 1000 tones); 'ewma' keeps
+        # a running average of that memory, readable any time (51.9 us/frame).
+        # frame_stride=2 halves either, for a sqrt(2) noise penalty.
+        'iq_filter': 'boxcar',            # 'boxcar' | 'ewma'
+        'iq_average_s': None,             # averaging length (None = poll_interval_s)
+        'frame_stride': 1,                # average one accumulation in N
+        'filter_blocks_per_batch': 4,     # interleaved averages, for the scatter
+        # Diagnostic: compare this many tones against demodulate('accurate')
+        # each window. 0 = off. It loops over tones in Python (1064 ms for
+        # 1000 tones, 34 ms for 32), and that GIL hold costs accumulations.
+        'estimator_compare_tones': 0,
+        # Health snapshot is O(n_tones) Python (75 ms at 1000 tones), so it is
+        # rebuilt only when read, or this often at most.
+        'snapshot_max_age_s': 60.0,
         'dry_run': True,                  # estimate/decide/announce, no apply
         'lo_auto_commit': True,           # seamless LO-word updates
         'lo_min_commit_interval_s': 5.0,
@@ -6826,11 +6854,6 @@ class ReadoutServer:
                                 fast_read_params, sw_buf_point_map=sched._buf_holds,
                                 sw_n_settle=sched.n_settle, revision=sched.revision)
                             self._write_to_stream_clients(payload)
-                            if self.tracking is not None and self.tracking.enabled:
-                                # Tone-tracking tap: O(1) append of the
-                                # already-built payload; all estimation runs
-                                # in the tracking consumer task.
-                                self.tracking.tap(payload)
                             sched.after_sample()
                         sched.advance()
                         await asyncio.sleep(0)  # stay responsive to new commands
@@ -6852,10 +6875,6 @@ class ReadoutServer:
                     payload, cnt, err = self.prepare_frame(
                         fast_read_params, fw_modulation=True, revision=rev, fw_n_settle=n_settle)
                     self._write_to_stream_clients(payload)
-                    if self.tracking is not None and self.tracking.enabled:
-                        # Tone-tracking tap (fw engine): O(1) append of the
-                        # already-built payload, same as the sw branch.
-                        self.tracking.tap(payload)
                     if self._yield_due(len(payload)):
                         await self._drain_stream_clients()
                 else:
