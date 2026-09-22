@@ -230,6 +230,30 @@ FLAG_5 = 5
 FLAG_6 = 6
 FLAG_7 = 7
 
+# The ten unsigned header words that end every data frame (see prepare_frame).
+_FRAME_HEADER = struct.Struct('<10I')
+
+
+class _PublishedEvent(asyncio.Event):
+    """An asyncio.Event that tells the server when it changes.
+
+    Used for the stream flags and the stream / fw-modulation events, so that a
+    stream loop running in its own process (stream_process.py) sees the change
+    in its next frame. Does nothing more than a plain Event otherwise.
+    """
+
+    def __init__(self, server):
+        super().__init__()
+        self._server = server
+
+    def set(self):
+        super().set()
+        self._server._publish_stream_state()
+
+    def clear(self):
+        super().clear()
+        self._server._publish_stream_state()
+
 # Frame producers drain their clients and hand control back to the event loop
 # every few frames rather than every frame. Measured on the ARM at 1000 tones:
 # drain + sleep(0) per frame costs ~83 us against a ~78 us frame, and that --
@@ -1022,7 +1046,7 @@ class ReadoutServer:
         self._fw_modulation_revision_history = {}       # revision -> {center, slot_offsets, mod_indices, n_dwell, n_settle, mode, ts}
         self._mod_dwell_tag = -1                        # last slot seen by prepare_frame
         self._mod_dwell_pos = 0                          # accumulations into the current dwell
-        self._frame_cache = None                        # (n_data, frame, hdr view, length prefix)
+        self._frame_cache = None                        # (n_data, length prefix)
         self._frames_since_yield = 0                    # frames written since the last drain/yield
         self._last_yield = 0.0                          # time.monotonic() of the last drain/yield
         self.loop_timing = np.zeros((LOOP_TIMING_FRAMES, 6))   # ring buffer, see _info_loop_timing
@@ -1390,7 +1414,7 @@ class ReadoutServer:
         self._fw_modulation_revision_history = {}       # revision -> {center, slot_offsets, mod_indices, n_dwell, n_settle, mode, ts}
         self._mod_dwell_tag = -1                        # last slot seen by prepare_frame
         self._mod_dwell_pos = 0                          # accumulations into the current dwell
-        self._frame_cache = None                        # (n_data, frame, hdr view, length prefix)
+        self._frame_cache = None                        # (n_data, length prefix)
         self._frames_since_yield = 0                    # frames written since the last drain/yield
         self._last_yield = 0.0                          # time.monotonic() of the last drain/yield
         self.loop_timing = np.zeros((LOOP_TIMING_FRAMES, 6))   # ring buffer, see _info_loop_timing
@@ -5353,46 +5377,40 @@ class ReadoutServer:
         t_read = time.perf_counter()
 
         n_data = len(data)
-        # Only the I/Q payload is signed. Every header word is a counter, a
-        # half of the 64-bit telescope time, the packed modulation tag or a
-        # flag -- all unsigned 32-bit -- so write them through an unsigned view
-        # of the header block instead of casting each one into int32 (which
-        # NumPy 2 refuses once acc_cnt passes 2**31). Same negative indices,
-        # same wire bytes; hdr[-k] is frame[-k].
-        #
-        # The array, that view and the length prefix are reused across calls --
-        # allocating and re-viewing them per frame costs ~15 us of a ~40 us
-        # frame build on the ARM. Every element is rewritten below (payload plus
-        # all ten header words), so nothing stale survives. Rebuilt whenever the
-        # active tone count changes.
+        # The frame is the '<i4' I/Q words followed by ten header words, which
+        # are all unsigned 32-bit (counters, halves of the 64-bit telescope
+        # time, the packed modulation tag, flags) and are packed as such --
+        # casting them into int32 is refused by NumPy 2 once acc_cnt passes
+        # 2**31. Header word k from the end is frame[-k]:
+        #   -10 server request, -9 set freqs, -8 set amps, -7 set phases,
+        #   -6 cal freeze, -5 flag5 / modulation tag, -4 tt msb, -3 tt lsb,
+        #   -2 acc_cnt, -1 packet error.
+        # One join copies the words straight out of the read buffer (``data``
+        # is a view of it on the usual contiguous comb). Filling a cached numpy
+        # frame instead -- copy in, ten scalar stores, tobytes, prepend the
+        # prefix -- cost ~4x as much. The length prefix is cached per tone count.
         if self._frame_cache is None or self._frame_cache[0] != n_data:
-            buf = np.zeros(n_data + num_headers, dtype='<i4')
-            self._frame_cache = (n_data, buf, buf[-num_headers:].view('<u4'),
-                                 struct.pack('>I', (n_data + num_headers) * 4))
-        _, frame, hdr, data_len = self._frame_cache
-        frame[:n_data] = data
-        hdr[-1] = err
-        hdr[-2] = cnt & 0xFFFFFFFF          # free-running, wraps at 2**32
-        hdr[-3] = tt & 0xFFFFFFFF
-        hdr[-4] = (tt >> 32) & 0xFFFFFFFF
+            self._frame_cache = (n_data, struct.pack('>I', (n_data + num_headers) * 4))
+        data_len = self._frame_cache[1]
+        flags = self.stream_flags
         if mod_point > 0:
-            tag = (int(mod_point) & 0xFFFF) | (int(bool(settling)) << 16) | ((int(revision) & 0x7FFF) << 17)
-            hdr[-5] = tag
+            flag5 = (int(mod_point) & 0xFFFF) | (int(bool(settling)) << 16) | ((int(revision) & 0x7FFF) << 17)
             # keep FLAG_SET_FREQS high during the transient window for older consumers
-            set_freqs = int(self.stream_flags[FLAG_SET_FREQS].is_set() or settling)
+            set_freqs = flags[FLAG_SET_FREQS].is_set() or bool(settling)
         else:
-            hdr[-5] = int(self.stream_flags[5].is_set())
-            set_freqs = int(self.stream_flags[FLAG_SET_FREQS].is_set())
-        hdr[-6] = int(self.stream_flags[FLAG_CAL_FREEZE].is_set())
-        hdr[-7] = int(self.stream_flags[FLAG_SET_PHASES].is_set())
-        hdr[-8] = int(self.stream_flags[FLAG_SET_AMPS].is_set())
-        hdr[-9] = set_freqs
-        hdr[-10] = int(self.stream_flags[FLAG_SERVER_REQUEST].is_set())
+            flag5 = flags[5].is_set()
+            set_freqs = flags[FLAG_SET_FREQS].is_set()
+        header = _FRAME_HEADER.pack(
+            flags[FLAG_SERVER_REQUEST].is_set(), set_freqs,
+            flags[FLAG_SET_AMPS].is_set(), flags[FLAG_SET_PHASES].is_set(),
+            flags[FLAG_CAL_FREEZE].is_set(), flag5,
+            (tt >> 32) & 0xFFFFFFFF, tt & 0xFFFFFFFF,
+            cnt & 0xFFFFFFFF,                   # free-running, wraps at 2**32
+            bool(err))
 
-        # A fresh bytes per frame: tracking.tap() and burst mode retain the
-        # payload without copying, so a shared output buffer would alias frames
-        # already queued.
-        payload = data_len + frame.tobytes()
+        # A fresh bytes per frame: burst mode retains the payload without
+        # copying, so a shared output buffer would alias frames already queued.
+        payload = b''.join((data_len, data, header))
 
         # Loop timing: where this frame's time went, and whether accumulations
         # were missed since the last one. 'outside' is everything between the

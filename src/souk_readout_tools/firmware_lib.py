@@ -10824,7 +10824,14 @@ def plan_accumulator_reads(tone_indices, n_chans, fixed_us=_DEVMEM_FIXED_US,
     take = np.empty(2 * ti.size, dtype=int)
     take[0::2] = base
     take[1::2] = base + 1
-    return {'ranges': ranges, 'take': take, 'plan_us': plan_us, 'full_us': full_us}
+    # The normal comb is contiguous and in order, and then 'take' is just a
+    # range: slicing gives a view where the fancy index copies every word
+    # (~27 us on the ARM at 1000 tones).
+    take_slice = None
+    if np.array_equal(take, np.arange(take[0], take[0] + take.size)):
+        take_slice = slice(int(take[0]), int(take[0]) + take.size)
+    return {'ranges': ranges, 'take': take, 'take_slice': take_slice,
+            'plan_us': plan_us, 'full_us': full_us}
 
 
 def _cached_read_plan(fast_read_params, tone_indices, sparse_read):
@@ -10894,8 +10901,11 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
         legacy 4-tuple.
     :return: ``(acc_cnt, data, error_flag, telescope_time)``, or
         ``(acc_cnt, data, error_flag, telescope_time, buf_id, slot_id)`` when
-        ``get_buf_id=True``. ``data`` is complex values at the specified tone
-        indices and ``telescope_time`` is the 64-bit PTP timestamp.
+        ``get_buf_id=True``. ``data`` is the interleaved re/im int32 words at
+        the specified tone indices and ``telescope_time`` is the 64-bit PTP
+        timestamp. ``data`` may be a view of the read buffer (the ZDMA landing
+        buffer, for one) and is only valid until the next read: copy it to
+        keep it.
     """
     acc=fast_read_params['acc']
     addrs=fast_read_params['addrs']
@@ -10958,7 +10968,8 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
     if tone_indices is not None and plan is not None:
         # dout holds only the planned ranges; 'take' maps tones into it, already
         # interleaved [real0, imag0, ...] in the caller's tone order.
-        out = (start_acc_cnt, dout[plan['take']], err, tt)
+        take = plan['take_slice'] if plan.get('take_slice') is not None else plan['take']
+        out = (start_acc_cnt, dout[take], err, tt)
     elif tone_indices is not None:
         # Extract real and imaginary parts at specific output channel indices
         # Data is interleaved as [real0, imag0, real1, imag1, ...]
