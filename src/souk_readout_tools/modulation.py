@@ -1741,8 +1741,10 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
         ``(N, n_tones)`` per-point probe offsets (Hz). ``None`` uses
         ``grouped['offsets_hz']``.
     method : {'fast', 'accurate', 'model'}, optional
-        Slope/curvature estimator. ``'fast'`` = finite differences;
-        ``'accurate'`` = (weighted) polynomial fit of phase vs offset (handles
+        Slope/curvature estimator. ``'fast'`` = finite differences between the
+        lowest, most central and highest offsets (points sharing an offset are
+        averaged; any slot order); ``'accurate'`` = (weighted) polynomial fit
+        of phase vs offset (handles
         asymmetric offsets); ``'model'`` shares the ``'accurate'`` path here.
     linewidth_hz : float or array-like or None, optional
         Per-tone resonator linewidth (Hz) for the *model-free* detuning. Ignored
@@ -1871,14 +1873,25 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
 
         # Local slope / curvature from the chosen phase basis.
         if method == 'fast':
-            df = f[-1] - f[0]
-            slope = (phi[:, -1] - phi[:, 0]) / df if df != 0 else np.full(n_cycles, np.nan)
-            if N >= 3:
-                mid = N // 2
-                half = (f[-1] - f[0]) / 2.0
-                d2 = (phi[:, -1] - 2 * phi[:, mid] + phi[:, 0]) / (half ** 2) if half != 0 else np.full(n_cycles, np.nan)
+            # Finite differences between the lowest, most central and highest
+            # OFFSETS (averaging points that share one), not the first, middle
+            # and last slots: the fw default [-d, 0, +d, 0] is neither sorted
+            # nor unrepeated, and the slot version read it as ~+37 linewidths
+            # at any detuning.
+            f_lo, f_hi = f.min(), f.max()
+            f_mid = f[int(np.argmin(np.abs(f - 0.5 * (f_lo + f_hi))))]
+            phi_lo = phi[:, f == f_lo].mean(axis=1)
+            phi_mid = phi[:, f == f_mid].mean(axis=1)
+            phi_hi = phi[:, f == f_hi].mean(axis=1)
+            nan = np.full(n_cycles, np.nan)
+            slope = (phi_hi - phi_lo) / (f_hi - f_lo) if f_hi > f_lo else nan
+            if f_lo < f_mid < f_hi:
+                # Three-point second difference; for a symmetric pattern it is
+                # (phi_hi - 2 phi_mid + phi_lo) / half**2.
+                d2 = 2.0 * ((phi_hi - phi_mid) / (f_hi - f_mid)
+                            - (phi_mid - phi_lo) / (f_mid - f_lo)) / (f_hi - f_lo)
             else:
-                d2 = np.full(n_cycles, np.nan)
+                d2 = nan
         else:   # 'accurate' / 'model' -> polynomial fits of phi vs f
             slope = np.full(n_cycles, np.nan)
             d2 = np.full(n_cycles, np.nan)
