@@ -122,7 +122,11 @@ here.
 | `first_retune_profile.py` | board | no (UIO); servers stopped | test 4 | cProfile of a first and a second `set_tone_frequencies_fast` in a fresh process, tones re-sent unchanged |
 | `sweep_step_timing.py` | host | no | test 3 | sweep time per point and fixed cost (11/101/401 points); `set_tone_powers` with and without optimisers; state restored |
 | `shadow_outside_writer_check.py` | board | no; servers up | test 7 | a katcp write to one LO word: does the server's copy report it, does the next request undo it; restored |
-| `dual_soak.py` | host | no | test 10 | both pipelines streaming for a long time with no requests during the recording; every lost and torn accumulation, with times |
+| `dual_soak.py` | host | no | test 10 | both pipelines streaming for a long time with no requests during the recording; every lost and torn accumulation, with times. `--modulate HZ [--track]` adds fw modulation and dry-run tracking; records whether each server runs a stream process |
+| `acc_hold_check.py` | board | no with `--uio`; servers must be UP (clocks) | — | whether an accumulation stays unchanged in the accumulator until `acc_cnt` moves, read at fractions of the period -- the premise of the stream loop's late read (`catch_up`); needs a live signal |
+| `clock_rate_check.py` | board | no with `--uio`; servers must be UP | — | accumulation rate and ADC clock (from the TT tick rate) against what the software assumes; run after a reboot -- on 2026-09-22 both were 13/12 slow with every PLL "locked" |
+| `frame_path_bench.py` | board or PC | no | — | RAM only: per-frame pieces of `prepare_frame` and `tracking.tap` against their alternatives (fancy-index vs slice gather, numpy frame vs one join, int64 tap variants) |
+| `gil_yield_check.py` | board | no; servers may stay up | — | whether a second thread (the tracking consumer) can share the stream loop's process: spin vs yielding accumulation wait, consumer batch time and accumulations lost per second |
 | `dump_addrs.py` | board | — | — | offsets from a live readout object (fallback to `fpg_addrs.py`) |
 | `tracking_benchmark.py`, `tracking_health_benchmark.py` | host | no | — | tone tracking; unrelated to this document |
 

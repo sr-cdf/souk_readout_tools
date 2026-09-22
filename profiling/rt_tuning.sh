@@ -4,6 +4,7 @@
 #
 #     sudo ./rt_tuning.sh status
 #     sudo ./rt_tuning.sh apply [--journald-volatile] [--split-threads]
+#     sudo ./rt_tuning.sh kernel      # just the part a reboot undoes (see below)
 #     sudo ./rt_tuning.sh revert
 #
 # Layout applied:
@@ -19,12 +20,28 @@
 #           Measured worse on 2026-09-17 (GIL contention), so off by default.
 #   net.core.wmem_max / rmem_max 32 MiB, so the servers' 1 MiB SO_SNDBUF request
 #           is honoured instead of being capped at 212 992 B (~13 ms at 2 kHz).
+#   end0 transmit queues: tx-0 for CPU2, tx-1 for CPU3 (XPS). Left to the flow
+#           hash, both streams often share a queue, and then one stream core can
+#           end up sending the other's packets as well: +30 us a frame on one
+#           pipeline, -30 us on the other, fixed for the whole connection
+#           (2026-09-22).
 #
-# Deliberately NOT applied: SCHED_FIFO. The frame producers busy-wait for each
-# accumulation; a spinning real-time task is either throttled by
-# kernel.sched_rt_runtime_us (a 50 ms stall every second) or, with throttling
-# off, starves the per-CPU kernel threads on its core (RCU stalls). Revisit
-# only once the wait sleeps between accumulations.
+# Not applied here: SCHED_FIFO. A spinning real-time task is either throttled
+# by kernel.sched_rt_runtime_us (a 50 ms stall every second) or, with
+# throttling off, starves the per-CPU kernel threads on its core. The stream
+# process (firmware.stream_process) no longer spins -- with late reads its wait
+# sleeps between accumulations -- so it can run SCHED_FIFO: set
+# SOUK_STREAM_RT_PRIO=50 in its unit's environment. That is what gets it past
+# SLAB's cache_reap, which runs on every CPU every 2 s (~100-300 us) and, on
+# this PREEMPT_NONE kernel, otherwise holds a waking SCHED_OTHER frame loop off
+# its own core (2026-09-22).
+#
+# The systemd and sysctl files persist; moving the kernel threads, the unbound
+# workqueue mask and the default IRQ mask do not -- a reboot puts them back on
+# all four CPUs, and kernel work then lands on the stream cores whenever the
+# frame loop sleeps (2026-09-22: a 2 s event woke the frame loop ~300 us late
+# after two reboots). 'apply' therefore also installs souk-rt-kernel.service,
+# which runs 'kernel' at every boot, from a copy of this script in /usr/local/sbin.
 #
 # --journald-volatile keeps the journal in RAM (removed large stalls at
 # 3.5-4 kHz before); the journal is then lost on reboot. Flags in any order.
@@ -36,6 +53,26 @@ SYSCTL_CONF=/etc/sysctl.d/60-souk-net.conf
 JOURNALD_CONF=/etc/systemd/journald.conf.d/60-souk-volatile.conf
 SERVERS="readout_server_0:2 readout_server_1:3"
 HOUSEKEEPING=0,1
+BOOT_UNIT=/etc/systemd/system/souk-rt-kernel.service
+BOOT_SCRIPT=/usr/local/sbin/souk-rt-tuning
+
+kernel_affinity() {
+    # kernel threads that allow it (per-CPU ones refuse, which is fine), unbound
+    # workqueues, new IRQs: all to the housekeeping CPUs
+    for p in $(ps -eo pid=,args= | awk '$2 ~ /^\[/ {print $1}'); do
+        case "$(taskset -pc "$p" 2>/dev/null | awk '{print $NF}')" in
+            0-3) taskset -pc $HOUSEKEEPING "$p" > /dev/null 2>&1 ;;
+        esac
+    done
+    echo 3 > /sys/devices/virtual/workqueue/cpumask 2>/dev/null
+    echo 3 > /proc/irq/default_smp_affinity
+    # one transmit queue per stream core
+    q=0
+    for s in $SERVERS; do
+        printf '%x' $((1 << ${s##*:})) > /sys/class/net/end0/queues/tx-$q/xps_cpus 2>/dev/null
+        q=$((q + 1))
+    done
+}
 
 status() {
     echo "== processes (PSR = CPU last run on, allowed CPUs, policy)"
@@ -57,12 +94,14 @@ status() {
     done
     echo "== workqueue / default IRQ affinity"
     echo "  $(cat /sys/devices/virtual/workqueue/cpumask 2>/dev/null) / $(cat /proc/irq/default_smp_affinity)"
+    echo "== end0 transmit queue CPUs (XPS)"
+    for f in /sys/class/net/end0/queues/tx-*/xps_cpus; do echo "  $(basename $(dirname $f)): $(cat $f)"; done
     echo "== interrupts per CPU (end0 = Ethernet, mmc1 = SD card)"
     grep -E "CPU0|end0|mmc1" /proc/interrupts
     echo "== sysctl"
     sysctl net.core.wmem_max net.core.rmem_max kernel.sched_rt_runtime_us
     echo "== files"
-    for f in $SYSTEMD_CONF $SYSCTL_CONF $JOURNALD_CONF /etc/systemd/system/readout_server_{0,1}.service.d/50-cpu.conf; do
+    for f in $SYSTEMD_CONF $SYSCTL_CONF $JOURNALD_CONF $BOOT_UNIT $BOOT_SCRIPT /etc/systemd/system/readout_server_{0,1}.service.d/50-cpu.conf; do
         [ -e "$f" ] && echo "  present: $f" || echo "  absent:  $f"
     done
 }
@@ -97,18 +136,17 @@ apply() {
     sysctl --system > /dev/null
     systemctl daemon-reexec          # new default CPUAffinity for units started from now on
     systemctl daemon-reload
-    # move what is already running: userspace, then the kernel threads that
-    # allow it (per-CPU ones refuse, which is fine), unbound workqueues, new IRQs
+    # move what is already running: userspace, then the kernel side
     for p in $(ps -eo pid=,args= | awk '$2 !~ /^\[/ {print $1}'); do
         taskset -a -pc $HOUSEKEEPING "$p" > /dev/null 2>&1
     done
-    for p in $(ps -eo pid=,args= | awk '$2 ~ /^\[/ {print $1}'); do
-        case "$(taskset -pc "$p" 2>/dev/null | awk '{print $NF}')" in
-            0-3) taskset -pc $HOUSEKEEPING "$p" > /dev/null 2>&1 ;;
-        esac
-    done
-    echo 3 > /sys/devices/virtual/workqueue/cpumask 2>/dev/null
-    echo 3 > /proc/irq/default_smp_affinity
+    kernel_affinity
+    # ... and the kernel side again at every boot, before the servers start
+    install -m 755 "$0" $BOOT_SCRIPT
+    printf '[Unit]\nDescription=SOUK: kernel threads, workqueues and IRQs to CPU0-1, XPS (rt_tuning.sh)\nAfter=sysinit.target\nBefore=readout_server_0.service readout_server_1.service\n\n[Service]\nType=oneshot\nExecStart=%s kernel\n\n[Install]\nWantedBy=multi-user.target\n' \
+        $BOOT_SCRIPT > $BOOT_UNIT
+    systemctl daemon-reload
+    systemctl enable souk-rt-kernel.service
     systemctl restart readout_server_0 readout_server_1
     sleep 3
     status
@@ -116,6 +154,8 @@ apply() {
 
 revert() {
     had_journald=$([ -e $JOURNALD_CONF ] && echo yes)
+    systemctl disable souk-rt-kernel.service 2>/dev/null
+    rm -f $BOOT_UNIT $BOOT_SCRIPT
     rm -f $SYSTEMD_CONF $SYSCTL_CONF $JOURNALD_CONF \
           /etc/systemd/system/readout_server_{0,1}.service.d/50-cpu.conf
     sysctl -w net.core.wmem_max=212992 net.core.rmem_max=212992 > /dev/null
@@ -130,6 +170,7 @@ revert() {
     done
     echo f > /sys/devices/virtual/workqueue/cpumask 2>/dev/null
     echo f > /proc/irq/default_smp_affinity
+    for f in /sys/class/net/end0/queues/tx-*/xps_cpus; do echo 0 > $f; done
     systemctl restart readout_server_0 readout_server_1
     sleep 3
     status
@@ -138,6 +179,7 @@ revert() {
 case "$CMD" in
     status) status ;;
     apply)  shift; apply "$@" ;;
+    kernel) kernel_affinity ;;
     revert) revert ;;
-    *) echo "usage: sudo $0 status | apply [--journald-volatile] [--split-threads] | revert"; exit 1 ;;
+    *) echo "usage: sudo $0 status | apply [--journald-volatile] [--split-threads] | kernel | revert"; exit 1 ;;
 esac
