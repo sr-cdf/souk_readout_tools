@@ -277,6 +277,10 @@ STREAM_YIELD_MAX_FRAMES = 8
 STREAM_YIELD_MAX_BYTES = 65536
 STREAM_YIELD_MAX_SECONDS = 0.002
 
+# A stream client that stays backed up this long is dropped rather than waited
+# for (see _drain_stream_clients): a vanished peer never drains.
+STREAM_DRAIN_TIMEOUT_S = 2.0
+
 # How often an *idle* stream client's handler wakes to send its zero-length
 # heartbeat and poll for a subscribe line. The client blocks in recv(4) with no
 # socket timeout and needs the heartbeat to get control back. While frames are
@@ -6700,14 +6704,25 @@ class ReadoutServer:
 
         This is the frame producer's only yield point, so it is also where new
         commands and connections get serviced.
+
+        A client whose socket is keeping up has nothing buffered here (the
+        kernel's 1 MiB send buffer takes the frames), so there is nothing to
+        wait for. One that is backed up is waited for, but only for
+        ``STREAM_DRAIN_TIMEOUT_S``, and then dropped: a peer that has vanished
+        without closing -- the board dropping its IP address, a host that died
+        -- never drains, and on 2026-09-22 two such connections froze the frame
+        loop, and every other client with it, until TCP gave up on them.
         """
         for client in list(self.stream_clients):
             try:
-                await client.drain()
-            except ConnectionResetError:
-                print(f"Stream client disconnected {getattr(client, 'addr', '?')} (ConnectionResetError)")
+                if client.transport.get_write_buffer_size():
+                    await asyncio.wait_for(client.drain(), STREAM_DRAIN_TIMEOUT_S)
+            except (ConnectionError, asyncio.TimeoutError) as e:
+                print(f"Stream client dropped {getattr(client, 'addr', '?')} "
+                      f"({type(e).__name__}: not reading)")
                 if client in self.stream_clients:
                     self.stream_clients.remove(client)
+                client.transport.abort()
         await asyncio.sleep(0)
 
     def _apply_pending_modulation_command(self):
