@@ -90,52 +90,98 @@ Client support:
 
 ## Data path and performance
 
-The stream rate is limited by the `stream_data` software loop (AXI
-accumulator reads dominate), so the hot path gets exactly one addition:
+The only work tracking adds to the per-accumulation path is one coherent add
+of the I/Q words into a running average, while the read buffer is still hot:
 
 ```
-stream_data (modulated branches, fw and sw, per sample):
-    payload = prepare_frame(...)          # unchanged
-    write to stream clients               # unchanged
-    if tracking enabled: tracking.tap(payload)   # ONE deque append, O(1)
+prepare_frame (per accumulation):
+    cnt, data, err, tt = read_accumulated_data_fast(...)   # unchanged
+    payload = length prefix + frame words                  # unchanged
+    if tracking enabled: tracking.tap(data, point, settling, revision)
 ```
 
-`tap` appends the already-built payload bytes to a bounded drop-oldest ring
-(no copy, no parsing, no per-tone work). A slow consumer can never stall
-the stream — the ring just drops oldest.
+`tap` adds the interleaved words into a per-(block, point) running average and
+does nothing else: no frames are retained, so there is no ring, no backlog and
+no drop policy.
 
-The consumer task polls the ring (`poll_interval_s`, default 0.2 s) and does
-**all** its per-tone work in the thread executor (`to_thread`; the heavy
-numpy ops release the GIL), **vectorised across all tones** — parse → cycle
-assembly → estimation → filtering → the controller's deadband/confirmation
-`decide` → the health-snapshot rebuild all run in one off-loop step per
-poll. Only the **commit** runs back on the event loop, because it owns the
-modulation hardware writes (it queues `_pending_modulation` / calls the fw
-apply path); it's O(number of corrected tones), not O(all tones). So
-nothing in tracking — estimation, decision, or health reporting — charges
-per-tone work to the stream loop.
+**That placement is the design.** Handing raw frames to a consumer on another
+core moves megabytes per second through the 1 MB L2 the four A53s share, which
+costs accumulations on *both* pipelines — including one that is not tracking,
+in a separate process. At equal duty cycle, a 16 MB working set on CPU0-1 took
+a pipeline from 0.114% to 22% loss; a 32 kB one cost nothing
+(`doc/v712-notes.md`).
+
+**Averaging length and shape are configurable, and single-stage.** An integer
+sum *is* a boxcar, so `iq_filter='boxcar'` accumulates for `iq_average_s` and
+resets. `iq_filter='ewma'` runs `S = (1-a)S + x` in the same place, with a
+per-point normaliser, so its average has memory `iq_average_s` and is readable
+at any time. A *sliding* boxcar is deliberately not offered: it needs every
+frame of the window kept, 100 MB at 5 s and 2500 Hz. `frame_stride` averages
+one accumulation in N, trading noise for stream-loop time.
+
+The consumer wakes every `poll_interval_s` (default 5 s) and takes the
+finished average — O(1), and lock-free because the stream task and the
+consumer coroutine share the event loop and never interleave. Estimation,
+filtering, the controller's deadband/confirmation `decide` and the health
+snapshot then run in a thread on `(blocks, points, tones)` arrays of a few tens
+of kB, whatever the sample rate. Only the commit returns to the event loop,
+which owns the modulation writes; it is O(corrected tones), not O(all tones).
+
+With the stream loop in its own process (`firmware.stream_process`) the tap
+runs there against a shared-memory accumulator and the finished window comes
+back through the same shared block; nothing else changes.
 
 **Estimator**: `estimate_detunings` is a lean whole-array implementation of
 `demodulate`'s model-free `method='fast'` maths (finite-difference phase
 slope + curvature; detuning from the curvature/slope ratio, which crosses
-zero at resonance independent of the unknown phase offset). A unit test
-asserts numerical agreement with `demodulate` to 1e-10. `modulation.py`'s
-analysis API is untouched. Settling-flagged samples are excluded; only
-complete cycles are used; partial cycles carry across batches.
+zero at resonance independent of the unknown phase offset). Unit tests
+assert numerical agreement with `demodulate` to 1e-10, on a sorted
+three-point pattern and on the fw default in several slot orders.
+Settling-flagged samples are excluded by the tap, so they never enter the
+average.
 
-**Benchmarks** (dev machine x86, `profiling/tracking_benchmark.py`, 2048
-tones, N=3 points, 2 samples/point, 500 Hz stream — re-run on the RFSoC ARM
-quad-A53 for production numbers):
+It works on the lowest, central and highest *offsets*, not the first, middle
+and last *slots*, averaging points that share an offset. The slot form — used
+by this and by `demodulate(method='fast')` until 2026-09-22 — reads the fw
+default `[-d, 0, +d, 0]` as ~+37 linewidths at any detuning, since its middle
+slot is `+d` rather than the centre; `'accurate'` was unaffected, as it fits
+phase against offset. Phase differences are angles of products of neighbouring
+points, so nothing is unwrapped: two `angle` calls on `(blocks, tones)`.
+
+Since this *is* `method='fast'`, the comparison worth running is against
+`method='accurate'`, which fits a quadratic to phase against offset rather
+than using the extreme points only — a real difference for a pattern like
+`[0, +d, 0, -d]`, whose repeated centre point 'fast' never uses.
+`estimator_compare_tones` runs both on that many tones per window and reports
+`estimator_diff` in `get_info('tracking')`. Off by default: it loops over
+tones in Python (1064 ms at 1000 tones, 34 ms at 32), and that GIL hold costs
+accumulations. The lean estimator drives every decision regardless.
+
+**Measured on the RFSoC ARM**, 1000 tones, 4 modulation points:
 
 | stage | where | cost |
 |---|---|---|
-| tap (per frame, the only hot-path work) | stream loop | 0.066 µs = 0.003 % of a 2 ms frame period |
-| consumer batch (parse+assemble+estimate+filter+decide) | to_thread (off-loop) | 107 ms per 1.2 s of stream ≈ 9 % of one core |
-| estimator alone | to_thread | 0.39 ms per cycle, all 2048 tones |
-| `demodulate` reference on same batch | — | 7× slower than the lean estimator |
-| health snapshot rebuild | to_thread | ~14 ms per poll (`profiling/tracking_health_benchmark.py`) |
+| `tap`, boxcar | stream task, per accumulation | **33.1 µs** (21 % of the 161 µs typical spare at 2500 Hz) |
+| `tap`, boxcar, `frame_stride=2` / `4` | stream task | 17.4 / 10.3 µs |
+| `tap`, ewma | stream task, per accumulation | 51.9 µs (26.8 / 14.8 strided) |
+| consumer, per window | thread (off the event loop) | a few ms on ~64 kB, whatever the sample rate |
+| health snapshot rebuild | thread | ~14 ms per poll (`profiling/tracking_health_benchmark.py`) |
 | `status()` / `health_check()` accessor | event loop | ~0.05 µs, flat in tone count (cache read) |
-| `commit` (staging + queue) | event loop | O(corrected tones), per correction only |
+| `commit` (staging + queue) | event loop | grows with corrected tones, per correction only |
+
+Two details worth knowing:
+
+- **The running sum is int64, not int32.** int32 would save 15.4 µs a frame,
+  and at the tone powers of 2026-09-20 (peak word 902) it would have had about
+  9000 times the headroom it needed. But the receive chain's filter-bank
+  shifts are set to maximise signal-to-noise, so accumulator words can reach
+  full int32 scale, and an int32 sum then wraps after two frames — silently,
+  into plausible detunings and therefore plausible but wrong corrections. Use
+  `frame_stride` to buy the time back instead. (`psb_scale` belongs to the
+  transmit side and has nothing to do with this.)
+- **Binding the row views once, and counting in Python integers, matters.**
+  Reading the count from a numpy array and re-indexing the accumulator on
+  every frame cost about 14 µs more per accumulation than the addition itself.
 
 The only tracking work on the stream loop is the per-frame tap (negligible)
 and the per-correction commit (rare, small). Everything O(all-tones) —
@@ -317,11 +363,17 @@ If a residual effect matters, compute it from the logged step times/sizes
 | `gain` | 1.0 | `new_center = center − gain · detuning_hz` |
 | `max_step_linewidths` | 0.5 | per-decision step clamp |
 | `enable_mask` | all modulated | tones allowed corrections |
-| `filter` | `'boxcar'` | `'boxcar'` or `'ewma'` |
-| `filter_window` | 10 | boxcar length (cycles) |
+| `iq_filter` | `'boxcar'` | coherent I/Q average in the stream task: `'boxcar'` (16.2 µs/frame) or `'ewma'` (49.1 µs/frame) |
+| `iq_average_s` | = `poll_interval_s` | averaging length: boxcar window, or EWMA time constant |
+| `frame_stride` | 1 | average one accumulation in N (trades noise for stream-loop time) |
+| `filter_blocks_per_batch` | 4 | interleaved averages per window; gives the scatter the health stats use |
+| `estimator_compare_tones` | 0 (off) | compare this many tones against `demodulate(method='accurate')` each window, reported as `estimator_diff`; Python-looped, so it costs accumulations |
+| `min_detuning_snr` | 1.0 | a reading must beat its own scatter between blocks by this factor before anything is staged |
+| `snapshot_max_age_s` | 60.0 | most often the health snapshot is rebuilt (it is O(tones) Python) |
+| `filter` | `'boxcar'` | post-estimator detuning filter: `'boxcar'` or `'ewma'` |
+| `filter_window` | 10 | boxcar length (windows) |
 | `filter_tau_s` | 1.0 | EWMA time constant |
-| `poll_interval_s` | 0.2 | consumer poll period |
-| `ring_depth` | ~2 s of frames | tap ring depth |
+| `poll_interval_s` | 5.0 | how often the estimator runs (and, for a boxcar, the averaging length) |
 | `lo_auto_commit` | `True` | auto-commit seamless updates |
 | `lo_min_commit_interval_s` | 5 | floor between lo commits |
 | `bin_auto_commit` | `False` | bin re-arms staged only, applied on demand |
@@ -529,3 +581,70 @@ absolute_response(t) = (center[rev(t)] − center[rev0]) + freq_shift_det(t)
 with the detector-side sign convention noted above. The result is
 identical to what an untracked (but never-drifting) tone would have
 measured.
+
+## What tracking costs on the ARM
+
+v7.12.1, both pipelines streaming 1000 tones each, GC frozen during captures,
+`timing-monitor` stopped.
+
+**Per accumulation**, in the stream loop: the tap, 33.1 µs for a boxcar
+(17.4 µs at `frame_stride=2`, 51.9 µs for an EWMA), against the loop's spare
+time:
+
+| rate | period | spare, median | spare, worst frame in a thousand |
+|---|---|---|---|
+| 1500 Hz | 667 µs | 425-447 µs | 309-335 µs |
+| 2000 Hz | 500 µs | 263-284 µs | 162-179 µs |
+| 2500 Hz | 400 µs | 162-184 µs | 62-80 µs |
+| 3000 Hz | 333 µs | 93-118 µs | -9 to +9 µs, past the edge |
+
+**Per window**, in a thread: a few ms on ~64 kB whatever the sample rate, plus
+~14 ms when the health snapshot is rebuilt.
+
+**Per correction**: never through `set_tone_frequencies` — ~30 ms on the event
+loop and 25-56 lost accumulations at 1-2 kHz, since it re-derives channel
+maps, mixer settings and the whole tone plan. The tracker fills the idle half
+of the ping-pong buffer and flips (`profiling/tracker_apply_cost.py`, 1000
+tones):
+
+| step | cost | where it runs |
+|---|---|---|
+| format the words (`prepare_control_buffer_data_fast`) | 892 µs | off the event loop |
+| write one slot, TX and RX | 110 µs | off the event loop |
+| fill all four modulation slots | 438 µs | off the event loop |
+| flip the buffer (`set_control_buffer_idx_fast`) | 60 µs | on the event loop |
+
+An update is therefore ~1.3 ms off-loop plus a 60 µs flip: 0.013% of the
+machine at a 10 s cadence, 0.13% at 1 Hz. The apply was never the expensive
+part.
+
+### Two findings that shaped this design
+
+**The GIL, when the consumer shares the process.** The first version kept
+every frame and estimated per cycle; at 1500 Hz it lost 216 705 accumulations
+in ten minutes in stalls of up to 83 ms, and cutting its batch 363 → 29 ms
+barely moved that. The stream loop's wait was a spin, so it held the GIL
+almost continuously and the consumer got it only at
+`sys.setswitchinterval` boundaries — a 40 ms batch took 350 ms, and each of
+those waits cost the loop accumulations. Two obvious levers were worse:
+lowering the switch interval cut the batch (350 → 65 ms) but raised losses
+(9.4 → 14.4 stalls/s), and smaller consumer operations contend more often
+(a tiny op in a Python loop is the worst case, 8.8 ms p99.9). The wait now
+sleeps between accumulations.
+
+**Memory traffic, not CPU share.** Even with the GIL free, a consumer that
+streams megabytes through the shared L2 costs accumulations on both pipelines
+— see [Data path and performance](#data-path-and-performance). Hence averaging
+in the stream loop, with the consumer seeing tens of kB.
+
+### Where to run it
+
+1000 tones to 2500 Hz: in-process is fine with the settings above. With
+`firmware.stream_process` the tap runs in the stream process and the estimator
+in the server, which removes the GIL contention outright — the configuration
+the 2500 Hz dual-pipeline results were taken in. At 2048 tones or 3000 Hz the
+rate itself binds, not tracking.
+
+**Still unmeasured**: the flip's effect on a *running* stream (the 60 µs above
+was with the pipelines idle), and the transient when the firmware switches
+buffers mid-cycle.

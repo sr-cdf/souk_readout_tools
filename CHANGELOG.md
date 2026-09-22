@@ -2,105 +2,135 @@
 
 ## Unreleased
 
-**The accumulation counter skips the casperfpga block path.**
-`acc.get_acc_cnt()` was already reading over devmem -- `LocalMemTransport.read`
-is an mmap slice -- but through `Block.read_uint` -> `CasperFpga.read_uint` ->
-name resolution -> `struct.unpack`, which costs **27.1 us against 3.7 us** for a
-slice at a cached address. It runs twice per sample. New
-`read_acc_cnt_fast` / `_blocking_wait_for_acc_fast` save **46.8 us on every
-accumulation, at every tone count**, and make the 10 us poll period in
-`_blocking_wait_for_acc` meaningful for the first time (each iteration
-previously cost 27 us, so the period was inoperative).
+## v1.8.1
 
-**ZDMA is selectable from the server config.** `firmware.zdma: true` (with
-`firmware.zdma_udmabuf`, default `udmabuf0`) enables the DMA read path, which
-was previously reachable only by editing `firmware_lib.ZDMA_ENABLED`. Give each
-pipeline its own buffer -- every transfer overwrites the whole thing. Falls back
-to the CPU read with a warning if the buffer or a DMA channel is unavailable.
+Software only: the same firmware v7.12.1 image as v1.8.0. Measurements and
+method in `doc/v712-notes.md`.
 
-**A stream client disconnecting no longer logs an unhandled exception.**
-`handle_stream_client` caught only `ConnectionResetError`, but a write to a
-departed peer raises `BrokenPipeError`, which asyncio delivers through whichever
-await is pending -- so it escaped into `client_connected_cb` and was logged with
-a full traceback for what is a routine disconnect. Now catches `ConnectionError`
-(covering reset, broken pipe and abort) and deregisters the writer in a
-`finally`: previously an escaping exception left the dead writer in
-`stream_clients` and the streamer kept writing to a closed socket.
+**Streaming, both pipelines, 1000 tones each** (`profiling/dual_soak.py`, no
+requests during the recording): zero events for an hour at 1500 Hz; 0.0009% at
+2000 Hz; 0.013% at 2500 Hz. At 2500 Hz with fw modulation and dry-run
+tracking, 30 min: 0 and 7 lost of 4.5 M each, 0 torn — stream process,
+SCHED_FIFO and `souk-enable-tuning`.
 
-**A partially-populated RF mixerless module no longer disables the whole
-frontend.** `_mixerless_module_hw_config_list()` declares two channels;
-`SOUKRFMixerlessModule.__init__` probes every channel it is given and raises on
-the first that does not answer, so on a one-channel card the exception escaped
-and `RFPeripherals` abandoned the module entirely -- losing the channel that
-*was* present and leaving `hardware=no` with all attenuator/bypass calls
-failing. The channels are now probed first (`_populated_hw_config_list`) and
-only the ones that answer are passed in; a missing channel is logged at WARNING,
-since on a board meant to be fully populated it is a fault rather than a choice.
-Raises if *no* channel answers. Verified on a one-channel card: ch0
-(recv 0x3b / transmit 0x3a) kept, ch1 (0x39 / 0x38) skipped.
+**Correctness fixes**
 
-**The AXI window can be mapped through UIO instead of `/dev/mem`.**
-`create_fast_readout_interface(..., uio=True)` (or `use_uio_for_localmem()`)
-points casperfpga's `LocalMemTransport` at `/dev/uio0`, which is `root:uio`
-rather than root-only. Verified reading the accumulator **as a normal user in
-the `uio` group**. Timing is identical to `/dev/mem` (2.0 us at 64 B, 93.2 us at
-16 KiB) -- it buys permissions, not latency, which is the whole point: the
-readout server needs root *only* for `/dev/mem`. `server/tsu_strobe.py` maps PS
-GEM2 directly and still needs root, but it is already a separate service.
+- **v7.12 sent every tone to its pair-neighbour's synthesis bin.** The 16-bit
+  PSB reorder map holds two entries per bus word; the `'<u2'` view in
+  `psb_chanselect_{set,get}_channel_inmap` swapped each pair. Affects every
+  fast-path tone set on v7.12 since v1.7.10; v7.11 is unaffected. Fixed and
+  verified on DAC snapshots.
+- **`demodulate(method='fast')` and the tracker's estimator read the fw
+  default slot pattern wrong.** `[-d, 0, +d, 0]` came out as ~+37 linewidths at
+  any detuning; they now use the lowest/central/highest offsets and average
+  repeats. `'accurate'` unaffected. Re-run analyses that used `'fast'` on
+  fw-modulated data.
+- **ZDMA reads no longer abort on the 4 GiB byte-counter wrap** (`BYTE_CNT_OVRFL`,
+  ISR `0x008`): a failed read every ~4.5 min at 1000 tones and 2 kHz.
+- **`read_acc_cnt_fast` reads until two reads agree**: the firmware returns
+  mixed old/new bits ~1 in 30-70k increments, which showed as false
+  16-sample gaps and torn reads. Costs ~4 µs.
+- **`get_samples` allocates its receive buffer before sending the request**:
+  0 startup samples lost at every rate to 3000 Hz (was ~190 ms of allocation
+  while the server's send buffer filled).
+- **The read plan is built before the wait, and a content match stores the new
+  index array.** First read of every capture was torn (2.95 ms); a second tone
+  set cost 35 µs per read until a restart (2400 Hz loss 0.03% → 2%).
+- **`set_telescope_time` waits one more PPS before reading back**: it reported
+  a successful load as `aligned: false` with a 1970 timestamp.
+- **`parse_samples` / `parse_stream` warn on dropped accumulations**: lost
+  count, percentage, gap count, first position.
+- **A stream client that disconnects or stops reading no longer stalls the
+  stream** (`BrokenPipeError` escaped `handle_stream_client`;
+  `STREAM_DRAIN_TIMEOUT_S` 2 s drops a backed-up client).
+- **Tracking starts with one linewidth for all tones** (`_expand_per_tone`):
+  `float()` of a 1-element array is a TypeError on NumPy 2.
+- **A partially-populated RF mixerless module no longer disables the whole
+  frontend**: channels are probed and only those that answer are used.
 
-Implemented as a `LocalMemTransport` **subclass** in this package, not a patch of
-casperfpga: only `__init__` differs (open the UIO device, mmap at offset 0 rather
-than `AXIL_OFFSET`), and `_get_device_address` / `read` / `blindwrite` are
-inherited unchanged. `CasperFpga` already accepts `transport=`, so this is the
-mechanism it was designed for; the class is substituted only for the duration of
-`SoukMkidReadout(local=True)` construction, which hardcodes the local transport
-and takes no `transport=` of its own. A one-line passthrough upstream would
-remove even that.
+**Performance**
 
-**ZDMA reads the accumulator for large tone sets.** New
-`souk_readout_tools/zdma.py` (vendored from souk-firmware v7.12.1's own
-hardware-validated reference) DMAs into a cached `u-dma-buf` instead of reading
-through the uncached mapping, inverting the cost model: **21.94 us fixed +
-1.4 ns/word** against devmem's 1.64 us + 22.4 ns/word. The two are complementary,
-so the read planner picks by size -- devmem below ~335 channels, ZDMA above.
-Measured through `read_accumulated_data_fast`: 2048 tones **277 -> 115 us
-(2.4x)**, 1000 tones 110 -> 86, unchanged below the crossover, values identical
-throughout.
+- **The stream loop reads an accumulation that landed while it was busy**
+  (`fast_read_params['catch_up']`, `acc_due_s`), instead of waiting past it: a
+  round that overruns by less than a period costs nothing. Off for the sw
+  engine, sweeps, `get_samples`, and across a retune. Virtual clock, 1 M
+  frames at +100 µs/frame: 10 253 lost → 0.
+- **The wait sleeps instead of spinning** when catching up (`ACC_LATE_WAKE_S`),
+  which frees the core between accumulations and makes SCHED_FIFO safe.
+- **Frame producers drain and yield every 8 frames / 64 KiB / 2 ms**, not every
+  frame: ~83 µs against a ~78 µs frame. Usable rate ~2000 → ~3500 Hz;
+  3000 Hz loss 27.6% → 0.385%.
+- **`prepare_frame` builds each frame with one `b''.join`** (`_FRAME_HEADER`),
+  ~4× cheaper than the cached numpy frame; byte-identical.
+- **Contiguous combs are read as a slice** (`plan_accumulator_reads`
+  `take_slice`): ~27 µs at 1000 tones. `read_accumulated_data_fast` may now
+  return a view, valid until the next read.
+- **ZDMA reads the accumulator above ~480 channels** (`souk_readout_tools/zdma.py`,
+  `firmware.zdma`): 2048 tones 277 → 115 µs. `firmware.zdma_channel` gives each
+  pipeline its own DMA channel and buffer; dual-pipeline loss 3-30× lower.
+- **Partial accumulator reads for small tone sets**: 1 tone 224 → 36 µs,
+  64 → 41, 341 → 65, 1000 → 109 µs.
+- **The accumulation counter skips casperfpga** (`read_acc_cnt_fast`):
+  27.1 → 3.7 µs, twice per accumulation.
+- **LO control words go through a RAM copy of the control registers**:
+  `set_tone_amplitudes` 1.26-1.34 s → 6 ms, `set_tone_phases` → 7-9 ms,
+  frequency write TX+RX at 1000 tones 247 → 110 µs.
+  `get_info('control_shadow')` reports words changed by another writer.
+- **No garbage collection while a stream runs** (`_set_streaming`): a lost
+  accumulation every ~4 s at 2400 Hz; busy p50 216 → 177 µs.
+- **No timed wakes in the frame path**: the 1 s keepalive (72 → 16 gaps/60 s at
+  2 kHz), the 30 s poll, the 0.1 s trigger poll (an accumulation every 106 ms
+  at 2400 Hz), and torn-read logging (~0.5 ms each).
+- **The socket send buffer is pinned to 1 MiB** (`STREAM_SEND_BUFFER_BYTES`):
+  startup gaps 3 → 1 at 1 kHz.
+- **`get_info`'s `fpga` and `server` sections no longer stall both pipelines**
+  (`firmware_lib.fpga_programmed`, `info_fpga`): five status calls 311 ms and
+  5 bus stalls → 2.8 ms and none.
+- **The filterbank-compensation prototype is built at startup**: the first
+  `set_tone_frequencies` after a restart 8.66 s → ~30 ms (it imported
+  `scipy.signal` lazily).
+- **Tone tracking averages each accumulation in the stream loop**
+  (`tracking.IQAccumulator`, `iq_filter`, `frame_stride`,
+  `filter_blocks_per_batch`): 33 µs a frame at 1000 tones, against a consumer
+  that cost 363 ms per 0.2 s batch and 10 MB of cache traffic. `tone_health`
+  vectorised, 5.1 → 1.5 ms. `min_detuning_snr` gates staging on the scatter.
+- **The timing monitor polls with two subprocesses, not nine**, at three
+  cadences: the loaded pipeline lost 2.5 → 0.03 accumulations a second at
+  2400 Hz.
 
-Opt-in via `ZDMA_ENABLED` or `get_fast_read_params(zdma='udmabuf0')`, and it
-degrades to the mmap path with a warning if u-dma-buf or a DMA channel is
-unavailable. One reader is cached per transport: each PROCESS needs its own
-landing buffer, since every transfer overwrites the whole thing.
+**New options and instrumentation**
 
-**`sparse_read` is selectable from the client.** `get_samples(...,
-sparse_read=)` and `enable_stream(sparse_read=)` carry the override to the
-server, which records it on `fast_read_params` rather than threading it through
-`prepare_frame`'s ten call sites. `None` (default) auto-selects, `False` forces
-the full-buffer read, `True` forces the partial one; the explicit values exist
-to diagnose a suspected read problem, not for routine use.
-
-**Partial accumulator reads for small tone sets.** `plan_accumulator_reads`
-groups requested channels into contiguous runs, merging runs closer than
-~37 channels (where bridging is cheaper than another transaction), and
-`read_accumulated_data_fast` reads only those. Falls back to the unchanged bulk
-read whenever that is cheaper, so a full 2048-channel comb is untouched.
-`sparse_read=None|True|False`; the plan is cached per tone set.
-
-Both together, measured on v7.12.1: 1 tone 224 -> 36 us (6.2x), 64 -> 41 (5.5x),
-341 -> 65 (3.8x), 1000 -> 109 (2.6x), 2048 -> 278 (1.2x, counter only).
-
-Partial reads are snapped to 64-byte boundaries. `mm[a:b]` is a memcpy, and
-glibc's aarch64 memcpy finishes odd-length copies with overlapping unaligned
-vector loads, which SIGBUS on the uncached `/dev/mem` mapping -- reading 341
-channels (2728 B) bus-errors where 64 channels does not.
-
-**Staged control-buffer writes measured and rejected.** A bulk slice write
-streams ~4x faster per word than scattered stores, but constructing the payload
-costs more than that saves: scatter vs staged, tx+rx, 4 tones 50/136 us, 1000
-244/378, 2048 430/579. `sparse_write=None` always scatters; `True` keeps the
-staged path for re-testing if the construction is ever made cheap. New
-`profiling/access_size_scaling.py` measures the fixed/per-word cost model these
-decisions rest on.
+- **Opt-in: the stream loop in its own process** (`server/stream_process.py`,
+  `firmware.stream_process` or `SOUK_STREAM_PROCESS=1`, pinned by
+  `SOUK_STREAM_CPUS` / `SOUK_WORKER_CPUS`, SCHED_FIFO via
+  `SOUK_STREAM_RT_PRIO`). No request, tracking window or info call can hold
+  the frame loop up; paused with an acknowledgement around every FPGA program.
+  Not with the sw engine or triggered streams. Both pipelines at 2500 Hz with
+  modulation and tracking: 893 / 1768 lost in 146 s in-process → 0 / 7 in
+  30 min.
+- **KRM board tuning as a setup step**: `souk-enable-tuning`,
+  `souk-disable-tuning`, `souk-tuning-status` (`data/daemon/rt_tuning.sh`,
+  moved from `profiling/`). CPU layout, stream processes at real-time
+  priority, socket-buffer limits, one end0 transmit queue per stream core
+  (XPS), re-applied at boot by `souk-rt-kernel.service`. Off unless run;
+  `doc/installation.md` step 9.
+- **`get_info('loop_timing')`** reports per-accumulation wait, read, frame,
+  outside and busy times, missed accumulations and torn reads, and now
+  `losses`: the board's wall-clock time and the timing of the 15 frames before
+  each lost or torn accumulation, kept for the whole capture (`LOSS_RECORDS`
+  256).
+- **`get_samples(warmup=)`, `receive_stream(info=)`**, and the rate and
+  accumulation-length setters report the setting actually applied.
+- **end0's PTP clock gets a stable name, `/dev/ptp-end0`**
+  (`data/timing/90-ptp-end0.rules`, installed by `install_timing_services.sh`,
+  used by `ptp-phc.conf` and the timing monitor). The driver re-registers the
+  clock on every ifup, so `/dev/ptp0` became `/dev/ptp1` and chrony's refclock
+  pointed at nothing. The monitor's `chronyc` calls also pass `-n`, without
+  which they hang for over 10 s on this board.
+- **Profiling tools**: `dual_soak.py --modulate HZ [--track]`,
+  `acc_hold_check.py` (does the accumulator hold a sample until `acc_cnt`
+  moves), `clock_rate_check.py` (real rate and ADC clock against what the
+  software assumes), `frame_path_bench.py`, `gil_yield_check.py`.
 
 ## v1.8.0
 

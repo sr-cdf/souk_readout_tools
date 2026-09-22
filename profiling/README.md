@@ -1,13 +1,21 @@
 # Readout access profiling
 
-Tools and results for how fast the readout talks to the FPGA: control-buffer
-writes, accumulator reads, and the streaming loop built on them. The document
-started as one question about the transport and one about the language, and
-has grown into a firmware-by-firmware comparison. Each part below keeps its
-original results and compares them with what came before, so old and new
-numbers sit side by side rather than replacing each other.
+Tools and results for the readout's fast path: control-buffer writes,
+accumulator reads, and the streaming loop built on them.
+
+It began with two questions — transport and language — and grew into a
+firmware-by-firmware comparison (Parts 1-3). Once the bus stopped being the
+limit, the cost moved into the software around it: the frame loop, requests,
+tracking, and the board's own housekeeping. Both kinds are kept here, with
+their tools listed separately; the streaming results and their conclusions are
+in `doc/v712-notes.md`.
+
+Each part keeps its original numbers beside later ones, so every figure can be
+traced to the firmware and software it was taken on.
 
 ## TL;DR
+
+### Firmware, transport and language
 
 - **Transport:** katcp costs 37–280× LocalMem (`/dev/mem`) for the same
   control_sw call (`get_acc_cnt()` 1 ms vs 27 µs; `_read_bram()` 2048
@@ -17,7 +25,7 @@ numbers sit side by side rather than replacing each other.
   packed two to a word (v7.12's PSB reorder map, the ADC/DAC snapshots) the
   order of the two entries flips as well. Reading such data as `'<u2'`
   pair-swaps it — on v7.12 that sent every tone to its neighbour's synthesis
-  bin until 2026-09-16. Fixed; see `doc/v712-notes.md`, TL;DR.
+  bin until 2026-09-16. Fixed; see `doc/v712-notes.md`, Summary.
 - **Counter reads can glitch on v7.12.1:** `acc_cnt` read mid-increment returns
   mixed old/new bits about 1 in 30 000–70 000 increments
   (`acc_cnt_probe.py`); read it until two reads agree.
@@ -32,7 +40,7 @@ numbers sit side by side rather than replacing each other.
   | LO control write, bulk copy | 76 MiB/s (1000 tones 202.5 µs) | **0.98 GiB/s** (17.6 µs) | 11.5× |
   | LO control write, scattered per word (tone updates until 2026-09-17) | 1000 tones 217.1 µs | 77.0 µs | 2.8× |
   | benchmark step: bulk 16 KB write + bulk 8 KB raw read, Python | 369 µs | 73 µs | 5.1× |
-  | `read_accumulated_data_fast`, 1000 tones (the server's per-accumulation read) | 226 µs | 111 µs | 2.0× |
+  | one sample through `read_accumulated_data_fast` — wait for the accumulation, read the tones' I/Q words, the counter, the time tag and the modulation tag, and index them into tone order — 1000 tones | 226 µs | 111 µs | 2.0× |
 
   ~70–75% from the AXI4 BRAMs, ~25–30% from the 200 MHz clock; the new kernel
   changes nothing for devmem.
@@ -43,24 +51,41 @@ numbers sit side by side rather than replacing each other.
   ZDMA reads at 2.2 GiB/s after a 17 µs start (2048 channels 102 → 31 µs,
   through `firmware_lib` 279 → 116 µs). ZDMA writes only win for the whole
   4-slot LO register (126 → 94 µs).
-- **Software write path (2026-09-17):** LO control words now go through a RAM
-  copy of the control BRAMs and are pushed as one bulk copy. Frequency write to
-  TX + RX at 1000 tones 247 → 110 µs; `set_tone_amplitudes` 1.3 s (katcp) →
-  6 ms. See [LO control writes through a RAM copy](#lo-control-writes-through-a-ram-copy-2026-09-17).
-- **What that buys in streaming** (1000 tones, loss-free rate, against the
-  600 Hz campaign): ≤ 600 Hz with the old software and firmware → 1500 Hz now,
-  2000 Hz with ZDMA (under 0.1% loss to 2400 / 3000 Hz).
-  Two pipelines at once, tuned: 0.05–0.11% loss per minute up to 2400 Hz.
-  A `get_info` on one pipeline stalls the other's reads through two slow driver
-  calls (converter mixer settings, FPGA status): starting a capture on
-  pipeline 1 costs pipeline 0 ~93 accumulations at 1500 Hz
-  (`doc/v712-notes.md`, "Caching tried and reverted").
-  Rate ladders and the software's share: `doc/v712-notes.md`, TL;DR.
+
+### Server, streaming and tracking
+
+Measured with the second tool table below; detail in `doc/v712-notes.md`.
+
+- **Tone writes through a RAM copy of the control BRAMs**: frequency to TX +
+  RX at 1000 tones 247 → 110 µs, `set_tone_amplitudes` 1.3 s (katcp) → 6 ms.
+  See [LO control writes through a RAM copy](#lo-control-writes-through-a-ram-copy-2026-09-17).
+- **Per-accumulation budget**, 1000 tones with ZDMA, against a 400 µs period
+  at 2500 Hz: read 67 µs, frame build 62 (including a 33 µs tracking tap),
+  send 95 — busy 227, spare 174.
+- **Late reads.** The accumulator holds a sample until `acc_cnt` moves
+  (`acc_hold_check.py`), so the wait takes a waiting accumulation instead of
+  blocking for the next: the deadline becomes mean busy < period, plus one
+  period of tolerance per round.
+- **Rates, 1000 tones per pipeline.** One pipeline: zero events to 2000 Hz,
+  0.04% at 3000 Hz. Both pipelines for an hour: zero events at 1500 Hz, 8 and
+  5 lost at 2000 Hz. Both at 2500 Hz with fw modulation and dry-run tracking,
+  30 min: **0 and 7 lost of 4.5 M each, 0 torn**, with the stream loop in its
+  own SCHED_FIFO process (`souk-enable-tuning`).
+- **Tracking costs one coherent add per accumulation**, 33 µs at 1000 tones
+  (`tracker_estimator_cost.py`, `frame_path_bench.py`). The frame-keeping
+  design it replaced cost 363 ms per 0.2 s batch and, through the shared L2,
+  accumulations on *both* pipelines.
+- **What is left is the rest of the system**: `get_info` sections that reach
+  the converter driver or the FPGA manager hold the processor-to-fabric bus
+  2-10 ms; `fork`/`exec` on the board (timing monitor, ssh login) costs frames
+  through TLB and cache churn; SLAB's per-CPU `cache_reap` needs SCHED_FIFO to
+  preempt.
 
 ## Contents
 
 1. [How this document evolved](#how-this-document-evolved)
-2. [Tools](#tools)
+2. [Tools](#tools): [firmware and fast path](#firmware-and-fast-path-tools),
+   [server and streaming](#server-and-streaming-tools)
 3. [Running a firmware stage](#running-a-firmware-stage)
 4. [Part 1: katcp vs LocalMem, then Python vs C (v7.10.3)](#part-1-katcp-vs-localmem-then-python-vs-c-v7103)
 5. [Part 2: v7.12.1 against Part 1](#part-2-v7121-against-part-1)
@@ -79,6 +104,9 @@ numbers sit side by side rather than replacing each other.
 | 2026-09-16 | Which part of the PR buys what? | stages S0–S3 with fixed software; UIO, ZDMA and DRAM-ceiling transports; rate ladder | v7.11.2 → v7.12.1 | Part 3 |
 | 2026-09-17 | How hard can two pipelines stream at once, and why do counters glitch? | `rt_tuning.sh`, `rate_ladder.py --loop-timing`, `acc_cnt_probe.py`, `zdma_channel_check.py` | v7.12.1 | `doc/v712-notes.md`, "Pushing the zero-drop rate" |
 | 2026-09-17 | Can tone writes use the bulk copy? | `control_write_check.py` on the RAM copy of the LO control registers | v7.12.1 | Part 3, "LO control writes through a RAM copy" |
+| 2026-09-20 | What does tone tracking cost, and where should it run? | `tracker_estimator_cost.py`, `tracker_apply_cost.py`, `gil_yield_check.py`, synthetic loads of varying working set | v7.12.1 | `doc/v712-notes.md`, "What tone tracking costs"; `doc/tone_tracking.md` |
+| 2026-09-21 | Why does a round that overruns by 10 µs cost a whole accumulation? | a virtual-clock model of the wait, then `acc_hold_check.py` on the board | v7.12.1 | `doc/v712-notes.md`, "What limits a stream" |
+| 2026-09-22 | Can both pipelines stream at 2500 Hz with modulation and tracking and lose nothing? | `dual_soak.py --modulate --track`, `perf_cpu_sampler.py`, the servers' own loss records | v7.12.1 | `doc/v712-notes.md`, "Where the rates stand" |
 
 Three corrections made on 2026-09-16 run through the rest of this file:
 
@@ -101,6 +129,14 @@ here.
 
 ## Tools
 
+Two groups. The first measures the bus, the firmware and the read/write path
+on them — the tools behind Parts 1-3, and the set to re-run after a firmware
+upgrade. The second measures the software above them: the frame loop,
+requests, tracking and the board's own behaviour (results in
+`doc/v712-notes.md`).
+
+### Firmware and fast-path tools
+
 | script | runs on | root? | test | measures |
 |---|---|---|---|---|
 | `board_state.py` | board | for the register and mapping checks | B0 | boot-file md5s, `PL0_REF_CTRL` (AXI clock) and `AFI_FS` (HPM width) read back, kernel nodes, installed software md5s, configured `.fpg`, services, tcpborphserver mapping |
@@ -111,27 +147,39 @@ here.
 | `fast_path_timing.py` | board | yes | B3 | control_sw calls over katcp vs LocalMem; `firmware_lib.read_accumulated_data_fast` at 1–2048 tones, devmem and ZDMA |
 | `run_stage.sh` | board | yes | B0–B3 | all of the above for one stage, servers stopped |
 | `board_checks.py` | board | yes, servers stopped | B5 | katcp vs devmem bit-exact on one accumulation, PSB inmap round trip, sparse LO write isolation, katcp writes at both ends of the map |
-| `control_write_check.py` | board | no (UIO); idle servers may stay up | — | LO control writes through the RAM copy: katcp cross-read, tone isolation, copy vs firmware; old vs new write timings on spare slot 3 (restored) |
-| `host_checks.py` | host | no | B6–B8 | `peripherals` (lock/ready flags), `sync` (timed sync round trip; needs `timing-monitor`), `sweep` (fit fr/Qi/Qc, compare to a reference run) |
-| `rate_ladder.py` | host | no | B4 | stream / `get_samples` ladder: delivered/s, loss, startup and steady small/large gaps, `packet_error` |
-| `acc_cnt_probe.py` | board | no (UIO) | — | tight `acc_cnt` read loop: impossible jumps, backward steps, slow reads (`--double-read` tests the fix) |
 | `zdma_channel_check.py` | board | yes | — | one accumulation through a given DMA channel + u-dma-buf, compared bit for bit with devmem |
-| `loop_timing_summary.py` | host | no | B4 | per-capture summary of `rate_ladder.py --loop-timing` rows |
-| `retune_during_stream.py` | host | no | test 2 | lost accumulations per `set_tone_frequencies` / `_amplitudes` / `_phases` request during a stream |
-| `perf_cpu_sampler.py` | board | yes | — | perf-event samples of chosen CPUs (kernel symbols, thread names) per 100 ms, for a kernel without ftrace |
-| `first_retune_profile.py` | board | no (UIO); servers stopped | test 4 | cProfile of a first and a second `set_tone_frequencies_fast` in a fresh process, tones re-sent unchanged |
-| `sweep_step_timing.py` | host | no | test 3 | sweep time per point and fixed cost (11/101/401 points); `set_tone_powers` with and without optimisers; state restored |
-| `shadow_outside_writer_check.py` | board | no; servers up | test 7 | a katcp write to one LO word: does the server's copy report it, does the next request undo it; restored |
-| `dual_soak.py` | host | no | test 10 | both pipelines streaming for a long time with no requests during the recording; every lost and torn accumulation, with times. `--modulate HZ [--track]` adds fw modulation and dry-run tracking; records whether each server runs a stream process |
-| `acc_hold_check.py` | board | no with `--uio`; servers must be UP (clocks) | — | whether an accumulation stays unchanged in the accumulator until `acc_cnt` moves, read at fractions of the period -- the premise of the stream loop's late read (`catch_up`); needs a live signal |
-| `clock_rate_check.py` | board | no with `--uio`; servers must be UP | — | accumulation rate and ADC clock (from the TT tick rate) against what the software assumes; run after a reboot -- on 2026-09-22 both were 13/12 slow with every PLL "locked" |
-| `frame_path_bench.py` | board or PC | no | — | RAM only: per-frame pieces of `prepare_frame` and `tracking.tap` against their alternatives (fancy-index vs slice gather, numpy frame vs one join, int64 tap variants) |
-| `gil_yield_check.py` | board | no; servers may stay up | — | whether a second thread (the tracking consumer) can share the stream loop's process: spin vs yielding accumulation wait, consumer batch time and accumulations lost per second |
+| `acc_cnt_probe.py` | board | no (UIO) | — | tight `acc_cnt` read loop: impossible jumps, backward steps, slow reads (`--double-read` tests the fix) |
+| `acc_hold_check.py` | board | no with `--uio`; servers must be UP (for the clocks) | — | whether an accumulation stays unchanged until `acc_cnt` moves, read at fractions of the period — the premise of the stream loop's late read; needs a live signal |
+| `clock_rate_check.py` | board | no with `--uio`; servers must be UP | — | the real accumulation rate and ADC clock, from the time-tag tick rate, against what the software assumes; run after a reboot (on 2026-09-22 both were 12/13 of nominal with every PLL reporting lock) |
+| `control_write_check.py` | board | no (UIO); idle servers may stay up | — | LO control writes through the copy in memory: katcp cross-read, tone isolation, copy against firmware; old and new write timings on spare slot 3 (restored) |
+| `host_checks.py` | host | no | B6–B8 | `peripherals` (lock/ready flags), `sync` (timed sync round trip; needs `timing-monitor`), `sweep` (fit fr/Qi/Qc against a reference run) |
 | `dump_addrs.py` | board | — | — | offsets from a live readout object (fallback to `fpg_addrs.py`) |
-| `tracking_benchmark.py`, `tracking_health_benchmark.py` | host | no | — | tone tracking; unrelated to this document |
+
+### Server and streaming tools
+
+| script | runs on | root? | measures |
+|---|---|---|---|
+| `rate_ladder.py` | host | no | stream / `get_samples` ladder (B4): delivered per second, loss, startup and steady small/large gaps, `packet_error`; `--loop-timing` stores the server's own per-accumulation timing |
+| `loop_timing_summary.py` | host | no | per-capture summary of those `--loop-timing` rows |
+| `dual_soak.py` | host | no | both pipelines streaming for a long time with no requests during the recording: every lost and torn accumulation with its time, the server's loop timing and loss records. `--modulate HZ [--track]` adds firmware modulation and dry-run tracking; records whether each server runs a stream process |
+| `retune_during_stream.py` | host | no | accumulations lost per `set_tone_frequencies` / `_amplitudes` / `_phases` request issued during a stream |
+| `sweep_step_timing.py` | host | no | sweep time per point and fixed cost (11/101/401 points), and `set_tone_powers` with and without its optimisers; state restored |
+| `shadow_outside_writer_check.py` | board | no; servers up | a katcp write to one LO word from outside the server: does the server's copy report it, does the next request undo it; restored |
+| `first_retune_profile.py` | board | no (UIO); servers stopped | cProfile of a first and a second `set_tone_frequencies_fast` in a fresh process, tones re-sent unchanged (this is how the 8.5 s `scipy.signal` import was found) |
+| `frame_path_bench.py` | board or PC | no | RAM only: the per-frame pieces of `prepare_frame` and the tracking tap against their alternatives — fancy-index against slice gather, a cached numpy frame against one join, int32 against int64 tap |
+| `gil_yield_check.py` | board | no; servers may stay up | whether a second thread can share the stream loop's process: a spinning against a sleeping accumulation wait, the consumer's batch time, and accumulations lost per second |
+| `tracker_estimator_cost.py` | board | no | what a tracking estimator costs per consumer batch, by stage (parse, assemble, decimate, estimate, filter) |
+| `tracker_apply_cost.py` | board | no | what applying a correction costs: format the words, write a slot, fill four slots, flip the buffer |
+| `tracking_benchmark.py`, `tracking_health_benchmark.py` | host | no | the tracking estimator and the health-snapshot rebuild, off the board |
+| `perf_cpu_sampler.py` | board | yes | perf-event samples of chosen CPUs (kernel symbols, thread names), for a kernel with no ftrace — what holds a core, and for how long |
+
+The board tuning these results assume (CPU layout, SCHED_FIFO stream
+processes, socket and transmit-queue settings) was `rt_tuning.sh` here; it is
+now packaged and applied with `souk-enable-tuning` (`doc/installation.md`
+step 9).
 
 Test numbering (B0–B9) and the master result tables live in
-`doc/v712-notes.md`, "Staged comparison".
+`doc/v712-notes.md`, Appendix A.
 
 ## Running a firmware stage
 
@@ -430,7 +478,7 @@ through the PR one part at a time, with software held fixed:
 | S3 | v7.12.1 | v7.12.1 | v7.12.1 | kernel rebuild; UIO and u-dma-buf |
 
 Full definitions, what is held fixed, and the B4–B9 tables:
-`doc/v712-notes.md`, "Staged comparison". The tables below are the profiler
+`doc/v712-notes.md`, Appendix A. The tables below are the profiler
 ones, with the earlier measurements kept alongside for comparison.
 
 ### B2 — sweep step, same invocation as Parts 1 and 2 (p50 µs)
@@ -546,7 +594,7 @@ Through the server: `set_tone_amplitudes` 1.26–1.34 s → 6 ms,
 of all four registers equals the copy; one-tone isolation passes;
 `get_info('control_shadow')` reports 0 stale words after every kind of write
 and flags a word changed from another process. Design, limits and side
-findings: `doc/v712-notes.md`, "LO control writes through a RAM copy".
+findings: `doc/v712-notes.md`, "LO control writes through a copy in memory".
 
 ### What S3 shows
 
@@ -626,7 +674,24 @@ findings: `doc/v712-notes.md`, "LO control writes through a RAM copy".
    first) takes a 1000-tone frequency write to TX + RX from 247 to 110 µs, and
    removes katcp from amplitude and phase writes.
 
+From the second half of the work — the server rather than the bus:
+
+7. **The read no longer sets the limit.** It is 67 µs of a 400 µs period at
+   1000 tones and 2500 Hz. What costs accumulations is whatever takes the
+   loop's core or slows it for hundreds of µs: requests sharing its event loop
+   and GIL, a working set that overflows the shared 1 MB L2, `fork`/`exec`,
+   and per-CPU kernel work.
+8. **Count events over a long capture, not loss %.** A percentage conflates a
+   loop that is marginally too slow with one that is interrupted once, and
+   30 s ladders bound the event rate only to ~1 in 10⁵.
+9. **Benchmark the deadline, not the mean.** Batched frames measured 28%
+   cheaper per frame and were far worse on hardware, because the deadline is
+   per accumulation; a loopback sink under-predicted the real send path by
+   60-76 µs a frame.
+
 ## Files
+
+Firmware and fast path:
 
 - `board_state.py` — record the board configuration (B0)
 - `fpg_addrs.py` — register offsets from the control_sw yaml or an `.fpg` header
@@ -635,21 +700,32 @@ findings: `doc/v712-notes.md`, "LO control writes through a RAM copy".
 - `devmem_profile.c` / `Makefile` — C profiler; per-word default, `--bulk` mode (B2)
 - `fast_path_timing.py` — control_sw and firmware_lib read path, end to end (B3)
 - `run_stage.sh` — B0–B3 for one stage, on the board
-- `rate_ladder.py` — stream / `get_samples` rate ladder, from the host (B4)
 - `board_checks.py` — correctness checks on the board, servers stopped (B5)
-- `control_write_check.py` — LO control writes through the RAM copy: correctness + old/new timings
-- `host_checks.py` — peripherals, timed sync and sweep + fit, from the host (B6–B8)
-- `rt_tuning.sh` — moved to `src/souk_readout_tools/data/daemon/` and run by `souk-enable-tuning` (KRM board tuning)
 - `zdma_channel_check.py` — validate a DMA channel + u-dma-buf against devmem
 - `acc_cnt_probe.py` — tight `acc_cnt` read loop that records impossible jumps and backward steps
-- `loop_timing_summary.py` — per-capture summary of `rate_ladder.py --loop-timing` rows
-- `retune_during_stream.py` — lost accumulations per tone request during a stream (test 2)
-- `perf_cpu_sampler.py` — perf-event CPU sampler with kernel symbols (no ftrace on the board)
-- `first_retune_profile.py` — why the first retune after a restart is slow (test 4)
-- `sweep_step_timing.py` — sweep per-point and `set_tone_powers` timing through the server (test 3)
-- `shadow_outside_writer_check.py` — outside katcp writes against the server's RAM copy (test 7)
-- `dual_soak.py` — long two-pipeline stream, counters and torn flags only (test 10)
+- `acc_hold_check.py` — does the accumulator hold a sample until `acc_cnt` moves
+- `clock_rate_check.py` — the real accumulation rate and ADC clock, after a reboot
+- `control_write_check.py` — LO control writes through the copy in memory: correctness and old/new timings
+- `host_checks.py` — peripherals, timed sync and sweep + fit, from the host (B6–B8)
 - `dump_addrs.py` — offsets from a live readout object (fallback)
+
+Server, streaming and tracking:
+
+- `rate_ladder.py` — stream / `get_samples` rate ladder, from the host (B4)
+- `loop_timing_summary.py` — per-capture summary of `rate_ladder.py --loop-timing` rows
+- `dual_soak.py` — long two-pipeline stream with modulation and tracking; every lost and torn accumulation
+- `retune_during_stream.py` — accumulations lost per tone request during a stream
+- `sweep_step_timing.py` — sweep per-point and `set_tone_powers` timing through the server
+- `shadow_outside_writer_check.py` — outside katcp writes against the server's copy in memory
+- `first_retune_profile.py` — why the first retune after a restart was slow
+- `frame_path_bench.py` — per-frame pieces of `prepare_frame` and the tracking tap, in RAM
+- `gil_yield_check.py` — can a second thread share the stream loop's process
+- `tracker_estimator_cost.py`, `tracker_apply_cost.py` — what tracking costs to estimate and to apply
+- `tracking_benchmark.py`, `tracking_health_benchmark.py` — the same, off the board
+- `perf_cpu_sampler.py` — perf-event CPU sampler with kernel symbols (no ftrace on the board)
+
+Data and build products:
+
 - `devmem_profile_{c,py}_hw.txt`, `devmem_profile_c_hw_bulk.txt` — v7.10.3
   hardware runs (Part 1); `devmem_profile_c.txt` — in-RAM backing-file floor.
   Gitignored, local only.

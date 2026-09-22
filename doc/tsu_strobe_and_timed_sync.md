@@ -88,12 +88,30 @@ bring-up above:
 1. `set_timed_sync` fires but the `tt_sync` register is not updated by it, so we
    cannot yet *timestamp* where a timed sync landed. (Which sync latches
    `tt_sync`? Is the `mrst` ordering — reset before vs after the TT load —
-   as intended?)
+   as intended?) **Confirmed unchanged on v7.12.1** (2026-09-19): an armed sync
+   fired — `timed_sync_time` held the target and the countdown register read
+   expired — while `tt_sync_msb/lsb` stayed 0, so `timed_sync_check` reports a
+   FAIL on a sync that did fire. Until the register works, verify a timed sync
+   from the accumulations' own telescope time instead.
 2. `get_drift()` reads a flat 0 after `arm_sync()` while the TT drifts ~1.6 ppm —
    it does not appear to be a live accumulating-drift monitor on this gateware,
    though the Sync block docstring (step 4) says to use it to observe drift.
 3. Cosmetic: `update_internal_time`'s log lines labelled "NTP" are computed from
    the system clock (`time.time()`), not an NTP query.
+
+## Loading the telescope time first (v7.12.1 note)
+
+On a freshly powered board the firmware TT counts from 1970 plus uptime, so
+every target second is in the past and `timed_sync_ready` refuses.
+`client.set_telescope_time()` is the one-shot that fixes it: it needs PTP
+locked and the 1-PPS strobe healthy, blocks a few seconds on PPS edges, and
+leaves the TT within ~100 µs of the second boundary (116 µs, 2026-09-19).
+
+That call used to report its own success as a failure: it read the alignment
+back immediately, but `ext_sync_tt` holds the TT latched *at* the sync that
+performs the load, so the read returned the pre-load counter (`aligned: false`
+with a 1970 timestamp) even though the load had worked. It now waits one more
+PPS before reading back.
 
 ## Client commands
 

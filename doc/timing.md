@@ -65,7 +65,7 @@ ptp4l
     |
     | disciplines
     v
-/dev/ptp0, the Ethernet PTP Hardware Clock (PHC)
+/dev/ptp-end0, the Ethernet PTP Hardware Clock (PHC)
     |
     | chrony refclock PHC0
     v
@@ -78,9 +78,18 @@ SOUK firmware telescope_time counter
 
 Important distinctions:
 
-- `ptp4l` receives PTP packets and disciplines `/dev/ptp0`.
-- chrony reads `/dev/ptp0` as a local refclock named `PHC0` and disciplines
+- `ptp4l` receives PTP packets and disciplines `/dev/ptp-end0`.
+- chrony reads `/dev/ptp-end0` as a local refclock named `PHC0` and disciplines
   Linux `CLOCK_REALTIME`.
+
+`/dev/ptp-end0` is end0's PHC under a stable name, from the udev rule
+`data/timing/90-ptp-end0.rules` (installed by `install_timing_services.sh`).
+The kernel numbers PTP clocks as they register and the GEM driver registers a
+new one on every ifup, so `/dev/ptpN` moves: on 2026-09-22 an ifdown/ifup
+turned `/dev/ptp0` into `/dev/ptp1` and left chrony's refclock on a device
+that no longer existed. A daemon holding the old device keeps it until it
+restarts, so restart ptp4l and chrony after an ifdown/ifup; the monitor
+reopens by name on its next poll.
 - chrony can also use NTP servers as fallback for Linux time.
 - the firmware `telescope_time` counter is separate. Linux time being correct
   does not automatically sync the firmware counter.
@@ -349,13 +358,13 @@ With a valid production GM, keep the chrony PHC refclock at `offset 0`.
 
 Chrony disciplines Linux `CLOCK_REALTIME`. In this setup it has:
 
-- a local PHC refclock, `PHC0`, backed by `/dev/ptp0`
+- a local PHC refclock, `PHC0`, backed by `/dev/ptp-end0`
 - normal NTP servers as fallback for Linux time
 
 The packaged PHC line is:
 
 ```text
-refclock PHC /dev/ptp0 poll 0 dpoll -2 offset 0 prefer
+refclock PHC /dev/ptp-end0 poll 0 dpoll -2 offset 0 prefer
 ```
 
 Design choices:
@@ -454,28 +463,47 @@ chronyc waitsync 30 0.001
 `CLOCK_REALTIME`, for example:
 
 ```bash
-sudo phc2sys -s /dev/ptp0 -c CLOCK_REALTIME -O 0
+sudo phc2sys -s /dev/ptp-end0 -c CLOCK_REALTIME -O 0
 sudo phc2sys -a -r
 ```
 
 The SOUK packaged setup does not use `phc2sys`. Chrony already reads
-`/dev/ptp0` as `PHC0` and steers Linux time. Running `phc2sys` as well would
+`/dev/ptp-end0` as `PHC0` and steers Linux time. Running `phc2sys` as well would
 create a second service steering `CLOCK_REALTIME`, which would make the clock
 state harder to interpret.
 
 Current policy:
 
-- use `ptp4l` to discipline `/dev/ptp0`
+- use `ptp4l` to discipline `/dev/ptp-end0`
 - use chrony to discipline Linux time from `PHC0` or NTP
 - do not start `phc2sys` unless the timing design is deliberately changed
 
 ## Timing Monitor
 
 The timing monitor combines PTP and chrony status into the state needed by
-readout operations. It polls:
+readout operations. Each poll (`--poll-interval`, 1 s):
 
-- `pmc` for PTP port state, GM data, and ingress freshness
-- `chronyc` for system clock source, source health, and error estimates
+- **the system clock, by syscall**: `ntp_adjtime` for the kernel's own sync flag
+  and drift (~7 us), and `PTP_SYS_OFFSET_PRECISE` on `/dev/ptp-end0` for the
+  system-vs-PHC offset, falling back to reading the PHC between two system-clock
+  reads where the driver does not cross-timestamp (this NIC does not). Reported
+  as `system_clock_synced`, `system_clock_freq_ppm`, `phc_sys_offset_s`
+- **`pmc`** every `--ptp-interval` (5 s) for PTP port state, GM data and ingress
+  freshness -- only `pmc` can tell whether ptp4l still has the grandmaster, so
+  this interval is the detection latency for losing it (`ptp_age_s`)
+- **`chronyc`** every `--detail-interval` (30 s) for the selected source, source
+  health and error estimates, along with the GM parent data and UTC properties
+  (`detail_age_s`)
+
+**Why these cadences.** Every `chronyc` or `pmc` call is a process launch,
+~4 ms, and it is the launch rather than its CPU time that costs a streaming
+pipeline: page tables built and torn down, TLB shootdowns, the shared L2
+polluted — which crosses cores whatever the monitor's affinity. Polling
+everything every second was nine launches a second and cost a 1000-tone
+pipeline 2.5 accumulations a second at 2400 Hz; the cadences above give 0.6
+launches a second. Stop the monitor for the most demanding captures, and read
+any field with an `age` as a value up to that many seconds old.
+Measurements: `doc/v712-notes.md`.
 
 It exposes a line-delimited JSON protocol on:
 
@@ -768,13 +796,13 @@ the expected GM clock class.
 Packaged line:
 
 ```text
-refclock PHC /dev/ptp0 poll 0 dpoll -2 offset 0 prefer
+refclock PHC /dev/ptp-end0 poll 0 dpoll -2 offset 0 prefer
 ```
 
 Fields:
 
 - `refclock PHC`: use chrony's PHC refclock driver
-- `/dev/ptp0`: PHC disciplined by `ptp4l`
+- `/dev/ptp-end0`: PHC disciplined by `ptp4l`
 - `poll 0`: poll the refclock every 1 second
 - `dpoll -2`: driver poll interval of 2^-2 seconds, i.e. 0.25 s
 - `offset 0`: apply no PHC-to-UTC correction for a proper UTC GM
