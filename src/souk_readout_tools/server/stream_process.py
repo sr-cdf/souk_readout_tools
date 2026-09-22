@@ -62,7 +62,7 @@ from souk_readout_tools.server import tracking
 
 # Control words (int64) at the start of the shared block.
 MODE, FLAGS, FW_REV, FW_N_SETTLE, TONE_GEN, PAUSE_REQ, PAUSE_ACK, LT_N, READY, STARTED, \
-    TRACK_REQ, TRACK_ACK = range(12)
+    TRACK_REQ, TRACK_ACK, LOSS_N = range(13)
 CTRL_WORDS = 16
 # A finished tracking window's description, written by the stream process when
 # it swaps buffers (float64 words): seq, mode (0 boxcar / 1 ewma / -1 empty),
@@ -119,6 +119,12 @@ class SharedBlock:
         return np.ndarray((rs.LOOP_TIMING_FRAMES, 6), dtype=np.float64,
                           buffer=self.mm, offset=8 * (CTRL_WORDS + TRACK_INFO_WORDS))
 
+    def loss_records(self):
+        """The loss records (same layout as ``ReadoutServer.loss_records``)."""
+        return np.ndarray((rs.LOSS_RECORDS, 2 + 6 * rs.LOSS_RECORD_FRAMES), dtype=np.float64,
+                          buffer=self.mm, offset=8 * (CTRL_WORDS + TRACK_INFO_WORDS
+                                                      + rs.LOOP_TIMING_FRAMES * 6))
+
     def unlink(self):
         try:
             os.unlink(self.path)
@@ -147,11 +153,13 @@ class StreamProcess:
     def __init__(self, settings):
         self.settings = dict(settings)
         self.path = f"/dev/shm/souk_stream_p{int(settings['pipeline_id'])}"
-        self.block = SharedBlock(self.path, 8 * (CTRL_WORDS + TRACK_INFO_WORDS)
-                                 + rs.LOOP_TIMING_FRAMES * 6 * 8)
+        self.block = SharedBlock(self.path, 8 * (CTRL_WORDS + TRACK_INFO_WORDS
+                                                 + rs.LOOP_TIMING_FRAMES * 6
+                                                 + rs.LOSS_RECORDS * (2 + 6 * rs.LOSS_RECORD_FRAMES)))
         self.ctrl = self.block.control()
         self.track_info = self.block.track_info()
         self.loop_timing = self.block.loop_timing()
+        self.loss_records = self.block.loss_records()
         # The pipe exists before the process does, so state published before
         # start() is waiting for it when it begins.
         self._ctx = multiprocessing.get_context('spawn')
@@ -196,6 +204,10 @@ class StreamProcess:
         """Rows written to the loop-timing ring since the stream started
         (updated whenever the frame loop yields)."""
         return self.ctrl[LT_N]
+
+    def losses_recorded(self):
+        """Loss records written since the stream started (updated with LT_N)."""
+        return self.ctrl[LOSS_N]
 
     def status(self):
         c = self.ctrl
@@ -417,6 +429,7 @@ class Streamer:
     _set_streaming = rs.ReadoutServer._set_streaming
     _write_to_stream_clients = rs.ReadoutServer._write_to_stream_clients
     _yield_due = rs.ReadoutServer._yield_due
+    _record_loss = rs.ReadoutServer._record_loss
     _drain_stream_clients = rs.ReadoutServer._drain_stream_clients
     _write_typed_update_frame = rs.ReadoutServer._write_typed_update_frame
 
@@ -427,6 +440,7 @@ class Streamer:
         self.ctrl = self.block.control()
         self.track_info = self.block.track_info()
         self.loop_timing = self.block.loop_timing()
+        self.loss_records = self.block.loss_records()
         self.stream_flags = [_SharedFlag(self.ctrl, i) for i in range(8)]
         self.stream_flags[rs.FLAG_SET_FREQS] = _SetFreqsFlag(self.ctrl, rs.FLAG_SET_FREQS, self)
         self.stream_clients = []
@@ -448,6 +462,7 @@ class Streamer:
         self._mod_dwell_pos = 0
         self._loop_timing_n = 0
         self._loop_timing_last = None
+        self._loss_records_n = 0
         self._frames_since_yield = 0
         self._last_yield = 0.0
 
@@ -496,7 +511,7 @@ class Streamer:
                 if c[TRACK_REQ] != c[TRACK_ACK]:
                     self._swap_tracking_window()
                 if self._yield_due(len(payload)):
-                    c[LT_N] = self._loop_timing_n
+                    c[LT_N], c[LOSS_N] = self._loop_timing_n, self._loss_records_n
                     await self._drain_stream_clients()
             except asyncio.CancelledError:
                 raise
@@ -508,11 +523,11 @@ class Streamer:
     def _change_mode(self, mode):
         was, now = self._mode != MODE_IDLE, mode != MODE_IDLE
         if now and not was:
-            self._loop_timing_n, self._loop_timing_last = 0, None
+            self._loop_timing_n, self._loop_timing_last, self._loss_records_n = 0, None, 0
             self._set_streaming(True)
         elif was and not now:
             self._set_streaming(False)
-        self.ctrl[LT_N] = self._loop_timing_n
+        self.ctrl[LT_N], self.ctrl[LOSS_N] = self._loop_timing_n, self._loss_records_n
         self._mode = mode
 
     def _open_interface(self):
@@ -620,8 +635,8 @@ class Streamer:
             if self.tracking is not None:
                 self.tracking.reset(msg[1])
         elif kind == 'reset_loop_timing':
-            self._loop_timing_n, self._loop_timing_last = 0, None
-            self.ctrl[LT_N] = 0
+            self._loop_timing_n, self._loop_timing_last, self._loss_records_n = 0, None, 0
+            self.ctrl[LT_N] = self.ctrl[LOSS_N] = 0
         elif kind == 'stop':
             self._stopped.set()
 

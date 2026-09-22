@@ -319,6 +319,11 @@ def _pin_worker_thread():
 # tuples: keeping one new object per frame made Python's garbage collector run
 # every ~700 frames, a ~0.2-0.5 ms pause that itself cost accumulations.
 LOOP_TIMING_FRAMES = 1 << 17
+# The ring is overwritten within a minute, so each frame that follows a lost
+# accumulation or has a torn read is also recorded with the frames before it
+# and the wall-clock time, to match against the journal (see _record_loss).
+LOSS_RECORDS = 256
+LOSS_RECORD_FRAMES = 16
 
 
 #Because we need sudo to access /dev/mem (setcap not effective)
@@ -1057,6 +1062,8 @@ class ReadoutServer:
         self.loop_timing = np.zeros((LOOP_TIMING_FRAMES, 6))   # ring buffer, see _info_loop_timing
         self._loop_timing_n = 0                         # rows written since the capture began
         self._loop_timing_last = None                   # (perf_counter at last prepare_frame exit, cnt)
+        self.loss_records = np.zeros((LOSS_RECORDS, 2 + 6 * LOSS_RECORD_FRAMES))  # see _record_loss
+        self._loss_records_n = 0                        # records written since the capture began
 
         #FFM tone tracking (doc/tone_tracking.md): off by default -- zero
         # behavioural change while None. The TrackingRuntime owns the ring
@@ -1442,6 +1449,8 @@ class ReadoutServer:
         self.loop_timing = np.zeros((LOOP_TIMING_FRAMES, 6))   # ring buffer, see _info_loop_timing
         self._loop_timing_n = 0                         # rows written since the capture began
         self._loop_timing_last = None                   # (perf_counter at last prepare_frame exit, cnt)
+        self.loss_records = np.zeros((LOSS_RECORDS, 2 + 6 * LOSS_RECORD_FRAMES))  # see _record_loss
+        self._loss_records_n = 0                        # records written since the capture began
 
         #FFM tone tracking (doc/tone_tracking.md): off by default -- zero
         # behavioural change while None. The TrackingRuntime owns the ring
@@ -5575,6 +5584,8 @@ class ReadoutServer:
             outside, missed = t_enter - last[0], (int(cnt) - last[1] - 1) & 0xFFFFFFFF
         self.loop_timing[self._loop_timing_n % len(self.loop_timing)] = (
             t_seen - t_enter, t_read - t_seen, t_exit - t_read, outside, missed, int(err))
+        if missed or err:
+            self._record_loss()
         self._loop_timing_n += 1
         self._loop_timing_last = (t_exit, int(cnt))
 
@@ -6369,9 +6380,22 @@ class ReadoutServer:
                         f"differ from the firmware", source='info')
         return report
 
+    def _record_loss(self):
+        """Copy the loop-timing rows of this frame and the LOSS_RECORD_FRAMES - 1
+        before it into ``loss_records``: wall-clock time, frame number, then the
+        rows oldest first (NaN before the capture's first frame)."""
+        ring, n = self.loop_timing, self._loop_timing_n
+        k = min(LOSS_RECORD_FRAMES, n + 1)
+        rec = self.loss_records[self._loss_records_n % len(self.loss_records)]
+        rec[:] = np.nan
+        rec[0], rec[1] = time.time(), n
+        rec[2 + 6 * (LOSS_RECORD_FRAMES - k):] = ring[np.arange(n - k + 1, n + 1) % len(ring)].ravel()
+        self._loss_records_n += 1
+
     def _reset_loop_timing(self):
         self._loop_timing_n = 0
         self._loop_timing_last = None
+        self._loss_records_n = 0
         if self.stream_process is not None:
             self.stream_process.send('reset_loop_timing')
 
@@ -6397,6 +6421,12 @@ class ReadoutServer:
         in us then ``missed, torn``. A read lasting the whole gap on the torn frame
         means the bus held the CPU off; a huge ``missed`` means the counter
         stepped backwards.
+
+        ``losses`` keeps every frame that followed lost accumulations or had a
+        torn read (the last 256; ``losses_recorded`` counts them all), which the
+        ring above loses within a minute: the board's ``wall_time``, the
+        ``frame`` number, and ``rows`` for it and the 15 frames before it, laid
+        out as in ``events``.
         """
         sp = self.stream_process
         # With a stream process, its frames: the ring is in the shared block.
@@ -6428,6 +6458,14 @@ class ReadoutServer:
                           'rows': [[round(float(1e6 * v), 1) for v in rows[j, :4]] + [int(rows[j, 4]), int(rows[j, 5])]
                                    for j in range(max(k - 1, 0), k + 1)]}
                          for k in ev]
+        recs = sp.loss_records if sp is not None else self.loss_records
+        n_rec = sp.losses_recorded() if sp is not None else self._loss_records_n
+        recs = recs[:n_rec] if n_rec <= len(recs) else np.roll(recs, -(n_rec % len(recs)), axis=0)
+        out['losses_recorded'] = int(n_rec)
+        out['losses'] = [{'wall_time': float(r[0]), 'frame': int(r[1]),
+                          'rows': [[round(float(1e6 * v), 1) for v in row[:4]] + [int(row[4]), int(row[5])]
+                                   for row in r[2:].reshape(-1, 6) if not np.isnan(row[0])]}
+                         for r in recs]
         if len(rows) < 2:
             return out
 
