@@ -102,7 +102,7 @@ apply_phc_offset() {
     fi
 
     sed -i -E \
-        "s|^(refclock[[:space:]]+PHC[[:space:]]+/dev/ptp0[[:space:]].*)offset[[:space:]]+[^[:space:]]+|\\1offset ${PHC_OFFSET}|" \
+        "s|^(refclock[[:space:]]+PHC[[:space:]]+/dev/ptp[^[:space:]]*[[:space:]].*)offset[[:space:]]+[^[:space:]]+|\\1offset ${PHC_OFFSET}|" \
         "$dst"
     echo "Set chrony PHC refclock offset to ${PHC_OFFSET} seconds in $dst"
 }
@@ -133,6 +133,12 @@ install_service() {
     chmod "$mode" "$dst"
 }
 
+# A stable /dev/ptp-end0 for end0's PHC, which the kernel renumbers on every
+# ifdown/ifup. Always installed: chrony's config and the monitor rely on it.
+install_service "${TIMING_DIR}/90-ptp-end0.rules" "/etc/udev/rules.d/90-ptp-end0.rules" 644
+udevadm control --reload-rules
+udevadm trigger --subsystem-match=ptp --action=add
+udevadm settle
 install_config "${TIMING_DIR}/ptp4l.conf" "/etc/linuxptp/ptp4l.conf" 644
 install_config "${TIMING_DIR}/ptp-phc.conf" "/etc/chrony/conf.d/ptp-phc.conf" 644
 apply_phc_offset "/etc/chrony/conf.d/ptp-phc.conf"

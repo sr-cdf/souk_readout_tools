@@ -515,7 +515,7 @@ def _ensure_daemon_files(dirs, pipeline_id):
         if SUDO and os.path.exists(timing_dir):
             os.chown(timing_dir, TARGET_UID, TARGET_GID)
 
-        for config_file in ('ptp4l.conf', 'ptp-phc.conf'):
+        for config_file in ('ptp4l.conf', 'ptp-phc.conf', '90-ptp-end0.rules'):
             dst_config = os.path.join(timing_dir, config_file)
             copy_package_file(pkg_timing_dir.joinpath(config_file), dst_config, 0o664)
 

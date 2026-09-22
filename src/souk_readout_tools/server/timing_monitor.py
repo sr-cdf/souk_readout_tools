@@ -109,7 +109,9 @@ class _PtpSysOffsetPrecise(ctypes.Structure):
 
 STA_UNSYNC = 0x0040
 PTP_SYS_OFFSET_PRECISE = 0xC0403D08   # _IOWR('=', 8, struct ptp_sys_offset_precise)
-PHC_DEVICE = "/dev/ptp0"
+# end0's PHC under a name that follows it (data/timing/90-ptp-end0.rules): the
+# kernel renumbers /dev/ptpN every time the interface goes down and up.
+PHC_DEVICE = "/dev/ptp-end0"
 
 
 def kernel_clock_status() -> dict:
@@ -148,7 +150,7 @@ def _fd_to_clockid(fd: int) -> int:
 def phc_sys_offset_s(fd: int) -> Optional[float]:
     """
     System clock minus PHC, measuring the two clocks instead of reporting what
-    chrony believes about them. Needs an open /dev/ptp0 (root); None if neither
+    chrony believes about them. Needs an open PHC_DEVICE (root); None if neither
     method works.
 
     Uses PTP_SYS_OFFSET_PRECISE where the driver cross-timestamps both clocks in
@@ -478,8 +480,12 @@ class ChronycClient:
 
     @staticmethod
     async def _get_plain(*args: str) -> str:
+        # -n: numeric addresses. Without it the human-readable `sources` hangs
+        # on name resolution on the board (>10 s, measured 2026-09-22, while
+        # `getent hosts` answers in 6 ms), so every call hit the timeout and
+        # logged a warning; the CSV forms were never affected.
         return await _run_subprocess(
-            "chronyc", *args, timeout=CHRONYC_TIMEOUT_S
+            "chronyc", "-n", *args, timeout=CHRONYC_TIMEOUT_S
         )
 
     @staticmethod
@@ -674,12 +680,17 @@ class TimingMonitor:
         self.ptp_interval_s = float(ptp_interval_s)
         self._ptp: Optional[tuple] = None             # last pmc results
         self._ptp_monotonic: Optional[float] = None
-        try:                                  # root-only; None elsewhere
-            self._phc_fd: Optional[int] = os.open(PHC_DEVICE, os.O_RDONLY)
-        except OSError:
-            self._phc_fd = None
+        self._phc_fd: Optional[int] = self._open_phc()
         self._detail: Optional[tuple] = None          # last slow-query results
         self._detail_monotonic: Optional[float] = None
+
+    @staticmethod
+    def _open_phc() -> Optional[int]:
+        """An fd on PHC_DEVICE, or None (not root, or no such device)."""
+        try:
+            return os.open(PHC_DEVICE, os.O_RDONLY)
+        except OSError:
+            return None
 
     async def poll_once(self) -> None:
         now = self._time_func()
@@ -716,6 +727,13 @@ class TimingMonitor:
         detail_age_s = monotonic_now - self._detail_monotonic
         clock = kernel_clock_status()
         phc_offset = phc_sys_offset_s(self._phc_fd) if self._phc_fd is not None else None
+        if phc_offset is None:
+            # An ifdown/ifup replaces the PHC, and the old fd reads nothing
+            # from then on: open it again by name and retry once.
+            if self._phc_fd is not None:
+                os.close(self._phc_fd)
+            self._phc_fd = self._open_phc()
+            phc_offset = phc_sys_offset_s(self._phc_fd) if self._phc_fd is not None else None
         port_state = (port_data.get("port_state") or "UNKNOWN").upper()
         selected = next(
             (source.get("name", "") for source in chrony_sources

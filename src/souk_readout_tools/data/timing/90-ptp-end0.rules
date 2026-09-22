@@ -1,0 +1,12 @@
+# A stable name for end0's PTP hardware clock: /dev/ptp-end0.
+#
+# The kernel numbers PTP clocks in the order they register, and the GEM driver
+# unregisters its clock on ifdown and registers a new one on ifup, so /dev/ptpN
+# moves: on 2026-09-22 an ifdown/ifup (after the board dropped its secondary IP)
+# turned /dev/ptp0 into /dev/ptp1, and chrony's refclock pointed at a device
+# that no longer existed. chrony (ptp-phc.conf) and the timing monitor use this
+# name instead. The clock's parent in sysfs is the interface itself, so the rule
+# matches it by name.
+#
+# Installed to /etc/udev/rules.d/ by install_timing_services.sh.
+SUBSYSTEM=="ptp", KERNELS=="end0", SYMLINK+="ptp-end0"
