@@ -167,6 +167,7 @@ For full installation details (including server setup, SD card imaging, and daem
 | `souk-restart-daemon` | Restart the server systemd service(s) without reinstalling them |
 | `souk-restart-daemons` | Restart both pipeline systemd services without reinstalling them |
 | `souk-enable-timing` | Install and restart the packaged `ptp4l`, chrony PHC, and timing-monitor setup |
+| `souk-enable-tuning` | KRM only: CPU layout, real-time stream processes and network tuning for both pipelines (`souk-disable-tuning` undoes it, `souk-tuning-status` shows it) |
 | `souk-timing-monitor` | Run the PTP/NTP timing monitor daemon |
 | `souk-test-timing-monitor` | Query or stream status from `/run/timing-monitor.sock` |
 | `souk-find-attenuators` | Discover RUDAT and SOUK mixerless-module attenuators (`--status` for live values) |

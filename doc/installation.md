@@ -13,6 +13,7 @@ Detailed installation instructions for SOUK Readout Tools.
   - [Writing the SD Card Image](#0-writing-the-sd-card-image)
   - [Enable Timing Services](#7-enable-timing-services-recommended)
   - [Enable the LNA Bias Service](#8-enable-the-lna-bias-service-one-board-per-telescope)
+  - [Tune the KRM Board](#9-tune-the-krm-board-krm-only)
 - [Client Installation](#client-installation)
 - [Configuration Reference](#configuration-reference)
 - [Troubleshooting](#troubleshooting)
@@ -470,6 +471,39 @@ Restart, stop, or remove the service with `souk-lna-service-restart`,
 See [lna_bias.md](lna_bias.md) for the client API, board revisions (v2 adds
 per-channel hard power switching), and the `i2c`/`fixed` backends used for
 bench setups.
+
+### 9. Tune the KRM Board (KRM Only)
+
+Streaming both pipelines at 2500 Hz with modulation and tone tracking, without
+losing accumulations, needs the board set up for it. This step is specific to
+the KRM (two pipelines on the four A53 cores, Ethernet on `end0`). Skip it on
+other platforms such as the RFSoC 4x2: everything works without it, at lower
+sustained rates.
+
+```bash
+souk-enable-tuning        # apply, and restart both readout servers
+souk-tuning-status        # what is applied
+souk-disable-tuning       # undo, and restart both readout servers
+```
+
+It gives each pipeline's stream loop a CPU core of its own (CPU2 and CPU3) and
+moves everything else, including each server's request side, to CPU0-1. Each
+stream loop runs in its own process at real-time priority, the socket buffer
+limits are raised, and each stream core gets its own network transmit queue.
+The kernel-side part is re-applied at every boot by `souk-rt-kernel.service`.
+`souk-enable-tuning --in-process` keeps each stream loop inside its server
+instead; `--journald-volatile` keeps the journal in RAM. The header of
+`data/daemon/rt_tuning.sh` lists every setting.
+
+Also enable DMA reads of the accumulator in each pipeline's config (the KRM
+image provides the buffers), with a separate buffer and channel per pipeline:
+
+```yaml
+firmware:
+  zdma: true
+  zdma_udmabuf: "udmabuf0"   # "udmabuf1" for pipeline 1 (a string: quote it)
+  zdma_channel: 0            # 1 for pipeline 1
+```
 
 ---
 

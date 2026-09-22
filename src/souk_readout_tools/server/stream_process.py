@@ -42,8 +42,8 @@ modulation engine, which steps hardware from the frame loop, and triggered
 streams. ``get_info('loop_timing')`` reports the stream process's frames.
 
 CPUs: the stream process pins itself to ``SOUK_STREAM_CPUS`` and the server
-moves itself to ``SOUK_WORKER_CPUS`` (``profiling/rt_tuning.sh
---split-threads`` sets both). Without them the two share a core, and the
+moves itself to ``SOUK_WORKER_CPUS`` (on the KRM, ``souk-enable-tuning`` sets
+both, and ``SOUK_STREAM_RT_PRIO``). Without them the two share a core, and the
 kernel preempts the frame loop whenever the server works.
 """
 

@@ -639,7 +639,7 @@ findings: `doc/v712-notes.md`, "LO control writes through a RAM copy".
 - `board_checks.py` — correctness checks on the board, servers stopped (B5)
 - `control_write_check.py` — LO control writes through the RAM copy: correctness + old/new timings
 - `host_checks.py` — peripherals, timed sync and sweep + fit, from the host (B6–B8)
-- `rt_tuning.sh` — CPU layout and socket-buffer limits for two servers at once
+- `rt_tuning.sh` — moved to `src/souk_readout_tools/data/daemon/` and run by `souk-enable-tuning` (KRM board tuning)
 - `zdma_channel_check.py` — validate a DMA channel + u-dma-buf against devmem
 - `acc_cnt_probe.py` — tight `acc_cnt` read loop that records impossible jumps and backward steps
 - `loop_timing_summary.py` — per-capture summary of `rate_ladder.py --loop-timing` rows

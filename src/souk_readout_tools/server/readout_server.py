@@ -298,10 +298,10 @@ STREAM_KEEPALIVE_IDLE_S = 1
 STREAM_SEND_BUFFER_BYTES = 1 << 20
 
 # CPU isolation for streaming, set through the systemd unit by
-# profiling/rt_tuning.sh: the event-loop thread, which builds and sends every
-# frame, runs alone on SOUK_STREAM_CPUS; all other threads of the server
-# (executor workers serving requests, katcp I/O) on SOUK_WORKER_CPUS, so they
-# cannot preempt it. Unset: no change.
+# souk-enable-tuning (data/daemon/rt_tuning.sh): the event-loop thread, which
+# builds and sends every frame, runs alone on SOUK_STREAM_CPUS; all other
+# threads of the server (executor workers serving requests, katcp I/O) on
+# SOUK_WORKER_CPUS, so they cannot preempt it. Unset: no change.
 def _cpus_from_env(name):
     value = os.environ.get(name, '').strip()
     return {int(c) for c in value.split(',') if c.strip()} if value else None

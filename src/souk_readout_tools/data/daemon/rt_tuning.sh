@@ -1,50 +1,44 @@
 #!/bin/bash
-# CPU and network layout for two readout servers streaming at full speed on the
-# 4-core A53 (doc/v712-notes.md, "Pushing the zero-drop rate"). Board-side, root:
+# Board tuning for the KRM (two readout pipelines on the RFSoC's four A53
+# cores). Specific to that board: it assumes two servers, readout_server_0 and
+# readout_server_1, and the Ethernet interface end0 with two transmit queues.
+# Leave it off on other platforms (e.g. the RFSoC 4x2); nothing else depends on
+# it. Run through the console scripts, or directly as root:
 #
-#     sudo ./rt_tuning.sh status
-#     sudo ./rt_tuning.sh apply [--journald-volatile] [--split-threads]
-#     sudo ./rt_tuning.sh kernel      # just the part a reboot undoes (see below)
-#     sudo ./rt_tuning.sh revert
+#     souk-enable-tuning [--in-process] [--journald-volatile]   # = sudo rt_tuning.sh apply ...
+#     souk-disable-tuning                                       # = sudo rt_tuning.sh revert
+#     souk-tuning-status                                        # = sudo rt_tuning.sh status
+#     sudo rt_tuning.sh kernel      # only the part a reboot undoes (see below)
 #
-# Layout applied:
-#   CPU0-1  everything else: systemd default CPUAffinity, so ptp4l, tsu-strobe,
-#           tcpborphserver, chrony, journald, ssh and any later process; the
-#           movable kernel threads (e.g. watchdogd), unbound workqueues and new
-#           IRQs. The Ethernet (end0) and SD-card (mmc1) interrupts already land
-#           on CPU0.
-#   CPU2    readout_server_0 alone; CPU3 readout_server_1 alone.
-#           --split-threads: only each server's event-loop thread (it builds and
-#           sends the frames) stays there, its other threads (request workers,
-#           katcp I/O) go to CPU0-1 via SOUK_STREAM_CPUS / SOUK_WORKER_CPUS.
-#           Measured worse on 2026-09-17 (GIL contention), so off by default.
-#   net.core.wmem_max / rmem_max 32 MiB, so the servers' 1 MiB SO_SNDBUF request
-#           is honoured instead of being capped at 212 992 B (~13 ms at 2 kHz).
-#   end0 transmit queues: tx-0 for CPU2, tx-1 for CPU3 (XPS). Left to the flow
-#           hash, both streams often share a queue, and then one stream core can
-#           end up sending the other's packets as well: +30 us a frame on one
-#           pipeline, -30 us on the other, fixed for the whole connection
-#           (2026-09-22).
+# What 'apply' sets up:
+#   CPU0-1  everything that is not a stream loop: systemd's default CPUAffinity
+#           (ptp4l, tsu-strobe, tcpborphserver, chrony, journald, ssh, and each
+#           readout server's own request side), kernel threads that can move,
+#           unbound workqueues and new interrupts. The Ethernet and SD-card
+#           interrupts already arrive on CPU0.
+#   CPU2    pipeline 0's stream loop, alone; CPU3 pipeline 1's.
+#           By default each stream loop runs in its own process
+#           (SOUK_STREAM_PROCESS=1) at real-time priority (SOUK_STREAM_RT_PRIO=50),
+#           and its server moves to CPU0-1 (SOUK_WORKER_CPUS). Real-time priority
+#           is what keeps the kernel's periodic per-CPU work (the SLAB cache
+#           reaper, every 2 s for 100-300 us) from delaying the loop, and it is
+#           safe because the loop sleeps between accumulations instead of
+#           spinning. --in-process instead keeps each whole server, stream loop
+#           included, on its core at normal priority (the older layout).
+#   Network: net.core.wmem_max / rmem_max 32 MiB, so each server's 1 MiB send
+#           buffer is granted (the default cap is 208 KiB, ~13 ms at 2 kHz), and
+#           one end0 transmit queue per stream core (tx-0 for CPU2, tx-1 for
+#           CPU3). Without that, both streams can share a queue, and then one
+#           stream core also sends the other's packets (~30 us a frame).
 #
-# Not applied here: SCHED_FIFO. A spinning real-time task is either throttled
-# by kernel.sched_rt_runtime_us (a 50 ms stall every second) or, with
-# throttling off, starves the per-CPU kernel threads on its core. The stream
-# process (firmware.stream_process) no longer spins -- with late reads its wait
-# sleeps between accumulations -- so it can run SCHED_FIFO: set
-# SOUK_STREAM_RT_PRIO=50 in its unit's environment. That is what gets it past
-# SLAB's cache_reap, which runs on every CPU every 2 s (~100-300 us) and, on
-# this PREEMPT_NONE kernel, otherwise holds a waking SCHED_OTHER frame loop off
-# its own core (2026-09-22).
+# The systemd and sysctl files persist across a reboot. The kernel-side settings
+# (kernel threads, workqueue and interrupt masks, transmit queues) do not, so
+# 'apply' also installs souk-rt-kernel.service, which runs 'kernel' at every
+# boot from a copy of this script in /usr/local/sbin.
 #
-# The systemd and sysctl files persist; moving the kernel threads, the unbound
-# workqueue mask and the default IRQ mask do not -- a reboot puts them back on
-# all four CPUs, and kernel work then lands on the stream cores whenever the
-# frame loop sleeps (2026-09-22: a 2 s event woke the frame loop ~300 us late
-# after two reboots). 'apply' therefore also installs souk-rt-kernel.service,
-# which runs 'kernel' at every boot, from a copy of this script in /usr/local/sbin.
-#
-# --journald-volatile keeps the journal in RAM (removed large stalls at
-# 3.5-4 kHz before); the journal is then lost on reboot. Flags in any order.
+# --journald-volatile keeps the journal in RAM (it removed large stalls at
+# 3.5-4 kHz); the journal is then lost on reboot. Options in any order.
+# Background and measurements: doc/v712-notes.md.
 set -u
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)"; exit 1; }
 CMD=${1:-status}
@@ -104,25 +98,29 @@ status() {
     for f in $SYSTEMD_CONF $SYSCTL_CONF $JOURNALD_CONF $BOOT_UNIT $BOOT_SCRIPT /etc/systemd/system/readout_server_{0,1}.service.d/50-cpu.conf; do
         [ -e "$f" ] && echo "  present: $f" || echo "  absent:  $f"
     done
+    echo "== readout server environment (from all drop-ins)"
+    for s in $SERVERS; do
+        echo "  ${s%%:*}: $(systemctl show -p Environment --value ${s%%:*} 2>/dev/null)"
+    done
 }
 
 apply() {
     mkdir -p "$(dirname $SYSTEMD_CONF)" "$(dirname $SYSCTL_CONF)"
     printf '[Manager]\nCPUAffinity=0 1\n' > $SYSTEMD_CONF
     printf 'net.core.wmem_max = 33554432\nnet.core.rmem_max = 33554432\n' > $SYSCTL_CONF
-    volatile=no; split=no
+    volatile=no; process=yes
     for arg in "$@"; do
         case "$arg" in
             --journald-volatile) volatile=yes ;;
-            --split-threads) split=yes ;;
+            --in-process) process=no ;;
             *) echo "unknown option $arg"; exit 1 ;;
         esac
     done
     for s in $SERVERS; do
         unit=${s%%:*}; cpu=${s##*:}
         mkdir -p /etc/systemd/system/$unit.service.d
-        if [ $split = yes ]; then
-            printf '[Service]\nCPUAffinity=%s\nEnvironment=SOUK_STREAM_CPUS=%s SOUK_WORKER_CPUS=%s\n' \
+        if [ $process = yes ]; then
+            printf '[Service]\nCPUAffinity=%s\nEnvironment=SOUK_STREAM_CPUS=%s SOUK_WORKER_CPUS=%s SOUK_STREAM_PROCESS=1 SOUK_STREAM_RT_PRIO=50\n' \
                 "$cpu" "$cpu" "$HOUSEKEEPING" > /etc/systemd/system/$unit.service.d/50-cpu.conf
         else
             printf '[Service]\nCPUAffinity=%s\n' "$cpu" > /etc/systemd/system/$unit.service.d/50-cpu.conf
@@ -181,5 +179,5 @@ case "$CMD" in
     apply)  shift; apply "$@" ;;
     kernel) kernel_affinity ;;
     revert) revert ;;
-    *) echo "usage: sudo $0 status | apply [--journald-volatile] [--split-threads] | kernel | revert"; exit 1 ;;
+    *) echo "usage: sudo $0 status | apply [--in-process] [--journald-volatile] | kernel | revert"; exit 1 ;;
 esac
