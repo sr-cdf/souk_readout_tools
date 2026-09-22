@@ -57,6 +57,14 @@ firmware:
   zdma: false
   zdma_udmabuf: "udmabuf0"
   zdma_channel: 0
+  # Run the stream loop (read -> frame -> send -> tracking tap) in its own
+  # process, so no request, tracking window or info call can hold it up
+  # (server/stream_process.py). For testing. Pin it with SOUK_STREAM_CPUS and
+  # move the server off its core with SOUK_WORKER_CPUS (rt_tuning.sh
+  # --split-threads). The DMA channel above then belongs to the stream process.
+  # Not with the sw modulation engine or triggered streams. The environment
+  # variable SOUK_STREAM_PROCESS=1/0 overrides this.
+  stream_process: false
   dac_fullscale_bits: 16
   adc_fullscale_bits: 16
   dac_physical_bits: 14

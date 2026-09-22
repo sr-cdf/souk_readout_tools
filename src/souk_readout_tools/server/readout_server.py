@@ -25,6 +25,7 @@ Version: 1.2.0
 
 
 import asyncio, contextvars, functools
+import atexit
 import concurrent.futures
 import gc
 import threading
@@ -1017,13 +1018,13 @@ class ReadoutServer:
         self.sweep_task = None
         self.stream_task = None
         self.triggered_stream_task = None
-        self.e_stream_enabled = asyncio.Event()
+        self.e_stream_enabled = _PublishedEvent(self)
         self.e_stream_stopped = asyncio.Event()     # the inverse, for waiters
         self.e_stream_stopped.set()
         self.e_triggered_stream_enabled = asyncio.Event()
         self.tasks = []
         self.fake_trigger_event = asyncio.Event()
-        self.stream_flags = [asyncio.Event() for _ in range(8)]
+        self.stream_flags = [_PublishedEvent(self) for _ in range(8)]
 
         #fast frequency modulation state
         self.e_modulation_enabled = asyncio.Event()   # modulation armed (alongside e_stream_enabled)
@@ -1042,7 +1043,7 @@ class ReadoutServer:
         # software (manual) switches between them and stamps each accumulation
         # with its live slot. Mutually exclusive with the software modulation
         # above -- both ride the frame[-5] tag word, so only one runs at a time.
-        self.e_fw_modulation_enabled = asyncio.Event()  # fw-slot modulation active
+        self.e_fw_modulation_enabled = _PublishedEvent(self)  # fw-slot modulation active
         self.fw_modulation_params = None                # prepared per-slot control bundle
         self.fw_modulation_cfg = None                   # center, slot offsets, mod_indices, n_dwell, mode
         self.fw_modulation_state = None                 # get_info payload
@@ -1122,9 +1123,11 @@ class ReadoutServer:
         if level == "firmware":
             # 1) Program firmware if needed (verbose so the log records *why*)
             if firmware_lib.needs_programming(self.r, self.config, verbose=True):
+                self._pause_stream_process()
                 self.r, self.r_fast = firmware_lib.reload_firmware(self.config, r=self.r)
             # 2) Shared resources init if needed
             if firmware_lib.needs_shared_resource_initialising(self.r, self.config):
+                self._pause_stream_process()
                 firmware_lib.initialise_shared_resources(self.r, self.config)
             
             #re-establish firmware interfaces in case they were initially created before programming
@@ -1136,12 +1139,15 @@ class ReadoutServer:
         if level == "pipeline":
             # 1) Program firmware if needed (verbose so the log records *why*)
             if firmware_lib.needs_programming(self.r, self.config, verbose=True):
+                self._pause_stream_process()
                 self.r, self.r_fast = firmware_lib.reload_firmware(self.config, r=self.r)
             # 2) Shared resources init if needed
             if firmware_lib.needs_shared_resource_initialising(self.r, self.config):
+                self._pause_stream_process()
                 firmware_lib.initialise_shared_resources(self.r, self.config)
             # 3) Pipeline resources init if needed
             if firmware_lib.needs_pipeline_initialising(self.r, self.config):
+                self._pause_stream_process()
                 firmware_lib.initialise_pipeline_resources(self.r, self.r_fast, self.config)
                 self.applied_config = copy.deepcopy(self.config)
 
@@ -1158,6 +1164,8 @@ class ReadoutServer:
         query the firmware. See issue #14 - touching AXI with a dead fabric clock
         hangs the PS.
         """
+        self._pause_stream_process(strict=False)
+        self._fabric_ok = False
         self.r = None
         self.r_fast = None
         self._clock_fault = {
@@ -1265,7 +1273,8 @@ class ReadoutServer:
         # falls back to the CPU mapping (with a warning) if the buffer or a DMA
         # channel is unavailable, so a wrong setting degrades rather than fails.
         fw_cfg = self.config.get('firmware', {})
-        if fw_cfg.get('zdma'):
+        # (With a stream process, the DMA channel is that process's.)
+        if fw_cfg.get('zdma') and self.stream_process is None:
             firmware_lib.ZDMA_ENABLED = True
             firmware_lib.ZDMA_UDMABUF = fw_cfg.get('zdma_udmabuf', 'udmabuf0')
             firmware_lib.ZDMA_CHANNEL = int(fw_cfg.get('zdma_channel', 0))
@@ -1303,6 +1312,10 @@ class ReadoutServer:
                     f'match config',
                     source=source,
                 )
+        # The stream process may read the fabric again once it is known good.
+        self._fabric_ok = ok
+        if ok and self.stream_process is not None:
+            self.stream_process.resume()
         return self.r, self.r_fast
 
     def force_ready(self, level='pipeline'):
@@ -1331,8 +1344,10 @@ class ReadoutServer:
         try:
             if level == "firmware":
                 # 1) Program firmware
+                self._pause_stream_process()
                 self.r, self.r_fast = firmware_lib.reload_firmware(self.config, r=self.r)
                 # 2) Shared resources
+                self._pause_stream_process()
                 firmware_lib.initialise_shared_resources(self.r, self.config)
 
                 #re-establish firmware interfaces in case they were initially created before programming
@@ -1342,10 +1357,13 @@ class ReadoutServer:
 
             if level == "pipeline":
                 # 1) Program firmware
+                self._pause_stream_process()
                 self.r, self.r_fast = firmware_lib.reload_firmware(self.config, r=self.r)
                 # 2) Shared resources
+                self._pause_stream_process()
                 firmware_lib.initialise_shared_resources(self.r, self.config)
                 # 3) Pipeline resources
+                self._pause_stream_process()
                 firmware_lib.initialise_pipeline_resources(self.r, self.r_fast, self.config)
                 self.applied_config = copy.deepcopy(self.config)
 
@@ -1386,12 +1404,12 @@ class ReadoutServer:
         self.sweep_task = None
         self.stream_task = None
         self.triggered_stream_task = None
-        self.e_stream_enabled = asyncio.Event()
+        self.e_stream_enabled = _PublishedEvent(self)
         self.e_stream_stopped = asyncio.Event()     # the inverse, for waiters
         self.e_stream_stopped.set()
         self.e_triggered_stream_enabled = asyncio.Event()
         self.tasks = []
-        self.stream_flags = [asyncio.Event() for _ in range(8)]
+        self.stream_flags = [_PublishedEvent(self) for _ in range(8)]
 
         #fast frequency modulation state
         self.e_modulation_enabled = asyncio.Event()   # modulation armed (alongside e_stream_enabled)
@@ -1410,7 +1428,7 @@ class ReadoutServer:
         # software (manual) switches between them and stamps each accumulation
         # with its live slot. Mutually exclusive with the software modulation
         # above -- both ride the frame[-5] tag word, so only one runs at a time.
-        self.e_fw_modulation_enabled = asyncio.Event()  # fw-slot modulation active
+        self.e_fw_modulation_enabled = _PublishedEvent(self)  # fw-slot modulation active
         self.fw_modulation_params = None                # prepared per-slot control bundle
         self.fw_modulation_cfg = None                   # center, slot offsets, mod_indices, n_dwell, mode
         self.fw_modulation_state = None                 # get_info payload
@@ -1606,8 +1624,11 @@ class ReadoutServer:
         self.ensure_ready(level="pipeline", log_source='pipeline')
     
         #force pipeline init
+        self._pause_stream_process()
         firmware_lib.initialise_pipeline_resources(self.r, self.r_fast, self.config)
         self.applied_config = copy.deepcopy(self.config)
+        if self.stream_process is not None and getattr(self, '_fabric_ok', False):
+            self.stream_process.resume()
 
         return
 
@@ -2056,7 +2077,7 @@ class ReadoutServer:
             'clock_fault_message': clock_fault['message'] if clock_fault else None,
             'timing_ready': timing.get('ready_for_firmware_sync', False),
             'timing_state': timing.get('state'),
-            'streaming': self.e_stream_enabled.is_set() and self.stream_task is not None and not self.stream_task.done(),
+            'streaming': self._stream_running(),
             'triggered_streaming': self.e_triggered_stream_enabled.is_set() and self.triggered_stream_task is not None and not self.triggered_stream_task.done(),
             'modulation_streaming': self.e_modulation_enabled.is_set(),
             'sweeping': self.sweep_task is not None and not self.sweep_task.done(),
@@ -2130,7 +2151,7 @@ class ReadoutServer:
             'request_client_addrs': [c.get_extra_info('peername') for c in self.request_clients],
             'stream_clients': len(self.stream_clients),
             'stream_client_addrs': [c.get_extra_info('peername') for c in self.stream_clients],
-            'streaming': self.e_stream_enabled.is_set() and self.stream_task is not None and not self.stream_task.done(),
+            'streaming': self._stream_running(),
             'triggered_streaming': (self.e_triggered_stream_enabled.is_set()
                                     and self.triggered_stream_task is not None
                                     and not self.triggered_stream_task.done()),
@@ -3257,6 +3278,8 @@ class ReadoutServer:
                     self._isolate_frame_thread()       # catch threads started since
                     self._reset_loop_timing()
                     self.stream_sparse_read = message.get('sparse_read')
+                    if self.stream_process is not None:
+                        self.stream_process.send('sparse_read', self.stream_sparse_read)
                     self.e_triggered_stream_enabled.clear()
                     self._set_streaming(True)
                     print('Stream enabled, clients:', self.stream_clients)
@@ -3273,6 +3296,12 @@ class ReadoutServer:
                     # continuous output (call enable_stream) and does NOT itself
                     # capture (call get_samples). Heavy prep runs off the hot path.
                     try:
+                        if self.stream_process is not None:
+                            raise ValueError(
+                                'the sw modulation engine steps hardware from the frame '
+                                'loop, which runs in the stream process here; use the fw '
+                                "engine (enable_modulation(engine='fw')), or turn "
+                                'firmware.stream_process off')
                         if self.e_stream_enabled.is_set():
                             raise ValueError(
                                 'disable_stream before enable_modulation; initial modulation '
@@ -3909,9 +3938,13 @@ class ReadoutServer:
                         await self.send_response(writer, {'status': 'error', 'message': str(e)})
 
                 elif request == 'enable_triggered_stream':
-                    self._set_streaming(False)
-                    self.e_triggered_stream_enabled.set()
-                    await self.send_response(writer, {'status': 'success'})
+                    if self.stream_process is not None:
+                        await self.send_response(writer, {'status': 'error', 'message':
+                            'triggered streams are not supported with the stream process'})
+                    else:
+                        self._set_streaming(False)
+                        self.e_triggered_stream_enabled.set()
+                        await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'disable_triggered_stream':
                     self.e_triggered_stream_enabled.clear()
@@ -4601,6 +4634,106 @@ class ReadoutServer:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, max_fails)
 
 
+    # -- the stream loop in its own process (stream_process.py) ----------------
+    # None unless firmware.stream_process / SOUK_STREAM_PROCESS is on. Everything
+    # the frame loop reads from this server goes through the two properties
+    # below and the _PublishedEvent flags, so no call site needs to know.
+    stream_process = None
+
+    @property
+    def active_tone_indices(self):
+        """Accumulator channels the frames carry, in user tone order."""
+        return self._active_tone_indices
+
+    @active_tone_indices.setter
+    def active_tone_indices(self, value):
+        self._active_tone_indices = value
+        if self.stream_process is not None:
+            self.stream_process.publish_tones(value)
+
+    @property
+    def fw_modulation_state(self):
+        """The fw engine's get_info payload (carries ``applied_revision``)."""
+        return self._fw_modulation_state
+
+    @fw_modulation_state.setter
+    def fw_modulation_state(self, value):
+        self._fw_modulation_state = value
+        self._publish_stream_state()
+
+    def _publish_stream_state(self):
+        """Hand the stream process the mode, the flags and the fw revision."""
+        sp = self.stream_process
+        if sp is None:
+            return
+        flags = 0
+        for i, flag in enumerate(getattr(self, 'stream_flags', ())):
+            if flag.is_set():
+                flags |= 1 << i
+        state = getattr(self, '_fw_modulation_state', None)
+        cfg = getattr(self, 'fw_modulation_cfg', None)
+        fw = getattr(self, 'e_fw_modulation_enabled', None)
+        on = getattr(self, 'e_stream_enabled', None)
+        sp.publish(streaming=bool(on is not None and on.is_set()),
+                   fw=bool(fw is not None and fw.is_set()),
+                   flags=flags,
+                   fw_rev=int(state['applied_revision']) if state else 0,
+                   fw_n_settle=int(cfg.get('n_settle', 0)) if cfg else 0)
+
+    def _stream_running(self):
+        """Streaming is enabled and a frame loop is alive to do it."""
+        if not self.e_stream_enabled.is_set():
+            return False
+        if self.stream_process is not None:
+            return self.stream_process.alive()
+        return self.stream_task is not None and not self.stream_task.done()
+
+    def _pause_stream_process(self, strict=True):
+        """Before anything that can reprogram the FPGA or its clocks: returns once
+        the stream process has stopped reading (unclocked fabric hangs the
+        board). It resumes when _create_firmware_interfaces finds the fabric
+        healthy again. Raises if it does not confirm, unless not ``strict``."""
+        if self.stream_process is None:
+            return
+        try:
+            self.stream_process.pause()
+        except RuntimeError as e:
+            if strict:
+                raise
+            _server_log(str(e), source='clock')
+
+    async def _start_stream_process(self):
+        """Start the stream loop in its own process (async_main, when wanted)."""
+        from souk_readout_tools.server import stream_process as sp_mod
+        fw_cfg = self.config.get('firmware', {}) if self.config else {}
+        sp = sp_mod.StreamProcess({
+            'fw_config_file': fw_cfg.get('fw_config_file'),
+            'pipeline_id': fw_cfg.get('pipeline_id', 0),
+            'address': self.server_address, 'port': self.stream_server_port,
+            'zdma': bool(fw_cfg.get('zdma')),
+            'zdma_udmabuf': fw_cfg.get('zdma_udmabuf', 'udmabuf0'),
+            'zdma_channel': int(fw_cfg.get('zdma_channel', 0))})
+        # The stream process claims the DMA channel and its landing buffer; this
+        # process reads (sweeps, get_samples) through the CPU mapping instead.
+        firmware_lib.ZDMA_ENABLED = False
+        sp.snapshot_frame = lambda: tone_tracking.pack_typed_frame(
+            tone_tracking.FRAME_TYPE_SNAPSHOT, self._tone_update_snapshot())
+        # The stream process gets SOUK_STREAM_CPUS, or else this server's own
+        # CPUs as the unit gave them; this server then moves to the workers
+        # BEFORE spawning, so multiprocessing's helper process lands there too.
+        sp.settings['cpus'] = sorted(_cpus_from_env('SOUK_STREAM_CPUS')
+                                     or os.sched_getaffinity(0))
+        self.stream_process = sp
+        if _cpus_from_env('SOUK_WORKER_CPUS'):
+            self._isolate_frame_thread()
+        else:
+            _server_log('stream process without SOUK_WORKER_CPUS: it shares a core '
+                        'with this server, which will preempt it', source='network')
+        self._publish_stream_state()
+        sp.publish_tones(self.active_tone_indices)
+        sp.start(paused=not getattr(self, '_fabric_ok', False))
+        atexit.register(sp.stop)
+
     def _set_streaming(self, on):
         """Start/stop the frame producer, keeping ``e_stream_stopped`` in step.
 
@@ -4609,6 +4742,8 @@ class ReadoutServer:
         """
         (self.e_stream_enabled.set if on else self.e_stream_enabled.clear)()
         (self.e_stream_stopped.clear if on else self.e_stream_stopped.set)()
+        if getattr(self, 'stream_process', None) is not None:
+            return                  # the stream process manages its own collector
         # Garbage collection while frames flow: a collection runs inside the
         # frame loop and, at 2400 Hz, ~130 us of slack per period is not enough
         # to absorb it. Freeze what is already alive and stop collecting; the
@@ -4798,8 +4933,12 @@ class ReadoutServer:
         """Send one typed frame to every update-subscribed stream client.
 
         Unsubscribed (legacy) clients never receive typed frames, so their
-        byte stream is unchanged.
+        byte stream is unchanged. With a stream process, that process owns the
+        clients and this hands the frame over.
         """
+        if self.stream_process is not None:
+            self.stream_process.send_typed(frame_bytes)
+            return
         for client in list(self.stream_clients):
             if not getattr(client, 'typed_updates', False):
                 continue
@@ -4820,8 +4959,8 @@ class ReadoutServer:
         which disturb the stream briefly (``expected_transient_cycles``).
         """
         try:
-            if not any(getattr(c, 'typed_updates', False)
-                       for c in self.stream_clients):
+            if self.stream_process is None and not any(
+                    getattr(c, 'typed_updates', False) for c in self.stream_clients):
                 return
             payload = {'type': 'TONE_UPDATE', 'ts': time.time(), 'op': op}
             if cmd is not None:
@@ -5336,7 +5475,7 @@ class ReadoutServer:
         """
         num_headers = 10
         t_enter = time.perf_counter()
-        tone_indices = self.active_tone_indices
+        tone_indices = self.active_tone_indices     # a property: read it once
 
         # The stream loop may read an accumulation that landed while it was
         # busy (firmware_lib.acc_due_s) -- but not across a retune
@@ -6233,6 +6372,8 @@ class ReadoutServer:
     def _reset_loop_timing(self):
         self._loop_timing_n = 0
         self._loop_timing_last = None
+        if self.stream_process is not None:
+            self.stream_process.send('reset_loop_timing')
 
     def _info_loop_timing(self):
         """Per-frame timing of the frame producers since the current capture began.
@@ -6257,9 +6398,13 @@ class ReadoutServer:
         means the bus held the CPU off; a huge ``missed`` means the counter
         stepped backwards.
         """
-        n, size = self._loop_timing_n, len(self.loop_timing)
+        sp = self.stream_process
+        # With a stream process, its frames: the ring is in the shared block.
+        ring = sp.loop_timing if sp is not None else self.loop_timing
+        n = sp.frames_recorded() if sp is not None else self._loop_timing_n
+        size = len(ring)
         # oldest row first; after a wrap, frame numbers continue from n - size
-        rows = self.loop_timing[:n] if n <= size else np.roll(self.loop_timing, -(n % size), axis=0)
+        rows = ring[:n] if n <= size else np.roll(ring, -(n % size), axis=0)
         first_frame = max(n - size, 0)
         try:
             period_us = 1e6 / float(firmware_lib.get_sample_rate(self.r_fast))
@@ -6269,6 +6414,8 @@ class ReadoutServer:
                'missed_accumulations': int(rows[:, 4].sum()) if len(rows) else 0,
                'frames_after_gap': int((rows[:, 4] > 0).sum()) if len(rows) else 0,
                'torn_reads': int(rows[:, 5].sum()) if len(rows) else 0}
+        if sp is not None:
+            out['stream_process'] = sp.status()
         # large gaps and torn reads first, so frequent 1-sample overruns cannot
         # crowd out the rare events
         if len(rows):
@@ -7447,8 +7594,14 @@ class ReadoutServer:
 
     def _isolate_frame_thread(self):
         """Pin this (event-loop) thread to SOUK_STREAM_CPUS and every other
-        thread of the process to SOUK_WORKER_CPUS. No-op unless both are set."""
+        thread of the process to SOUK_WORKER_CPUS. No-op unless both are set.
+
+        With a stream process the frame loop is not in this process at all, so
+        every thread here goes to SOUK_WORKER_CPUS (the stream process pins
+        itself to SOUK_STREAM_CPUS)."""
         stream, workers = _cpus_from_env('SOUK_STREAM_CPUS'), _cpus_from_env('SOUK_WORKER_CPUS')
+        if self.stream_process is not None:
+            stream = workers
         if not (stream and workers):
             return
         me = threading.get_native_id()
@@ -7464,6 +7617,20 @@ class ReadoutServer:
         """
         asyncio.get_running_loop().set_default_executor(
             concurrent.futures.ThreadPoolExecutor(initializer=_pin_worker_thread))
+        from souk_readout_tools.server import stream_process as sp_mod
+        if sp_mod.wanted(self.config):
+            # The stream port, and every frame, belong to the stream process.
+            await self._start_stream_process()
+            request_server = await asyncio.start_server(self.handle_request_client, self.server_address, self.request_server_port)
+            _server_log(
+                f'request server listening on '
+                f'{_format_socket_name(request_server.sockets[0].getsockname())}; '
+                f'stream port {self.stream_server_port} served by the stream process',
+                source='network',
+            )
+            async with request_server:
+                await request_server.serve_forever()
+            return
         self._isolate_frame_thread()
         request_server = await asyncio.start_server(self.handle_request_client, self.server_address, self.request_server_port)
         stream_server = await asyncio.start_server(self.handle_stream_client, self.server_address, self.stream_server_port)
