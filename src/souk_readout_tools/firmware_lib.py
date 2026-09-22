@@ -10198,25 +10198,148 @@ def read_acc_cnt_fast(fast_read_params):
         cnt = again
 
 
-def _blocking_wait_for_acc_fast(fast_read_params, poll_period_s=0.00001, timeout=1):
+ACC_WAKE_MARGIN_S = 150e-6      # time.sleep wakes ~60 us late on this ARM
+# A late read (see ``catch_up`` below) is only attempted if it will end at
+# least this long before the next accumulation is due. The read's own length
+# is measured (``acc_read_s``: ~85 us at 1000 tones, ~280 us at 2048 without
+# ZDMA); this guard covers timing error and any dump that starts before the
+# counter moves -- profiling/acc_hold_check.py measures that window.
+ACC_CATCH_UP_GUARD_S = 50e-6
+# Arrival times are extrapolated from the last one watched; past this many
+# accumulations the extrapolation is not trusted and the wait spins instead.
+ACC_ANCHOR_MAX_COUNTS = 64
+# With late reads allowed (catch_up) the wait never needs to be early: it sleeps
+# until this long after the accumulation is due, then polls by sleeping this
+# long at a time instead of spinning (see _blocking_wait_for_acc_fast).
+ACC_LATE_WAKE_S = 20e-6
+
+
+def acc_due_s(fast_read_params, cnt, limited=True):
+    """``time.perf_counter()`` at which accumulation ``cnt`` is due, or None.
+
+    Extrapolated from the last arrival the wait watched happen (``acc_anchor``)
+    and the learned interval; None until both are known, or -- if ``limited`` --
+    when the anchor is too old to sleep on (the caller then re-times it).
+    """
+    interval = fast_read_params.get('acc_interval_s')
+    anchor = fast_read_params.get('acc_anchor')
+    if not interval or anchor is None:
+        return None
+    n = (cnt - anchor[1]) % 2**32
+    # The interval is known to about one arrival's timing jitter over the
+    # baseline it was measured on (acc_base), so sleep on it at most twice that
+    # far ahead: early on the wait re-times every few accumulations, and the
+    # baseline -- and with it the reach -- doubles each time.
+    base = fast_read_params.get('acc_base')
+    baseline = (anchor[1] - base[1]) % 2**32 if base else 0
+    if limited and n > min(ACC_ANCHOR_MAX_COUNTS, max(2, 2 * baseline)):
+        return None
+    return anchor[0] + n * interval
+
+
+def _blocking_wait_for_acc_fast(fast_read_params, poll_period_s=0.00001, timeout=1,
+                                yield_gil=True):
     """``_blocking_wait_for_acc`` using the cheap counter read.
 
     The 10 us poll period only means anything once the counter itself is cheap:
     with the katcp read each iteration cost 27.5 us, so the loop could not
     resolve better than that however small the period was set.
+
+    With ``yield_gil``, the bulk of the wait is spent in ``time.sleep`` rather
+    than in the spin below, which holds the GIL. The spin starves every other
+    thread in the process: with the tracking consumer running, its batch took
+    350 ms instead of 64 ms and the stream loop lost 2.1 accumulations a second
+    at 2500 Hz (0.33/s when it sleeps). The interval between accumulations is
+    learned here, so the sleep stops ``ACC_WAKE_MARGIN_S`` short of the next one
+    and the spin still resolves its arrival to the poll period.
+
+    With ``fast_read_params['catch_up']`` set (the stream loop sets it), an
+    accumulation that landed while the caller was busy and has not been read
+    yet (``acc_last_read``) is returned at once instead of waited past. It
+    stays in the accumulator until the next one lands, so a loop that comes
+    back late -- by up to a period less the read time and
+    ``ACC_CATCH_UP_GUARD_S`` -- reads it rather than losing it. Without this,
+    the deadline was every single iteration: at 2500 Hz all of the losses in
+    hour-long runs were single accumulations, i.e. iterations that ran over by
+    less than a period. Off by default because sweeps and triggered reads need
+    an accumulation made *after* the call.
+
+    With ``catch_up`` the wait also does not spin once the interval is known: it
+    sleeps until ``ACC_LATE_WAKE_S`` after the accumulation is due and polls by
+    sleeping, because a read that starts a little late is as good as an early
+    one. That leaves the core free between frames, which matters twice over: the
+    kernel's per-CPU work (on this board SLAB's cache_reap, every 2 s, ~100-300
+    us, on each stream core) runs while the loop sleeps instead of when it wants
+    to read; and a real-time stream process (SOUK_STREAM_RT_PRIO) is not
+    throttled by the kernel, as a spinning one would be. It still spins, and so
+    re-times the arrivals, whenever the timing anchor is too old to trust.
     """
-    t0 = 0
     cnt0 = read_acc_cnt_fast(fast_read_params)
+    last = fast_read_params.get('acc_last_read')
+    behind = (cnt0 - last) % 2**32 if last is not None else 0
+    if fast_read_params.get('catch_up') and 0 < behind < ACC_ANCHOR_MAX_COUNTS:
+        # Not limited: this only has to tell whether a read would end before
+        # the next dump, and a rough answer does; with none at all read anyway
+        # -- a torn read is flagged, waiting past this one is a certain loss.
+        # (A long gap -- the stream was idle -- waits for a fresh one instead.)
+        due = acc_due_s(fast_read_params, cnt0 + 1, limited=False)
+        need = fast_read_params.get('acc_read_s', 0.0) + ACC_CATCH_UP_GUARD_S
+        if due is None or due - time.perf_counter() > need:
+            return cnt0
+    due = acc_due_s(fast_read_params, cnt0 + 1)
+    nap = bool(fast_read_params.get('catch_up')) and due is not None
+    if yield_gil and due is not None:
+        wake = due + ACC_LATE_WAKE_S if nap else due - ACC_WAKE_MARGIN_S
+        d = min(wake - time.perf_counter(), fast_read_params['acc_interval_s'])
+        if d > 0:
+            time.sleep(d)
+    t0 = 0
+    watched = False
     cnt1 = read_acc_cnt_fast(fast_read_params)
-    if cnt1 < cnt0:
-        cnt1 += 2**32
-    while cnt1 < ((cnt0 + 1) % (2**32)):
-        _blocking_sleep(poll_period_s)
-        t0 += poll_period_s
+    while cnt1 == cnt0:
+        if nap:
+            time.sleep(ACC_LATE_WAKE_S)     # a little early: nap, do not spin
+            t0 += ACC_LATE_WAKE_S
+        else:
+            watched = True                  # spinning: the arrival will be timed
+            _blocking_sleep(poll_period_s)
+            t0 += poll_period_s
         if t0 > timeout:
             raise TimeoutError(f'Timeout waiting for accumulation '
                                f'(firmware_lib._blocking_wait_for_acc_fast: {timeout}s)')
         cnt1 = read_acc_cnt_fast(fast_read_params)
+    if cnt1 != (cnt0 + 1) % 2**32:
+        # More than one landed during this wait, so the sleep overshot: the
+        # interval is stale (the rate changed?) or the thread was held up.
+        # Forget it; the next wait spins and learns it again.
+        fast_read_params.pop('acc_interval_s', None)
+    elif watched:
+        # The spin saw this one land, so its time is known to the poll period:
+        # measure the interval against the previous anchor and re-anchor. One
+        # that landed during the sleep is not timed; the old anchor still
+        # extrapolates correctly.
+        #
+        # The interval is measured from the first arrival timed since the rate
+        # was last (re)learned (``acc_base``): one arrival's ~15 us of timing
+        # jitter spread over thousands of periods. Between re-timings the wait
+        # extrapolates up to ACC_ANCHOR_MAX_COUNTS periods ahead, and a
+        # one-arrival estimate is only good to a few % -- enough, after tens of
+        # periods, to sleep straight through an accumulation.
+        seen = time.perf_counter()
+        anchor = fast_read_params.get('acc_anchor')
+        base = fast_read_params.get('acc_base')
+        if anchor is not None:
+            n = (cnt1 - anchor[1]) % 2**32
+            interval = fast_read_params.get('acc_interval_s')
+            if 0 < n and seen > anchor[0]:
+                dt = (seen - anchor[0]) / n
+                if interval is None or abs(dt - interval) > 0.2 * interval:
+                    interval, base = dt, (seen, cnt1)   # first, or the rate changed
+                elif base is not None and (cnt1 - base[1]) % 2**32:
+                    interval = (seen - base[0]) / ((cnt1 - base[1]) % 2**32)
+                fast_read_params['acc_interval_s'] = interval
+        fast_read_params['acc_base'] = base or (seen, cnt1)
+        fast_read_params['acc_anchor'] = (seen, cnt1)
     return cnt1
 
 
@@ -10820,6 +10943,12 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
     # the tag belongs to the sample we just read.
     buf_slot = read_buf_id_fast(fast_read_params) if get_buf_id else None
     stop_acc_cnt = read_acc_cnt_fast(fast_read_params)
+    fast_read_params['acc_last_read'] = start_acc_cnt
+    # How long a read takes, for the late-read test in the wait: the slowest
+    # recent read, decaying 1% per read.
+    fast_read_params['acc_read_s'] = max(
+        time.perf_counter() - fast_read_params['t_acc_seen'],
+        0.99 * fast_read_params.get('acc_read_s', 0.0))
     if start_acc_cnt != stop_acc_cnt:
         # Torn read: flagged in the return value, not logged. Every caller
         # records the flag (packet_error in frames, acc_errs in sweeps), and one

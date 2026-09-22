@@ -5308,11 +5308,22 @@ class ReadoutServer:
         """
         num_headers = 10
         t_enter = time.perf_counter()
+        tone_indices = self.active_tone_indices
+
+        # The stream loop may read an accumulation that landed while it was
+        # busy (firmware_lib.acc_due_s) -- but not across a retune
+        # or a new modulation revision: the first frame after one of those
+        # must still be an accumulation made after it.
+        if fast_read_params is not None and fast_read_params.get('catch_up'):
+            key = fast_read_params.get('catch_up_key')
+            if key is None or key[0] is not tone_indices or key[1] != revision:
+                fast_read_params['acc_last_read'] = None
+                fast_read_params['catch_up_key'] = (tone_indices, revision)
 
         read_tag = fw_modulation or (sw_buf_point_map is not None)
         if read_tag:
             cnt,data,err,tt,buf_id,slot_id = firmware_lib.read_accumulated_data_fast(
-                fast_read_params, tone_indices=self.active_tone_indices, get_buf_id=True)
+                fast_read_params, tone_indices=tone_indices, get_buf_id=True)
             if fw_modulation:
                 tag_index = int(slot_id)                        # live LO slot
                 n_settle = int(fw_n_settle)
@@ -5338,7 +5349,7 @@ class ReadoutServer:
                 settling = self._mod_dwell_pos < n_settle
         else:
             cnt,data,err,tt = firmware_lib.read_accumulated_data_fast(
-                fast_read_params, tone_indices=self.active_tone_indices)
+                fast_read_params, tone_indices=tone_indices)
         t_read = time.perf_counter()
 
         n_data = len(data)
@@ -6782,6 +6793,10 @@ class ReadoutServer:
 
                 if self.e_modulation_enabled.is_set() and self.modulation_sched is not None:
                     self._modulation_owner = 'stream'
+                    # No late reads here: the scheduler writes the next point's
+                    # buffer after each accumulation and counts on reading them
+                    # one by one.
+                    fast_read_params['catch_up'] = False
                     sched = self.modulation_sched
                     # One full cycle through the N points. Each frame is tagged
                     # from the firmware buffer_id (the point the accumulator
@@ -6812,6 +6827,7 @@ class ReadoutServer:
                     # its own, so there is no per-sample stepping here -- just read
                     # each accumulation and tag it with its live slot (frame[-5]).
                     self._modulation_owner = None
+                    fast_read_params['catch_up'] = True
                     rev = (self.fw_modulation_state['applied_revision']
                            if self.fw_modulation_state else 0)
                     n_settle = int(self.fw_modulation_cfg.get('n_settle', 0)) if self.fw_modulation_cfg else 0
@@ -6826,6 +6842,9 @@ class ReadoutServer:
                         await self._drain_stream_clients()
                 else:
                     self._modulation_owner = None
+                    # Read an accumulation that landed while this loop was busy
+                    # rather than wait past it (firmware_lib.acc_due_s).
+                    fast_read_params['catch_up'] = True
                     payload, cnt, err = self.prepare_frame(fast_read_params)
                     self._write_to_stream_clients(payload)
                     if self._yield_due(len(payload)):
