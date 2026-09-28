@@ -25,22 +25,26 @@ RFSoC) with minimal wiring in `readout_server.py`. Tests:
 
 ## Provenance and reconstruction
 
-Post-processing reconstructs the absolute per-tone response exactly:
+Post-processing reconstructs the absolute per-tone response exactly, by the
+**reconstruction identity**:
 
 ```
-absolute_response(t) = (center[rev(t)] − center[rev0]) + freq_shift_hz(t)
+resonance(t) = center[rev(t)] + center_detuning_hz(t)
 ```
 
-with `freq_shift_hz` in the **detector-side** sign (resonator motion,
-`= −` `demodulate`'s probe-side `freq_shift_hz`; see
-`doc/frequency_modulation.md`), where `rev(t)` is the revision stamped into
-each frame's flag5 tag (bits 17–31) and `center[rev]` comes from the
-revision history
-(`get_info('modulation')['revision_history']`) or, equivalently, from the
-logged `TONE_UPDATE` frames. The tracker may follow real optically-induced
+— where the tracker put the modulation centre, plus how far the resonance
+sits from it (`center_detuning_hz`, resonance minus centre, from the
+demodulation; [conversions.md](conversions.md)). `rev(t)` is the revision
+stamped into each frame's flag5 tag (bits 17–31) and `center[rev]` comes from
+the logged `TONE_UPDATE` frames or the revision history
+(`get_info('modulation')['revision_history']`).
+`modulation.demodulate_stream(recording)` does the whole job: it
+demodulates each revision with its own state and joins them onto one
+reference, so its `resonance_shift_hz` is the resonator's own motion and
+never steps at a commit. The tracker may follow real optically-induced
 shifts — that is acceptable **only because** every correction is
 revision-logged; nothing is lost, the signal just moves from
-`freq_shift_hz` into centre steps and is added back in reconstruction.
+`center_detuning_hz` into centre steps and is added back in reconstruction.
 
 **Revision wrap**: the flag5 revision field is 15 bits. Long campaigns with
 periodic commits will wrap it (`(rev + 1) & 0x7FFF`), and the wrapped key
@@ -75,17 +79,20 @@ asserted byte-for-byte in `tests/test_tracking.py`.
   revisions land): `{ts, op (enable/update/recenter/disable/rest/
   tracking_dry_run), revision, kind ('lo' | 'bin'), source ('client' |
   'tracking'), mod_indices, centers_hz {tone: Hz, changed tones only},
-  warnings, expected_transient_cycles (bin only),
-  triggering_detunings_linewidths (tracking only)}`.
+  modulation_state (the revision's full state: per-tone centres, offsets and
+  readout-correction factors), warnings, expected_transient_cycles (bin
+  only), triggering_center_detunings_linewidths (tracking only)}`.
 
 Client support:
 
 - `stream_dac.SocketFrameSource(subscribe_updates=True)` subscribes, parses
   typed frames and queues them; `StreamToDac` logs them to a JSONL sidecar
-  (`<recording>.updates.jsonl`) next to the raw recording.
-- Binary `receive_stream(duration=30, subscribe_tone_updates=True)` saves
-  typed records in `<capture>.updates.jsonl`; the CLI accepts
-  `--subscribe_tone_updates`. `parse_stream(path)` loads the records into
+  (`<recording>.updates.jsonl`) next to the raw recording, in the same
+  format as `receive_stream` (with `sample_index`), and uses each
+  revision's state for its readout correction and ffm output.
+- Binary `receive_stream(duration=30)` subscribes by default (not for a
+  mock client) and saves typed records in `<capture>.updates.jsonl`; the
+  CLI's `--no-subscribe_tone_updates` turns it off. `parse_stream(path)` loads the records into
   `tone_updates`, with `sample_index` recording how many IQ frames preceded
   each event on the socket (not necessarily the first sample of its revision).
   `tone_centers_by_revision[revision]` gives cumulative tone-keyed centres in
@@ -93,8 +100,10 @@ Client support:
   `modulation_revision` to look up its centres. Missing entries are unknown;
   repeated revision IDs retain the latest map, so use the ordered records
   across resets/wraps. Dry-run events are retained but do not change centres.
-  Initial readout-correction factors and analysis settings are not updated
-  automatically from these events. Mock binary subscription is unsupported.
+  `readout_correction_by_revision` holds each announced revision's
+  readout-correction factors, and `parse_stream` corrects every sample with
+  its own revision's (the initial ones where none was announced). Mock
+  binary subscription is unsupported.
 - `receive_stream_g3(subscribe_tone_updates=True)` emits a G3 Wiring frame
   (update JSON in `'status'`, like the start-of-stream Wiring frame) when a
   `TONE_UPDATE` arrives mid-stream.
@@ -144,11 +153,23 @@ back through the same shared block; nothing else changes.
 
 **Estimator**: `estimate_detunings` is a lean whole-array implementation of
 `demodulate`'s `method='fast'` maths (finite-difference phase slope +
-curvature; detuning from the curvature/slope ratio, which crosses zero at the
-phase inflection independent of the phase offset). The window's I/Q is first
-de-embedded and circle-centred per tone (`center_iq`) with fits of the latest
-sweep in server memory, which `enable_tracking` makes when it starts. Tones
-without a fit are never corrected. On the centred phase a notch is exactly
+curvature through `resonator.phase_derivatives`; detuning from the
+curvature/slope ratio, `resonator.detuning_from_derivatives`, which crosses
+zero at the phase inflection independent of the phase offset). The window's
+I/Q is first de-embedded and circle-centred per tone with the calibration
+the client pushed (`set_resonator_calibrations`, reported as
+`calibration_source: 'client'`) — the same calibration the analysis of the
+recording uses, with the RX gain change since its sweep divided out
+(`rx_gain`). **The server does no fitting**: `enable_tracking` refuses
+without a valid pushed calibration (it goes stale when a tone is inactive or
+more than five linewidths from where it was made), and tones it does not
+cover are left alone. The centring coefficients, with each probe point's
+de-embedding and the revision's readout correction folded in, are rebuilt
+at every applied revision (`resonator.basis_coefficients`), so a window
+costs one complex multiply-add per value. `detuning_estimator='mobius'` swaps the curvature estimate
+for the calibration's exact inversion of the centre point, which also works
+unmodulated (on a zero-offset modulation); the default picks the curvature
+whenever there are three distinct offsets. On the centred phase a notch is exactly
 `-2 atan(2x)`, which inverts to `x = -φ''/(2φ'|φ'|)`: detuning in linewidths
 from slope and curvature alone, without compression (within ~1% at ±0.1 lw
 offsets); the linewidth only converts to Hz. Uncentred, the same numbers taken
@@ -348,11 +369,11 @@ tone-control buffer writes beyond what a normal
 ## Closed-loop response (what tracking does to your science data)
 
 Tracking is a slow, deadband-gated, quantised transfer of signal from
-`freq_shift_hz` into centre steps. Within the deadband nothing happens and
-`freq_shift_hz` is untouched. Once the *filtered* detuning exceeds the
-threshold for K consecutive windows, a step of up to
-`gain · detuning` (clamped to `max_step_linewidths`) moves the centre and
-`freq_shift_hz` drops by the same amount. This is nonlinear (deadband +
+`center_detuning_hz` into centre steps. Within the deadband nothing happens
+and `center_detuning_hz` is untouched. Once the *filtered* detuning exceeds
+the threshold for K consecutive windows, a step of up to
+`gain · center_detuning` (clamped to `max_step_linewidths`) moves the centre
+toward the resonance and `center_detuning_hz` drops by the same amount. This is nonlinear (deadband +
 quantisation + confirmation delay) — but **exactly recoverable** via the
 revision history (see the reconstruction formula above), so it is a
 bookkeeping transformation, not a filter on the science signal.
@@ -377,11 +398,11 @@ If a residual effect matters, compute it from the logged step times/sizes
 
 | key | default | meaning |
 |---|---|---|
-| `linewidth_hz` | (from `enable_modulation`, else fr/Ql of the server's fits) | per-tone linewidths |
+| `linewidth_hz` | (from `enable_modulation`, else fr/Ql of the pushed calibration) | per-tone linewidths |
 | `dry_run` | `True` | decide/log/announce only, no applies |
 | `threshold_linewidths` | 0.05 | deadband on the filtered detuning, in true linewidths from the inflection |
 | `confirm_windows` | 3 | consecutive decision windows over threshold |
-| `gain` | 1.0 | `new_center = center − gain · detuning_hz` |
+| `gain` | 1.0 | `new_center = center + gain · center_detuning_hz` (toward the resonance) |
 | `max_step_linewidths` | 0.5 | per-decision step clamp |
 | `enable_mask` | all modulated | tones allowed corrections |
 | `iq_filter` | `'boxcar'` | coherent I/Q average in the stream task: `'boxcar'` (16.2 µs/frame) or `'ewma'` (49.1 µs/frame) |
@@ -401,9 +422,10 @@ If a residual effect matters, compute it from the logged step times/sizes
 | `bin_min_commit_interval_s` | 30 | floor between bin commits |
 | `commit_threshold_count` | off | commit a class when ≥ M tones staged |
 | `commit_interval_s` | off | commit every T s if anything staged |
-| `unlock_slope_ratio` | 0.25 | `unlocked` when phase slope drops below this fraction of its settled baseline |
+| `unlock_slope_ratio` | 0.25 | `unlocked` when the centred phase slope drops below this fraction of the calibration's on-resonance slope `4 / linewidth` (0.25 ≈ 0.9 linewidths off) |
 | `unlock_invalid_fraction` | 0.5 | `unlocked` when this fraction of recent cycles are unusable |
-| `unlock_detuning_linewidths` | off | also `unlocked` when the reading exceeds this (usually left off — see below) |
+| `unlock_detuning_linewidths` | 1.0 | also `unlocked` when the filtered reading exceeds this; `None` disables |
+| `detuning_estimator` | `None` | `'curvature'` (three-point, needs three distinct offsets) or `'mobius'` (the calibration's inversion; works unmodulated); `None` picks curvature when it can |
 
 Commit policies combine — first to fire wins, gated by the per-class
 minimum interval; with neither optional policy set, a class commits as soon
@@ -418,7 +440,8 @@ covered by the standard `get_info` / `health_check` tooling:
 
 - **`health_check()`** carries a compact `tracking` block (the
   `summary()` below), plus `resonators_tracking` (true only when tracking
-  is enabled and actually applying — not dry-run) and `max_detuning_hz`.
+  is enabled and actually applying — not dry-run) and `max_detuning_hz`
+  (the summary's `max_abs_center_detuning_hz`).
   This is the lean, poll-often path.
 - **`get_info('tracking')`** returns `{summary, tones, controller, …}` —
   the same summary block, **plus per-tone** health, plus the full
@@ -441,16 +464,17 @@ monitor watches:
 | `n_tracked` | tones under tracking |
 | `n_locked` / `n_drifting` / `n_recenter_pending` / `n_unlocked` / `n_no_data` | tones in each lock state (below) |
 | `n_over_threshold` | filtered \|detuning\| past the deadband |
-| `max_abs_detuning_linewidths`, `median_abs_detuning_linewidths` | drift extrema/centre, in linewidths |
-| `max_abs_detuning_hz` | worst drift in Hz |
+| `max_abs_center_detuning_linewidths`, `median_abs_center_detuning_linewidths` | drift extrema/centre, in linewidths |
+| `max_abs_center_detuning_hz` | worst drift in Hz |
 | `staged` | `{lo, bin}` corrections awaiting commit |
 | `commits`, `backoffs` | applied corrections; batches discarded on external revisions |
 | `filter_settled`, `held`, `hold_reason`, `dry_run`, `last_estimate_age_s` | loop liveness (a stale `last_estimate_age_s` means the loop has stopped estimating) |
 
 **Per-tone health** (`tones[i]`) — `state` plus
-`detuning_linewidths`, `detuning_std_linewidths` (running spread — a
-noisy/unstable tone shows a large std at a small mean),
-`slope_ratio` (current responsivity ÷ its on-resonance baseline),
+`center_detuning_linewidths`, `center_detuning_std_linewidths` (running
+spread — a noisy/unstable tone shows a large std at a small mean),
+`slope_ratio` (current centred phase slope ÷ the calibration's on-resonance
+`4 / linewidth`),
 `invalid_fraction`, and `staged_center_hz` if a correction is pending.
 
 **Lock states**: `locked` (inside deadband), `drifting` (past threshold,
@@ -458,17 +482,18 @@ correcting/suppressed), `recenter_pending` (a `bin` correction staged),
 `no_data` (nothing usable yet), and **`unlocked`** — the resonance is
 likely lost and the loop would be tracking noise.
 
-`unlocked` is not detected from the detuning reading by default: far from
-resonance it divides by a vanishing slope squared, so it is noise rather than
-a reliably large number. Instead it is caught by the **phase slope collapsing**
-below `unlock_slope_ratio` of the on-resonance baseline (a flat phase far
-from resonance has no responsivity) and/or by the invalid-cycle fraction
-exceeding `unlock_invalid_fraction`. `unlock_detuning_linewidths` can
-additionally trip on the reading (it is in true linewidths out to a couple of
-linewidths), but is off by default for this reason.
-So the monitor's "have we lost the resonance / are we tracking noise?"
-question is answered by `n_unlocked` and each tone's `slope_ratio`, not by
-the detuning magnitude alone.
+`unlocked` is caught three ways: the **phase slope collapsing** below
+`unlock_slope_ratio` of the calibration's on-resonance slope `4 / linewidth`
+(a flat phase far from resonance has no responsivity; the reference is the
+fit, not a baseline captured from the stream, which could itself be noise),
+the invalid-cycle fraction exceeding `unlock_invalid_fraction`, and the
+filtered reading past `unlock_detuning_linewidths` (the centred estimate is
+in true linewidths out to a couple of linewidths and does not compress, so
+a large reading means far off). Far beyond that the reading divides by a
+vanishing slope squared and becomes noise, which the slope test catches. So
+the monitor's "have we lost the resonance / are we tracking noise?" question
+is answered by `n_unlocked` and each tone's `slope_ratio`, not by the
+detuning magnitude alone.
 
 ## Commands
 
@@ -544,14 +569,18 @@ client.enable_stream()
 
 (`engine='sw'` works identically here and takes any number of points ≥ 3.)
 
-**3. Start tracking in dry-run** (the default) and watch it before letting
-it touch anything. It fits the sweep held in server memory (step 1's) to
-centre the I/Q, so re-enable tracking after a new sweep:
+**3. Push the calibration, then start tracking in dry-run** (the default)
+and watch it before letting it touch anything. The tracker centres the I/Q
+with the calibration you push — fit on the client; the server does no
+fitting — and the analysis of the recording finds the same one in the
+stream's metadata. Push again after a new sweep:
 
 ```python
+fits = fitting.batch_fit(sweep)                # on the client
+client.set_resonator_calibrations(fits, sweep_data=sweep)
 client.enable_tracking()                       # dry_run=True
 state = client.get_tracking_state()
-state['filtered_detuning_linewidths']          # per-tone filtered detunings
+state['filtered_center_detuning_linewidths']   # per-tone filtered detunings
 state['controller']['staged']                  # what it WOULD correct
 ```
 
@@ -579,10 +608,11 @@ client.commit_tracking_updates(classes='bin')  # brief, flagged transient
 ```
 
 **5. Record with provenance.** Any consumer that must reconstruct
-absolute response subscribes to the typed frames:
-`receive_stream_g3(subscribe_tone_updates=True)` (Wiring frame per
-update), or `SocketFrameSource(subscribe_updates=True)` /
-`souk-stream-to-dac --mode ffm` (JSONL sidecar). Legacy
+absolute response subscribes to the typed frames: `receive_stream` does by
+default (JSONL sidecar), `receive_stream_g3(subscribe_tone_updates=True)`
+emits a Wiring frame per update, and `SocketFrameSource(subscribe_updates=True)`
+/ `souk-stream-to-dac --mode ffm` log a JSONL sidecar. A pushed calibration
+rides in every recording's `info['resonators']`. Legacy
 `souk-receive-stream` recordings still work — the revision tag is in every
 frame's flag5, and `get_info('modulation')['revision_history']` maps
 revisions to centres (mind the 15-bit wrap on long runs; the JSONL/G3
@@ -592,17 +622,12 @@ records are the wrap-proof source).
 steps are unwanted): `client.hold_tracking()` … `client.resume_tracking()`.
 Sweeps and retunes hold it automatically.
 
-**7. Reconstruct offline.** For each tone, cut the timestream at the
-revision edges (mask `expected_transient_cycles` after `bin` edges and the
-settling flags), demodulate as usual, and apply
-
-```
-absolute_response(t) = (center[rev(t)] − center[rev0]) + freq_shift_det(t)
-```
-
-with the detector-side sign convention noted above. The result is
-identical to what an untracked (but never-drifting) tone would have
-measured.
+**7. Reconstruct offline.** `modulation.demodulate_stream(recording)` cuts
+the timestream at the revision edges, demodulates each piece with its own
+state and joins them (above); its `resonance_shift_hz` is identical to what
+an untracked (but never-drifting) tone would have measured. By hand: mask
+`expected_transient_cycles` after `bin` edges and the settling flags,
+demodulate, and apply `resonance(t) = center[rev(t)] + center_detuning_hz(t)`.
 
 ## What tracking costs on the ARM
 

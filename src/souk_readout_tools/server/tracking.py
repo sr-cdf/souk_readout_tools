@@ -855,15 +855,14 @@ class TrackingRuntime:
         ``{tone_index: ResonatorCalibration}`` used to circle-centre the I/Q
         before estimating. Modulated tones without one are never corrected.
     calibration_source : str, optional
-        Where they came from, for the status: ``'client'`` (pushed with
-        ``set_resonator_calibrations``) or ``'server_fit'`` (fitted here from
-        the latest sweep).
+        Where they came from, for the status (default ``'client'``: pushed
+        with ``set_resonator_calibrations``; the server does no fitting).
     rx_gain : float, optional
         RX amplitude ratio, stream over calibration (from the recorded chain
         states), divided out before centring.
     """
 
-    def __init__(self, server, params, calibrations, calibration_source='server_fit',
+    def __init__(self, server, params, calibrations, calibration_source='client',
                  rx_gain=1.0):
         self.server = server
         self.params = params

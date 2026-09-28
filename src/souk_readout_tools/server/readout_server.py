@@ -2668,22 +2668,28 @@ class ReadoutServer:
     def _tracking_calibrations(self, tone_indices):
         """The calibrations tracking centres with, their source and RX gain.
 
-        The client's pushed record when it is valid and covers every tone --
-        the same calibration the analysis of the recording uses -- else fits
-        of the latest sweep in memory. With the pushed record, the RX gain
-        ratio between its sweep and the chain now is divided out. Runs in
-        to_thread: fitting can be slow.
+        Only the record the client pushed (``set_resonator_calibrations``) --
+        the same calibration the analysis of the recording uses. The server
+        does no fitting: tones the record does not cover are left alone, and
+        without a valid record this raises. The RX gain ratio between the
+        record's sweep and the chain now is divided out. Runs in to_thread:
+        the validity check reads the tone frequencies.
         """
         from souk_readout_tools.resonator import (calibrations_from_record,
                                                   recorded_rx_gain_ratio)
         status = self._info_resonators()
-        indices = [int(t) for t in tone_indices]
-        if status['valid']:
-            calibrations = calibrations_from_record(status['record'], tones=indices)
-            if all(t in calibrations for t in indices):
-                ratio = recorded_rx_gain_ratio(status['record'], self._chain_info())
-                return calibrations, 'client', 1.0 if ratio is None else ratio
-        return self._calibrations_from_latest_sweep(indices), 'server_fit', 1.0
+        if not status['valid']:
+            raise ValueError(
+                f'no usable resonator calibration ({status["invalid_reason"]}): '
+                'push one with client.set_resonator_calibrations(fits, '
+                'sweep_data=sweep); the server does no fitting')
+        calibrations = calibrations_from_record(
+            status['record'], tones=[int(t) for t in tone_indices])
+        if not calibrations:
+            raise ValueError('the pushed resonator calibration covers none of '
+                             'the modulated tones')
+        ratio = recorded_rx_gain_ratio(status['record'], self._chain_info())
+        return calibrations, 'client', 1.0 if ratio is None else ratio
 
     def _info_registers(self):
         """Full firmware register dump — placeholder."""
@@ -4012,8 +4018,8 @@ class ReadoutServer:
                 elif request == 'enable_tracking':
                     # Start (or reconfigure) the FFM tone-tracking loop on
                     # whichever modulation engine is armed (fw or sw). Needs
-                    # a calibration per tracked tone (pushed, or fitted from
-                    # the sweep in server memory) to circle-centre the I/Q;
+                    # the client's pushed calibration to circle-centre the
+                    # I/Q (the server does no fitting);
                     # three distinct offsets for the curvature estimator,
                     # none for 'mobius'. dry_run defaults to True: full
                     # estimate/decide/log/announce pipeline, no hardware
@@ -4033,8 +4039,8 @@ class ReadoutServer:
                             self.tracking = None
                         # The estimator works on circle-centred I/Q, so every
                         # tracked tone needs a calibration: the client's pushed
-                        # record, else fits of the latest server sweep (which
-                        # also supply the linewidths when none are given).
+                        # record (which also supplies the linewidths when none
+                        # are given).
                         cfg = ((self.fw_modulation_cfg
                                 if self.e_fw_modulation_enabled.is_set()
                                 else self.modulation_cfg) or self.fw_modulation_cfg)
@@ -6359,59 +6365,6 @@ class ReadoutServer:
         if epoch != self._modulation_command_epoch:
             raise RuntimeError('modulation command superseded by a newer request')
 
-    def _calibrations_from_latest_sweep(self, tone_indices):
-        """Fit selected resonators from the last sweep retained in RAM.
-
-        Called in to_thread: fitting can be slow, especially for many tones.
-        Cache only fits associated with the current sweep snapshot.
-        """
-        if not self.latest_sweep_data_valid:
-            raise ValueError(
-                'no valid sweep is held in server memory; run a targeted '
-                'sweep before tracking or automatic phase recentering')
-        sweep = self.latest_sweep_results
-        token = id(sweep)
-        if getattr(self, '_sweep_calibration_token', None) != token:
-            self._sweep_calibration_token = token
-            self._sweep_calibrations = {}
-        cache = self._sweep_calibrations
-        indices = [int(t) for t in tone_indices]
-        missing = [t for t in indices if t not in cache]
-        if missing:
-            from souk_readout_tools.fitting import fit_sweep_stack
-            from souk_readout_tools.resonator import ResonatorCalibration
-            f = np.asarray(sweep['sweep_frequencies'], dtype=float)
-            z = np.asarray(sweep['sweep_responses'], dtype=complex)
-            e = np.asarray(sweep['sweep_sems'], dtype=complex)
-            correction = sweep.get('readout_correction')
-            if correction is not None:
-                correction = np.asarray(correction, dtype=float)
-                z = z * correction
-                e = e * correction
-            if any(t < 0 or t >= f.shape[1] for t in missing):
-                raise ValueError('modulated tone index is absent from the latest sweep')
-            fits = fit_sweep_stack(
-                f[:, missing], z[:, missing], e[:, missing],
-                sweep_direction=sweep.get('direction', 'up'),
-                verbose=False, n_jobs=1)
-            # Remember failed fits too, so repeat calls do not refit an
-            # unfit tone in the same sweep. A batch error remains retryable.
-            for tone in missing:
-                cache[tone] = None
-            for tone, fit in zip(missing, fits):
-                if fit is None or not np.isfinite(fit.fr):
-                    continue
-                try:
-                    cal = ResonatorCalibration.from_fit(fit)
-                except (ValueError, TypeError, ZeroDivisionError):
-                    continue
-                if np.isfinite(cal.fr) and np.isfinite(cal.Ql) and cal.Ql > 0:
-                    cache[tone] = cal
-        if (not self.latest_sweep_data_valid
-                or id(self.latest_sweep_results) != token):
-            raise RuntimeError('server sweep changed while calibrations were fitting')
-        return {t: cache[t] for t in indices if cache.get(t) is not None}
-
     async def _update_modulation_to_inflection(self, engine=None):
         """Take one server-side, calibrated phase-curvature correction step."""
         state = self._info_modulation()
@@ -6432,9 +6385,6 @@ class ReadoutServer:
         from souk_readout_tools.resonator import detuning_from_derivatives
         calibrations, source, rx_gain = await self.to_thread(
             self._tracking_calibrations, indices)
-        if not calibrations:
-            raise ValueError('no modulated tones have usable fits in the '
-                             'server memory sweep')
 
         temporary = self.tracking is None
         if temporary:
@@ -6515,7 +6465,7 @@ class ReadoutServer:
                     shifts[tone] = shift
             for tone in indices:
                 if tone not in calibrations:
-                    skipped[tone] = 'no usable fit in latest server sweep'
+                    skipped[tone] = 'not in the pushed calibration'
             if not corrections:
                 return {'changed': False, 'phase_inflection_shifts_hz': {},
                         'skipped_tones': skipped}
@@ -6541,12 +6491,11 @@ class ReadoutServer:
         'linewidth_hz': None,             # falls back to enable_modulation's
         'threshold_linewidths': 0.05,     # deadband on the FILTERED detuning
         'confirm_windows': 3,             # consecutive windows over threshold
-        'gain': 1.0,                      # new_center = center - gain*detuning
+        'gain': 1.0,                      # new_center = center + gain*center_detuning
         'max_step_linewidths': 0.5,       # per-decision step clamp
         # An over-threshold reading must also beat this many times its own
         # scatter before anything is staged. Catches a tone -- or a whole
-        # pipeline -- reading noise, which the slope-baseline unlock test
-        # cannot (that baseline is captured from noise too).
+        # pipeline -- reading noise before the unlock tests trip.
         'min_detuning_snr': 1.0,
         'enable_mask': None,              # tones allowed corrections (None=all)
         'filter': 'boxcar',               # 'boxcar' | 'ewma'

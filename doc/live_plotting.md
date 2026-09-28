@@ -77,52 +77,69 @@ souk-live-plot --stream-file captures/live --follow --panels logmag:time phase:t
 ```
 
 One to four panels are supported. Explicit panels are written `signal:domain`
-in row-major order. Domains are `time`, `psd`, and `asd`.
+in row-major order. Domains are `time`, `psd`, and `asd`. Signals are the
+package-wide quantities of `resonator.QUANTITIES` — the same names, signs and
+definitions as offline analysis, the tracker and stream-to-DAC (see
+[conversions.md](conversions.md)); older and shorter names are accepted as
+aliases.
 
-| Signal | Meaning / units |
+| Signal (aliases) | Meaning / units |
 |---|---|
 | `i`, `q` | Parsed I/Q in accumulator counts |
-| `amp` (also `mag`, `magnitude`) | Absolute I+jQ, counts |
-| `phase` | Unwrapped phase, radians |
-| `logmag` | 20 log10(amplitude / one count), dB |
-| `centered_phase` | Phase after subtracting the sweep circle center |
-| `centered_rotated_phase` | Centered phase after the fixed sweep rotation |
-| `frequency_shift` | Resonance-frequency shift, Hz |
-| `fractional_frequency` | Resonance-frequency shift divided by the reference tone frequency |
-| `dissipation` | Matched loss coordinate, Δ(1 / 2Qi) |
-| `frequency_linewidths` (also `freq_lw`) | Resonance-frequency shift in linewidths, fractional shift × Qr |
-| `dissipation_linewidths` (also `diss_lw`) | Qr·Δ(1 / 2Qi), dissipation on the same scale |
+| `amplitude` (`amp`, `mag`, `magnitude`) | \|I+jQ\|, counts |
+| `log_amplitude` (`logmag`) | 20 log10(amplitude / one count), dB |
+| `phase`, `unwrapped_phase` | Phase about the I/Q origin, rad (wrapped, unwrapped) |
+| `centered_phase`, `centered_rotated_phase` | Phase about the calibration's circle centre (then rotated so the resonance sits at 0), rad |
+| `centered_radius` (`radius`) | \|z − centre\| / circle radius |
+| `resonance_shift_hz` (`frequency_shift`, `frequency`) | Resonance shift, Hz; positive = resonance moved up |
+| `fractional_resonance_shift` (`fractional_frequency`) | The shift ÷ the tone frequency |
+| `resonance_shift_linewidths` (`frequency_linewidths`, `freq_lw`) | The shift ÷ the calibration's linewidth fr/Ql |
+| `resonance_frequency_hz` | The absolute resonance, Hz (calibration) |
+| `detuning_hz`, `fractional_detuning`, `detuning_linewidths` | Resonance − tone (calibration) |
+| `matched_dissipation_shift` (`dissipation`) | Δ(1 / 2Qi), on the fractional-frequency scale |
+| `matched_dissipation_hz`, `matched_dissipation_linewidths` (`diss_lw`) | fr·Δ(1 / 2Qi), Hz; Qr·Δ(1 / 2Qi) |
+| `internal_loss`, `internal_loss_shift`, `fractional_internal_loss_shift` | 1/Qi, Δ(1/Qi), Qi·Δ(1/Qi) (a fit with Qi) |
+| `center_detuning_hz`, `center_detuning_linewidths`, `dphi_df` (`responsivity`), `d2phi_df2` (`curvature`), `curvature_over_slope` | Demodulated streams only, one estimate per modulation cycle (below) |
 
-The two linewidth signals take each tone's loaded Q from `--calibrations`
-(fits or `ResonatorCalibration`), with either conversion; `--format
-linewidths` selects the pair.
+The linewidth quantities take each tone's loaded Q from the calibration, with
+any conversion; `--format linewidths` selects the frequency/dissipation pair.
 
-Centered phase needs a sweep or explicit `phase_center_params` in Python;
-geometry is fitted once to the sweep, not to the moving live arc. The sweep
-and stream must use the same IQ coordinate system. Frequency/dissipation
-conversion reuses the existing resonator/timeseries conventions. Linearized
-conversion needs a sweep; Mobius also needs per-tone `ResonatorCalibration`
-objects or fits. Precomputed demodulated frequency/dissipation fields in
-supplied captures take precedence over reconversion.
+The centred quantities use the calibration's circle: `--calibrations`, else
+the calibration the stream carries (pushed to the server with
+`client.set_resonator_calibrations`), else a model-free calibration of
+`--sweep` (Kasa circle after an estimated cable delay — close to, but not,
+the fitted frame the tracker uses; the status line says so). The geometry
+is fixed for the session, never fitted to the moving live arc, and the sweep
+and stream must use the same IQ coordinate system. `--conversion` picks the
+fixed-tone method of `resonator.prepare_conversion`: `linearized` (default;
+the sweep's local gradient), `phase` (centred phase and log-radius over the
+centred slope; calibration), `mobius` (the exact fitted inversion;
+calibration), `lookup` (inverts the sweep's whole centred phase curve;
+follows large signals) or `circle` (diagnostic). Precomputed demodulated
+fields in supplied captures take precedence over reconversion.
 
 Create `resonators.npz` from a saved sweep before using `--conversion mobius`:
 
 ```python
 from souk_readout_tools.client.readout_client import ReadoutClient
-from souk_readout_tools.stream_dac import calibrations_from_sweep, save_calibrations
+from souk_readout_tools.resonator import calibrations_from_sweep, save_calibrations
 
 sweep = ReadoutClient.import_sweep('sweep.npy')
 calibrations = calibrations_from_sweep(sweep)
-save_calibrations('resonators.npz', calibrations)
+save_calibrations('resonators.npz', calibrations, sweep_data=sweep)
 ```
 
-This fits the sweep and saves the per-tone resonator calibration parameters
-in a NumPy `.npz` archive. It is generated offline, separately from the stream
-capture and its `.json` metadata. Keep the sweep's tone indices aligned with
-the stream; `sorted(calibrations)` shows which tones have calibrations. For
-Python use, pass the resulting dictionary directly as `LivePlot(...,
+This fits the sweep and saves the per-tone calibrations — and, given
+`sweep_data`, the sweep itself — in one plain NumPy `.npz`, so
+`--calibrations resonators.npz` alone serves every conversion (older
+`stream_dac.save_calibrations` archives still load). Keep the sweep's tone
+indices aligned with the stream; `sorted(calibrations)` shows which tones have
+calibrations. For Python use, pass the dictionary directly as `LivePlot(...,
 calibrations=calibrations, sweep_data=sweep, conversion_method='mobius')`.
-Linearized conversion needs only `--sweep`, with no calibration archive.
+Pushing the calibrations to the server instead
+(`client.set_resonator_calibrations(calibrations, sweep_data=sweep)`) puts
+them in every stream's metadata, where the viewer, the tracker and offline
+analysis all find the same ones.
 
 The standard parser's readout correction is applied. Fast-modulation streams
 can be displayed raw or demodulated; see the next section.
@@ -224,10 +241,13 @@ pattern are used; partial edge cycles and cycles containing lost packets are
 left as NaN. The first usable per-point reference is held fixed within each
 modulation revision. The viewer subscribes to in-band `SNAPSHOT` and
 `TONE_UPDATE` records, switches offsets and RX correction at the tagged
-revision boundary, and adds applied centre steps to the resonance-side
-frequency-shift trace. An unknown revision stays blank until its full state
-arrives. A manually recorded file needs its `.updates.jsonl` sidecar
-(`receive_stream(..., subscribe_tone_updates=True)`) for this reconstruction.
+revision boundary, and joins the revisions onto one reference
+(`modulation.StreamDemodulator`), so a tracking commit or recentre never
+reads as a resonator move: calibrated tones through their absolute resonance
+(`f_res = f_centre + d_centre`), uncalibrated ones by carrying the reference
+along the measured I/Q gradient. An unknown revision stays blank until its
+full state arrives. A recorded file needs its `.updates.jsonl` sidecar
+(`receive_stream` writes it by default) for this reconstruction.
 
 Settling treatment is explicit: `--settling none` (default) leaves settling
 samples as NaN; `--settling raw` demodulates their actual transient IQ while
@@ -236,10 +256,12 @@ PSDs reject segments containing NaNs, so frequent settling gaps can leave no
 usable segment at the chosen `--nperseg`. Using `raw` keeps those transients
 in the spectrum; it does not make them valid steady-state measurements.
 
-`frequency_shift` is resonance-side motion; `fractional_frequency` divides it
-by the reference tone frequency. `dissipation` is the matched loss coordinate
-Delta(1 / (2 Qi)). Model-free conversion uses the probe-point gradient;
-`--conversion mobius` uses the supplied resonator calibrations.
+`resonance_shift_hz` is resonance-side motion; `fractional_resonance_shift`
+divides it by the tone frequency. `matched_dissipation_shift` is
+Δ(1 / (2 Qi)). With a calibration the per-sample conversion is the centred
+phase and log-radius over each point's live slope (the preferred three-point
+conversion); without one, the tangent/normal projection on the probe points'
+I/Q gradient; `--conversion mobius` uses the calibration's exact inversion.
 
 Plot the derivative-based tuning diagnostics directly, without a linewidth
 or fit:
@@ -259,10 +281,11 @@ For symmetric offsets `-h, 0, +h`, the fast estimator uses
 `(phase_plus - 2*phase_zero + phase_minus)/h**2`, averaging repeated
 measurements of the same offset. Curvature crosses zero at the phase
 inflection point (peak phase responsivity for the ideal resonator model).
-It is a tuning-error diagnostic, not itself a distance in Hz. Detuning inverts
-the circle-centred notch phase `-2 atan(2x)` exactly:
-`detuning_linewidths = -curvature / (2 * slope * |slope|)`, and
-`detuning_hz` is that times the linewidth. With `--calibrations` (any
+It is a tuning-error diagnostic, not itself a distance in Hz. The centre
+detuning inverts the circle-centred notch phase `-2 atan(2x)` exactly:
+`center_detuning_linewidths = curvature / (2 * slope * |slope|)` — resonance
+minus modulation centre, positive when the tone should move up — and
+`center_detuning_hz` is that times the linewidth. With a calibration (any
 `--conversion`) the derivative estimates use the de-embedded, centred phase.
 
 These diagnostics are estimated once per modulation cycle, held across that
@@ -270,13 +293,13 @@ cycle for time plots, and use the cycle rate for PSD/ASD. Choose e.g.
 `--panels responsivity:time responsivity:psd curvature:time curvature:psd`
 for a four-panel view. Frequency/dissipation traces remain sample-aligned.
 
-`detuning` (alias `detuning_hz`) and `detuning_linewidths` use the existing
-cycle estimator: positive means probe above resonance. In the model-free case
-it requires a linewidth and sufficient distinct offsets for curvature; without
-these, estimates remain NaN. Pass `--calibrations`: the per-cycle slope,
-curvature and detuning are then taken on the circle-centred phase with each
-tone's fitted linewidth, whatever `--conversion` is. That is the same
-estimate the server tracker acts on. Without calibrations the raw phase is
+In demodulated mode the `detuning_*` panels show this cycle estimate
+(`center_detuning_*`: the tone is the modulation centre). In the model-free
+case it requires a linewidth and sufficient distinct offsets for curvature;
+without these, estimates remain NaN. With a calibration the per-cycle slope,
+curvature and detuning are taken on the circle-centred phase with each tone's
+fitted linewidth, whatever `--conversion` is. That is the same estimate the
+server tracker acts on. Without calibrations the raw phase is
 used; its detuning is taken about the origin rather than the circle centre and
 reads 3x to ~100x high (worse for deeper dips), so only its sign and zero mean
 anything.
@@ -286,24 +309,23 @@ missing cycles as gaps. It is not presented as a sample-rate measurement.
 
 To move the modulation centres toward **zero of the calibrated phase
 curvature** shown by `--calibrations ... --panels curvature:time`, call
-`client.update_modulation()` while streaming. The RFSoC server fits the
-selected resonators from its latest sweep held in memory, caches those fits,
-and uses its live, settling-excluded I/Q accumulator to estimate calibrated
-phase curvature. It applies one correction of at most half a fitted linewidth
+`client.update_modulation()` while streaming. The RFSoC server centres the
+selected resonators with the calibration you pushed
+(`set_resonator_calibrations`; the server does no fitting) and uses its
+live, settling-excluded I/Q accumulator to estimate calibrated phase
+curvature. It applies one correction of at most half a fitted linewidth
 per tone. The viewer follows the resulting revision in the stream without a
 restart. No client capture or calibration archive lookup is involved. Run a
 targeted sweep on the server first if it has no valid sweep in memory. Tones
 without usable fits are listed as skipped. Explicit `center=` or `offsets=`
-still sends the requested values. The plot and server use the same calibrated
-phase calculation when their fits come from the same sweep with the same fit
-settings; an archive from a different sweep can have a different phase zero.
+still sends the requested values. The plot and the server use the same
+phase calculation; pushing the calibration makes them use the same
+calibration too (an archive from a different sweep can have a different
+phase zero).
 
-`client.enable_tracking()` can use fitted linewidths from that server sweep
-when they were not passed to `enable_modulation`. Tracking currently
-estimates **raw-I/Q** phase curvature, which can have a different zero from
-the Mobius plot. Its default `dry_run=True` observes and stages corrections
-without applying them; the no-argument `update_modulation()` path above uses
-the calibrated plot basis.
+`client.enable_tracking()` estimates the same calibrated, centred phase
+curvature, with the same pushed calibration. Its default `dry_run=True`
+observes and stages corrections without applying them.
 
 ## Following a growing file
 
@@ -345,9 +367,10 @@ finally:
 
 # A custom layout with calibration already loaded; also reads only the file.
 viewer = LivePlot(
-    panels=[Panel('fractional_frequency', 'time'),
-            Panel('fractional_frequency', 'asd'),
-            Panel('dissipation', 'time'), Panel('dissipation', 'asd')],
+    panels=[Panel('fractional_resonance_shift', 'time'),
+            Panel('fractional_resonance_shift', 'asd'),
+            Panel('matched_dissipation_shift', 'time'),
+            Panel('matched_dissipation_shift', 'asd')],
     layout=(2, 2), tones=[0], sweep_data=sweep, calibrations=calibrations,
     conversion_method='mobius')
 viewer.start_file('/path/to/capture')

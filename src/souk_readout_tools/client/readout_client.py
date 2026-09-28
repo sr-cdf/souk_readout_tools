@@ -2956,9 +2956,10 @@ class ReadoutClient:
         dropped frames — riding the existing armed channel maps. ``engine=None``
         (default) updates whichever engine is active.
 
-        With no requested settings change, ask the RFSoC server to use its
-        in-memory sweep calibration and live I/Q window to take one bounded
-        step toward zero calibrated phase curvature.
+        With no requested settings change, ask the RFSoC server to take one
+        bounded step toward zero calibrated phase curvature from its live I/Q
+        window, centred with the calibration pushed by
+        :meth:`set_resonator_calibrations` (the server does no fitting).
 
         Firmware-slot (``engine='fw'``): loads the new slot combs into the inactive
         ping-pong buffer and flips to them in one step (glitch-free). Software
@@ -3213,9 +3214,10 @@ class ReadoutClient:
 
         With modulation armed (fw or sw), the server circle-centres the
         streamed cycles with the calibrations pushed by
-        :meth:`set_resonator_calibrations` (else with fits of its most recent
-        sweep), filters the per-tone centre detuning -- resonance minus centre
-        -- and stages small centre corrections. Seamless LO-word updates (``'lo'`` class) and
+        :meth:`set_resonator_calibrations` -- required: the server does no
+        fitting, and tones they do not cover are left alone -- filters the
+        per-tone centre detuning -- resonance minus centre -- and stages small
+        centre corrections. Seamless LO-word updates (``'lo'`` class) and
         FFT-bin/map changes (``'bin'`` class) have independent commit
         policies; every committed correction bumps the modulation revision
         (stamped into each frame's flag5 tag) and is announced in-band as a

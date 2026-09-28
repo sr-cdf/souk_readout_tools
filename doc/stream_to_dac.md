@@ -2,7 +2,9 @@
 
 `souk-stream-to-dac` turns the readout server's continuous TCP stream into a
 live analog voltage proportional to a chosen KID's response — magnitude,
-phase, or resonant-frequency shift — on a USB DAC. The first use case is
+phase, or any resonance quantity of the package's shared vocabulary
+(resonance shift, dissipation, detuning, …; [conversions.md](conversions.md))
+— on a USB DAC. The first use case is
 spectral characterisation with a TOPTICA cw-THz source: the TOPTICA control
 software records an analog input against its own scan-frequency axis, and we
 feed it the detector response in real time.
@@ -76,8 +78,10 @@ multiplies modulated captures by the per-(point, tone) software
 readout-flattening factors (the filterbank compensation's RX half, which
 cannot land in hardware — see `doc/filterbank_compensation.md`). The stream
 path applies exactly the same factors (`stream_dac.ReadoutCorrection`,
-selected per sample via the flag5 point tag) before any conversion, so
-converted values match the calibration's units. For unmodulated streams the
+selected per sample via the flag5 point tag, and per revision once a
+tracking commit or recentre is announced: the probes then sit at new
+positions across the filterbank) before any conversion, so converted values
+match the calibration's units. For unmodulated streams the
 correction is the identity. `tests/test_stream_dac.py` proves byte-for-byte
 agreement between the stream path and `parse_samples` on identical raw data.
 
@@ -87,44 +91,78 @@ agreement between the stream path and `parse_samples` on identical raw data.
 |---|---|---|
 | `magnitude` | \|IQ\| (counts) | nothing — zero-calibration first light |
 | `phase` | phase re: reference IQ (rad) | reference (startup capture or config) |
-| `df_modelfree` | phase / `dphi_df` (Hz) | reference + `conversion.dphi_df` (rad/Hz) |
-| `df_calibrated` | Möbius probe detuning (Hz) or dissipation | `conversion.calibration_file` |
-| `ffm` | absolute resonator shift (Hz), self-calibrating | frequency modulation running |
+| `df_modelfree` | −phase / `dphi_df`: the resonance shift (Hz) | reference + `conversion.dphi_df` (rad/Hz, the raw phase slope) |
+| `df_calibrated` | `conversion.output` by `conversion.method` | a calibration: `conversion.calibration_file`, or one pushed to the server |
+| `ffm` | `conversion.output`, recentre-proof, self-calibrating | frequency modulation running; a calibration optional |
 
-`df_calibrated` uses `ResonatorCalibration.tone_converter(f_tone)` — the
-exact Möbius inversion, one complex multiply + add per sample — and can
-output the matched dissipation quadrature instead
-(`conversion.output: dissipation`).
+`conversion.output` is a quantity of `resonator.QUANTITIES` (aliases
+accepted): `resonance_shift_hz` (default; positive = resonance moved up),
+`resonance_frequency_hz`, `detuning_hz` (resonance − tone),
+`matched_dissipation_shift` (Δ(1/(2·Qi))), the `*_linewidths` and
+fractional variants; `ffm` adds its per-cycle `center_detuning_hz`,
+`center_detuning_linewidths` and `dphi_df`. Names that need a calibration
+are refused at startup without one. The older `frequency` and `dissipation`
+still work: they are `resonance_shift_hz` and `matched_dissipation_shift`.
+**Signs changed** with the shared vocabulary: `df_calibrated`'s
+`frequency` used to be the probe detuning `f_tone − fr`, which is
+`−detuning_hz`, and `df_modelfree` used to output `+phase / dphi_df`.
+
+`df_calibrated` is `stream_dac.QuantityConverter`:
+`resonator.prepare_conversion` once, then `convert_iq` and `express` per
+update — the functions offline analysis uses, so the DAC reads what an
+analysis of the recording would. `conversion.method` is `mobius` (default:
+the exact fitted inversion, one complex multiply-add plus a few flops per
+update), `phase`, `linearized`, `lookup` or `circle`; the last three need the
+calibration file to hold its sweep (`save_calibrations(...,
+sweep_data=sweep)`). The shift is relative to the sweep's state when the
+file has the sweep, else to the fitted state. The calibration comes from
+`conversion.calibration_file`, else from the stream's `info['resonators']`
+— the calibration pushed with `client.set_resonator_calibrations`, which
+the server serves while its tones are still where it was made. An RX gain
+change since its sweep is divided out automatically.
 
 ### `ffm` mode: live demodulated output
 
 With frequency modulation running (`enable_modulation` + `enable_stream`,
 either engine — fw slot tags and sw point tags ride the same flag5 field),
 `FfmConverter` groups the stream into modulation cycles (settling excluded,
-incomplete cycles dropped) and per cycle:
+incomplete cycles dropped) and runs each through the kernel the offline
+demodulation and the server's tracker use (`resonator.phase_derivatives`,
+any slot order):
 
-- the phase-vs-offset slope gives a **live `dφ/df`** — the modulation
-  measures its own responsivity every cycle, so no prior calibration file
-  is needed and slow responsivity drift is tracked automatically;
-- the centre-point phase, referenced to a startup-captured baseline
-  (`conversion.baseline_cycles`, default 20 cycles) and divided by that
-  slope, gives the linearised frequency shift.
+- each cycle measures a **live `dφ/df`** and the phase curvature — the
+  modulation measures its own responsivity, so slow responsivity drift is
+  tracked automatically;
+- the centre point against a reference (its mean over the first
+  `conversion.baseline_cycles`, default 20) gives the resonance shift and
+  dissipation. With a calibration (the file, or the one pushed to the
+  server) this happens in its circle-centred basis — the centred phase and
+  log-radius over the live slope, the preferred conversion, with no
+  dissipation leaking into frequency; without one, on the raw I/Q by the
+  tangent/normal projection on the live gradient.
 
-The linearisation is valid while the tone sits in the linear part of the
-phase-frequency curve — which is exactly what server-side tone tracking
-(`enable_tracking`, `doc/tone_tracking.md`) maintains. Run them together.
+The conversion is first order in the excursion from the reference, which is
+what server-side tone tracking (`enable_tracking`, `doc/tone_tracking.md`)
+keeps small. Run them together.
 
-**Recentering provenance**: a tracking (or client) recenter moves the tone
-centre and bumps the stream revision tag. The script subscribes to the
-typed tone-update frames automatically in ffm mode, keys the per-revision
-centres, and outputs the **absolute** resonator shift since startup:
-`x = (center[rev] − center[rev0]) − probe_side_shift` (detector-side sign:
-positive = resonance moved up). Recenters therefore do not step the analog
-output, and the same updates land in the `.updates.jsonl` sidecar next to
-the raw recording for offline reconstruction. The startup phase baseline
-absorbs the `center − fr` operating-point offset documented in
-`modulation.params_from_sweep`. `conversion.average_cycles` boxcars the
-last N per-cycle outputs before the DAC mapping.
+**Recentres**: a tracking (or client) recentre moves the tone centre and
+bumps the stream revision tag. The script subscribes to the typed
+tone-update frames automatically in ffm mode, registers each revision's
+centre, offsets and readout correction, and outputs the resonator's own
+motion by the reconstruction identity:
+`x = (center[rev] − center[ref]) + shift about the reference` (positive =
+resonance moved up). Recentres therefore do not step the analog output;
+cycles of a revision whose announcement has not yet arrived are held back
+rather than read with the old state. In the calibrated basis the join is
+exact to first order; on raw I/Q the cable delay adds about
+`2π τ / |dφ/df|` hertz per hertz of recentre (well under 1% for typical
+delays). The same updates land in the `.updates.jsonl` sidecar next to the
+raw recording (with `sample_index`, as `receive_stream` writes them), so
+`parse_stream` and `modulation.demodulate_stream` reconstruct the recording
+offline — `tests/test_stream_dac.py` checks the DAC against that offline
+analysis of its own recording. `conversion.average_cycles` boxcars the last N
+per-cycle outputs before the DAC mapping; `conversion.demod_method`
+(`fast`, or `accurate` for a quadratic fit) selects the estimator.
 
 The converter interface (`stream_dac.StreamConverter`) keeps all of this
 out of the I/O threads: `ffm` is just a converter with
@@ -134,23 +172,29 @@ mean.
 ### Calibration workflow (sweep → fit → file)
 
 ```python
-from souk_readout_tools import stream_dac
+from souk_readout_tools import resonator
 
 # 1. Take + parse a sweep as usual (client.perform_sweep / get_sweep_data).
 sweep = client.parse_sweep_data(client.get_sweep_data())
 
 # 2. Fit all tones and build per-tone calibrations (fitting.batch_fit
 #    under the hood; kwargs are forwarded to it).
-cals = stream_dac.calibrations_from_sweep(sweep)
+cals = resonator.calibrations_from_sweep(sweep)
 
-# 3. Save for the config's conversion.calibration_file.
-stream_dac.save_calibrations('my_array_cal.npz', cals)
+# 3a. Push them to the server: every stream then carries them
+#     (info['resonators']), and df_calibrated / ffm need no file ...
+client.set_resonator_calibrations(cals, sweep_data=sweep)
+
+# 3b. ... or save them (with the sweep) for conversion.calibration_file.
+resonator.save_calibrations('my_array_cal.npz', cals, sweep_data=sweep)
 ```
 
-The `.npz` stores the `ResonatorCalibration` constructor arrays per tone
-(fr, Ql, tau, circle centre/radius/rotation, gain, Duffing `anl`, …) keyed by
-`tone_indices` — plain numpy, no pickle. `stream_dac.load_calibrations`
-restores them.
+The `.npz` holds the calibration record's per-tone arrays (fr, Ql, Qi,
+cable delay, circle centre/radius/rotation, gain, Duffing `anl`, the
+operating point, …) keyed by `tone_indices`, its provenance, and the sweep
+when given — plain numpy, no pickle. `resonator.load_calibrations` restores
+them (older `stream_dac.save_calibrations` files load too; the `stream_dac`
+names still work).
 
 ## df → volts mapping
 
@@ -312,14 +356,15 @@ The selftest reports the USB write+read transaction time (~1 ms class) and
 loopback error; pick `dac.update_rate_hz` accordingly (default 200 Hz).
 
 **2. Tune up the array as usual** (tones set, powers optimised), then take
-and fit a sweep and build the calibration file (only needed for
-`df_calibrated`; skip for `magnitude`/`phase`/`ffm`):
+and fit a sweep and push the calibrations (needed for `df_calibrated`;
+gives `ffm` its centred basis; skip for `magnitude`/`phase`):
 
 ```python
-from souk_readout_tools import stream_dac
+from souk_readout_tools import resonator
 sweep = client.parse_sweep_data(client.get_sweep_data())
-cals = stream_dac.calibrations_from_sweep(sweep)
-stream_dac.save_calibrations('array_cal.npz', cals)   # -> conversion.calibration_file
+cals = resonator.calibrations_from_sweep(sweep)
+client.set_resonator_calibrations(cals, sweep_data=sweep)   # in every stream's info
+resonator.save_calibrations('array_cal.npz', cals, sweep_data=sweep)  # or a file
 ```
 
 **3. Zero-calibration first light.** Start streaming
@@ -335,14 +380,14 @@ Watch the status line respond to the source (chop by hand). Move to
 
 **4. Choose the science mode.**
 
-- Fixed tone: `--mode df_calibrated` (with the calibration file) or
-  `--mode phase` / `df_modelfree` for quick looks. The df→V mapping
+- Fixed tone: `--mode df_calibrated` (with the pushed calibration or the
+  file) or `--mode phase` / `df_modelfree` for quick looks. The df→V mapping
   (`gain`, `v_offset`, clip range) sets the scale on the TOPTICA axis:
   e.g. `gain: 2e-4` puts ±10 kHz of detuning across ±2 V.
 - Modulated (recommended for long scans): arm FFM + tracking on the
   server first (see the recipe in `doc/tone_tracking.md`), then
-  `--mode ffm`. The output is then the absolute resonator shift,
-  self-calibrating and immune to recenters.
+  `--mode ffm`. The output is then the resonator's own shift,
+  self-calibrating and immune to recentres.
 
 **5. Measure end-to-end latency once per setup.** Step a known input —
 `client.update_modulation(center=...)` by a known offset, or chop the
@@ -365,10 +410,13 @@ against the TOPTICA-side trace.
 
 `tests/test_stream_dac.py` covers: the frame assembler against synthetic
 byte streams (partial reads, keepalives, typed-frame top byte), trailer/flag5
-decoding, the stream-path-vs-`parse_samples` units test, converter round
-trips through a `ResonatorCalibration`, calibration file round trip, a live
-socket test against an in-process server, `ReadoutClient(mock=True)` frames,
-and a replay → dummy-DAC end-to-end run (drop counting, safe state,
-re-recorded bytes identical). Frame sources are interchangeable:
+decoding, the stream-path-vs-`parse_samples` units test, per-revision
+readout correction, converter round trips through a `ResonatorCalibration`,
+the calibrated ffm path (any slot order, loss vs frequency, recentres, held
+revisions), the DAC against the offline analysis of its own recording and
+the replay of its updates, calibration file round trip, a live socket test
+against an in-process server, `ReadoutClient(mock=True)` frames, and a
+replay → dummy-DAC end-to-end run (drop counting, safe state, re-recorded
+bytes identical). Frame sources are interchangeable:
 `SocketFrameSource` (live), `MockFrameSource` (emulated server),
 `ReplayFrameSource` (recorded file at true rate).
