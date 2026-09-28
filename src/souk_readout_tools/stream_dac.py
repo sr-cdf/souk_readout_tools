@@ -627,32 +627,32 @@ class FfmConverter(StreamConverter):
 
     - ``resonator.phase_derivatives`` (any slot order; points sharing an
       offset averaged coherently) gives a live ``dphi_df`` -- the modulation
-      measures its own responsivity every cycle -- and the phase curvature,
-      hence the centre detuning (resonance minus modulation centre);
-    - the centre point against a reference -- its mean over the first
-      ``baseline_cycles`` cycles, so the output starts from zero -- gives
-      the resonance shift and matched dissipation. With a ``calibration``
-      this happens in its circle-centred basis, by
-      ``resonator.phase_shift_and_dissipation`` on the live slope (the
-      preferred conversion); without one, on the raw I/Q, by the
-      tangent/normal projection on the live gradient.
+      measures its own responsivity every cycle -- and the phase curvature;
+    - with a ``calibration``, every cycle is absolute: its points, taken into
+      the circle-centred basis, are inverted exactly
+      (``resonator.mobius_center_detuning``, the tracker's default estimate,
+      right in scale for driven resonators) into the centre detuning, so the
+      resonance is ``centre[rev] + centre detuning`` -- the reconstruction
+      identity of ``doc/tone_tracking.md`` -- and the resonance shift is its
+      change since the first ``baseline_cycles`` cycles (so the output starts
+      from zero); the dissipation likewise, from the inversion's loss
+      coordinate. A recentre needs no join at all;
+    - without one, on the raw I/Q, the centre point against a startup
+      reference by the tangent/normal projection on the live gradient, plus
+      the centre steps: ``(centre[rev] - centre[ref]) + shift about the
+      reference``. First order in the excursion from the reference, and the
+      cable delay's phase moving with the probe reads as about
+      ``2 pi tau / |dphi_df|`` hertz per hertz of recentre.
 
-    A tracking (or client) recentre moves the probe and bumps the revision
-    stamped in every frame. Each revision's centre and offsets are
-    registered with :meth:`note_center` (:class:`StreamToDac` feeds it the
-    SNAPSHOT / TONE_UPDATE typed frames) and the output stays the
-    resonator's own motion since the reference, by the reconstruction
-    identity of ``doc/tone_tracking.md``::
+    Each revision's centre and offsets are registered with :meth:`note_center`
+    (:class:`StreamToDac` feeds it the SNAPSHOT / TONE_UPDATE typed frames).
+    Once typed frames are arriving, the cycles of a revision not yet
+    announced are held back; without them the centre after a recentre is
+    unknown and every recentre reads as a step of the recentre size.
 
-        resonance shift = (center[rev] - center[ref]) + shift about the reference
-
-    The centred basis depends only on the detuning, so this is exact to
-    first order in the detuning excursion, which tracking keeps small. On the
-    raw I/Q the cable delay's phase also moves with the probe and reads as
-    about ``2 pi tau / |dphi_df|`` hertz per hertz of recentre (well under 1%
-    for typical delays and linewidths). Once typed frames are arriving, the
-    cycles of a revision not yet announced are held back; without them every
-    recentre reads as a step of the recentre size.
+    (Converting a calibrated tone about one startup reference through the
+    live slope, as this did first, stepped by ~25% of each tracking move on
+    tones driven to anl ~ 0.3: first order in a large excursion.)
 
     Parameters
     ----------
@@ -783,21 +783,46 @@ class FfmConverter(StreamConverter):
         self.last_dphi_df = slope
         curvature = float(d['d2phi_df2'][0])
 
+        cal = self.calibration
+        if cal is not None:
+            # The calibration's inversion of the cycle's points: the centre
+            # detuning (the tracker's estimate, right in scale for driven
+            # resonators, where the curvature form reads ~2x) and the loss.
+            detuning_hz = float(resonator.mobius_center_detuning(z, offsets, cal))
+            loss = float(np.nanmean(cal.convert_centered_iq(z)[1]))
+
         if self.output in CYCLE_FIELDS:
             cycle = {'dphi_df': slope, 'd2phi_df2': curvature,
                      'curvature_over_slope': curvature / slope}
-            if self.calibration is not None:
-                # The calibration's inversion: right in scale for driven
-                # resonators, where the curvature form reads ~2x.
-                detuning_hz = float(resonator.mobius_center_detuning(
-                    z, offsets, self.calibration))
+            if cal is not None:
                 cycle['center_detuning_hz'] = detuning_hz
-                cycle['center_detuning_linewidths'] = (
-                    detuning_hz * self.calibration.Ql / self.calibration.fr)
+                cycle['center_detuning_linewidths'] = detuning_hz * cal.Ql / cal.fr
             self._push(cycle[self.output])
             return
 
-        # The centre point (its dwells averaged) and its local slope/gradient.
+        if cal is not None:
+            # Every cycle is absolute -- the reconstruction identity,
+            # resonance = centre + centre detuning -- so a recentre needs no
+            # join. (Converting about one startup reference through the live
+            # slope, as before, stepped by ~25% of each tracking move on the
+            # driven krm4 tones: first order in a large excursion.)
+            resonance = center + detuning_hz
+            if self._reference is None:
+                self._baseline.append((resonance, loss))
+                if len(self._baseline) >= self._baseline_cycles:
+                    self.reference_resonance_hz, reference_loss = (
+                        float(v) for v in np.nanmean(self._baseline, axis=0))
+                    self._reference = (reference_loss, None)
+                    self._baseline = []
+                return
+            self._push(float(resonator.express(
+                self.output, resonance - self.reference_resonance_hz,
+                loss - self._reference[0], frequency_hz=center, calibration=cal,
+                reference_resonance_hz=self.reference_resonance_hz)))
+            return
+
+        # Uncalibrated: the centre point (its dwells averaged) and its local
+        # slope/gradient, about a startup reference, plus the centre steps.
         mid_offset = float(d['center_offset_hz'][0])
         mid = offsets == mid_offset
         first = int(np.flatnonzero(mid)[0])
@@ -808,27 +833,12 @@ class FfmConverter(StreamConverter):
                 self._baseline, self._baseline_key = [], key
             self._baseline.append(z_mid)
             if len(self._baseline) >= self._baseline_cycles:
-                reference = complex(np.mean(self._baseline))
-                self._reference = (reference, center)
+                self._reference = (complex(np.mean(self._baseline)), center)
                 self._baseline = []
-                if self.calibration is not None:
-                    # Where the resonance (inflection) was at the reference.
-                    cal = self.calibration
-                    probe_detuning = float(cal.convert_centered_iq(reference)[0])
-                    self.reference_resonance_hz = (
-                        center + mid_offset - probe_detuning
-                        + resonator.operating_point_hz(cal) - cal.fr)
             return
         reference, reference_center = self._reference
-        if self.calibration is not None:
-            local_slope = float(d['local_dphi_df'][first, 0])
-            if not np.isfinite(local_slope):
-                local_slope = slope
-            shift, dissipation_hz = resonator.phase_shift_and_dissipation(
-                z_mid, reference, local_slope)
-        else:
-            shift, dissipation_hz = resonator.project_iq_tangent_normal(
-                reference, d['dz_df'][first, 0], z_mid)
+        shift, dissipation_hz = resonator.project_iq_tangent_normal(
+            reference, d['dz_df'][first, 0], z_mid)
         probe_hz = center + mid_offset
         shift = float(shift) + (center - reference_center)
         self._push(float(resonator.express(

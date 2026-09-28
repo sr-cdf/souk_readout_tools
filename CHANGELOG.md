@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **stream-to-DAC `ffm` no longer steps at tracking commits**: with a
+  calibration every cycle is absolute (centre + Möbius centre detuning, the
+  reconstruction identity), so recentres need no join. Converting about one
+  startup reference through the live slope stepped by ~25% of each move on
+  driven krm4 tones (e.g. +6.86 kHz move -> -1.77 kHz step). Fixed-tone modes
+  on a modulated stream now average whole modulation cycles (they followed
+  the probe slots above ~700 Hz updates: 4.9 kHz p-p).
+
 - **Möbius is the default detuning estimator**: on tones driven to anl ~0.3
   (krm4, 2026-09-28) the curvature form `phi''/(2 phi'|phi'|)` read 2x (fit:
   3-3.5x) and the gain-1 tracker jumped +/-0.24 lw every commit.
