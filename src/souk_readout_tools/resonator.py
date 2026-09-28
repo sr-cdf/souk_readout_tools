@@ -70,6 +70,7 @@ Uncertainty propagation:
 - Uncertainty in fitted transform parameters themselves is not included.
 """
 
+import functools
 import json
 import time
 import warnings
@@ -1892,14 +1893,25 @@ def operating_point_hz(calibration, n_grid=20001, y_max=8.0):
     from the rational inverse :func:`invert_duffing_coordinate`. Past
     ``BIFURCATION_ANL`` the peak rides up to the cliff edge, where a small
     shift jumps the branch: :func:`calibration_record` flags such tones.
+
+    A driven fit's grid solve costs a few ms, so results are remembered per
+    parameter set (a pure function of them: it cannot go stale); the
+    demodulators, the tracker and stream-to-DAC call it every cycle.
     """
     foj = float(getattr(calibration, 'frequency_origin_fraction', 0.0))
     anl = float(getattr(calibration, 'anl', 0.0))
     if anl == 0.0:
         return float(calibration.fr * (1.0 - foj))
-    y = np.linspace(-y_max, y_max, int(n_grid))
-    x = invert_duffing_coordinate(y, anl) / calibration.Ql     # (f - fr) / fr
-    f = calibration.fr * (1.0 + x)
+    return _driven_operating_point_hz(float(calibration.fr), float(calibration.Ql), anl,
+                                      int(n_grid), float(y_max))
+
+
+@functools.lru_cache(maxsize=8192)
+def _driven_operating_point_hz(fr, Ql, anl, n_grid, y_max):
+    """:func:`operating_point_hz` for a driven fit (``anl > 0``)."""
+    y = np.linspace(-y_max, y_max, n_grid)
+    x = invert_duffing_coordinate(y, anl) / Ql     # (f - fr) / fr
+    f = fr * (1.0 + x)
     dS21_dy = 2.0 / (1.0 + 4.0 * y ** 2)
     df_dy = np.abs(np.gradient(f, y))
     slope = dS21_dy / np.where(df_dy > 0.0, df_dy, np.inf)
