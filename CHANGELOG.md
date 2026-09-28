@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Möbius is the default detuning estimator**: on tones driven to anl ~0.3
+  (krm4, 2026-09-28) the curvature form `phi''/(2 phi'|phi'|)` read 2x (fit:
+  3-3.5x) and the gain-1 tracker jumped +/-0.24 lw every commit.
+  `resonator.mobius_center_detuning` (measured gain 0.98) now drives
+  `enable_tracking` (`detuning_estimator='mobius'`; `'curvature'` optional),
+  argument-less `update_modulation()`, and the calibrated `center_detuning_*`
+  of `demodulate*`, the live viewer and stream-to-DAC `ffm`.
+
+- **Tracker overshoot fixes**: a staged correction is replaced, not added to
+  (held bin moves applied the same detuning twice); the detuning filter
+  restarts at each revision; `demodulate*` / `StreamDemodulator` divide out the
+  RX gain change since the calibration (unmatched, 1 dB made a 5 kHz recentre
+  read as a -1.3 kHz step).
+
+- **stream-to-dac drift high-pass**: `channels[].highpass_s` (s) subtracts a
+  running EMA baseline of `x` before the gain/clip (`OutputChannel(highpass_s=)`),
+  so ffm drift no longer rails the output. Off by default. See
+  `doc/stream_to_dac.md` (df → volts mapping).
+
 - **One conversion contract in `resonator.py`**: every I/Q -> quantity
   conversion now lives there and `timeseries`, `noise`, `modulation`, the live
   viewer, the tracker and `stream_dac` call it: `QUANTITIES` (+ aliases,

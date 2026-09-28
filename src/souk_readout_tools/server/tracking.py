@@ -4,8 +4,12 @@ Server-side FFM tone tracking: watch demodulated detunings, issue corrections.
 With fast frequency modulation running, this module keeps every modulated
 tone at its operating point during long observations: a lean vectorised
 estimator turns whole modulation cycles from the stream, circle-centred with
-per-tone sweep fits, into per-tone detunings, a controller filters them, applies a deadband + confirmation
-logic, and stages small centre corrections that are committed through the
+the client's pushed calibration, into per-tone detunings -- by default the
+calibration's exact inversion (``resonator.mobius_center_detuning``), right in
+scale for driven resonators; optionally the rotation-free curvature/slope form
+(:func:`estimate_detunings`), which reads ~2x on driven tones -- a controller
+filters them, applies a deadband + confirmation logic, and stages small centre
+corrections that are committed through the
 server's normal ``update_modulation`` machinery (the frame producer stays
 the sole owner of modulation hardware writes). Every committed correction is
 revision-stamped into the stream and announced in-band as a typed
@@ -18,9 +22,8 @@ Detuning follows the package convention: the resonance minus the modulation
 centre, so a positive reading moves the centre up.
 
 Tracking is permanent readout infrastructure (live frequency-shift serving
-and array health monitoring are other plausible consumers); the estimator
-(:func:`assemble_cycles` + :func:`estimate_detunings`) is deliberately
-separable from the controller and from the server wiring.
+and array health monitoring are other plausible consumers); the estimators
+are deliberately separable from the controller and from the server wiring.
 
 Performance contract (see doc/tone_tracking.md): the only work added to the
 per-accumulation hot path is one coherent add of the I/Q words into the
@@ -53,7 +56,7 @@ import numpy as np
 from souk_readout_tools import modulation
 from souk_readout_tools.resonator import (basis_coefficients,
                                           detuning_from_derivatives,
-                                          operating_point_hz,
+                                          mobius_center_detuning,
                                           phase_derivatives)
 
 # Number of int32 trailer words at the end of every stream frame
@@ -899,16 +902,17 @@ class TrackingRuntime:
         self.n_tones = len(np.asarray(cfg['center'], dtype=float))
         self.mod_indices = [int(i) for i in cfg['mod_indices']]
 
-        # Detuning estimator: 'curvature' -- the three-point slope/curvature,
-        # rotation-free, needs three distinct offsets -- or 'mobius', the
-        # calibration's exact inversion of the averaged centred I/Q, which
-        # needs no modulation at all (a zero-offset "modulation" gives
-        # unmodulated tracking) but leans on the fitted rotation.
+        # Detuning estimator: 'mobius' (default) -- the calibration's exact
+        # inversion of the averaged centred I/Q, right in scale for driven
+        # resonators and needing no modulation at all (a zero-offset
+        # "modulation" gives unmodulated tracking), but leaning on the fitted
+        # rotation -- or 'curvature', the three-point slope/curvature:
+        # rotation-free, but it reads ~2x on driven tones (anl ~ 0.3), where a
+        # gain-1 loop then jumps from side to side of the resonance.
         offsets = self._full_offsets(cfg)
         distinct = min((len(np.unique(offsets[:, t])) for t in self.mod_indices),
                        default=0)
-        estimator = params.get('detuning_estimator') or (
-            'curvature' if distinct >= 3 else 'mobius')
+        estimator = params.get('detuning_estimator') or 'mobius'
         if estimator not in ('curvature', 'mobius'):
             raise ValueError("detuning_estimator must be 'curvature' or 'mobius'")
         if estimator == 'curvature' and distinct < 3:
@@ -935,9 +939,6 @@ class TrackingRuntime:
         # at startup.
         with np.errstate(divide='ignore', invalid='ignore'):
             self.expected_abs_slope = 4.0 / self.linewidth_hz
-        self._operating_offset_hz = np.zeros(self.n_tones)
-        for t, cal in calibrations.items():
-            self._operating_offset_hz[t] = operating_point_hz(cal) - cal.fr
         # Offsets, the RX correction and the centring follow the applied
         # revision (tracking commits move the centres, and the correction
         # factors with them): see _refresh_revision_state.
@@ -1307,16 +1308,22 @@ class TrackingRuntime:
                             'centered_rotated', self.rx_gain)
                         centred[..., j] = phase_blocks[..., j] * A + B
                     phase = phase_derivatives(centred, offsets, method='fast')
+                    mobius = np.stack([
+                        mobius_center_detuning(centred[..., j], offsets[:, j],
+                                               self.phase_calibrations[t])
+                        for j, t in enumerate(indices)], axis=-1)
                     with warnings.catch_warnings():
                         warnings.simplefilter('ignore', RuntimeWarning)
                         slope = np.nanmedian(phase['dphi_df'], axis=0)
                         curvature = np.nanmedian(phase['d2phi_df2'], axis=0)
+                        mobius = np.nanmedian(mobius, axis=0)
                     self.last_phase_estimate = {
                         'revision': int(revision or 0),
                         'indices': indices,
                         'centers': np.asarray(centers, dtype=float).copy(),
                         'slope': slope,
                         'curvature': curvature,
+                        'mobius_detuning_hz': mobius,
                         'timestamp': time.time(),
                     }
                     self.phase_estimate_requested = False
@@ -1360,13 +1367,8 @@ class TrackingRuntime:
         the lock health is the fit's at that detuning.
         """
         detuning_hz = np.full((z.shape[0], self.n_tones), np.nan)
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', RuntimeWarning)
-            for t, cal in self.calibrations.items():
-                probe_detuning = cal.convert_centered_iq(z[:, :, t])[0]  # f_probe - fr
-                detuning_hz[:, t] = (np.nanmean(self.offsets[None, :, t] - probe_detuning,
-                                                axis=1)
-                                     + self._operating_offset_hz[t])
+        for t, cal in self.calibrations.items():
+            detuning_hz[:, t] = mobius_center_detuning(z[:, :, t], self.offsets[:, t], cal)
         with np.errstate(divide='ignore', invalid='ignore'):
             detuning_lw = detuning_hz / self.linewidth_hz
             slope = -self.expected_abs_slope / (1.0 + 4.0 * detuning_lw ** 2)

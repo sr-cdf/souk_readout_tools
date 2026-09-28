@@ -52,7 +52,7 @@ import numpy as np
 from .resonator import (ResonatorCalibration, apply_readout_correction,
                         calibration_for_tone, calibration_from_data,
                         detuning_from_derivatives, is_calibration_record,
-                        operating_point_hz, phase_derivatives,
+                        mobius_center_detuning, operating_point_hz, phase_derivatives,
                         phase_shift_and_dissipation, project_iq_tangent_normal,
                         readout_correction_factors, recorded_rx_gain_ratio,
                         to_basis)
@@ -1251,7 +1251,8 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         ``matched_dissipation_shift``, ``resonance_frequency_hz`` (calibrated
         tones only; NaN otherwise), ``center_detuning_hz`` /
         ``center_detuning_linewidths`` / ``needs_update`` (per cycle,
-        calibrated tones only, from the phase inflection), ``dphi_df`` (local
+        calibrated tones only, by the calibration's inversion,
+        ``resonator.mobius_center_detuning``), ``dphi_df`` (local
         point slope), ``center_dphi_df``, ``d2phi_df2`` and
         ``modulation_offset_hz``. Per tone: ``conversion`` and ``basis`` (lists),
         ``point_reference_z``, ``point_gradient`` (mean ``dz/df`` per point),
@@ -1614,11 +1615,12 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         gradient = derivatives['dz_df'][:, :, 0]
         point_gradient[:, t] = _nanmean_quiet(gradient, axis=0)
 
-        # Where the resonance is: the curvature/slope detuning of each cycle,
-        # meaningful on the centred phase only.
+        # Where the resonance is, per cycle: the calibration's inversion of the
+        # centred points, whose scale holds for driven resonators too (the
+        # curvature/slope form shares its zero but reads ~2x there).
         if centred:
             linewidth = cal.fr / cal.Ql
-            center_lw = detuning_from_derivatives(slope_center, curvature)
+            center_lw = mobius_center_detuning(point_z, f, cal) / linewidth
         else:
             linewidth = np.nan
             center_lw = np.full(n_cycles, np.nan)
@@ -1773,23 +1775,25 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
     Demodulate grouped modulation cycles into per-tone, per-cycle quantities.
 
     Each cycle's probe points give the phase slope ``dphi/df`` and curvature
-    ``d2phi/df2`` at the centre (``resonator.phase_derivatives``), and from
-    them the **centre detuning**: the resonance minus the modulation centre,
-    measured from the phase inflection (``d2phi/df2 = 0``, the steepest
-    point) as ``phi'' / (2 phi' |phi'|)`` linewidths
-    (``resonator.detuning_from_derivatives``), exact for the centred notch
-    phase ``-2 atan(2x)``. For a linear notch the inflection is ``fr``; for a
-    driven one it is ``resonator.operating_point_hz``, which
-    :func:`params_from_sweep` centres on. The centre point's I/Q gives the
-    resonance shift and dissipation of each cycle.
+    ``d2phi/df2`` at the centre (``resonator.phase_derivatives``) and the
+    **centre detuning**: the resonance -- its operating point, the phase
+    inflection (``resonator.operating_point_hz``, which :func:`params_from_sweep`
+    centres on) -- minus the modulation centre. For a calibrated tone it is the
+    calibration's exact inversion of the centred points
+    (``resonator.mobius_center_detuning``), right in scale for driven
+    resonators too, as the tracker's default estimator is. The curvature form
+    ``phi'' / (2 phi' |phi'|)`` (``resonator.detuning_from_derivatives``)
+    shares its zero but is exact only for a linear notch (it read ~2x on tones
+    driven to anl ~ 0.3); it is what a raw tone gets, with ``linewidth_hz``.
+    The centre point's I/Q gives the resonance shift and dissipation of each
+    cycle.
 
     Two bases:
 
     - **Calibrated / centred** (``calibration`` supplied, the recommended
       one): each probe point is de-embedded (cable delay removed at its
       absolute frequency) and circle-centred, where the phase is well
-      conditioned and the detuning needs no linewidth; the calibration's
-      ``fr / Ql`` only converts it to Hz.
+      conditioned and the calibration inverts each point exactly.
     - **Raw** (no ``calibration``): the phase about the origin, not the circle
       centre, reads the detuning 13x to 25x high near resonance (worse for
       very shallow dips): only its sign and rough zero mean anything, so it
@@ -1922,10 +1926,15 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
         out['dphi_df'][:, t] = slope
         out['d2phi_df2'][:, t] = curvature
 
-        # The detuning from the phase inflection: on the centred phase for a
-        # calibrated tone; on the raw phase only with an explicit linewidth.
-        if N >= 3 and np.isfinite(linewidth):
+        # Resonance minus centre: the calibration's inversion for a calibrated
+        # tone (right in scale for driven resonators too); the curvature/slope
+        # form on the raw phase only with an explicit linewidth.
+        center_lw = None
+        if centred:
+            center_lw = mobius_center_detuning(zb, f, cal) / linewidth
+        elif N >= 3 and np.isfinite(linewidth):
             center_lw = detuning_from_derivatives(slope, curvature)
+        if center_lw is not None:
             out['center_detuning_linewidths'][:, t] = center_lw
             out['center_detuning_hz'][:, t] = center_lw * linewidth
             with np.errstate(invalid='ignore'):

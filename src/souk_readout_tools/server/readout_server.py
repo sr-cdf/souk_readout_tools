@@ -6366,7 +6366,8 @@ class ReadoutServer:
             raise RuntimeError('modulation command superseded by a newer request')
 
     async def _update_modulation_to_inflection(self, engine=None):
-        """Take one server-side, calibrated phase-curvature correction step."""
+        """Take one server-side correction step toward the operating point,
+        with the tracker's detuning estimator (Mobius by default)."""
         state = self._info_modulation()
         if not state.get('enabled'):
             raise ValueError('modulation must be enabled for an automatic update')
@@ -6455,11 +6456,15 @@ class ReadoutServer:
                 if abs(slope) < runtime.params.get('unlock_slope_ratio', 0.25) * 4.0 / lw:
                     skipped[tone] = 'phase slope is too weak for a reliable correction'
                     continue
-                # Resonance minus centre, the exact inverse of the centred
-                # notch phase -2 atan(2x): move the centre that way.
-                shift = float(np.clip(
-                    detuning_from_derivatives(slope, curvature) * lw,
-                    -0.5 * lw, 0.5 * lw))
+                # Resonance minus centre: move the centre that way.
+                if runtime.detuning_estimator == 'mobius':
+                    detuning = float(phase['mobius_detuning_hz'][j])
+                else:
+                    detuning = float(detuning_from_derivatives(slope, curvature) * lw)
+                if not np.isfinite(detuning):
+                    skipped[tone] = 'no finite detuning estimate'
+                    continue
+                shift = float(np.clip(detuning, -0.5 * lw, 0.5 * lw))
                 if abs(shift) >= 0.01 * lw:
                     corrections[tone] = float(centers[tone] + shift)
                     shifts[tone] = shift
@@ -6534,10 +6539,12 @@ class ReadoutServer:
         'unlock_slope_ratio': 0.25,
         'unlock_invalid_fraction': 0.5,
         'unlock_detuning_linewidths': 1.0,
-        # 'curvature' (three-point, rotation-free; needs three distinct
-        # offsets) or 'mobius' (fitted inversion; works unmodulated, on a
-        # zero-offset modulation). None picks curvature when it can.
-        'detuning_estimator': None,
+        # 'mobius' (the calibration's exact inversion: right in scale for
+        # driven resonators; works unmodulated, on a zero-offset modulation;
+        # leans on the fitted rotation) or 'curvature' (three-point,
+        # rotation-free, needs three distinct offsets; reads ~2x on driven
+        # tones, where a gain-1 loop jumps from side to side).
+        'detuning_estimator': 'mobius',
     }
 
     async def _commit_tracking_update(self, engine, klass, corrections,

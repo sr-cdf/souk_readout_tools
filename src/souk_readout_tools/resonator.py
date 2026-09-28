@@ -2803,6 +2803,55 @@ def detuning_from_derivatives(dphi_df, d2phi_df2):
     return np.where(np.isfinite(detuning), detuning, np.nan)
 
 
+def mobius_center_detuning(z_points, offsets, calibration):
+    """Resonance minus modulation centre (Hz) by the calibration's exact inversion.
+
+    The default detuning estimate for calibrated tones -- the tracker's, the
+    live viewer's and the demodulators'. Each probe point's centred I/Q (the
+    ``centered_rotated`` basis, :func:`to_basis`) is inverted with the fitted
+    model -- the circle's Mobius map and, for a driven fit, the analytic
+    Duffing inverse -- into that probe's detuning from the fitted resonance;
+    less the point's offset it is the centre's, averaged over the points,
+    plus the operating point's offset from ``fr``, so zero means the centre
+    sits on the phase inflection (:func:`operating_point_hz`).
+
+    Its scale is right for driven resonators too. :func:`detuning_from_derivatives`
+    shares its zero but not its scale there: on tones driven to ``anl ~ 0.3``
+    it read 2x (3-3.5x by the fit), enough to make a gain-1 tracker jump from
+    side to side of the resonance. The price is leaning on the fitted rotation
+    and nonlinearity, which the curvature estimate does not.
+
+    Parameters
+    ----------
+    z_points : array_like of complex, shape (..., N)
+        Centred I/Q at each of the tone's N probe points (e.g. cycle means).
+    offsets : array_like, shape (N,)
+        Each point's probe offset from the centre (Hz); a single zero offset
+        (no modulation) works too.
+    calibration : ResonatorCalibration
+
+    Returns
+    -------
+    numpy.ndarray, shape (...)
+        Resonance minus centre in Hz; divide by ``fr / Ql`` for linewidths.
+
+    Examples
+    --------
+    >>> cal = ResonatorCalibration(1e9, 2e4, 0.0, 0.75 + 0j, 0.25, np.pi)
+    >>> off = np.array([-5e3, 0.0, 5e3, 0.0])
+    >>> s21 = 1 - 0.5 / (1 + 2j * 2e4 * (1e9 + off - (1e9 + 3e3)) / 1e9)
+    >>> round(float(mobius_center_detuning(to_basis(s21, cal, 1e9 + off), off, cal)))
+    3000
+    """
+    # Points that saw no sample are NaN: they drop out quietly.
+    with np.errstate(divide='ignore', invalid='ignore'), warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        probe_detuning = calibration.convert_centered_iq(
+            np.asarray(z_points, dtype=complex))[0]
+        centre = np.nanmean(np.asarray(offsets, dtype=float) - probe_detuning, axis=-1)
+    return centre + operating_point_hz(calibration) - calibration.fr
+
+
 def phase_shift_and_dissipation(z, reference, dphi_df):
     """Resonance shift and matched dissipation, both in Hz, from centred I/Q.
 

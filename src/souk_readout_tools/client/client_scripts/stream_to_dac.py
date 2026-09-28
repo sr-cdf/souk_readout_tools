@@ -268,7 +268,8 @@ def main():
             x_offset=channel_config.get('x_offset', 0.0),
             v_offset=channel_config.get('v_offset', 0.0),
             v_min=channel_config.get('v_min', 0.0),
-            v_max=channel_config.get('v_max', 5.0)))
+            v_max=channel_config.get('v_max', 5.0),
+            highpass_s=channel_config.get('highpass_s')))
 
     dac = stream_dac.make_dac_backend(config['dac']['backend'],
                                       dac_options(config))

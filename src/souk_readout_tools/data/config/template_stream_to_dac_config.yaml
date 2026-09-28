@@ -76,6 +76,10 @@ conversion:
 # a 1 V full scale) and v_offset does nothing -- the coupling capacitor blocks
 # any standing offset. Channel names DAC0/DAC1 map to the first two audio
 # channels, so a LabJack config ports over unchanged.
+# highpass_s: null, or a time constant in seconds. When set, x_offset is
+# replaced by a running average of x with that time constant (a single-pole
+# high-pass before the clip), so slow resonance drift cannot walk the output
+# into v_min/v_max. On alsa, use at most the measured coupling time constant.
 channels:
   - dac_channel: DAC0
     tone_index: 0
@@ -85,6 +89,7 @@ channels:
     v_offset: 0.0
     v_min: 0.0
     v_max: 5.0
+    highpass_s: null
   # - dac_channel: DAC1     # optional second tone
   #   tone_index: 1
   #   gain: 1.0

@@ -151,12 +151,23 @@ With the stream loop in its own process (`firmware.stream_process`) the tap
 runs there against a shared-memory accumulator and the finished window comes
 back through the same shared block; nothing else changes.
 
-**Estimator**: `estimate_detunings` is a lean whole-array implementation of
-`demodulate`'s `method='fast'` maths (finite-difference phase slope +
-curvature through `resonator.phase_derivatives`; detuning from the
-curvature/slope ratio, `resonator.detuning_from_derivatives`, which crosses
-zero at the phase inflection independent of the phase offset). The window's
-I/Q is first de-embedded and circle-centred per tone with the calibration
+**Estimator**: by default (`detuning_estimator='mobius'`) the calibration's
+exact inversion of each probe point's centred I/Q —
+`resonator.mobius_center_detuning`: the circle's Möbius map plus, for a
+driven fit, the analytic Duffing inverse, less each point's offset, averaged,
+plus the operating point's offset from `fr`. Its scale is right for driven
+resonators, it needs no probe offsets (so it also tracks unmodulated, on a
+zero-offset modulation), and it leans on the fitted rotation. The
+alternative, `'curvature'`, is `estimate_detunings`: a lean whole-array
+implementation of `demodulate`'s `method='fast'` maths (finite-difference
+phase slope + curvature through `resonator.phase_derivatives`; detuning from
+the curvature/slope ratio, `resonator.detuning_from_derivatives`, which
+crosses zero at the phase inflection independent of the phase offset). Its
+zero is right on any resonator but its scale only on a linear one: on krm4
+tones driven to `anl ≈ 0.3` it read 2× (3–3.5× by the fit), and the gain-1
+loop jumped ±0.24 linewidth from side to side of the resonance at every
+commit — the reason Möbius became the default (2026-09-28). Either way the
+window's I/Q is first de-embedded and circle-centred per tone with the calibration
 the client pushed (`set_resonator_calibrations`, reported as
 `calibration_source: 'client'`) — the same calibration the analysis of the
 recording uses, with the RX gain change since its sweep divided out
@@ -166,13 +177,10 @@ more than five linewidths from where it was made), and tones it does not
 cover are left alone. The centring coefficients, with each probe point's
 de-embedding and the revision's readout correction folded in, are rebuilt
 at every applied revision (`resonator.basis_coefficients`), so a window
-costs one complex multiply-add per value. `detuning_estimator='mobius'` swaps the curvature estimate
-for the calibration's exact inversion of the centre point, which also works
-unmodulated (on a zero-offset modulation); the default picks the curvature
-whenever there are three distinct offsets. On the centred phase a notch is exactly
-`-2 atan(2x)`, which inverts to `x = -φ''/(2φ'|φ'|)`: detuning in linewidths
-from slope and curvature alone, without compression (within ~1% at ±0.1 lw
-offsets); the linewidth only converts to Hz. Uncentred, the same numbers taken
+costs one complex multiply-add per value. For the curvature estimator: on the
+centred phase a linear notch is exactly `-2 atan(2x)`, which inverts to
+`x = -φ''/(2φ'|φ'|)`: detuning in linewidths from slope and curvature alone
+(within ~1% at ±0.1 lw offsets); the linewidth only converts to Hz. Uncentred, the same numbers taken
 about the raw origin read 13× to 25× high. With the earlier `-(φ''/φ')·lw/8`
 form, that made the simulated loop limit-cycle at ±0.3 lw or park 0.5–0.8 lw
 off resonance on deep dips. Centring costs ~14 ms per window at 1000 tones
@@ -425,7 +433,7 @@ If a residual effect matters, compute it from the logged step times/sizes
 | `unlock_slope_ratio` | 0.25 | `unlocked` when the centred phase slope drops below this fraction of the calibration's on-resonance slope `4 / linewidth` (0.25 ≈ 0.9 linewidths off) |
 | `unlock_invalid_fraction` | 0.5 | `unlocked` when this fraction of recent cycles are unusable |
 | `unlock_detuning_linewidths` | 1.0 | also `unlocked` when the filtered reading exceeds this; `None` disables |
-| `detuning_estimator` | `None` | `'curvature'` (three-point, needs three distinct offsets) or `'mobius'` (the calibration's inversion; works unmodulated); `None` picks curvature when it can |
+| `detuning_estimator` | `'mobius'` | `'mobius'` (the calibration's inversion: right in scale for driven tones, works unmodulated, leans on the fitted rotation) or `'curvature'` (three-point, rotation-free, needs three distinct offsets; reads ~2× on driven tones) |
 
 Commit policies combine — first to fire wins, gated by the per-class
 minimum interval; with neither optional policy set, a class commits as soon
@@ -501,7 +509,8 @@ Server request port (and matching `ReadoutClient` methods):
 
 - `enable_tracking(**params)` — start/reconfigure on whichever engine is
   armed, fw (the default engine; needs `mode='auto'`) or sw; ≥ 3
-  slots/points (tracking needs the curvature estimate).
+  slots/points for the `'curvature'` estimator; the default `'mobius'` needs
+  none (a zero-offset modulation tracks unmodulated).
 - `disable_tracking()` — stop; staged corrections are dropped.
 - `hold_tracking()` / `resume_tracking()` — pause without teardown.
 - `commit_tracking_updates(classes=None, tones=None)` — on-demand commit of
@@ -550,7 +559,8 @@ cfg = modulation.params_from_sweep(sweep, fits=fits)
 print(cfg['summary'])
 ```
 
-**2. Arm modulation (≥ 3 points/slots — tracking needs the curvature) and
+**2. Arm modulation (≥ 3 points/slots, for the per-cycle diagnostics and the
+`'curvature'` option) and
 stream.** The default engine is firmware-slot (`fw`); its `auto` mode
 round-robins all 4 mixer LO slots, so ask `params_from_sweep` for a
 4-entry pattern (e.g. `offset_linewidths=(-0.1, 0, 0.1, 0)` in step 1).

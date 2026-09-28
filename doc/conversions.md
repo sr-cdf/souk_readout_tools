@@ -132,19 +132,35 @@ blocks of cycles, averaged coherently) in the working basis:
   `method='fit'` fits a quadratic to the unwrapped phase against offset
   instead, so every point counts (the same numbers for three distinct
   offsets).
-- **Centre detuning**, resonance minus centre, in linewidths
-  (`detuning_from_derivatives`):
+- **Centre detuning**, resonance (its operating point) minus centre. Two
+  estimators; the default everywhere is the first:
 
-  ```
-  d = φ'' / (2 φ' |φ'|)
-  ```
+  - **Möbius** (`mobius_center_detuning`): each point's centred I/Q is
+    inverted with the fitted model — the circle's Möbius map and, for a
+    driven fit, the analytic Duffing inverse — into that probe's detuning
+    from `fr`; less the point's offset, averaged over the points, plus
+    `operating_point − fr`:
 
-  exact for the centred notch's true derivatives (invert
-  `φ = −2 atan(2x)`), whatever the phase offset — a rotation error cancels —
-  and without a linewidth; the calibration's `fr/Ql` only converts it to Hz.
-  The finite differences read it about 1% low at ±0.1-linewidth offsets and
-  5% at ±0.25. For a driven response only its zero, the inflection, is
-  exact — which is what tracking needs.
+    ```
+    d_centre = mean_p[ f_p − (f_probe,p − fr)_mobius ] + (operating_point − fr)
+    ```
+
+    Right in scale for driven resonators; works with any number of offsets,
+    none included (unmodulated tracking); leans on the fitted rotation and
+    nonlinearity.
+  - **Curvature** (`detuning_from_derivatives`), in linewidths:
+
+    ```
+    d = φ'' / (2 φ' |φ'|)
+    ```
+
+    exact for the centred *linear* notch's true derivatives (invert
+    `φ = −2 atan(2x)`), whatever the phase offset — a rotation error
+    cancels — and without a linewidth. The finite differences read it about
+    1% low at ±0.1-linewidth offsets and 5% at ±0.25. For a driven response
+    only its zero, the inflection, is right: on krm4 tones driven to
+    `anl ≈ 0.3` it read 2× (3–3.5× by the fit), and a gain-1 tracker then
+    jumped from one side of the resonance to the other every commit.
 - **Per-point gradients**, exact for a response that is a Möbius function of
   frequency — a resonance circle in any affine basis. With the difference
   quotients `D_ab = (z_b − z_a)/(f_b − f_a)`:
@@ -193,14 +209,16 @@ reference and adds the centre steps, `(f_centre[rev] − f_centre[ref]) +
 shift about the reference` — exact to first order in the centred basis,
 which depends on the detuning alone.
 
-### Tracking without modulation
+### The tracker's estimator
 
-The tracker's `detuning_estimator='mobius'` replaces the curvature estimate
-by the calibration's exact inversion of the centre point:
-`d_centre = −(f_probe − fr)_mobius + (operating_point − fr)`. It needs a
-trustworthy calibration but no probe offsets, so it also runs on a
-zero-offset modulation. The default picks the curvature whenever there are
-three distinct offsets.
+`detuning_estimator='mobius'` (the default) tracks with the Möbius centre
+detuning above; it needs a trustworthy calibration but no probe offsets, so
+it also runs on a zero-offset modulation — tracking without modulation.
+`'curvature'` needs three distinct offsets and no fitted rotation, which
+makes it the choice when the rotation is in doubt (a stale calibration after
+a re-arm) and the tones are close to linear. The live viewer's and the
+demodulators' `center_detuning_*` use the Möbius form for calibrated tones,
+so they show what the tracker acts on.
 
 ## Calibration records: how a calibration travels
 

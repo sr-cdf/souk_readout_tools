@@ -787,11 +787,13 @@ class FfmConverter(StreamConverter):
             cycle = {'dphi_df': slope, 'd2phi_df2': curvature,
                      'curvature_over_slope': curvature / slope}
             if self.calibration is not None:
-                detuning = float(resonator.detuning_from_derivatives(
-                    slope, curvature))
-                cycle['center_detuning_linewidths'] = detuning
-                cycle['center_detuning_hz'] = (
-                    detuning * self.calibration.fr / self.calibration.Ql)
+                # The calibration's inversion: right in scale for driven
+                # resonators, where the curvature form reads ~2x.
+                detuning_hz = float(resonator.mobius_center_detuning(
+                    z, offsets, self.calibration))
+                cycle['center_detuning_hz'] = detuning_hz
+                cycle['center_detuning_linewidths'] = (
+                    detuning_hz * self.calibration.Ql / self.calibration.fr)
             self._push(cycle[self.output])
             return
 
@@ -1423,6 +1425,14 @@ class OutputChannel:
 
     ``volts = clip(gain * (x - x_offset) + v_offset, v_min, v_max)``.
 
+    With ``highpass_s`` set, ``x_offset`` is replaced by a running baseline:
+    an exponential moving average of ``x`` with that time constant, started
+    at the first value (so the output starts at ``v_offset``). This is the
+    single-pole high-pass of an AC-coupled output, done before the clip, so
+    slow resonance drift cannot push the output into the rails. Features
+    slower than ``highpass_s`` are removed, as the coupling capacitor would
+    do anyway if ``highpass_s`` is at or below its time constant.
+
     Parameters
     ----------
     dac_channel : str
@@ -1433,10 +1443,14 @@ class OutputChannel:
         IQ -> x converter for this channel.
     gain, x_offset, v_offset, v_min, v_max : float
         Mapping parameters (defaults: 1, 0, 0, 0, 5).
+    highpass_s : float or None, optional
+        High-pass time constant in seconds (corner ``1/(2 pi highpass_s)``
+        Hz). ``None`` or 0 (default) disables it and uses ``x_offset``.
     """
 
     def __init__(self, dac_channel, tone_position, converter, gain=1.0,
-                 x_offset=0.0, v_offset=0.0, v_min=0.0, v_max=5.0):
+                 x_offset=0.0, v_offset=0.0, v_min=0.0, v_max=5.0,
+                 highpass_s=None):
         self.dac_channel = str(dac_channel)
         self.tone_position = int(tone_position)
         self.converter = converter
@@ -1445,12 +1459,30 @@ class OutputChannel:
         self.v_offset = float(v_offset)
         self.v_min = float(v_min)
         self.v_max = float(v_max)
+        self.highpass_s = float(highpass_s) if highpass_s else None
+        self._baseline = None
+        self._last_time = None
         self.last_x = np.nan
         self.last_volts = np.nan
 
-    def volts(self, x):
-        """Map converter output ``x`` to a clipped output voltage."""
-        v = self.gain * (x - self.x_offset) + self.v_offset
+    def volts(self, x, now=None):
+        """Map converter output ``x`` to a clipped output voltage.
+
+        ``now`` (seconds, default ``time.monotonic()``) times the high-pass.
+        """
+        if self.highpass_s is None:
+            v = self.gain * (x - self.x_offset) + self.v_offset
+            return float(np.clip(v, self.v_min, self.v_max))
+        now = time.monotonic() if now is None else float(now)
+        if self._baseline is None:
+            self._baseline = x
+        else:
+            # Exact single-pole step for the elapsed time, so skipped
+            # updates (held NaN cycles, slow loops) do not change the corner.
+            alpha = 1.0 - np.exp(-(now - self._last_time) / self.highpass_s)
+            self._baseline += alpha * (x - self._baseline)
+        self._last_time = now
+        v = self.gain * (x - self._baseline) + self.v_offset
         return float(np.clip(v, self.v_min, self.v_max))
 
 

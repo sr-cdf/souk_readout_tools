@@ -281,12 +281,17 @@ For symmetric offsets `-h, 0, +h`, the fast estimator uses
 `(phase_plus - 2*phase_zero + phase_minus)/h**2`, averaging repeated
 measurements of the same offset. Curvature crosses zero at the phase
 inflection point (peak phase responsivity for the ideal resonator model).
-It is a tuning-error diagnostic, not itself a distance in Hz. The centre
-detuning inverts the circle-centred notch phase `-2 atan(2x)` exactly:
-`center_detuning_linewidths = curvature / (2 * slope * |slope|)` — resonance
-minus modulation centre, positive when the tone should move up — and
-`center_detuning_hz` is that times the linewidth. With a calibration (any
-`--conversion`) the derivative estimates use the de-embedded, centred phase.
+It is a tuning-error diagnostic, not itself a distance in Hz. With a
+calibration (any `--conversion`) the derivative estimates use the
+de-embedded, centred phase.
+
+The centre detuning is resonance minus modulation centre, positive when the
+tone should move up. For a calibrated tone it is the calibration's exact
+inversion of the cycle's points (`resonator.mobius_center_detuning`), the
+tracker's default estimate, right in scale for driven resonators too. The
+curvature form `curvature / (2 * slope * |slope|)` linewidths shares its
+zero but is exact only for a linear notch — on tones driven to `anl ≈ 0.3`
+it reads about 2× — so it is used only for uncalibrated tones.
 
 These diagnostics are estimated once per modulation cycle, held across that
 cycle for time plots, and use the cycle rate for PSD/ASD. Choose e.g.
@@ -294,38 +299,34 @@ cycle for time plots, and use the cycle rate for PSD/ASD. Choose e.g.
 for a four-panel view. Frequency/dissipation traces remain sample-aligned.
 
 In demodulated mode the `detuning_*` panels show this cycle estimate
-(`center_detuning_*`: the tone is the modulation centre). In the model-free
-case it requires a linewidth and sufficient distinct offsets for curvature;
-without these, estimates remain NaN. With a calibration the per-cycle slope,
-curvature and detuning are taken on the circle-centred phase with each tone's
-fitted linewidth, whatever `--conversion` is. That is the same estimate the
-server tracker acts on. Without calibrations the raw phase is
-used; its detuning is taken about the origin rather than the circle centre and
-reads 3x to ~100x high (worse for deeper dips), so only its sign and zero mean
-anything.
+(`center_detuning_*`: the tone is the modulation centre). With a calibration
+it is the same estimate the server tracker acts on by default, whatever
+`--conversion` is. In the model-free case it is the curvature form, which
+requires a linewidth and sufficient distinct offsets; without these,
+estimates remain NaN. Its raw phase is taken about the origin rather than the
+circle centre and reads 3x to ~100x high (worse for deeper dips), so only its
+sign and zero mean anything.
 Detuning is held across each cycle for the time plot, explicitly noted in the
 status; its PSD/ASD uses one estimate per cycle at the cycle rate, preserving
 missing cycles as gaps. It is not presented as a sample-rate measurement.
 
-To move the modulation centres toward **zero of the calibrated phase
-curvature** shown by `--calibrations ... --panels curvature:time`, call
-`client.update_modulation()` while streaming. The RFSoC server centres the
-selected resonators with the calibration you pushed
-(`set_resonator_calibrations`; the server does no fitting) and uses its
-live, settling-excluded I/Q accumulator to estimate calibrated phase
-curvature. It applies one correction of at most half a fitted linewidth
-per tone. The viewer follows the resulting revision in the stream without a
-restart. No client capture or calibration archive lookup is involved. Run a
-targeted sweep on the server first if it has no valid sweep in memory. Tones
-without usable fits are listed as skipped. Explicit `center=` or `offsets=`
-still sends the requested values. The plot and the server use the same
-phase calculation; pushing the calibration makes them use the same
+To move the modulation centres onto the operating point shown by the
+`center_detuning_hz:time` panel, call `client.update_modulation()` while
+streaming. The RFSoC server centres the selected resonators with the
+calibration you pushed (`set_resonator_calibrations`; the server does no
+fitting) and estimates the centre detuning from its live, settling-excluded
+I/Q accumulator with the tracker's estimator (Möbius by default). It applies
+one correction of at most half a fitted linewidth per tone. The viewer
+follows the resulting revision in the stream without a restart. Tones the
+calibration does not cover are listed as skipped. Explicit `center=` or
+`offsets=` still sends the requested values. The plot and the server use the
+same calculation; pushing the calibration makes them use the same
 calibration too (an archive from a different sweep can have a different
 phase zero).
 
-`client.enable_tracking()` estimates the same calibrated, centred phase
-curvature, with the same pushed calibration. Its default `dry_run=True`
-observes and stages corrections without applying them.
+`client.enable_tracking()` estimates the same centre detuning, with the same
+pushed calibration. Its default `dry_run=True` observes and stages
+corrections without applying them.
 
 ## Following a growing file
 

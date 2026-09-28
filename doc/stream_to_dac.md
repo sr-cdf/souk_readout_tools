@@ -208,6 +208,26 @@ volts = clip(gain * (x − x_offset) + v_offset, v_min, v_max)
 just a channel name (`TDAC0`) with wider `v_min`/`v_max`. Match
 `v_min`/`v_max` to the TOPTICA input range once known.
 
+**Drift and clipping: `channels[].highpass_s`.** In `ffm` mode `x` is the
+cumulative resonance shift (tracking recentres are added back), so slow drift
+walks it into `v_min`/`v_max`. The clip is digital, before any coupling
+capacitor, so AC coupling does not help: the output flat-tops, then the
+plateau decays to 0 V. Setting `highpass_s` (seconds) replaces `x_offset` with
+a running baseline, an exponential moving average of `x` with that time
+constant, so the mapping becomes
+
+```
+volts = clip(gain * (x − baseline) + v_offset, v_min, v_max)
+```
+
+This is a single-pole high-pass with corner `1/(2π·highpass_s)`, started at
+the first value. A steady drift rate still leaves a standing
+`gain · rate · highpass_s`. On the `alsa` backend, choose `highpass_s` at or
+below the measured coupling time constant: nothing slower survives the
+capacitor anyway. On a DC-coupled DAC it is a real trade: features slower than
+`highpass_s` are attenuated. The status line's `x` is always the unfiltered
+value.
+
 ## DAC backends
 
 - `labjack` — LabJack T4/T7 via `labjack-ljm` (guarded import; optional

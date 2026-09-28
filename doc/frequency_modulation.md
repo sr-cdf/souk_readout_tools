@@ -24,7 +24,9 @@ resonator's local response *continuously*, alongside the data:
 - **Three or more points add the curvature `d²φ/df²`.** The phase response has
   an inflection at the resonance centre — zero curvature on centre, growing as
   the tone detunes — so the curvature-to-slope ratio measures where the
-  resonance sits relative to the modulation centre. You get a live
+  resonance sits relative to the modulation centre (with a calibration the
+  demodulator and tracker read it by inverting the fitted model exactly,
+  which keeps the right scale on strongly driven resonators). You get a live
   `center_detuning_linewidths` (resonance minus centre: positive means the
   tone should move up) and a `needs_update` flag per tone, and
   `update_modulation(center=…)` re-centres a drifting tone **seamlessly** — no
@@ -185,11 +187,14 @@ shapes, sign conventions and edge cases are in
 
 ## Tracking the operating point
 
-This is the point of the curvature measurement: keeping tones centred without
-sweeping. Each demodulated cycle reports where each resonance sits relative to
-its modulation centre (`center_detuning_hz`, from the phase inflection of the
-centred phase, `φ''/(2φ'|φ'|)` linewidths) and flags tones beyond a threshold
-with `needs_update` (default 0.1 linewidths). Moving each centre by its
+This is the point of the probe points: keeping tones centred without
+sweeping. Each demodulated cycle reports where each resonance's operating
+point sits relative to its modulation centre (`center_detuning_hz`: for a
+calibrated tone the calibration's exact inversion of the cycle's points,
+`resonator.mobius_center_detuning`, right in scale for driven resonators; the
+curvature form `φ''/(2φ'|φ'|)` linewidths shares its zero but reads ~2× on
+tones driven to anl ≈ 0.3) and flags tones beyond a threshold with
+`needs_update` (default 0.1 linewidths). Moving each centre by its
 `center_detuning_hz` puts it on the resonance:
 
 ```python
@@ -437,13 +442,14 @@ Enable modulation (default `engine='fw'`).
 - Result: `{'revision', ..., 'needs_recenter'}` (fw also reports `mode`/`n_slots`/`n_dwell`).
 
 ### `update_modulation(offsets=None, center=None, samples_per_point=None, n_settle=None, engine=None, mode=None, force=False, ...)`
-With no requested settings change, the RFSoC server estimates **calibrated
-phase curvature** from its live, settling-excluded I/Q accumulator, centred
+With no requested settings change, the RFSoC server estimates each tone's
+**centre detuning** from its live, settling-excluded I/Q accumulator, centred
 with the calibration pushed by `set_resonator_calibrations` (required: the
-server does no fitting). No independent stream capture is needed; each
+server does no fitting), with the tracker's estimator (Möbius by default) —
+and moves each centre by it. No independent stream capture is needed; each
 correction is capped at half a fitted linewidth, and tones the calibration
 does not cover are reported as skipped. This is a one-step local correction;
-repeat only after inspecting the new curvature.
+repeat only after inspecting the new detuning.
 
 With explicit `center=` or `offsets=`, the method sends those values to the
 active engine. `engine=None` selects the active engine. **fw:** the new combs
@@ -772,7 +778,7 @@ Per-cycle, per-tone demodulation in one of two bases (see [De-embedding](#de-emb
 | `resonance_shift_hz` | tangent/normal projection on the live I/Q gradient, relative to the mean cycle | `−Im ln(z_c/z_ref) / (dφ/df)` (`conversion='phase'`), relative to the mean cycle |
 | `matched_dissipation_shift` | the normal component ÷ the centre frequency | `Re ln(z_c/z_ref) / (dφ/df)` ÷ the centre frequency, i.e. `Δ(1/(2·Qi))` |
 | `resonance_frequency_hz` | NaN | the reference's resonance (the calibration's inversion) + `resonance_shift_hz` |
-| `center_detuning_linewidths` | NaN unless `linewidth_hz`; reads 13–100× high | `φ''/(2φ'\|φ'\|)`: resonance − centre, exact for the notch's derivatives |
+| `center_detuning_linewidths` | curvature form `φ''/(2φ'\|φ'\|)`, NaN unless `linewidth_hz`; reads 13–100× high | resonance − centre by the calibration's exact inversion (`resonator.mobius_center_detuning`), right in scale for driven tones |
 | `center_detuning_hz` | × `linewidth_hz` | × the calibration's `fr/Ql` |
 | `needs_update` | `\|center_detuning_linewidths\| > threshold_linewidths` | same |
 | `z_center_point` | the centre probe point's raw I/Q | (same) |
