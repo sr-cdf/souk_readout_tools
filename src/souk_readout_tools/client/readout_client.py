@@ -3177,8 +3177,12 @@ class ReadoutClient:
             objects (e.g. ``params_from_sweep(...)['calibration']``) or a
             record.
         sweep_data : dict or None, optional
-            The sweep they came from: its RX chain state lets the server and
-            the analysis correct a later RX gain change.
+            The sweep they were fitted to. Pass it: its traces give each tone
+            a sweep table (``resonator.sweep_frequency_correction``), so
+            tracking and the analysis read frequencies off the sweep itself
+            rather than the fitted shape (which is ~2% out near the operating
+            point and stepped the tracked resonance at every commit), and its
+            RX chain state lets them correct a later RX gain change.
         **provenance
             Anything else to keep with the record.
 

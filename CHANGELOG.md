@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Sweep tables: calibrated frequencies come off the calibration sweep**: a
+  record made with its sweep (`sweep_data=`) carries per-tone
+  `frequency_correction_*` (`resonator.sweep_frequency_correction`), applied in
+  the Möbius inversion and `operating_point_hz`. Fit frequency-scale error near
+  the operating point 2.1% -> 0.19% (krm4 hold-out); it stepped the tracked
+  resonance by that times every commit's move. `calibration_quality` adds
+  `frequency_scale` and flags tones with no table or >20% out. See
+  `doc/conversions.md` (The sweep table).
+
 - **Calibration health per tone**: `resonator.calibration_fit` (median
   |z_c| / r, 1 while the circle fits) in the tracker's per-tone health and
   summary (`median_calibration_fit`, `n_poor_calibration_fit`) and the DAC

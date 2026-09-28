@@ -20,6 +20,8 @@ where the resonance is (phase inflection)     ``operating_point_hz``
 build/save/load a calibration record          ``calibration_record``,
                                               ``save_calibrations``,
                                               ``load_calibration_record``
+a fit's frequency error on its own sweep      ``sweep_frequency_correction``
+check calibrations, pick the good tones       ``calibration_quality``
 fit a sweep straight to calibrations          ``calibrations_from_sweep``
 the calibration a recording carries           ``calibration_from_data``
 toggle the filterbank readout correction      ``with_readout_correction``,
@@ -70,6 +72,7 @@ Uncertainty propagation:
 - Uncertainty in fitted transform parameters themselves is not included.
 """
 
+import copy
 import functools
 import json
 import time
@@ -1269,13 +1272,13 @@ class ResonatorCalibration:
     __slots__ = ('fr', 'Ql', 'Qi', 'tau', 'center', 'radius', 'gain_amplitude',
                  'gain_phase', 'rotation_angle', 'frequency_origin_fraction',
                  'anl', 'group_delay_cal', 'group_delay_reference_frequency',
-                 '_deembed_scale', '_rotation_phasor')
+                 'frequency_correction', '_deembed_scale', '_rotation_phasor')
 
     def __init__(self, fr, Ql, tau, center, radius, rotation_angle,
                  gain_amplitude=1.0, gain_phase=0.0,
                  frequency_origin_fraction=0.0, anl=0.0,
                  group_delay_cal=None, group_delay_reference_frequency=None,
-                 Qi=np.nan):
+                 Qi=np.nan, frequency_correction=None):
         self.fr = float(fr)
         self.Ql = float(Ql)
         # Internal Q of the calibration state: only for absolute loss
@@ -1291,6 +1294,11 @@ class ResonatorCalibration:
         self.anl = float(anl)
         self.group_delay_cal = group_delay_cal
         self.group_delay_reference_frequency = group_delay_reference_frequency
+        # The sweep table (sweep_frequency_correction) as (knots, correction),
+        # both probe detunings from fr in Hz; None reads the model alone.
+        self.frequency_correction = (
+            None if frequency_correction is None
+            else tuple(np.asarray(v, dtype=float) for v in frequency_correction))
         self._deembed_scale = np.exp(-1j * self.gain_phase) / self.gain_amplitude
         self._rotation_phasor = np.exp(1j * rotation_angle)
 
@@ -1519,6 +1527,16 @@ class ResonatorCalibration:
         """Return signed fractional radius change, ``abs(z) / radius - 1``."""
         return np.abs(np.asarray(z_centered, dtype=complex)) / self.radius - 1.0
 
+    def correct_probe_detuning(self, probe_detuning_hz):
+        """Move the model's probe detuning ``f - fr`` (Hz) onto the frequency
+        axis of the calibration's own sweep, through its sweep table
+        (:func:`sweep_frequency_correction`). Unchanged without a table; past
+        the table's ends its end corrections hold."""
+        if self.frequency_correction is None:
+            return probe_detuning_hz
+        knots, correction = self.frequency_correction
+        return probe_detuning_hz + np.interp(probe_detuning_hz, knots, correction)
+
     def convert_centered_iq(self, z_centered, *, method='mobius'):
         """
         Convert phase-centered IQ to probe-detuning and loss coordinates.
@@ -1543,6 +1561,12 @@ class ResonatorCalibration:
 
         For a Duffing fit, the default method analytically maps ``x_circle``
         back to probe detuning before scaling by ``fr``.
+
+        A calibration with a sweep table (a record made with its sweep) then
+        reads ``df`` off the sweep's own frequency axis
+        (:meth:`correct_probe_detuning`): the fit's shape error near the
+        operating point, about 2% of the detuning on real resonators, is taken
+        out. The loss coordinate keeps the model's scale.
 
         Args:
             z_centered: Complex scalar or array on the phase-centered circle,
@@ -1572,6 +1596,8 @@ class ResonatorCalibration:
             method=method,
         )
         df = x * self.fr
+        if method == 'mobius':
+            df = self.correct_probe_detuning(df)
         dd = (
             self.radial_loss_proxy(z)
             if method == 'circle' else matched_dissipation
@@ -1700,7 +1726,7 @@ class ToneConverter:
     """
 
     __slots__ = ('_multiply', '_offset', '_fr', '_Ql', '_radius',
-                 '_frequency_origin_fraction', '_anl', '_method')
+                 '_frequency_origin_fraction', '_anl', '_method', '_correct')
 
     def __init__(self, cal, f_tone, method='mobius'):
         # Combine cable delay, gain removal, and rotation into one phasor.
@@ -1716,6 +1742,7 @@ class ToneConverter:
         if method not in ('mobius', 'circle'):
             raise ValueError("method must be 'mobius' or 'circle'")
         self._method = method
+        self._correct = cal.correct_probe_detuning
 
     def __call__(self, z):
         """
@@ -1744,6 +1771,8 @@ class ToneConverter:
             method=self._method,
         )
         df = x * self._fr
+        if self._method == 'mobius':
+            df = self._correct(df)
         dd = (
             np.abs(z_d) / r - 1.0
             if self._method == 'circle' else matched_dissipation
@@ -1897,13 +1926,20 @@ def operating_point_hz(calibration, n_grid=20001, y_max=8.0):
     A driven fit's grid solve costs a few ms, so results are remembered per
     parameter set (a pure function of them: it cannot go stale); the
     demodulators, the tracker and stream-to-DAC call it every cycle.
+
+    With a sweep table (:func:`sweep_frequency_correction`) the model's
+    inflection is placed at the frequency the calibration sweep showed it at.
     """
     foj = float(getattr(calibration, 'frequency_origin_fraction', 0.0))
     anl = float(getattr(calibration, 'anl', 0.0))
     if anl == 0.0:
-        return float(calibration.fr * (1.0 - foj))
-    return _driven_operating_point_hz(float(calibration.fr), float(calibration.Ql), anl,
-                                      int(n_grid), float(y_max))
+        op = float(calibration.fr * (1.0 - foj))
+    else:
+        op = _driven_operating_point_hz(float(calibration.fr), float(calibration.Ql), anl,
+                                        int(n_grid), float(y_max))
+    if getattr(calibration, 'frequency_correction', None) is None:
+        return op
+    return float(calibration.fr + calibration.correct_probe_detuning(op - calibration.fr))
 
 
 @functools.lru_cache(maxsize=8192)
@@ -1916,6 +1952,126 @@ def _driven_operating_point_hz(fr, Ql, anl, n_grid, y_max):
     df_dy = np.abs(np.gradient(f, y))
     slope = dS21_dy / np.where(df_dy > 0.0, df_dy, np.inf)
     return float(f[int(np.argmax(slope))])
+
+
+# A sweep table spans the operating point +-FREQUENCY_TABLE_LINEWIDTHS in
+# FREQUENCY_TABLE_KNOTS knots (1/20 of a linewidth apart), and needs the fit to
+# map its sweep one-to-one out to +-FREQUENCY_TABLE_MIN_LINEWIDTHS.
+FREQUENCY_TABLE_LINEWIDTHS = 2.0
+FREQUENCY_TABLE_MIN_LINEWIDTHS = 0.5
+FREQUENCY_TABLE_KNOTS = 81
+
+
+def _table_frequency_scale(knots, correction, linewidth):
+    """Swept over modelled frequency change across +-1/4 linewidth of a
+    table's centre (its operating point): 1 when the fit reads its sweep right."""
+    centre, half = 0.5 * (knots[0] + knots[-1]), 0.25 * linewidth
+    change = (np.interp(centre + half, knots, correction)
+              - np.interp(centre - half, knots, correction))
+    return float(1.0 + change / (2.0 * half))
+
+
+def sweep_frequency_correction(calibration, frequencies, s21):
+    """Tabulate a calibration's frequency error on its own sweep.
+
+    Each sweep point is read back through the fitted model -- the Mobius
+    inversion, and the Duffing inverse for a driven fit -- and the frequency
+    it was swept at is compared with the frequency the model gives. Near the
+    operating point real fits are off by about 2% of the detuning (10% or more
+    on some driven tones), and that is what put a step in the tracked
+    resonance at every tracking commit: the step is the error times the move.
+
+    A calibration carrying the table (``frequency_correction``) reads its
+    frequencies off the sweep instead: its probe detuning is the model's plus
+    the table's correction at that detuning
+    (:meth:`ResonatorCalibration.correct_probe_detuning`), while the model
+    still separates frequency from loss -- which the sweep alone cannot: it
+    only shows what a change of frequency looks like, not a change of loss.
+    :func:`calibration_record` builds one per tone when given the sweep.
+
+    The table spans the operating point +-2 linewidths, 1/20 of a linewidth
+    between knots, and is cut at the first sweep point either side where the
+    model runs backwards (a glitch in the sweep, or the fit breaking down);
+    past its ends the end corrections hold.
+
+    Parameters
+    ----------
+    calibration : ResonatorCalibration
+        The tone's calibration, fitted to this sweep. Any table it already
+        carries is ignored.
+    frequencies, s21 : array_like
+        The tone's calibration sweep: probe frequencies (Hz) and raw complex
+        I/Q, as fitted.
+
+    Returns
+    -------
+    dict
+        ``knots_hz``: the model's probe detunings ``f - fr`` (Hz), evenly
+        spaced; ``correction_hz``: swept minus modelled frequency at each
+        (Hz); ``frequency_scale``: swept over modelled frequency change across
+        +-1/4 linewidth of the operating point (1 for a perfect fit);
+        ``linewidths``: how far the one-to-one stretch reaches below and
+        above the operating point.
+
+    Raises
+    ------
+    ValueError
+        When the model does not map the sweep one-to-one out to
+        +-0.5 linewidths of its operating point: the fit is unusable there.
+
+    Examples
+    --------
+    A fit whose ``Ql`` is 3% low reads its sweep 3% wide; the table puts it
+    back:
+
+    >>> fr, Ql = 1e9, 2e4
+    >>> f = fr + fr / Ql * np.linspace(-5, 5, 201)
+    >>> s21 = 1 - 0.5 / (1 + 2j * Ql * (f - fr) / fr)
+    >>> cal = ResonatorCalibration(fr, 0.97 * Ql, 0.0, 0.75 + 0j, 0.25, np.pi)
+    >>> round(float(cal.convert_raw_iq(fr + 2e3, 1 - 0.5 / (1 + 2j * Ql * 2e3 / fr))[0]))
+    2062
+    >>> table = sweep_frequency_correction(cal, f, s21)
+    >>> round(table['frequency_scale'], 3)
+    0.97
+    >>> cal.frequency_correction = (table['knots_hz'], table['correction_hz'])
+    >>> round(float(cal.convert_raw_iq(fr + 2e3, 1 - 0.5 / (1 + 2j * Ql * 2e3 / fr))[0]))
+    2000
+    """
+    model = copy.copy(calibration)
+    model.frequency_correction = None
+    f = np.asarray(frequencies, dtype=float).ravel()
+    z = np.asarray(s21, dtype=complex).ravel()
+    keep = np.isfinite(f) & np.isfinite(z)
+    order = np.argsort(f[keep])
+    f, z = f[keep][order], z[keep][order]
+    linewidth = model.fr / model.Ql
+    op = operating_point_hz(model) - model.fr
+    swept = f - model.fr
+    with np.errstate(divide='ignore', invalid='ignore'):
+        modelled = model.convert_raw_iq(f, z)[0]
+    # Out from the sweep point nearest the operating point, while the model
+    # keeps running forwards.
+    near = np.flatnonzero(np.abs(swept - op) <= FREQUENCY_TABLE_LINEWIDTHS * linewidth)
+    if near.size < 3:
+        raise ValueError('the sweep has too few points near the operating point')
+    lo = hi = near[np.argmin(np.abs(swept[near] - op))]
+    while lo > near[0] and modelled[lo - 1] < modelled[lo]:
+        lo -= 1
+    while hi < near[-1] and modelled[hi + 1] > modelled[hi]:
+        hi += 1
+    reach = ((swept[lo] - op) / linewidth, (swept[hi] - op) / linewidth)
+    if not reach[0] <= -FREQUENCY_TABLE_MIN_LINEWIDTHS <= FREQUENCY_TABLE_MIN_LINEWIDTHS <= reach[1]:
+        raise ValueError(
+            f'the fit does not map its sweep one-to-one within '
+            f'{FREQUENCY_TABLE_MIN_LINEWIDTHS:g} linewidths of its operating point '
+            f'(only {reach[0]:+.2f} to {reach[1]:+.2f})')
+    modelled, swept = modelled[lo:hi + 1], swept[lo:hi + 1]
+    knots = op + linewidth * np.linspace(-FREQUENCY_TABLE_LINEWIDTHS, FREQUENCY_TABLE_LINEWIDTHS,
+                                         FREQUENCY_TABLE_KNOTS)
+    correction = np.interp(knots, modelled, swept - modelled)
+    return {'knots_hz': knots, 'correction_hz': correction,
+            'frequency_scale': _table_frequency_scale(knots, correction, linewidth),
+            'linewidths': (float(reach[0]), float(reach[1]))}
 
 
 # ---------------------------------------------------------------------------
@@ -2026,6 +2182,48 @@ def _sweep_provenance(sweep_data):
     }
 
 
+def _has_sweep_traces(sweep_data):
+    return (isinstance(sweep_data, Mapping)
+            and all(sweep_data.get(key) is not None for key in ('sweep_f', 'sweep_i', 'sweep_q')))
+
+
+def _set_frequency_tables(record, tables):
+    """Write per-tone sweep tables -- ``(knots, correction)`` or None -- into
+    a record, as ``frequency_correction_start_hz`` / ``_step_hz`` / ``_hz``
+    (NaN without one), with the operating points they move."""
+    starts, steps, values = [], [], []
+    for table in tables:
+        if table is None:
+            starts.append(np.nan)
+            steps.append(np.nan)
+            values.append([np.nan] * FREQUENCY_TABLE_KNOTS)
+        else:
+            knots, correction = table
+            starts.append(float(knots[0]))
+            steps.append(float((knots[-1] - knots[0]) / (len(knots) - 1)))
+            values.append([float(v) for v in correction])
+    record['frequency_correction_start_hz'] = starts
+    record['frequency_correction_step_hz'] = steps
+    record['frequency_correction_hz'] = values
+    record['operating_point_hz'] = [
+        operating_point_hz(cal) for cal in calibrations_from_record(record).values()]
+
+
+def _sweep_tables(record, sweep_data):
+    """Each record tone's sweep table from ``sweep_data`` (None if refused)."""
+    calibrations = calibrations_from_record(record)
+    tables = []
+    for tone in record['tone_indices']:
+        try:
+            f, i, q = sweep_trace(sweep_data, int(tone))
+            table = sweep_frequency_correction(
+                calibrations[int(tone)], f, np.asarray(i, float) + 1j * np.asarray(q, float))
+            tables.append((table['knots_hz'], table['correction_hz']))
+        except (ValueError, IndexError):
+            tables.append(None)
+    return tables
+
+
 def calibration_record(calibrations, *, sweep_data=None, **provenance):
     """Collect per-tone resonator calibrations into one plain, JSON-safe record.
 
@@ -2042,9 +2240,14 @@ def calibration_record(calibrations, *, sweep_data=None, **provenance):
         sequence (an entry's ``tone_index`` is used when it has one). Noise-only
         and non-finite fits are left out. A record comes back as a copy.
     sweep_data : dict or None, optional
-        The sweep the calibrations were made from. Only its metadata is kept:
-        date, RX chain gain and PFB shift (for :func:`recorded_rx_gain_ratio`)
-        and whether its filterbank readout correction was applied.
+        The sweep the calibrations were fitted to. Its traces give every tone
+        a sweep table (:func:`sweep_frequency_correction`), so conversions
+        read frequencies off the sweep itself rather than the fitted shape;
+        tones the fit does not map one-to-one near the operating point get
+        none (:func:`calibration_quality` flags them). Of the rest, only its
+        metadata is kept: date, RX chain gain and PFB shift (for
+        :func:`recorded_rx_gain_ratio`) and whether its filterbank readout
+        correction was applied.
     **provenance
         Anything else to keep with the record (JSON-safe values).
 
@@ -2060,6 +2263,10 @@ def calibration_record(calibrations, *, sweep_data=None, **provenance):
         ``'calibration'``); ``group_delay_cal`` (the shared path-delay table,
         or None) with per-tone ``group_delay_reference_frequency_hz``; and a
         ``provenance`` dict (creation time, software version, sweep metadata).
+        With sweep tables, per-tone ``frequency_correction_hz`` (the table's
+        corrections) at knots ``frequency_correction_start_hz +
+        frequency_correction_step_hz * k`` of model probe detuning (NaN
+        without a table).
 
     Examples
     --------
@@ -2073,6 +2280,8 @@ def calibration_record(calibrations, *, sweep_data=None, **provenance):
     if is_calibration_record(calibrations):
         record = json.loads(json.dumps(dict(calibrations), default=_json_safe))
         record.setdefault('provenance', {}).update(provenance)
+        if _has_sweep_traces(sweep_data):
+            _set_frequency_tables(record, _sweep_tables(record, sweep_data))
         return record
     items = _calibration_items(calibrations)
     cals = [calibration for _, calibration, _ in items]
@@ -2091,6 +2300,10 @@ def calibration_record(calibrations, *, sweep_data=None, **provenance):
     record['group_delay_reference_frequency_hz'] = [
         None if cal.group_delay_reference_frequency is None
         else float(cal.group_delay_reference_frequency) for cal in cals]
+    if _has_sweep_traces(sweep_data):
+        _set_frequency_tables(record, _sweep_tables(record, sweep_data))
+    elif any(cal.frequency_correction is not None for cal in cals):
+        _set_frequency_tables(record, [cal.frequency_correction for cal in cals])
     info = {'created_unix': time.time(), 'software_version': _software_version()}
     if sweep_data is not None:
         info.update(_sweep_provenance(sweep_data))
@@ -2116,6 +2329,7 @@ def calibrations_from_record(record, tones=None):
     table = _group_delay_from_json(record.get('group_delay_cal'))
     n = len(record['tone_indices'])
     references = record.get('group_delay_reference_frequency_hz') or [None] * n
+    starts = record.get('frequency_correction_start_hz') or [None] * n
     out = {}
     for j, tone in enumerate(record['tone_indices']):
         tone = int(tone)
@@ -2127,11 +2341,16 @@ def calibrations_from_record(record, tones=None):
         reference = references[j]
         if reference is not None and not np.isfinite(reference):
             reference = None
+        correction = None
+        if starts[j] is not None and np.isfinite(starts[j]):
+            values = np.asarray(record['frequency_correction_hz'][j], dtype=float)
+            knots = starts[j] + record['frequency_correction_step_hz'][j] * np.arange(values.size)
+            correction = (knots, values)
         out[tone] = ResonatorCalibration(
             kwargs.pop('fr'), kwargs.pop('Ql'), kwargs.pop('tau'), center,
             kwargs.pop('radius'), kwargs.pop('rotation_angle'),
             group_delay_cal=table, group_delay_reference_frequency=reference,
-            **kwargs)
+            frequency_correction=correction, **kwargs)
     return out
 
 
@@ -2308,7 +2527,8 @@ def calibration_fit(z_centered, calibration):
 
 def calibration_quality(calibrations, sweep_data=None, samples=None, *,
                         max_linewidth_ratio=2.0, max_neighbour_ratio=3.0, neighbours=10,
-                        max_anl=0.6, min_dip_depth_db=3.0, fit_range=CALIBRATION_FIT_RANGE):
+                        max_anl=0.6, min_dip_depth_db=3.0, fit_range=CALIBRATION_FIT_RANGE,
+                        max_frequency_scale_error=0.2):
     """Per-tone checks of a calibration, and the tones that fail them.
 
     For choosing the tones to track, ``enable_tracking(enable_mask=result['good'])``,
@@ -2322,6 +2542,12 @@ def calibration_quality(calibrations, sweep_data=None, samples=None, *,
       in frequency (linewidths vary across a band, so not the global median);
     - **near bifurcation**: ``anl > max_anl`` (the cliff is at ``BIFURCATION_ANL``);
     - **shallow dip** (``sweep_data``): shallower than ``min_dip_depth_db``;
+    - **sweep table** (a record made with its sweep, or ``sweep_data``): the
+      fit must map its own sweep one-to-one within 0.5 linewidths of its
+      operating point (:func:`sweep_frequency_correction`), and there read
+      frequencies within ``max_frequency_scale_error`` of the sweep's
+      (``frequency_scale``; the table corrects smaller errors, but a fit that
+      far out has the shape wrong for the loss coordinate too);
     - **calibration fit** (``samples``, a capture taken since the calibration
       sweep): :func:`calibration_fit` outside ``fit_range``.
 
@@ -2341,9 +2567,9 @@ def calibration_quality(calibrations, sweep_data=None, samples=None, *,
     dict
         Lists aligned with ``tone_indices``: ``linewidth_hz``,
         ``measured_linewidth_hz``, ``neighbour_linewidth_hz``, ``anl``,
-        ``dip_depth_db`` and ``fit`` (NaN where not measured); ``reasons``,
-        ``{tone: [reason, ...]}`` for the tones that fail; ``poor`` and
-        ``good``, sorted tone indices.
+        ``dip_depth_db``, ``frequency_scale`` and ``fit`` (NaN where not
+        measured); ``reasons``, ``{tone: [reason, ...]}`` for the tones that
+        fail; ``poor`` and ``good``, sorted tone indices.
 
     Examples
     --------
@@ -2370,6 +2596,21 @@ def calibration_quality(calibrations, sweep_data=None, samples=None, *,
             except (ValueError, IndexError):
                 continue
             measured[j], depth[j] = e.linewidth_hz, e.dip_depth_db
+    scale, no_table = np.full(n, np.nan), {}
+    for j, t in enumerate(tones):
+        if cals[t].frequency_correction is not None:
+            scale[j] = _table_frequency_scale(*cals[t].frequency_correction, lw[j])
+        elif sweep_data is not None:
+            try:
+                f, i, q = sweep_trace(sweep_data, t)
+                scale[j] = sweep_frequency_correction(
+                    cals[t], f, np.asarray(i, float) + 1j * np.asarray(q, float))['frequency_scale']
+            except ValueError as error:
+                no_table[t] = str(error)
+            except IndexError:
+                pass
+        elif 'frequency_correction_hz' in record:
+            no_table[t] = 'the fit does not map its sweep one-to-one near its operating point'
     neighbour = np.full(n, np.nan)
     order = np.argsort(fr)
     for rank, j in enumerate(order):
@@ -2406,6 +2647,11 @@ def calibration_quality(calibrations, sweep_data=None, samples=None, *,
                 why.append(f'anl {anl[j]:.2f} (bifurcation {BIFURCATION_ANL:.2f})')
             if np.isfinite(depth[j]) and depth[j] < min_dip_depth_db:
                 why.append(f'dip {depth[j]:.1f} dB deep')
+            if t in no_table:
+                why.append(f'no sweep table: {no_table[t]}')
+            if np.isfinite(scale[j]) and abs(scale[j] - 1.0) > max_frequency_scale_error:
+                why.append(f'fit reads its sweep {100 * (1 / scale[j] - 1):+.0f}% in '
+                           f'frequency at the operating point')
             if np.isfinite(fit[j]) and not fit_range[0] <= fit[j] <= fit_range[1]:
                 why.append(f'calibration fit {fit[j]:.2f}')
             if why:
@@ -2413,7 +2659,8 @@ def calibration_quality(calibrations, sweep_data=None, samples=None, *,
     return {'tone_indices': tones, 'linewidth_hz': lw.tolist(),
             'measured_linewidth_hz': measured.tolist(),
             'neighbour_linewidth_hz': neighbour.tolist(), 'anl': anl.tolist(),
-            'dip_depth_db': depth.tolist(), 'fit': fit.tolist(), 'reasons': reasons,
+            'dip_depth_db': depth.tolist(), 'frequency_scale': scale.tolist(),
+            'fit': fit.tolist(), 'reasons': reasons,
             'poor': sorted(reasons), 'good': [t for t in tones if t not in reasons]}
 
 
@@ -3003,7 +3250,11 @@ def mobius_center_detuning(z_points, offsets, calibration):
     shares its zero but not its scale there: on tones driven to ``anl ~ 0.3``
     it read 2x (3-3.5x by the fit), enough to make a gain-1 tracker jump from
     side to side of the resonance. The price is leaning on the fitted rotation
-    and nonlinearity, which the curvature estimate does not.
+    and nonlinearity, which the curvature estimate does not. A calibration
+    with a sweep table (a record made with its sweep) reads each probe's
+    detuning off the sweep's own frequency axis instead of the fitted shape
+    (:func:`sweep_frequency_correction`), which is what keeps the tracked
+    resonance continuous across tracking commits.
 
     Parameters
     ----------

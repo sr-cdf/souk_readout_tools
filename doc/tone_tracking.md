@@ -599,7 +599,11 @@ client.enable_stream()
 and watch it before letting it touch anything. The tracker centres the I/Q
 with the calibration you push — fit on the client; the server does no
 fitting — and the analysis of the recording finds the same one in the
-stream's metadata. Push again after a new sweep:
+stream's metadata. Push it with the sweep it was fitted to: that gives each
+tone a [sweep table](conversions.md#the-sweep-table), so the tracker reads
+frequencies off the sweep rather than the fitted shape (without one, every
+commit steps the tracked resonance by the fit's ~2% scale error times the
+move). Push again after a new sweep:
 
 ```python
 fits = fitting.batch_fit(sweep)                # on the client

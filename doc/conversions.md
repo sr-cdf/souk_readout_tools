@@ -147,7 +147,9 @@ blocks of cycles, averaged coherently) in the working basis:
 
     Right in scale for driven resonators; works with any number of offsets,
     none included (unmodulated tracking); leans on the fitted rotation and
-    nonlinearity.
+    nonlinearity. With a [sweep table](#the-sweep-table) (a record made with
+    its sweep) each probe's detuning is read off the sweep's own frequency
+    axis rather than the fitted shape.
   - **Curvature** (`detuning_from_derivatives`), in linewidths:
 
     ```
@@ -202,9 +204,12 @@ revision with its own state and join them onto one reference, so
 `resonance_shift_hz` is the resonator's own motion and never steps at a
 commit: a calibrated tone through its absolute resonance, each revision's
 reference inverted with the calibration (exact, free of the finite-difference
-bias); an uncalibrated tone by carrying the reference I/Q along the measured
-gradient by the probe move (first order in the accumulated move: for drifts
-approaching a linewidth, use a calibration). Stream-to-DAC keeps one
+bias, as long as the calibration's frequency scale is right: a fit off by
+`k` near the operating point steps by `(1 − k)` × the move, which is what the
+[sweep table](#the-sweep-table) takes out); an uncalibrated tone by carrying
+the reference I/Q along the measured gradient by the probe move (first order
+in the accumulated move: for drifts approaching a linewidth, use a
+calibration). Stream-to-DAC keeps one
 reference and adds the centre steps, `(f_centre[rev] − f_centre[ref]) +
 shift about the reference` — exact to first order in the centred basis,
 which depends on the detuning alone.
@@ -256,11 +261,52 @@ shape (a cooldown changes `Qi`, coupling and drive) or the levels change.
 The tracker reports it per tone and stream-to-DAC for its channel.
 `resonator.calibration_quality(record, sweep, capture)` checks a whole
 calibration — fitted vs measured linewidth, linewidth odd for its frequency
-neighbours, near bifurcation, shallow dip, and this fit on a fresh capture —
-and returns the `good` tones, e.g. for `enable_tracking(enable_mask=...)`. A saved `.npz` (no pickle) holds the record and, given
-`sweep_data`, the sweep itself, so the sweep-based methods can be redone
-from the file alone. Anywhere that takes `calibrations=` accepts fits,
-`ResonatorCalibration` objects or a record.
+neighbours, near bifurcation, shallow dip, the sweep table below, and this
+fit on a fresh capture — and returns the `good` tones, e.g. for
+`enable_tracking(enable_mask=...)`.
+
+A saved `.npz` (no pickle) holds the record and, given `sweep_data`, the
+sweep itself, so the sweep-based methods can be redone from the file alone.
+Anywhere that takes `calibrations=` accepts fits, `ResonatorCalibration`
+objects or a record.
+
+### The sweep table
+
+A fit describes its own sweep only approximately. Read back through the
+fitted model, the sweep's points near the operating point come out at the
+wrong frequencies by about 2% of their detuning (krm4, 2026-09-28: median
+2.1%, 90th percentile 6%, worse on driven tones fitted as linear), and every
+tracking commit then stepped the tracked resonance by that error times the
+move. So a record made with its sweep (`sweep_data=`, as above) carries a
+**sweep table** per tone (`resonator.sweep_frequency_correction`): the
+swept minus the modelled frequency, tabulated against the modelled one over
+the operating point ±2 linewidths, 1/20 of a linewidth between knots. The
+calibration adds it to every Möbius probe detuning
+(`ResonatorCalibration.correct_probe_detuning`) and to its operating point, so
+frequencies come off the sweep itself: the same hold-out test read 0.19%
+(90th percentile 0.6%). The tracker, the demodulators, the live viewer and
+stream-to-DAC all go through that inversion and need nothing else.
+
+The model still does the other half. A sweep shows only what a change of
+frequency looks like; when loss changes too the I/Q point leaves the swept
+curve, and the circle geometry is what splits the move into frequency and
+loss. (Reading frequency from the angle round a fixed centre instead,
+as the `'lookup'` method does, takes a loop-size change for a frequency
+change almost one-for-one; during a source scan the loops changed size by
+±2.4%.) The loss coordinate keeps the model's scale.
+
+A table is cut at the first sweep point either side where the model runs
+backwards (a glitch in the sweep, or the fit breaking down), past its ends
+the end corrections hold, and a tone whose one-to-one stretch does not reach
+±0.5 linewidths gets none: it keeps the model alone and
+`calibration_quality` lists it (`no sweep table`), as it does a fit more than
+20% out in frequency at its operating point, where the loss scale is suspect
+too (`frequency_scale`, swept over modelled, is reported for every tone).
+Records made without the sweep carry no tables and convert as before;
+`calibration_record(record, sweep_data=sweep)` adds them. Per tone the record
+holds `frequency_correction_hz` at knots `frequency_correction_start_hz +
+k · frequency_correction_step_hz` of model probe detuning (NaN without a
+table), about 0.6 MB for 380 tones.
 
 ## The workflow, stage by stage
 
