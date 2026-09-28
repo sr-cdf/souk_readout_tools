@@ -1,7 +1,47 @@
 """
-Resonator data transforms for MKID S21 analysis.
+Resonator data transforms and the package's one I/Q -> physics conversion.
 
-Provides two independent categories of transform on complex S21 data:
+Every consumer -- timeseries, plotting, the live viewer, the demodulators,
+the DAC streamer and the server tracker -- takes its conversions from here,
+so a quantity has one name, one sign and one definition wherever it appears.
+``doc/conversions.md`` has the maths and a worked example for saved data.
+
+============================================  =================================
+I want to...                                  Use
+============================================  =================================
+see the list of named quantities, units       ``QUANTITIES``, ``canonical_quantity``
+convert a parsed capture to named quantities  ``convert_samples``
+convert one tone's I/Q (plain arrays)         ``prepare_conversion`` + ``convert_iq``
+express a shift in Hz/fractional/linewidths   ``express``
+move raw I/Q into a de-embedded/centred basis ``basis_coefficients``, ``to_basis``
+phase slope/curvature from modulation points  ``phase_derivatives``
+detuning (resonance - tone) from those        ``detuning_from_derivatives``
+where the resonance is (phase inflection)     ``operating_point_hz``
+build/save/load a calibration record          ``calibration_record``,
+                                              ``save_calibrations``,
+                                              ``load_calibration_record``
+fit a sweep straight to calibrations          ``calibrations_from_sweep``
+the calibration a recording carries           ``calibration_from_data``
+apply the filterbank readout correction       ``readout_correction_factors``,
+                                              ``apply_readout_correction``
+match RX gain between sweep and timestream    ``rx_gain_ratio``,
+                                              ``recorded_rx_gain_ratio``
+============================================  =================================
+
+Conventions, everywhere:
+
+- Shifts are **resonator-side**: positive when the resonance moves up.
+- **Detuning is resonance minus tone** (positive: resonance above the tone).
+  For demodulated modulation data the tone is the modulation centre, which
+  every sample is referred to.
+- Dissipation is the matched coordinate ``Delta(1 / (2 Qi))``: the factor 1/2
+  is already applied, and it is positive for more loss.
+- The **resonance** is the operational one: the inflection of the de-embedded,
+  circle-centred phase (zero curvature, steepest slope). For a linear
+  resonator that is the fitted ``fr``; a driven (Duffing) one sits at
+  ``operating_point_hz``, displaced from ``fr``.
+
+The transforms underneath fall in two independent categories:
 
 **Deembedding** (``deembed``) — the RF procedure for representing a
 notch resonator.  Removes cable delay and normalises by the
@@ -29,11 +69,13 @@ Uncertainty propagation:
 - Uncertainty in fitted transform parameters themselves is not included.
 """
 
+import json
+import time
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
-from scipy import signal
 
 
 @dataclass
@@ -878,6 +920,29 @@ def project_iq_tangent_normal(reference_iq, gradient, s21):
     return df, dd
 
 
+def smooth_sweep(frequencies, s21, smooth_window_hz=1000):
+    """Savitzky-Golay-smooth a complex sweep over ``smooth_window_hz``.
+
+    First order, so a straight line passes unchanged; the window is the
+    number of sweep steps in ``smooth_window_hz`` (odd, at least 3). A falsy
+    window, or one covering fewer than three points, returns the input.
+    """
+    z = np.asarray(s21, dtype=complex)
+    if not smooth_window_hz or z.size < 3:
+        return z
+    step_hz = float(np.median(np.abs(np.diff(np.asarray(frequencies, dtype=float)))))
+    if not step_hz > 0.0:
+        return z
+    window = min(max(3, int(float(smooth_window_hz) / step_hz)), z.size)
+    if window % 2 == 0:
+        window -= 1
+    if window < 3:
+        return z
+    from scipy import signal
+    return (signal.savgol_filter(z.real, window, 1)
+            + 1j * signal.savgol_filter(z.imag, window, 1))
+
+
 @dataclass(frozen=True)
 class LinearizedResonatorCalibration:
     """Small-signal tangent/normal projection around one probe frequency."""
@@ -895,17 +960,7 @@ class LinearizedResonatorCalibration:
             raise ValueError("frequencies and s21 must be matching 1-D arrays")
         if frequencies.size < 2:
             raise ValueError("at least two sweep points are required")
-        if smooth_window_hz:
-            step_hz = float(np.median(np.abs(np.diff(frequencies))))
-            window = max(3, int(float(smooth_window_hz) / step_hz))
-            window = min(window, frequencies.size)
-            if window % 2 == 0:
-                window -= 1
-            if window >= 3:
-                z = (
-                    signal.savgol_filter(z.real, window, 1)
-                    + 1j * signal.savgol_filter(z.imag, window, 1)
-                )
+        z = smooth_sweep(frequencies, z, smooth_window_hz)
         gradient = np.gradient(z, frequencies)
         order = np.argsort(frequencies)
         f_sorted = frequencies[order]
@@ -953,68 +1008,67 @@ def linearized_frequency_and_dissipation(
 class PhaseLookupCalibration:
     """Fit-free frequency readout by inverting a sweep's phase-vs-frequency curve.
 
-    Where :class:`ResonatorCalibration` needs a resonator fit and
-    :class:`LinearizedResonatorCalibration` linearises about one point (so it
-    saturates for large excursions), this calibration uses the *whole* measured
-    sweep as a lookup table. The resonance loop is centred (Kasa circle fit) and
-    rotated so the off-resonance point sits near ``+/-pi``; the unwrapped phase
-    ``theta(f) = angle(z_centered)`` is then monotonic through resonance, and the
-    inverse ``f(theta)`` maps a measured phase straight back to an equivalent
-    probe frequency. This is exact across the full swept span -- it never
-    linearises -- so it is the natural fallback when a tone will not fit but its
-    sweep still resolves a resonance.
+    Where :class:`LinearizedResonatorCalibration` linearises about one point (so
+    it saturates for large excursions), this uses the *whole* measured sweep as
+    a lookup table. The loop is moved into the centred, rotated basis, where
+    the phase ``theta(f)`` is monotonic through resonance, and the inverse
+    ``f(theta)`` maps a measured phase straight back to the probe frequency at
+    which the swept resonator showed that phase. That is exact across the
+    swept span -- it never linearises -- so it follows large signals and is the
+    natural fallback when a tone will not fit but its sweep still resolves a
+    resonance.
 
-    Build with :meth:`from_sweep`; convert raw timestream IQ with
-    :meth:`convert_raw_iq`. The frequency result follows the same convention as
-    :meth:`ResonatorCalibration.convert_raw_iq`: a probe-side detuning relative
-    to ``reference_frequency`` (positive above it); resonator motion at a fixed
-    probe has the opposite sign. The loss result is the model-free radial proxy
-    ``abs(z_centered) / radius - 1`` (a diagnostic, not a matched
-    ``Delta(1 / (2 * Qi))``).
+    Pass ``calibration`` (a :class:`ResonatorCalibration`) to :meth:`from_sweep`
+    to centre in the same de-embedded frame as every other conversion; without
+    one the loop is centred with a Kasa circle fit of the raw sweep, which is
+    model-free but a slightly different frame (no cable-delay removal).
 
-    Excursions past the swept edges clamp to the sweep endpoints rather than
-    extrapolating, so keep the sweep at least as wide as the timestream's
-    frequency motion.
+    :meth:`convert_raw_iq` follows the package convention: a resonator-side
+    shift (positive when the resonance moves up) and the matched dissipation
+    ``Delta(1 / (2 Qi))``, both relative to the sweep at ``reference_frequency``.
+    The dissipation compares the measured radius with the swept loop's radius at
+    the same phase, scaled by the local phase slope, so it too holds past the
+    linear range. Phases beyond the swept range come back NaN rather than
+    clamped: keep the sweep wider than the timestream's frequency motion.
 
-    **Noise on the steep part matters.** The inverse ``f(theta)`` is read out
-    right where ``theta(f)`` is steepest, so a little IQ noise there turns into a
-    large frequency error if the calibration curve is jagged. ``from_sweep``
-    therefore smooths the complex sweep (Savitzky-Golay over ``smooth_window_hz``)
-    before building the lookup; raise ``smooth_window_hz`` for a noisy sweep.
+    **Noise on the steep part matters.** The inverse is read out right where
+    ``theta(f)`` is steepest, so ``from_sweep`` smooths the complex sweep
+    (Savitzky-Golay over ``smooth_window_hz``); raise it for a noisy sweep.
     """
 
-    def __init__(self, reference_frequency, center, radius, rotation_angle,
-                 sign, phase_lookup, frequency_lookup, reference_phase):
+    def __init__(self, reference_frequency, basis_multiply, basis_offset, sign,
+                 phase_lookup, frequency_lookup, radius_lookup, slope_lookup,
+                 reference_phase):
         self.reference_frequency = float(reference_frequency)
-        self.center = complex(center)
-        self.radius = float(radius)
-        self.rotation_angle = float(rotation_angle)
-        # +1 or -1: whether unwrapped phase increases or decreases with
-        # frequency through resonance. Folded into the stored lookup and the
-        # reference phase, and re-applied to measured angles in convert_raw_iq.
+        # z_c = z * basis_multiply + basis_offset at the reference frequency.
+        self.basis_multiply = complex(basis_multiply)
+        self.basis_offset = complex(basis_offset)
+        # +1 or -1: whether the centred phase increases or decreases with
+        # frequency. Folded into the stored lookup so it ascends.
         self.sign = float(sign)
-        # Strictly ascending phase and the sweep frequency at each phase, for
-        # np.interp inversion.
+        # Strictly ascending (folded) phase, and at each phase the sweep
+        # frequency, the loop radius |z_c| and the folded slope dtheta/df.
         self.phase_lookup = np.asarray(phase_lookup, dtype=float)
         self.frequency_lookup = np.asarray(frequency_lookup, dtype=float)
-        # Centred phase at the parked tone; measured angles are folded onto the
-        # branch nearest this so the inversion stays single-valued within a loop.
+        self.radius_lookup = np.asarray(radius_lookup, dtype=float)
+        self.slope_lookup = np.asarray(slope_lookup, dtype=float)
+        # Folded phase at the parked tone; measured angles are folded onto the
+        # branch nearest this so the inversion stays single-valued.
         self.reference_phase = float(reference_phase)
 
     @classmethod
     def from_sweep(cls, frequencies, s21, reference_frequency,
-                   smooth_window_hz=1000, min_phase_progress=0.5):
+                   smooth_window_hz=1000, min_phase_progress=0.5,
+                   calibration=None):
         """Build a phase lookup from one complex sweep trace.
 
         Pass a **targeted, single-resonance** sweep (the same trace you would
         fit). ``reference_frequency`` is the parked-tone frequency the timestream
-        is read out at (only the detuning origin; it need not be a sweep point).
-        ``smooth_window_hz`` sets the Savitzky-Golay smoothing applied to the
-        complex sweep before the lookup is built -- raise it for a noisy sweep,
-        pass 0/None to disable. ``min_phase_progress`` is the minimum ratio of
-        net phase travel to total variation required to accept the loop as
-        invertible (~1 for a clean resonance, ~0 for noise); below it the sweep
-        is rejected as having no resolved resonance.
+        is read out at. ``smooth_window_hz`` sets the Savitzky-Golay smoothing
+        (0/None disables it). ``min_phase_progress`` is the minimum ratio of net
+        phase travel to total variation required to accept the loop as
+        invertible (~1 for a clean resonance, ~0 for noise). ``calibration``
+        centres the loop in its de-embedded frame (see the class docstring).
         """
         frequencies = np.asarray(frequencies, dtype=float).ravel()
         z = np.asarray(s21, dtype=complex).ravel()
@@ -1032,26 +1086,20 @@ class PhaseLookupCalibration:
             raise ValueError(
                 "degenerate sweep: frequency did not advance across the majority "
                 "of points; cannot build a phase lookup")
-        # Smooth the complex sweep before taking angles: noise on the steep part
-        # of theta(f) is what limits a lookup inverter (see class docstring).
-        # Same window policy as LinearizedResonatorCalibration.
-        if smooth_window_hz:
-            step_hz = float(np.median(np.abs(np.diff(f))))
-            if step_hz > 0.0:
-                window = max(3, int(float(smooth_window_hz) / step_hz))
-                window = min(window, f.size)
-                if window % 2 == 0:
-                    window -= 1
-                if window >= 3:
-                    z = (signal.savgol_filter(z.real, window, 1)
-                         + 1j * signal.savgol_filter(z.imag, window, 1))
-        # Work in the centred basis: the raw notch phase (angle about the origin)
-        # is not monotonic with frequency, but the angle about the resonance
-        # circle's centre sweeps monotonically through the loop. Centre (Kasa
-        # fit) then rotate off-resonance to +/-pi so on-resonance sits near 0.
-        _, center, radius = center_circle(z)
-        _, rotation_angle = rotate_to_real_axis(z - center)
-        z_centered = (z - center) * np.exp(1j * rotation_angle)
+        # Smooth before taking angles: noise on the steep part of theta(f) is
+        # what limits a lookup inverter.
+        z = smooth_sweep(f, z, smooth_window_hz)
+        if calibration is not None:
+            z_centered = to_basis(z, calibration, f, 'centered_rotated')
+            multiply, offset = basis_coefficients(
+                calibration, float(reference_frequency), 'centered_rotated')
+        else:
+            # Model-free: centre (Kasa fit) then rotate off-resonance to +/-pi.
+            _, center, _ = center_circle(z)
+            _, rotation_angle = rotate_to_real_axis(z - center)
+            multiply = np.exp(1j * rotation_angle)
+            offset = -center * multiply
+            z_centered = z * multiply + offset
         theta_f = np.unwrap(np.angle(z_centered))  # phase in frequency order
         # The inverse f(theta) only exists if theta advances monotonically
         # through resonance. Judge that by net travel vs total variation (~1 for
@@ -1066,70 +1114,94 @@ class PhaseLookupCalibration:
                 "phase lookup (loop too noisy or no resolved resonance)")
         sign = 1.0 if np.sum(dtheta) >= 0.0 else -1.0
         theta_f = sign * theta_f
+        slope_f = np.gradient(theta_f, f)
         reference_phase = float(np.interp(float(reference_frequency), f, theta_f))
         # Sort by ascending phase and drop ties so np.interp stays single-valued.
         p_order = np.argsort(theta_f)
         phase_lookup = theta_f[p_order]
-        frequency_lookup = f[p_order]
         keep = np.concatenate(([True], np.diff(phase_lookup) > 0.0))
         return cls(
-            reference_frequency, center, radius, rotation_angle, sign,
-            phase_lookup[keep], frequency_lookup[keep], reference_phase,
+            reference_frequency, complex(np.squeeze(multiply)),
+            complex(np.squeeze(offset)), sign, phase_lookup[keep],
+            f[p_order][keep], np.abs(z_centered)[p_order][keep],
+            slope_f[p_order][keep], reference_phase,
         )
 
     def convert_raw_iq(self, s21, *, fractional=True):
-        """Convert raw timestream IQ to (probe detuning, radial loss proxy).
+        """Convert raw timestream IQ at ``reference_frequency`` to shift and loss.
 
-        ``fractional`` divides the detuning by ``reference_frequency``. The loss
-        proxy ``abs(z_centered) / radius - 1`` is dimensionless and returned
-        unscaled either way.
+        Returns ``(resonance_shift, dissipation)`` relative to the sweep at
+        ``reference_frequency``: the resonator-side shift in Hz and the matched
+        dissipation in Hz (``fr * Delta(1 / (2 Qi))``), or both divided by
+        ``reference_frequency`` when ``fractional`` (the default), which makes
+        the second ``Delta(1 / (2 Qi))`` itself. NaN beyond the swept range.
         """
-        z = np.asarray(s21, dtype=complex)
-        z_centered = (z - self.center) * np.exp(1j * self.rotation_angle)
+        z_centered = np.asarray(s21, dtype=complex) * self.basis_multiply + self.basis_offset
         theta = self.sign * np.angle(z_centered)
         # Fold each measured angle onto the 2*pi branch nearest the parked
-        # reference phase. This tracks the whole resonance loop (far past where a
-        # linearised readout saturates) and, unlike folding into a fixed range,
-        # stays correct when a cable-delay ramp makes the sweep span exceed 2*pi.
-        # Excursions beyond ~half a loop from park are inherently ambiguous.
-        theta += 2.0 * np.pi * np.round(
+        # reference phase. This tracks the whole resonance loop and, unlike
+        # folding into a fixed range, stays correct when a cable-delay ramp makes
+        # the sweep span exceed 2*pi.
+        theta = theta + 2.0 * np.pi * np.round(
             (self.reference_phase - theta) / (2.0 * np.pi))
+        inside = ((theta >= self.phase_lookup[0])
+                  & (theta <= self.phase_lookup[-1]))
         f_equiv = np.interp(theta, self.phase_lookup, self.frequency_lookup)
-        df = f_equiv - self.reference_frequency
-        radial = np.abs(z_centered) / self.radius - 1.0
+        # The resonator moved by +d if the tone now shows the phase the swept
+        # resonator showed d below the tone.
+        shift = self.reference_frequency - f_equiv
+        radius = np.interp(theta, self.phase_lookup, self.radius_lookup)
+        slope = self.sign * np.interp(theta, self.phase_lookup, self.slope_lookup)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dissipation = np.log(np.abs(z_centered) / radius) / slope
+        shift = np.where(inside, shift, np.nan)
+        dissipation = np.where(inside, dissipation, np.nan)
         if fractional:
-            return df / self.reference_frequency, radial
-        return df, radial
+            return shift / self.reference_frequency, dissipation / self.reference_frequency
+        return shift, dissipation
 
 
 def phase_lookup_frequency_and_dissipation(
         sweep_frequencies, sweep_s21, reference_frequency, timestream_s21,
-        smooth_window_hz=1000, *, fractional=True, return_calibration=False):
+        smooth_window_hz=1000, *, fractional=True, return_calibration=False,
+        calibration=None):
     """Convert raw IQ by inverting the sweep's phase curve (fit-free fallback).
 
     Mirrors :func:`linearized_frequency_and_dissipation` but inverts the whole
-    resonance loop instead of linearising about the parked tone, so it tracks
+    resonance loop instead of linearising about the parked tone, so it follows
     large signals far past where the linear readout saturates. Returns
-    ``(frequency, radial_loss_proxy)``; see :class:`PhaseLookupCalibration` for
-    conventions.
+    ``(resonance_shift, dissipation)``; see :class:`PhaseLookupCalibration`.
     """
-    calibration = PhaseLookupCalibration.from_sweep(
+    lookup = PhaseLookupCalibration.from_sweep(
         sweep_frequencies,
         sweep_s21,
         reference_frequency,
         smooth_window_hz=smooth_window_hz,
+        calibration=calibration,
     )
-    frequency, dissipation = calibration.convert_raw_iq(
+    frequency, dissipation = lookup.convert_raw_iq(
         timestream_s21, fractional=fractional)
     if return_calibration:
-        return frequency, dissipation, calibration
+        return frequency, dissipation, lookup
     return frequency, dissipation
 
 
 def calibration_for_tone(calibrations, tone_index):
-    """Resolve one per-tone calibration from a mapping, sequence, or fit."""
+    """Resolve one tone's calibration from a record, mapping, sequence or fit.
+
+    ``calibrations`` may be a calibration record (:func:`calibration_record`),
+    a ``{tone_index: ...}`` mapping (``'0003'``-style keys too) or a sequence
+    indexed by tone. Fit results are wrapped in :class:`ResonatorCalibration`;
+    any other calibration (linearized, phase lookup) comes back unchanged.
+    Returns ``None`` when the tone has none.
+    """
     if calibrations is None:
         return None
+    if is_calibration_record(calibrations):
+        tone_index = int(tone_index)
+        if tone_index not in [int(t) for t in calibrations['tone_indices']]:
+            return None
+        return calibrations_from_record(calibrations, tones=[tone_index])[tone_index]
     if isinstance(calibrations, Mapping):
         calibration = calibrations.get(
             tone_index, calibrations.get(f"{tone_index:04d}"))
@@ -1138,10 +1210,14 @@ def calibration_for_tone(calibrations, tone_index):
             calibration = calibrations[tone_index]
         except (IndexError, KeyError, TypeError):
             calibration = None
-    if calibration is not None and not isinstance(
-            calibration, ResonatorCalibration):
+    if calibration is not None and _is_fit_result(calibration):
         calibration = ResonatorCalibration.from_fit(calibration)
     return calibration
+
+
+def _is_fit_result(obj):
+    """True for a fitting.FitResult (or anything shaped like one)."""
+    return hasattr(obj, 'iq_center_deembed') and hasattr(obj, 'alpha')
 
 
 class ResonatorCalibration:
@@ -1188,7 +1264,7 @@ class ResonatorCalibration:
         df, dd = convert(z)     # z is raw IQ, scalar or array
     """
 
-    __slots__ = ('fr', 'Ql', 'tau', 'center', 'radius', 'gain_amplitude',
+    __slots__ = ('fr', 'Ql', 'Qi', 'tau', 'center', 'radius', 'gain_amplitude',
                  'gain_phase', 'rotation_angle', 'frequency_origin_fraction',
                  'anl', 'group_delay_cal', 'group_delay_reference_frequency',
                  '_deembed_scale', '_rotation_phasor')
@@ -1196,9 +1272,13 @@ class ResonatorCalibration:
     def __init__(self, fr, Ql, tau, center, radius, rotation_angle,
                  gain_amplitude=1.0, gain_phase=0.0,
                  frequency_origin_fraction=0.0, anl=0.0,
-                 group_delay_cal=None, group_delay_reference_frequency=None):
+                 group_delay_cal=None, group_delay_reference_frequency=None,
+                 Qi=np.nan):
         self.fr = float(fr)
         self.Ql = float(Ql)
+        # Internal Q of the calibration state: only for absolute loss
+        # (internal_loss); NaN when the calibration did not come from a fit.
+        self.Qi = float(Qi)
         self.tau = float(tau)
         self.center = complex(center)
         self.radius = float(radius)
@@ -1260,7 +1340,7 @@ class ResonatorCalibration:
         return cls(fr, Ql, tau, center, radius, rotation_angle,
                    gain_amplitude=fit_result.a, gain_phase=fit_result.alpha,
                    frequency_origin_fraction=frequency_origin_fraction,
-                   anl=anl)
+                   anl=anl, Qi=getattr(fit_result, 'Qi', np.nan))
 
     @classmethod
     def from_sweep(cls, frequencies, s21, fr=None, Ql=None, group_delay_cal=None):
@@ -1683,3 +1763,1455 @@ class ToneConverter:
             Complex phase-centered IQ.
         """
         return z * self._multiply - self._offset
+
+
+# ===========================================================================
+# The conversion contract
+# ===========================================================================
+#
+# Everything below is the one place raw I/Q becomes a named physical
+# quantity. The signs and definitions are in the module docstring; the maths
+# is in doc/conversions.md.
+
+# ---------------------------------------------------------------------------
+# Quantities
+# ---------------------------------------------------------------------------
+
+QUANTITIES = {
+    # I/Q views, in whichever basis was asked for (raw unless stated).
+    'i': ('I', 'counts'),
+    'q': ('Q', 'counts'),
+    'amplitude': ('Amplitude', 'counts'),
+    'log_amplitude': ('Log amplitude', 'dB'),
+    'phase': ('Phase', 'rad'),
+    'unwrapped_phase': ('Unwrapped phase', 'rad'),
+    # The same views in a fixed basis, whatever basis was asked for.
+    'centered_phase': ('Centred phase', 'rad'),
+    'centered_rotated_phase': ('Centred, rotated phase', 'rad'),
+    'centered_radius': ('Centred radius, |z_c| / r', '1'),
+    # Resonator response: need a sweep or calibration, or demodulated data.
+    'resonance_shift_hz': ('Resonance shift', 'Hz'),
+    'fractional_resonance_shift': ('Fractional resonance shift', '1'),
+    'resonance_shift_linewidths': ('Resonance shift', 'linewidths'),
+    'resonance_frequency_hz': ('Resonance frequency', 'Hz'),
+    'detuning_hz': ('Detuning, resonance - tone', 'Hz'),
+    'fractional_detuning': ('Detuning / tone frequency', '1'),
+    'detuning_linewidths': ('Detuning, resonance - tone', 'linewidths'),
+    'center_detuning_hz': ('Detuning, resonance - modulation centre', 'Hz'),
+    'center_detuning_linewidths': ('Detuning, resonance - modulation centre',
+                                   'linewidths'),
+    'matched_dissipation_shift': ('Dissipation, Δ(1/2Qi)', '1'),
+    'matched_dissipation_hz': ('Dissipation, fr·Δ(1/2Qi)', 'Hz'),
+    'matched_dissipation_linewidths': ('Dissipation, Qr·Δ(1/2Qi)', '1'),
+    'internal_loss': ('Internal loss, 1/Qi', '1'),
+    'internal_loss_shift': ('Internal loss shift, Δ(1/Qi)', '1'),
+    'fractional_internal_loss_shift': ('Internal loss shift, Qi·Δ(1/Qi)', '1'),
+    # Modulation diagnostics, one estimate per cycle.
+    'dphi_df': ('Phase slope', 'rad/Hz'),
+    'd2phi_df2': ('Phase curvature', 'rad/Hz²'),
+    'curvature_over_slope': ('Phase curvature / slope', '1/Hz'),
+}
+
+# Earlier and shorter names, resolved by canonical_quantity.
+QUANTITY_ALIASES = {
+    'amp': 'amplitude', 'mag': 'amplitude', 'magnitude': 'amplitude',
+    'logmag': 'log_amplitude', 'log_mag': 'log_amplitude',
+    'log_magnitude': 'log_amplitude',
+    'centred_phase': 'centered_phase',
+    'centred_rotated_phase': 'centered_rotated_phase',
+    'centred_radius': 'centered_radius', 'radius': 'centered_radius',
+    'frequency': 'resonance_shift_hz', 'freq': 'resonance_shift_hz',
+    'frequency_shift': 'resonance_shift_hz', 'resonance_shift': 'resonance_shift_hz',
+    'fractional_frequency': 'fractional_resonance_shift',
+    'fractional': 'fractional_resonance_shift',
+    'frac_frequency': 'fractional_resonance_shift',
+    'frequency_linewidths': 'resonance_shift_linewidths',
+    'freq_lw': 'resonance_shift_linewidths',
+    'dissipation': 'matched_dissipation_shift',
+    'diss': 'matched_dissipation_shift',
+    'dissipation_linewidths': 'matched_dissipation_linewidths',
+    'diss_lw': 'matched_dissipation_linewidths',
+    'detuning': 'detuning_hz',
+    'responsivity': 'dphi_df', 'phase_slope': 'dphi_df',
+    'curvature': 'd2phi_df2', 'phase_curvature': 'd2phi_df2',
+}
+
+_IQ_VIEWS = ('i', 'q', 'amplitude', 'log_amplitude', 'phase', 'unwrapped_phase')
+_FIXED_BASIS_VIEWS = {'centered_phase': 'centered',
+                      'centered_rotated_phase': 'centered_rotated',
+                      'centered_radius': 'centered'}
+_DEMOD_ONLY = ('center_detuning_hz', 'center_detuning_linewidths',
+               'dphi_df', 'd2phi_df2', 'curvature_over_slope')
+
+
+def canonical_quantity(name):
+    """Resolve a quantity name or alias to its ``QUANTITIES`` key.
+
+    Case, spaces and hyphens are forgiven (``'Centred phase'`` works).
+
+    Examples
+    --------
+    >>> canonical_quantity('frequency_shift')
+    'resonance_shift_hz'
+    >>> QUANTITIES[canonical_quantity('diss')]
+    ('Dissipation, Δ(1/2Qi)', '1')
+    """
+    if not isinstance(name, str):
+        raise ValueError('quantity names must be strings')
+    key = name.strip().lower().replace(' ', '_').replace('-', '_')
+    key = QUANTITY_ALIASES.get(key, key)
+    if key not in QUANTITIES:
+        raise ValueError(f'Unknown quantity {name!r}; choose from '
+                         + ', '.join(QUANTITIES))
+    return key
+
+
+# ---------------------------------------------------------------------------
+# Where the resonance is
+# ---------------------------------------------------------------------------
+
+# Duffing bifurcation threshold of the fitted model: above it the swept
+# response is bistable and the steepest point is a cliff edge.
+BIFURCATION_ANL = 4.0 * np.sqrt(3.0) / 9.0
+
+
+def operating_point_hz(calibration, n_grid=20001, y_max=8.0):
+    """Frequency (Hz) of the operational resonance: the phase inflection.
+
+    The steepest point of the de-embedded, centred response -- maximum
+    ``|dS21/df|``, zero phase curvature -- which is the best signal-to-noise
+    point for a frequency readout and the point tracking steers to.
+
+    Linear (``anl == 0``): ``fr`` itself for any asymmetry ``phi`` (the fitted
+    model carries only ``Re(1/Qe)`` in its denominator). Driven (``anl > 0``):
+    displaced from ``fr`` by the Duffing detuning plus the bistable skew. The
+    driven model is parametrised by the smooth Duffing coordinate ``y`` rather
+    than frequency, because the forward solver's branch selection jumps in
+    ``f``; on the circle ``|dS21/dy| = 2 / (1 + 4 y**2)`` and ``df/dy`` comes
+    from the rational inverse :func:`invert_duffing_coordinate`. Past
+    ``BIFURCATION_ANL`` the peak rides up to the cliff edge, where a small
+    shift jumps the branch: :func:`calibration_record` flags such tones.
+    """
+    foj = float(getattr(calibration, 'frequency_origin_fraction', 0.0))
+    anl = float(getattr(calibration, 'anl', 0.0))
+    if anl == 0.0:
+        return float(calibration.fr * (1.0 - foj))
+    y = np.linspace(-y_max, y_max, int(n_grid))
+    x = invert_duffing_coordinate(y, anl) / calibration.Ql     # (f - fr) / fr
+    f = calibration.fr * (1.0 + x)
+    dS21_dy = 2.0 / (1.0 + 4.0 * y ** 2)
+    df_dy = np.abs(np.gradient(f, y))
+    slope = dS21_dy / np.where(df_dy > 0.0, df_dy, np.inf)
+    return float(f[int(np.argmax(slope))])
+
+
+# ---------------------------------------------------------------------------
+# Calibration records: how a calibration travels
+# ---------------------------------------------------------------------------
+
+CALIBRATION_SCHEMA = 'souk-resonator-calibration/1'
+
+# Per-tone numbers of a record and the ResonatorCalibration argument each
+# feeds; the complex circle centre is split so a record is plain JSON.
+_RECORD_FIELDS = (
+    ('fr_hz', 'fr'), ('Ql', 'Ql'), ('Qi', 'Qi'), ('tau_s', 'tau'),
+    ('circle_radius', 'radius'), ('rotation_rad', 'rotation_angle'),
+    ('gain_amplitude', 'gain_amplitude'), ('gain_phase_rad', 'gain_phase'),
+    ('frequency_origin_fraction', 'frequency_origin_fraction'), ('anl', 'anl'),
+)
+# The keys of the .npz files the old stream_dac.save_calibrations wrote.
+_LEGACY_FIELDS = ('fr', 'Ql', 'tau', 'center', 'radius', 'rotation_angle',
+                  'gain_amplitude', 'gain_phase', 'frequency_origin_fraction', 'anl')
+_SWEEP_KEYS = ('sweep_f', 'sweep_i', 'sweep_q', 'sweep_ei', 'sweep_eq')
+
+
+def is_calibration_record(obj):
+    """True for a calibration record (see :func:`calibration_record`)."""
+    return isinstance(obj, Mapping) and 'tone_indices' in obj and 'fr_hz' in obj
+
+
+def _json_safe(value):
+    """``json.dumps`` default for numpy scalars and arrays."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f'{type(value).__name__} is not JSON serialisable')
+
+
+def _software_version():
+    try:
+        from importlib.metadata import version
+        return version('souk_readout_tools')
+    except Exception:
+        return 'unknown'
+
+
+def _calibration_items(calibrations):
+    """``[(tone, ResonatorCalibration, source)]`` from fits or calibrations."""
+    if isinstance(calibrations, Mapping):
+        entries = [(int(key), value) for key, value in calibrations.items()]
+    else:
+        entries = []
+        for position, entry in enumerate(calibrations):
+            if entry is None:
+                continue
+            index = int(getattr(entry, 'tone_index', -1))
+            entries.append((index if index >= 0 else position, entry))
+    items = []
+    for tone, entry in sorted(entries, key=lambda item: item[0]):
+        if entry is None:
+            continue
+        if _is_fit_result(entry):
+            # Same acceptance as the server's own fits: a finite resonance,
+            # not a noise-only trace, and a usable loaded Q.
+            if (getattr(entry, 'noise_only', False)
+                    or not np.isfinite(getattr(entry, 'fr', np.nan))):
+                continue
+            calibration, source = ResonatorCalibration.from_fit(entry), 'fit'
+        elif isinstance(entry, ResonatorCalibration):
+            calibration, source = entry, 'calibration'
+        else:
+            raise TypeError(
+                f'tone {tone}: cannot record a {type(entry).__name__}; pass fit '
+                'results or ResonatorCalibration objects')
+        if np.isfinite(calibration.fr) and np.isfinite(calibration.Ql) and calibration.Ql > 0:
+            items.append((tone, calibration, source))
+    return items
+
+
+def _group_delay_to_json(table):
+    if table is None:
+        return None
+    if isinstance(table, Mapping):
+        return {'frequencies': np.asarray(table['frequencies'], dtype=float).tolist(),
+                'tau_ns': np.asarray(table['tau_ns'], dtype=float).tolist()}
+    if np.ndim(table) == 0:
+        return float(table)
+    return np.asarray(table, dtype=float).tolist()
+
+
+def _group_delay_from_json(table):
+    if table is None or np.ndim(table) == 0 and not isinstance(table, Mapping):
+        return table
+    if isinstance(table, Mapping):
+        return {key: np.asarray(value, dtype=float) for key, value in table.items()}
+    return np.asarray(table, dtype=float)
+
+
+def _sweep_provenance(sweep_data):
+    """What a record keeps of the sweep it came from (metadata only)."""
+    info = sweep_data.get('info') if isinstance(sweep_data, Mapping) else None
+    gain_db, fftshift = _rx_chain_gain_db(info)
+    return {
+        'sweep_date': sweep_data.get('date') if isinstance(sweep_data, Mapping) else None,
+        'rx_chain_gain_db': gain_db,
+        'pfb_fftshift': json.loads(json.dumps(fftshift, default=_json_safe)),
+        'readout_correction_applied': bool(
+            isinstance(sweep_data, Mapping)
+            and sweep_data.get('readout_correction_applied', False)),
+    }
+
+
+def calibration_record(calibrations, *, sweep_data=None, **provenance):
+    """Collect per-tone resonator calibrations into one plain, JSON-safe record.
+
+    The record is how a calibration travels: pushed to the server with
+    ``ReadoutClient.set_resonator_calibrations`` (which puts it in every
+    stream's metadata as ``info['resonators']``), saved with
+    :func:`save_calibrations`, and accepted anywhere ``calibrations=`` is.
+
+    Parameters
+    ----------
+    calibrations : mapping, sequence or record
+        Fit results (``fitting.batch_fit`` output) or
+        :class:`ResonatorCalibration` objects, as ``{tone_index: ...}`` or a
+        sequence (an entry's ``tone_index`` is used when it has one). Noise-only
+        and non-finite fits are left out. A record comes back as a copy.
+    sweep_data : dict or None, optional
+        The sweep the calibrations were made from. Only its metadata is kept:
+        date, RX chain gain and PFB shift (for :func:`recorded_rx_gain_ratio`)
+        and whether its filterbank readout correction was applied.
+    **provenance
+        Anything else to keep with the record (JSON-safe values).
+
+    Returns
+    -------
+    dict
+        ``schema``; ``tone_indices``; per-tone lists ``fr_hz``, ``Ql``, ``Qi``,
+        ``tau_s``, ``circle_center_re``, ``circle_center_im``,
+        ``circle_radius``, ``rotation_rad``, ``gain_amplitude``,
+        ``gain_phase_rad``, ``frequency_origin_fraction``, ``anl``,
+        ``operating_point_hz`` (the phase inflection), ``linewidth_hz``
+        (``fr / Ql``), ``bifurcated`` and ``source`` (``'fit'`` or
+        ``'calibration'``); ``group_delay_cal`` (the shared path-delay table,
+        or None) with per-tone ``group_delay_reference_frequency_hz``; and a
+        ``provenance`` dict (creation time, software version, sweep metadata).
+
+    Examples
+    --------
+    >>> cal = ResonatorCalibration(1e9, 2e4, 0.0, 0.5 + 0.0j, 0.5, 0.0)
+    >>> record = calibration_record({3: cal})
+    >>> record['tone_indices'], record['linewidth_hz']
+    ([3], [50000.0])
+    >>> calibrations_from_record(record)[3].Ql
+    20000.0
+    """
+    if is_calibration_record(calibrations):
+        record = json.loads(json.dumps(dict(calibrations), default=_json_safe))
+        record.setdefault('provenance', {}).update(provenance)
+        return record
+    items = _calibration_items(calibrations)
+    cals = [calibration for _, calibration, _ in items]
+    record = {'schema': CALIBRATION_SCHEMA,
+              'tone_indices': [int(tone) for tone, _, _ in items]}
+    for field, attribute in _RECORD_FIELDS:
+        record[field] = [float(getattr(cal, attribute)) for cal in cals]
+    record['circle_center_re'] = [float(cal.center.real) for cal in cals]
+    record['circle_center_im'] = [float(cal.center.imag) for cal in cals]
+    record['operating_point_hz'] = [operating_point_hz(cal) for cal in cals]
+    record['linewidth_hz'] = [cal.fr / cal.Ql for cal in cals]
+    record['bifurcated'] = [bool(cal.anl >= BIFURCATION_ANL) for cal in cals]
+    record['source'] = [source for _, _, source in items]
+    tables = [cal.group_delay_cal for cal in cals if cal.group_delay_cal is not None]
+    record['group_delay_cal'] = _group_delay_to_json(tables[0]) if tables else None
+    record['group_delay_reference_frequency_hz'] = [
+        None if cal.group_delay_reference_frequency is None
+        else float(cal.group_delay_reference_frequency) for cal in cals]
+    info = {'created_unix': time.time(), 'software_version': _software_version()}
+    if sweep_data is not None:
+        info.update(_sweep_provenance(sweep_data))
+    info.update(provenance)
+    record['provenance'] = json.loads(json.dumps(info, default=_json_safe))
+    bifurcated = [tone for tone, flag in zip(record['tone_indices'], record['bifurcated'])
+                  if flag]
+    if bifurcated:
+        warnings.warn(
+            f'{len(bifurcated)} tone(s) fitted past the Duffing bifurcation '
+            f'(anl >= {BIFURCATION_ANL:.3f}): their steepest point is a cliff '
+            f'edge, not a smooth inflection; lower the tone power before '
+            f'tracking them. Tones: {bifurcated[:10]}', stacklevel=2)
+    return record
+
+
+def calibrations_from_record(record, tones=None):
+    """Rebuild ``{tone_index: ResonatorCalibration}`` from a record.
+
+    ``tones`` restricts to those tone indices.
+    """
+    wanted = None if tones is None else {int(t) for t in tones}
+    table = _group_delay_from_json(record.get('group_delay_cal'))
+    n = len(record['tone_indices'])
+    references = record.get('group_delay_reference_frequency_hz') or [None] * n
+    out = {}
+    for j, tone in enumerate(record['tone_indices']):
+        tone = int(tone)
+        if wanted is not None and tone not in wanted:
+            continue
+        kwargs = {attribute: float(record[field][j])
+                  for field, attribute in _RECORD_FIELDS if field in record}
+        center = complex(record['circle_center_re'][j], record['circle_center_im'][j])
+        reference = references[j]
+        if reference is not None and not np.isfinite(reference):
+            reference = None
+        out[tone] = ResonatorCalibration(
+            kwargs.pop('fr'), kwargs.pop('Ql'), kwargs.pop('tau'), center,
+            kwargs.pop('radius'), kwargs.pop('rotation_angle'),
+            group_delay_cal=table, group_delay_reference_frequency=reference,
+            **kwargs)
+    return out
+
+
+def save_calibrations(filename, calibrations, sweep_data=None, **provenance):
+    """Save calibrations -- and the sweep they came from -- to one ``.npz``.
+
+    Loads without pickle (plain ``np.load`` works). Holds the record's
+    per-tone arrays, its provenance as JSON and, when ``sweep_data`` is given,
+    the sweep traces ``sweep_f`` / ``sweep_i`` / ``sweep_q`` (and errors), so a
+    linearized, phase or lookup conversion can be redone from the file alone.
+    ``calibrations`` and ``provenance`` are as for :func:`calibration_record`.
+    """
+    record = calibration_record(calibrations, sweep_data=sweep_data, **provenance)
+    arrays = {'schema': np.asarray(record['schema']),
+              'provenance_json': np.asarray(json.dumps(record['provenance'])),
+              'group_delay_json': np.asarray(json.dumps(record['group_delay_cal']))}
+    for key, value in record.items():
+        if key in ('schema', 'provenance', 'group_delay_cal'):
+            continue
+        if key == 'group_delay_reference_frequency_hz':
+            value = [np.nan if v is None else v for v in value]
+        arrays[key] = np.asarray(value)
+    if sweep_data is not None:
+        for key in _SWEEP_KEYS:
+            if sweep_data.get(key) is not None:
+                arrays[key] = np.asarray(sweep_data[key], dtype=float)
+        arrays['sweep_readout_correction_applied'] = np.asarray(
+            bool(sweep_data.get('readout_correction_applied', False)))
+        arrays['sweep_wideband'] = np.asarray(bool(sweep_data.get('wideband_sweep', False)))
+    np.savez(filename, **arrays)
+
+
+def load_calibration_record(filename):
+    """Load ``(record, sweep_data)`` from :func:`save_calibrations`.
+
+    ``sweep_data`` is None when the file holds no sweep. Also reads the older
+    files ``stream_dac.save_calibrations`` wrote (parameters only).
+    """
+    with np.load(filename, allow_pickle=False) as handle:
+        arrays = {key: handle[key] for key in handle.files}
+    sweep = None
+    if 'sweep_f' in arrays:
+        sweep = {key: arrays.pop(key) for key in _SWEEP_KEYS if key in arrays}
+        sweep['readout_correction_applied'] = bool(
+            arrays.pop('sweep_readout_correction_applied', False))
+        sweep['wideband_sweep'] = bool(arrays.pop('sweep_wideband', False))
+    if 'schema' not in arrays:
+        # Legacy layout: the ResonatorCalibration arguments, one array each.
+        legacy = {}
+        for j, tone in enumerate(arrays['tone_indices'].astype(int)):
+            legacy[int(tone)] = ResonatorCalibration(
+                float(arrays['fr'][j]), float(arrays['Ql'][j]), float(arrays['tau'][j]),
+                complex(arrays['center'][j]), float(arrays['radius'][j]),
+                float(arrays['rotation_angle'][j]),
+                gain_amplitude=float(arrays['gain_amplitude'][j]),
+                gain_phase=float(arrays['gain_phase'][j]),
+                frequency_origin_fraction=float(arrays['frequency_origin_fraction'][j]),
+                anl=float(arrays['anl'][j]))
+        return calibration_record(legacy, legacy_file=True), sweep
+    record = {'schema': str(arrays.pop('schema')),
+              'provenance': json.loads(str(arrays.pop('provenance_json'))),
+              'group_delay_cal': json.loads(str(arrays.pop('group_delay_json')))}
+    for key, value in arrays.items():
+        record[key] = value.tolist()
+    record['group_delay_reference_frequency_hz'] = [
+        None if v is None or not np.isfinite(v) else v
+        for v in record.get('group_delay_reference_frequency_hz', [])]
+    return record, sweep
+
+
+def load_calibrations(filename):
+    """Load ``{tone_index: ResonatorCalibration}`` from :func:`save_calibrations`."""
+    return calibrations_from_record(load_calibration_record(filename)[0])
+
+
+def calibrations_from_sweep(sweep_data, tone_indices=None, **batch_fit_kwargs):
+    """Fit a parsed sweep and return ``{tone_index: ResonatorCalibration}``.
+
+    Runs :func:`souk_readout_tools.fitting.batch_fit` (``batch_fit_kwargs``
+    are forwarded) and keeps each tone with a finite, not noise-only fit.
+    ``tone_indices`` restricts the result. Save with :func:`save_calibrations`,
+    or push to the server with ``ReadoutClient.set_resonator_calibrations``.
+    """
+    from .fitting import batch_fit
+    fits = batch_fit(sweep_data, **batch_fit_kwargs)
+    calibrations = {}
+    for tone, calibration, _ in _calibration_items(list(fits)):
+        if tone_indices is None or tone in tone_indices:
+            calibrations[tone] = calibration
+    return calibrations
+
+
+def calibration_from_data(data):
+    """The calibration record a capture carries, or None.
+
+    A capture saved with ``receive_stream(..., calibrations=...)`` carries it as
+    ``data['resonator_calibration']``; any capture recorded while the server
+    held a pushed calibration carries it in ``data['info']['resonators']``.
+    A calibration the server has marked stale is not returned.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    record = data.get('resonator_calibration')
+    if is_calibration_record(record):
+        return record
+    info = data.get('info')
+    section = info.get('resonators') if isinstance(info, Mapping) else None
+    if (isinstance(section, Mapping) and section.get('valid', True)
+            and is_calibration_record(section.get('record'))):
+        return section['record']
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Tones and sweeps
+# ---------------------------------------------------------------------------
+
+def sweep_trace(sweep_data, tone_index):
+    """One tone's sweep as ``(frequencies, I, Q)`` from targeted or wideband data."""
+    sweep_f = np.atleast_2d(sweep_data['sweep_f'])
+    sweep_i = np.atleast_2d(sweep_data['sweep_i'])
+    sweep_q = np.atleast_2d(sweep_data['sweep_q'])
+    if sweep_data.get('wideband_sweep', False) or sweep_f.shape[0] == 1:
+        return sweep_f[0], sweep_i[0], sweep_q[0]
+    n_tones = sweep_f.shape[1]
+    if not 0 <= tone_index < n_tones:
+        raise ValueError(f"Tone {tone_index} not in sweep data ({n_tones} tones)")
+    return sweep_f[:, tone_index], sweep_i[:, tone_index], sweep_q[:, tone_index]
+
+
+def resolve_tone_frequency(data, tone_index, override=None, sweep_f=None):
+    """The frequency (Hz) a capture's tone was read out at.
+
+    ``override`` wins: a scalar for every tone, a ``{tone: Hz}`` mapping
+    (``'0003'`` keys too) or an array indexed by absolute tone index. Otherwise
+    ``data['info']['tones']['frequencies_hz'][tone_index]``; failing that the
+    middle of ``sweep_f``, with a warning; failing that, ``ValueError``.
+    """
+    tone_index = int(tone_index)
+    if override is not None:
+        if isinstance(override, Mapping):
+            for key in (tone_index, f'{tone_index:04d}'):
+                if key in override:
+                    return float(override[key])
+            raise ValueError(f'reference_tone_frequency mapping missing tone {tone_index}')
+        if np.ndim(override):
+            try:
+                return float(np.asarray(override, dtype=float)[tone_index])
+            except IndexError as exc:
+                raise ValueError(
+                    'array-like reference_tone_frequency is indexed by absolute '
+                    f'tone index; tone {tone_index} is missing. Use a mapping for '
+                    'non-contiguous selected tones.') from exc
+        return float(override)
+    info = data.get('info') if isinstance(data, Mapping) else None
+    tones = info.get('tones', {}) if isinstance(info, Mapping) else {}
+    frequencies = tones.get('frequencies_hz') if isinstance(tones, Mapping) else None
+    if frequencies is not None:
+        try:
+            return float(np.asarray(frequencies, dtype=float)[tone_index])
+        except (IndexError, TypeError, ValueError):
+            pass
+    if sweep_f is not None:
+        warnings.warn(
+            f"Tone {tone_index} has no frequency in the capture's info; falling "
+            'back to the middle of the sweep range. Pass reference_tone_frequency '
+            'to set it explicitly.', stacklevel=3)
+        return float(np.mean(sweep_f))
+    raise ValueError(f'tone {tone_index} needs a frequency: none in the capture '
+                     'info; pass reference_tone_frequency')
+
+
+# ---------------------------------------------------------------------------
+# Readout (filterbank) correction and RX gain
+# ---------------------------------------------------------------------------
+
+def readout_correction_factors(info, num_tones):
+    """The ``(num_points, num_tones)`` software readout-flattening factors.
+
+    From a ``get_info`` payload's modulation state, or ``None`` when it
+    carries none (compensation off, or nothing armed). Tones without a
+    reported correction get 1. These are the linear gains the filterbank
+    compensation cannot apply in hardware (the RX scale word is inert);
+    ``ReadoutClient.parse_samples`` applies them to modulated captures by
+    default. See ``doc/filterbank_compensation.md``.
+    """
+    state = info.get('modulation') if isinstance(info, Mapping) else None
+    if not (isinstance(state, Mapping) and state.get('tones')):
+        return None
+    n_points = int(state.get('num_points', 0) or 0)
+    if n_points < 1:
+        return None
+    factors = np.ones((n_points, int(num_tones)), dtype=float)
+    found = False
+    for tone in state.get('tones', []):
+        if not isinstance(tone, Mapping):
+            continue
+        rc = tone.get('readout_correction')
+        try:
+            idx = int(tone.get('index'))
+        except (TypeError, ValueError):
+            continue
+        if rc is None or len(rc) != n_points or not 0 <= idx < num_tones:
+            continue
+        factors[:, idx] = np.asarray(rc, dtype=float)
+        found = True
+    return factors if found else None
+
+
+def apply_readout_correction(z, points, factors, *, invert=False):
+    """Scale each modulated sample by its ``(point, tone)`` readout factor.
+
+    ``z`` is ``(n_samples, n_tones)`` I/Q (real or complex), ``points`` the
+    1-based point tag of each sample (0 = not modulated, left alone) and
+    ``factors`` from :func:`readout_correction_factors`. ``invert=True``
+    divides instead, undoing an earlier application. Returns a new array.
+    """
+    z = np.array(z, dtype=np.result_type(np.asarray(z).dtype, float), copy=True)
+    points = np.asarray(points, dtype=int)
+    factors = np.asarray(factors, dtype=float)
+    valid = (points >= 1) & (points <= factors.shape[0])
+    gain = factors[points[valid] - 1][:, :z.shape[1]]
+    z[valid] = z[valid] / gain if invert else z[valid] * gain
+    return z
+
+
+def _rx_chain_gain_db(info):
+    """Analog RX gain in dB from a capture's recorded chain state, or None.
+
+    Only the analog part -- the RF frontend total (attenuator and bypass amp
+    together) and the ADC DSA, which sits at the converter. The PFB fftshift
+    is returned separately: it is downstream of the ADC and its per-stage
+    convention has bitten this codebase before, so a mismatch there is raised
+    rather than silently modelled.
+    """
+    if not isinstance(info, Mapping):
+        return None, None
+    frontend = info.get('rf_frontend')
+    rfdc = info.get('rfdc')
+    if not isinstance(frontend, Mapping) or not isinstance(rfdc, Mapping):
+        return None, None
+    try:
+        total = float(frontend['rx_total_gain_db'])
+        dsa = float(rfdc.get('dsa', 0.0))
+    except (KeyError, TypeError, ValueError):
+        return None, None
+    pipeline = info.get('pipeline')
+    digital = pipeline.get('pfb_fftshift') if isinstance(pipeline, Mapping) else None
+    return total - dsa, digital
+
+
+def rx_gain_ratio(sweep_data, ts_data, method="carrier", *, tones=None):
+    """Amplitude ratio to put a calibration sweep on the timestream's RX scale.
+
+    A sweep and a timestream taken at different ADC drive -- different RX
+    attenuation or DSA -- differ by one scale factor on the I/Q plane. That is
+    recoverable, and recovering it is what lets the ADC fill be raised for a
+    science capture while the calibration sweep is taken cold enough not to
+    clip. Note this is *RX* gain only: a sweep taken at a different **tone
+    power** cannot be rescaled to serve a timestream, because the drive changes
+    ``anl``, ``Qi`` and ``fr`` and the resonance is a different shape.
+
+    Parameters
+    ----------
+    sweep_data : dict
+        Calibration sweep.
+    ts_data : dict
+        Parsed timestream whose scale the sweep should be matched to.
+    method : {'carrier', 'chain'}, optional
+        ``'carrier'`` (default) measures the ratio as the timestream's median
+        ``|z|`` over the sweep's ``|z|`` at the same tone frequency. Model-free,
+        but it assumes the resonator did not move between the captures -- a
+        real shift in loading is absorbed as a fake gain change. ``'chain'``
+        computes it from the recorded RF frontend gain and ADC DSA, and raises
+        if the digital (PFB) settings differ.
+    tones : iterable of int or None, optional
+        Tone indices; ``None`` (default) does every tone in ``ts_data``.
+
+    Returns
+    -------
+    dict
+        ``ratio`` (per tone: timestream amplitude over sweep amplitude, so
+        divide the timestream by it to reach the sweep's scale), ``ratio_db``,
+        ``tone_indices``, ``valid``, ``method``.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> f = np.linspace(0.999e9, 1.001e9, 201)
+    >>> z = 1.0 - 0.5 / (1.0 + 2j * 5e4 * (f - 1e9) / 1e9)
+    >>> sweep = {"sweep_f": f[:, None], "sweep_i": z.real[:, None],
+    ...          "sweep_q": z.imag[:, None]}
+    >>> ts = {"i_data": {"0000": 2.0 * z.real[:3]},
+    ...       "q_data": {"0000": 2.0 * z.imag[:3]},
+    ...       "info": {"tones": {"frequencies_hz": [f[1]]}}}
+    >>> round(float(rx_gain_ratio(sweep, ts)["ratio"][0]), 2)
+    2.0
+    """
+    import operator
+
+    method = str(method).lower()
+    if method not in ("carrier", "chain"):
+        raise ValueError("method must be 'carrier' or 'chain'")
+    tone_keys = sorted(ts_data["i_data"])
+    if tones is None:
+        tones = range(len(tone_keys))
+    indices = [operator.index(t) for t in tones]
+
+    if method == "chain":
+        ratio = recorded_rx_gain_ratio(sweep_data, ts_data.get("info"))
+        if ratio is None:
+            raise ValueError(
+                "method='chain' needs rf_frontend and rfdc sections in both "
+                "captures' info; use method='carrier' instead.")
+        ratio = np.full(len(indices), ratio)
+        valid = np.ones(len(indices), dtype=bool)
+    else:
+        ratio = np.full(len(indices), np.nan)
+        valid = np.zeros(len(indices), dtype=bool)
+        outside = []
+        for row, tone_index in enumerate(indices):
+            tone_key = tone_keys[tone_index]
+            sweep_f, sweep_i, sweep_q = sweep_trace(sweep_data, tone_index)
+            tone_frequency = resolve_tone_frequency(ts_data, tone_index, sweep_f=sweep_f)
+            lo, hi = np.nanmin(sweep_f), np.nanmax(sweep_f)
+            if not (lo <= tone_frequency <= hi):
+                outside.append(tone_index)
+                continue
+            sweep_mag = np.interp(tone_frequency, sweep_f, np.abs(sweep_i + 1j * sweep_q))
+            ts_mag = np.median(np.abs(
+                np.asarray(ts_data["i_data"][tone_key], dtype=float)
+                + 1j * np.asarray(ts_data["q_data"][tone_key], dtype=float)))
+            if sweep_mag > 0 and np.isfinite(ts_mag):
+                ratio[row] = float(ts_mag / sweep_mag)
+                valid[row] = True
+        if outside:
+            warnings.warn(
+                f"{len(outside)} tone(s) sit outside their sweep range, so the "
+                "carrier ratio is undefined for them (an off-resonance capture "
+                "parked beyond the sweep span does this). Pass method='chain' or "
+                "an explicit ratio.", stacklevel=2)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio_db = 20.0 * np.log10(np.where(ratio > 0, ratio, np.nan))
+    return {"ratio": ratio, "ratio_db": ratio_db,
+            "tone_indices": np.asarray(indices, dtype=int), "valid": valid,
+            "method": method}
+
+
+def recorded_rx_gain_ratio(calibration, data_info):
+    """RX amplitude ratio, data over calibration, from recorded chain states.
+
+    ``calibration`` is a calibration record (its provenance keeps the sweep's
+    chain state) or the sweep data itself (its ``info``). Returns ``None`` when
+    either side's chain state is unknown; raises when their PFB shifts differ
+    (its per-stage gain is not modelled). Divide the data's I/Q by the ratio to
+    put it on the calibration's scale.
+    """
+    if is_calibration_record(calibration):
+        provenance = calibration.get('provenance') or {}
+        cal_db, cal_shift = provenance.get('rx_chain_gain_db'), provenance.get('pfb_fftshift')
+    elif isinstance(calibration, Mapping):
+        cal_db, cal_shift = _rx_chain_gain_db(calibration.get('info'))
+    else:
+        return None
+    data_db, data_shift = _rx_chain_gain_db(data_info)
+    if cal_db is None or data_db is None:
+        return None
+    if json.dumps(cal_shift, default=_json_safe) != json.dumps(data_shift, default=_json_safe):
+        raise ValueError(
+            f'PFB fftshift differs between the calibration and the data '
+            f'({cal_shift} vs {data_shift}); its per-stage gain is not modelled. '
+            'Match the RX scale explicitly (match_rx_gain=<ratio>).')
+    return float(10.0 ** ((float(data_db) - float(cal_db)) / 20.0))
+
+
+def _resolve_rx_gain(match_rx_gain, calibration, data_info):
+    """The data/calibration amplitude ratio a conversion should divide out."""
+    if match_rx_gain is False or match_rx_gain is None:
+        return 1.0
+    if match_rx_gain == 'auto':
+        ratio = recorded_rx_gain_ratio(calibration, data_info)
+        if ratio is None or np.isclose(ratio, 1.0, rtol=1e-6):
+            return 1.0
+        warnings.warn(
+            f'RX chain gain differs by {20 * np.log10(ratio):+.2f} dB between the '
+            'calibration and the data; the data I/Q is rescaled to the '
+            "calibration's scale (match_rx_gain=False to disable).", stacklevel=3)
+        return ratio
+    return float(match_rx_gain)
+
+
+# ---------------------------------------------------------------------------
+# Bases
+# ---------------------------------------------------------------------------
+
+BASES = ('raw', 'deembedded', 'centered', 'centered_rotated')
+
+
+def basis_coefficients(calibration, frequency_hz, basis='centered_rotated', gain=1.0):
+    """Affine coefficients ``(A, B)`` taking raw I/Q into a basis: ``A * z + B``.
+
+    ``'raw'`` leaves the I/Q alone; ``'deembedded'`` removes the fitted gain
+    and cable delay at ``frequency_hz`` (the probe frequency each sample was
+    measured at); ``'centered'`` also subtracts the fitted circle centre;
+    ``'centered_rotated'`` also rotates the off-resonance point onto the
+    negative real axis, so the resonance sits at phase 0. ``gain`` (data over
+    calibration amplitude, see :func:`recorded_rx_gain_ratio`) is divided out
+    first. Precompute once per tone and probe frequency: applying is one
+    complex multiply-add, cheap enough for the RFSoC's ARM.
+
+    Examples
+    --------
+    >>> cal = ResonatorCalibration(1e9, 2e4, 0.0, 0.5 + 0.0j, 0.5, np.pi)
+    >>> A, B = basis_coefficients(cal, 1e9)
+    >>> complex(np.round(A * 0.0 + B, 12))   # the resonance point lands at +r
+    (0.5-0j)
+    """
+    if basis not in BASES:
+        raise ValueError(f'basis must be one of {BASES}, got {basis!r}')
+    frequency_hz = np.asarray(frequency_hz, dtype=float)
+    scale = 1.0 / gain
+    if basis == 'raw' or calibration is None:
+        if basis != 'raw':
+            raise ValueError(f"basis={basis!r} needs a calibration")
+        return (np.full(frequency_hz.shape, scale, dtype=complex),
+                np.zeros(frequency_hz.shape, dtype=complex))
+    multiply = calibration.deembedding_calibration.multiplier(frequency_hz) * scale
+    if basis == 'deembedded':
+        return multiply, np.zeros(multiply.shape, dtype=complex)
+    rotation = calibration._rotation_phasor if basis == 'centered_rotated' else 1.0
+    return multiply * rotation, np.full(multiply.shape, -calibration.center * rotation)
+
+
+def to_basis(z, calibration, frequency_hz, basis='centered_rotated', gain=1.0):
+    """Raw I/Q measured at ``frequency_hz`` in a basis (see :func:`basis_coefficients`)."""
+    A, B = basis_coefficients(calibration, frequency_hz, basis, gain)
+    return np.asarray(z, dtype=complex) * A + B
+
+
+# ---------------------------------------------------------------------------
+# Three-point modulation: slope, curvature, detuning
+# ---------------------------------------------------------------------------
+
+def phase_derivatives(z_points, offsets, method='fast', per_point=False):
+    """Phase slope and curvature from the I/Q at each modulation probe point.
+
+    Parameters
+    ----------
+    z_points : array_like of complex, shape (..., N, n_tones)
+        One (averaged) I/Q value per probe point -- cycle means, or blocks of
+        cycles averaged coherently. The phase differentiated is that of the
+        basis they are in: use the centred basis (:func:`to_basis`) for
+        detuning, since about the raw origin it reads 13x to 100x high.
+    offsets : array_like, shape (N, n_tones) or (N,)
+        Probe offset of each point in Hz, in any slot order.
+    method : {'fast', 'fit'}, optional
+        ``'fast'`` (default, the tracker's): finite differences between the
+        lowest, central and highest distinct offsets, points sharing an offset
+        averaged coherently first; phase differences are angles of products,
+        so nothing is unwrapped. ``'fit'``: least-squares quadratic of the
+        unwrapped phase against offset (a line with two distinct offsets), so
+        every point counts -- e.g. both centre dwells of ``[0, +d, 0, -d]``.
+    per_point : bool, optional
+        Also return the phase slope and complex I/Q gradient at every point.
+
+    Returns
+    -------
+    dict
+        ``dphi_df`` (rad/Hz) and ``d2phi_df2`` (rad/Hz**2), shape
+        ``(..., n_tones)``, at ``center_offset_hz`` (the offset nearest the
+        middle of the span, ``(n_tones,)``). NaN where not estimable; the
+        curvature needs three distinct offsets. With ``per_point``:
+        ``local_dphi_df`` and ``dz_df``, shape ``(..., N, n_tones)``.
+
+    Examples
+    --------
+    A centred notch phase ``-2 atan(2x)``, the tone 0.3 linewidths below the
+    resonance, on the firmware default pattern:
+
+    >>> lw = 5e4; off = np.array([-5e3, 0.0, 5e3, 0.0])
+    >>> z = np.exp(-2j * np.arctan(2 * (-0.3 * lw + off) / lw))[:, None]
+    >>> d = phase_derivatives(z, off)
+    >>> round(float(detuning_from_derivatives(d['dphi_df'], d['d2phi_df2'])[0]), 3)
+    0.296
+    """
+    z = np.asarray(z_points, dtype=complex)
+    N, n_tones = z.shape[-2], z.shape[-1]
+    offsets = np.broadcast_to(np.asarray(offsets, dtype=float).reshape(N, -1),
+                              (N, n_tones))
+    f_lo = offsets.min(axis=0)
+    f_hi = offsets.max(axis=0)
+    f_mid = offsets[np.argmin(np.abs(offsets - 0.5 * (f_lo + f_hi)), axis=0),
+                    np.arange(n_tones)]
+    out = {'center_offset_hz': f_mid}
+    if method == 'fast':
+        def mean_at(f):
+            w = (offsets == f).astype(float)
+            return np.einsum('...nt,nt->...t', z, w / w.sum(axis=0))
+
+        z_lo, z_mid, z_hi = mean_at(f_lo), mean_at(f_mid), mean_at(f_hi)
+        d_lo = np.angle(z_mid * np.conj(z_lo))          # phi_mid - phi_lo
+        d_hi = np.angle(z_hi * np.conj(z_mid))          # phi_hi - phi_mid
+        three = (f_lo < f_mid) & (f_mid < f_hi)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            slope = (d_lo + d_hi) / (f_hi - f_lo)
+            # Second difference for (possibly) unequal spacing; for a symmetric
+            # pattern it is (phi_hi - 2 phi_mid + phi_lo) / half**2.
+            curvature = 2.0 * (d_hi / (f_hi - f_mid) - d_lo / (f_mid - f_lo)) / (f_hi - f_lo)
+            if per_point:
+                dz_mid = (z_hi - z_lo) / (f_hi - f_lo)
+                d2z = 2.0 * ((z_hi - z_mid) / (f_hi - f_mid)
+                             - (z_mid - z_lo) / (f_mid - f_lo)) / (f_hi - f_lo)
+        slope = np.where(f_hi > f_lo, slope, np.nan)
+        curvature = np.where(three, curvature, np.nan)
+        if per_point:
+            shift = offsets - f_mid                     # (N, n_tones)
+            curvature_or_0 = np.where(np.isfinite(curvature), curvature, 0.0)
+            out['local_dphi_df'] = slope[..., None, :] + curvature_or_0[..., None, :] * shift
+            d2z = np.where(three, d2z, 0.0)
+            out['dz_df'] = dz_mid[..., None, :] + d2z[..., None, :] * shift
+    elif method == 'fit':
+        lead = z.shape[:-2]
+        flat = z.reshape(-1, N, n_tones)
+        slope = np.full((flat.shape[0], n_tones), np.nan)
+        curvature = np.full_like(slope, np.nan)
+        local = np.full(flat.shape, np.nan)
+        dz_df = np.full(flat.shape, np.nan + 0j)
+        for t in range(n_tones):
+            x = offsets[:, t] - f_mid[t]
+            order = np.argsort(x)
+            distinct = len(np.unique(x))
+            if distinct < 2:
+                continue
+            deg = 2 if distinct >= 3 else 1
+            phi = np.unwrap(np.angle(flat[:, order, t]), axis=1)
+            c = np.polyfit(x[order], phi.T, deg)          # highest power first
+            zc = np.polyfit(x[order], flat[:, order, t].T, deg)
+            slope[:, t] = c[-2]
+            if deg == 2:
+                curvature[:, t] = 2.0 * c[0]
+                local[:, :, t] = c[1][:, None] + 2.0 * c[0][:, None] * x[None, :]
+                dz_df[:, :, t] = zc[1][:, None] + 2.0 * zc[0][:, None] * x[None, :]
+            else:
+                local[:, :, t] = c[0][:, None]
+                dz_df[:, :, t] = zc[0][:, None]
+        slope = slope.reshape(lead + (n_tones,))
+        curvature = curvature.reshape(lead + (n_tones,))
+        if per_point:
+            out['local_dphi_df'] = local.reshape(z.shape)
+            out['dz_df'] = dz_df.reshape(z.shape)
+    else:
+        raise ValueError(f"method must be 'fast' or 'fit', got {method!r}")
+    out['dphi_df'] = slope
+    out['d2phi_df2'] = curvature
+    return out
+
+
+def detuning_from_derivatives(dphi_df, d2phi_df2):
+    """Detuning, resonance minus tone, in linewidths, from phase slope and curvature.
+
+    On the circle-centred phase a notch is exactly ``phi_0 - 2 atan(2 x)``,
+    ``x = (f_tone - f_res) / linewidth``, which inverts to
+    ``x = -phi'' / (2 phi' |phi'|)``: the detuning in linewidths from the two
+    derivatives alone, whatever the phase offset (a rotation error cancels)
+    and without a linewidth. This returns ``-x``, the resonance-minus-tone
+    sign: positive means the resonance is above the tone, so the tone should
+    move up. Exact for the ideal linear notch's derivatives; the finite
+    differences of :func:`phase_derivatives` bias it by ~1% at +/-0.1
+    linewidth offsets and ~5% at +/-0.25. For a driven (Duffing) response only
+    its zero -- the inflection -- is exact. Multiply by a linewidth for Hz.
+    """
+    slope = np.asarray(dphi_df, dtype=float)
+    curvature = np.asarray(d2phi_df2, dtype=float)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        detuning = curvature / (2.0 * slope * np.abs(slope))
+    return np.where(np.isfinite(detuning), detuning, np.nan)
+
+
+def phase_shift_and_dissipation(z, reference, dphi_df):
+    """Resonance shift and matched dissipation, both in Hz, from centred I/Q.
+
+    With ``z`` and ``reference`` in the circle-centred basis and ``dphi_df``
+    the local slope of its phase with probe frequency, a resonator
+    perturbation moves the point along the circle (frequency) and radially
+    (loss) on the same scale -- the map is conformal -- so with
+    ``w = ln(z / reference)``::
+
+        resonance shift        = -Im(w) / dphi_df
+        fr * Delta(1 / (2 Qi)) =  Re(w) / dphi_df
+
+    Linear in the centred phase and log-radius, first-order exact at any point
+    on the circle, and needing nothing of the fit but the centring: the
+    preferred three-point conversion, with ``dphi_df`` measured live by the
+    modulation. About the raw origin the phase mixes loss into frequency, so
+    do not feed it uncentred I/Q.
+    """
+    with np.errstate(divide='ignore', invalid='ignore'):
+        w = np.log(np.asarray(z, dtype=complex) / np.asarray(reference, dtype=complex))
+        slope = np.asarray(dphi_df, dtype=float)
+        return -w.imag / slope, w.real / slope
+
+
+# ---------------------------------------------------------------------------
+# Fixed-tone conversion: prepare once, convert many
+# ---------------------------------------------------------------------------
+
+CONVERSION_METHODS = ('linearized', 'phase', 'mobius', 'lookup', 'circle')
+
+
+def centered_phase_slope(calibration, frequency_hz, sweep_f=None, sweep_z=None,
+                         smooth_window_hz=1000):
+    """``dphi/df`` (rad/Hz) of the circle-centred phase at ``frequency_hz``.
+
+    Measured from the sweep when one is given (smoothed, then
+    differentiated); otherwise from the calibration's model circle, which is
+    only done for a linear (``anl == 0``) calibration.
+    """
+    if sweep_f is not None:
+        f = np.asarray(sweep_f, dtype=float)
+        order = np.argsort(f)
+        f = f[order]
+        z = smooth_sweep(f, np.asarray(sweep_z, dtype=complex)[order], smooth_window_hz)
+        phase = np.unwrap(np.angle(to_basis(z, calibration, f, 'centered_rotated')))
+        return float(np.interp(frequency_hz, f, np.gradient(phase, f)))
+    if calibration.anl != 0.0:
+        raise ValueError('a driven (Duffing) calibration needs the sweep to '
+                         'measure its phase slope; pass sweep_data')
+    x = frequency_hz / calibration.fr - 1.0 + calibration.frequency_origin_fraction
+    return float(-4.0 * calibration.Ql / calibration.fr
+                 / (1.0 + (2.0 * calibration.Ql * x) ** 2))
+
+
+def prepare_conversion(frequency_hz, method='linearized', *, calibration=None,
+                       sweep_f=None, sweep_z=None, smooth_window_hz=1000):
+    """Precompute a fixed-tone conversion: everything except the samples.
+
+    Returns a plain dict for :func:`convert_iq`; keep it when converting the
+    same tone again (a live display does, every refresh). Every method gives
+    the resonator-side shift (Hz) and the matched dissipation
+    ``Delta(1 / (2 Qi))`` relative to the sweep's I/Q at the tone -- the
+    resonator's state during the sweep -- or, with no sweep, to the fitted
+    state:
+
+    ``'linearized'``  tangent/normal projection on the sweep's local complex
+                      gradient. Sweep only; first order; any basis.
+    ``'phase'``       centred phase and log-radius over the centred phase
+                      slope (:func:`phase_shift_and_dissipation`): the
+                      fixed-tone form of the three-point conversion.
+                      Calibration for the centring; slope and reference from
+                      the sweep, else from the model (linear only).
+    ``'mobius'``      exact fitted inversion, Duffing included. Calibration.
+    ``'lookup'``      inverts the sweep's whole centred phase curve; follows
+                      large signals, NaN beyond the swept span. Sweep; the
+                      calibration (optional) sets the centring.
+    ``'circle'``      diagnostic: the circle coordinate, and the radial proxy
+                      ``Delta(|z_c| / r)`` in place of dissipation.
+    """
+    if method not in CONVERSION_METHODS:
+        raise ValueError(f'method must be one of {CONVERSION_METHODS}, got {method!r}')
+    frequency_hz = float(frequency_hz)
+    have_sweep = sweep_f is not None and sweep_z is not None
+    if have_sweep:
+        sweep_f = np.asarray(sweep_f, dtype=float)
+        sweep_z = np.asarray(sweep_z, dtype=complex)
+    prepared = {'method': method, 'frequency_hz': frequency_hz}
+    if method in ('linearized', 'lookup') and not have_sweep:
+        raise ValueError(f"method={method!r} needs the calibration sweep")
+    if method in ('phase', 'mobius', 'circle') and calibration is None:
+        raise ValueError(f"method={method!r} needs a calibration for the tone")
+    if method == 'linearized':
+        prepared['calibration'] = LinearizedResonatorCalibration.from_sweep(
+            sweep_f, sweep_z, frequency_hz, smooth_window_hz=smooth_window_hz)
+    elif method == 'lookup':
+        prepared['lookup'] = PhaseLookupCalibration.from_sweep(
+            sweep_f, sweep_z, frequency_hz, smooth_window_hz=smooth_window_hz,
+            calibration=calibration)
+    elif method == 'phase':
+        A, B = basis_coefficients(calibration, frequency_hz, 'centered_rotated')
+        prepared['A'], prepared['B'] = complex(A), complex(B)
+        if have_sweep:
+            reference = interpolate_complex_trace(sweep_f, sweep_z, frequency_hz)
+            prepared['reference'] = complex(A * reference + B)
+        else:
+            # The model circle's point at the tone (linear calibrations).
+            x = frequency_hz / calibration.fr - 1.0 + calibration.frequency_origin_fraction
+            prepared['reference'] = complex(
+                calibration.radius * np.exp(-2j * np.arctan(2.0 * calibration.Ql * x)))
+        prepared['dphi_df'] = centered_phase_slope(
+            calibration, frequency_hz, sweep_f if have_sweep else None,
+            sweep_z if have_sweep else None, smooth_window_hz)
+    else:
+        prepared['calibration'] = calibration
+        prepared['reference_iq'] = (interpolate_complex_trace(sweep_f, sweep_z, frequency_hz)
+                                    if have_sweep else None)
+    return prepared
+
+
+def convert_iq(prepared, z, gain=1.0):
+    """Convert one tone's raw I/Q with a :func:`prepare_conversion` dict.
+
+    ``gain`` (data over calibration amplitude, see
+    :func:`recorded_rx_gain_ratio`) is divided out of ``z`` first, bringing the
+    data onto the calibration's scale. Returns ``(resonance_shift_hz,
+    matched_dissipation_shift)``: resonator-side Hz and ``Delta(1 / (2 Qi))``
+    (the radial proxy for ``'circle'``), relative to the prepared reference.
+
+    Examples
+    --------
+    >>> f = np.linspace(0.999e9, 1.001e9, 4001)
+    >>> sweep = 1 - 0.5 / (1 + 2j * 2e4 * (f - 1e9) / 1e9)
+    >>> moved = 1 - 0.5 / (1 + 2j * 2e4 * (1e9 - (1e9 + 100.0)) / 1e9)
+    >>> p = prepare_conversion(1e9, 'linearized', sweep_f=f, sweep_z=sweep,
+    ...                        smooth_window_hz=0)
+    >>> shift, _ = convert_iq(p, moved)
+    >>> round(float(shift))
+    100
+    """
+    z = np.asarray(z, dtype=complex) / gain
+    method = prepared['method']
+    frequency_hz = prepared['frequency_hz']
+    if method == 'linearized':
+        shift, dissipation_hz = prepared['calibration'].convert_raw_iq(z, fractional=False)
+        return shift, dissipation_hz / frequency_hz
+    if method == 'lookup':
+        shift, dissipation_hz = prepared['lookup'].convert_raw_iq(z, fractional=False)
+        return shift, dissipation_hz / frequency_hz
+    if method == 'phase':
+        shift, dissipation_hz = phase_shift_and_dissipation(
+            z * prepared['A'] + prepared['B'], prepared['reference'], prepared['dphi_df'])
+        return shift, dissipation_hz / frequency_hz
+    calibration = prepared['calibration']
+    reference = prepared['reference_iq']
+    if reference is not None:
+        return calibration.convert_referenced_raw_iq(
+            frequency_hz, z, reference, method=method)
+    # No sweep: relative to the fitted state, where the probe detuning is
+    # f - fr and the loss coordinate is zero.
+    probe_detuning, loss = calibration.convert_raw_iq(frequency_hz, z, method=method)
+    return (frequency_hz - calibration.fr) - probe_detuning, loss
+
+
+def frequency_and_dissipation(z, frequency_hz, method='linearized', *, calibration=None,
+                              sweep_f=None, sweep_z=None, smooth_window_hz=1000,
+                              gain=1.0):
+    """One-shot :func:`prepare_conversion` + :func:`convert_iq` for one tone."""
+    prepared = prepare_conversion(
+        frequency_hz, method, calibration=calibration, sweep_f=sweep_f,
+        sweep_z=sweep_z, smooth_window_hz=smooth_window_hz)
+    return convert_iq(prepared, z, gain=gain)
+
+
+# ---------------------------------------------------------------------------
+# Expressing a shift in other units
+# ---------------------------------------------------------------------------
+
+def express(quantity, resonance_shift_hz, matched_dissipation_shift, *,
+            frequency_hz, calibration=None, reference_resonance_hz=None):
+    """Turn a (resonance shift, matched dissipation) pair into a named quantity.
+
+    ``frequency_hz`` is the tone frequency the pair was measured at (the
+    modulation centre for demodulated data). Linewidth units use the
+    calibration's *reference* linewidth ``fr / Ql`` -- fixed, never an
+    instantaneous estimate, so a changing loss cannot reshape the signal.
+    Absolute quantities (``resonance_frequency_hz``, ``detuning_*``,
+    ``internal_loss``) need the resonance at the shift's reference:
+    ``reference_resonance_hz``, by default the calibration's operating point
+    (right when the reference is the calibration's own sweep).
+
+    Examples
+    --------
+    >>> cal = ResonatorCalibration(1e9, 2e4, 0.0, 0.5 + 0.0j, 0.5, 0.0, Qi=4e4)
+    >>> float(express('resonance_shift_linewidths', 5e3, 0.0, frequency_hz=1e9,
+    ...               calibration=cal))
+    0.1
+    >>> float(express('detuning_hz', 5e3, 0.0, frequency_hz=1e9 + 1e3,
+    ...               calibration=cal))
+    4000.0
+    """
+    name = canonical_quantity(quantity)
+    shift = np.asarray(resonance_shift_hz, dtype=float)
+    dissipation = np.asarray(matched_dissipation_shift, dtype=float)
+    if name == 'resonance_shift_hz':
+        return shift
+    if name == 'fractional_resonance_shift':
+        return shift / frequency_hz
+    if name == 'matched_dissipation_shift':
+        return dissipation
+    if name == 'matched_dissipation_hz':
+        return dissipation * frequency_hz
+    if name == 'internal_loss_shift':
+        return 2.0 * dissipation
+    known = ('resonance_shift_linewidths', 'matched_dissipation_linewidths',
+             'internal_loss', 'fractional_internal_loss_shift',
+             'resonance_frequency_hz', 'detuning_hz', 'fractional_detuning',
+             'detuning_linewidths')
+    if name not in known:
+        raise ValueError(f'{name!r} is not a resonance shift or loss quantity')
+    if calibration is None:
+        raise ValueError(f'{name!r} needs a calibration (a fit) for the tone')
+    linewidth = calibration.fr / calibration.Ql
+    if name == 'resonance_shift_linewidths':
+        return shift / linewidth
+    if name == 'matched_dissipation_linewidths':
+        return dissipation * frequency_hz / linewidth
+    if name in ('internal_loss', 'fractional_internal_loss_shift'):
+        if not np.isfinite(calibration.Qi):
+            raise ValueError(f'{name!r} needs Qi: build the calibration from a fit')
+        if name == 'internal_loss':
+            return 1.0 / calibration.Qi + 2.0 * dissipation
+        return 2.0 * dissipation * calibration.Qi
+    reference = (operating_point_hz(calibration) if reference_resonance_hz is None
+                 else reference_resonance_hz)
+    resonance = reference + shift
+    if name == 'resonance_frequency_hz':
+        return resonance
+    detuning = resonance - frequency_hz
+    if name == 'detuning_hz':
+        return detuning
+    if name == 'fractional_detuning':
+        return detuning / frequency_hz
+    return detuning / linewidth
+
+
+# ---------------------------------------------------------------------------
+# Parsed captures
+# ---------------------------------------------------------------------------
+
+def _capture_tone_keys(samples, tones):
+    available = samples.get('i_data', {})
+    keys_by_id = {int(key): key for key in available}
+    if len(keys_by_id) != len(available):
+        raise ValueError('i_data contains duplicate tone IDs')
+    if tones is None or (isinstance(tones, str) and tones == 'all'):
+        return [keys_by_id[tone] for tone in sorted(keys_by_id)]
+    if isinstance(tones, (int, np.integer, str)):
+        tones = [tones]
+    keys = []
+    for tone in tones:
+        try:
+            key = keys_by_id[int(tone)]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f'Tone {tone!r} is not present in the samples') from exc
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
+def tone_column(samples, field, tone):
+    """One tone's column of a per-tone field in a parsed or demodulated capture.
+
+    The field may be a ``{tone_key: array}`` dict or an array shaped
+    ``(n_samples, n_tones)`` / ``(n_tones, n_samples)`` / ``(n_samples,)``
+    (tone 0 only).
+    """
+    tone = int(tone)
+    if field not in samples:
+        raise ValueError(f'{field!r} is not in the capture')
+    values = samples[field]
+    if isinstance(values, Mapping):
+        for key in (tone, f'{tone:04d}', str(tone)):
+            if key in values:
+                return np.asarray(values[key])
+        raise ValueError(f'{field} is missing tone {tone}')
+    arr = np.asarray(values)
+    if arr.ndim == 1:
+        if tone != 0:
+            raise ValueError(f"{field!r} is 1D and contains only tone 0")
+        return arr
+    if arr.ndim != 2:
+        raise ValueError(f"{field!r} must be 1D or 2D, got {arr.ndim}D")
+    n_samples = samples.get('num_samples')
+    if n_samples is not None and arr.shape[0] == int(n_samples):
+        return arr[:, tone]
+    if tone < arr.shape[0]:
+        return arr[tone]
+    return arr[:, tone]
+
+
+def _unwrap_finite(phase):
+    """Unwrap each finite run separately, so a gap cannot poison its tail."""
+    phase = np.asarray(phase, dtype=float)
+    out = np.full(phase.shape, np.nan)
+    valid = np.isfinite(phase)
+    edges = np.flatnonzero(np.diff(np.r_[False, valid, False]))
+    for start, stop in zip(edges[::2], edges[1::2]):
+        out[start:stop] = np.unwrap(phase[start:stop])
+    return out
+
+
+def probe_frequencies(samples, tone, tone_frequency_hz):
+    """Per-sample probe frequency (Hz) of one tone in a parsed capture.
+
+    Unmodulated samples sit at ``tone_frequency_hz``. Modulated ones sit at
+    their revision's centre plus their point's offset, from the modulation
+    state in ``samples['info']`` and, when present, the per-revision centres
+    ``parse_stream`` collects from tone updates.
+    """
+    points = np.asarray(samples.get('modulation_point', ()), dtype=int)
+    n = int(samples.get('num_samples', len(points)))
+    info = samples.get('info') if isinstance(samples.get('info'), Mapping) else {}
+    state = info.get('modulation') if isinstance(info, Mapping) else None
+    frequencies = np.full(n, float(tone_frequency_hz))
+    if not points.size or not np.any(points > 0) or not isinstance(state, Mapping):
+        return frequencies
+    entry = next((t for t in state.get('tones', ())
+                  if isinstance(t, Mapping) and int(t.get('index', -1)) == int(tone)), None)
+    if entry is None or entry.get('offsets_hz') is None:
+        return frequencies
+    offsets = np.asarray(entry['offsets_hz'], dtype=float)
+    centers = np.full(n, float(entry.get('center_hz', tone_frequency_hz)))
+    by_revision = samples.get('tone_centers_by_revision') or {}
+    if by_revision and 'modulation_revision' in samples:
+        revisions = np.asarray(samples['modulation_revision'], dtype=int)
+        for revision, centre_map in by_revision.items():
+            centre = centre_map.get(str(int(tone)), centre_map.get(int(tone)))
+            if centre is not None:
+                centers[revisions == int(revision)] = float(centre)
+    valid = (points >= 1) & (points <= len(offsets))
+    frequencies[valid] = centers[valid] + offsets[points[valid] - 1]
+    return frequencies
+
+
+def convert_samples(samples, quantities, tones=None, *, method='linearized',
+                    basis='raw', calibrations=None, sweep_data=None,
+                    reference_tone_frequency=None, smooth_window_hz=1000,
+                    match_rx_gain='auto', cache=None):
+    """Named quantities, per tone, from a parsed capture.
+
+    The one entry point for ``parse_samples`` / ``parse_stream`` dicts, raw or
+    demodulated: pick quantities from ``QUANTITIES`` and get back
+    ``{quantity: {tone_key: array}}``.
+
+    Parameters
+    ----------
+    samples : dict
+        ``parse_samples`` / ``parse_stream`` output, or a demodulated capture
+        (``modulation.demodulate_timestream`` / ``demodulate_stream``), whose
+        shifts, dissipation and detunings are used as they are. For
+        demodulated data the tone of ``detuning_*`` is the modulation centre.
+    quantities : str or sequence of str
+        Names or aliases from ``QUANTITIES``.
+    tones : int, sequence of int or None, optional
+        Absolute tone indices; ``None`` does every tone.
+    method : str, optional
+        Fixed-tone conversion, see :func:`prepare_conversion`
+        (``'linearized'`` by default). Ignored for demodulated data.
+    basis : str, optional
+        Basis of the plain I/Q views (``i``, ``q``, ``amplitude``,
+        ``log_amplitude``, ``phase``, ``unwrapped_phase``); see
+        :func:`basis_coefficients`. The ``centered_*`` views use their own.
+    calibrations : record, mapping or None, optional
+        Per-tone calibrations or fits. ``None`` uses the calibration the
+        capture carries (:func:`calibration_from_data`), if any.
+    sweep_data : dict or None, optional
+        The calibration sweep, for ``'linearized'`` and ``'lookup'`` and the
+        reference and slope of ``'phase'``. ``None`` uses the sweep a capture
+        saved with its calibration, if any.
+    reference_tone_frequency : scalar, mapping, array or None, optional
+        Tone frequency override (:func:`resolve_tone_frequency`).
+    smooth_window_hz : float, optional
+        Sweep smoothing for the sweep-based methods.
+    match_rx_gain : {'auto', False} or float, optional
+        ``'auto'`` (default) rescales the capture's I/Q onto the calibration's
+        RX scale when both recorded chain states are known and differ (with a
+        warning); ``False`` never; a number is the data/calibration ratio.
+    cache : dict or None, optional
+        Pass the same dict on every call to reuse prepared conversions.
+
+    Returns
+    -------
+    dict
+        ``{quantity: {tone_key: numpy.ndarray}}``, each array one per sample.
+
+    Examples
+    --------
+    >>> t = np.arange(4)
+    >>> samples = {'i_data': {'0000': 1.0 + 0 * t}, 'q_data': {'0000': 0.5 + 0 * t},
+    ...            'num_samples': 4}
+    >>> out = convert_samples(samples, ['amplitude', 'phase'])
+    >>> round(float(out['amplitude']['0000'][0]), 4)
+    1.118
+    """
+    if isinstance(quantities, str):
+        quantities = [quantities]
+    names = list(dict.fromkeys(canonical_quantity(q) for q in quantities))
+    if basis not in BASES:
+        raise ValueError(f'basis must be one of {BASES}, got {basis!r}')
+    cache = {} if cache is None else cache
+    if calibrations is None:
+        calibrations = calibration_from_data(samples)
+    if sweep_data is None:
+        sweep_data = samples.get('calibration_sweep')
+    demodulated = bool(samples.get('modulation_demodulated'))
+    modulated = np.any(np.asarray(samples.get('modulation_point', ()), dtype=int) > 0)
+    gains = []
+
+    def gain():
+        # Resolved once, and only if a conversion against the calibration
+        # needs it (raw I/Q views never do).
+        if not gains:
+            source = calibrations if is_calibration_record(calibrations) else sweep_data
+            gains.append(1.0 if demodulated else
+                         _resolve_rx_gain(match_rx_gain, source, samples.get('info')))
+        return gains[0]
+
+    out = {name: {} for name in names}
+    for key in _capture_tone_keys(samples, tones):
+        tone = int(key)
+        z = (np.asarray(samples['i_data'][key], dtype=float)
+             + 1j * np.asarray(samples['q_data'][key], dtype=float))
+        calibration = calibration_for_tone(calibrations, tone)
+        sweep_f = sweep_z = None
+        if sweep_data is not None:
+            sweep_f, sweep_i, sweep_q = sweep_trace(sweep_data, tone)
+            sweep_z = np.asarray(sweep_i) + 1j * np.asarray(sweep_q)
+        state = {}
+
+        def frequency():
+            if 'frequency' not in state:
+                state['frequency'] = resolve_tone_frequency(
+                    samples, tone, reference_tone_frequency, sweep_f)
+            return state['frequency']
+
+        def in_basis(which):
+            if which not in state:
+                if demodulated and which != 'raw':
+                    raise ValueError(
+                        'demodulated I/Q is already in the basis it was demodulated '
+                        f"in ({samples.get('basis', 'raw')!r}); use basis='raw'")
+                if which == 'raw':
+                    state[which] = z          # counts as recorded: no gain
+                else:
+                    if not isinstance(calibration, ResonatorCalibration):
+                        raise ValueError(f"basis {which!r} needs a calibration for tone {tone}")
+                    state[which] = to_basis(z, calibration, probe_frequencies(
+                        samples, tone, frequency()), which, gain())
+            return state[which]
+
+        def shifts():
+            if 'shifts' not in state:
+                if demodulated:
+                    shift = tone_column(samples, 'resonance_shift_hz', tone).astype(float)
+                    dissipation = (tone_column(samples, 'matched_dissipation_shift', tone)
+                                   if 'matched_dissipation_shift' in samples
+                                   else np.full(shift.shape, np.nan))
+                    state['shifts'] = (shift, np.asarray(dissipation, dtype=float))
+                else:
+                    if modulated:
+                        raise ValueError(
+                            'frequency and dissipation of modulated I/Q need '
+                            'demodulating first (modulation.demodulate_stream)')
+                    cache_key = ('prepared', tone, method, frequency(), id(calibrations),
+                                 id(sweep_data), smooth_window_hz)
+                    if cache_key not in cache:
+                        cache[cache_key] = prepare_conversion(
+                            frequency(), method, calibration=calibration,
+                            sweep_f=sweep_f, sweep_z=sweep_z,
+                            smooth_window_hz=smooth_window_hz)
+                    state['shifts'] = convert_iq(cache[cache_key], z, gain())
+            return state['shifts']
+
+        for name in names:
+            if name in _IQ_VIEWS:
+                zb = in_basis(basis)
+                value = {'i': zb.real, 'q': zb.imag, 'amplitude': np.abs(zb)}.get(name)
+                if name == 'log_amplitude':
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        value = 20.0 * np.log10(np.abs(zb))
+                elif name == 'phase':
+                    value = np.angle(zb)
+                elif name == 'unwrapped_phase':
+                    value = _unwrap_finite(np.angle(zb))
+            elif name in _FIXED_BASIS_VIEWS:
+                zb = in_basis(_FIXED_BASIS_VIEWS[name])
+                value = (np.abs(zb) / calibration.radius if name == 'centered_radius'
+                         else _unwrap_finite(np.angle(zb)))
+            elif name in _DEMOD_ONLY or (demodulated and name in (
+                    'detuning_hz', 'detuning_linewidths', 'fractional_detuning')):
+                if not demodulated:
+                    raise ValueError(f'{name} needs demodulated modulation data')
+                field = {'detuning_hz': 'center_detuning_hz',
+                         'detuning_linewidths': 'center_detuning_linewidths'}.get(name, name)
+                if name == 'fractional_detuning':
+                    value = tone_column(samples, 'center_detuning_hz', tone) / frequency()
+                else:
+                    value = tone_column(samples, field, tone)
+            elif demodulated and name == 'resonance_frequency_hz':
+                value = tone_column(samples, 'resonance_frequency_hz', tone)
+            else:
+                shift, dissipation = shifts()
+                value = express(name, shift, dissipation, frequency_hz=frequency(),
+                                calibration=calibration if isinstance(
+                                    calibration, ResonatorCalibration) else None)
+            out[name][key] = np.asarray(value, dtype=float)
+    return out

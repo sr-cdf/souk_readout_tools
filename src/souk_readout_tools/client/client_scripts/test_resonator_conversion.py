@@ -38,7 +38,9 @@ def _calibration(fr, Qi, Qc, phi, gain, gain_phase, tau, anl=0.0):
     Qe = fitting.complex_coupling_q(Qc, phi)
     Ql = fitting.loaded_q(Qi, Qc, phi)
     phase_center = model_phase_center_geometry(Ql, Qe)
-    origin = np.imag(1.0 / Qe) / 2.0 if anl == 0.0 else 0.0
+    # The linear model's denominator carries only Re(1/Qe), so its circle
+    # coordinate is already zero at fr (as in ResonatorCalibration.from_fit);
+    # the driven path inverts Duffing and ignores the origin.
     return ResonatorCalibration(
         fr,
         Ql,
@@ -48,7 +50,7 @@ def _calibration(fr, Qi, Qc, phi, gain, gain_phase, tau, anl=0.0):
         phase_center.rotation_angle,
         gain_amplitude=gain,
         gain_phase=gain_phase,
-        frequency_origin_fraction=origin,
+        frequency_origin_fraction=0.0,
         anl=anl,
     )
 
