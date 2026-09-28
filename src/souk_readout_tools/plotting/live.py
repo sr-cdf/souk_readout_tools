@@ -216,10 +216,13 @@ class LivePlot:
     interval_ms : float
         GUI refresh interval (default 200 ms).
     sweep_data, calibrations, conversion_method, reference_tone_frequency,
-    smooth_window_hz, phase_center_params
-        Passed to the existing resonator/timeseries conversion helpers.
-        Centered phase requires a sweep or explicit fixed geometry. Frequency
-        conversion requires a sweep; Mobius additionally needs calibrations.
+        smooth_window_hz
+        Passed to ``resonator.convert_samples`` (see ``resonator.QUANTITIES``
+        for the names and signs). ``calibrations`` -- a record, fits or
+        ``ResonatorCalibration`` objects -- defaults to the one the stream
+        carries. Centred panels use it, else a model-free calibration of the
+        sweep. Frequency conversion needs a sweep ('linearized', 'lookup') or
+        calibrations ('phase', 'mobius').
     data_mode : {'raw', 'demodulated'}
         Raw probe samples (default), or sample-aligned modulation demodulation.
     demod_method : {'fast', 'accurate'}
@@ -259,9 +262,10 @@ class LivePlot:
                  data_mode='raw', demod_method='fast', settling='none', linewidth_hz=None,
                  sweep_data=None, calibrations=None, conversion_method='linearized',
                  reference_tone_frequency=None, smooth_window_hz=1000,
-                 phase_center_params=None, figure=None, controls=True):
+                 figure=None, controls=True):
         self.panels = [_panel(p) for p in (panels if panels is not None else (
-            'amp:time', 'amp:psd', 'phase:time', 'phase:psd'))]
+            'amplitude:time', 'amplitude:psd', 'unwrapped_phase:time',
+            'unwrapped_phase:psd'))]
         if not 1 <= len(self.panels) <= 4:
             raise ValueError('Choose between one and four panels')
         layout = layout or ((2, 2) if len(self.panels) == 4 else (len(self.panels), 1))
@@ -282,21 +286,21 @@ class LivePlot:
             raise ValueError('max_plot_points must be None or >= 6')
         if data_mode not in ('raw', 'demodulated'):
             raise ValueError('data_mode must be raw or demodulated')
-        from ._live_modulation import LiveDemodulator
+        from ..modulation import StreamDemodulator
         self.data_mode = data_mode
-        if data_mode == 'demodulated' and conversion_method == 'mobius' and calibrations is None:
-            raise ValueError('Mobius demodulation requires calibrations')
-        self._demodulator = LiveDemodulator(
-            demod_method, settling, linewidth_hz,
-            calibrations if conversion_method == 'mobius' else None,
-            cycle_calibration=calibrations)
+        # Demodulated data: the calibrations choose the centred basis and
+        # 'mobius' the exact inversion; otherwise the three-point 'phase'
+        # form (calibrated tones) or the 'linear' projection (the rest).
+        self._demodulator = StreamDemodulator(
+            demod_method, settling, linewidth_hz, calibration=calibrations,
+            conversion='mobius' if conversion_method == 'mobius' else None)
         self.x_axis = x_axis
         self.buffer = StreamBuffer(self.history_seconds, max_bytes=max_bytes)
         self.extractor = SignalExtractor(
             sweep_data=sweep_data, calibrations=calibrations,
             conversion_method=conversion_method,
             reference_tone_frequency=reference_tone_frequency,
-            smooth_window_hz=smooth_window_hz, phase_center_params=phase_center_params)
+            smooth_window_hz=smooth_window_hz)
         plt = _get_pyplot()
         self.figure = figure if figure is not None else plt.figure(figsize=(12, 8))
         if self.figure.axes:
@@ -584,9 +588,6 @@ class LivePlot:
         """Switch raw/demodulated display, retaining per-revision references."""
         if mode not in ('raw', 'demodulated'):
             raise ValueError('data_mode must be raw or demodulated')
-        if (mode == 'demodulated' and self.extractor.conversion_method == 'mobius'
-                and self.extractor.calibrations is None):
-            raise ValueError('Mobius demodulation requires calibrations')
         old_mode, old_samples = self.data_mode, self._samples
         try:
             self.data_mode = mode
@@ -639,7 +640,9 @@ class LivePlot:
                 values.setdefault(signal, {}).update(rows)
         rate = _positive(samples['sample_rate'], 'sample_rate')
         time_x = self._time_axis(samples)
-        notes = {samples['_live_demod_note']} if '_live_demod_note' in samples else set()
+        notes = {samples['demod_note']} if 'demod_note' in samples else set()
+        if self.extractor.note:
+            notes.add(self.extractor.note)
         if not samples.get('modulation_demodulated') and np.any(
                 np.asarray(samples.get('modulation_point', [])) > 0):
             notes.add('Raw modulated probe samples')
@@ -665,11 +668,14 @@ class LivePlot:
                         cache_key = panel.signal, key
                         if cache_key not in spectra:
                             spectral_row, spectral_rate = row, rate
-                            cycle_fields = samples.get('_live_cycle_spectra', {})
-                            field = 'detuning_hz' if panel.signal == 'detuning' else panel.signal
+                            cycle_fields = samples.get('cycle_spectra', {})
+                            # Demodulated data's tone is the modulation centre.
+                            field = {'detuning_hz': 'center_detuning_hz',
+                                     'detuning_linewidths': 'center_detuning_linewidths',
+                                     }.get(panel.signal, panel.signal)
                             if field in cycle_fields:
                                 spectral_row = cycle_fields[field][key]
-                                spectral_rate = samples['_live_cycle_rate']
+                                spectral_rate = samples['cycle_rate']
                             count = (len(spectral_row) if self.psd_seconds is None else
                                      max(2, int(self.psd_seconds * spectral_rate)))
                             spectra[cache_key] = _spectrum(

@@ -9,10 +9,13 @@ logic, and stages small centre corrections that are committed through the
 server's normal ``update_modulation`` machinery (the frame producer stays
 the sole owner of modulation hardware writes). Every committed correction is
 revision-stamped into the stream and announced in-band as a typed
-``TONE_UPDATE`` frame, so post-processing can reconstruct absolute per-tone
-response exactly:
+``TONE_UPDATE`` frame, so post-processing can reconstruct the resonance
+exactly (``modulation.demodulate_stream`` does it):
 
-    absolute_response(t) = (center[rev(t)] - center[rev0]) + freq_shift_hz(t)
+    resonance(t) = center[rev(t)] + center_detuning(t)
+
+Detuning follows the package convention: the resonance minus the modulation
+centre, so a positive reading moves the centre up.
 
 Tracking is permanent readout infrastructure (live frequency-shift serving
 and array health monitoring are other plausible consumers); the estimator
@@ -48,6 +51,8 @@ from collections import deque
 import numpy as np
 
 from souk_readout_tools import modulation
+from souk_readout_tools.resonator import (detuning_from_derivatives,
+                                          phase_derivatives)
 
 # Number of int32 trailer words at the end of every stream frame
 # (flags 0-5, tt_msb, tt_lsb, cnt, err) -- matches prepare_frame.
@@ -292,28 +297,21 @@ def center_iq(z, freq_hz, calibrations):
 
 
 def estimate_detunings(z, offsets, linewidth_hz):
-    """Per-cycle detuning from the phase slope and curvature, all tones at once.
+    """Per-cycle centre detuning from the phase slope and curvature, all tones at once.
 
-    The maths of :func:`souk_readout_tools.modulation.demodulate`'s
-    ``method='fast'`` path -- finite-difference phase slope and curvature --
-    on the lowest, middle and highest
-    probe offsets of each tone, whatever order the slots are in. Points that
-    share an offset are averaged coherently first, so the firmware default
-    ``[-d, 0, +d, 0]`` uses both centre dwells. (Taking the first, middle and
-    last *slots* instead -- as both this and ``demodulate('fast')`` did before
-    2026-09-22 -- reads that pattern as ~+37 linewidths whatever the true
-    detuning.)
-
-    Phase differences are the angles of products of neighbouring points, so
-    there is no unwrap: they are small whenever the probe offsets are small
-    against the linewidth, which the estimate assumes anyway.
+    ``resonator.phase_derivatives`` (``method='fast'``, the same kernel the
+    demodulators use) on the lowest, central and highest probe offsets of each
+    tone, whatever order the slots are in; points that share an offset are
+    averaged coherently first, so the firmware default ``[-d, 0, +d, 0]``
+    uses both centre dwells. Phase differences are angles of products of
+    neighbouring points, so nothing is unwrapped.
 
     On the circle-centred phase (:func:`center_iq`) a notch is exactly
-    ``phi = -2 atan(2x)``, which inverts to ``x = -phi'' / (2 phi' |phi'|)``:
-    the detuning in linewidths from the slope and curvature alone, no
-    linewidth needed and no compression (within ~1% at +/-0.1 lw offsets,
-    ~5% low at +/-0.25). The linewidth only converts to Hz. Raw,
-    uncentred I/Q reads 13x to 25x high or worse.
+    ``-2 atan(2x)``, and ``resonator.detuning_from_derivatives`` inverts that
+    from the slope and curvature alone: no linewidth needed and no
+    compression (within ~1% at +/-0.1 lw offsets, ~5% low at +/-0.25). The
+    linewidth only converts to Hz. Raw, uncentred I/Q reads 13x to 25x high
+    or worse.
 
     Parameters
     ----------
@@ -322,57 +320,37 @@ def estimate_detunings(z, offsets, linewidth_hz):
     offsets : numpy.ndarray
         ``(N, n_tones)`` per-point probe offsets in Hz.
     linewidth_hz : numpy.ndarray
-        ``(n_tones,)`` per-tone resonator linewidths in Hz, for ``detuning_hz``.
+        ``(n_tones,)`` per-tone resonator linewidths in Hz, for Hz.
 
     Returns
     -------
     dict
-        ``detuning_linewidths`` and ``detuning_hz``: ``(n_cycles, n_tones)``
+        ``center_detuning_linewidths`` and ``center_detuning_hz`` -- the
+        resonance minus the modulation centre -- as ``(n_cycles, n_tones)``
         (NaN where not estimable, including tones with fewer than three
         distinct offsets); ``dphi_df`` the phase slope (rad/Hz).
 
     Examples
     --------
-    A tone 0.3 linewidths above a centred arctan-phase resonance:
+    A tone 0.3 linewidths above a centred arctan-phase resonance: the
+    resonance is 0.3 linewidths below it.
 
     >>> lw = np.array([5e4]); off = np.array([-5e3, 0, 5e3, 0])[:, None]
     >>> z = np.exp(-2j * np.arctan(2 * (0.3 * lw + off) / lw))[None]
-    >>> round(float(estimate_detunings(z, off, lw)['detuning_linewidths'][0, 0]), 3)
-    0.296
+    >>> round(float(estimate_detunings(z, off, lw)['center_detuning_linewidths'][0, 0]), 3)
+    -0.296
     """
     n_cycles, N, n_tones = z.shape
     if N < 3:
         raise ValueError('tracking needs >= 3 modulation points for the '
                          'curvature-based detuning estimate')
-    offsets = np.broadcast_to(np.asarray(offsets, dtype=float), (N, n_tones))
-    lw = np.asarray(linewidth_hz, dtype=float)
-
-    # Lowest, highest and most central offset of each tone, and the coherent
-    # mean of the points at each (weights are 1/count at those points, else 0).
-    f_lo = offsets.min(axis=0)
-    f_hi = offsets.max(axis=0)
-    dist = np.abs(offsets - 0.5 * (f_lo + f_hi))
-    f_mid = offsets[np.argmin(dist, axis=0), np.arange(n_tones)]
-
-    def mean_at(f):
-        w = (offsets == f).astype(float)
-        return np.einsum('cnt,nt->ct', z, w / w.sum(axis=0))
-
-    z_lo, z_mid, z_hi = mean_at(f_lo), mean_at(f_mid), mean_at(f_hi)
-    d_lo = np.angle(z_mid * np.conj(z_lo))           # phi_mid - phi_lo
-    d_hi = np.angle(z_hi * np.conj(z_mid))           # phi_hi - phi_mid
-    with np.errstate(divide='ignore', invalid='ignore'):
-        slope = (d_lo + d_hi) / (f_hi - f_lo)
-        # Second difference for (possibly) unequal spacing; for a symmetric
-        # pattern it is (phi_hi - 2 phi_mid + phi_lo) / half**2.
-        d2 = 2.0 * (d_hi / (f_hi - f_mid) - d_lo / (f_mid - f_lo)) / (f_hi - f_lo)
-        detuning_linewidths = -d2 / (2.0 * slope * np.abs(slope))
-    bad = ~np.isfinite(detuning_linewidths)
-    detuning_linewidths = np.where(bad, np.nan, detuning_linewidths)
+    derivatives = phase_derivatives(z, offsets, method='fast')
+    detuning = detuning_from_derivatives(derivatives['dphi_df'],
+                                         derivatives['d2phi_df2'])
     return {
-        'detuning_linewidths': detuning_linewidths,
-        'detuning_hz': detuning_linewidths * lw,
-        'dphi_df': slope,
+        'center_detuning_linewidths': detuning,
+        'center_detuning_hz': detuning * np.asarray(linewidth_hz, dtype=float),
+        'dphi_df': derivatives['dphi_df'],
     }
 
 
@@ -485,7 +463,9 @@ class TrackingController:
     confirm_windows : int
         Consecutive decision windows over threshold before staging (default 3).
     gain : float
-        Correction gain: ``new_center = center - gain * detuning_hz``.
+        Correction gain: ``new_center = center + gain * center_detuning_hz``
+        (the detuning is resonance minus centre, so the centre moves toward
+        the resonance).
     max_step_linewidths : float
         Per-decision clamp on the correction step (default 0.5).
     enable_mask : array-like of int or None
@@ -537,7 +517,8 @@ class TrackingController:
         Parameters
         ----------
         filtered_lw : numpy.ndarray
-            ``(n_tones,)`` filtered detuning in linewidths.
+            ``(n_tones,)`` filtered centre detuning in linewidths (resonance
+            minus centre).
         centers_hz : numpy.ndarray
             Current per-tone centres (Hz) the detunings were measured
             against.
@@ -565,7 +546,7 @@ class TrackingController:
         -------
         list of dict
             Newly staged corrections
-            (``{'tone', 'class', 'new_center_hz', 'detuning_linewidths'}``).
+            (``{'tone', 'class', 'new_center_hz', 'center_detuning_linewidths'}``).
         """
         self.last_decision_ts = time.time()
         over = (np.abs(filtered_lw) > self.threshold_linewidths) \
@@ -603,7 +584,7 @@ class TrackingController:
             step = float(step_r[k])
             base = self.staged['lo'].get(
                 tone, self.staged['bin'].get(tone, centers_hz[tone]))
-            new_center = float(base - step)
+            new_center = float(base + step)      # toward the resonance
             total_shift = abs(new_center - centers_hz[tone])
             klass = 'lo' if total_shift <= lo_headroom_hz[tone] else 'bin'
             # A tone that grows beyond lo headroom moves to the bin set.
@@ -615,7 +596,7 @@ class TrackingController:
             self.over_count[tone] = 0        # restart confirmation post-stage
             staged_now.append({'tone': tone, 'class': klass,
                                'new_center_hz': new_center,
-                               'detuning_linewidths': float(filtered_lw[tone])})
+                               'center_detuning_linewidths': float(filtered_lw[tone])})
         return staged_now
 
     def take_staged(self, classes=('lo',), tones=None):
@@ -1182,7 +1163,7 @@ class TrackingRuntime:
         the scatter between blocks; ``n_cycles`` is how many cycles they stand
         for, which is what the exponential weight follows.
         """
-        detunings = estimate['detuning_linewidths']
+        detunings = estimate['center_detuning_linewidths']
         if n_cycles is None:
             n_cycles = detunings.shape[0]
         valid = np.isfinite(detunings)
@@ -1257,7 +1238,7 @@ class TrackingRuntime:
                     phase = modulation.demodulate(
                         {'z': phase_blocks,
                          'offsets_hz': local_offsets,
-                         'freq_hz': centers[indices][None, :] + local_offsets},
+                         'tone_frequency_hz': centers[indices][None, :] + local_offsets},
                         method='fast', calibration=local_cals)
                     with warnings.catch_warnings():
                         warnings.simplefilter('ignore', RuntimeWarning)
@@ -1288,7 +1269,7 @@ class TrackingRuntime:
         self.stage_ms['estimate'] = 1e3 * (_t() - _t0); _t0 = _t()
         if self.estimator_compare_tones:
             self.estimator_diff = self._compare_estimators(z, estimate)
-        filtered = self.filter.update(estimate['detuning_linewidths'])
+        filtered = self.filter.update(estimate['center_detuning_linewidths'])
         self.stage_ms['filter'] = 1e3 * (_t() - _t0); _t0 = _t()
         self._update_stats(estimate, n_cycles)
         self.stage_ms['stats'] = 1e3 * (_t() - _t0)
@@ -1322,8 +1303,8 @@ class TrackingRuntime:
             other = modulation.demodulate(
                 {'z': blocks[..., idx], 'offsets_hz': self.offsets[:, idx]},
                 method='accurate', linewidth_hz=self.linewidth_hz[idx])
-            ref = np.asarray(estimate['detuning_linewidths'], dtype=float)[:, idx]
-            alt = np.asarray(other['detuning_linewidths'], dtype=float)
+            ref = np.asarray(estimate['center_detuning_linewidths'], dtype=float)[:, idx]
+            alt = np.asarray(other['center_detuning_linewidths'], dtype=float)
             d = np.abs(alt - ref)
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore', RuntimeWarning)
@@ -1622,8 +1603,8 @@ class TrackingRuntime:
         Returns
         -------
         (tones, counts) : (dict, dict)
-            ``tones``: ``{tone_index: {state, detuning_linewidths,
-            detuning_std_linewidths, slope_ratio, invalid_fraction,
+            ``tones``: ``{tone_index: {state, center_detuning_linewidths,
+            center_detuning_std_linewidths, slope_ratio, invalid_fraction,
             staged_center_hz}}`` for every tracked tone. ``counts``: number
             of tones in each state.
         """
@@ -1665,8 +1646,8 @@ class TrackingRuntime:
             staged = staged_lo.get(i, staged_bin.get(i))
             tones[i] = {
                 'state': s,
-                'detuning_linewidths': f,
-                'detuning_std_linewidths': sd,
+                'center_detuning_linewidths': f,
+                'center_detuning_std_linewidths': sd,
                 'slope_ratio': sr,
                 'invalid_fraction': inv,
                 'staged_center_hz': None if staged is None else float(staged),
@@ -1711,11 +1692,11 @@ class TrackingRuntime:
             'n_no_data': counts['no_data'],
             'n_over_threshold': int(np.count_nonzero(
                 over & np.isfinite(filtered))),
-            'max_abs_detuning_linewidths': (None if not np.isfinite(max_lw)
+            'max_abs_center_detuning_linewidths': (None if not np.isfinite(max_lw)
                                             else float(max_lw)),
-            'median_abs_detuning_linewidths': (
+            'median_abs_center_detuning_linewidths': (
                 None if not np.isfinite(median_lw) else float(median_lw)),
-            'max_abs_detuning_hz': (None if not np.isfinite(max_hz)
+            'max_abs_center_detuning_hz': (None if not np.isfinite(max_hz)
                                     else float(max_hz)),
             'staged': {k: len(s) for k, s in self.controller.staged.items()},
             'commits': dict(self.commits),
@@ -1730,7 +1711,7 @@ class TrackingRuntime:
 
         This is the O(n_tones) work: it builds the per-tone health dict
         **once** (fixing the previous double ``tone_health`` compute) and
-        derives ``summary`` and ``filtered_detuning_linewidths`` from that
+        derives ``summary`` and ``filtered_center_detuning_linewidths`` from that
         single pass. It is run **off the event loop** (the consumer task's
         ``to_thread`` hop) and cached in ``self._snapshot``; :meth:`status`
         just serves that cache, so a health poll never runs this on the
@@ -1738,7 +1719,7 @@ class TrackingRuntime:
         profiling/tracking_health_benchmark.py.
         """
         tones, counts = self.tone_health()
-        recent = {i: t['detuning_linewidths'] for i, t in tones.items()}
+        recent = {i: t['center_detuning_linewidths'] for i, t in tones.items()}
         return {
             'summary': self.summary(counts=counts),
             'tones': tones,
@@ -1753,7 +1734,7 @@ class TrackingRuntime:
             'num_points': self.num_points,
             'cycles_seen': self.cycles_seen,
             'filter_settled': self.filter.settled,
-            'filtered_detuning_linewidths': recent,
+            'filtered_center_detuning_linewidths': recent,
             'controller': self.controller.status(),
             'commits': dict(self.commits),
             'commit_errors': self.commit_errors,

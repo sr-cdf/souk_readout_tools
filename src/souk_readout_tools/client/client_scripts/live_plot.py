@@ -53,7 +53,10 @@ def make_parser():
     parser.add_argument('--panels', nargs='+', help='Explicit row-major panels, e.g. amp:time phase:time')
     parser.add_argument('--columns', type=int, help='Panel columns (default 2 for four panels, otherwise 1)')
     parser.add_argument('--sweep', help='Saved calibration sweep (.npy/.json/.csv)')
-    parser.add_argument('--calibrations', help='Calibrations .npz archive saved by stream_dac.save_calibrations')
+    parser.add_argument('--calibrations',
+                        help='Calibrations .npz saved by resonator.save_calibrations (older '
+                             'stream_dac archives load too); its sweep is used when --sweep is '
+                             'not given. Default: the calibration the stream carries')
     parser.add_argument('--data-mode', choices=('raw', 'demodulated'), default='raw',
                         help='Raw probe IQ or sample-aligned demodulation (default raw)')
     parser.add_argument('--demod-method', choices=('fast', 'accurate'), default='fast')
@@ -61,7 +64,11 @@ def make_parser():
                         help='Demodulation: leave settling samples missing or convert their raw IQ')
     parser.add_argument('--linewidth-hz', type=float,
                         help='Resonator linewidth for model-free detuning (Python also accepts per-tone arrays)')
-    parser.add_argument('--conversion', choices=('linearized', 'mobius'), default='linearized')
+    parser.add_argument('--conversion',
+                        choices=('linearized', 'phase', 'mobius', 'lookup', 'circle'),
+                        default='linearized',
+                        help='Fixed-tone conversion (resonator.prepare_conversion); for '
+                             'demodulated data mobius selects the exact inversion')
     parser.add_argument('--backend', help='Matplotlib backend, e.g. QtAgg or TkAgg')
     return parser
 
@@ -71,9 +78,9 @@ def panel_options(args):
         panels = args.panels
     else:
         signals = [args.signal] if args.signal else {
-            'iq': ['i', 'q'], 'magphase': ['amp', 'phase'],
-            'freq_diss': ['fractional_frequency', 'dissipation'],
-            'linewidths': ['frequency_linewidths', 'dissipation_linewidths'],
+            'iq': ['i', 'q'], 'magphase': ['amplitude', 'unwrapped_phase'],
+            'freq_diss': ['fractional_resonance_shift', 'matched_dissipation_shift'],
+            'linewidths': ['resonance_shift_linewidths', 'matched_dissipation_linewidths'],
         }[args.format]
         panels = [f'{signal}:{domain}' for signal in signals for domain in args.layout.split('-')]
     columns = args.columns if args.columns is not None else (2 if len(panels) == 4 else 1)
@@ -106,8 +113,9 @@ def main(argv=None):
         sweep = ReadoutClient.import_sweep(args.sweep) if args.sweep else None
         calibrations = None
         if args.calibrations:
-            from souk_readout_tools.stream_dac import load_calibrations
-            calibrations = load_calibrations(args.calibrations)
+            from souk_readout_tools.resonator import load_calibration_record
+            calibrations, saved_sweep = load_calibration_record(args.calibrations)
+            sweep = sweep if sweep is not None else saved_sweep
         viewer = LivePlot(
             panels=panels, layout=layout, tones=args.tones,
             history_seconds=args.history, view_seconds=args.span,
@@ -126,8 +134,7 @@ def main(argv=None):
             # Standard raw captures have counters but no explicit time axis.
             # Preserve losses in those files just as the live ring does.
             if ('packet_counter' in samples and 'packet_missing' not in samples
-                    and not any(key in samples for key in (
-                        'time_s', 'resonance_shift_hz', 'frequency_shift_hz', 'frequency_hz'))):
+                    and not any(key in samples for key in ('time_s', 'resonance_shift_hz'))):
                 from souk_readout_tools.timeseries import fill_gaps
                 samples = fill_gaps(samples)
             viewer.update(samples)

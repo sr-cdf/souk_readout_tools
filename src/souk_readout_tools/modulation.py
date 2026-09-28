@@ -3,38 +3,44 @@ Fast-frequency-modulation client toolkit (setup + demodulation).
 
 These are **pure, transport-agnostic** functions: they operate on plain arrays /
 dicts (parsed stream samples + the ``tone_modulation`` state), with no
-``ReadoutClient`` or socket dependency. That keeps them usable client-side on
-received frames today and relocatable/shareable server-side later.
+``ReadoutClient`` or socket dependency. The conversion maths -- bases, the
+three-point slope/curvature kernel, the estimators -- is ``resonator``'s; this
+module groups the cycles, aligns the results to samples and handles revisions.
 
 The workflow a consumer follows is:
 
 0. :func:`params_from_sweep` -> turn a calibration sweep into a ready-to-use
    ``enable_modulation`` config (per-tone centres + per-tone probe deltas scaled
-   to each resonator's linewidth). This is the *setup* step.
+   to each resonator's linewidth, and the per-tone calibrations).
 1. Acquire modulated samples (``ReadoutClient.get_samples`` while modulation is
    armed, or a captured continuous stream) and parse them
-   (``ReadoutClient.parse_samples``) -> a ``data_dict`` carrying per-tone I/Q,
-   ``modulation_point`` (1..N, 0 = off), ``modulation_settling`` and
-   ``modulation_revision``.
-2. :func:`group_cycles` -> per-tone complex measurements grouped by step and
-   cycle (settling samples dropped), plus the per-point probe offsets (Hz) read
-   from ``get_info('modulation')`` and the grouped packet counters,
-   telescope time, packet errors and stream flags.
+   (``ReadoutClient.parse_samples`` / ``parse_stream``).
+2. :func:`group_cycles` -> per-tone complex measurements grouped by point and
+   cycle, the per-point probe offsets and probe frequencies, and the grouped
+   packet counters, telescope time, packet errors and stream flags.
    (:func:`point_timestreams` reshapes this into one ``parse_samples``-style
    timestream per probe point, for per-point PSDs with the standard plotters.)
-3. :func:`demodulate` -> per-cycle dphi/df, d2phi/df2, frequency shift and a
-   detuning estimate (with a ``needs_update`` flag for the future tracking loop).
+3. :func:`demodulate` (one estimate per cycle) or
+   :func:`demodulate_timestream` (every sample) -> resonance shift, matched
+   dissipation, phase slope and curvature, and the centre detuning with a
+   ``needs_update`` flag. :func:`demodulate_stream` does the same across a
+   whole recording's revisions (tracking commits, recentres).
+
+Conventions are ``resonator``'s: resonator-side shifts, detuning = resonance
+minus the modulation centre, dissipation ``Delta(1/(2 Qi))``. A ``calibration``
+chooses the **basis** (de-embedded and circle-centred per probe point, where
+the phase derivatives are well conditioned); ``conversion`` chooses the
+**estimator** (``'phase'``, the preferred three-point form; ``'linear'``;
+``'mobius'``).
 
 Physics caveats:
-- The point we steer to is the **steepest part of the phase curve / inflection
-  point** (d2phi/df2 = 0); for a non-ideal device this is *near*, not exactly,
-  the physical f0 once asymmetry / cable delay / nonlinearity matter.
-- ``d2phi/df2 / dphi/df`` has units 1/Hz, so a detuning expressed in linewidths
-  needs a **linewidth scale** (or a calibrated model). The ``'fast'`` estimator
-  here is leading-order for an ideal Lorentzian/arctan phase; calibrate per
-  device with ``method='model'`` for non-ideal resonators.
-- Dissipation is *not* a naive d|S21|/df: as a resonator detunes the operating
-  point slides around the resonance circle, so it needs the circle calibration.
+- The point we steer to is the **phase inflection** (d2phi/df2 = 0, the
+  steepest point): ``fr`` for a linear resonator, ``resonator.operating_point_hz``
+  for a driven one.
+- The detuning ``phi'' / (2 phi' |phi'|)`` is exact for the centred notch phase
+  and needs no linewidth; about the raw origin it reads 13x to 25x high.
+- Dissipation comes from the radius (or the normal to the I/Q gradient), not
+  from the phase.
 """
 
 import copy
@@ -42,6 +48,13 @@ import os
 import warnings
 
 import numpy as np
+
+from .resonator import (ResonatorCalibration, apply_readout_correction,
+                        calibration_for_tone, calibration_from_data,
+                        detuning_from_derivatives, operating_point_hz,
+                        phase_derivatives, phase_shift_and_dissipation,
+                        project_iq_tangent_normal, readout_correction_factors,
+                        to_basis)
 
 
 def _reconstruct_contiguous(pc, points, settling, revisions, z, n_points, spp, n_settle):
@@ -291,40 +304,6 @@ def active_modulation_state(info):
     return None
 
 
-def readout_correction_factors(info, num_tones):
-    """
-    Return the ``(num_points, num_tones)`` software readout-flattening factors
-    from a ``get_info`` payload's modulation state, or ``None`` when the state
-    carries none (compensation off, or nothing armed). Factors default to 1
-    for tones without a reported correction. These are the linear gains the
-    filterbank compensation cannot apply in hardware (the RX scale word is
-    inert); ``ReadoutClient.parse_samples`` multiplies them onto modulated
-    captures by default, and the plotting helpers use them to toggle the
-    correction on already-parsed data.
-    """
-    state = active_modulation_state(info)
-    if not isinstance(state, dict):
-        return None
-    n_points = int(state.get('num_points', 0) or 0)
-    if n_points < 1:
-        return None
-    factors = np.ones((n_points, int(num_tones)), dtype=float)
-    found = False
-    for tone in state.get('tones', []):
-        if not isinstance(tone, dict):
-            continue
-        rc = tone.get('readout_correction')
-        try:
-            idx = int(tone.get('index'))
-        except (TypeError, ValueError):
-            continue
-        if rc is None or len(rc) != n_points or not 0 <= idx < num_tones:
-            continue
-        factors[:, idx] = np.asarray(rc, dtype=float)
-        found = True
-    return factors if found else None
-
-
 def _extract_tone_metadata(container):
     """Collect tone role metadata from parsed-sample-style containers."""
     if not isinstance(container, dict):
@@ -389,27 +368,6 @@ def _modulated_indices_from_offsets(offsets_hz):
         return []
     active = np.any(np.abs(offsets_hz) > 0.0, axis=0)
     return np.flatnonzero(active).astype(int).tolist()
-
-
-def _linearized_iq_projection(reference_iq, gradient, s21,
-                              reference_frequency_hz=None):
-    """Project IQ displacement onto local frequency and matched-loss axes.
-
-    Thin wrapper over :func:`resonator.project_iq_tangent_normal`: returns the
-    tangent displacement in Hz and the matched-loss displacement as a fractional
-    dissipation (``dd_hz / reference_frequency_hz``, NaN if no usable reference).
-    """
-    from .resonator import project_iq_tangent_normal
-    df_hz, dd_hz = project_iq_tangent_normal(reference_iq, gradient, s21)
-    if reference_frequency_hz is None:
-        dissipation = np.full(np.shape(dd_hz), np.nan, dtype=float)
-    else:
-        reference_frequency_hz = float(reference_frequency_hz)
-        if np.isfinite(reference_frequency_hz) and reference_frequency_hz != 0.0:
-            dissipation = dd_hz / reference_frequency_hz
-        else:
-            dissipation = np.full(np.shape(dd_hz), np.nan, dtype=float)
-    return df_hz, dissipation
 
 
 def _annotate_tone_metadata(metadata, n_tones, modulated_indices):
@@ -507,7 +465,8 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
     dict
         ``z`` : grouped complex measurements (see ``reduce``);
         ``offsets_hz`` : ``(N, n_tones)`` per-point probe offsets (Hz);
-        ``freq_hz`` : ``(N, n_tones)`` absolute probe frequencies (centre + offset);
+        ``tone_frequency_hz`` : ``(N, n_tones)`` applied probe frequencies
+        (centre + offset);
         ``revision`` : ``(n_cycles,)`` representative config revision per cycle;
         ``packet_counter`` / ``telescope_time`` / ``packet_error`` :
         per-cycle, per-point metadata. For ``reduce='mean'`` these are the first
@@ -549,17 +508,11 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
     # and they are applied here, so downstream demod sees a flat channel. The
     # factors are ~1 over the centre half of a channel. Skipped when
     # parse_samples already applied them (marked 'readout_correction_applied').
-    readout_corr = None
     if not data_dict.get('readout_correction_applied', False):
-        for tone in tone_modulation_state.get('tones', []):
-            factors = tone.get('readout_correction')
-            if factors is not None and len(factors) == N and int(tone['index']) < n_tones:
-                if readout_corr is None:
-                    readout_corr = np.ones((N, n_tones), dtype=float)
-                readout_corr[:, int(tone['index'])] = np.asarray(factors, dtype=float)
-    if readout_corr is not None:
-        modulating = (points >= 1) & (points <= N)
-        z[modulating] = z[modulating] * readout_corr[points[modulating] - 1, :]
+        factors = readout_correction_factors(
+            {'modulation': tone_modulation_state}, n_tones)
+        if factors is not None and factors.shape[0] == N:
+            z = apply_readout_correction(z, points, factors)
 
     # Detect dropped accumulations via the packet counter, and (per on_missing)
     # notify only, fill the gaps with NaN placeholders, or interpolate them
@@ -642,13 +595,13 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
     # modulation state (user order). The absolute frequency (centre + offset) is
     # needed to de-embed the cable delay in the calibrated demod path.
     offsets_hz = np.zeros((N, n_tones), dtype=float)
-    freq_hz = np.zeros((N, n_tones), dtype=float)
+    tone_frequency_hz = np.zeros((N, n_tones), dtype=float)
     for tone in tone_modulation_state.get('tones', []):
         idx = int(tone['index'])
         if idx < n_tones:
             off = np.asarray(tone['offsets_hz'], dtype=float)
             offsets_hz[:, idx] = off
-            freq_hz[:, idx] = float(tone.get('center_hz', 0.0)) + off
+            tone_frequency_hz[:, idx] = float(tone.get('center_hz', 0.0)) + off
 
     mod_indices = _clean_indices(tone_modulation_state.get('mod_indices'), n_tones)
     if not mod_indices and 'mod_indices' not in tone_modulation_state:
@@ -902,7 +855,7 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
     return {
         'z': _stack_or_empty(cycles_z, z_out_shape, dtype=complex),
         'offsets_hz': offsets_hz,
-        'freq_hz': freq_hz,
+        'tone_frequency_hz': tone_frequency_hz,
         'tone_metadata': tone_metadata,
         'blind_indices': tone_roles['blind_indices'],
         'regular_indices': tone_roles['regular_indices'],
@@ -1057,7 +1010,7 @@ def point_timestreams(grouped, data_dict=None, sample_rate=None, dwell='mean'):
     # Absolute probe frequency per (point, tone); tones without a modulation
     # state entry sit at 0.0 there, so fall back to the capture's centre
     # frequencies for them.
-    freq_hz = np.asarray(grouped['freq_hz'], dtype=float)
+    freq_hz = np.asarray(grouped['tone_frequency_hz'], dtype=float)
     fallback_freqs = None
     if isinstance(data_dict, dict):
         info = data_dict.get('info')
@@ -1107,8 +1060,80 @@ def point_timestreams(grouped, data_dict=None, sample_rate=None, dwell='mean'):
     return out
 
 
+def _tone_calibration(calibration, t):
+    """This tone's ResonatorCalibration from a record, mapping or sequence.
+
+    A sequence is matched on each entry's ``tone_index`` (as
+    :func:`params_from_sweep` builds them) so an unordered or partial batch
+    fit maps correctly, falling back to position for entries without one.
+    Fit results are wrapped.
+    """
+    if calibration is None:
+        return None
+    if isinstance(calibration, dict):
+        cal = calibration_for_tone(calibration, t)
+    else:
+        cal = None
+        for position, entry in enumerate(calibration):
+            if entry is None:
+                continue
+            idx = int(getattr(entry, 'tone_index', -1))
+            if (idx if idx >= 0 else position) == t:
+                cal = calibration_for_tone({t: entry}, t)
+                break
+    return cal if isinstance(cal, ResonatorCalibration) else None
+
+
+_CONVERSIONS = ('phase', 'linear', 'mobius')
+
+
+def _check_conversion(conversion, centred, t):
+    """The conversion for one tone: the default, or the requested one checked."""
+    conversion = conversion or ('phase' if centred else 'linear')
+    if conversion not in _CONVERSIONS:
+        raise ValueError(f'conversion must be one of {_CONVERSIONS}, got {conversion!r}')
+    if conversion in ('phase', 'mobius') and not centred:
+        raise ValueError(
+            f'conversion={conversion!r} needs a calibration for tone {t} (and the '
+            "probe frequencies, grouped['tone_frequency_hz'])")
+    return conversion
+
+
+def _convert_points(conversion, cal, z, reference, slope, gradient, frequency_hz):
+    """Resonance shift (Hz) and ``Delta(1/(2 Qi))`` of samples about a reference.
+
+    ``z`` and ``reference`` are in the working basis; ``slope`` / ``gradient``
+    the local phase slope and complex I/Q gradient at each sample's point;
+    ``frequency_hz`` the tone (centre) frequency the Hz-equivalent loss of the
+    first-order forms is divided by.
+    """
+    if conversion == 'mobius':
+        probe_detuning, loss = cal.convert_centered_iq(z)
+        reference_detuning, reference_loss = cal.convert_centered_iq(reference)
+        return reference_detuning - probe_detuning, loss - reference_loss
+    if conversion == 'phase':
+        shift, dissipation_hz = phase_shift_and_dissipation(z, reference, slope)
+    else:
+        shift, dissipation_hz = project_iq_tangent_normal(reference, gradient, z)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return shift, dissipation_hz / frequency_hz
+
+
+def _reference_resonance_hz(cal, reference, probe_hz):
+    """The resonance (inflection) of the state a centred reference I/Q shows.
+
+    The calibration's exact inversion at the probe frequency, plus the
+    operating-point offset of a driven fit. Free of the finite-difference
+    bias of the three-point detuning, and a rotation error only enters at
+    second order in the detuning, so joining revisions through it is exact
+    for small detunings.
+    """
+    probe_detuning = cal.convert_centered_iq(reference)[0]
+    return float(probe_hz - probe_detuning + operating_point_hz(cal) - cal.fr)
+
+
 def demodulate_timestream(grouped, offsets=None, *, method='accurate',
-                          calibration=None, reference_z=None,
+                          calibration=None, conversion=None, reference_z=None,
                           data_dict=None, n_samples=None,
                           fill_settling=True,
                           use_settling_for_fit=False,
@@ -1117,27 +1142,31 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
     Convert every kept modulation sample into a sample-aligned demodulated stream.
 
     This is the "do not throw away integration time" companion to
-    :func:`demodulate`.  It uses the individual samples retained by
+    :func:`demodulate`. It uses the individual samples retained by
     ``group_cycles(..., reduce=None)`` rather than first averaging each point in
-    a cycle.  Each modulation point is treated as a valid resonator probe:
+    a cycle. Each modulation point is a valid probe of the resonator:
 
     - the static per-point response is divided out to form ``z_demod`` /
       ``mag`` / ``phase`` as if each sample had been measured at the centre
       point;
-    - the phase residual at that point is divided by the local phase slope to
-      give a centre-probe detuning timestream;
-    - the cycle-level ``dphi/df`` and ``d2phi/df2`` estimates are held across
-      all samples in that cycle so they line up with the original sample grid.
+    - each sample is converted about its point's reference through that
+      point's local phase slope (or I/Q gradient) from the cycle, so every
+      sample estimates the same resonance shift;
+    - the cycle-level ``dphi/df``, ``d2phi/df2`` and centre detuning are held
+      across all samples of that cycle.
 
-    ``freq_shift_hz`` follows the same probe-side sign convention as
-    :func:`demodulate`: it is the centre probe detuning, approximately
-    ``f_center - f_resonance``.  ``resonance_shift_hz`` is the opposite sign,
-    useful when reading detector resonance motion.
+    The conventions are ``resonator``'s: ``resonance_shift_hz`` is positive when
+    the resonance moves up, ``matched_dissipation_shift`` is ``Delta(1/(2 Qi))``
+    and ``center_detuning_*`` is the resonance minus the modulation centre.
 
     The simplest call takes the capture directly::
 
         ts = demodulate_timestream(data)            # parse_samples dict
         ts = demodulate_timestream('path/to/stream') # saved stream basename
+
+    For a recording whose tracking or recentring changed the modulation, use
+    :func:`demodulate_stream`, which splits it by revision and joins the
+    pieces onto one physical reference.
 
     Parameters
     ----------
@@ -1154,24 +1183,33 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         ``(N, n_tones)`` per-point probe offsets (Hz). ``None`` uses
         ``grouped['offsets_hz']``.
     method : {'accurate', 'model', 'fast'}, optional
-        Phase-derivative estimator.  ``'accurate'`` / ``'model'`` fit a
-        quadratic phase-vs-offset model when at least three distinct offsets are
-        present, falling back to a line.  ``'fast'`` uses the extreme offsets
-        for the centre slope and the same quadratic curvature fallback.  The
-        default is ``'accurate'`` because repeated centre points such as
+        Phase-derivative estimator (``resonator.phase_derivatives``).
+        ``'accurate'`` / ``'model'`` (the same thing) fit a quadratic of phase
+        against offset, so every point counts; ``'fast'`` uses finite
+        differences of the lowest, central and highest offsets. The default is
+        ``'accurate'`` because repeated centre points such as
         ``[-1000, 0, +1000, 0]`` are common.
-    calibration : dict or None, optional
-        Per-tone ``{tone_index: ResonatorCalibration}``.  When supplied, raw IQ
-        is de-embedded/phase-centred before forming ``z_demod`` and each sample's
-        frequency/dissipation is computed with the calibrated Möbius inversion.
-        The known modulation offset is then subtracted so all points estimate
-        the centre-probe detuning.
+    calibration : dict or sequence or None, optional
+        Per-tone calibrations (``{tone_index: ResonatorCalibration}``, fits or a
+        calibration record; e.g. ``params_from_sweep(...)['calibration']``).
+        It chooses the *basis*: a calibrated tone is de-embedded and
+        circle-centred at each point's probe frequency, where the phase
+        derivatives are well conditioned; an uncalibrated one stays raw.
+    conversion : {'phase', 'linear', 'mobius'} or None, optional
+        The per-sample estimator. ``'phase'`` (the default for a calibrated
+        tone): centred phase and log-radius over the point's live phase slope
+        (``resonator.phase_shift_and_dissipation``). ``'linear'`` (the default
+        without a calibration, and the only option there): tangent/normal
+        projection on the point's live complex gradient, first-order in any
+        basis. ``'mobius'``: the calibration's exact inversion.
     reference_z : numpy.ndarray or None, optional
-        Optional static per-point reference response, shape ``(N, n_tones)``.
-        If omitted, the reference is the complex mean of this capture for each
-        point/tone in the selected basis (raw IQ, or centred IQ with
-        ``calibration``).  Passing an external reference gives an absolute
-        baseline; the default gives a capture-relative baseline.
+        Per-point reference response, ``(N, n_tones)``, in the working basis
+        (raw, or centred for a calibrated tone). Omitted, or NaN for a tone, the
+        reference is the capture mean of each point (settling excluded).
+        :func:`demodulate_stream` passes it to hold one reference across a
+        long recording. For a calibrated tone, ``resonance_frequency_hz`` is
+        the reference state's resonance -- from the calibration's inversion of
+        the reference centre point -- plus ``resonance_shift_hz``.
     data_dict : dict or None, optional
         Original parsed sample dict.  If supplied, output length is
         ``len(data_dict['modulation_point'])`` and raw per-sample metadata are
@@ -1180,38 +1218,34 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
     n_samples : int or None, optional
         Explicit output length when ``data_dict`` is not supplied.
     fill_settling : bool or {'raw', 'interpolate', 'none'}, optional
-        How to fill samples flagged with ``modulation_settling==1`` when they
-        were not retained by ``group_cycles`` or when their transient IQ should
-        be replaced. ``True`` / ``'raw'`` (default) demodulates the raw settling
-        IQ using the completed cycle's reference/slope (note: if the parsed
-        data does not carry the software readout flattening --
-        ``parse_samples`` now applies it by default; data parsed with
-        ``apply_readout_correction=False`` does not -- filled settling
-        samples can sit up to ~0.5 dB off at extreme probe offsets; they
-        remain flagged). ``'interpolate'`` fills
-        settling samples by linear interpolation between non-settling
-        demodulated samples, leaving flags intact. ``False`` / ``'none'`` leaves
-        dropped settling samples as NaN. Incomplete cycles and missing packets
-        remain NaN.
+        How to fill samples flagged with ``modulation_settling==1``. ``True`` /
+        ``'raw'`` (default) demodulates the raw settling I/Q with the completed
+        cycle's reference/slope; they remain flagged. ``'interpolate'`` fills
+        them by linear interpolation between non-settling demodulated samples.
+        ``False`` / ``'none'`` leaves them NaN. Incomplete cycles and missing
+        packets remain NaN.
     use_settling_for_fit : bool, optional
-        If ``False`` (default), samples flagged with ``modulation_settling==1``
-        are included in the output but excluded from the per-point reference,
-        phase-slope and curvature estimates. Set ``True`` only when the settling
-        flag is being used diagnostically rather than to mark transient samples.
+        If ``False`` (default), settling samples are excluded from the
+        per-point reference, phase-slope and curvature estimates.
     threshold_linewidths : float, optional
-        Calibrated ``needs_update`` threshold.  Ignored without calibration.
+        ``needs_update`` trips when ``|center_detuning_linewidths|`` exceeds
+        this.
 
     Returns
     -------
     dict
-        Sample-aligned arrays, usually shape ``(n_samples, n_tones)``:
-        ``z_demod``, ``mag``, ``phase_rad``, ``phase_unwrapped_rad``,
-        ``freq_shift_hz``, ``resonance_shift_hz``, ``dphi_df`` (local point
-        slope), ``center_dphi_df`` (cycle slope at zero/nearest-centre offset),
-        ``d2phi_df2``, ``modulation_offset_hz``, and ``dissipation``.  Without
-        calibration, ``dissipation`` is the same local linearized matched
-        quadrature used by the parsed-sample plotting path, with the modulation
-        points providing the local IQ gradient.  Metadata arrays ``cycle_index``,
+        Sample-aligned arrays, shape ``(n_samples, n_tones)``: ``z_demod``,
+        ``mag``, ``phase_rad``, ``phase_unwrapped_rad``, ``resonance_shift_hz``,
+        ``matched_dissipation_shift``, ``resonance_frequency_hz`` (calibrated
+        tones only; NaN otherwise), ``center_detuning_hz`` /
+        ``center_detuning_linewidths`` / ``needs_update`` (per cycle,
+        calibrated tones only, from the phase inflection), ``dphi_df`` (local
+        point slope), ``center_dphi_df``, ``d2phi_df2`` and
+        ``modulation_offset_hz``. Per tone: ``conversion`` and ``basis`` (lists),
+        ``point_reference_z``, ``point_gradient`` (mean ``dz/df`` per point),
+        ``reference_center_detuning_hz``,
+        ``reference_resonance_frequency_hz`` and
+        ``dissipation_reference_frequency_hz``. Metadata arrays ``cycle_index``,
         ``modulation_point``, ``modulation_settling``, ``sample_present``,
         ``sample_used_in_cycle`` and packet/telescope fields are included when
         available.
@@ -1251,6 +1285,7 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
             "fill_settling must be bool or one of "
             "'raw', 'interpolate', 'none'")
     fill_mode = fill_aliases[fill_mode]
+    kernel = 'fast' if method == 'fast' else 'fit'
 
     # Require the sample-retaining grouping (4-D z); mean-reduced data cannot
     # recover the per-sample stream this function rebuilds.
@@ -1276,9 +1311,9 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         raise ValueError(
             f'offsets must have shape {(N, n_tones)}, got {offsets.shape}')
 
-    freq_hz = grouped.get('freq_hz')
-    if freq_hz is not None:
-        freq_hz = np.asarray(freq_hz, dtype=float)
+    tone_frequency_hz = grouped.get('tone_frequency_hz')
+    if tone_frequency_hz is not None:
+        tone_frequency_hz = np.asarray(tone_frequency_hz, dtype=float)
 
     if data_dict is not None:
         n_samples_out = len(data_dict['modulation_point'])
@@ -1298,14 +1333,15 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         'mag': np.full(sample_shape, np.nan),
         'phase_rad': np.full(sample_shape, np.nan),
         'phase_unwrapped_rad': np.full(sample_shape, np.nan),
-        'freq_shift_hz': np.full(sample_shape, np.nan),
         'resonance_shift_hz': np.full(sample_shape, np.nan),
+        'matched_dissipation_shift': np.full(sample_shape, np.nan),
+        'resonance_frequency_hz': np.full(sample_shape, np.nan),
         'dphi_df': np.full(sample_shape, np.nan),
         'center_dphi_df': np.full(sample_shape, np.nan),
         'd2phi_df2': np.full(sample_shape, np.nan),
         'modulation_offset_hz': np.full(sample_shape, np.nan),
-        'dissipation': np.full(sample_shape, np.nan),
-        'detuning_linewidths': np.full(sample_shape, np.nan),
+        'center_detuning_hz': np.full(sample_shape, np.nan),
+        'center_detuning_linewidths': np.full(sample_shape, np.nan),
         'needs_update': np.zeros(sample_shape, dtype=bool),
         'sample_index': np.arange(n_samples_out, dtype=int),
         'cycle_index': np.full(n_samples_out, -1, dtype=int),
@@ -1470,10 +1506,15 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
                 f'reference_z must have shape {(N, n_tones)}, got {ref_input.shape}')
 
     point_reference_z = np.full((N, n_tones), np.nan + 1j * np.nan, dtype=complex)
+    point_gradient = np.full((N, n_tones), np.nan + 1j * np.nan, dtype=complex)
     center_reference_z = np.full(n_tones, np.nan + 1j * np.nan, dtype=complex)
     center_offset_hz = np.full(n_tones, np.nan)
     center_point_index = np.zeros(n_tones, dtype=int)
     dissipation_reference_frequency_hz = np.full(n_tones, np.nan)
+    reference_center_detuning = np.full(n_tones, np.nan)
+    reference_resonance = np.full(n_tones, np.nan)
+    conversions = [None] * n_tones
+    bases = ['raw'] * n_tones
 
     tone_frequencies_hz = None
     info = out.get('info')
@@ -1482,36 +1523,12 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         if isinstance(tones_info, dict) and tones_info.get('frequencies_hz') is not None:
             tone_frequencies_hz = np.asarray(tones_info.get('frequencies_hz'), dtype=float)
 
-    def _cal_for(t):
-        if calibration is None:
-            return None
-        if isinstance(calibration, dict):
-            cal = calibration.get(t)
-        else:
-            # A list/sequence of fits or calibrations. Match on the tone index
-            # each entry carries (as params_from_sweep does) so an unordered or
-            # partial batch fit maps correctly; fall back to positional order
-            # for entries without a tone_index (e.g. ResonatorCalibrations).
-            cal = None
-            for position, entry in enumerate(calibration):
-                if entry is None:
-                    continue
-                idx = int(getattr(entry, 'tone_index', -1))
-                idx = idx if idx >= 0 else position
-                if idx == t:
-                    cal = entry
-                    break
-        # Accept a raw FitResult and wrap it, so calibration=fits works directly.
-        if cal is not None and not hasattr(cal, 'transform_raw_iq'):
-            from .resonator import ResonatorCalibration
-            cal = ResonatorCalibration.from_fit(cal)
-        return cal
-
-    def _reference_frequency_hz(t, c_point):
+    def _center_frequency_hz(t, c_point):
+        """The modulation centre (Hz): the grouped probe frequency less its
+        offset, else the capture's recorded tone frequency."""
         candidates = []
-        if freq_hz is not None and freq_hz.shape == (N, n_tones):
-            candidates.append(freq_hz[c_point, t])
-            candidates.append(_nanmean_quiet(freq_hz[:, t]))
+        if tone_frequency_hz is not None and tone_frequency_hz.shape == (N, n_tones):
+            candidates.append(tone_frequency_hz[c_point, t] - offsets[c_point, t])
         if tone_frequencies_hz is not None and t < len(tone_frequencies_hz):
             candidates.append(tone_frequencies_hz[t])
         for candidate in candidates:
@@ -1524,30 +1541,33 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         return np.nan
 
     # Per tone: build the working basis, its per-point reference, the local
-    # phase slope/curvature, then turn every sample into a centre-probe estimate.
+    # phase slope/curvature, then turn every sample into a shift estimate.
     for t in range(n_tones):
         f = offsets[:, t]
         zt = z[:, :, :, t]
-        cal = _cal_for(t)
+        cal = _tone_calibration(calibration, t)
+        centred = cal is not None and tone_frequency_hz is not None
+        conv = _check_conversion(conversion, centred, t)
+        conversions[t] = conv
 
-        # Working basis: calibrated (de-embedded + phase-centred) when a
-        # calibration is supplied, otherwise the raw I/Q as captured.
-        if cal is not None and freq_hz is not None:
+        # Working basis: de-embedded and circle-centred at each point's probe
+        # frequency when calibrated, otherwise the raw I/Q as captured.
+        if centred:
+            bases[t] = 'centered_rotated'
             z_basis = np.full_like(zt, np.nan + 1j * np.nan, dtype=complex)
             for p in range(N):
-                z_basis[:, p, :] = cal.transform_raw_iq(freq_hz[p, t], zt[:, p, :])
+                z_basis[:, p, :] = to_basis(zt[:, p, :], cal, tone_frequency_hz[p, t])
         else:
             z_basis = zt
 
         # Per-point reference = external value, or the capture mean (settling
         # samples excluded), falling back to the all-sample mean where empty.
         z_fit_basis = np.where(fit_sample_mask, z_basis, np.nan + 1j * np.nan)
-        if ref_input is not None:
+        ref = _nanmean_quiet(z_fit_basis, axis=(0, 2))
+        ref_all = _nanmean_quiet(z_basis, axis=(0, 2))
+        ref = np.where(np.isfinite(ref), ref, ref_all)
+        if ref_input is not None and np.all(np.isfinite(ref_input[:, t])):
             ref = ref_input[:, t]
-        else:
-            ref = _nanmean_quiet(z_fit_basis, axis=(0, 2))
-            ref_all = _nanmean_quiet(z_basis, axis=(0, 2))
-            ref = np.where(np.isfinite(ref), ref, ref_all)
         point_reference_z[:, t] = ref
 
         # Locate the centre probe point (a zero offset, else the nearest one).
@@ -1563,86 +1583,44 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         center_reference_z[t] = ref_center
         center_offset_hz[t] = c_offset
         center_point_index[t] = c_point
-        ref_freq_hz = _reference_frequency_hz(t, c_point)
-        dissipation_reference_frequency_hz[t] = ref_freq_hz
+        center_hz = _center_frequency_hz(t, c_point)
+        dissipation_reference_frequency_hz[t] = center_hz
 
-        # Per-cycle phase-vs-offset curve -> centre slope, local slope at each
-        # point, and curvature. 'fast' takes the slope from the extreme offsets;
-        # otherwise a quadratic (>=3 distinct offsets) / linear fit is used.
+        # Per-cycle phase slope and curvature at the centre, and the local
+        # slope and complex gradient at every point, from the point means.
         point_z = _nanmean_quiet(z_fit_basis, axis=2)      # (n_cycles, N)
         point_z_all = _nanmean_quiet(z_basis, axis=2)
         point_z = np.where(np.isfinite(point_z), point_z, point_z_all)
-        order = np.argsort(f)
-        f_fit = f[order]
-        phi_fit = np.unwrap(np.angle(point_z[:, order]), axis=1)
-        n_unique = len(np.unique(f_fit))
-
-        slope_center = np.full(n_cycles, np.nan)
-        curvature = np.full(n_cycles, np.nan)
-        local_slope = np.full((n_cycles, N), np.nan)
-        complex_gradient = np.full((n_cycles, N), np.nan + 1j * np.nan, dtype=complex)
-
-        if n_unique >= 2:
-            if method == 'fast':
-                lo = int(order[0])
-                hi = int(order[-1])
-                df_span = f[hi] - f[lo]
-                if df_span != 0:
-                    phi_span = _wrap_phase(np.angle(point_z[:, hi])
-                                           - np.angle(point_z[:, lo]))
-                    slope_center = phi_span / df_span
-
-            deg = 2 if n_unique >= 3 else 1
-            coeff = np.polyfit(f_fit, phi_fit.T, deg)
-            z_coeff = np.polyfit(f_fit, point_z[:, order].T, deg)
-            if deg == 1:
-                fit_slope = coeff[0]
-                fit_curv = np.full(n_cycles, np.nan)
-                complex_gradient[:, :] = z_coeff[0][:, None]
-            else:
-                fit_slope = 2.0 * coeff[0] * c_offset + coeff[1]
-                fit_curv = 2.0 * coeff[0]
-
-            if method != 'fast':
-                slope_center = fit_slope
-            if deg == 2:
-                curvature = fit_curv
-                for p in range(N):
-                    local_slope[:, p] = 2.0 * coeff[0] * f[p] + coeff[1]
-                    complex_gradient[:, p] = 2.0 * z_coeff[0] * f[p] + z_coeff[1]
-            else:
-                local_slope[:, :] = fit_slope[:, None]
+        derivatives = phase_derivatives(point_z[:, :, None], f[:, None],
+                                        method=kernel, per_point=True)
+        slope_center = derivatives['dphi_df'][:, 0]
+        curvature = derivatives['d2phi_df2'][:, 0]
+        local_slope = derivatives['local_dphi_df'][:, :, 0]
         local_slope = np.where(np.isfinite(local_slope), local_slope, slope_center[:, None])
+        gradient = derivatives['dz_df'][:, :, 0]
+        point_gradient[:, t] = _nanmean_quiet(gradient, axis=0)
+
+        # Where the resonance is: the curvature/slope detuning of each cycle,
+        # meaningful on the centred phase only.
+        if centred:
+            linewidth = cal.fr / cal.Ql
+            center_lw = detuning_from_derivatives(slope_center, curvature)
+        else:
+            linewidth = np.nan
+            center_lw = np.full(n_cycles, np.nan)
+        if centred:
+            reference_resonance[t] = _reference_resonance_hz(
+                cal, ref_center, center_hz + c_offset)
+            reference_center_detuning[t] = reference_resonance[t] - center_hz
 
         # z_demod: rotate/scale every sample onto the centre-point reference, so
         # each probe point reads as if measured at the centre.
         with np.errstate(divide='ignore', invalid='ignore'):
             z_demod_group = z_basis / ref[None, :, None] * ref_center
 
-        # Frequency + dissipation. Calibrated: the Mobius inversion gives the
-        # probe detuning directly (subtract the known offset for centre detuning).
-        if cal is not None and freq_hz is not None:
-            df_probe, diss = cal.convert_centered_iq(z_basis)
-            freq_group = df_probe - f[None, :, None]
-            diss_group = diss
-            lw_t = cal.fr / cal.Ql
-            with np.errstate(divide='ignore', invalid='ignore'):
-                det_lw_group = freq_group / lw_t
-            needs_update_group = np.abs(det_lw_group) > threshold_linewidths
-        else:
-            # Model-free: detuning from the phase residual / local slope, and
-            # dissipation from the linearized tangent/normal IQ projection.
-            phase_resid = _wrap_phase(
-                np.angle(z_basis) - np.angle(ref)[None, :, None])
-            with np.errstate(divide='ignore', invalid='ignore'):
-                freq_group = phase_resid / local_slope[:, :, None]
-            _, diss_group = _linearized_iq_projection(
-                ref[None, :, None],
-                complex_gradient[:, :, None],
-                z_basis,
-                reference_frequency_hz=ref_freq_hz)
-            det_lw_group = np.full_like(freq_group, np.nan, dtype=float)
-            needs_update_group = np.zeros(freq_group.shape, dtype=bool)
+        shift_group, dissipation_group = _convert_points(
+            conv, cal, z_basis, ref[None, :, None], local_slope[:, :, None],
+            gradient[:, :, None], center_hz)
 
         # Scatter this tone's grouped per-sample results onto the output grid.
         valid = meta_valid & np.isfinite(z_basis)
@@ -1651,20 +1629,24 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
 
         idx = sample_index[valid]
         out['z_demod'][idx, t] = z_demod_group[valid]
-        out['freq_shift_hz'][idx, t] = freq_group[valid]
-        out['resonance_shift_hz'][idx, t] = -freq_group[valid]
-        out['dissipation'][idx, t] = diss_group[valid]
-        out['detuning_linewidths'][idx, t] = det_lw_group[valid]
-        out['needs_update'][idx, t] = needs_update_group[valid]
+        out['resonance_shift_hz'][idx, t] = shift_group[valid]
+        out['matched_dissipation_shift'][idx, t] = dissipation_group[valid]
+        out['resonance_frequency_hz'][idx, t] = (
+            reference_resonance[t] + shift_group[valid] if centred else np.nan)
 
         offset_grid = np.broadcast_to(f[None, :, None], sample_index.shape)
         local_grid = np.broadcast_to(local_slope[:, :, None], sample_index.shape)
         center_grid = np.broadcast_to(slope_center[:, None, None], sample_index.shape)
         curv_grid = np.broadcast_to(curvature[:, None, None], sample_index.shape)
+        lw_grid = np.broadcast_to(center_lw[:, None, None], sample_index.shape)
         out['modulation_offset_hz'][idx, t] = offset_grid[valid]
         out['dphi_df'][idx, t] = local_grid[valid]
         out['center_dphi_df'][idx, t] = center_grid[valid]
         out['d2phi_df2'][idx, t] = curv_grid[valid]
+        out['center_detuning_linewidths'][idx, t] = lw_grid[valid]
+        out['center_detuning_hz'][idx, t] = lw_grid[valid] * linewidth
+        with np.errstate(invalid='ignore'):
+            out['needs_update'][idx, t] = np.abs(lw_grid[valid]) > threshold_linewidths
 
         # 'raw' fill: demodulate the dropped samples (those not retained in a
         # cycle) using their owning cycle's reference and slope, computed above.
@@ -1681,8 +1663,8 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
                 sample_idx = np.flatnonzero(sample_mask)
                 cycle_idx = raw_cycle_index[sample_idx]
                 raw_values = raw_z[sample_idx, t]
-                if cal is not None and freq_hz is not None:
-                    sample_basis = cal.transform_raw_iq(freq_hz[p, t], raw_values)
+                if centred:
+                    sample_basis = to_basis(raw_values, cal, tone_frequency_hz[p, t])
                 else:
                     sample_basis = raw_values
                 finite = np.isfinite(sample_basis)
@@ -1694,34 +1676,22 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
 
                 with np.errstate(divide='ignore', invalid='ignore'):
                     out['z_demod'][sample_idx, t] = sample_basis / ref[p] * ref_center
-
-                if cal is not None and freq_hz is not None:
-                    df_probe, diss = cal.convert_centered_iq(sample_basis)
-                    freq_sample = df_probe - f[p]
-                    out['dissipation'][sample_idx, t] = diss
-                    lw_t = cal.fr / cal.Ql
-                    with np.errstate(divide='ignore', invalid='ignore'):
-                        det_lw = freq_sample / lw_t
-                    out['detuning_linewidths'][sample_idx, t] = det_lw
-                    out['needs_update'][sample_idx, t] = (
-                        np.abs(det_lw) > threshold_linewidths)
-                else:
-                    phase_resid = _wrap_phase(np.angle(sample_basis) - np.angle(ref[p]))
-                    with np.errstate(divide='ignore', invalid='ignore'):
-                        freq_sample = phase_resid / local_slope[cycle_idx, p]
-                    _, diss = _linearized_iq_projection(
-                        ref[p],
-                        complex_gradient[cycle_idx, p],
-                        sample_basis,
-                        reference_frequency_hz=ref_freq_hz)
-                    out['dissipation'][sample_idx, t] = diss
-
-                out['freq_shift_hz'][sample_idx, t] = freq_sample
-                out['resonance_shift_hz'][sample_idx, t] = -freq_sample
+                shift, dissipation = _convert_points(
+                    conv, cal, sample_basis, ref[p], local_slope[cycle_idx, p],
+                    gradient[cycle_idx, p], center_hz)
+                out['resonance_shift_hz'][sample_idx, t] = shift
+                out['matched_dissipation_shift'][sample_idx, t] = dissipation
+                if centred:
+                    out['resonance_frequency_hz'][sample_idx, t] = reference_resonance[t] + shift
                 out['modulation_offset_hz'][sample_idx, t] = f[p]
                 out['dphi_df'][sample_idx, t] = local_slope[cycle_idx, p]
                 out['center_dphi_df'][sample_idx, t] = slope_center[cycle_idx]
                 out['d2phi_df2'][sample_idx, t] = curvature[cycle_idx]
+                out['center_detuning_linewidths'][sample_idx, t] = center_lw[cycle_idx]
+                out['center_detuning_hz'][sample_idx, t] = center_lw[cycle_idx] * linewidth
+                with np.errstate(invalid='ignore'):
+                    out['needs_update'][sample_idx, t] = (
+                        np.abs(center_lw[cycle_idx]) > threshold_linewidths)
 
     # 'interpolate' fill: bridge settling-sample gaps by linear interpolation
     # between the surrounding non-settling demodulated samples (flags untouched).
@@ -1739,19 +1709,21 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
             + 1j * _interp_nan_targets(out['z_demod'].imag, settling_targets, source)
         )
         for key in (
-                'freq_shift_hz',
                 'resonance_shift_hz',
+                'matched_dissipation_shift',
+                'resonance_frequency_hz',
                 'dphi_df',
                 'center_dphi_df',
                 'd2phi_df2',
-                'dissipation',
-                'detuning_linewidths'):
+                'center_detuning_hz',
+                'center_detuning_linewidths'):
             out[key] = _interp_nan_targets(out[key], settling_targets, source)
-        out['needs_update'][settling_targets] = (
-            np.abs(out['detuning_linewidths'][settling_targets])
-            > threshold_linewidths)
+        with np.errstate(invalid='ignore'):
+            out['needs_update'][settling_targets] = (
+                np.abs(out['center_detuning_linewidths'][settling_targets])
+                > threshold_linewidths)
 
-    # Derived magnitude/phase plus parsed-sample-compatible aliases so the result
+    # Derived magnitude/phase plus parsed-sample-compatible I/Q so the result
     # drops into the same plotting/analysis paths as a normal timestream.
     out['mag'] = np.abs(out['z_demod'])
     out['phase_rad'] = np.angle(out['z_demod'])
@@ -1764,101 +1736,99 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         f'{t:04d}': out['z_demod'][:, t].imag
         for t in range(n_tones)
     }
-    out['frequency_hz'] = out['resonance_shift_hz']
-    out['frequency_shift_hz'] = out['resonance_shift_hz']
-    out['probe_frequency_shift_hz'] = out['freq_shift_hz']
     out['modulation_demodulated'] = True
+    out['conversion'] = conversions
+    out['basis'] = bases
     out['point_reference_z'] = point_reference_z
+    out['point_gradient'] = point_gradient
     out['center_reference_z'] = center_reference_z
     out['point_reference_phase_rad'] = np.angle(point_reference_z)
     out['center_reference_phase_rad'] = np.angle(center_reference_z)
     out['center_offset_hz'] = center_offset_hz
     out['center_point_index'] = center_point_index
+    out['reference_center_detuning_hz'] = reference_center_detuning
+    out['reference_resonance_frequency_hz'] = reference_resonance
     out['dissipation_reference_frequency_hz'] = dissipation_reference_frequency_hz
     return out
 
 
 def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
-               calibration=None, phase_baseline=None, threshold_linewidths=0.1):
+               calibration=None, conversion=None, phase_baseline=None,
+               threshold_linewidths=0.1):
     """
     Demodulate grouped modulation cycles into per-tone, per-cycle quantities.
 
-    Two bases are supported:
+    Each cycle's probe points give the phase slope ``dphi/df`` and curvature
+    ``d2phi/df2`` at the centre (``resonator.phase_derivatives``), and from
+    them the **centre detuning**: the resonance minus the modulation centre,
+    measured from the phase inflection (``d2phi/df2 = 0``, the steepest
+    point) as ``phi'' / (2 phi' |phi'|)`` linewidths
+    (``resonator.detuning_from_derivatives``), exact for the centred notch
+    phase ``-2 atan(2x)``. For a linear notch the inflection is ``fr``; for a
+    driven one it is ``resonator.operating_point_hz``, which
+    :func:`params_from_sweep` centres on. The centre point's I/Q gives the
+    resonance shift and dissipation of each cycle.
 
-    - **Model-free** (no ``calibration``): work on the raw I/Q phase. The local
-      phase slope, curvature and frequency shift are estimated directly.
-      Detuning/`needs_update` then require ``linewidth_hz``, and dissipation is
-      unavailable (NaN). The raw phase is taken about the origin, not the
-      resonance-circle centre, so the detuning reads 13x to 25x high near
-      resonance (worse for very shallow dips). Only its sign and zero are
-      meaningful.
-    - **Calibrated / centred** (``calibration`` supplied): each probe point is
-      de-embedded (cable delay removed at its absolute frequency) and
-      phase-centred using a per-tone
-      :class:`souk_readout_tools.resonator.ResonatorCalibration` (from
-      :func:`params_from_sweep`). In this basis the phase is well conditioned,
-      and the **exact Möbius inversion** yields the absolute frequency shift
-      ``f_probe - f_r`` and
-      matched-scale ``Delta(1 / (2 * Qi))`` dissipation quadrature (no
-      linewidth argument needed — the calibration carries ``fr``/``Ql``).
-      For the fitted Duffing model, an
-      analytic inverse maps the recovered circle coordinate back to probe
-      detuning. Resonator detuning relative to the probe has the opposite sign.
-      This is the recommended basis.
+    Two bases:
 
-    In both bases ``detuning_*`` is measured from the phase inflection
-    (``d2phi/df2 = 0``, the steepest point) as
-    ``x = -d2phi_df2 / (2 dphi_df |dphi_df|)`` linewidths, the exact inverse of
-    the centred notch phase ``-2 atan(2x)``; the linewidth only converts it to
-    Hz. For a linear notch the
-    inflection is ``fr``; for a driven one it is the max-SNR operating point
-    :func:`params_from_sweep` centres on, not ``fr``.
+    - **Calibrated / centred** (``calibration`` supplied, the recommended
+      one): each probe point is de-embedded (cable delay removed at its
+      absolute frequency) and circle-centred, where the phase is well
+      conditioned and the detuning needs no linewidth; the calibration's
+      ``fr / Ql`` only converts it to Hz.
+    - **Raw** (no ``calibration``): the phase about the origin, not the circle
+      centre, reads the detuning 13x to 25x high near resonance (worse for
+      very shallow dips): only its sign and rough zero mean anything, so it
+      needs an explicit ``linewidth_hz`` as an opt-in, else NaN. The resonance
+      shift and dissipation still come out right to first order, from the
+      tangent/normal projection on the live I/Q gradient.
 
     Parameters
     ----------
     grouped : dict
         Output of :func:`group_cycles` (uses ``z``; ``offsets_hz`` /
-        ``freq_hz`` / ``revision``). ``z`` may be ``(n_cycles, N, n_tones)``
-        (mean-reduced) or ``(n_cycles, N, n_used, n_tones)`` (the sample axis is
-        averaged here).
+        ``tone_frequency_hz`` / ``revision``). ``z`` may be
+        ``(n_cycles, N, n_tones)`` (mean-reduced) or
+        ``(n_cycles, N, n_used, n_tones)`` (the sample axis is averaged here).
     offsets : numpy.ndarray or None, optional
         ``(N, n_tones)`` per-point probe offsets (Hz). ``None`` uses
         ``grouped['offsets_hz']``.
     method : {'fast', 'accurate', 'model'}, optional
         Slope/curvature estimator. ``'fast'`` = finite differences between the
         lowest, most central and highest offsets (points sharing an offset are
-        averaged; any slot order); ``'accurate'`` = (weighted) polynomial fit
-        of phase vs offset (handles
-        asymmetric offsets); ``'model'`` shares the ``'accurate'`` path here.
+        averaged coherently; any slot order) -- the tracker's; ``'accurate'``
+        (= ``'model'``) = quadratic fit of phase against offset.
     linewidth_hz : float or array-like or None, optional
-        Per-tone resonator linewidth (Hz) for the *model-free* detuning. Ignored
-        when a ``calibration`` is given (the calibration supplies it). Without
-        either, model-free ``detuning_*`` / ``needs_update`` are NaN/False.
+        Per-tone linewidth (Hz) for the *raw-basis* detuning. Ignored when a
+        ``calibration`` is given (it supplies ``fr / Ql``).
     calibration : dict or None, optional
-        Per-tone ``{tone_index: ResonatorCalibration}`` (e.g.
-        ``params_from_sweep(..., deembed=True)['calibration']``). Enables the
-        calibrated/centred basis with exact linear-notch frequency shift and
-        matched-scale dissipation.
+        Per-tone calibrations (``{tone_index: ResonatorCalibration}``, fits or a
+        record; e.g. ``params_from_sweep(...)['calibration']``): chooses the
+        centred basis.
+    conversion : {'phase', 'linear', 'mobius'} or None, optional
+        Per-cycle shift/dissipation estimator; see
+        :func:`demodulate_timestream`. Default ``'phase'`` when calibrated,
+        else ``'linear'``.
     phase_baseline : array-like or None, optional
-        Per-tone reference phase (rad) for the *model-free* frequency-shift
-        conversion; ``None`` uses each tone's mean centre-point phase.
+        Per-tone reference phase (rad) of the centre point, in the working
+        basis; ``None`` uses the mean centre point over the cycles.
     threshold_linewidths : float, optional
-        ``needs_update`` trips when ``|detuning_linewidths|`` exceeds this
-        (default 0.1).
+        ``needs_update`` trips when ``|center_detuning_linewidths|`` exceeds
+        this (default 0.1).
 
     Returns
     -------
     dict
-        Per-tone, per-cycle arrays of shape ``(n_cycles, n_tones)`` unless noted:
-        ``z_center``, ``dphi_df``, ``d2phi_df2``, ``freq_shift_hz``,
-        ``detuning_linewidths``, ``detuning_hz``, ``needs_update`` (bool),
-        ``dissipation``; plus ``revision`` ``(n_cycles,)`` and cycle-aligned
-        metadata copied from :func:`group_cycles` when available:
-        ``packet_counter``, ``telescope_time``, ``packet_error``,
-        ``packet_missing``, ``sample_index``, ``stream_flags``. In the
-        calibrated basis ``freq_shift_hz`` is the centre tone's probe detuning
-        ``f_probe - f_r`` (Hz) and ``dissipation`` is ``Delta(1 / (2 * Qi))``;
-        ``detuning_*`` is from the phase inflection in either basis.
+        Per-tone, per-cycle arrays of shape ``(n_cycles, n_tones)``:
+        ``z_center_point`` (the centre point's raw I/Q), ``dphi_df``,
+        ``d2phi_df2``, ``center_detuning_linewidths``, ``center_detuning_hz``,
+        ``needs_update`` (bool), ``resonance_shift_hz`` and
+        ``matched_dissipation_shift`` (relative to the mean cycle), and
+        ``resonance_frequency_hz`` (calibrated tones only); plus ``revision``
+        ``(n_cycles,)`` and cycle-aligned metadata copied from
+        :func:`group_cycles` when available: ``packet_counter``,
+        ``telescope_time``, ``packet_error``, ``packet_missing``,
+        ``sample_index``, ``stream_flags``.
     """
     z = np.asarray(grouped['z'])
     if z.ndim == 4:                      # (n_cycles, N, n_used, n_tones) -> average dwell
@@ -1866,24 +1836,28 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
     if z.ndim != 3:
         raise ValueError(f'grouped["z"] must be 3D or 4D, got {z.ndim}D')
     n_cycles, N, n_tones = z.shape
+    kernel = 'fast' if method == 'fast' else 'fit'
 
     if offsets is None:
         offsets = grouped['offsets_hz']
-    offsets = np.asarray(offsets, dtype=float)
-    freq_hz = grouped.get('freq_hz')           # absolute probe freqs (for de-embedding)
+    offsets = np.broadcast_to(np.asarray(offsets, dtype=float).reshape(N, -1),
+                              (N, n_tones))
+    tone_frequency_hz = grouped.get('tone_frequency_hz')   # absolute probe freqs
 
     lw = None if linewidth_hz is None else np.broadcast_to(
         np.asarray(linewidth_hz, dtype=float), (n_tones,))
 
+    shape = (n_cycles, n_tones)
     out = {
-        'z_center': np.zeros((n_cycles, n_tones), dtype=complex),
-        'dphi_df': np.full((n_cycles, n_tones), np.nan),
-        'd2phi_df2': np.full((n_cycles, n_tones), np.nan),
-        'freq_shift_hz': np.full((n_cycles, n_tones), np.nan),
-        'detuning_linewidths': np.full((n_cycles, n_tones), np.nan),
-        'detuning_hz': np.full((n_cycles, n_tones), np.nan),
-        'needs_update': np.zeros((n_cycles, n_tones), dtype=bool),
-        'dissipation': np.full((n_cycles, n_tones), np.nan),
+        'z_center_point': np.zeros(shape, dtype=complex),
+        'dphi_df': np.full(shape, np.nan),
+        'd2phi_df2': np.full(shape, np.nan),
+        'resonance_shift_hz': np.full(shape, np.nan),
+        'matched_dissipation_shift': np.full(shape, np.nan),
+        'resonance_frequency_hz': np.full(shape, np.nan),
+        'center_detuning_linewidths': np.full(shape, np.nan),
+        'center_detuning_hz': np.full(shape, np.nan),
+        'needs_update': np.zeros(shape, dtype=bool),
         'revision': np.asarray(grouped.get('revision', np.zeros(n_cycles)), dtype=int),
     }
     passthrough = {
@@ -1903,114 +1877,468 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
     if n_cycles == 0:
         return out
 
-    def _cal_for(t):
-        if calibration is None:
-            return None
-        if isinstance(calibration, dict):
-            cal = calibration.get(t)
-        else:
-            # A list/sequence of fits or calibrations. Match on the tone index
-            # each entry carries (as params_from_sweep does) so an unordered or
-            # partial batch fit maps correctly; fall back to positional order
-            # for entries without a tone_index (e.g. ResonatorCalibrations).
-            cal = None
-            for position, entry in enumerate(calibration):
-                if entry is None:
-                    continue
-                idx = int(getattr(entry, 'tone_index', -1))
-                idx = idx if idx >= 0 else position
-                if idx == t:
-                    cal = entry
-                    break
-        # Accept a raw FitResult and wrap it, so calibration=fits works directly.
-        if cal is not None and not hasattr(cal, 'transform_raw_iq'):
-            from .resonator import ResonatorCalibration
-            cal = ResonatorCalibration.from_fit(cal)
-        return cal
-
     for t in range(n_tones):
-        f = offsets[:, t]                       # (N,) probe offsets for this tone
+        f = offsets[:, t]                        # (N,) probe offsets for this tone
         zt = z[:, :, t]                          # (n_cycles, N)
         ci = int(np.argmin(np.abs(f)))           # the point nearest the centre
-        out['z_center'][:, t] = zt[:, ci]
+        out['z_center_point'][:, t] = zt[:, ci]
 
-        cal = _cal_for(t)
-        if cal is not None and freq_hz is not None:
-            # Calibrated basis: de-embed + phase-centre, then phase is well
-            # conditioned and the Mobius inversion gives df / dissipation.
-            zc = cal.transform_raw_iq(freq_hz[:, t], zt)     # (n_cycles, N), centred
-            phi = np.unwrap(np.angle(zc), axis=1)
-            df_pts, dd_pts = cal.convert_centered_iq(zc)      # (n_cycles, N) each
-            lw_t = cal.fr / cal.Ql                            # linewidth (Hz) from the fit
-            # Calibrated: freq_shift is the ABSOLUTE detuning of the centre probe
-            # from the fitted fr. Detuning (below) is from the phase inflection.
-            out['freq_shift_hz'][:, t] = df_pts[:, ci]
-            out['dissipation'][:, t] = dd_pts[:, ci]
+        cal = _tone_calibration(calibration, t)
+        centred = cal is not None and tone_frequency_hz is not None
+        conv = _check_conversion(conversion, centred, t)
+        if centred:
+            # Calibrated basis: de-embed + circle-centre each point at its own
+            # probe frequency; the phase is then well conditioned.
+            probe = np.asarray(tone_frequency_hz, dtype=float)[:, t]
+            zb = to_basis(zt, cal, probe[None, :])          # (n_cycles, N)
+            linewidth = cal.fr / cal.Ql
+            center_hz = probe[ci] - f[ci]
         else:
-            # Model-free basis: raw I/Q phase.
-            phi = np.unwrap(np.angle(zt), axis=1)
-            lw_t = None if lw is None else lw[t]
+            zb = zt
+            linewidth = np.nan if lw is None else lw[t]
+            center_hz = np.nan
+            if tone_frequency_hz is not None:
+                center_hz = float(np.asarray(tone_frequency_hz, dtype=float)[ci, t] - f[ci])
 
-        # Local slope / curvature from the chosen phase basis.
-        if method == 'fast':
-            # Finite differences between the lowest, most central and highest
-            # OFFSETS (averaging points that share one), not the first, middle
-            # and last slots: the fw default [-d, 0, +d, 0] is neither sorted
-            # nor unrepeated, and the slot version read it as ~+37 linewidths
-            # at any detuning.
-            f_lo, f_hi = f.min(), f.max()
-            f_mid = f[int(np.argmin(np.abs(f - 0.5 * (f_lo + f_hi))))]
-            phi_lo = phi[:, f == f_lo].mean(axis=1)
-            phi_mid = phi[:, f == f_mid].mean(axis=1)
-            phi_hi = phi[:, f == f_hi].mean(axis=1)
-            nan = np.full(n_cycles, np.nan)
-            slope = (phi_hi - phi_lo) / (f_hi - f_lo) if f_hi > f_lo else nan
-            if f_lo < f_mid < f_hi:
-                # Three-point second difference; for a symmetric pattern it is
-                # (phi_hi - 2 phi_mid + phi_lo) / half**2.
-                d2 = 2.0 * ((phi_hi - phi_mid) / (f_hi - f_mid)
-                            - (phi_mid - phi_lo) / (f_mid - f_lo)) / (f_hi - f_lo)
-            else:
-                d2 = nan
-        else:   # 'accurate' / 'model' -> polynomial fits of phi vs f
-            slope = np.full(n_cycles, np.nan)
-            d2 = np.full(n_cycles, np.nan)
-            if N >= 2:
-                slope = np.polyfit(f, phi.T, 1)[0]           # (n_cycles,)
-            if N >= 3:
-                d2 = 2.0 * np.polyfit(f, phi.T, 2)[0]
-
+        derivatives = phase_derivatives(zb[:, :, None], f[:, None], method=kernel,
+                                        per_point=True)
+        slope = derivatives['dphi_df'][:, 0]
+        curvature = derivatives['d2phi_df2'][:, 0]
         out['dphi_df'][:, t] = slope
-        out['d2phi_df2'][:, t] = d2
+        out['d2phi_df2'][:, t] = curvature
 
-        if cal is None or freq_hz is None:
-            # Model-free: no de-embedding, so the raw phase has an unknown offset
-            # (cable delay, electronics, the unknown true fr) and we cannot read an
-            # absolute frequency directly.
-            # freq_shift_hz is RELATIVE motion: the centre-point phase referenced
-            # to a baseline (mean over cycles, or supplied), divided by the local
-            # slope. It tracks how the resonance moves, NOT where it sits.
-            phase_reference = (np.mean(phi[:, ci]) if phase_baseline is None
-                               else np.asarray(phase_baseline, dtype=float)[t])
-            with np.errstate(divide='ignore', invalid='ignore'):
-                out['freq_shift_hz'][:, t] = (phi[:, ci] - phase_reference) / slope
+        # The detuning from the phase inflection: on the centred phase for a
+        # calibrated tone; on the raw phase only with an explicit linewidth.
+        if N >= 3 and np.isfinite(linewidth):
+            center_lw = detuning_from_derivatives(slope, curvature)
+            out['center_detuning_linewidths'][:, t] = center_lw
+            out['center_detuning_hz'][:, t] = center_lw * linewidth
+            with np.errstate(invalid='ignore'):
+                out['needs_update'][:, t] = np.abs(center_lw) > threshold_linewidths
 
-        # Detuning from the phase inflection: d2phi/df2 crosses zero there
-        # whatever the phase offset. On the circle-centred phase a notch is
-        # exactly -2 atan(2x), which inverts to x = -phi'' / (2 phi' |phi'|) --
-        # linewidths from slope and curvature alone; lw only converts to Hz.
-        # The raw phase is taken about the origin, not the circle centre, and
-        # reads 13x to 25x high near resonance (worse for very shallow dips):
-        # only its sign and zero mean anything, so it needs an explicit
-        # linewidth_hz as an opt-in.
-        if lw_t is not None and N >= 3:
-            with np.errstate(divide='ignore', invalid='ignore'):
-                detuning_linewidths = -d2 / (2.0 * slope * np.abs(slope))
-            out['detuning_linewidths'][:, t] = detuning_linewidths
-            out['detuning_hz'][:, t] = detuning_linewidths * lw_t
-            out['needs_update'][:, t] = np.abs(detuning_linewidths) > threshold_linewidths
+        # The centre point's shift and dissipation about the mean cycle (or
+        # the supplied baseline phase).
+        reference = _nanmean_quiet(zb[:, ci])
+        if phase_baseline is not None:
+            reference = np.abs(reference) * np.exp(
+                1j * np.asarray(phase_baseline, dtype=float)[t])
+        local_slope = derivatives['local_dphi_df'][:, ci, 0]
+        local_slope = np.where(np.isfinite(local_slope), local_slope, slope)
+        shift, dissipation = _convert_points(
+            conv, cal, zb[:, ci], reference, local_slope,
+            derivatives['dz_df'][:, ci, 0], center_hz)
+        out['resonance_shift_hz'][:, t] = shift
+        out['matched_dissipation_shift'][:, t] = dissipation
+        if centred:
+            out['resonance_frequency_hz'][:, t] = shift + _reference_resonance_hz(
+                cal, reference, center_hz + f[ci])
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Long recordings: demodulate across modulation revisions
+# ---------------------------------------------------------------------------
+
+# Per-cycle fields held across each cycle's samples (and spectra at the cycle
+# rate, not the sample rate).
+CYCLE_FIELDS = ('center_detuning_hz', 'center_detuning_linewidths', 'dphi_df',
+                'd2phi_df2', 'curvature_over_slope')
+
+
+class StreamDemodulator:
+    """Demodulate a modulated stream across its revisions, on one reference.
+
+    Tracking commits and recentres change the modulation state mid-stream;
+    each change is a revision stamped into every frame and announced by a
+    ``TONE_UPDATE`` record. This splits the stream at those revisions,
+    demodulates each piece with its own state (offsets, readout-correction
+    factors) and joins them onto **one physical reference**, so a probe move
+    never looks like a resonator move:
+
+    - a calibrated tone is joined through its absolute resonance frequency,
+      ``f_res = f_centre + d_centre`` (the reconstruction identity), with the
+      centre detuning of each revision's reference from the calibration's
+      inversion (exact, unlike the finite-difference detuning);
+    - an uncalibrated tone carries its per-point reference I/Q across each
+      move along the measured I/Q gradient (first order in the move, which
+      tracking keeps small).
+
+    The first usable per-point reference of each revision is held fixed, so
+    repeated calls on a rolling buffer (the live viewer) stay consistent. Keep
+    one instance for one stream. :func:`demodulate_stream` is the one-shot
+    form for a saved recording.
+    """
+
+    def __init__(self, method='fast', settling='none', linewidth_hz=None,
+                 calibration=None, conversion=None):
+        if method not in ('fast', 'accurate'):
+            raise ValueError('demod_method must be fast or accurate')
+        if settling not in ('none', 'raw'):
+            raise ValueError('settling must be none or raw')
+        if linewidth_hz is not None and (
+                not np.all(np.isfinite(linewidth_hz)) or np.any(np.asarray(linewidth_hz) <= 0)):
+            raise ValueError('linewidth_hz must be positive and finite')
+        self.method = method
+        self.settling = settling
+        self.linewidth_hz = linewidth_hz
+        self.calibration = calibration
+        self.conversion = conversion
+        self.revision = None
+        self.signature = None
+        # Per epoch and tone: (reference_z (N,), gradient (N,), probe Hz (N,)).
+        self._epoch_references = {}
+        self._last_reference = {}           # tone -> the latest epoch's entry
+        self._baseline_resonance = {}       # tone -> f_res of the first reference
+
+    @property
+    def references(self):
+        """The latest per-point reference I/Q of each tone (working basis)."""
+        return {tone: entry[0] for tone, entry in self._last_reference.items()}
+
+    def __call__(self, samples, tones=None):
+        if samples.get('modulation_demodulated'):
+            return samples
+        # The calibration given, else the one the stream carries.
+        source_calibration = (self.calibration if self.calibration is not None
+                              else calibration_from_data(samples))
+        keys = sorted(map(int, samples['i_data'])) if tones is None else sorted(set(tones))
+        if not keys:
+            raise ValueError('Select at least one tone for demodulation')
+        n = int(samples['num_samples'])
+        sample_index = np.asarray(samples.get('sample_index', np.arange(n)), dtype=np.int64)
+        revision = np.asarray(samples['modulation_revision'], dtype=int)
+        points = np.asarray(samples['modulation_point'], dtype=int)
+        initial = active_modulation_state(samples.get('info'))
+        events = []
+        if initial is not None:
+            initial_rev = initial.get('applied_revision', initial.get('revision'))
+            if initial_rev is None:
+                active_revs = revision[points > 0]
+                initial_rev = int(active_revs[0]) if len(active_revs) else None
+            events.append((-(1 << 62), None if initial_rev is None else
+                           int(initial_rev) & 0x7fff, initial,
+                           ('initial', initial_rev, repr(initial))))
+        for record in samples.get('tone_updates', ()):
+            payload = record.get('payload', {})
+            if payload.get('type') not in ('SNAPSHOT', 'TONE_UPDATE'):
+                continue
+            if payload.get('op') == 'tracking_dry_run':
+                continue
+            state = payload.get('modulation_state')
+            rev = payload.get('revision')
+            if state is None:
+                if payload.get('type') == 'SNAPSHOT':
+                    # Legacy snapshots carry only a compact summary. Preserve
+                    # the initial metadata for frames tagged with its revision.
+                    continue
+                if payload.get('op') != 'disable':
+                    # Old update records lack the offsets/RX correction needed
+                    # to reconstruct the next revision.
+                    continue
+            events.append((int(record['sample_index']),
+                           None if rev is None else int(rev) & 0x7fff,
+                           state, ('update', int(record['sample_index']), rev)))
+        events.sort(key=lambda item: item[0])
+        if not events:
+            raise ValueError('Demodulation requires modulation state in stream metadata')
+
+        fields = ('resonance_shift_hz', 'matched_dissipation_shift',
+                  'resonance_frequency_hz', *CYCLE_FIELDS)
+        merged = {field: np.full((n, len(keys)), np.nan) for field in fields}
+        iq = {field: np.full((n, len(keys)), np.nan) for field in ('i_data', 'q_data')}
+        z_demod = np.full((n, len(keys)), np.nan + 1j * np.nan)
+        spectra_parts = []
+        rates = []
+        counts = 0
+        covered = np.zeros(n, dtype=bool)
+        for event_index, (begin, event_rev, state, epoch) in enumerate(events):
+            if state is None:
+                continue
+            # Old-revision frames may still be queued after an announcement.
+            # The tag on each IQ frame chooses the state; only a later
+            # announcement reusing this same revision ID ends its epoch.
+            stop = next((later[0] for later in events[event_index + 1:]
+                         if later[1] == event_rev), 1 << 62)
+            mask = ((sample_index >= begin) & (sample_index < stop)
+                    & (points > 0))
+            if event_rev is not None:
+                mask &= revision == event_rev
+            if not mask.any():
+                continue
+            covered |= mask
+            global_idx = np.flatnonzero(mask)
+            lo, hi = int(global_idx[0]), int(global_idx[-1]) + 1
+            local_idx = global_idx - lo
+            selected = {
+                key: value[lo:hi] if isinstance(value, np.ndarray)
+                and value.shape[:1] == (n,) else value
+                for key, value in samples.items()}
+            selected['num_samples'] = hi - lo
+            selected['num_tones'] = len(keys)
+            selected['modulation_point'] = np.where(mask[lo:hi], points[lo:hi], 0)
+            for field in ('i_data', 'q_data'):
+                by_id = {int(k): v for k, v in samples[field].items()}
+                selected[field] = {f'{i:04d}': by_id[t][lo:hi]
+                                   for i, t in enumerate(keys)}
+            if 'stream_flags' in samples:
+                selected['stream_flags'] = {
+                    key: value[lo:hi]
+                    for key, value in samples['stream_flags'].items()}
+            local_state = copy.deepcopy(state)
+            by_id = {int(t['index']): t for t in local_state['tones']}
+            # Each point's applied probe frequency, for carrying references.
+            probes = {tone: float(by_id[tone]['center_hz'])
+                      + np.asarray(by_id[tone]['offsets_hz'], dtype=float)
+                      for tone in keys if by_id[tone].get('center_hz') is not None}
+            local_state['tones'] = [dict(by_id[t], index=i)
+                                    for i, t in enumerate(keys)]
+            for field in ('mod_indices', 'modulated_indices'):
+                if field in local_state:
+                    selected_ids = set(map(int, local_state[field]))
+                    local_state[field] = [i for i, t in enumerate(keys)
+                                          if t in selected_ids]
+            tone_info = samples['info'].get('tones', {})
+            selected['info'] = {'modulation': local_state, 'tones': {}}
+            if 'frequencies_hz' in tone_info:
+                selected['info']['tones']['frequencies_hz'] = (
+                    np.asarray(tone_info['frequencies_hz'])[keys])
+            for field in ('blind_indices', 'regular_indices'):
+                if field in tone_info:
+                    selected['info']['tones'][field] = [
+                        i for i, t in enumerate(keys) if t in tone_info[field]]
+            calibration = {}
+            if source_calibration is not None:
+                calibration = {i: _tone_calibration(source_calibration, t)
+                               for i, t in enumerate(keys)}
+                calibration = {i: cal for i, cal in calibration.items() if cal is not None}
+            linewidth = self.linewidth_hz
+            if linewidth is not None and np.ndim(linewidth):
+                linewidth = np.asarray(linewidth)[keys]
+
+            # This epoch's per-point references: held from its first
+            # demodulation; for a new epoch of an uncalibrated tone, carried
+            # from the previous epoch along the I/Q gradient.
+            references = self._epoch_references.setdefault(epoch, {})
+            N = int(local_state['num_points'])
+            reference = np.full((N, len(keys)), np.nan + 1j * np.nan)
+            for i, tone in enumerate(keys):
+                entry = references.get(tone)
+                if entry is None and i not in calibration:
+                    previous = self._last_reference.get(tone)
+                    if (previous is not None and tone in probes
+                            and len(previous[0]) == N == len(probes[tone])):
+                        step = probes[tone] - previous[2]      # per point, Hz
+                        entry = (previous[0] + previous[1] * step, previous[1],
+                                 probes[tone])
+                        references[tone] = entry
+                if entry is not None:
+                    reference[:, i] = entry[0]
+            result = self._demodulate(selected, calibration or None, linewidth,
+                                      reference)
+            if 'point_reference_z' in result:
+                for i, tone in enumerate(keys):
+                    if tone not in references and np.all(
+                            np.isfinite(result['point_reference_z'][:, i])):
+                        references[tone] = (
+                            result['point_reference_z'][:, i].copy(),
+                            result['point_gradient'][:, i].copy(),
+                            probes.get(tone, np.full(N, np.nan)))
+                    if tone in references:
+                        self._last_reference[tone] = references[tone]
+                    if tone not in self._baseline_resonance and np.isfinite(
+                            result['reference_resonance_frequency_hz'][i]):
+                        self._baseline_resonance[tone] = float(
+                            result['reference_resonance_frequency_hz'][i])
+            for field in ('i_data', 'q_data'):
+                for i in range(len(keys)):
+                    iq[field][global_idx, i] = result[field][f'{i:04d}'][local_idx]
+            for field in fields:
+                if field in result:
+                    merged[field][global_idx] = result[field][local_idx]
+            # Calibrated tones join the revisions through the absolute
+            # resonance frequency; carried references need nothing more.
+            for i, tone in enumerate(keys):
+                if i in calibration and tone in self._baseline_resonance:
+                    merged['resonance_shift_hz'][global_idx, i] = (
+                        result['resonance_frequency_hz'][local_idx, i]
+                        - self._baseline_resonance[tone])
+            if 'z_demod' in result:
+                z_demod[global_idx] = result['z_demod'][local_idx]
+            spectra_parts.append(result['cycle_spectra'])
+            rates.append(result['cycle_rate'])
+            counts += int(result.get('complete_cycles', 0))
+
+        output = dict(samples)
+        for field in ('i_data', 'q_data'):
+            output[field] = {f'{tone:04d}': iq[field][:, i]
+                             for i, tone in enumerate(keys)}
+        for field, values in merged.items():
+            output[field] = {f'{tone:04d}': values[:, i]
+                             for i, tone in enumerate(keys)}
+        output['z_demod'] = z_demod
+        output['modulation_demodulated'] = True
+        if rates:
+            common_rate = all(np.isclose(rate, rates[0]) for rate in rates)
+            selected_parts = spectra_parts if common_rate else spectra_parts[-1:]
+            output['cycle_rate'] = rates[0] if common_rate else rates[-1]
+            spectra = {}
+            for field in CYCLE_FIELDS:
+                rows = [part[field] for part in selected_parts if field in part]
+                if rows:
+                    gap = np.full((1, len(keys)), np.nan)
+                    combined = np.concatenate(
+                        [piece for i, row in enumerate(rows)
+                         for piece in ((gap, row) if i else (row,))])
+                else:
+                    combined = np.empty((0, len(keys)))
+                spectra[field] = {f'{tone:04d}': combined[:, i]
+                                  for i, tone in enumerate(keys)}
+            output['cycle_spectra'] = spectra
+        else:
+            output['cycle_rate'] = float(samples['sample_rate'])
+            output['cycle_spectra'] = {
+                field: {f'{tone:04d}': np.empty(0) for tone in keys}
+                for field in CYCLE_FIELDS}
+        missing = int(np.count_nonzero((points > 0) & ~covered))
+        output['demod_note'] = (
+            f'Demodulated ({self.method}, settling={self.settling}); '
+            f'{len(spectra_parts)} revision segment(s); '
+            f'{missing} samples awaiting revision metadata')
+        if rates and not all(np.isclose(rate, rates[0]) for rate in rates):
+            output['demod_note'] += '; spectra use latest cadence'
+        if source_calibration is None and self.linewidth_hz is None:
+            output['demod_note'] += '; detuning needs calibrations'
+        return output
+
+    def _demodulate(self, samples, calibration, linewidth_hz, reference):
+        state = active_modulation_state(samples.get('info'))
+        if state is None:
+            raise ValueError('Demodulation requires modulation state in stream metadata')
+        points = np.asarray(samples['modulation_point'])
+        n = len(points)
+        tones = int(samples['num_tones'])
+        N, spp = int(state['num_points']), int(state['samples_per_point'])
+        settle = int(state.get('n_settle', 0))
+        if N < 2 or spp < 1 or not 0 <= settle < spp:
+            raise ValueError('Demodulation requires >=2 probe points and non-settling dwell samples')
+        signature = (N, spp, settle)
+        revisions = np.asarray(samples['modulation_revision'])
+        missing = np.asarray(samples.get('packet_missing', np.zeros(n)), dtype=bool)
+        active = (points > 0) & ~missing
+        rev = np.unique(revisions[active])
+        if len(rev) > 1:
+            raise ValueError('A demodulation segment must contain one revision')
+        if len(rev):
+            expected = state.get('applied_revision', state.get('revision'))
+            if expected is not None and (int(expected) & 0x7fff) != rev[0]:
+                raise ValueError('Stream modulation revision disagrees with metadata')
+            self.revision = int(rev[0])
+            self.signature = signature
+
+        # Reject partial dwells/cycles before group_cycles can truncate unequal
+        # dwell lengths. Keep original indices, including gaps, for demodulation.
+        length = N * spp
+        starts = np.flatnonzero((points == 1) & np.r_[True, points[:-1] != 1])
+        pattern = np.repeat(np.arange(1, N + 1), spp)
+        settling_pattern = np.tile(np.arange(spp) < settle, N)
+        flags = np.asarray(samples['modulation_settling'])
+        counter = np.asarray(samples['packet_counter'], dtype=np.int64)
+        discontinuity = np.asarray(samples.get('packet_discontinuity', np.zeros(n)), dtype=bool)
+        complete = np.zeros(n, dtype=bool)
+        # One row per candidate cycle: the sample indices it would span.
+        window = starts[starts + length <= n, None] + np.arange(length)
+        step_ok = np.r_[(np.diff(counter) & 0xffffffff) == 1, False]
+        ok = (np.all(points[window] == pattern, axis=1)
+              & np.all(flags[window] == settling_pattern, axis=1)
+              & ~np.any(missing[window], axis=1)
+              & np.all(step_ok[window[:, :-1]], axis=1)
+              & ~np.any(discontinuity[window], axis=1))
+        complete[window[ok]] = True
+        clean = dict(samples)
+        clean['modulation_point'] = np.where(complete, points, 0)
+        # This state's RX correction, on every dwell sample (settling too).
+        if not clean.get('readout_correction_applied', False):
+            correction = readout_correction_factors({'modulation': state}, tones)
+            if correction is not None:
+                z = _tone_iq(samples, tones)
+                z = apply_readout_correction(z, points, correction)
+                clean['i_data'] = {f'{t:04d}': z[:, t].real for t in range(tones)}
+                clean['q_data'] = {f'{t:04d}': z[:, t].imag for t in range(tones)}
+                clean['readout_correction_applied'] = True
+        # Time continuity is already checked above, including uint32 wrap.
+        clean['packet_counter'] = np.arange(n)
+        grouped = group_cycles(clean, state, reduce=None, on_missing='notify')
+        count = len(grouped['z'])
+        if count:
+            result = demodulate_timestream(
+                grouped, method=self.method, calibration=calibration,
+                conversion=self.conversion, reference_z=reference, data_dict=clean,
+                fill_settling=self.settling)
+            cycle = demodulate(
+                grouped, method=self.method, calibration=calibration,
+                conversion=self.conversion, linewidth_hz=linewidth_hz)
+            slope = cycle['dphi_df']
+            cycle['curvature_over_slope'] = np.divide(
+                cycle['d2phi_df2'], slope, out=np.full_like(slope, np.nan),
+                where=np.isfinite(slope) & (slope != 0))
+            # Hold the cycle estimates across their samples for the time
+            # display; the spectra below keep the true cycle cadence.
+            index = result['cycle_index']
+            valid = complete & (index >= 0)
+            if self.settling == 'none':
+                valid &= flags == 0
+            for field in CYCLE_FIELDS:
+                result[field] = np.full((n, tones), np.nan)
+                result[field][valid] = cycle[field][index[valid]]
+            cycle_indices = np.asarray(grouped['cycle_sample_index'], dtype=int)
+            positions = np.rint((cycle_indices - cycle_indices[0]) / length).astype(int)
+            if np.any(cycle_indices - cycle_indices[0] != positions * length):
+                raise ValueError('Modulation cycle indices are not on a regular cadence')
+            result['cycle_spectra'] = {}
+            for field in CYCLE_FIELDS:
+                rows = np.full((positions[-1] + 1, tones), np.nan)
+                rows[positions] = cycle[field]
+                result['cycle_spectra'][field] = rows
+            result['cycle_rate'] = samples['sample_rate'] / length
+        else:
+            result = dict(samples)
+            for field in ('resonance_shift_hz', 'matched_dissipation_shift',
+                          'resonance_frequency_hz', *CYCLE_FIELDS):
+                result[field] = np.full((n, tones), np.nan)
+            result['i_data'] = {key: np.full(n, np.nan) for key in samples['i_data']}
+            result['q_data'] = {key: np.full(n, np.nan) for key in samples['q_data']}
+            result['cycle_spectra'] = {field: np.empty((0, tones)) for field in CYCLE_FIELDS}
+            result['cycle_rate'] = samples['sample_rate'] / length
+        for field in ('sample_index', 'time_s', 'telescope_time', 'packet_counter',
+                      'packet_missing', 'packet_discontinuity'):
+            if field in samples:
+                result[field] = samples[field]
+        result['modulation_demodulated'] = True
+        result['complete_cycles'] = count
+        return result
+
+
+def demodulate_stream(samples, tones=None, *, method='accurate', settling='none',
+                      linewidth_hz=None, calibration=None, conversion=None):
+    """Demodulate a whole modulated recording across its revisions.
+
+    The offline form of the live viewer's demodulation
+    (:class:`StreamDemodulator`): ``samples`` from ``ReadoutClient.parse_stream``
+    (with its tone-update records, recorded with ``subscribe_tone_updates``)
+    or a stream basename. Every tracking commit or recentre is split out and
+    joined back onto one physical reference, so ``resonance_shift_hz`` is the
+    resonator's own motion across the whole recording. ``calibration``
+    defaults to the one the recording carries (``info['resonators']``).
+    Returns the parsed dict with per-tone fields added (see
+    :func:`demodulate_timestream` for their meaning), ``cycle_spectra`` /
+    ``cycle_rate`` for the per-cycle estimates and a ``demod_note``.
+    """
+    if isinstance(samples, (str, os.PathLike)):
+        from .client.readout_client import ReadoutClient
+        samples = ReadoutClient.parse_stream(samples, apply_readout_correction=False)
+    return StreamDemodulator(method, settling, linewidth_hz, calibration,
+                             conversion)(samples, tones)
 
 
 def _measured_reference_freqs(f_tone, z_tone):
@@ -2032,48 +2360,6 @@ def _measured_reference_freqs(f_tone, z_tone):
     phase_slope = np.gradient(np.unwrap(np.angle(zs)), fs)
     f_max_dphase_df = float(fs[int(np.argmax(np.abs(phase_slope)))])
     return f_min_s21, f_max_dz_df, f_max_dphase_df
-
-
-def _max_snr_operating_point(cal, n_grid=20001, y_max=8.0):
-    """Frequency (Hz) of maximum frequency-shift responsivity for one tone.
-
-    The best signal-to-noise operating point for reading a resonator frequency
-    shift is where the response moves fastest per Hz of detuning,
-    ``argmax |dS21/df|`` of the resonator's own (de-embedded) response. This is
-    the geometric steepest point of the resonance circle. For a driven nonlinear
-    fit it is displaced from the fitted ``fr`` by the Duffing detuning plus the
-    bistable-cliff skew. Cable delay is deliberately excluded: it does not move
-    with the resonator, so it adds responsivity to a probe sweep but none to a
-    detector frequency shift. Gain is a constant scale and does not move the
-    peak.
-
-    Linear (``anl == 0``): the peak is at ``min |D|`` of the notch denominator,
-    which is ``fr`` itself for any ``phi`` -- the fitted model carries only
-    ``Re(1/Qe)`` there, so the impedance-mismatch asymmetry does not displace
-    the operating point (``frequency_origin_fraction`` is 0).
-
-    Nonlinear (``anl > 0``): the driven model is parametrised by the smooth
-    Duffing drive coordinate ``y`` rather than by frequency, because the forward
-    Duffing solver's branch selection is discontinuous in ``f`` (a one-sample
-    jump a fine ``f`` grid would mistake for an infinite slope). On the circle
-    ``|dS21/dy| = 2/(1 + 4 y**2)`` and the constant ``|1/Qe|`` drops out of the
-    argmax, so ``|dS21/df| = |dS21/dy| / |df/dy|`` depends only on ``Ql`` and
-    ``anl`` (``df/dy`` via the smooth rational inverse ``invert_duffing_coordinate``).
-    Near a bifurcation ``df/dy -> 0`` and the peak rides up to the cliff, as the
-    max-SNR criterion implies.
-    """
-    foj = float(getattr(cal, 'frequency_origin_fraction', 0.0))
-    anl = float(getattr(cal, 'anl', 0.0))
-    if anl == 0.0:
-        return float(cal.fr * (1.0 - foj))
-    from .resonator import invert_duffing_coordinate
-    y = np.linspace(-y_max, y_max, int(n_grid))
-    x = invert_duffing_coordinate(y, anl) / cal.Ql        # (f - fr) / fr
-    f = cal.fr * (1.0 + x)
-    dS21_dy = 2.0 / (1.0 + 4.0 * y ** 2)
-    df_dy = np.abs(np.gradient(f, y))
-    slope = dS21_dy / np.where(df_dy > 0.0, df_dy, np.inf)
-    return float(f[int(np.argmax(slope))])
 
 
 def params_from_sweep(sweep, *, n_points=None, point_sequence=None,
@@ -2100,12 +2386,11 @@ def params_from_sweep(sweep, *, n_points=None, point_sequence=None,
     is displaced from ``fr`` by the impedance-mismatch asymmetry (``phi``) and,
     for a driven nonlinear fit, by the Duffing detuning plus the bistable-cliff
     skew (cable delay is excluded — it does not move with the resonator). See
-    :func:`_max_snr_operating_point`. Because the demod's ``freq_shift_hz`` is
-    referenced to ``fr``, it reads ``center - fr`` (also returned in
-    ``reference_freqs['offset_from_fr_hz']``) as a constant baseline at the
-    operating point rather than ~0. ``detuning_*`` / ``needs_update`` are
-    measured from the centred-phase inflection, which is this operating point,
-    so they read ~0 there with no subtraction.
+    :func:`resonator.operating_point_hz`: it is the package's operational
+    resonance, so the demodulators' ``center_detuning_*`` / ``needs_update``
+    (measured from the centred-phase inflection) read ~0 there, and
+    ``reference_freqs['offset_from_fr_hz']`` records how far it sits from the
+    fitted ``fr``.
 
     This package does **not** fit resonators itself (so no fit options have to be
     threaded through it). With ``deembed=True`` (default) you must therefore pass
@@ -2189,7 +2474,7 @@ def params_from_sweep(sweep, *, n_points=None, point_sequence=None,
         ``fitted_fr_hz`` (fitted ``fr``; NaN where no fit), ``min_s21_hz``,
         ``max_dz_df_hz`` and ``max_dphase_df_hz`` (measured magnitude-min and
         peak ``|dS21/df|`` / phase-slope frequencies), and ``offset_from_fr_hz``
-        (``center - fitted_fr``, the demod ``freq_shift_hz`` baseline);
+        (``center - fitted_fr``);
         ``summary`` : a human-readable multi-line summary string.
     """
     sequence_requested = point_sequence is not None
@@ -2385,8 +2670,8 @@ def params_from_sweep(sweep, *, n_points=None, point_sequence=None,
             fitted_fr[t] = cal.fr
             linewidth[t] = cal.fr / cal.Ql
             # Operating point = geometric steepest point (max frequency-shift
-            # SNR), not the fitted fr: see _max_snr_operating_point.
-            center[t] = _max_snr_operating_point(cal)
+            # SNR), not the fitted fr: see resonator.operating_point_hz.
+            center[t] = operating_point_hz(cal)
             if t in mod_indices:
                 calibration[t] = cal
         else:
@@ -2458,8 +2743,7 @@ def params_from_sweep(sweep, *, n_points=None, point_sequence=None,
         # Per-tone (n_tones,) reference frequencies for cross-checking the
         # operating point. center is the geometric steepest point (max SNR);
         # these show how far it sits from the fitted fr and the measured
-        # magnitude/slope features. offset_from_fr_hz = center - fitted_fr is the
-        # expected demod freq_shift_hz baseline at the operating point.
+        # magnitude/slope features. offset_from_fr_hz = center - fitted_fr.
         'reference_freqs': {
             'center_hz': center,
             'fitted_fr_hz': fitted_fr,

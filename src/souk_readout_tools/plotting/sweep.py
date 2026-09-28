@@ -17,7 +17,7 @@ from ._common import (_get_pyplot, _propagate_errors_mag,
                        _scale_iq_to_magnitude_units,
                        _validate_reference_plane,
                        _disable_axis_offsets)
-from ..noise import _with_sweep_readout_correction
+from ..resonator import with_readout_correction
 
 
 def _extract_traces(sweep_data, tones=None):
@@ -796,7 +796,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
         matplotlib.figure.Figure
     """
     plt = _get_pyplot()
-    sweep_data = _with_sweep_readout_correction(sweep_data, apply_readout_correction)
+    sweep_data = with_readout_correction(sweep_data, apply_readout_correction)
     custom_title = kwargs.pop('title', None)
     units = _canonical_units(units)
     calibration_cache = {}

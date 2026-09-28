@@ -3194,7 +3194,8 @@ class ReadoutClient:
             Consecutive decision windows over threshold before staging a
             correction (server default 3).
         gain : float, optional
-            ``new_center = center - gain * detuning_hz`` (server default 1.0).
+            ``new_center = center + gain * center_detuning_hz``, the detuning
+            being resonance minus centre (server default 1.0).
         max_step_linewidths : float, optional
             Per-decision correction clamp (server default 0.5).
         enable_mask : array-like of int or None, optional
@@ -3307,13 +3308,13 @@ class ReadoutClient:
           per-state tone counts (``n_locked`` / ``n_drifting`` /
           ``n_recenter_pending`` / ``n_unlocked`` / ``n_no_data``),
           ``n_over_threshold``, drift extrema
-          (``max_abs_detuning_linewidths`` / ``_hz``,
-          ``median_abs_detuning_linewidths``), staged/commit/back-off counts
+          (``max_abs_center_detuning_linewidths`` / ``_hz``,
+          ``median_abs_center_detuning_linewidths``), staged/commit/back-off counts
           and loop liveness (``filter_settled``, ``held``, ``dry_run``,
           ``last_estimate_age_s``). The same block appears in
           :meth:`health_check`.
-        - ``tones`` — per-tone ``{state, detuning_linewidths,
-          detuning_std_linewidths, slope_ratio, invalid_fraction,
+        - ``tones`` — per-tone ``{state, center_detuning_linewidths,
+          center_detuning_std_linewidths, slope_ratio, invalid_fraction,
           staged_center_hz}``. A **lost resonance** (tracking noise) shows
           ``state='unlocked'`` and a low ``slope_ratio`` — the detuning
           reading itself compresses far from resonance and is not a

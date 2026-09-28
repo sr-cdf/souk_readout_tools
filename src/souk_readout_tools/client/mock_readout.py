@@ -2116,12 +2116,12 @@ class MockReadoutServer:
                 'hold_reason': None,
                 'params': params,
                 'cycles_seen': 0,
-                'filtered_detuning_linewidths': {},
+                'filtered_center_detuning_linewidths': {},
                 # Health blocks mirroring the real get_info('tracking'):
                 # the mock has no estimation loop, so tones report no_data.
                 'tones': {int(i): {'state': 'no_data',
-                                   'detuning_linewidths': None,
-                                   'detuning_std_linewidths': None,
+                                   'center_detuning_linewidths': None,
+                                   'center_detuning_std_linewidths': None,
                                    'slope_ratio': None,
                                    'invalid_fraction': None,
                                    'staged_center_hz': None}
@@ -2134,9 +2134,9 @@ class MockReadoutServer:
                     'n_tracked': n_tracked, 'n_locked': 0, 'n_drifting': 0,
                     'n_recenter_pending': 0, 'n_unlocked': 0,
                     'n_no_data': n_tracked, 'n_over_threshold': 0,
-                    'max_abs_detuning_linewidths': None,
-                    'median_abs_detuning_linewidths': None,
-                    'max_abs_detuning_hz': None,
+                    'max_abs_center_detuning_linewidths': None,
+                    'median_abs_center_detuning_linewidths': None,
+                    'max_abs_center_detuning_hz': None,
                     'staged': {'lo': 0, 'bin': 0},
                     'commits': {'lo': 0, 'bin': 0}, 'backoffs': 0,
                     'last_estimate_age_s': None,

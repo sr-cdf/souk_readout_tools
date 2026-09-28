@@ -56,13 +56,15 @@ from scipy import signal as scipy_signal
 from scipy import special as scipy_special
 from scipy import stats as scipy_stats
 
-from .noise import (_get_sweep_trace,
-                    _with_samples_readout_correction,
-                    _with_sweep_readout_correction,
-                    fractional_frequency_and_dissipation_timestreams,
+from .noise import (fractional_frequency_and_dissipation_timestreams,
                     remove_blind_tone_common_modes,
                     remove_common_modes_svd,
                     remove_iq_common_modes_svd)
+from .resonator import (CONVERSION_METHODS, ResonatorCalibration,
+                        calibration_for_tone, convert_iq, is_calibration_record,
+                        prepare_conversion, resolve_rx_gain,
+                        resolve_tone_frequency, sweep_trace, tone_column,
+                        with_readout_correction)
 
 __all__ = [
     'fill_gaps',
@@ -525,104 +527,45 @@ def _get_tone_data(ts_data, tones=None):
     return selected
 
 
-def _resolve_reference_tone_frequency(ts_data, tone_idx, sweep_f,
-                                      reference_tone_frequency):
-    """Resolve the timestream tone frequency for freq/diss computation.
-
-    reference_tone_frequency:
-        None: look up ``ts_data['info']['tones']['frequencies_hz'][tone_idx]``.
-            Falls back to ``np.mean(sweep_f)`` with a warning if unavailable.
-        scalar: used directly for every tone.
-        mapping: ``{tone_idx: frequency_hz}`` or ``{'0000': frequency_hz}``.
-        array-like: indexed by absolute tone index.
-    """
-    if reference_tone_frequency is None:
-        info = ts_data.get('info')
-        if isinstance(info, dict):
-            tf = info.get('tones', {}).get('frequencies_hz')
-            if tf is not None:
-                try:
-                    return float(np.asarray(tf)[tone_idx])
-                except (IndexError, ValueError, TypeError):
-                    pass
-        warnings.warn(
-            f"Tone {tone_idx} has no frequency in ts_data['info']; "
-            "falling back to the midpoint of the sweep range. Pass "
-            "reference_tone_frequency to set this explicitly.",
-            stacklevel=3)
-        return float(np.mean(sweep_f))
-    if isinstance(reference_tone_frequency, Mapping):
-        for key in (tone_idx, f"{tone_idx:04d}"):
-            if key in reference_tone_frequency:
-                return float(reference_tone_frequency[key])
-        raise ValueError(
-            f"reference_tone_frequency mapping missing tone {tone_idx}")
-
-    if np.ndim(reference_tone_frequency):
-        try:
-            return float(np.asarray(reference_tone_frequency, dtype=float)[tone_idx])
-        except IndexError as exc:
-            raise ValueError(
-                "array-like reference_tone_frequency is indexed by absolute "
-                f"tone index; tone {tone_idx} is missing. Use a mapping for "
-                "non-contiguous selected tones."
-            ) from exc
-
-    return float(reference_tone_frequency)
-
-
 def _compute_freq_diss(ts_data, tone_key, i_arr, q_arr, sweep_data,
                        reference_tone_frequency=None, smooth_window_hz=1000,
                        conversion_method='linearized', calibrations=None):
-    """
-    Compute fractional frequency and dissipation from timestream + sweep.
+    """Fractional resonance shift and matched dissipation of one tone's I/Q.
 
-    Uses the canonical resonator conversion helpers. ``conversion_method``
-    selects the historical local linear estimate or fitted-model inversion.
+    A capture-level wrapper round ``resonator.prepare_conversion`` /
+    ``resonator.convert_iq`` (see there for the methods): both rows relative
+    to the sweep's I/Q at the tone, the shift resonator-side. The capture is
+    brought onto the calibration's RX scale when both recorded RX chain
+    states are known and differ.
     """
-    from .resonator import (
-        calibration_for_tone,
-        interpolate_complex_trace,
-        linearized_frequency_and_dissipation,
-    )
-
-    z_ts = i_arr + 1j * q_arr
     tone_idx = int(tone_key)
-
-    sweep_f, sweep_i, sweep_q = _get_sweep_trace(sweep_data, tone_idx)
-    sweep_z = sweep_i + 1j * sweep_q
-
-    tone_freq = _resolve_reference_tone_frequency(
-        ts_data, tone_idx, sweep_f, reference_tone_frequency)
-
-    if conversion_method == 'linearized':
-        frac_f, frac_d = linearized_frequency_and_dissipation(
-            sweep_f, sweep_z, tone_freq, z_ts,
-            smooth_window_hz=smooth_window_hz)
-    elif conversion_method in ('mobius', 'circle'):
-        calibration = calibration_for_tone(calibrations, tone_idx)
-        if calibration is None:
-            raise ValueError(
-                f"conversion_method={conversion_method!r} requires a "
-                f"calibration for tone {tone_idx}")
-        reference_s21 = interpolate_complex_trace(sweep_f, sweep_z, tone_freq)
-        df_hz, frac_d = calibration.convert_referenced_raw_iq(
-            tone_freq, z_ts, reference_s21, method=conversion_method)
-        frac_f = df_hz / tone_freq
-    else:
+    method = conversion_method or 'linearized'
+    if method not in CONVERSION_METHODS:
+        raise ValueError(f"conversion_method must be one of {CONVERSION_METHODS}")
+    sweep_f, sweep_i, sweep_q = sweep_trace(sweep_data, tone_idx)
+    tone_freq = resolve_tone_frequency(
+        ts_data, tone_idx, reference_tone_frequency, sweep_f)
+    calibration = calibration_for_tone(calibrations, tone_idx)
+    if not isinstance(calibration, ResonatorCalibration):
+        calibration = None
+    if calibration is None and method in ('phase', 'mobius', 'circle'):
         raise ValueError(
-            "conversion_method must be 'linearized', 'mobius', or 'circle'")
-
-    return frac_f, frac_d
+            f"conversion_method={method!r} requires a calibration for tone {tone_idx}")
+    source = calibrations if is_calibration_record(calibrations) else sweep_data
+    info = ts_data.get('info') if isinstance(ts_data, Mapping) else None
+    prepared = prepare_conversion(
+        tone_freq, method, calibration=calibration, sweep_f=sweep_f,
+        sweep_z=np.asarray(sweep_i) + 1j * np.asarray(sweep_q),
+        smooth_window_hz=smooth_window_hz)
+    shift_hz, frac_d = convert_iq(
+        prepared, np.asarray(i_arr, dtype=float) + 1j * np.asarray(q_arr, dtype=float),
+        resolve_rx_gain('auto', source, info))
+    return shift_hz / tone_freq, frac_d
 
 
 def _has_precomputed_freq_diss(ts_data):
     """Return True when a timestream dict already carries demodulated freq/loss."""
-    return any(key in ts_data for key in (
-        'resonance_shift_hz',
-        'frequency_shift_hz',
-        'frequency_hz',
-    ))
+    return 'resonance_shift_hz' in ts_data
 
 
 def _warn_ignored_conversion_args(conversion_method, calibrations):
@@ -641,78 +584,34 @@ def _warn_ignored_conversion_args(conversion_method, calibrations):
         'ts_data already carries demodulated frequency/dissipation, so '
         + ' and '.join(ignored) + ' cannot affect this result. The '
         'conversion was chosen when the timestream was demodulated: pass '
-        'calibration= to demodulate_timestream for the calibrated Mobius '
-        'inversion, or omit it for the linearized estimate.',
+        'calibration= and conversion= to modulation.demodulate_timestream '
+        'instead.',
         stacklevel=3)
 
 
-def _sample_tone_column(ts_data, key, tone_idx):
-    """Extract a tone column from sample-major or tone-major arrays."""
-    arr = np.asarray(ts_data[key])
-    if arr.ndim == 1:
-        if tone_idx != 0:
-            raise ValueError(f"{key!r} is 1D and contains only tone 0")
-        return arr
-    if arr.ndim != 2:
-        raise ValueError(f"{key!r} must be 1D or 2D, got {arr.ndim}D")
-
-    n_samples = ts_data.get('num_samples')
-    if n_samples is not None and arr.shape[0] == int(n_samples):
-        return arr[:, tone_idx]
-    if tone_idx < arr.shape[0]:
-        return arr[tone_idx]
-    if tone_idx < arr.shape[1]:
-        return arr[:, tone_idx]
-    raise ValueError(f"Tone {tone_idx} not present in {key!r} shape {arr.shape}")
-
-
 def _precomputed_freq_diss(ts_data, tone_key, reference_tone_frequency=None):
-    """Read demodulated fractional frequency and dissipation from ``ts_data``."""
+    """Read demodulated fractional frequency and dissipation from ``ts_data``.
+
+    The demodulators' ``resonance_shift_hz`` over the tone (modulation centre)
+    frequency, and their ``matched_dissipation_shift`` (``dissipation`` in
+    results saved before it was renamed).
+    """
     tone_idx = int(tone_key)
-    freq_key = next(
-        key for key in ('resonance_shift_hz', 'frequency_shift_hz', 'frequency_hz')
-        if key in ts_data)
-    freq_hz = _sample_tone_column(ts_data, freq_key, tone_idx)
-
-    info = ts_data.get('info') if isinstance(ts_data, dict) else None
-    tone_freq = None
-    if reference_tone_frequency is None and isinstance(info, dict):
-        freqs = info.get('tones', {}).get('frequencies_hz')
-        if freqs is not None:
-            try:
-                tone_freq = float(np.asarray(freqs, dtype=float)[tone_idx])
-            except (IndexError, TypeError, ValueError):
-                tone_freq = None
-    elif reference_tone_frequency is not None:
-        if isinstance(reference_tone_frequency, Mapping):
-            for key in (tone_idx, tone_key):
-                if key in reference_tone_frequency:
-                    tone_freq = float(reference_tone_frequency[key])
-                    break
-        elif np.ndim(reference_tone_frequency):
-            try:
-                tone_freq = float(np.asarray(reference_tone_frequency, dtype=float)[tone_idx])
-            except IndexError as exc:
-                raise ValueError(
-                    "array-like reference_tone_frequency is indexed by absolute "
-                    f"tone index; tone {tone_idx} is missing. Use a mapping for "
-                    "non-contiguous selected tones."
-                ) from exc
-        else:
-            tone_freq = float(reference_tone_frequency)
-
+    shift_hz = tone_column(ts_data, 'resonance_shift_hz', tone_idx)
+    try:
+        tone_freq = resolve_tone_frequency(ts_data, tone_idx, reference_tone_frequency)
+    except ValueError:
+        tone_freq = None
     if tone_freq is None or tone_freq == 0.0:
         raise ValueError(
             "Precomputed frequency timestreams need tone frequencies in "
             "ts_data['info']['tones']['frequencies_hz'] or an explicit "
             "reference_tone_frequency to plot fractional frequency.")
-
-    frac_f = freq_hz / tone_freq
-    if 'dissipation' in ts_data:
-        frac_d = _sample_tone_column(ts_data, 'dissipation', tone_idx)
-    else:
-        frac_d = np.full_like(frac_f, np.nan, dtype=float)
-    return frac_f, frac_d
+    frac_f = np.asarray(shift_hz, dtype=float) / tone_freq
+    for key in ('matched_dissipation_shift', 'dissipation'):
+        if key in ts_data:
+            return frac_f, np.asarray(tone_column(ts_data, key, tone_idx), dtype=float)
+    return frac_f, np.full_like(frac_f, np.nan, dtype=float)
 
 
 def _filter_psd_dc_point(f, p, include_dc_point):
@@ -981,16 +880,16 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
     sample_rate : float, optional
         Sample rate in Hz. Required when ``ts_data`` is a plain array; ignored
         when the dict already carries one.
-    conversion_method : {'linearized', 'mobius', 'circle'}, optional
-        Freq/diss conversion. ``None`` (default) means ``'linearized'``.
-        Ignored, with a warning, when ``ts_data`` is already demodulated and no
-        cleaning modes are active. Note that only ``'linearized'`` and
-        ``'mobius'`` return a true frequency/dissipation pair; ``'circle'``
-        returns the radial proxy in the dissipation row.
+    conversion_method : {'linearized', 'phase', 'mobius', 'lookup', 'circle'}, optional
+        Freq/diss conversion (``resonator.prepare_conversion``). ``None``
+        (default) means ``'linearized'``. Ignored, with a warning, when
+        ``ts_data`` is already demodulated and no cleaning modes are active.
+        All but ``'circle'`` return a true frequency/dissipation pair;
+        ``'circle'`` returns the radial proxy in the dissipation row.
     calibrations : optional
-        Per-tone resonator calibrations or fit results, required by
-        ``conversion_method='mobius'`` and ``'circle'`` and by
-        ``format='linewidths'`` (for Qr).
+        Per-tone resonator calibrations, fit results or a calibration record,
+        required by ``conversion_method='phase'``, ``'mobius'`` and
+        ``'circle'`` and by ``format='linewidths'`` (for Qr).
     include_dc_point : bool, optional
         Keep the zero-frequency PSD point. Default ``False``.
     log_bin : bool, optional
@@ -1098,8 +997,8 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
     True
     """
     ts_data = _as_ts_data(ts_data, sample_rate)
-    ts_data = _with_samples_readout_correction(ts_data, apply_readout_correction)
-    sweep_data = _with_sweep_readout_correction(sweep_data, apply_readout_correction)
+    ts_data = with_readout_correction(ts_data, apply_readout_correction)
+    sweep_data = with_readout_correction(sweep_data, apply_readout_correction)
     selected = _get_tone_data(ts_data, tones)
     capture_rate = ts_data['sample_rate']
     psd_kw = dict(psd_kwargs or {})
@@ -1319,8 +1218,8 @@ def _referred_frequencies(ts_data, tone_indices, reference_tone_frequency):
         else:
             # Explicit: resolves without touching ts_data or the sweep.
             try:
-                refs.append(_resolve_reference_tone_frequency(
-                    {}, idx, None, reference_tone_frequency))
+                refs.append(resolve_tone_frequency(
+                    {}, idx, reference_tone_frequency))
             except (ValueError, TypeError):
                 refs.append(np.nan)
     return np.asarray(refs, dtype=float)
@@ -2217,11 +2116,12 @@ def snapshot_psds(snapshot_data, format='iq', tones=None, sweep_data=None,
         between acquisitions turns each block boundary into a real step, and a
         random-step sequence has an ``f**-2`` tail that mimics ``1/f``.
         Ignored by ``method='averaged'``, which never joins blocks.
-    conversion_method : {'linearized', 'mobius', 'circle'}, optional
-        Freq/diss conversion. ``None`` (default) means ``'linearized'``.
+    conversion_method : {'linearized', 'phase', 'mobius', 'lookup', 'circle'}, optional
+        Freq/diss conversion (``resonator.prepare_conversion``). ``None``
+        (default) means ``'linearized'``.
     calibrations : optional
-        Per-tone calibrations, required by ``'mobius'`` and ``'circle'``
-        and by ``format='linewidths'`` (for Qr).
+        Per-tone calibrations, required by ``'phase'``, ``'mobius'`` and
+        ``'circle'`` and by ``format='linewidths'`` (for Qr).
     include_dc_point : bool, optional
         Keep the zero-frequency point. Default ``False``.
     log_bin : bool, optional
@@ -5663,8 +5563,8 @@ def _freq_diss_rows(ts_data, sweep_data, tones, reference_tone_frequency,
     Shares every conversion helper with `timestream_psds`, so the rows here are
     the same numbers whose PSDs that function returns.
     """
-    ts_data = _with_samples_readout_correction(ts_data, apply_readout_correction)
-    sweep_data = _with_sweep_readout_correction(sweep_data, apply_readout_correction)
+    ts_data = with_readout_correction(ts_data, apply_readout_correction)
+    sweep_data = with_readout_correction(sweep_data, apply_readout_correction)
     selected = _get_tone_data(ts_data, tones)
     precomputed = _has_precomputed_freq_diss(ts_data)
     if not precomputed and sweep_data is None:
@@ -5674,14 +5574,15 @@ def _freq_diss_rows(ts_data, sweep_data, tones, reference_tone_frequency,
     if precomputed:
         _warn_ignored_conversion_args(conversion_method, calibrations)
     method = conversion_method or 'linearized'
-    # Only 'linearized' and 'mobius' return Im(delta_tilde). 'circle' returns
-    # the radial proxy Delta(rho), which is a different quantity: its cross
+    # Every method but 'circle' returns Im(delta_tilde). 'circle' returns the
+    # radial proxy Delta(rho), which is a different quantity: its cross
     # spectrum against the frequency row has no common-quasiparticle reading.
     if method == 'circle':
         raise ValueError(
             "conversion_method='circle' returns the radial proxy Delta(rho), "
             "not the dissipation quadrature Im(delta_tilde); a cross spectrum "
-            "against it is not interpretable. Use 'linearized' or 'mobius'.")
+            "against it is not interpretable. Use 'linearized', 'phase', "
+            "'mobius' or 'lookup'.")
 
     freq, diss, idx = [], [], []
     for key, i_arr, q_arr in selected:

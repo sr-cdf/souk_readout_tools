@@ -2533,9 +2533,9 @@ def batch_fit(sweep_data, resonances=None, data_format="log_magnitude",
         cannot be re-toggled after fitting.
     """
     from .peak_finder import find_mkid_resonances
-    from .noise import _with_sweep_readout_correction
+    from .resonator import with_readout_correction
 
-    sweep_data = _with_sweep_readout_correction(sweep_data, apply_readout_correction)
+    sweep_data = with_readout_correction(sweep_data, apply_readout_correction)
     sf, z_stack, e_stack = _prepare_sweep_stack(sweep_data, z_err)
     f_all, z_all, e_all = _flatten_sweep(sweep_data, z_err)
     if use_error_weights is not None:

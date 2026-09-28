@@ -22,7 +22,8 @@ build/save/load a calibration record          ``calibration_record``,
                                               ``load_calibration_record``
 fit a sweep straight to calibrations          ``calibrations_from_sweep``
 the calibration a recording carries           ``calibration_from_data``
-apply the filterbank readout correction       ``readout_correction_factors``,
+toggle the filterbank readout correction      ``with_readout_correction``,
+                                              ``readout_correction_factors``,
                                               ``apply_readout_correction``
 match RX gain between sweep and timestream    ``rx_gain_ratio``,
                                               ``recorded_rx_gain_ratio``
@@ -2345,6 +2346,91 @@ def apply_readout_correction(z, points, factors, *, invert=False):
     return z
 
 
+def sample_readout_factors(data, num_tones=None):
+    """Per-sample ``(n_samples, num_tones)`` readout factors of a parsed capture.
+
+    Each modulated sample gets the factor of its point, from the modulation
+    state in ``data['info']`` -- or, in a recording whose tracking or
+    recentring changed the state, from its own revision's factors
+    (``readout_correction_by_revision``, collected by ``parse_stream``).
+    ``None`` when the capture is unmodulated or reports no factors.
+    """
+    points = np.asarray(data.get('modulation_point', ()), dtype=int)
+    if not points.size or not np.any(points > 0):
+        return None
+    if num_tones is None:
+        num_tones = max([int(data.get('num_tones', 0) or 0)]
+                        + [int(key) + 1 for key in data.get('i_data', {})])
+    initial = readout_correction_factors(data.get('info'), num_tones)
+    by_revision = {int(rev): np.asarray(factors, dtype=float) for rev, factors in
+                   (data.get('readout_correction_by_revision') or {}).items()}
+    if initial is None and not by_revision:
+        return None
+    revisions = np.asarray(data.get('modulation_revision', np.zeros(len(points))), dtype=int)
+    gains = np.ones((len(points), int(num_tones)), dtype=float)
+    for revision in np.unique(revisions[points > 0]):
+        factors = by_revision.get(int(revision), initial)
+        if factors is None:
+            continue
+        rows = (revisions == revision) & (points >= 1) & (points <= factors.shape[0])
+        width = min(factors.shape[1], gains.shape[1])
+        gains[rows, :width] = factors[points[rows] - 1][:, :width]
+    return gains
+
+
+def with_readout_correction(data, apply=True):
+    """A sweep or parsed capture with the software readout correction on or off.
+
+    The filterbank compensation's RX half cannot be applied in hardware, so
+    the server reports per-(point, tone) factors: a parsed sweep carries them
+    (``readout_correction``), a parsed capture takes them from its modulation
+    state (:func:`sample_readout_factors`). Both carry a
+    ``readout_correction_applied`` flag, so the correction can be toggled
+    either way. Returns the input itself when it is already in the requested
+    state or has no factors (compensation off, older or unmodulated data).
+    """
+    if not isinstance(data, dict):
+        return data
+    want = bool(apply)
+    if want == bool(data.get('readout_correction_applied', False)):
+        return data
+    if 'sweep_i' in data:
+        factors = data.get('readout_correction')
+        if factors is None:
+            return data
+        factors = np.asarray(factors, dtype=float)
+        if factors.shape != np.shape(data['sweep_i']):
+            return data
+        gain = factors if want else 1.0 / factors
+        out = dict(data)
+        for key in ('sweep_i', 'sweep_q', 'sweep_ei', 'sweep_eq'):
+            if out.get(key) is not None:
+                out[key] = np.asarray(out[key], dtype=float) * gain
+        out['readout_correction_applied'] = want
+        return out
+    if 'i_data' not in data:
+        return data
+    gains = sample_readout_factors(data)
+    if gains is None:
+        return data
+    if not want:
+        gains = 1.0 / gains
+
+    def scaled(columns):
+        out = {}
+        for key, values in columns.items():
+            values = np.asarray(values)
+            out[key] = (values.astype(float) * gains[:, int(key)]
+                        if len(values) == len(gains) else values)
+        return out
+
+    out = dict(data)
+    out['i_data'] = scaled(data['i_data'])
+    out['q_data'] = scaled(data['q_data'])
+    out['readout_correction_applied'] = want
+    return out
+
+
 def _rx_chain_gain_db(info):
     """Analog RX gain in dB from a capture's recorded chain state, or None.
 
@@ -2495,8 +2581,13 @@ def recorded_rx_gain_ratio(calibration, data_info):
     return float(10.0 ** ((float(data_db) - float(cal_db)) / 20.0))
 
 
-def _resolve_rx_gain(match_rx_gain, calibration, data_info):
-    """The data/calibration amplitude ratio a conversion should divide out."""
+def resolve_rx_gain(match_rx_gain, calibration, data_info):
+    """The data/calibration RX amplitude ratio a conversion divides out.
+
+    ``match_rx_gain``: ``'auto'`` uses :func:`recorded_rx_gain_ratio` when both
+    chain states are known and differ (with a warning), else 1; ``False`` or
+    ``None`` gives 1; a number is taken as the ratio.
+    """
     if match_rx_gain is False or match_rx_gain is None:
         return 1.0
     if match_rx_gain == 'auto':
@@ -2876,7 +2967,7 @@ def frequency_and_dissipation(z, frequency_hz, method='linearized', *, calibrati
 # ---------------------------------------------------------------------------
 
 def express(quantity, resonance_shift_hz, matched_dissipation_shift, *,
-            frequency_hz, calibration=None, reference_resonance_hz=None):
+            frequency_hz=None, calibration=None, reference_resonance_hz=None):
     """Turn a (resonance shift, matched dissipation) pair into a named quantity.
 
     ``frequency_hz`` is the tone frequency the pair was measured at (the
@@ -2903,14 +2994,19 @@ def express(quantity, resonance_shift_hz, matched_dissipation_shift, *,
     dissipation = np.asarray(matched_dissipation_shift, dtype=float)
     if name == 'resonance_shift_hz':
         return shift
-    if name == 'fractional_resonance_shift':
-        return shift / frequency_hz
     if name == 'matched_dissipation_shift':
         return dissipation
-    if name == 'matched_dissipation_hz':
-        return dissipation * frequency_hz
     if name == 'internal_loss_shift':
         return 2.0 * dissipation
+    if frequency_hz is None and name not in (
+            'resonance_shift_linewidths', 'internal_loss',
+            'fractional_internal_loss_shift', 'resonance_frequency_hz'):
+        raise ValueError(f'{name!r} needs a frequency: pass the tone frequency '
+                         '(reference_tone_frequency)')
+    if name == 'fractional_resonance_shift':
+        return shift / frequency_hz
+    if name == 'matched_dissipation_hz':
+        return dissipation * frequency_hz
     known = ('resonance_shift_linewidths', 'matched_dissipation_linewidths',
              'internal_loss', 'fractional_internal_loss_shift',
              'resonance_frequency_hz', 'detuning_hz', 'fractional_detuning',
@@ -2947,7 +3043,8 @@ def express(quantity, resonance_shift_hz, matched_dissipation_shift, *,
 # Parsed captures
 # ---------------------------------------------------------------------------
 
-def _capture_tone_keys(samples, tones):
+def capture_tone_keys(samples, tones=None):
+    """The ``i_data`` keys of a capture for absolute tone IDs (``None``: all)."""
     available = samples.get('i_data', {})
     keys_by_id = {int(key): key for key in available}
     if len(keys_by_id) != len(available):
@@ -3112,7 +3209,9 @@ def convert_samples(samples, quantities, tones=None, *, method='linearized',
         calibrations = calibration_from_data(samples)
     if sweep_data is None:
         sweep_data = samples.get('calibration_sweep')
-    demodulated = bool(samples.get('modulation_demodulated'))
+    # Precomputed shifts (a demodulator's output) are used as they are.
+    demodulated = (bool(samples.get('modulation_demodulated'))
+                   or 'resonance_shift_hz' in samples)
     modulated = np.any(np.asarray(samples.get('modulation_point', ()), dtype=int) > 0)
     gains = []
 
@@ -3122,11 +3221,11 @@ def convert_samples(samples, quantities, tones=None, *, method='linearized',
         if not gains:
             source = calibrations if is_calibration_record(calibrations) else sweep_data
             gains.append(1.0 if demodulated else
-                         _resolve_rx_gain(match_rx_gain, source, samples.get('info')))
+                         resolve_rx_gain(match_rx_gain, source, samples.get('info')))
         return gains[0]
 
     out = {name: {} for name in names}
-    for key in _capture_tone_keys(samples, tones):
+    for key in capture_tone_keys(samples, tones):
         tone = int(key)
         z = (np.asarray(samples['i_data'][key], dtype=float)
              + 1j * np.asarray(samples['q_data'][key], dtype=float))
@@ -3162,15 +3261,22 @@ def convert_samples(samples, quantities, tones=None, *, method='linearized',
             if 'shifts' not in state:
                 if demodulated:
                     shift = tone_column(samples, 'resonance_shift_hz', tone).astype(float)
-                    dissipation = (tone_column(samples, 'matched_dissipation_shift', tone)
-                                   if 'matched_dissipation_shift' in samples
-                                   else np.full(shift.shape, np.nan))
+                    dissipation = np.full(shift.shape, np.nan)
+                    # 'dissipation' in results saved before the rename.
+                    for field in ('matched_dissipation_shift', 'dissipation'):
+                        if field in samples:
+                            dissipation = tone_column(samples, field, tone)
+                            break
                     state['shifts'] = (shift, np.asarray(dissipation, dtype=float))
                 else:
                     if modulated:
                         raise ValueError(
                             'frequency and dissipation of modulated I/Q need '
                             'demodulating first (modulation.demodulate_stream)')
+                    if (method in ('phase', 'mobius', 'circle')
+                            and not isinstance(calibration, ResonatorCalibration)):
+                        raise ValueError(
+                            f'method={method!r} requires a calibration for tone {tone}')
                     cache_key = ('prepared', tone, method, frequency(), id(calibrations),
                                  id(sweep_data), smooth_window_hz)
                     if cache_key not in cache:
@@ -3210,7 +3316,11 @@ def convert_samples(samples, quantities, tones=None, *, method='linearized',
                 value = tone_column(samples, 'resonance_frequency_hz', tone)
             else:
                 shift, dissipation = shifts()
-                value = express(name, shift, dissipation, frequency_hz=frequency(),
+                try:
+                    tone_hz = frequency()
+                except ValueError:
+                    tone_hz = None      # express says so if this quantity needs it
+                value = express(name, shift, dissipation, frequency_hz=tone_hz,
                                 calibration=calibration if isinstance(
                                     calibration, ResonatorCalibration) else None)
             out[name][key] = np.asarray(value, dtype=float)

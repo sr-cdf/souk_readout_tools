@@ -166,10 +166,11 @@ res_acc = mod.demodulate(grouped, linewidth_hz=W, method='accurate')
 slope = np.nanmean(res_fast['dphi_df'][:, 0])
 check('dphi/df matches model slope -4/w', np.isclose(slope, -4.0 / W, rtol=0.05))
 check('d2phi/df2 finite for 3 points', np.isfinite(res_fast['d2phi_df2'][:, 0]).all())
-check('detuning ~0 when centred', np.nanmean(np.abs(res_fast['detuning_linewidths'][:, 0])) < 0.05)
+check('detuning ~0 when centred', np.nanmean(np.abs(res_fast['center_detuning_linewidths'][:, 0])) < 0.05)
 check('needs_update False when centred', not res_fast['needs_update'][:, 0].any())
 check('fast vs accurate dphi/df agree', np.isclose(np.nanmean(res_acc['dphi_df'][:, 0]), slope, rtol=0.05))
-check('dissipation NaN without calibration', np.isnan(res_fast['dissipation'][:, 0]).all())
+check('dissipation from the I/Q gradient without calibration',
+      np.isfinite(res_fast['matched_dissipation_shift'][:, 0]).all())
 check('grouped z shape (n_cycles, N, n_tones)', grouped['z'].ndim == 3 and grouped['z'].shape[1] == 3)
 check('grouped preserves packet counters per point',
       grouped['packet_counter'].shape == grouped['z'].shape[:2])
@@ -197,9 +198,9 @@ d = c.parse_samples(c.get_samples(2 * 8 * 12))
 g2 = mod.group_cycles(d, state2)
 r2 = mod.demodulate(g2, linewidth_hz=W, method='fast')
 check('d2phi/df2 NaN for 2 points', np.isnan(r2['d2phi_df2'][:, 0]).all())
-check('detuning NaN for 2 points', np.isnan(r2['detuning_linewidths'][:, 0]).all())
+check('detuning NaN for 2 points', np.isnan(r2['center_detuning_linewidths'][:, 0]).all())
 r2nl = mod.demodulate(g2, linewidth_hz=None, method='fast')
-check('detuning NaN without linewidth', np.isnan(r2nl['detuning_linewidths'][:, 0]).all())
+check('detuning NaN without linewidth', np.isnan(r2nl['center_detuning_linewidths'][:, 0]).all())
 
 # Detune the centre -> needs_update trips.
 c.enable_modulation(center=F0, offsets=[-1e3, 0.0, 1e3], samples_per_point=8, n_settle=2, engine='sw')
@@ -208,7 +209,7 @@ state3 = c.get_modulation_state()
 d = c.parse_samples(c.get_samples(3 * 8 * 12))
 g3 = mod.group_cycles(d, state3)
 r3 = mod.demodulate(g3, linewidth_hz=W, method='fast')
-det = np.nanmean(r3['detuning_linewidths'][:, 0])
+det = np.nanmean(r3['center_detuning_linewidths'][:, 0])
 check('detuning detected when off-resonance (>0.1 lw)', abs(det) > 0.1)
 check('needs_update trips when detuned', r3['needs_update'][:, 0].any())
 
@@ -277,19 +278,29 @@ def make_grouped(carrier):
         off[:, t] = cfg9['offsets'][:, t]
         fh[:, t] = carrier[t] + off[:, t]
         zc[0, :, t] = fitting.s21_model(fh[:, t], fr_true[t], Qi, Qc, phi_c, a, alpha, tau)
-    return {'z': zc, 'offsets_hz': off, 'freq_hz': fh, 'revision': np.array([cfg9.get('revision', 1)])}
+    return {'z': zc, 'offsets_hz': off, 'tone_frequency_hz': fh,
+            'revision': np.array([cfg9.get('revision', 1)])}
 
 # Carrier on fitted resonance -> centred frequency offset ~ 0, dissipation finite.
 res_on = mod.demodulate(make_grouped(fr_true), calibration=cfg9['calibration'])
 lw9 = np.array([cfg9['calibration'][t].fr / cfg9['calibration'][t].Ql for t in range(2)])
-check('centred: asymmetric fit zeroes freq_shift at fr',
-      np.all(np.abs(res_on['freq_shift_hz'][0]) < 1e-6 * lw9))
-check('centred: dissipation finite (calibration present)', np.all(np.isfinite(res_on['dissipation'][0])))
-check('centred: detuning needs no external linewidth', np.all(np.isfinite(res_on['detuning_linewidths'][0])))
-# Carrier detuned by +0.3 linewidths -> freq_shift ~ +0.3 lw, needs_update trips.
+fr_fit = np.array([cfg9['calibration'][t].fr for t in range(2)])
+check('centred: resonance frequency is the fitted fr when parked on it',
+      np.all(np.abs(res_on['resonance_frequency_hz'][0] - fr_fit) < 1e-4 * lw9))
+res_mobius = mod.demodulate(make_grouped(fr_true), calibration=cfg9['calibration'],
+                            conversion='mobius')
+check('centred: the Mobius inversion agrees',
+      np.all(np.abs(res_mobius['resonance_frequency_hz'][0] - fr_fit) < 1e-4 * lw9))
+check('centred: dissipation finite (calibration present)',
+      np.all(np.isfinite(res_on['matched_dissipation_shift'][0])))
+check('centred: detuning needs no external linewidth',
+      np.all(np.isfinite(res_on['center_detuning_linewidths'][0])))
+# Carrier 0.3 linewidths above resonance -> the resonance is 0.3 lw below the
+# centre (detuning = resonance - tone). The finite differences over these
+# +/-0.2 lw offsets read ~5% low; the zero is exact.
 res_off = mod.demodulate(make_grouped(fr_true + 0.3 * lw9), calibration=cfg9['calibration'])
 check('centred: detuning tracks carrier offset (sign+scale)',
-      np.allclose(res_off['detuning_linewidths'][0], 0.3, atol=1e-5))
+      np.allclose(res_off['center_detuning_linewidths'][0], -0.3, rtol=0.08))
 check('centred: needs_update trips when detuned', res_off['needs_update'][0].all())
 print(cfg9['summary'])
 

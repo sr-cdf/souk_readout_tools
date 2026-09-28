@@ -20,8 +20,7 @@ from ._common import (_get_pyplot, _compute_mag_phase, _dual_panels,
                        _is_calibrated_magnitude_unit,
                        _canonical_units, _validate_reference_plane)
 from ._psd import check_psd_units, psd_display_values
-from ..noise import (_get_sweep_trace, _with_samples_readout_correction,
-                     _with_sweep_readout_correction)
+from ..resonator import sweep_trace, with_readout_correction
 from ..timeseries import (FREQ_DISS_FORMATS, _compute_freq_diss, _get_tone_data,
                           _has_precomputed_freq_diss, _linewidth_scale,
                           _precomputed_freq_diss,
@@ -170,7 +169,7 @@ def _apply_tone_transforms(z, tone_idx, deembed, phase_center, *,
     z_sweep = None
 
     if sweep_data is not None and (deembed is True or phase_center is True):
-        sweep_f, sw_i, sw_q = _get_sweep_trace(sweep_data, tone_idx)
+        sweep_f, sw_i, sw_q = sweep_trace(sweep_data, tone_idx)
         if tone_frequency is None:
             tone_frequency = float(np.mean(sweep_f))
         if units != 'raw':
@@ -200,6 +199,13 @@ def _apply_tone_transforms(z, tone_idx, deembed, phase_center, *,
         if phase_center is True and z_sweep is not None:
             z_sweep, pc_params = _apply_phase_center(z_sweep, True)
             z, _ = _apply_phase_center(z, pc_params)
+        elif phase_center is True:
+            # A timestream covers a tiny arc of the resonance circle: a circle
+            # fitted to it is noise, not the resonance's centre.
+            raise ValueError(
+                "phase_center=True for timestream data needs sweep_data (or a "
+                "params dict from resonator.phase_center): the timestream's own "
+                "short arc cannot locate the resonance circle.")
         else:
             z, pc_params = _apply_phase_center(z, phase_center)
 
@@ -279,11 +285,12 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             ``resonator.deembed()``.
         phase_center: bool or phase-centering params dict.  Applies
             circle centering and rotation.  For timestream data, ``True``
-            derives params from the matching ``sweep_data`` trace when
-            available; without ``sweep_data`` it computes from the timestream
-            directly.  Pass a pre-computed params dict from
+            derives params from the matching ``sweep_data`` trace, and
+            raises without one (a timestream's short arc cannot locate the
+            circle).  Pass a pre-computed params dict from
             ``resonator.phase_center()`` to apply specific params.  Applied
-            after deembedding when both are set.
+            after deembedding when both are set.  For the fitted frame the
+            tracker uses, convert with ``resonator.to_basis`` instead.
         sweep_data: Sweep data dict. Required for 'freq_diss' format and
             used as the parameter source for ``deembed=True`` or
             ``phase_center=True`` on I/Q and mag/phase timestream plots.
@@ -358,10 +365,13 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         matplotlib.figure.Figure
     """
     plt = _get_pyplot()
-    ts_data = _with_samples_readout_correction(ts_data, apply_readout_correction)
-    sweep_data = _with_sweep_readout_correction(sweep_data, apply_readout_correction)
+    ts_data = with_readout_correction(ts_data, apply_readout_correction)
+    sweep_data = with_readout_correction(sweep_data, apply_readout_correction)
     custom_title = kwargs.pop('title', None)
     selected = _get_tone_data(ts_data, tones)
+    # Frequency/dissipation always converts the recorded I/Q, which is what the
+    # sweep and calibrations describe; units only rescale the I/Q panels.
+    recorded_iq = {key: (i_arr, q_arr) for key, i_arr, q_arr in selected}
     sample_rate = ts_data['sample_rate']
     x_values, x_label = _build_x_axis(ts_data, x_axis)
     info = ts_data.get('info')
@@ -493,7 +503,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     reference_tone_frequency=reference_tone_frequency)
             else:
                 frac_f, frac_d = _compute_freq_diss(
-                    ts_data, key, i_arr, q_arr, sweep_data,
+                    ts_data, key, *recorded_iq[key], sweep_data,
                     reference_tone_frequency=reference_tone_frequency,
                     smooth_window_hz=smooth_window_hz,
                     conversion_method=conversion_method,
@@ -817,13 +827,13 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
         matplotlib.figure.Figure
     """
     plt = _get_pyplot()
-    ts_data = _with_samples_readout_correction(ts_data, apply_readout_correction)
-    sweep_data = _with_sweep_readout_correction(sweep_data, apply_readout_correction)
+    ts_data = with_readout_correction(ts_data, apply_readout_correction)
+    sweep_data = with_readout_correction(sweep_data, apply_readout_correction)
     selected = _get_tone_data(ts_data, tones=[tone_index])
     key, i_arr, q_arr = selected[0]
 
     # Extract sweep trace for this tone
-    sweep_f, sw_i, sw_q = _get_sweep_trace(sweep_data, tone_index)
+    sweep_f, sw_i, sw_q = sweep_trace(sweep_data, tone_index)
 
     # Normalise both sweep and timestream with the same units
     if _is_calibrated_magnitude_unit(units):

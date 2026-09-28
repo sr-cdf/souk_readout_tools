@@ -2095,7 +2095,7 @@ class ReadoutServer:
                 tracking_summary = self.tracking.status()['summary']
                 resonators_tracking = bool(tracking_summary['enabled']
                                            and not tracking_summary['dry_run'])
-                max_detuning_hz = tracking_summary['max_abs_detuning_hz']
+                max_detuning_hz = tracking_summary['max_abs_center_detuning_hz']
             except Exception:
                 pass
 
@@ -6341,6 +6341,7 @@ class ReadoutServer:
         if not indices or int(state.get('num_points', 0)) < 3:
             raise ValueError('automatic update needs at least three modulation '
                              'points on selected tones')
+        from souk_readout_tools.resonator import detuning_from_derivatives
         calibrations = await self.to_thread(
             self._calibrations_from_latest_sweep, indices)
         if not calibrations:
@@ -6412,9 +6413,11 @@ class ReadoutServer:
                 if abs(slope) < 0.25 / lw:
                     skipped[tone] = 'phase slope is too weak for a reliable correction'
                     continue
-                # Exact inverse of the centred notch phase -2 atan(2x).
-                shift = float(np.clip(curvature / (2.0 * slope * abs(slope)) * lw,
-                                      -0.5 * lw, 0.5 * lw))
+                # Resonance minus centre, the exact inverse of the centred
+                # notch phase -2 atan(2x): move the centre that way.
+                shift = float(np.clip(
+                    detuning_from_derivatives(slope, curvature) * lw,
+                    -0.5 * lw, 0.5 * lw))
                 if abs(shift) >= 0.01 * lw:
                     corrections[tone] = float(centers[tone] + shift)
                     shifts[tone] = shift
@@ -6517,7 +6520,7 @@ class ReadoutServer:
         """
         announce = {
             'tracking_class': klass,
-            'triggering_detunings_linewidths': {
+            'triggering_center_detunings_linewidths': {
                 str(t): staged_detunings.get(int(t)) for t in corrections},
         }
         if engine == 'fw':
@@ -6616,7 +6619,7 @@ class ReadoutServer:
                 'dry_run': True,
                 'centers_hz': {str(t): float(v)
                                for t, v in corrections.items()},
-                'triggering_detunings_linewidths': {
+                'triggering_center_detunings_linewidths': {
                     str(t): controller.staged_detunings.get(int(t))
                     for t in corrections},
             }
