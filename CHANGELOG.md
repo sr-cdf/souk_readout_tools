@@ -2,17 +2,74 @@
 
 ## Unreleased
 
+- **One conversion contract in `resonator.py`**: every I/Q -> quantity
+  conversion now lives there and `timeseries`, `noise`, `modulation`, the live
+  viewer, the tracker and `stream_dac` call it: `QUANTITIES` (+ aliases,
+  `canonical_quantity`), `express`, `convert_samples`,
+  `prepare_conversion`/`convert_iq` (`linearized`, `phase`, `mobius`,
+  `lookup`, `circle`), `basis_coefficients`/`to_basis`, `phase_derivatives`,
+  `detuning_from_derivatives`, `phase_shift_and_dissipation`,
+  `operating_point_hz`. Maths and workflow: `doc/conversions.md`.
+
+- **One sign convention, new names (breaking)**: resonance shift positive when
+  the resonance moves up; detuning = resonance - tone (`center_detuning_*` for
+  demodulated data). `demodulate*`: `resonance_shift_hz`,
+  `matched_dissipation_shift`, `resonance_frequency_hz`, `center_detuning_hz` /
+  `_linewidths` (were `freq_shift_hz`, `dissipation`, `detuning_*`);
+  `group_cycles` `freq_hz` -> `tone_frequency_hz`; tracking status and
+  announce keys `*center_detuning*`, `new_center = center + gain *
+  center_detuning_hz`. stream-to-DAC: `df_calibrated` `frequency` is now
+  `resonance_shift_hz` (old probe detuning = `-detuning_hz`); `df_modelfree`
+  sign flipped.
+
+- **Calibrations travel with the data**: `calibration_record` (JSON-safe,
+  `souk-resonator-calibration/1`); `save_calibrations(..., sweep_data=)` keeps
+  the sweep in the same `.npz` (old `stream_dac` files load);
+  `ReadoutClient.set_resonator_calibrations` -> `get_info('resonators')` with
+  live validity (tones active, within 5 lw), so every stream sidecar carries it
+  and analysis, live view and DAC use it by default (`calibration_from_data`).
+  RX gain matched from recorded chain states (`match_rx_gain='auto'`).
+
+- **No fitting on the ARM**: tracking and argument-less `update_modulation()`
+  use the pushed calibration only and refuse without one
+  (`_calibrations_from_latest_sweep` removed). Tracker refreshes offsets,
+  readout correction and centring per revision; lock health against the fit's
+  `4/lw` (`unlock_detuning_linewidths` default 1.0); `detuning_estimator=
+  'mobius'` tracks unmodulated; status adds `calibration_source`, `rx_gain`.
+
+- **Three-point kernel**: any slot order (lowest/central/highest offsets,
+  coherently averaged); per-point gradients exact for a resonance circle
+  (central difference read the chord 3.8% low at +/-0.1 lw, 20% at +/-0.25,
+  scaling every converted shift); calibrated default `conversion='phase'`,
+  `w = ln(z_c/z_ref)` over the live slope.
+
+- **Revisions joined onto one reference**: `modulation.demodulate_stream` /
+  `StreamDemodulator` (live viewer) demodulate each revision with its own state;
+  calibrated tones joined through the absolute resonance (recentre residual
+  27 Hz -> 0). `parse_stream` corrects each revision with its own factors
+  (`readout_correction_by_revision`); `receive_stream` subscribes to tone
+  updates by default.
+
+- **stream-to-DAC on the core**: `QuantityConverter` (`conversion.output`,
+  `conversion.method`) replaces `DfCalibratedConverter`; `FfmConverter` reads
+  the fw default `[-d, 0, +d, 0]` two-sided and accepts `[0, -d, +d, 0]`,
+  centres with the pushed or file calibration, follows per-revision state and
+  correction, holds unannounced revisions; recordings carry `sample_index` and
+  replay their updates.
+
+- **Conversion fixes**: `plot_timestream` freq/diss on already-scaled I/Q
+  (units); `noise` Möbius with RX-gain matching; `phase_center=True` without a
+  sweep raises; a live-viewer probe recentre no longer reads as a resonator
+  move.
+
 - **Tracking detuning on circle-centred I/Q, exact inversion**: raw-phase
   curvature/slope read 3-100x high (sim: loop limit-cycled or parked 0.5-0.8 lw
-  off). I/Q is now de-embedded + circle-centred (`tracking.center_iq`) and
-  `detuning_linewidths = -phi''/(2 phi'|phi'|)` (exact for the centred notch
-  phase, ~1% at +/-0.1 lw offsets; was `x/(1+4x^2)`). `enable_tracking` now
-  needs a sweep in server memory (fits give calibrations and default
-  linewidths); `TrackingRuntime(server, params, calibrations)`.
+  off). The window's I/Q is de-embedded + circle-centred and the centre
+  detuning inverts the centred notch phase exactly (~1% at +/-0.1 lw offsets;
+  was `x/(1+4x^2)`). `TrackingRuntime(server, params, calibrations)`.
   `threshold_linewidths` default 0.3 -> 0.05. `demodulate` with `calibration`:
-  `detuning_*` now from the inflection (max-SNR point), `freq_shift_hz` still
-  Möbius `f_probe - fr`. Live plot: `--calibrations` centres per-cycle
-  detuning for any `--conversion` (`LiveDemodulator(cycle_calibration=)`).
+  detuning from the inflection (max-SNR point). Live plot: `--calibrations`
+  centres per-cycle detuning for any `--conversion`.
 
 - **Server restart stops orphaned fw modulation**: firmware-slot switching left
   running by a previous server (reported as not modulating, and
