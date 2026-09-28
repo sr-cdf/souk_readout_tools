@@ -2245,6 +2245,136 @@ def calibration_from_data(data):
     return None
 
 
+def calibration_fit(z_centered, calibration):
+    """How well a calibration's circle still fits a tone's data: 1 when it does.
+
+    The median of ``|z_c| / r`` over ``z_centered``, the tone's I/Q in the
+    calibration's centred basis (:func:`to_basis`, each sample at its own probe
+    frequency). Every point of a resonance the calibration describes lies on
+    its circle, whatever the detuning, so this leaves 1 when the resonance
+    changes shape since the calibration sweep (``Qi``, coupling, drive -- a
+    cooldown does all three) or the data changes scale (TX or RX levels).
+    Calibrated conversions go wrong with it: on krm4 a tone at 0.45 read its
+    own tracking moves 1.37x too large. Beyond about 0.85-1.15, re-sweep and
+    push again. The tracker and stream-to-DAC report it per tone.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        return float(np.nanmedian(np.abs(np.asarray(z_centered, dtype=complex)))
+                     / float(calibration.radius))
+
+
+def calibration_quality(calibrations, sweep_data=None, samples=None, *,
+                        max_linewidth_ratio=2.0, max_neighbour_ratio=3.0, neighbours=10,
+                        max_anl=0.6, min_dip_depth_db=3.0, fit_range=(0.85, 1.15)):
+    """Per-tone checks of a calibration, and the tones that fail them.
+
+    For choosing the tones to track, ``enable_tracking(enable_mask=result['good'])``,
+    or to push. Each check is skipped when its data is not given:
+
+    - **fitted vs measured linewidth** (``sweep_data``): ``fr / Ql`` against the
+      model-free FWHM of the same trace beyond ``max_linewidth_ratio``: the fit
+      did not describe the dip;
+    - **linewidth odd for its neighbourhood**: ``fr / Ql`` beyond
+      ``max_neighbour_ratio`` of the median of its ``neighbours`` nearest tones
+      in frequency (linewidths vary across a band, so not the global median);
+    - **near bifurcation**: ``anl > max_anl`` (the cliff is at ``BIFURCATION_ANL``);
+    - **shallow dip** (``sweep_data``): shallower than ``min_dip_depth_db``;
+    - **calibration fit** (``samples``, a capture taken since the calibration
+      sweep): :func:`calibration_fit` outside ``fit_range``.
+
+    Parameters
+    ----------
+    calibrations : record, fits or ResonatorCalibration objects
+        Anything :func:`calibration_record` takes, e.g. the record of
+        :func:`load_calibration_record`.
+    sweep_data : dict, optional
+        The calibration sweep (a parsed sweep, or the one the file holds).
+    samples : dict, optional
+        A parsed capture (``parse_samples`` / ``parse_stream``), modulated or
+        not; its RX gain change since the sweep is divided out.
+
+    Returns
+    -------
+    dict
+        Lists aligned with ``tone_indices``: ``linewidth_hz``,
+        ``measured_linewidth_hz``, ``neighbour_linewidth_hz``, ``anl``,
+        ``dip_depth_db`` and ``fit`` (NaN where not measured); ``reasons``,
+        ``{tone: [reason, ...]}`` for the tones that fail; ``poor`` and
+        ``good``, sorted tone indices.
+
+    Examples
+    --------
+    >>> record, sweep = load_calibration_record('cal.npz')              # doctest: +SKIP
+    >>> capture = client.parse_samples(client.get_samples(10000))       # doctest: +SKIP
+    >>> quality = calibration_quality(record, sweep, capture)           # doctest: +SKIP
+    >>> client.enable_tracking(dry_run=False, enable_mask=quality['good'])  # doctest: +SKIP
+    """
+    record = (calibrations if is_calibration_record(calibrations)
+              else calibration_record(calibrations))
+    cals = calibrations_from_record(record)
+    tones = [int(t) for t in record['tone_indices'] if int(t) in cals]
+    n = len(tones)
+    fr = np.array([cals[t].fr for t in tones])
+    lw = np.array([cals[t].fr / cals[t].Ql for t in tones])
+    anl = np.array([cals[t].anl for t in tones])
+    measured, depth, fit = np.full(n, np.nan), np.full(n, np.nan), np.full(n, np.nan)
+    if sweep_data is not None:
+        for j, t in enumerate(tones):
+            try:
+                f, i, q = sweep_trace(sweep_data, t)
+                e = estimate_resonance_empirical(
+                    np.asarray(f, dtype=float), np.asarray(i, float) + 1j * np.asarray(q, float))
+            except (ValueError, IndexError):
+                continue
+            measured[j], depth[j] = e.linewidth_hz, e.dip_depth_db
+    neighbour = np.full(n, np.nan)
+    order = np.argsort(fr)
+    for rank, j in enumerate(order):
+        lo = max(0, min(rank - neighbours // 2, n - neighbours - 1))
+        near = [k for k in order[lo:lo + neighbours + 1] if k != j]
+        if near:
+            neighbour[j] = np.median(lw[near])
+    if samples is not None:
+        try:
+            gain = recorded_rx_gain_ratio(record, samples.get('info')) or 1.0
+        except ValueError:
+            gain = 1.0
+        settling = np.asarray(samples.get('modulation_settling', ()), dtype=bool)
+        for j, t in enumerate(tones):
+            try:
+                z = (np.asarray(tone_column(samples, 'i_data', t), dtype=float)
+                     + 1j * np.asarray(tone_column(samples, 'q_data', t), dtype=float)) / gain
+                probe = probe_frequencies(samples, t, resolve_tone_frequency(samples, t))
+            except ValueError:
+                continue
+            keep = ~settling if settling.size == z.size else np.ones(z.size, dtype=bool)
+            fit[j] = calibration_fit(to_basis(z[keep], cals[t], probe[keep]), cals[t])
+    reasons = {}
+    with np.errstate(divide='ignore', invalid='ignore'):
+        for j, t in enumerate(tones):
+            why = []
+            ratio = lw[j] / measured[j]
+            if np.isfinite(ratio) and not 1 / max_linewidth_ratio <= ratio <= max_linewidth_ratio:
+                why.append(f'fitted linewidth {lw[j] / 1e3:.1f} kHz, measured {measured[j] / 1e3:.1f} kHz')
+            ratio = lw[j] / neighbour[j]
+            if np.isfinite(ratio) and not 1 / max_neighbour_ratio <= ratio <= max_neighbour_ratio:
+                why.append(f'linewidth {lw[j] / 1e3:.1f} kHz, neighbours {neighbour[j] / 1e3:.1f} kHz')
+            if anl[j] > max_anl:
+                why.append(f'anl {anl[j]:.2f} (bifurcation {BIFURCATION_ANL:.2f})')
+            if np.isfinite(depth[j]) and depth[j] < min_dip_depth_db:
+                why.append(f'dip {depth[j]:.1f} dB deep')
+            if np.isfinite(fit[j]) and not fit_range[0] <= fit[j] <= fit_range[1]:
+                why.append(f'calibration fit {fit[j]:.2f}')
+            if why:
+                reasons[t] = why
+    return {'tone_indices': tones, 'linewidth_hz': lw.tolist(),
+            'measured_linewidth_hz': measured.tolist(),
+            'neighbour_linewidth_hz': neighbour.tolist(), 'anl': anl.tolist(),
+            'dip_depth_db': depth.tolist(), 'fit': fit.tolist(), 'reasons': reasons,
+            'poor': sorted(reasons), 'good': [t for t in tones if t not in reasons]}
+
+
 # ---------------------------------------------------------------------------
 # Tones and sweeps
 # ---------------------------------------------------------------------------
