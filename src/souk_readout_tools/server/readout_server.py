@@ -1080,6 +1080,10 @@ class ReadoutServer:
         self._tone_state_cache = None              # user-order freqs/amps/phases last applied by this server
         self.latest_sweep_results = {}
         self.latest_sweep_data_valid = False
+        # Resonator calibration record pushed by a client
+        # (set_resonator_calibrations); served in get_info('resonators') and
+        # so recorded with every stream. Its validity is worked out on read.
+        self.resonator_calibration = None
         self.sweep_progress = 0.0
         self.sweep_state = {'state': 'idle', 'message': 'No sweep in progress'}
 
@@ -1482,6 +1486,10 @@ class ReadoutServer:
         self._tone_state_cache = None              # user-order freqs/amps/phases last applied by this server
         self.latest_sweep_results = {}
         self.latest_sweep_data_valid = False
+        # Resonator calibration record pushed by a client
+        # (set_resonator_calibrations); served in get_info('resonators') and
+        # so recorded with every stream. Its validity is worked out on read.
+        self.resonator_calibration = None
         self.sweep_progress = 0.0
         self.sweep_state = {'state': 'idle', 'message': 'No sweep in progress'}
 
@@ -2606,20 +2614,76 @@ class ReadoutServer:
     def _info_calibrations(self):
         return firmware_lib.info_calibrations(self.r, self.r_fast, self.config)
 
+    def _current_tone_frequencies(self):
+        """The tones' frequencies now: the applied modulation centres while
+        modulation is armed (tracking moves them), else a live hardware read."""
+        cfg = (self.fw_modulation_cfg if self.e_fw_modulation_enabled.is_set()
+               else self.modulation_cfg if self.e_modulation_enabled.is_set()
+               else None)
+        if cfg is not None:
+            return np.asarray(cfg['center'], dtype=float)
+        try:
+            return np.asarray(firmware_lib.get_tone_frequencies(
+                self.r, self.r_fast, self.config), dtype=float)
+        except Exception:
+            return None
+
     def _info_resonators(self):
-        """Resonator detuning tracking — placeholder until tracking module."""
-        return {
-            'ready': False,
-            'tracking_enabled': False,
-            'tone_count': 0,
-            'driven_frequencies_hz': None,
-            'estimated_resonant_frequencies_hz': None,
-            'detuning_hz': None,
-            'fractional_detuning': None,
-            'accumulated_phase_rad': None,
-            'tracking_timestamp': None,
-            'tracking_interval_s': None,
-        }
+        """The resonator calibration record a client pushed.
+
+        ``set_resonator_calibrations`` stores it; every stream sidecar records
+        ``get_info('all')``, so it travels with each recording and the analysis
+        tools use it by default (``resonator.calibration_from_data``). Validity
+        is worked out afresh on each read, never cached: every calibrated tone
+        must still be active and within five linewidths of its calibrated
+        resonance.
+        """
+        pushed = getattr(self, 'resonator_calibration', None)
+        if pushed is None:
+            return {'ready': False, 'valid': False, 'source': None,
+                    'invalid_reason': 'no calibration pushed', 'record': None}
+        record = pushed['record']
+        tones = self._current_tone_frequencies()
+        reasons = []
+        for j, tone in enumerate(record['tone_indices']):
+            if tones is None or not 0 <= int(tone) < len(tones):
+                reasons.append(f'tone {tone} is not active')
+            elif (abs(tones[int(tone)] - record['operating_point_hz'][j])
+                  > 5 * record['linewidth_hz'][j]):
+                reasons.append(f'tone {tone} is over five linewidths from its '
+                               'calibrated resonance')
+        return {'ready': True, 'valid': not reasons,
+                'invalid_reason': '; '.join(reasons[:5]) or None,
+                'source': 'client', 'pushed_unix': pushed['pushed_unix'],
+                'record': record}
+
+    def _chain_info(self):
+        """The RX chain state (for recorded_rx_gain_ratio), or None."""
+        try:
+            return {'rf_frontend': self._info_rf_frontend(), 'rfdc': self._info_rfdc(),
+                    'pipeline': self._info_pipeline()}
+        except Exception:
+            return None
+
+    def _tracking_calibrations(self, tone_indices):
+        """The calibrations tracking centres with, their source and RX gain.
+
+        The client's pushed record when it is valid and covers every tone --
+        the same calibration the analysis of the recording uses -- else fits
+        of the latest sweep in memory. With the pushed record, the RX gain
+        ratio between its sweep and the chain now is divided out. Runs in
+        to_thread: fitting can be slow.
+        """
+        from souk_readout_tools.resonator import (calibrations_from_record,
+                                                  recorded_rx_gain_ratio)
+        status = self._info_resonators()
+        indices = [int(t) for t in tone_indices]
+        if status['valid']:
+            calibrations = calibrations_from_record(status['record'], tones=indices)
+            if all(t in calibrations for t in indices):
+                ratio = recorded_rx_gain_ratio(status['record'], self._chain_info())
+                return calibrations, 'client', 1.0 if ratio is None else ratio
+        return self._calibrations_from_latest_sweep(indices), 'server_fit', 1.0
 
     def _info_registers(self):
         """Full firmware register dump — placeholder."""
@@ -3925,14 +3989,35 @@ class ReadoutServer:
                         await self.send_response(writer, {'status': 'success',
                             'result': {'purged': purged, 'revision': 0}})
 
+                elif request == 'set_resonator_calibrations':
+                    # Store (or with record=None clear) a client's resonator
+                    # calibration record; see _info_resonators.
+                    try:
+                        from souk_readout_tools.resonator import is_calibration_record
+                        record = message.get('record')
+                        if record is None:
+                            self.resonator_calibration = None
+                        elif not is_calibration_record(record):
+                            raise ValueError('record is not a resonator calibration '
+                                             'record (resonator.calibration_record)')
+                        else:
+                            self.resonator_calibration = {
+                                'record': record, 'pushed_unix': time.time()}
+                        await self.send_response(writer, {'status': 'success',
+                            'result': self._info_resonators()})
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
                 elif request == 'enable_tracking':
                     # Start (or reconfigure) the FFM tone-tracking loop on
-                    # whichever modulation engine is armed (fw or sw).
-                    # Requires >= 3 points/slots and a sweep in server
-                    # memory to fit (the I/Q is circle-centred with those
-                    # calibrations, which also supply linewidths). dry_run defaults to
-                    # True: full estimate/decide/log/announce pipeline, no
-                    # hardware applies.
+                    # whichever modulation engine is armed (fw or sw). Needs
+                    # a calibration per tracked tone (pushed, or fitted from
+                    # the sweep in server memory) to circle-centre the I/Q;
+                    # three distinct offsets for the curvature estimator,
+                    # none for 'mobius'. dry_run defaults to True: full
+                    # estimate/decide/log/announce pipeline, no hardware
+                    # applies.
                     try:
                         params = dict(self.TRACKING_DEFAULTS)
                         for key in params:
@@ -3947,18 +4032,21 @@ class ReadoutServer:
                             self.tracking.stop()
                             self.tracking = None
                         # The estimator works on circle-centred I/Q, so every
-                        # tracked tone needs a fit from the latest server sweep
-                        # (which also supplies the linewidths when none are given).
+                        # tracked tone needs a calibration: the client's pushed
+                        # record, else fits of the latest server sweep (which
+                        # also supply the linewidths when none are given).
                         cfg = ((self.fw_modulation_cfg
                                 if self.e_fw_modulation_enabled.is_set()
                                 else self.modulation_cfg) or self.fw_modulation_cfg)
                         if cfg is None:
                             raise ValueError('modulation must be armed '
                                              '(enable_modulation) before enable_tracking')
-                        calibrations = await self.to_thread(
-                            self._calibrations_from_latest_sweep,
+                        calibrations, source, rx_gain = await self.to_thread(
+                            self._tracking_calibrations,
                             [int(t) for t in cfg['mod_indices']])
-                        runtime = tone_tracking.TrackingRuntime(self, params, calibrations)
+                        runtime = tone_tracking.TrackingRuntime(
+                            self, params, calibrations, calibration_source=source,
+                            rx_gain=rx_gain)
                         runtime.start()
                         self.tracking = runtime
                         await self.send_response(writer, {'status': 'success',
@@ -6342,8 +6430,8 @@ class ReadoutServer:
             raise ValueError('automatic update needs at least three modulation '
                              'points on selected tones')
         from souk_readout_tools.resonator import detuning_from_derivatives
-        calibrations = await self.to_thread(
-            self._calibrations_from_latest_sweep, indices)
+        calibrations, source, rx_gain = await self.to_thread(
+            self._tracking_calibrations, indices)
         if not calibrations:
             raise ValueError('no modulated tones have usable fits in the '
                              'server memory sweep')
@@ -6357,7 +6445,9 @@ class ReadoutServer:
             params['linewidth_hz'] = [
                 (calibrations[t].fr / calibrations[t].Ql if t in calibrations
                  else float('nan')) for t in indices]
-            runtime = tone_tracking.TrackingRuntime(self, params, calibrations)
+            runtime = tone_tracking.TrackingRuntime(
+                self, params, calibrations, calibration_source=source,
+                rx_gain=rx_gain)
             runtime.start()
             self.tracking = runtime
         else:
@@ -6410,7 +6500,9 @@ class ReadoutServer:
                 if abs(centers[tone] - cal.fr) > 5 * lw:
                     skipped[tone] = 'centre is over five fitted linewidths from calibration'
                     continue
-                if abs(slope) < 0.25 / lw:
+                # The tracker's own unlock rule: the slope against the fit's
+                # on-resonance 4 / linewidth.
+                if abs(slope) < runtime.params.get('unlock_slope_ratio', 0.25) * 4.0 / lw:
                     skipped[tone] = 'phase slope is too weak for a reliable correction'
                     continue
                 # Resonance minus centre, the exact inverse of the centred
@@ -6484,14 +6576,19 @@ class ReadoutServer:
         'bin_min_commit_interval_s': 30.0,
         'commit_threshold_count': None,   # commit when >= M tones staged
         'commit_interval_s': None,        # commit every T s if staged
-        # Lost-resonance (lock-health) detection: a far-off-resonance tone
-        # reads a SMALL detuning (the model-free estimate compresses), so
-        # 'unlocked' is called on the phase slope collapsing below this
-        # fraction of its settled baseline and/or on the fraction of
-        # invalid (NaN) cycles. The reading-based trip is off by default.
+        # Lost-resonance (lock-health) detection: 'unlocked' when the phase
+        # slope falls below this fraction of the fit's on-resonance slope
+        # 4 / linewidth (0.25 is ~0.9 linewidths off), when too many cycles
+        # are invalid (NaN), or when the filtered reading itself is past
+        # unlock_detuning_linewidths -- the centred estimate does not
+        # compress, so a large reading means far off. None disables that.
         'unlock_slope_ratio': 0.25,
         'unlock_invalid_fraction': 0.5,
-        'unlock_detuning_linewidths': None,
+        'unlock_detuning_linewidths': 1.0,
+        # 'curvature' (three-point, rotation-free; needs three distinct
+        # offsets) or 'mobius' (fitted inversion; works unmodulated, on a
+        # zero-offset modulation). None picks curvature when it can.
+        'detuning_estimator': None,
     }
 
     async def _commit_tracking_update(self, engine, klass, corrections,

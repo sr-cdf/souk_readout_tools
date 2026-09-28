@@ -97,6 +97,7 @@ class MockReadoutServer:
         self._mod_bin_hz = 1.0e6        # mock filterbank channel spacing (Hz)
         self._mod_armed_bin_center = None   # per-tone armed bin centre (Hz), fixed until recenter
         self._tracking = None           # status-level mock of the tracking loop
+        self._resonator_calibration = None   # pushed calibration record
         # firmware-slot modulation (mock): _fw_mod is the loaded config (or None),
         # _fw_mod_enabled the on/off switch, _fw_mod_slot the live slot in manual
         # mode. Frames are tagged with slot+1 in the same flag5 field as software
@@ -841,41 +842,27 @@ class MockReadoutServer:
         return {'ready': True, 'calibration_files': list(self.calibration_files)}
 
     def _info_resonators(self):
-        driven = np.asarray(self.tone_frequencies, dtype=float)
-        if driven.size:
-            catalog_f = self._resonator_catalog['frequency_hz']
-            nearest = np.array([
-                catalog_f[np.argmin(np.abs(catalog_f - frequency))]
-                for frequency in driven
-            ])
-            detuning = driven - nearest
-            fractional_detuning = detuning / nearest
-            accumulated_phase = np.zeros_like(driven)
-            tracking_timestamp = time.time()
-        else:
-            nearest = None
-            detuning = None
-            fractional_detuning = None
-            accumulated_phase = None
-            tracking_timestamp = None
-
-        return {
-            'ready': True,
-            'tracking_enabled': False,
-            'tone_count': int(driven.size),
-            'driven_frequencies_hz': driven.tolist(),
-            'estimated_resonant_frequencies_hz': (
-                nearest.tolist() if nearest is not None else None),
-            'detuning_hz': detuning.tolist() if detuning is not None else None,
-            'fractional_detuning': (
-                fractional_detuning.tolist()
-                if fractional_detuning is not None else None),
-            'accumulated_phase_rad': (
-                accumulated_phase.tolist()
-                if accumulated_phase is not None else None),
-            'tracking_timestamp': tracking_timestamp,
-            'tracking_interval_s': None,
-        }
+        """Mock ``get_info('resonators')``: the pushed calibration record, valid
+        while each calibrated tone is active and within five linewidths of it
+        (as the real server works it out)."""
+        pushed = self._resonator_calibration
+        if pushed is None:
+            return {'ready': False, 'valid': False, 'source': None,
+                    'invalid_reason': 'no calibration pushed', 'record': None}
+        record = pushed['record']
+        tones = np.asarray(self.tone_frequencies, dtype=float)
+        reasons = []
+        for j, tone in enumerate(record['tone_indices']):
+            if not 0 <= int(tone) < tones.size:
+                reasons.append(f'tone {tone} is not active')
+            elif (abs(tones[int(tone)] - record['operating_point_hz'][j])
+                  > 5 * record['linewidth_hz'][j]):
+                reasons.append(f'tone {tone} is over five linewidths from its '
+                               'calibrated resonance')
+        return {'ready': True, 'valid': not reasons,
+                'invalid_reason': '; '.join(reasons[:5]) or None,
+                'source': 'client', 'pushed_unix': pushed['pushed_unix'],
+                'record': record}
 
     def _info_registers(self):
         return {'ready': False, 'available': False, 'dump': None}
@@ -2082,6 +2069,12 @@ class MockReadoutServer:
             if self._mod is not None:
                 self._mod['state']['enabled'] = False
             return {'status': 'success'}
+
+        if request == 'set_resonator_calibrations':
+            record = message.get('record')
+            self._resonator_calibration = (
+                None if record is None else {'record': record, 'pushed_unix': time.time()})
+            return {'status': 'success', 'result': self._info_resonators()}
 
         # ----- FFM tone tracking (status-level mock) ----------------------
         # The real tracking loop lives in the server; the mock keeps enough

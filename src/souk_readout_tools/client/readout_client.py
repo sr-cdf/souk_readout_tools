@@ -3155,6 +3155,48 @@ class ReadoutClient:
         """
         return self.get_info('modulation')
 
+    # ----- Resonator calibrations on the server --------------------------------
+
+    def set_resonator_calibrations(self, calibrations, sweep_data=None, **provenance):
+        """
+        Give the server the resonator calibrations to work with and record.
+
+        The record (``resonator.calibration_record``) goes into
+        ``get_info('resonators')``, so every stream recorded from now on
+        carries the calibration its analysis needs, and tracking centres its
+        I/Q with the same calibration as the analysis (instead of fitting the
+        server's sweep again on the ARM). The server reports it invalid, and
+        tracking stops using it, once a calibrated tone is gone or over five
+        linewidths from its resonance. ``calibrations=None`` clears it.
+
+        Parameters
+        ----------
+        calibrations : mapping, sequence, record or None
+            Fit results (``fitting.batch_fit``), ``ResonatorCalibration``
+            objects (e.g. ``params_from_sweep(...)['calibration']``) or a
+            record.
+        sweep_data : dict or None, optional
+            The sweep they came from: its RX chain state lets the server and
+            the analysis correct a later RX gain change.
+        **provenance
+            Anything else to keep with the record.
+
+        Returns
+        -------
+        dict
+            Server ack; ``result`` is the new ``get_info('resonators')``.
+        """
+        record = None
+        if calibrations is not None:
+            from souk_readout_tools.resonator import calibration_record
+            record = calibration_record(calibrations, sweep_data=sweep_data, **provenance)
+        return self.send_request({'request': 'set_resonator_calibrations',
+                                  'record': record})
+
+    def get_resonator_calibrations(self):
+        """The server's ``get_info('resonators')``: the pushed record and its validity."""
+        return self.get_info('resonators')
+
     # ----- FFM tone tracking (server-side auto-recentering) -----------------
 
     def enable_tracking(self, linewidth_hz=None, dry_run=True,
@@ -3164,14 +3206,16 @@ class ReadoutClient:
                         poll_interval_s=None, ring_depth=None,
                         lo_auto_commit=None, lo_min_commit_interval_s=None,
                         bin_auto_commit=None, bin_min_commit_interval_s=None,
-                        commit_threshold_count=None, commit_interval_s=None):
+                        commit_threshold_count=None, commit_interval_s=None,
+                        detuning_estimator=None, **options):
         """
         Start the server-side FFM tone-tracking loop (see doc/tone_tracking.md).
 
-        With modulation armed (fw or sw, >= 3 points), the server fits its most
-        recent sweep held in memory, circle-centres the streamed cycles with
-        those fits, filters the per-tone detuning, and stages small
-        centre corrections. Seamless LO-word updates (``'lo'`` class) and
+        With modulation armed (fw or sw), the server circle-centres the
+        streamed cycles with the calibrations pushed by
+        :meth:`set_resonator_calibrations` (else with fits of its most recent
+        sweep), filters the per-tone centre detuning -- resonance minus centre
+        -- and stages small centre corrections. Seamless LO-word updates (``'lo'`` class) and
         FFT-bin/map changes (``'bin'`` class) have independent commit
         policies; every committed correction bumps the modulation revision
         (stamped into each frame's flag5 tag) and is announced in-band as a
@@ -3184,7 +3228,7 @@ class ReadoutClient:
             Per-tone resonator linewidths (Hz): one entry per modulated tone
             (``params_from_sweep(...)['linewidth_hz']``) or per active tone.
             If omitted, the server uses armed linewidth metadata, else fr/Ql
-            of its fits. A sweep in server memory is needed either way.
+            of its calibrations.
         dry_run : bool, optional
             Full estimate/decide/log/announce pipeline with **no** hardware
             applies (default True). Disable once the behaviour is trusted.
@@ -3225,6 +3269,17 @@ class ReadoutClient:
             Commit policy: commit a class when >= M tones are staged.
         commit_interval_s : float or None, optional
             Commit policy: commit every T seconds if anything is staged.
+        detuning_estimator : {'curvature', 'mobius'} or None, optional
+            ``'curvature'``: the three-point slope/curvature of the centred
+            phase (rotation-free; needs three distinct offsets). ``'mobius'``:
+            the calibration's exact inversion of the averaged centred I/Q,
+            which also tracks unmodulated tones (arm a zero-offset modulation
+            so corrections stay revision-stamped). ``None`` (default) picks
+            curvature when it can.
+        **options
+            Any other server tracking parameter
+            (``ReadoutServer.TRACKING_DEFAULTS``), e.g. ``iq_average_s``,
+            ``min_detuning_snr`` or ``unlock_detuning_linewidths``.
 
         Returns
         -------
@@ -3233,6 +3288,7 @@ class ReadoutClient:
             payload.
         """
         message = {'request': 'enable_tracking', 'dry_run': bool(dry_run)}
+        message.update(options)
         if linewidth_hz is not None:
             message['linewidth_hz'] = np.asarray(
                 linewidth_hz, dtype=float).tolist()
@@ -3252,7 +3308,8 @@ class ReadoutClient:
                            ('bin_auto_commit', bin_auto_commit),
                            ('bin_min_commit_interval_s', bin_min_commit_interval_s),
                            ('commit_threshold_count', commit_threshold_count),
-                           ('commit_interval_s', commit_interval_s)):
+                           ('commit_interval_s', commit_interval_s),
+                           ('detuning_estimator', detuning_estimator)):
             if value is not None:
                 message[key] = value
         return self.send_request(message)
@@ -3316,9 +3373,9 @@ class ReadoutClient:
         - ``tones`` — per-tone ``{state, center_detuning_linewidths,
           center_detuning_std_linewidths, slope_ratio, invalid_fraction,
           staged_center_hz}``. A **lost resonance** (tracking noise) shows
-          ``state='unlocked'`` and a low ``slope_ratio`` — the detuning
-          reading itself compresses far from resonance and is not a
-          reliable lost-lock signal.
+          ``state='unlocked'``, a low ``slope_ratio`` (the phase slope over
+          the fit's on-resonance ``4 / linewidth``) and a large, noisy
+          detuning.
         - ``controller`` — the full parameter/staged/counter detail.
 
         A pure server-side read, safe to poll while streaming.
