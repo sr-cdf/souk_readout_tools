@@ -20,6 +20,7 @@ import yaml
 
 from souk_readout_tools import stream_dac
 from souk_readout_tools.client import readout_client
+from souk_readout_tools.modulation import active_modulation_state
 
 
 def handle_signal(signum, frame):
@@ -133,6 +134,30 @@ def selftest(config):
         dac.write({dac_channel: 0.0})
         dac.close()
     return 0
+
+
+def check_modulated_stream(app, mode, info):
+    """On a modulated stream, only ffm demodulates. A fixed-tone mode converts
+    the boxcar mean of the last N frames, which follows the probe slots unless
+    N spans whole modulation cycles: round N to whole cycles, and say so."""
+    state = active_modulation_state(info)
+    if not (isinstance(state, dict) and state.get('tones')):
+        return
+    cycle = int(state.get('num_points') or 0) * int(state.get('samples_per_point') or 0)
+    if cycle < 2:
+        return
+    cycle_rate = app.sample_rate / cycle
+    if mode == 'ffm':
+        if app.dac_update_rate > cycle_rate:
+            print(f'Note: the ffm output changes once per modulation cycle '
+                  f'({cycle_rate:.0f} Hz); faster DAC updates repeat it.')
+        return
+    if app.navg % cycle:
+        app.navg = cycle * max(1, int(round(app.navg / cycle)))
+    print(f'Note: the stream is modulated and mode={mode} does not demodulate: '
+          f'it converts the mean of the last {app.navg} frames '
+          f'({app.navg // cycle} whole {cycle}-frame cycles, so the probe slots '
+          'average out). Use --mode ffm to demodulate.')
 
 
 def main():
@@ -318,6 +343,7 @@ def main():
             ch.converter = stream_dac.build_converter(
                 mode, config['conversion'], info, ch.tone_position,
                 reference_iq=ref)
+        check_modulated_stream(app, mode, info)
     except Exception:
         app.safe_state('startup failed')
         source.close()
