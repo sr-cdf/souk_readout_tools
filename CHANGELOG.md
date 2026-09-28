@@ -2,6 +2,138 @@
 
 ## Unreleased
 
+- **Tracking detuning on circle-centred I/Q, exact inversion**: raw-phase
+  curvature/slope read 3-100x high (sim: loop limit-cycled or parked 0.5-0.8 lw
+  off). I/Q is now de-embedded + circle-centred (`tracking.center_iq`) and
+  `detuning_linewidths = -phi''/(2 phi'|phi'|)` (exact for the centred notch
+  phase, ~1% at +/-0.1 lw offsets; was `x/(1+4x^2)`). `enable_tracking` now
+  needs a sweep in server memory (fits give calibrations and default
+  linewidths); `TrackingRuntime(server, params, calibrations)`.
+  `threshold_linewidths` default 0.3 -> 0.05. `demodulate` with `calibration`:
+  `detuning_*` now from the inflection (max-SNR point), `freq_shift_hz` still
+  Möbius `f_probe - fr`. Live plot: `--calibrations` centres per-cycle
+  detuning for any `--conversion` (`LiveDemodulator(cycle_calibration=)`).
+
+- **Server restart stops orphaned fw modulation**: firmware-slot switching left
+  running by a previous server (reported as not modulating, and
+  `disable_modulation()` took the sw path) is now rested at attach
+  (`_create_firmware_interfaces`: slot 0, dwell 1).
+
+- **`get_info('tracking')['summary']['last_estimate_age_s']` is live**: stamped
+  when served (`TrackingRuntime.status`), not when the cached snapshot was built,
+  so it no longer freezes between rebuilds or during a long commit.
+
+- **Tracking commits 32 s -> ms**: `load_group_delay_calibration` re-parsed the
+  `path_group_delay_ns` CSV (~220k rows) on every modulation prepare; now parsed
+  once per (path, mtime, size). New `get_info('tracking')['commit_stage_ms']`
+  (prepare/apply/announce split of the last fw commit).
+
+- **`modulation.demodulate_timestream(data)`**: also takes a parsed capture or a
+  stream file basename directly (state from `data['info']`, grouped with
+  `reduce=None, include_settling=True`); `group_cycles` output still accepted.
+
+- **Faster modulation grouping**: `group_cycles(reduce=None)` gathers complete
+  cycles with one reshape when the dwell is uniform (walk kept as fallback;
+  identical output), and the live demodulator's cycle check is vectorised.
+  Live demod refresh 1.5 s -> 0.13 s per 10 s of 2500 Hz history (4 of 380 tones).
+
+- **`souk-live-plot` receives in a separate process**: the in-process receiver
+  thread was GIL-starved by slow refreshes (~200 frames/s) until the server
+  dropped the client. New `LivePlot.start_process(connect)`; `start(client)` /
+  `plot_live` keep the thread. Snapshots copy only displayed tones
+  (`StreamBuffer.snapshot(tones)`; 0.97 s -> 0.06 s for 3 of 380 tones, 60 s at 2500 Hz).
+
+- **`souk-receive-stream` console script**: `client_scripts/receive_stream.py`
+  was documented under that name but never registered in `setup.py`.
+
+- **`receive_stream` no longer overwrites captures**: with no filename it writes
+  the first unused `tmp_stream`, `tmp_stream_1`, ...; a given filename that
+  already holds a capture raises `FileExistsError` unless `overwrite=True`.
+  `souk-receive-stream` gains `--overwrite` (its `-f` default is now the same
+  unused `tmp_stream[_N]`).
+
+- **`format='linewidths'`**: the freq/diss pair times each tone's loaded Q from
+  `calibrations=` (fits or `ResonatorCalibration`): frequency in linewidths,
+  dissipation `Qr * Delta(1/2Qi)` on the same scale (beta unchanged). In
+  `timestream_psds`, `snapshot_psds`, `allan_deviation`, `timestream_stats`
+  and the timestream/snapshot plots; `subtract_psds` refuses mixed formats.
+  `souk-live-plot --format linewidths` (signals `frequency_linewidths`,
+  `dissipation_linewidths`; needs `--calibrations`).
+
+- **Power sweep down-sweep data in plots and the ANL fit**: `plot_power_sweep`
+  draws each down sweep as its down fit (x markers, dotted model) in the fit's
+  own frame, not a `plot_sweep` re-estimate; parameter trends overlay the down
+  fits. `find_best_power(anl_fit_use_down_sweeps=True)` adds `anl_down` to the
+  log(anl) fit (`fit_sweep_indices_down`), shown in `plot_best_power`.
+
+- **Save fits: `fitting.export_fits` / `load_fits`**: pickle-free `.npz` with
+  every scalar `FitResult` field, `<name>_err`, covariance, traces and the
+  sweep's `info`/`tone_metadata`; `load_fits` rebuilds the `FitResult` list.
+
+- **Live Matplotlib time/PSD/ASD viewer**: `souk-live-plot` / `plot_live`,
+  selectable tones and one-to-four panels, bounded rolling history, pause,
+  follow and autoscale controls, calibrated frequency/dissipation, and file
+  inspection/following (`--stream-file PATH --follow`) without hardware.
+  `receive_stream` gains in-memory callbacks and cooperative stop.
+  Raw/sample-aligned fast demodulation, frequency/dissipation and cycle-rate
+  detuning panels; explicit settling policy and opt-in display reduction.
+  See [live plotting](doc/live_plotting.md).
+
+- Binary `receive_stream(subscribe_tone_updates=True)` now subscribes to
+  SNAPSHOT/TONE_UPDATE frames and saves them in `<capture>.updates.jsonl`,
+  with host timestamps and IQ sample positions. `parse_stream` bundles the
+  records as `tone_updates` and cumulative centres as `tone_centers_by_revision`.
+  The receiver CLI accepts `--subscribe_tone_updates`. Mock subscription is
+  explicitly unsupported; ordinary mock captures are unchanged.
+
+- `parse_stream` now returns the same modulation fields as `parse_samples`,
+  normalises tone frequencies to modulation centres, and applies the same
+  readout correction by default (`apply_readout_correction=False` for raw I/Q).
+  Capture dates are retained and telescope timestamps remain unsigned 64-bit.
+
+- `receive_stream(duration=30)` records for 30 seconds and returns the absolute
+  capture path for `parse_stream(path)`, with metadata at `path + '.json'`.
+  Omitting duration still records until interrupted or disconnected. The return
+  value is now the path instead of the last printed IQ frame (usually `None`).
+  Also supported in mock mode and by the receiver CLI's `--duration` option.
+
+- **RF mixerless module selected by config: `rf_frontend.mixerless_module.model`**
+  (`cardiff_dual` default, `manchester_single`, `rx_prototype`; table
+  `MIXERLESS_MODULE_MODELS` in `server/rf_peripherals.py`, by expander address,
+  replacing `_mixerless_module_hw_config_list`). `rx_prototype` = one channel,
+  RX 0x3D / TX 0x38 (measured; 0x3C's bypass bit cuts RX by 47 dB), TX bypass only; its RX reads as never bypassed and takes S21/P1dB
+  from `rx_amp_enabled_s21_db` / `rx_input_1db_comp_dbm` only (warning while unset);
+  its `rx_input_1db_comp_dbm` is taken at 0 dB RX attenuation and the current
+  attenuation is added (`get_rx_input_1db_comp`).
+  Per-path `has_bypass_amp(path)`; `get_info('rf_frontend')` adds
+  `mixerless_module_model`, `bypass_amp_paths`. See doc/rf_peripherals.md.
+
+- **A missing RF module channel ends the channel list instead of being skipped**,
+  so channel 1 can no longer take channel 0's place and drive another
+  pipeline's RF chain.
+
+- **LNA service polls one channel at a time**, releasing the hardware lock
+  between channels (`LNAService.poll_loop`): a request no longer waits behind a
+  whole ~18 s sweep of a v2 board, only one ~1.3 s channel read.
+
+- **LNA health messages tell an open sense line from a missing LNA**
+  (`_lna_health` in `server/lna_controller.py`). A remote reading above both
+  2 V and the local voltage is reported as an open sense line (use
+  `method='local'`); "draws no bias current" needs the output on (v2). A v2
+  channel switched off is no longer reported as disconnected. A failed
+  remote-method set now says if the output was off and where the local
+  voltage was left.
+
+- **LNA service request timeout 15 s -> 180 s** (`DEFAULT_LNA_SERVICE_TIMEOUT_S`,
+  `lna_service.timeout_s` in site.yaml): a remote-method set of one channel
+  measured 46.5 s on krm4.
+
+- **`server/lna_controller.py` imports without `smbus2`**, so the `remote`
+  backend works from a host PC.
+
+- **`get_rf_peripheral_status()` now includes `supports_bypass_amps`**: without
+  it the client's config snapshot always recorded both bypass states as `None`.
+
 ## v1.8.1
 
 Software only: the same firmware v7.12.1 image as v1.8.0. Measurements and

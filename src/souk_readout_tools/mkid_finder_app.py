@@ -23,9 +23,10 @@ if not _log.handlers:
     _handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
     _log.addHandler(_handler)
 
-from scipy.signal import butter, filtfilt, find_peaks, peak_widths
+from scipy.signal import butter, filtfilt, find_peaks
 from scipy.ndimage import median_filter
 from souk_readout_tools.resonator import estimate_resonance_empirical
+from souk_readout_tools.peak_finder import _candidate_analysis_slice
 
 import matplotlib
 import matplotlib.transforms
@@ -108,20 +109,27 @@ class Resonance:
         logmag_data,
         filtered_data,
         peak_idx,
+        peak_properties=None,
+        candidate_index=0,
     ):
         """Perform analysis and store results.
 
         ``frequencies`` and ``s21_complex`` are the sweep axis (Hz) and complex
         S21; ``logmag_data`` and ``filtered_data`` are the log-magnitude trace
         and its filtered version; ``peak_idx`` indexes this resonance's dip
-        within those arrays.
+        within those arrays.  The estimate uses a local window around the dip,
+        sized from the ``find_peaks`` widths in ``peak_properties`` (entry
+        ``candidate_index``) when given, else at least 1001 points.
         """
         _log.debug(f'Resonance.analyse at {frequencies[peak_idx]/1e6:.3f} MHz')
         self.peak_idx = peak_idx
+        window = _candidate_analysis_slice(
+            peak_idx, candidate_index, peak_properties or {}, len(frequencies),
+            min_points=101 if peak_properties else 1001)
         estimate = estimate_resonance_empirical(
-            frequencies,
-            s21_complex,
-            peak_index=peak_idx,
+            frequencies[window],
+            s21_complex[window],
+            peak_index=peak_idx - window.start,
         )
 
         # Store results
@@ -567,13 +575,13 @@ class AnalysisWorker(QObject):
             
             self.progress.emit(f"Analyzing {len(peaks)} resonances...")
             
-            # Vectorized analysis - do ALL peaks at once
             analysis_results = self._analyze_all_peaks(
                 peaks,
                 filtered_data,
                 self.frequencies,
                 self.s21_complex,
                 self.log_magnitude,
+                peak_properties,
             )
             
             if self._cancelled:
@@ -598,10 +606,12 @@ class AnalysisWorker(QObject):
         frequencies,
         s21_complex,
         log_magnitude,
+        peak_properties=None,
     ):
         """
-        Analyze all peaks using the same S21 dip geometry as the resonator
-        empirical estimator, but keep the width search vectorized for the GUI.
+        Analyze all peaks with the resonator empirical estimator, each in the
+        local window ``peak_finder.find_mkid_resonances`` uses (sized from the
+        ``find_peaks`` widths in ``peak_properties``).
         Returns a dict of arrays with results for each peak.
         """
         peaks = np.asarray(peaks, dtype=int)
@@ -625,91 +635,36 @@ class AnalysisWorker(QObject):
         filtered_data = np.asarray(filtered_data, dtype=float).ravel()
         log_magnitude = np.asarray(log_magnitude, dtype=float).ravel()
         z = np.asarray(s21_complex, dtype=complex).ravel()
-        mag_db = 20.0 * np.log10(np.abs(z) + 1e-300)
-        finite = np.isfinite(frequencies) & np.isfinite(mag_db)
-        peaks = peaks[(peaks >= 0) & (peaks < frequencies.size)]
-        peaks = peaks[finite[peaks]]
-        if len(peaks) == 0 or not np.any(finite):
-            return {
-                'peak_idx': np.array([], dtype=int),
-                'frequencies': np.array([]),
-                'fwhm': np.array([]),
-                'q_factor': np.array([]),
-                'qc': np.array([]),
-                'qi': np.array([]),
-                'dip_depth': np.array([]),
-                'skew': np.array([]),
-                'marker_mag': np.array([]),
-                'marker_filt': np.array([]),
-            }
+        if peak_properties is None:
+            peak_properties = {}
+        candidate = np.arange(len(peaks))
+        keep = (peaks >= 0) & (peaks < frequencies.size)
+        peaks, candidate = peaks[keep], candidate[keep]
 
-        # Dip depth is measured against the weaker shoulder, matching the
-        # scalar empirical estimator and avoiding exaggerated widths on slopes.
-        mag_for_shoulders = np.where(finite, mag_db, -np.inf)
-        left_shoulder = np.maximum.accumulate(mag_for_shoulders)[peaks]
-        right_shoulder = np.maximum.accumulate(mag_for_shoulders[::-1])[::-1][peaks]
-        dip_db = mag_db[peaks]
-        depth_db = np.maximum(0.0, np.minimum(left_shoulder, right_shoulder) - dip_db)
+        # Analyse each dip in the same local window as
+        # peak_finder.find_mkid_resonances.  Estimating against the whole
+        # wideband trace takes the shoulders from far-off baseline ripple,
+        # which inflates the depth and lets the width walk run for MHz.
+        results = []
+        for peak_idx, cand in zip(peaks, candidate):
+            if self._cancelled:
+                break
+            window = _candidate_analysis_slice(
+                peak_idx, cand, peak_properties, frequencies.size)
+            results.append(estimate_resonance_empirical(
+                frequencies[window], z[window],
+                peak_index=int(peak_idx - window.start)))
+        peaks = peaks[:len(results)]
 
-        # peak_widths expects peaks rather than dips.  Supplying the S21-based
-        # prominence keeps the contour level identical to the scalar estimator.
-        freq_step = (
-            float(np.nanmedian(np.abs(np.diff(frequencies[finite]))))
-            if np.count_nonzero(finite) > 1
-            else 1.0
-        )
-        freq_step = freq_step if np.isfinite(freq_step) and freq_step > 0.0 else 1.0
-        left_width = np.full(len(peaks), np.nan, dtype=float)
-        right_width = np.full(len(peaks), np.nan, dtype=float)
-        linewidth = np.full(len(peaks), freq_step, dtype=float)
-        positive_depth = depth_db > 0.0
-        if np.any(positive_depth) and not self._cancelled:
-            y = -np.where(finite, mag_db, np.nanmax(mag_db[finite]) + 1.0)
-            use_peaks = peaks[positive_depth]
-            widths = peak_widths(
-                y,
-                use_peaks,
-                rel_height=0.5,
-                prominence_data=(
-                    depth_db[positive_depth],
-                    np.zeros(len(use_peaks), dtype=int),
-                    np.full(len(use_peaks), len(y) - 1, dtype=int),
-                ),
-            )
-            sample_axis = np.arange(len(frequencies), dtype=float)
-            f_left = np.interp(widths[2], sample_axis, frequencies)
-            f_right = np.interp(widths[3], sample_axis, frequencies)
-            fr_good = frequencies[use_peaks]
-            left_width[positive_depth] = np.maximum(fr_good - f_left, 0.0)
-            right_width[positive_depth] = np.maximum(f_right - fr_good, 0.0)
-            measured_width = left_width[positive_depth] + right_width[positive_depth]
-            linewidth[positive_depth] = np.where(
-                measured_width > 0.0,
-                measured_width,
-                freq_step,
-            )
+        fr = np.array([e.fr for e in results], dtype=float)
+        linewidth = np.array([e.linewidth_hz for e in results], dtype=float)
+        q_factor = np.array([e.Ql for e in results], dtype=float)
+        qc = np.array([e.Qc for e in results], dtype=float)
+        qi = np.array([e.Qi for e in results], dtype=float)
+        depth_db = np.array([e.dip_depth_db for e in results], dtype=float)
+        skew = np.array([e.skew for e in results], dtype=float)
 
-        fr = frequencies[peaks]
-        skew = np.where(
-            np.isfinite(left_width + right_width),
-            (right_width - left_width) / linewidth,
-            np.nan,
-        )
-        with np.errstate(divide='ignore', invalid='ignore'):
-            q_factor = np.where(linewidth > 0.0, np.abs(fr / linewidth), np.inf)
-            qc = np.where(
-                (depth_db > 0.0) & np.isfinite(q_factor),
-                q_factor / (1.0 - 10.0 ** (-depth_db / 20.0)),
-                np.inf,
-            )
-            denom = np.where(
-                (q_factor != 0.0) & (qc != 0.0),
-                1.0 / q_factor - 1.0 / qc,
-                0.0,
-            )
-            qi = np.where(denom != 0.0, 1.0 / denom, np.inf)
-
-        marker_mag = mag_db[peaks].copy()
+        marker_mag = np.full(len(peaks), np.nan, dtype=float)
         marker_filt = np.full(len(peaks), np.nan, dtype=float)
         in_log = peaks < log_magnitude.size
         in_filtered = peaks < filtered_data.size
@@ -1300,6 +1255,8 @@ class ResonanceFinderApp(QMainWindow):
                     self.log_magnitude,
                     self.filtered_data,
                     peak_idx,
+                    self.peak_properties,
+                    i,
                 )
                 self.resonances.append(matched_resonance)
             else:
@@ -1311,6 +1268,8 @@ class ResonanceFinderApp(QMainWindow):
                     self.log_magnitude,
                     self.filtered_data,
                     peak_idx,
+                    self.peak_properties,
+                    i,
                 )
                 self.resonances.append(new_resonance)
         self.updateResonanceIndexes()

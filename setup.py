@@ -90,6 +90,8 @@ if install_client:
         'souk-batch-snapshots=souk_readout_tools.client.client_scripts.batch_snapshots:main',
         'souk-find-resonances=souk_readout_tools.client.client_scripts.find_resonances:main',
         'souk-stream-to-dac=souk_readout_tools.client.client_scripts.stream_to_dac:main',
+        'souk-receive-stream=souk_readout_tools.client.client_scripts.receive_stream:main',
+        'souk-live-plot=souk_readout_tools.client.client_scripts.live_plot:main',
         'souk-find-boards=souk_readout_tools.board_management:_cli_find_boards',
         'souk-board-status=souk_readout_tools.board_management:_cli_status',
         'souk-board-power=souk_readout_tools.board_management:_cli_power',

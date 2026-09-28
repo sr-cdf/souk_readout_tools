@@ -113,7 +113,7 @@ per machine rather than one edit per pipeline config:
 lna_service:
   host: "10.11.11.11"   # the RFSoC wired to the LNA bias board
   port: 10500
-  timeout_s: 15.0
+  timeout_s: 180.0
 ```
 
 Prefer a hostname if your site has stable DNS or `/etc/hosts` entries — then a

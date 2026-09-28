@@ -164,6 +164,17 @@ rf_frontend:
   # for non-mixerless RF frontends (e.g. a RUDAT bench setup).
   mixerless_module:
     connected: true
+    model: cardiff_dual              # which module is fitted -- sets its i2c addresses
+                                     # and which paths have a bypass amp. One of
+                                     # MIXERLESS_MODULE_MODELS in server/rf_peripherals.py:
+                                     #   cardiff_dual       2 ch, 0x3B/0x3A + 0x39/0x38, TX+RX bypass
+                                     #   manchester_single  1 ch, 0x3B/0x3A, TX+RX bypass
+                                     #   rx_prototype       1 ch, RX 0x3D / TX 0x38, new RX
+                                     #                      circuit: TX bypass only. Its RX S21 is
+                                     #                      not modelled: set rx_amp_enabled_s21_db
+                                     #                      and rx_input_1db_comp_dbm below.
+                                     # (addresses are recv/transmit; check with
+                                     #  `i2cdetect -y -r 0 0x38 0x3f` on the board)
     rf_channel: 0                    # module channel (0 or 1); copy_template_config()
                                      # sets this to match firmware.pipeline_id by default
     # Optional measured mixerless-module calibration overrides.
@@ -172,6 +183,8 @@ rf_frontend:
     # These override the built-in component model when set. The *_delta_s21_db
     # keys are bypassed-minus-enabled S21, useful when only the bypass change
     # is measured. Prefer absolute enabled/bypassed S21 values when available.
+    # On a path with no bypass amp (see model above) *_amp_enabled_s21_db is the
+    # only source of that path's module S21 (excluding the variable attenuator).
     tx_amp_enabled_s21_db:
     tx_amp_bypassed_s21_db:
     tx_amp_bypass_delta_s21_db:
@@ -180,6 +193,9 @@ rf_frontend:
     rx_amp_bypass_delta_s21_db:
     # Input-referred 1 dB compression points for the mixerless-module path.
     # If unset, the wrapper uses the component model as a fallback.
+    # With model rx_prototype, rx_input_1db_comp_dbm is the value measured at
+    # 0 dB RX attenuation; the server adds the current attenuation, since that
+    # module's attenuator sits ahead of the compressing stage.
     tx_input_1db_comp_dbm:
     rx_input_1db_comp_dbm:
     # Optional module-only group delay. Full path deembedding still uses

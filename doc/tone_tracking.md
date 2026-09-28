@@ -83,7 +83,18 @@ Client support:
 - `stream_dac.SocketFrameSource(subscribe_updates=True)` subscribes, parses
   typed frames and queues them; `StreamToDac` logs them to a JSONL sidecar
   (`<recording>.updates.jsonl`) next to the raw recording.
-  `receive_stream.py` is untouched and keeps working.
+- Binary `receive_stream(duration=30, subscribe_tone_updates=True)` saves
+  typed records in `<capture>.updates.jsonl`; the CLI accepts
+  `--subscribe_tone_updates`. `parse_stream(path)` loads the records into
+  `tone_updates`, with `sample_index` recording how many IQ frames preceded
+  each event on the socket (not necessarily the first sample of its revision).
+  `tone_centers_by_revision[revision]` gives cumulative tone-keyed centres in
+  Hz, carrying unchanged tones forward from the snapshot. Use each sample's
+  `modulation_revision` to look up its centres. Missing entries are unknown;
+  repeated revision IDs retain the latest map, so use the ordered records
+  across resets/wraps. Dry-run events are retained but do not change centres.
+  Initial readout-correction factors and analysis settings are not updated
+  automatically from these events. Mock binary subscription is unsupported.
 - `receive_stream_g3(subscribe_tone_updates=True)` emits a G3 Wiring frame
   (update JSON in `'status'`, like the start-of-stream Wiring frame) when a
   `TONE_UPDATE` arrives mid-stream.
@@ -132,9 +143,19 @@ runs there against a shared-memory accumulator and the finished window comes
 back through the same shared block; nothing else changes.
 
 **Estimator**: `estimate_detunings` is a lean whole-array implementation of
-`demodulate`'s model-free `method='fast'` maths (finite-difference phase
-slope + curvature; detuning from the curvature/slope ratio, which crosses
-zero at resonance independent of the unknown phase offset). Unit tests
+`demodulate`'s `method='fast'` maths (finite-difference phase slope +
+curvature; detuning from the curvature/slope ratio, which crosses zero at the
+phase inflection independent of the phase offset). The window's I/Q is first
+de-embedded and circle-centred per tone (`center_iq`) with fits of the latest
+sweep in server memory, which `enable_tracking` makes when it starts. Tones
+without a fit are never corrected. On the centred phase a notch is exactly
+`-2 atan(2x)`, which inverts to `x = -φ''/(2φ'|φ'|)`: detuning in linewidths
+from slope and curvature alone, without compression (within ~1% at ±0.1 lw
+offsets); the linewidth only converts to Hz. Uncentred, the same numbers taken
+about the raw origin read 13× to 25× high. With the earlier `-(φ''/φ')·lw/8`
+form, that made the simulated loop limit-cycle at ±0.3 lw or park 0.5–0.8 lw
+off resonance on deep dips. Centring costs ~14 ms per window at 1000 tones
+(host; `stage_ms['center']`). Unit tests
 assert numerical agreement with `demodulate` to 1e-10, on a sorted
 three-point pattern and on the fw default in several slot orders.
 Settling-flagged samples are excluded by the tap, so they never enter the
@@ -356,9 +377,9 @@ If a residual effect matters, compute it from the logged step times/sizes
 
 | key | default | meaning |
 |---|---|---|
-| `linewidth_hz` | (from `enable_modulation`) | per-tone linewidths; **required** here or at `enable_modulation` (`params_from_sweep` output carries it) |
+| `linewidth_hz` | (from `enable_modulation`, else fr/Ql of the server's fits) | per-tone linewidths |
 | `dry_run` | `True` | decide/log/announce only, no applies |
-| `threshold_linewidths` | 0.3 | deadband on the filtered detuning (wider than `demodulate`'s 0.1 by design) |
+| `threshold_linewidths` | 0.05 | deadband on the filtered detuning, in true linewidths from the inflection |
 | `confirm_windows` | 3 | consecutive decision windows over threshold |
 | `gain` | 1.0 | `new_center = center − gain · detuning_hz` |
 | `max_step_linewidths` | 0.5 | per-decision step clamp |
@@ -437,14 +458,14 @@ correcting/suppressed), `recenter_pending` (a `bin` correction staged),
 `no_data` (nothing usable yet), and **`unlocked`** — the resonance is
 likely lost and the loop would be tracking noise.
 
-`unlocked` is deliberately **not** detected from a large detuning reading:
-the model-free estimate *compresses* (≈ `x/2/(1+x²)`, saturating near 0.25
-linewidths), so a resonance that has run far away reads a deceptively
-*small* detuning. Instead it is caught by the **phase slope collapsing**
+`unlocked` is not detected from the detuning reading by default: far from
+resonance it divides by a vanishing slope squared, so it is noise rather than
+a reliably large number. Instead it is caught by the **phase slope collapsing**
 below `unlock_slope_ratio` of the on-resonance baseline (a flat phase far
 from resonance has no responsivity) and/or by the invalid-cycle fraction
 exceeding `unlock_invalid_fraction`. `unlock_detuning_linewidths` can
-additionally trip on the reading, but is off by default for this reason.
+additionally trip on the reading (it is in true linewidths out to a couple of
+linewidths), but is off by default for this reason.
 So the monitor's "have we lost the resonance / are we tracking noise?"
 question is answered by `n_unlocked` and each tone's `slope_ratio`, not by
 the detuning magnitude alone.
@@ -524,7 +545,8 @@ client.enable_stream()
 (`engine='sw'` works identically here and takes any number of points ≥ 3.)
 
 **3. Start tracking in dry-run** (the default) and watch it before letting
-it touch anything:
+it touch anything. It fits the sweep held in server memory (step 1's) to
+centre the I/Q, so re-enable tracking after a new sweep:
 
 ```python
 client.enable_tracking()                       # dry_run=True

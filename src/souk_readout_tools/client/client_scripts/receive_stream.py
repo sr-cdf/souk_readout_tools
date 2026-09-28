@@ -35,10 +35,18 @@ def main():
     parser.add_argument('-r', '--request_port', type=int,
                         default=None,
                         help='Readout server request port. Must be used with --address if --config_file is not given; the remote config will be pulled from this server.')
-    parser.add_argument('-n', '--num_tones', type=int, default=2048, help='Number of tones to receive, default is all 2048. Save disk space by specifying the actual number of tones')
+    parser.add_argument('-n', '--num_tones', type=int, default=None,
+                        help='Expected number of active tones; default infers it from the first stream frame')
     parser.add_argument('-d', '--directory', type=str, default='./tmp', help='Directory where the file will be saved, default is ./tmp')
-    parser.add_argument('-f', '--filename', type=str, default='tmp_stream', help='Filename to save the data to, default is tmp_stream')
+    parser.add_argument('-f', '--filename', type=str, default=None, help='Filename to save the data to, default is the first unused tmp_stream, tmp_stream_1, ...')
+    parser.add_argument('--overwrite', action='store_true', help='Replace an existing capture at --filename')
     parser.add_argument('-p', '--print_data', action='store_true', help='Prints out the data to the console')
+
+    parser.add_argument('--duration', type=float, default=None,
+                        help='Capture duration in seconds; default waits until interrupted')
+
+    parser.add_argument('--subscribe_tone_updates', action='store_true',
+                        help='Save in-stream snapshots and tone updates alongside IQ data')
 
     args  = parser.parse_args()
 
@@ -58,9 +66,17 @@ def main():
     else:
         parser.error('Either --config_file or both --address and --request_port are required')
 
-    client.receive_stream(print_data=args.print_data,
+    if args.filename is None:
+        filename = readout_client._unused_stream_filename(os.path.join(args.directory, 'tmp_stream'))
+    else:
+        filename = os.path.join(args.directory, args.filename)
+    path = client.receive_stream(print_data=args.print_data,
                           num_tones=args.num_tones,
-                          filename=os.path.join(args.directory,args.filename))
+                          filename=filename,
+                          duration=args.duration,
+                          subscribe_tone_updates=args.subscribe_tone_updates,
+                          overwrite=args.overwrite)
+    print(f"Saved stream to {path}")
 
     
 

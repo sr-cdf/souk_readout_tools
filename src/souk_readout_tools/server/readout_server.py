@@ -1307,6 +1307,21 @@ class ReadoutServer:
             except Exception as e:
                 _server_log(f'_create_firmware_interfaces: control-register copy not read ({e})',
                             source=source)
+            # A previous server process may have left firmware-slot modulation
+            # running. This process has no config for it, so it would report "not
+            # modulating" and disable_modulation() would take the software path
+            # and never stop the mixer. Rest it so hardware matches the state.
+            if not self.e_fw_modulation_enabled.is_set():
+                try:
+                    mixer = self.r_fast.mixer
+                    if (mixer.get_slot_mode() == 'auto' or mixer.get_manual_slot() != 0
+                            or mixer.get_dwell_accs() != 1):
+                        firmware_lib.disable_fw_modulation(self.r_fast)
+                        _server_log('firmware-slot modulation left running by a previous '
+                                    'server; stopped (slot 0, dwell 1)', source=source)
+                except Exception as e:
+                    _server_log(f'_create_firmware_interfaces: fw modulation state not '
+                                f'checked ({e})', source=source)
         if not ok and self.r is not None and getattr(self.r, 'fpga', None) is not None:
             try:
                 programmed = self.r.fpga.is_programmed()
@@ -1564,16 +1579,22 @@ class ReadoutServer:
                 status = self.rf_peripherals.get_status()
                 tx_bypass = _format_log_value(status.get('tx_amp_bypass', 'unknown'))
                 rx_bypass = _format_log_value(status.get('rx_amp_bypass', 'unknown'))
+
+                # None where the module has no model: a path with no bypass
+                # amp (e.g. rx_prototype's RX) has no total_gain_model.
+                def _db(value):
+                    return 'n/a' if value is None else f'{value:.1f} dB'
+
                 _server_log(
-                    f'  TX: atten={status["tx_attenuation_db"]:.1f} dB, '
+                    f'  TX: atten={_db(status["tx_attenuation_db"])}, '
                     f'amp_bypass={tx_bypass}, '
-                    f'total_gain_model={status["tx_total_gain_db"]:.1f} dB',
+                    f'total_gain_model={_db(status["tx_total_gain_db"])}',
                     source='rf',
                 )
                 _server_log(
-                    f'  RX: atten={status["rx_attenuation_db"]:.1f} dB, '
+                    f'  RX: atten={_db(status["rx_attenuation_db"])}, '
                     f'amp_bypass={rx_bypass}, '
-                    f'total_gain_model={status["rx_total_gain_db"]:.1f} dB',
+                    f'total_gain_model={_db(status["rx_total_gain_db"])}',
                     source='rf',
                 )
 
@@ -2380,9 +2401,12 @@ class ReadoutServer:
             'hardware_available': rf.is_hardware,
             'controllable': rf.is_controllable,
             'supports_bypass_amps': rf.supports_bypass_amps,
+            'bypass_amp_paths': [p for p in ('tx', 'rx') if rf.has_bypass_amp(p)],
             'attenuator_backend': rf.attenuator_backend,
             'rf_channel': status.get('rf_channel', mixerless_cfg.get('rf_channel')),
         }
+        if mixerless_cfg.get('connected', False):
+            info['mixerless_module_model'] = rf.mixerless_model
 
         # Backend-specific identity
         if rf.attenuator_backend == 'rudat':
@@ -2435,8 +2459,9 @@ class ReadoutServer:
             info['tx_input_1db_comp_dbm'] = None
             info['rx_input_1db_comp_dbm'] = None
 
-        # Bypass-amp state (only when the mixerless module is the active frontend)
-        if rf.supports_bypass_amps:
+        # Bypass-amp state (only when the mixerless module is the active
+        # frontend; a path with no bypass amp reads as never bypassed)
+        if 'tx_amp_bypass' in status:
             tx_amp_bypass = status.get('tx_amp_bypass')
             rx_amp_bypass = status.get('rx_amp_bypass')
             tx_amp_model = status.get('tx_bypass_amp_s21_db')
@@ -2487,9 +2512,14 @@ class ReadoutServer:
                      'tx_amp_bypass_delta_s21_db',
                      'rx_amp_enabled_s21_db', 'rx_amp_bypassed_s21_db',
                      'rx_amp_bypass_delta_s21_db',
-                     'tx_input_1db_comp_dbm', 'rx_input_1db_comp_dbm',
                      'tx_group_delay_ns', 'rx_group_delay_ns'):
             info[key] = mixerless_cfg.get(key)
+        # The P1dB keys above already hold the value in effect -- the override,
+        # the component model, or for rx_prototype the override plus the RX
+        # attenuation -- so the raw config value only fills a gap.
+        for key in ('tx_input_1db_comp_dbm', 'rx_input_1db_comp_dbm'):
+            if info.get(key) is None:
+                info[key] = mixerless_cfg.get(key)
 
         return info
 
@@ -3284,15 +3314,20 @@ class ReadoutServer:
 
 
                 elif request == 'enable_stream':
-                    self._isolate_frame_thread()       # catch threads started since
-                    self._reset_loop_timing()
-                    self.stream_sparse_read = message.get('sparse_read')
-                    if self.stream_process is not None:
-                        self.stream_process.send('sparse_read', self.stream_sparse_read)
-                    self.e_triggered_stream_enabled.clear()
-                    self._set_streaming(True)
-                    print('Stream enabled, clients:', self.stream_clients)
-                    await self.send_response(writer, {'status': 'success'})
+                    if self.sweep_task is not None and not self.sweep_task.done():
+                        await self.send_response(writer, {
+                            'status': 'error',
+                            'message': 'a sweep is in progress; enable_stream after it finishes'})
+                    else:
+                        self._isolate_frame_thread()       # catch threads started since
+                        self._reset_loop_timing()
+                        self.stream_sparse_read = message.get('sparse_read')
+                        if self.stream_process is not None:
+                            self.stream_process.send('sparse_read', self.stream_sparse_read)
+                        self.e_triggered_stream_enabled.clear()
+                        self._set_streaming(True)
+                        print('Stream enabled, clients:', self.stream_clients)
+                        await self.send_response(writer, {'status': 'success'})
 
                 elif request == 'disable_stream':
                     if self.e_modulation_enabled.is_set():
@@ -3424,6 +3459,23 @@ class ReadoutServer:
                     except Exception as e:
                         print(traceback.format_exc())
                         await self.send_response(writer, {'status': 'error', 'message': str(e)})
+
+                elif request == 'update_modulation_to_inflection':
+                    try:
+                        if getattr(self, '_auto_inflection_busy', False):
+                            raise RuntimeError('automatic modulation update is already running')
+                        self._auto_inflection_busy = True
+                        try:
+                            result = await self._update_modulation_to_inflection(
+                                engine=message.get('engine'))
+                        finally:
+                            self._auto_inflection_busy = False
+                        await self.send_response(writer, {
+                            'status': 'success', 'result': result})
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        await self.send_response(writer, {
+                            'status': 'error', 'message': str(e)})
 
                 elif request == 'update_modulation':
                     # Seamless live update of centre and/or offsets. Rides the
@@ -3876,8 +3928,9 @@ class ReadoutServer:
                 elif request == 'enable_tracking':
                     # Start (or reconfigure) the FFM tone-tracking loop on
                     # whichever modulation engine is armed (fw or sw).
-                    # Requires >= 3 points/slots and per-tone linewidths
-                    # (here or at enable_modulation). dry_run defaults to
+                    # Requires >= 3 points/slots and a sweep in server
+                    # memory to fit (the I/Q is circle-centred with those
+                    # calibrations, which also supply linewidths). dry_run defaults to
                     # True: full estimate/decide/log/announce pipeline, no
                     # hardware applies.
                     try:
@@ -3893,7 +3946,19 @@ class ReadoutServer:
                         if self.tracking is not None:
                             self.tracking.stop()
                             self.tracking = None
-                        runtime = tone_tracking.TrackingRuntime(self, params)
+                        # The estimator works on circle-centred I/Q, so every
+                        # tracked tone needs a fit from the latest server sweep
+                        # (which also supplies the linewidths when none are given).
+                        cfg = ((self.fw_modulation_cfg
+                                if self.e_fw_modulation_enabled.is_set()
+                                else self.modulation_cfg) or self.fw_modulation_cfg)
+                        if cfg is None:
+                            raise ValueError('modulation must be armed '
+                                             '(enable_modulation) before enable_tracking')
+                        calibrations = await self.to_thread(
+                            self._calibrations_from_latest_sweep,
+                            [int(t) for t in cfg['mod_indices']])
+                        runtime = tone_tracking.TrackingRuntime(self, params, calibrations)
                         runtime.start()
                         self.tracking = runtime
                         await self.send_response(writer, {'status': 'success',
@@ -4354,6 +4419,7 @@ class ReadoutServer:
                 elif request == 'sweep':
                     if self.sweep_task is None or self.sweep_task.done():
                         try:
+                            self._refuse_while_streaming('sweep')
                             self._begin_exclusive_frequency_operation('sweep')
                             centers = message.get('centers')
                             spans = message.get('spans')
@@ -4498,6 +4564,7 @@ class ReadoutServer:
                 elif request == 'retune':
                     if self.sweep_task is None or self.sweep_task.done():
                         try:
+                            self._refuse_while_streaming('retune')
                             self._begin_exclusive_frequency_operation('retune')
                             centers = message.get('centers')
                             spans = message.get('spans')
@@ -4887,6 +4954,23 @@ class ReadoutServer:
             except Exception as e:
                 print(f"Error sending SNAPSHOT frame: {e}")
 
+    @staticmethod
+    def _stream_modulation_state(state, engine, revision=None):
+        """Self-contained modulation metadata for one tagged stream revision.
+
+        Keep per-tone offsets and RX readout correction; a centre-only delta
+        cannot decode an offset change or correct raw I/Q at the new centre.
+        Omit the accumulating revision history from every typed announcement.
+        """
+        if state is None:
+            return None
+        snapshot = {key: copy.deepcopy(value) for key, value in state.items()
+                    if key != 'revision_history'}
+        snapshot['engine'] = engine
+        if revision is not None:
+            snapshot['applied_revision'] = int(revision)
+        return snapshot
+
     def _tone_update_snapshot(self):
         """Build the SNAPSHOT payload sent to a newly subscribed client.
 
@@ -4916,6 +5000,7 @@ class ReadoutServer:
         else:
             payload['revision'] = 0
             payload['modulation'] = None
+            payload['modulation_state'] = None
             payload['tracking'] = (self.tracking.status() if self.tracking
                                    else {'enabled': False})
             return payload
@@ -4934,6 +5019,8 @@ class ReadoutServer:
                            if i < len(center)},
             'offsets_hz': np.asarray(offsets, dtype=float).tolist(),
         }
+        payload['modulation_state'] = self._stream_modulation_state(
+            state, engine, payload['revision'])
         payload['tracking'] = (self.tracking.status() if self.tracking
                                else {'enabled': False})
         return payload
@@ -4988,6 +5075,8 @@ class ReadoutServer:
                     'revision': int(cmd['revision']),
                     'kind': kind,
                     'engine': cmd.get('engine', 'sw'),
+                    'modulation_state': self._stream_modulation_state(
+                        state, cmd.get('engine', 'sw'), cmd['revision']),
                     'source': cmd.get('source', 'client'),
                     'mod_indices': mod_indices,
                     'centers_hz': {str(i): float(center[i]) for i in changed},
@@ -5000,6 +5089,8 @@ class ReadoutServer:
                     payload['expected_transient_cycles'] = 1
                 if 'announce' in cmd:
                     payload.update(cmd['announce'])
+            if cmd is None:
+                payload['modulation_state'] = None
             self._write_typed_update_frame(tone_tracking.pack_typed_frame(
                 tone_tracking.FRAME_TYPE_TONE_UPDATE, payload))
         except Exception as e:
@@ -6180,11 +6271,180 @@ class ReadoutServer:
         if epoch != self._modulation_command_epoch:
             raise RuntimeError('modulation command superseded by a newer request')
 
+    def _calibrations_from_latest_sweep(self, tone_indices):
+        """Fit selected resonators from the last sweep retained in RAM.
+
+        Called in to_thread: fitting can be slow, especially for many tones.
+        Cache only fits associated with the current sweep snapshot.
+        """
+        if not self.latest_sweep_data_valid:
+            raise ValueError(
+                'no valid sweep is held in server memory; run a targeted '
+                'sweep before tracking or automatic phase recentering')
+        sweep = self.latest_sweep_results
+        token = id(sweep)
+        if getattr(self, '_sweep_calibration_token', None) != token:
+            self._sweep_calibration_token = token
+            self._sweep_calibrations = {}
+        cache = self._sweep_calibrations
+        indices = [int(t) for t in tone_indices]
+        missing = [t for t in indices if t not in cache]
+        if missing:
+            from souk_readout_tools.fitting import fit_sweep_stack
+            from souk_readout_tools.resonator import ResonatorCalibration
+            f = np.asarray(sweep['sweep_frequencies'], dtype=float)
+            z = np.asarray(sweep['sweep_responses'], dtype=complex)
+            e = np.asarray(sweep['sweep_sems'], dtype=complex)
+            correction = sweep.get('readout_correction')
+            if correction is not None:
+                correction = np.asarray(correction, dtype=float)
+                z = z * correction
+                e = e * correction
+            if any(t < 0 or t >= f.shape[1] for t in missing):
+                raise ValueError('modulated tone index is absent from the latest sweep')
+            fits = fit_sweep_stack(
+                f[:, missing], z[:, missing], e[:, missing],
+                sweep_direction=sweep.get('direction', 'up'),
+                verbose=False, n_jobs=1)
+            # Remember failed fits too, so repeat calls do not refit an
+            # unfit tone in the same sweep. A batch error remains retryable.
+            for tone in missing:
+                cache[tone] = None
+            for tone, fit in zip(missing, fits):
+                if fit is None or not np.isfinite(fit.fr):
+                    continue
+                try:
+                    cal = ResonatorCalibration.from_fit(fit)
+                except (ValueError, TypeError, ZeroDivisionError):
+                    continue
+                if np.isfinite(cal.fr) and np.isfinite(cal.Ql) and cal.Ql > 0:
+                    cache[tone] = cal
+        if (not self.latest_sweep_data_valid
+                or id(self.latest_sweep_results) != token):
+            raise RuntimeError('server sweep changed while calibrations were fitting')
+        return {t: cache[t] for t in indices if cache.get(t) is not None}
+
+    async def _update_modulation_to_inflection(self, engine=None):
+        """Take one server-side, calibrated phase-curvature correction step."""
+        state = self._info_modulation()
+        if not state.get('enabled'):
+            raise ValueError('modulation must be enabled for an automatic update')
+        actual_engine = state.get('engine')
+        if engine is not None and engine != actual_engine:
+            raise ValueError(f'active modulation engine is {actual_engine!r}, '
+                             f'not {engine!r}')
+        if not self.e_stream_enabled.is_set():
+            raise ValueError('a live stream is required for an automatic update')
+        cfg = (self.fw_modulation_cfg if actual_engine == 'fw'
+               else self.modulation_cfg)
+        indices = [int(t) for t in cfg['mod_indices']]
+        if not indices or int(state.get('num_points', 0)) < 3:
+            raise ValueError('automatic update needs at least three modulation '
+                             'points on selected tones')
+        calibrations = await self.to_thread(
+            self._calibrations_from_latest_sweep, indices)
+        if not calibrations:
+            raise ValueError('no modulated tones have usable fits in the '
+                             'server memory sweep')
+
+        temporary = self.tracking is None
+        if temporary:
+            params = dict(self.TRACKING_DEFAULTS)
+            params.update(poll_interval_s=0.75, iq_average_s=0.75,
+                          dry_run=True, lo_auto_commit=False,
+                          bin_auto_commit=False)
+            params['linewidth_hz'] = [
+                (calibrations[t].fr / calibrations[t].Ql if t in calibrations
+                 else float('nan')) for t in indices]
+            runtime = tone_tracking.TrackingRuntime(self, params, calibrations)
+            runtime.start()
+            self.tracking = runtime
+        else:
+            runtime = self.tracking
+            if runtime.engine != actual_engine:
+                raise ValueError('tracking is running on a different modulation engine')
+            if (runtime.num_points != int(state['num_points'])
+                    or runtime.mod_indices != indices):
+                raise ValueError('tracking modulation layout is stale; re-enable '
+                                 'tracking after changing points or tone selection')
+            # A centre update can change RX flattening even if the offsets
+            # stay fixed. Refresh the estimator's metadata from applied state.
+            runtime.offsets = runtime._full_offsets(cfg)
+            runtime.readout_correction = (
+                tone_tracking.modulation.readout_correction_factors(
+                    {'modulation': state}, runtime.n_tones))
+        try:
+            runtime.phase_calibrations = calibrations
+            runtime.last_phase_estimate = None
+            runtime.phase_estimate_requested = True
+            deadline = time.monotonic() + max(
+                8.0, 2.5 * float(runtime.params['poll_interval_s']))
+            while runtime.last_phase_estimate is None:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('no complete live I/Q window reached the '
+                                       'server estimator; no update was applied')
+                await asyncio.sleep(0.1)
+            phase = runtime.last_phase_estimate
+            if 'error' in phase:
+                raise RuntimeError('calibrated phase estimate failed: '
+                                   + phase['error'])
+            revision = int(state.get('applied_revision', 0))
+            if phase['revision'] != revision or int(
+                    self._info_modulation().get('applied_revision', -1)) != revision:
+                raise RuntimeError('modulation changed during the estimate; '
+                                   'no update was applied')
+            centers = phase['centers']
+            corrections = {}
+            shifts = {}
+            skipped = {}
+            for j, tone in enumerate(phase['indices']):
+                cal = calibrations[tone]
+                lw = float(cal.fr / cal.Ql)
+                slope = float(phase['slope'][j])
+                curvature = float(phase['curvature'][j])
+                if not (np.isfinite(lw) and lw > 0 and np.isfinite(slope)
+                        and np.isfinite(curvature)):
+                    skipped[tone] = 'invalid fitted linewidth or phase derivative'
+                    continue
+                if abs(centers[tone] - cal.fr) > 5 * lw:
+                    skipped[tone] = 'centre is over five fitted linewidths from calibration'
+                    continue
+                if abs(slope) < 0.25 / lw:
+                    skipped[tone] = 'phase slope is too weak for a reliable correction'
+                    continue
+                # Exact inverse of the centred notch phase -2 atan(2x).
+                shift = float(np.clip(curvature / (2.0 * slope * abs(slope)) * lw,
+                                      -0.5 * lw, 0.5 * lw))
+                if abs(shift) >= 0.01 * lw:
+                    corrections[tone] = float(centers[tone] + shift)
+                    shifts[tone] = shift
+            for tone in indices:
+                if tone not in calibrations:
+                    skipped[tone] = 'no usable fit in latest server sweep'
+            if not corrections:
+                return {'changed': False, 'phase_inflection_shifts_hz': {},
+                        'skipped_tones': skipped}
+            result = await self._commit_tracking_update(
+                actual_engine, 'lo', corrections, {})
+            if 'reclassified_to_bin' in result:
+                raise ValueError('phase correction would exceed fixed-bin '
+                                 'coverage; recenter modulation explicitly')
+            result['changed'] = True
+            result['phase_inflection_shifts_hz'] = shifts
+            result['skipped_tones'] = skipped
+            return result
+        finally:
+            runtime.phase_estimate_requested = False
+            if temporary:
+                runtime.stop()
+                if self.tracking is runtime:
+                    self.tracking = None
+
     # ----- FFM tone tracking (doc/tone_tracking.md) --------------------------
 
     TRACKING_DEFAULTS = {
         'linewidth_hz': None,             # falls back to enable_modulation's
-        'threshold_linewidths': 0.3,      # deadband on the FILTERED detuning
+        'threshold_linewidths': 0.05,     # deadband on the FILTERED detuning
         'confirm_windows': 3,             # consecutive windows over threshold
         'gain': 1.0,                      # new_center = center - gain*detuning
         'max_step_linewidths': 0.5,       # per-decision step clamp
@@ -6308,6 +6568,7 @@ class ReadoutServer:
             center[int(tone)] = float(new_center)
         armed = self.fw_modulation_params.get('armed') if klass == 'lo' \
             else None
+        t0 = time.perf_counter()
         bundle, state, cfg = await self.to_thread(
             self._prepare_fw_modulation, center, c['slot_offsets'],
             c['mod_indices'], c['n_dwell'], mode=c['mode'],
@@ -6320,10 +6581,12 @@ class ReadoutServer:
         cfg['linewidth_hz'] = c.get('linewidth_hz')
         rev = self._next_fw_modulation_revision(cfg)
         previous_center = np.asarray(c['center'], dtype=float)
+        t1 = time.perf_counter()
         if klass == 'lo':
             await self.to_thread(self._update_fw_modulation, bundle, cfg)
         else:
             await self.to_thread(self._apply_fw_modulation, bundle, cfg)
+        t2 = time.perf_counter()
         self.fw_modulation_params = bundle
         self.fw_modulation_cfg = cfg
         state['enabled'] = self.e_fw_modulation_enabled.is_set()
@@ -6337,8 +6600,12 @@ class ReadoutServer:
             {'cfg': cfg, 'state': state, 'revision': rev, 'engine': 'fw',
              'source': 'tracking', 'announce': announce},
             previous_center)
+        t3 = time.perf_counter()
         return {'class': klass, 'revision': rev,
-                'tones': sorted(int(t) for t in corrections)}
+                'tones': sorted(int(t) for t in corrections),
+                'timing_ms': {'prepare': round(1e3 * (t1 - t0), 1),
+                              'apply': round(1e3 * (t2 - t1), 1),
+                              'announce': round(1e3 * (t3 - t2), 1)}}
 
     def _announce_tracking_dry_run(self, klass, corrections, controller):
         """Announce a dry-run tracking decision in-band (nothing applied)."""
@@ -6822,6 +7089,15 @@ class ReadoutServer:
         if self.e_fw_modulation_enabled.is_set():
             return 'firmware-slot modulation enabled'
         return None
+
+    def _refuse_while_streaming(self, operation):
+        """A sweep retunes every tone and reads the accumulator itself, so the
+        stream's frames would be garbage meanwhile -- and with the stream loop
+        in its own process the two really do run at once, contending for the
+        bus and slowing the sweep. Refuse rather than let them overlap."""
+        if self.e_stream_enabled.is_set():
+            raise RuntimeError(f'{operation} cannot run while a stream is enabled; '
+                               f'call disable_stream first')
 
     def _begin_exclusive_frequency_operation(self, operation):
         """
@@ -7421,6 +7697,7 @@ class ReadoutServer:
                 'settle_accumulations': settle_accumulations,
                 'chanmap_settle_accumulations': chanmap_settle_accumulations,
                 'samples_per_second': firmware_lib.get_sample_rate(self.r_fast),
+                'direction': direction,
                 'accumulation_counts': acc_counts,
                 'accumulation_errors': acc_errs,
                 'telescope_time': sweep_tt,

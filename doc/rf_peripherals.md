@@ -67,6 +67,7 @@ rf_frontend:
   hardware_id: "souk-mixerless-module"
   mixerless_module:
     connected: true                 # true for the SOUK mixerless module
+    model: cardiff_dual             # which module is fitted (see "Module models" below)
     rf_channel: 0                   # 0 or 1; copy_template_config() defaults this to pipeline_id
     tx_amp_enabled_s21_db: 20.0     # measured; scalar/table/file
     tx_amp_bypassed_s21_db: -2.0
@@ -102,6 +103,45 @@ This RF channel is separate from the Linux SMBus number. The SOUK RF frontend
 and LNA bias hardware are still accessed through `SMBus(0)`; only the
 module-side RF path/channel changes with the pipeline.
 
+### Module models
+
+`mixerless_module.model` says which physical module is fitted. It is a key of
+`MIXERLESS_MODULE_MODELS` in `server/rf_peripherals.py`, which lists each
+channel's receive/transmit expander addresses and which paths have a bypass
+amp. When you swap a module, change this line; when you get a new module, add a
+row there. The default when the key is missing is `cardiff_dual`.
+
+| `model` | Channels (recv/transmit) | Bypass amps |
+|---|---|---|
+| `cardiff_dual` | 0x3B/0x3A, 0x39/0x38 | TX and RX |
+| `manchester_single` | 0x3B/0x3A | TX and RX |
+| `rx_prototype` | 0x3D/0x38 (one channel) | TX only (new RX circuit) |
+
+The prototype's one channel is controlled from two different channels'
+expanders: RX attenuator on 0x3D, TX attenuator and bypass on 0x38. It also
+answers at 0x39 and 0x3C, which are not in its RF path; 0x3C's "TX bypass"
+bit cuts the RX chain by ~47 dB, so nothing may drive 0x3C.
+
+Its `rx_input_1db_comp_dbm` is the value measured at 0 dB RX attenuation, and
+the server reports it plus the current RX attenuation: the attenuator sits
+ahead of the stage that compresses (at 31.5 dB, −38 dBm total input stayed
+linear to 0.01 dB). On the other models the override is used as given.
+
+To see which module is on the bus, run `i2cdetect -y -r 0 0x38 0x3f` on the
+board (0x3E/0x3F are the LNA v2 bias board). If the configured model's channel
+0 does not answer, the server's RF init fails with an error naming the model
+that matches the bus. A channel that stops answering ends the channel list
+rather than being skipped, so a pipeline never drives another pipeline's RF
+chain.
+
+On a path with no bypass amp, the amp reads as never bypassed,
+`set_{tx,rx}_amp_bypass` raises, and the submodule's component model is not
+used: that path's module S21 comes only from `{tx,rx}_amp_enabled_s21_db` and
+its P1dB only from `{tx,rx}_input_1db_comp_dbm`. The server logs a warning at
+startup while the S21 is unset, because power calibration then assumes 0 dB.
+`get_info('rf_frontend')` reports `mixerless_module_model` and
+`bypass_amp_paths`.
+
 ## Standalone usage
 
 The submodule can be used independently of the readout server.  This is useful
@@ -120,7 +160,7 @@ from souk_rf_mixerless_module import (
 )
 
 bus = SMBus(0)  # /dev/i2c-0
-hw_config = [
+hw_config = [   # cardiff_dual: ch0 at 0x3B/0x3A, ch1 at 0x39/0x38
     SOUKRFMixerlessModuleChnHWConfig(
         r8_r13="R8", r9_r14="R9", r12_r17="R17",
         r18_r21="R21", r19_r22="R19", r20_r23="R23",
@@ -132,6 +172,9 @@ hw_config = [
         u4_type="MAX7329", u8_type="MAX7329",
     ),
 ]
+# For another module, build the list from its addresses instead:
+#   from souk_readout_tools.server.rf_peripherals import MIXERLESS_MODULE_MODELS, _hw_config
+#   hw_config = [_hw_config(ch) for ch in MIXERLESS_MODULE_MODELS['rx_prototype']]
 module = SOUKRFMixerlessModule(bus, hw_config)
 
 # Set TX attenuator to 12.0 dB

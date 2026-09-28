@@ -575,21 +575,37 @@ def load_group_delay_calibration(value, cal_dir=None):
             candidate = os.path.join(cal_dir, os.path.basename(path))
             if os.path.exists(candidate):
                 path = candidate
-        data = np.genfromtxt(path, delimiter=',', names=True, autostrip=True)
-        if getattr(data, 'dtype', None) is not None and data.dtype.names:
-            column_map = {name.lower(): name for name in data.dtype.names}
-            freq_key = column_map.get('freq_hz') or column_map.get('frequency_hz')
-            tau_key = column_map.get('tau_ns') or column_map.get('group_delay_ns')
-            if freq_key is not None and tau_key is not None:
-                return {'frequencies': np.asarray(data[freq_key], dtype=float).ravel(),
-                        'tau_ns': np.asarray(data[tau_key], dtype=float).ravel()}
-        raw = np.loadtxt(path, delimiter=',', ndmin=2)
-        return {'frequencies': raw[:, 0].astype(float).ravel(),
-                'tau_ns': raw[:, 1].astype(float).ravel()}
+        # Parsing a full-resolution calibration (~200k rows) takes tens of
+        # seconds on the ARM and is needed on every modulation prepare, so keep
+        # the parsed copy until the file itself changes.
+        key = (os.path.abspath(path), os.path.getmtime(path), os.path.getsize(path))
+        if key in _group_delay_cal_cache:
+            return _group_delay_cal_cache[key]
+        _group_delay_cal_cache.clear()
+        _group_delay_cal_cache[key] = cal = _read_group_delay_csv(path)
+        return cal
     arr = np.asarray(value, dtype=float)
     if arr.ndim == 0:
         return float(arr)
     return {'frequencies': arr[:, 0].ravel(), 'tau_ns': arr[:, 1].ravel()}
+
+
+_group_delay_cal_cache = {}   # (path, mtime, size) -> parsed calibration
+
+
+def _read_group_delay_csv(path):
+    """Parse a ``measure_path_group_delay`` CSV into the dict form."""
+    data = np.genfromtxt(path, delimiter=',', names=True, autostrip=True)
+    if getattr(data, 'dtype', None) is not None and data.dtype.names:
+        column_map = {name.lower(): name for name in data.dtype.names}
+        freq_key = column_map.get('freq_hz') or column_map.get('frequency_hz')
+        tau_key = column_map.get('tau_ns') or column_map.get('group_delay_ns')
+        if freq_key is not None and tau_key is not None:
+            return {'frequencies': np.asarray(data[freq_key], dtype=float).ravel(),
+                    'tau_ns': np.asarray(data[tau_key], dtype=float).ravel()}
+    raw = np.loadtxt(path, delimiter=',', ndmin=2)
+    return {'frequencies': raw[:, 0].astype(float).ravel(),
+            'tau_ns': raw[:, 1].astype(float).ravel()}
 
 
 def resolve_filterbank_group_delay(config_dict, tone_frequencies_hz, cal_dir=None):
@@ -7087,7 +7103,7 @@ def _gather_bypass_amp_s21_for_state(config_dict, rf_peripherals, path,
         if not bypassed and bypass_state is not None:
             return bypass_state - delta
 
-    if not _rf_supports_bypass_amps(rf_peripherals):
+    if not _rf_supports_bypass_amps(rf_peripherals, path):
         return 0
 
     dev_name = 'transmit_atten' if path == 'tx' else 'recv_atten'
@@ -7122,6 +7138,8 @@ def _gather_bypass_amp_s21(config_dict, rf_peripherals, path, freq_axis):
     if path not in ('tx', 'rx'):
         raise ValueError("path must be 'tx' or 'rx'")
 
+    # Live state whenever the module has any bypass amp: a path without one
+    # reads as never bypassed, so its S21 comes from {path}_amp_enabled_s21_db.
     if _rf_supports_bypass_amps(rf_peripherals):
         get_bypass = (
             rf_peripherals.get_tx_amp_bypass if path == 'tx'
@@ -7475,13 +7493,14 @@ def _apply_per_bin_scaling(r, config_dict, amps):
 RX_POLICIES = ('protect', 'compensate', 'maximise', 'raise', 'none')
 
 
-def _rf_supports_bypass_amps(rf_peripherals):
-    """True when the active RF frontend has controllable bypass amps."""
-    return bool(
-        rf_peripherals is not None
-        and rf_peripherals.enabled
-        and getattr(rf_peripherals, 'supports_bypass_amps', False)
-    )
+def _rf_supports_bypass_amps(rf_peripherals, path=None):
+    """True when the active RF frontend has a controllable bypass amp on
+    ``path`` ('tx' or 'rx'), or on either path when ``path`` is None."""
+    if rf_peripherals is None or not rf_peripherals.enabled:
+        return False
+    if path is None:
+        return bool(getattr(rf_peripherals, 'supports_bypass_amps', False))
+    return bool(rf_peripherals.has_bypass_amp(path))
 
 
 def _rf_has_controllable_attenuator(rf_peripherals):
@@ -7612,7 +7631,7 @@ def _apply_forced_power_controls(
     applied = {}
 
     if force_tx_amp_bypass is not None:
-        if not _rf_supports_bypass_amps(rf_peripherals):
+        if not _rf_supports_bypass_amps(rf_peripherals, 'tx'):
             raise RuntimeError('Cannot force TX amp bypass: bypass amps are not available')
         value = _coerce_forced_bool(force_tx_amp_bypass, 'force_tx_amp_bypass')
         rf_peripherals.set_tx_amp_bypass(value)
@@ -7621,7 +7640,7 @@ def _apply_forced_power_controls(
         print(f'  forced TX amp bypass={value}')
 
     if force_rx_amp_bypass is not None:
-        if not _rf_supports_bypass_amps(rf_peripherals):
+        if not _rf_supports_bypass_amps(rf_peripherals, 'rx'):
             raise RuntimeError('Cannot force RX amp bypass: bypass amps are not available')
         value = _coerce_forced_bool(force_rx_amp_bypass, 'force_rx_amp_bypass')
         rf_peripherals.set_rx_amp_bypass(value)
@@ -8589,7 +8608,7 @@ def maximise_tx_power(r, r_fast=None, config_dict=None,
         if has_rf:
             print(f'  step 4: maximise analog chain')
             # Enable TX amplifier
-            if _rf_supports_bypass_amps(rf_peripherals):
+            if _rf_supports_bypass_amps(rf_peripherals, 'tx'):
                 current_bypass = rf_peripherals.get_tx_amp_bypass()
             else:
                 current_bypass = None
@@ -9364,7 +9383,7 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=DEFAULT_ADC_HEADROOM_D
     adc_block = int(config_dict['firmware']['adc_block'])
     rf_available = _rf_has_controllable_attenuator(rf_peripherals)
     has_rf = allow_rf and rf_available
-    has_bypass_amps = allow_rf and _rf_supports_bypass_amps(rf_peripherals)
+    has_bypass_amps = allow_rf and _rf_supports_bypass_amps(rf_peripherals, 'rx')
     dsa_fixed = force_adc_dsa_db is not None
     rx_atten_fixed = force_rx_attenuation_db is not None
     rx_amp_fixed = force_rx_amp_bypass is not None
@@ -9732,7 +9751,7 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
     adc_block = int(config_dict['firmware']['adc_block'])
     DSA_MAX = 27
     has_rf = allow_rf and _rf_has_controllable_attenuator(rf_peripherals)
-    has_bypass_amps = allow_rf and _rf_supports_bypass_amps(rf_peripherals)
+    has_bypass_amps = allow_rf and _rf_supports_bypass_amps(rf_peripherals, 'rx')
     rx_amp_fixed = force_rx_amp_bypass is not None
     rx_atten_fixed = force_rx_attenuation_db is not None
     dsa_fixed = force_adc_dsa_db is not None
@@ -9922,7 +9941,7 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None,
     adc_tile = int(config_dict['firmware']['adc_tile'])
     adc_block = int(config_dict['firmware']['adc_block'])
     has_rf = allow_rf and _rf_has_controllable_attenuator(rf_peripherals)
-    has_bypass_amps = allow_rf and _rf_supports_bypass_amps(rf_peripherals)
+    has_bypass_amps = allow_rf and _rf_supports_bypass_amps(rf_peripherals, 'rx')
     dsa_fixed = force_adc_dsa_db is not None
     rx_atten_fixed = force_rx_attenuation_db is not None
     rx_amp_fixed = force_rx_amp_bypass is not None
@@ -11741,7 +11760,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
     # ---- Gather RF peripheral info ----
     has_rf = (_rf_has_controllable_attenuator(rf_peripherals)
               and reference_plane != 'dac')
-    has_bypass_amps = has_rf and _rf_supports_bypass_amps(rf_peripherals)
+    has_bypass_amps = has_rf and _rf_supports_bypass_amps(rf_peripherals, 'tx')
     s21_enabled_value = 0.0
     s21_bypassed_value = 0.0
     s21_enabled = 0.0

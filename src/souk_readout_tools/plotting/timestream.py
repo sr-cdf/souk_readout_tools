@@ -22,8 +22,9 @@ from ._common import (_get_pyplot, _compute_mag_phase, _dual_panels,
 from ._psd import check_psd_units, psd_display_values
 from ..noise import (_get_sweep_trace, _with_samples_readout_correction,
                      _with_sweep_readout_correction)
-from ..timeseries import (_compute_freq_diss, _get_tone_data,
-                          _has_precomputed_freq_diss, _precomputed_freq_diss,
+from ..timeseries import (FREQ_DISS_FORMATS, _compute_freq_diss, _get_tone_data,
+                          _has_precomputed_freq_diss, _linewidth_scale,
+                          _precomputed_freq_diss,
                           _prepare_psd_for_log_plot,
                           _warn_ignored_conversion_args, timestream_psds)
 
@@ -229,6 +230,9 @@ def _psd_axis_labels(format, psd_units, conversion_method):
             return 'I noise (dBc/Hz, SSB)', 'Q noise (dBc/Hz, SSB)'
         return 'AM noise (dBc/Hz, SSB)', 'PM noise (dBc/Hz, SSB)'
     suffix = ' (dB)' if psd_units == 'db' else ''
+    if format == 'linewidths':
+        return ('Frequency noise PSD (linewidths$^2$/Hz)' + suffix,
+                r'Dissipation PSD, $Q_r\,\Delta(1/2Q_i)$' + suffix)
     if format == 'iq':
         return 'I PSD' + suffix, 'Q PSD' + suffix
     if format == 'magphase':
@@ -263,7 +267,10 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
     Args:
         ts_data: dict from parse_samples() with 'i_data', 'q_data',
             'sample_rate', 'num_samples'.
-        format: 'iq' | 'iq_vs_t' | 'magphase' | 'freq_diss'
+        format: 'iq' | 'iq_vs_t' | 'magphase' | 'freq_diss' | 'linewidths'.
+            ``'linewidths'`` is ``'freq_diss'`` times each tone's loaded Q
+            (from ``calibrations``): frequency motion in linewidths, and
+            dissipation ``Qr * Delta(1/2Qi)`` on the same scale.
         tones: List of tone indices (int) to plot, or None for [0].
         deembed: bool or deembed params dict.  Applies true RF
             deembedding (baseline normalisation).  For timestream data,
@@ -297,7 +304,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             output): there the conversion was fixed at demodulation time via
             its ``calibration`` argument.
         calibrations: Per-tone resonator calibrations or fit results. Required
-            by ``conversion_method='mobius'`` and ``'circle'``. Ignored for
+            by ``conversion_method='mobius'`` and ``'circle'``, and by
+            ``format='linewidths'`` for each tone's Qr. Otherwise ignored for
             already-demodulated timestreams (see ``conversion_method``).
         fig: Existing figure. If None, create new.
         label: Legend label. If None, uses an auto-incrementing index.
@@ -401,10 +409,14 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
         mag_label = '|RX| (dB)'
 
     precomputed_freq_diss = _has_precomputed_freq_diss(ts_data)
-    if format == 'freq_diss' and sweep_data is None and not precomputed_freq_diss:
-        raise ValueError("sweep_data is required for format='freq_diss'")
-    if format == 'freq_diss' and precomputed_freq_diss:
-        _warn_ignored_conversion_args(conversion_method, calibrations)
+    if (format in FREQ_DISS_FORMATS and sweep_data is None
+            and not precomputed_freq_diss):
+        raise ValueError(f"sweep_data is required for format={format!r}")
+    if format in FREQ_DISS_FORMATS and precomputed_freq_diss:
+        # 'linewidths' still reads the loaded Q from calibrations.
+        _warn_ignored_conversion_args(
+            conversion_method,
+            calibrations if format == 'freq_diss' else None)
     if conversion_method is None:
         conversion_method = 'linearized'
 
@@ -474,7 +486,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             ax1.set_ylabel(mag_label)
             ax2.set_ylabel('Phase (rad)')
 
-        elif format == 'freq_diss':
+        elif format in FREQ_DISS_FORMATS:
             if precomputed_freq_diss:
                 frac_f, frac_d = _precomputed_freq_diss(
                     ts_data, key,
@@ -486,15 +498,23 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     smooth_window_hz=smooth_window_hz,
                     conversion_method=conversion_method,
                     calibrations=calibrations)
-            ax1.plot(x_values, frac_f, label=trace_label, **kwargs)
-            ax2.plot(x_values, frac_d, label=trace_label, **kwargs)
-            ax1.set_ylabel('Fractional resonator-frequency motion')
-            ax2.set_ylabel(_dissipation_axis_label(conversion_method))
+            if format == 'linewidths':
+                scale = _linewidth_scale(calibrations, key)
+                ax1.plot(x_values, scale * frac_f, label=trace_label, **kwargs)
+                ax2.plot(x_values, scale * frac_d, label=trace_label, **kwargs)
+                ax1.set_ylabel('Resonator-frequency motion (linewidths)')
+                ax2.set_ylabel(r'Dissipation $Q_r\,\Delta(1/2Q_i)$')
+            else:
+                ax1.plot(x_values, frac_f, label=trace_label, **kwargs)
+                ax2.plot(x_values, frac_d, label=trace_label, **kwargs)
+                ax1.set_ylabel('Fractional resonator-frequency motion')
+                ax2.set_ylabel(_dissipation_axis_label(conversion_method))
 
         else:
             raise ValueError(
                 f"Unknown format '{format}'. "
-                "Use 'iq', 'iq_vs_t', 'magphase', or 'freq_diss'.")
+                "Use 'iq', 'iq_vs_t', 'magphase', 'freq_diss' or "
+                "'linewidths'.")
 
     ax2.set_xlabel(x_label)
     _legend(ax1)
@@ -506,9 +526,10 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             'iq_vs_t': 'Timestream',
             'magphase': 'Timestream',
             'freq_diss': 'Frequency & Dissipation',
+            'linewidths': 'Frequency & Dissipation (linewidths)',
         }
         title = title_map.get(format, 'Timestream')
-        if format != 'freq_diss':
+        if format not in FREQ_DISS_FORMATS:
             title += suffix
     fig.suptitle(title)
     fig.tight_layout()
@@ -548,8 +569,9 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
 
     Args:
         ts_data: dict from parse_samples().
-        format: 'iq' | 'magphase' | 'freq_diss'
-            Selects which quantity to compute PSD of.
+        format: 'iq' | 'magphase' | 'freq_diss' | 'linewidths'
+            Selects which quantity to compute PSD of (``'linewidths'``: see
+            ``plot_timestream``; needs ``calibrations``).
         tones: List of tone indices. Default: [0].
         sweep_data: Required for 'freq_diss' format.
         reference_tone_frequency: Tone frequency to use for the freq/diss
@@ -568,7 +590,8 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
             output) and no cleaning modes are active: there the conversion
             was fixed at demodulation time via its ``calibration`` argument.
         calibrations: Per-tone resonator calibrations or fit results. Required
-            by ``conversion_method='mobius'`` and ``'circle'``. Ignored for
+            by ``conversion_method='mobius'`` and ``'circle'``, and by
+            ``format='linewidths'`` for each tone's Qr. Otherwise ignored for
             already-demodulated timestreams (see ``conversion_method``).
         psd_kwargs: dict of kwargs passed to compute_psd().
         precomputed_psd: dict mapping tone_key -> (f_psd, psd_values).
@@ -675,7 +698,7 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
     if sharey is None:
         # The freq/diss panels are both fractional, so one scale compares them
         # directly; I/Q and magnitude/phase panels are not in the same units.
-        sharey = (format == 'freq_diss')
+        sharey = (format in FREQ_DISS_FORMATS)
     fig, ax1, ax2 = _dual_panels(fig, sharex=sharex, sharey=sharey)
 
     # The legend names tones by the capture's own dict keys ('0000', ...);
@@ -974,7 +997,7 @@ def plot_allan_deviation(data, format='freq_diss', tones=None, sweep_data=None,
 
     Args:
         data: parsed timestream dict, complex array, or (i, q) pair.
-        format: 'iq' | 'magphase' | 'freq_diss'.
+        format: 'iq' | 'magphase' | 'freq_diss' | 'linewidths'.
         tones: tone indices to plot. None selects tone 0.
         sweep_data: required for format='freq_diss'.
         taus: averaging times in seconds. None gives octave spacing.
@@ -1047,7 +1070,7 @@ def plot_timestream_histogram(data, format='freq_diss', tones=None,
 
     Args:
         data: parsed timestream dict, complex array, or (i, q) pair.
-        format: 'iq' | 'magphase' | 'freq_diss'.
+        format: 'iq' | 'magphase' | 'freq_diss' | 'linewidths'.
         tones: tone indices. None selects tone 0.
         sweep_data: required for format='freq_diss'.
         bins: histogram bins.

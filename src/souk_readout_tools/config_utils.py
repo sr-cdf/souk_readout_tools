@@ -77,7 +77,7 @@ def get_template_config_path():
 SITE_CONFIG_FILENAME = 'site.yaml'
 
 DEFAULT_LNA_SERVICE_PORT = 10500
-DEFAULT_LNA_SERVICE_TIMEOUT_S = 15.0
+DEFAULT_LNA_SERVICE_TIMEOUT_S = 180.0  # a remote-method set of one channel can take ~2 min
 
 
 def get_site_config_path():

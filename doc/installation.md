@@ -455,7 +455,7 @@ point the readout servers at the service by creating
 lna_service:
   host: "10.11.11.11"   # address of the slot-1 RFSoC
   port: 10500
-  timeout_s: 15.0
+  timeout_s: 180.0
 ```
 
 and set `cryostat.lna_bias.backend: "remote"` in each pipeline config (the

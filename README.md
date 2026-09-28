@@ -149,6 +149,7 @@ For full installation details (including server setup, SD card imaging, and daem
 | `souk-connection-test` | Test connectivity to the readout server (`-C config.yaml` or `-a address`) |
 | `souk-wideband_sweep` | Perform a wideband frequency sweep |
 | `souk-mkid-finder-app` | Launch the interactive MKID resonance finder GUI |
+| `souk-live-plot` | [View live stream files](doc/live_plotting.md) as time/PSD/ASD panels; optionally start a receiver using hardware details |
 | `souk-batch-snapshots` | Acquire pre-accumulator snapshots across tones |
 | `souk-find-resonances` | Find resonances from sweep data |
 | `souk-find-boards` | List attached RFSoC USB serial bridges and identify the board-management port |
@@ -197,6 +198,7 @@ For full installation details (including server setup, SD card imaging, and daem
 | [Timing Site Checklist](doc/timing_site_checklist.md) | Site commissioning checks for PTP GM, chrony, monitor state, and holdover behaviour |
 | [TSU Strobe and Timed Sync](doc/tsu_strobe_and_timed_sync.md) | 1-PPS TSU strobe, firmware timed-sync bring-up for multi-board timestamp alignment, and test scripts |
 | [v7.9 Multitone Notes](doc/v79-multitone-notes.md) | VACC multitone design notes and constraints |
+| [Version Compatibility](doc/compatibility.md) | Which software runs on which firmware, OS image/kernel/boot-file changes, and supported boards, by version |
 | [Changelog](CHANGELOG.md) | Version history, feature list, and roadmap |
 
 ## Configuration

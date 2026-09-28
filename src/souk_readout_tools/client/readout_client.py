@@ -156,6 +156,37 @@ def _cal_path_str(path):
     return '.'.join(path)
 
 
+def _stream_capture_exists(filename):
+    """True if a capture (binary or its ``.json`` metadata) is at ``filename``."""
+    return os.path.exists(filename) or os.path.exists(filename + '.json')
+
+
+def _unused_stream_filename(base):
+    """``base`` if no capture is there yet, else the first free ``base_1``, ``base_2``, ..."""
+    filename, n = base, 0
+    while _stream_capture_exists(filename):
+        n += 1
+        filename = f'{base}_{n}'
+    return filename
+
+
+def _stream_output_filename(filename, overwrite):
+    """Resolve ``receive_stream``'s output path without clobbering old captures.
+
+    No filename: the first free ``tmp_stream[_N]`` in the cwd. A given filename
+    that already holds a capture raises unless ``overwrite`` is True.
+    """
+    if filename is None:
+        filename = _unused_stream_filename(os.path.join(os.getcwd(), 'tmp_stream'))
+        print(f"No filename specified, writing to {filename}")
+    filename = os.path.abspath(os.fspath(filename))
+    if not overwrite and _stream_capture_exists(filename):
+        raise FileExistsError(
+            f"{filename} (or its .json) already exists; pass overwrite=True to "
+            f"replace it, or choose another filename")
+    return filename
+
+
 def _check_center_separation(centers, min_separation=1.0):
     """Raise ValueError if any two sweep centers are closer than min_separation (Hz)."""
     centers = np.sort(np.asarray(centers, dtype=float).ravel())
@@ -2925,6 +2956,10 @@ class ReadoutClient:
         dropped frames — riding the existing armed channel maps. ``engine=None``
         (default) updates whichever engine is active.
 
+        With no requested settings change, ask the RFSoC server to use its
+        in-memory sweep calibration and live I/Q window to take one bounded
+        step toward zero calibrated phase curvature.
+
         Firmware-slot (``engine='fw'``): loads the new slot combs into the inactive
         ping-pong buffer and flips to them in one step (glitch-free). Software
         (``engine='sw'``): swaps the new per-point words in place.
@@ -2936,6 +2971,19 @@ class ReadoutClient:
         beyond bin coverage is rejected (use ``force``/``on_map_change='recenter'``
         or disable+enable).
         """
+        auto_inflection = (center is None and offsets is None
+                           and samples_per_point is None and n_settle is None
+                           and mode is None and not force
+                           and compensate_rx_ticks is None
+                           and on_map_change == 'continue' and autosync is None
+                           and mrst is None and buffer_reuse_delay_accs is None)
+        if auto_inflection:
+            message = {'request': 'update_modulation_to_inflection'}
+            if engine is not None:
+                message['engine'] = engine
+            response = self.send_request(message)
+            self._warn_modulation_response(response)
+            return response
         if engine is None:
             state = self.get_modulation_state()
             engine = state.get('engine') if isinstance(state, dict) else None
@@ -3120,8 +3168,9 @@ class ReadoutClient:
         """
         Start the server-side FFM tone-tracking loop (see doc/tone_tracking.md).
 
-        With software modulation armed (>= 3 points), the server demodulates
-        the streamed cycles, filters the per-tone detuning, and stages small
+        With modulation armed (fw or sw, >= 3 points), the server fits its most
+        recent sweep held in memory, circle-centres the streamed cycles with
+        those fits, filters the per-tone detuning, and stages small
         centre corrections. Seamless LO-word updates (``'lo'`` class) and
         FFT-bin/map changes (``'bin'`` class) have independent commit
         policies; every committed correction bumps the modulation revision
@@ -3134,13 +3183,13 @@ class ReadoutClient:
         linewidth_hz : array-like or None, optional
             Per-tone resonator linewidths (Hz): one entry per modulated tone
             (``params_from_sweep(...)['linewidth_hz']``) or per active tone.
-            Optional here if already supplied to :meth:`enable_modulation`;
-            tracking requires it from one of the two.
+            If omitted, the server uses armed linewidth metadata, else fr/Ql
+            of its fits. A sweep in server memory is needed either way.
         dry_run : bool, optional
             Full estimate/decide/log/announce pipeline with **no** hardware
             applies (default True). Disable once the behaviour is trusted.
         threshold_linewidths : float, optional
-            Deadband on the *filtered* detuning (server default 0.3).
+            Deadband on the *filtered* detuning (server default 0.05).
         confirm_windows : int, optional
             Consecutive decision windows over threshold before staging a
             correction (server default 3).
@@ -3719,6 +3768,25 @@ class ReadoutClient:
             cnt[j] = hdr[-2]
             tt[j] = (int(hdr[-4]) << 32) + int(hdr[-3])
             flags[j] = hdr[-10:-4]
+        ReadoutClient._warn_on_dropped_accumulations(cnt, 'parse_samples')
+        return ReadoutClient._parsed_timestream(
+            i_data, q_data, cnt, err, tt, flags, sample_rate, info,
+            time.strftime('%Y-%m-%d %H:%M:%S UTC%z'), apply_readout_correction)
+
+    @staticmethod
+    def _parsed_timestream(i_data, q_data, cnt, err, tt, flags, sample_rate,
+                          info, date, apply_readout_correction,
+                          tone_indices=None, total_tones=None):
+        """Build a common parsed result from sample-major I/Q and header arrays.
+
+        By default column ``j`` holds tone ``j``. A subset (the live viewer's
+        displayed tones) passes ``tone_indices`` -- the tone of each column --
+        and ``total_tones``, which the info and readout correction refer to.
+        """
+        num_samples, num_tones = i_data.shape
+        if tone_indices is None:
+            tone_indices, total_tones = np.arange(num_tones), num_tones
+        tone_indices = np.asarray(tone_indices, dtype=int)
         # Fast-modulation tag lives in flag5 (frame[-5]); decode as UNSIGNED
         # because the revision (bits 17..31) can set the int32 sign bit:
         #   bits 0..15  = active point (0 = modulation off, 1..N = the point)
@@ -3731,7 +3799,7 @@ class ReadoutClient:
         modulation_settling = ((f5 >> 16) & 0x1).astype(int)
         modulation_revision = ((f5 >> 17) & 0x7FFF).astype(int)
         info = ReadoutClient._normalise_modulated_sample_info(
-            info, modulation_point, num_tones)
+            info, modulation_point, total_tones)
 
         # Software readout flattening (filterbank compensation, RX half): the
         # RX scale word is inert in current firmware, so the server reports
@@ -3741,8 +3809,9 @@ class ReadoutClient:
         # group_cycles skips its own application when it sees the marker.
         readout_correction_applied = False
         if apply_readout_correction and np.any(modulation_point > 0):
-            factors = ReadoutClient._readout_correction_factors(info, num_tones)
+            factors = ReadoutClient._readout_correction_factors(info, total_tones)
             if factors is not None:
+                factors = factors[:, tone_indices]
                 n_points = factors.shape[0]
                 valid = (modulation_point >= 1) & (modulation_point <= n_points)
                 gain = np.ones((num_samples, num_tones), dtype=float)
@@ -3751,23 +3820,22 @@ class ReadoutClient:
                 q_data = q_data * gain
                 readout_correction_applied = True
 
-        data_dict = {'date': time.strftime('%Y-%m-%d %H:%M:%S UTC%z'),
+        data_dict = {'date': date,
                     'num_tones':num_tones,
                     'num_samples':num_samples,
                     'sample_rate':sample_rate,
                     'info':info,
-                    'i_data':{f'{i:04d}':i_data[:,i] for i in range(num_tones)},
-                    'q_data':{f'{i:04d}':q_data[:,i] for i in range(num_tones)},
+                    'i_data':{f'{t:04d}':i_data[:,i] for i, t in enumerate(tone_indices)},
+                    'q_data':{f'{t:04d}':q_data[:,i] for i, t in enumerate(tone_indices)},
                     'packet_counter':cnt,
                     'packet_error':err,
                     'telescope_time':tt,
-                    'stream_flags':{f'flag{i}':flags[:,i] for i in range(6)},
+                    'stream_flags':{f'flag{i}':flags[:,i] for i in range(flags.shape[1])},
                     'modulation_point': modulation_point,
                     'modulation_settling': modulation_settling,
                     'modulation_revision': modulation_revision,
                     'readout_correction_applied': readout_correction_applied,
                     }
-        ReadoutClient._warn_on_dropped_accumulations(cnt, 'parse_samples')
 
         return data_dict
 
@@ -5616,16 +5684,21 @@ class ReadoutClient:
         return sweep_dict
 
 
-    def receive_stream(self, num_tones=None, filename=None, print_data=False, info=None):
-        """Receive continuous stream frames from the stream socket and write them to disk.
+    def receive_stream(self, num_tones=None, filename=None, print_data=False, info=None,
+                       duration=None, subscribe_tone_updates=False,
+                       frame_callback=None, stop_event=None, write_to_file=True,
+                       overwrite=False, update_callback=None):
+        """Receive continuous stream frames, optionally saving and/or consuming them.
 
         Parameters
         ----------
         num_tones : int or None, optional
-            Number of active tones to expect per frame; ``None`` infers it from
-            the server info.
+            Number of active tones to expect per frame; ``None`` uses the
+            first received frame (server info is used until it arrives).
         filename : str or None, optional
-            Output basename; defaults to ``tmp_stream`` in the cwd.
+            Output basename; defaults to the first unused ``tmp_stream``,
+            ``tmp_stream_1``, ``tmp_stream_2``, ... in the cwd, so earlier
+            captures are never overwritten.
         print_data : bool, optional
             Print frames as they arrive (default ``False``).
         info : dict or None, optional
@@ -5634,21 +5707,81 @@ class ReadoutClient:
             the server's frame producer loses nothing recorded. Pass a snapshot
             taken before ``enable_stream()`` to keep that stall out of the
             stream altogether (``profiling/rate_ladder.py`` does).
-        """
-        if self.mock:
-            return self._mock_server.receive_stream(num_tones, filename, print_data)
+        duration : float or None, optional
+            Positive, finite capture duration in seconds, measured after the
+            stream socket connects and the output file opens. ``None`` waits
+            until Ctrl+C or disconnect. Incomplete frames are discarded.
 
-        iq_data=None
-        if filename is None:
-            filename = os.path.join(os.getcwd(), 'tmp_stream')
-            print(f"No filename specified, writing to {filename}")
+        subscribe_tone_updates : bool, optional
+            Opt in to SNAPSHOT and TONE_UPDATE frames. Save their JSON payloads
+            to ``filename + '.updates.jsonl'`` (default False).
+
+        frame_callback : callable or None, optional
+            Called synchronously as ``frame_callback(payload, metadata)`` for
+            each complete IQ frame. ``payload`` is immutable ``bytes`` without
+            the TCP length prefix, and ``metadata`` has the sidecar JSON
+            structure. The first frame determines the actual tone count when
+            ``num_tones`` is omitted. Callback exceptions propagate to the
+            caller. Keep callbacks short so reception can keep up.
+        update_callback : callable or None, optional
+            Called as ``update_callback(record)`` for each subscribed typed
+            SNAPSHOT or TONE_UPDATE. ``record['sample_index']`` is the count
+            of IQ frames received before that update.
+        stop_event : threading.Event or None, optional
+            Setting the event stops reception, including idle or partial
+            reads. Reads poll at most every 0.1 seconds; partial frames are
+            retained across polling timeouts and discarded only on shutdown.
+            The initial socket connection has a one-second timeout in this mode.
+        write_to_file : bool, optional
+            Save the binary capture and sidecars (default True). False creates
+            no files and is useful with ``frame_callback`` for live displays.
+        overwrite : bool, optional
+            Replace an existing capture at a given ``filename`` (default False,
+            which raises ``FileExistsError`` before connecting).
+
+        Returns
+        -------
+        str or None
+            Absolute path to the binary capture, readable with ``parse_stream``.
+            Metadata is saved alongside it at ``path + '.json'``. Returns None
+            when ``write_to_file=False``.
+        """
+        if duration is not None:
+            duration = float(duration)
+            if not np.isfinite(duration) or duration <= 0:
+                raise ValueError("duration must be a positive finite number of seconds")
+        if frame_callback is not None and not callable(frame_callback):
+            raise TypeError("frame_callback must be callable or None")
+        if update_callback is not None and not callable(update_callback):
+            raise TypeError("update_callback must be callable or None")
+        if stop_event is not None and not callable(getattr(stop_event, 'is_set', None)):
+            raise TypeError("stop_event must provide an is_set() method")
+        if num_tones is not None and (
+                isinstance(num_tones, (bool, np.bool_))
+                or not isinstance(num_tones, (int, np.integer))
+                or not 0 <= num_tones <= 2048):
+            raise ValueError("num_tones must be an integer between 0 and 2048")
+        if self.mock and subscribe_tone_updates:
+            raise NotImplementedError("Mock binary capture does not generate tone updates")
+        if self.mock:
+            return self._mock_server.receive_stream(
+                num_tones, filename, print_data, duration=duration, info=info,
+                frame_callback=frame_callback, stop_event=stop_event,
+                write_to_file=write_to_file, overwrite=overwrite)
+
+        if write_to_file:
+            # Before get_info('all') and connecting, so a clash costs nothing.
+            filename = _stream_output_filename(filename, overwrite)
+
         if info is None:
             info = self.get_info('all')
 
         # Determine num_tones from info (server sends only active tones)
         tone_indices = info.get('tones', {}).get('firmware_indices')
+        expected_num_tones = num_tones
         if num_tones is None:
             num_tones = len(tone_indices) if tone_indices is not None else 2048
+        num_tones = int(num_tones)
 
         max_frame_bytes = 2048*2*4 + 10*4
         data = bytearray(max_frame_bytes)
@@ -5671,42 +5804,128 @@ class ReadoutClient:
         metadata['index_flag_0'] = 2*num_tones-1+1
         metadata['ordering'] = 'I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, Q_tone1_sample0,..flags, tt_msb, tt_lsb, cnt, err .'
         metadata['info'] = info
+        metadata['tone_updates_subscribed'] = bool(subscribe_tone_updates)
 
-        with open(filename+'.json','w') as file:
-            json.dump(metadata,file,indent=4)
+        if write_to_file:
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            with open(filename+'.json','w') as file:
+                json.dump(metadata,file,indent=4)
+        else:
+            filename = None
 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((self.stream_server_address, self.stream_server_port))
-            with open(filename, 'wb') as file:
-                print(f"Writing data to {filename}")
-                t0=time.time()
+            if stop_event is not None:
+                if stop_event.is_set() and not write_to_file:
+                    return None
+                # Bound shutdown while a live worker is connecting. Once
+                # connected, read_exact uses shorter cancellation polls.
+                s.settimeout(1.0)
+            try:
+                s.connect((self.stream_server_address, self.stream_server_port))
+            except socket.timeout:
+                if stop_event is not None and stop_event.is_set() and not write_to_file:
+                    return None
+                raise
+            from contextlib import nullcontext
+            with (open(filename, 'wb') if write_to_file else nullcontext(None)) as file, (
+                    open(filename + '.updates.jsonl', 'w')
+                    if write_to_file and subscribe_tone_updates else nullcontext(None)) as updates_file:
+                if subscribe_tone_updates:
+                    s.sendall(b'{"subscribe": ["tone_updates"]}\n')
+                if write_to_file:
+                    print(f"Writing data to {filename}")
+                t0=time.monotonic()
+                deadline = None if duration is None else t0 + duration
                 count=0
                 ppid = os.getppid()
+                # Apply the remaining deadline to every read, including
+                # fragmented TCP headers and stalled partial payloads.
+                def read_exact(target):
+                    received = 0
+                    while received < len(target):
+                        if stop_event is not None and stop_event.is_set():
+                            raise EOFError()
+                        remaining = None
+                        if deadline is not None:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise socket.timeout()
+                        if stop_event is not None:
+                            remaining = min(remaining, 0.1) if remaining is not None else 0.1
+                        if remaining is not None:
+                            s.settimeout(remaining)
+                        try:
+                            n = s.recv_into(target[received:])
+                        except socket.timeout:
+                            if stop_event is None:
+                                raise
+                            # A polling timeout is not a frame boundary. Keep
+                            # the bytes already received and check stop/deadline.
+                            continue
+                        if n == 0:
+                            raise EOFError()
+                        received += n
+
                 while True:
+                    callback_running = False
                     try:
                         #quit if parent has changed, prevents zombie processes
                         if os.getppid() != ppid:
                             break
 
-                        # Read data length
-                        raw_datalen = s.recv(4)
-                        if not raw_datalen:
+                        header = bytearray(4)
+                        read_exact(memoryview(header))
+                        prefix = struct.unpack('>I', header)[0]
+                        frame_type, datalen = prefix >> 24, prefix & 0xFFFFFF
+                        if frame_type:
+                            payload = bytearray(datalen)
+                            read_exact(memoryview(payload))
+                            record = {
+                                'host_time_unix': time.time(),
+                                'sample_index': count,
+                                'frame_type': frame_type,
+                                'payload': json.loads(payload.decode('utf-8')),
+                            }
+                            if updates_file is not None:
+                                updates_file.write(json.dumps(record) + '\n')
+                                updates_file.flush()
+                            if update_callback is not None:
+                                callback_running = True
+                                update_callback(record)
+                                callback_running = False
                             continue
-                        datalen = struct.unpack('>I', raw_datalen)[0]
-                        if datalen==0:
+                        if datalen == 0:
                             continue
-                        received_len = 0
-                        while received_len < datalen:
-                            packet_len = s.recv_into(view[received_len:], datalen - received_len)
-                            if packet_len == 0:
-                                break
-                            received_len += packet_len
-                        if received_len < datalen:
-                            print(f"Expected {datalen} bytes, but only received {received_len} bytes.")
-                            break
+                        if datalen > max_frame_bytes or datalen < 40 or datalen % 8:
+                            raise ValueError(f"Invalid stream frame length: {datalen}")
+                        read_exact(view[:datalen])
+
+                        frame_num_tones = (datalen - 40) // 8
+                        if expected_num_tones is not None and frame_num_tones != expected_num_tones:
+                            raise ValueError(
+                                f"Stream frame has {frame_num_tones} tones; expected "
+                                f"{expected_num_tones}. Restart reception after changing tones.")
+                        if count == 0:
+                            expected_num_tones = frame_num_tones
+                            metadata['num_tones'] = frame_num_tones
+                            metadata['frame_bytes'] = datalen
+                            for index, key in enumerate([
+                                    'index_flag_0', 'index_flag_1', 'index_flag_2',
+                                    'index_flag_3', 'index_flag_4', 'index_flag_5',
+                                    'index_tt_msb', 'index_tt_lsb', 'index_cnt', 'index_err']):
+                                metadata[key] = 2 * frame_num_tones + index
+                            if write_to_file:
+                                with open(filename + '.json', 'w') as metadata_file:
+                                    json.dump(metadata, metadata_file, indent=4)
 
                         # Write entire frame (already only active tones in user order)
-                        file.write(data[:datalen])
+                        payload = bytes(view[:datalen])
+                        if file is not None:
+                            file.write(payload)
+                        if frame_callback is not None:
+                            callback_running = True
+                            frame_callback(payload, metadata)
+                            callback_running = False
                         count+=1
 
                         if print_data:
@@ -5720,18 +5939,23 @@ class ReadoutClient:
                             tt = (tt_msb << 32) + tt_lsb
                             iq_data=i+1j*q
                             print(f"Received IQ data: err={err} cnt={cnt} tt={tt} {iq_data.tolist()}\r",end='',flush=True)
-                    except KeyboardInterrupt:
+                    except (socket.timeout, EOFError, KeyboardInterrupt):
+                        if callback_running:
+                            raise
                         break
 
                     except Exception as e:
+                        if (frame_callback is not None or update_callback is not None
+                                or not write_to_file or isinstance(e, ValueError)):
+                            raise
                         print(f"Error receiving stream data: {e}")
                         print(traceback.format_exc())
                         break
 
-                t1=time.time()
+                t1=time.monotonic()
                 print()
                 print(f"Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
-        return iq_data
+        return filename
 
 
     def receive_stream_g3(self, num_tones=None, filename=None, print_data=False,
@@ -6226,7 +6450,7 @@ class ReadoutClient:
                 s.close()
 
     @staticmethod
-    def parse_stream(filename):
+    def parse_stream(filename, apply_readout_correction=True):
         """
         Parse a saved stream file into per-tone I/Q arrays.
 
@@ -6235,7 +6459,22 @@ class ReadoutClient:
         Data is already in user-tone order (the server sends only active
         tones in user order). num_tones in the metadata reflects the
         actual number of active tones.
+
+        Returns the same fields and applies the same modulation metadata
+        normalisation and readout correction as :py:meth:`parse_samples`.
+        Set ``apply_readout_correction=False`` to retain raw accumulator I/Q.
+        The date is preserved from the capture metadata.
+        Subscribed captures also contain ``tone_updates`` (ordered records with
+        payload, frame_type, host_time_unix and sample_index, the number of IQ
+        frames saved before the event), and ``tone_centers_by_revision`` (integer
+        revision -> tone-keyed centre frequencies in Hz). Match the latter to
+        ``modulation_revision``; absent revisions/tones are unknown. Repeated
+        revision IDs use the latest announcement; use ordered records for
+        captures spanning revision resets/wraps. These records do not silently
+        change the initial correction factors or the analysis configuration.
+
         """
+        filename = os.fspath(filename)
         with open(filename+'.json','r') as file:
             metadata = json.load(file)
         date = metadata['date']
@@ -6261,8 +6500,8 @@ class ReadoutClient:
         err = udata[index_err]
         cnt = udata[index_cnt].astype(np.int64)
         if index_tt_msb is not None and index_tt_lsb is not None:
-            tt_msb = udata[index_tt_msb].astype(np.int64)
-            tt_lsb = udata[index_tt_lsb].astype(np.int64)
+            tt_msb = udata[index_tt_msb].astype(np.uint64)
+            tt_lsb = udata[index_tt_lsb].astype(np.uint64)
             tt = (tt_msb << 32) + tt_lsb
         else:
             tt = np.zeros(num_samples, dtype=np.uint64)
@@ -6271,20 +6510,34 @@ class ReadoutClient:
         i_data = data[:2*num_tones:2]
         q_data = data[1:2*num_tones:2]
 
-        data_dict = {'date':date,
-                     'num_tones':num_tones,
-                     'num_samples':num_samples,
-                     'sample_rate':sample_rate,
-                     'info':info,
-                     'i_data':{f'{i:04d}':i_data[i] for i in range(num_tones)},
-                     'q_data':{f'{i:04d}':q_data[i] for i in range(num_tones)},
-                     'packet_counter':cnt,
-                     'packet_error':err,
-                     'telescope_time':tt,
-                     'stream_flags':{f'flag{i}':flags[i] for i in range(flags.shape[0])}
-                     }
         ReadoutClient._warn_on_dropped_accumulations(cnt, 'parse_stream')
-        return data_dict
+        result = ReadoutClient._parsed_timestream(
+            i_data.T, q_data.T, cnt, err, tt, flags.T, sample_rate, info,
+            date, apply_readout_correction)
+
+        if metadata.get('tone_updates_subscribed', False):
+            with open(filename + '.updates.jsonl') as file:
+                updates = [json.loads(line) for line in file if line.strip()]
+            result['tone_updates'] = updates
+            # Keep complete records (including dry runs and unknown frame types)
+            # and a cumulative centre map for each announced revision. Sparse
+            # updates change only the listed tones; snapshots replace the map.
+            centers = {}
+            by_revision = {}
+            for record in updates:
+                payload = record['payload']
+                if payload.get('type') == 'SNAPSHOT':
+                    centers = dict((payload.get('modulation') or {}).get('centers_hz', {}))
+                elif (payload.get('type') == 'TONE_UPDATE'
+                      and payload.get('op') != 'tracking_dry_run'):
+                    centers.update(payload.get('centers_hz', {}))
+                else:
+                    continue
+                revision = payload.get('revision')
+                if revision is not None:
+                    by_revision[int(revision)] = dict(centers)
+            result['tone_centers_by_revision'] = by_revision
+        return result
 
     @staticmethod
     def export_stream_data(filename,data_dict,file_format=None):

@@ -3347,6 +3347,22 @@ def _fits_for_tone(fit_data, tone_index):
     return []
 
 
+def _down_fits_for_tone(fit_data, tone_index):
+    """Like :py:func:`_fits_for_tone`, for the down-sweep fits (or ``[]``)."""
+    if fit_data is None:
+        return []
+    if "fits_by_power_down" in fit_data:
+        return _fits_for_tone(
+            {"fits_by_power": fit_data["fits_by_power_down"]}, tone_index
+        )
+    if "fits_down" in fit_data:
+        return _fits_for_tone(
+            {"tone_index": fit_data["tone_index"], "fits": fit_data["fits_down"]},
+            tone_index,
+        )
+    return []
+
+
 def _fits_for_power(fit_data, sweep_index, tone_indices):
     """Return fits at one power step matching the selected tone indices."""
     if fit_data is None:
@@ -5160,6 +5176,7 @@ def _find_best_power_for_tone(
     bif_mismatch_db,
     anl_direction_ratio,
     exclude_hysteretic_rows,
+    anl_fit_use_down_sweeps=True,
 ):
     """Per-tone implementation backing :py:func:`find_best_power`."""
 
@@ -5374,18 +5391,36 @@ def _find_best_power_for_tone(
         nearest_target_idx = -1
 
     # Stage 3: ANL power-law fit on the non-excluded rows, skipping
-    # low-clamped ANL values that should not pull the fit slope down.
+    # low-clamped ANL values that should not pull the fit slope down.  On a
+    # bidirectional run the down-sweep anl is a second measurement at the
+    # same power (below bifurcation both directions return the same anl), so
+    # it joins the fit as extra points appended after the up rows.
+    anl_down = _column("anl_down")
+    anl_down_valid = np.zeros(n, dtype=bool)
+    if anl_fit_use_down_sweeps:
+        anl_lo, anl_hi = param_valid_ranges.get("anl", (-np.inf, np.inf))
+        anl_down_valid = (
+            anl_fit_valid
+            & _flag_column("success_down")
+            & np.isfinite(anl_down)
+            & (anl_down > anl_lo)
+            & (anl_down < anl_hi)
+        )
     anl_fit = _fit_log_anl_power_law(
-        powers,
-        anl,
-        anl_fit_valid,
-        anl_err=anl_err,
+        np.concatenate([powers, powers]),
+        np.concatenate([anl, anl_down]),
+        np.concatenate([anl_fit_valid, anl_down_valid]),
+        anl_err=np.concatenate([anl_err, _column("anl_down_err")]),
         target_anl=target_anl,
         min_points=anl_fit_min_points,
         clip_sigma=anl_fit_clip_sigma,
         min_slope=anl_fit_min_slope,
         weight_by_uncertainty=anl_fit_weight_by_uncertainty,
     )
+    # Split the masks back into the up rows and the down rows.
+    for key in ("eligible_mask", "fit_mask", "outlier_mask"):
+        mask = np.asarray(anl_fit[key], dtype=bool)
+        anl_fit[key], anl_fit[key + "_down"] = mask[:n], mask[n:]
 
     # Rows excluded from the ANL fit because anl pegged at a fitter bound;
     # tracked separately so plots can mark them distinctly from generic
@@ -5496,6 +5531,14 @@ def _find_best_power_for_tone(
             "outlier_sweep_indices": [
                 int(sweep_idx[i]) for i in range(n) if outlier_mask[i]
             ],
+            "fit_sweep_indices_down": [
+                int(sweep_idx[i]) for i in range(n) if anl_fit["fit_mask_down"][i]
+            ],
+            "outlier_sweep_indices_down": [
+                int(sweep_idx[i])
+                for i in range(n)
+                if anl_fit["outlier_mask_down"][i]
+            ],
             "pegged_sweep_indices": list(anl_pegged_sweep_indices),
         }
 
@@ -5600,7 +5643,6 @@ def _find_best_power_for_tone(
     # curve.  A systematic ratio between them means the fitted nonlinearity
     # is an artefact of which branch was followed, so the ANL-vs-power line
     # built from it cannot be trusted either.
-    anl_down = _column("anl_down")
     comparable = (
         valid
         & ~hysteretic
@@ -5825,6 +5867,7 @@ def find_best_power(
     bif_mismatch_db=DEFAULT_BIF_MISMATCH_DB,
     anl_direction_ratio=DEFAULT_ANL_DIRECTION_RATIO,
     exclude_hysteretic_rows=False,
+    anl_fit_use_down_sweeps=True,
     population_fallback=True,
     population_fallback_min_tones=DEFAULT_POPULATION_FALLBACK_MIN_TONES,
 ):
@@ -5962,6 +6005,11 @@ def find_best_power(
       hysteretic powers out of the ANL-vs-power fit.  They are past the
       single-branch model's validity, but they also carry the largest
       ``anl`` values that anchor the slope, so this is off by default.
+    - ``anl_fit_use_down_sweeps`` (default ``True``, needs
+      ``fit_down_sweeps``) adds each row's ``anl_down`` to the ANL-vs-power
+      fit as a second point at the same power, under the same row exclusions
+      plus ``success_down`` and the ``anl`` validity range.  The pick lists
+      them as ``fit_sweep_indices_down`` / ``outlier_sweep_indices_down``.
 
     Each returned row carries ``flags`` (a list of the above strings),
     ``flagged`` (bool), ``operating_window_dbm``, ``median_reduced_chi2``,
@@ -6076,6 +6124,7 @@ def find_best_power(
             bif_mismatch_db=bif_mismatch_db,
             anl_direction_ratio=anl_direction_ratio,
             exclude_hysteretic_rows=exclude_hysteretic_rows,
+            anl_fit_use_down_sweeps=anl_fit_use_down_sweeps,
         )
         for tone in tones
     ]
@@ -8978,6 +9027,30 @@ def _unique_empirical_fallback_reasons(fits):
     return reasons
 
 
+def _down_trace_in_up_frame(up_fit, down_sweep, tone_index):
+    """Return a copy of ``up_fit`` carrying the raw down-sweep data.
+
+    Used when the down sweep was not fitted.  ``plot_fits`` de-embeds and
+    centres with the fit's own ``a``/``alpha``/``tau`` and circle, whereas
+    ``plot_sweep`` re-estimates them from the trace it is given, so drawing
+    the down data through the up fit keeps both branches in one frame.
+    ``None`` if there is no down trace for this tone.
+    """
+    trace = _sorted_trace(down_sweep, tone_index)
+    if trace is None:
+        return None
+    f, z, _ = trace
+    return replace(
+        up_fit,
+        f_data=f,
+        z_data=z,
+        z_fit=None,
+        z_err_data=None,
+        z_data_deembed_phase_centered=None,
+        z_fit_deembed_phase_centered=None,
+    )
+
+
 def _plot_one_tone(
     run,
     fit_data,
@@ -9039,6 +9112,7 @@ def _plot_one_tone(
         return sweep.get("info") if isinstance(sweep, dict) else None
 
     fits_for_tone = _fits_for_tone(fit_data, tone_index)
+    down_fits = _down_fits_for_tone(fit_data, tone_index)
     title = _plot_transform_title(
         f"Tone {tone_index} fitted power sweep",
         deembed,
@@ -9104,12 +9178,54 @@ def _plot_one_tone(
                 tx_power_reference_plane=tx_power_reference_plane,
             )
 
-        # Reverse sweep, dashed in the same colour: where the two separate,
-        # the resonator is bifurcated at that power.
+        # Reverse sweep, crosses (and a dotted down fit) in the same colour:
+        # where the two separate, the resonator is bifurcated at that power.
         down_sweep = (
             run.get("sweeps_down") or [None] * n_sweeps
         )[sweep_index] if show_down_sweeps else None
-        if down_sweep is not None and fig is not None:
+        down_fit = (
+            down_fits[sweep_index] if sweep_index < len(down_fits) else None
+        )
+        # A down fit is drawn in its own frame: its a/alpha/tau and circle
+        # match the up fit's where both are good, and it does not inherit a
+        # broken up fit's frame past bifurcation.
+        down_trace = None
+        if down_sweep is not None:
+            down_trace = (
+                down_fit if down_fit is not None
+                else _down_trace_in_up_frame(fit, down_sweep, tone_index)
+                if fit is not None else None
+            )
+        if down_trace is not None and fig is not None:
+            fig = plot_fits(
+                down_trace,
+                format=format,
+                fig=fig,
+                label="_nolegend_",
+                show_errors=False,
+                title=title,
+                color=power_colour(power),
+                data_kwargs={"marker": "x", "markersize": 3.5, "alpha": 0.6},
+                fit_kwargs={"linestyle": ":"},
+                deembed=deembed,
+                phase_center=phase_center,
+                phase_rotate=phase_rotate,
+                mag_centered=mag_centered,
+                phase_centered=phase_centered,
+                mag_rotated=mag_rotated,
+                phase_rotated=phase_rotated,
+                group_delay_cal=group_delay_cal,
+                unwrap_phase=unwrap_phase,
+                units=units,
+                info=_sweep_info(sweep_index),
+                config=config,
+                reference_plane=reference_plane,
+                tx_power_dbm=power,
+                tx_power_reference_plane=tx_power_reference_plane,
+                figsize=fit_figsize,
+                finalize=False,
+            )
+        elif down_sweep is not None and fig is not None:
             fig = plot_sweep(
                 down_sweep,
                 format=format,
@@ -9119,7 +9235,7 @@ def _plot_one_tone(
                 show_errors=False,
                 title=title,
                 color=power_colour(power),
-                linestyle="--",
+                linestyle=":",
                 deembed=deembed,
                 phase_center=phase_center,
                 phase_rotate=phase_rotate,
@@ -9141,7 +9257,7 @@ def _plot_one_tone(
             sweep is not None for sweep in (run.get("sweeps_down") or [])
         ) if show_down_sweeps else 0
         if n_down:
-            full_title += " (dashed: down sweep)"
+            full_title += " (x / dotted: down sweep)"
         no_fit_count = sum(
             _empirical_fallback_reason(fit) is not None for fit in fits_for_tone
         )
@@ -9957,9 +10073,43 @@ def _plot_power_sweep_parameters(
         [power_colour(power) for power in power_axis]
         if colour_points else None
     )
+    # Down-sweep fits of a bidirectional run, drawn as hollow markers: below
+    # bifurcation they should sit on the up-sweep points.
+    good_down = [
+        (i, fit)
+        for i, fit in enumerate(_down_fits_for_tone(fit_data, tone_index))
+        if fit is not None
+    ]
+    down_params = (
+        extract_parameters([fit for _, fit in good_down]) if good_down else None
+    )
+    down_power_axis = np.asarray(
+        [
+            _power_for_tone(run, i, tone_index, use_readback=use_readback)
+            for i, _ in good_down
+        ],
+        dtype=float,
+    )
     for ax, name in zip(axes, parameters):
         values = np.asarray(fit_params[name], dtype=float)
         ylabel = _PARAMETER_PLOT_LABELS.get(str(name), str(name))
+        if down_params is not None and name in down_params:
+            down_values = np.asarray(down_params[name], dtype=float)
+            ax.plot(
+                down_power_axis,
+                down_values,
+                "o",
+                markerfacecolor="none",
+                markeredgecolor="tab:orange",
+                markersize=3.5,
+                markeredgewidth=0.8,
+                label="down sweep",
+                zorder=4,
+            )
+            ax.legend(fontsize=6.5, loc="best", frameon=True)
+            values_for_limits = np.concatenate([values, down_values])
+        else:
+            values_for_limits = values
         if colour_points:
             ax.plot(power_axis, values, color="0.55", linewidth=0.65, alpha=0.6)
             ax.scatter(
@@ -10038,7 +10188,7 @@ def _plot_power_sweep_parameters(
         ax.grid(True, alpha=0.18, linewidth=0.5)
         # Keep the y-range bound to the values, so optional large error bars
         # do not blow out the view. Bars that extend beyond are clipped.
-        finite_vals = values[np.isfinite(values)]
+        finite_vals = values_for_limits[np.isfinite(values_for_limits)]
         if finite_vals.size:
             vmin = float(np.min(finite_vals))
             vmax = float(np.max(finite_vals))
@@ -10341,6 +10491,38 @@ def _plot_best_power_one_tone(
         zorder=3,
     )
 
+    # Down-sweep anl of a bidirectional run, hollow markers at the same
+    # powers; blue when it took part in the ANL fit.
+    anl_down = np.asarray(
+        [_as_float(row.get("anl_down", np.nan)) for row in tone_rows],
+        dtype=float,
+    )
+    down_mask = np.isfinite(powers) & np.isfinite(anl_down) & (anl_down > 0.0)
+    fit_down_set = set(pick.get("fit_sweep_indices_down", ()))
+    outlier_down_set = set(pick.get("outlier_sweep_indices_down", ()))
+    fit_down = np.asarray([idx in fit_down_set for idx in sweep_idx]) & down_mask
+    outlier_down = (
+        np.asarray([idx in outlier_down_set for idx in sweep_idx]) & down_mask
+    )
+    other_down = down_mask & ~(fit_down | outlier_down)
+    for mask, colour, label in (
+        (fit_down, "tab:blue", "ANL fit points (down sweep)"),
+        (outlier_down, "tab:red", "clipped from ANL fit (down sweep)"),
+        (other_down, "0.55", "other down-sweep ANL"),
+    ):
+        if np.any(mask):
+            ax.scatter(
+                powers[mask],
+                anl_down[mask],
+                facecolors="none",
+                edgecolors=colour,
+                marker="D",
+                s=70,
+                linewidths=1.0,
+                label=label,
+                zorder=4,
+            )
+
     target_value = _as_float(pick.get("target_anl", target_anl))
     if np.isfinite(target_value) and target_value > 0.0:
         ax.axhline(
@@ -10560,7 +10742,7 @@ def _plot_best_power_one_tone(
             zorder=10,
         )
 
-    positive = list(anl[plot_mask])
+    positive = list(anl[plot_mask]) + list(anl_down[down_mask])
     if (
         show_anl_errors
         and np.any(error_mask)

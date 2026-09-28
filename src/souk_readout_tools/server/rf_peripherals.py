@@ -11,6 +11,9 @@ Independent dimensions:
 - ``rf_frontend.mixerless_module.connected`` — whether the SOUK mixerless
   module is the active RF frontend. Drives bypass-amp support and (when
   attenuator backend is ``i2c``) the attenuator role.
+- ``rf_frontend.mixerless_module.model`` — which physical module is fitted
+  (a key of ``MIXERLESS_MODULE_MODELS``): its i2c addresses and which paths
+  have a bypass amp.
 - ``rf_frontend.attenuator.backend`` — how programmable attenuators are
   controlled: ``i2c`` (uses the mixerless module's on-board attenuators),
   ``rudat`` (Mini-Circuits USB), or ``fixed`` (explicit non-controllable
@@ -66,89 +69,116 @@ except ImportError:
     _RUDAT_AVAILABLE = False
 
 
-def _channel_i2c_addresses(hw_config):
-    """The (recv, transmit) i2c addresses a channel's strap config implies.
+# The SOUK mixerless modules we have, selected by
+# rf_frontend.mixerless_module.model. Each channel, in rf_channel order, gives
+# the i2c addresses of its receive and transmit GPIO expanders (what
+# `i2cdetect -y -r 0 0x38 0x3f` shows) and the paths whose amplifier can be
+# bypassed from software.
+#
+# A path with no bypass amp is not the circuit the submodule's component model
+# describes: its amp is reported as never bypassed, the model's gain and P1dB
+# are not used, and its S21 must be measured into
+# rf_frontend.mixerless_module.{tx,rx}_amp_enabled_s21_db.
+MIXERLESS_MODULE_MODELS = {
+    'cardiff_dual': [
+        {'recv': 0x3B, 'transmit': 0x3A, 'bypass_amps': ('tx', 'rx')},
+        {'recv': 0x39, 'transmit': 0x38, 'bypass_amps': ('tx', 'rx')},
+    ],
+    'manchester_single': [
+        {'recv': 0x3B, 'transmit': 0x3A, 'bypass_amps': ('tx', 'rx')},
+    ],
+    # New RX circuit, no RX bypass amp. One RF channel: its RX attenuator is
+    # on 0x3D and its TX attenuator and TX bypass on 0x38, channel 1's
+    # transmit expander (measured in loopback on krm4, 2026-09-23). 0x39 and
+    # 0x3C also answer but are not in the RF path, and 0x3C must never be
+    # driven: its "TX bypass" bit cuts the whole RX chain by ~47 dB.
+    'rx_prototype': [
+        {'recv': 0x3D, 'transmit': 0x38, 'bypass_amps': ('tx',)},
+    ],
+}
+DEFAULT_MIXERLESS_MODULE_MODEL = 'cardiff_dual'
 
-    Mirrors the lookup ``MAX732_8_9.__init__`` does: the resistor choices in
-    ``hw_config`` select ad2/ad1/ad0 levels via ``GPIO_ADDR_RESISTOR_MAP``, and
-    those levels pick an address out of ``DEV_ADDRS_MAP`` for the fitted part.
-    Returns ``None`` for an address that cannot be resolved, so a caller can
-    treat it as "not probeable" rather than crashing.
+
+def _hw_config(channel):
+    """The submodule's strap-resistor config for a channel at these addresses.
+
+    The reverse of the lookup ``MAX732_8_9.__init__`` does: the address fixes
+    the part and its ad0/ad1/ad2 levels in ``DEV_ADDRS_MAP``, and each level
+    fixes which resistor of the pair is fitted in ``GPIO_ADDR_RESISTOR_MAP``.
     """
-    out = []
-    for role, straps, part in (
-        ('recv', ('r8_r13', 'r9_r14', 'r12_r17'), hw_config.u4_type),
-        ('transmit', ('r18_r21', 'r19_r22', 'r20_r23'), hw_config.u8_type),
+    straps = {}
+    for role, names, part_field in (
+        ('recv', ('r8_r13', 'r9_r14', 'r12_r17'), 'u4_type'),
+        ('transmit', ('r18_r21', 'r19_r22', 'r20_r23'), 'u8_type'),
     ):
-        levels = {}
-        for pin, attr in zip(('ad0', 'ad1', 'ad2'), straps):
-            chosen = getattr(hw_config, attr)
-            levels[pin] = GPIO_ADDR_RESISTOR_MAP[role][pin][chosen]
-        addr = next((a for a, info in DEV_ADDRS_MAP.items()
-                     if info.get(part) == levels), None)
-        out.append(addr)
-    return tuple(out)
+        (part, levels), = DEV_ADDRS_MAP[channel[role]].items()
+        straps[part_field] = part
+        for pin, name in zip(('ad0', 'ad1', 'ad2'), names):
+            resistors = GPIO_ADDR_RESISTOR_MAP[role][pin]
+            straps[name] = next(r for r, level in resistors.items()
+                                if level == levels[pin])
+    return SOUKRFMixerlessModuleChnHWConfig(**straps)
 
 
-def _populated_hw_config_list(bus, configs):
-    """Keep only the channels whose devices actually answer on the bus.
+def _answers(bus, addr):
+    try:
+        bus.read_byte(addr)
+        return True
+    except OSError:
+        return False
 
-    Boards are not always fully populated -- a one-channel card is legitimate --
-    but ``SOUKRFMixerlessModule.__init__`` probes every channel it is given and
-    raises on the first that does not answer, which previously abandoned the
-    whole module and took the working channels down with it.
 
-    A channel that is absent is logged at WARNING rather than passed over
-    silently: on a board that is *meant* to be fully populated, a missing
-    channel is a fault worth seeing.
+def _models_on_bus(bus):
+    """The models whose expanders all answer, keeping only the fullest.
+
+    A module can answer at addresses its model does not use (the prototype's
+    0x39/0x3C), so this is not an exact match; and a dual module also answers
+    at a single one's addresses, so of the matches only those with the most
+    expanders are kept.
     """
-    kept = []
-    for idx, cfg in enumerate(configs):
-        addrs = _channel_i2c_addresses(cfg)
-        missing = []
-        for role, addr in zip(('recv', 'transmit'), addrs):
-            if addr is None:
-                missing.append(f'{role}=unresolvable')
-                continue
-            try:
-                bus.read_byte(addr)
-            except OSError:
-                missing.append(f'{role}@0x{addr:02x}')
+    def addresses(model):
+        return {ch[role] for ch in MIXERLESS_MODULE_MODELS[model]
+                for role in ('recv', 'transmit')}
+    known = set().union(*(addresses(m) for m in MIXERLESS_MODULE_MODELS))
+    answering = {addr for addr in known if _answers(bus, addr)}
+    matches = [m for m in MIXERLESS_MODULE_MODELS if addresses(m) <= answering]
+    most = max((len(addresses(m)) for m in matches), default=0)
+    return [m for m in matches if len(addresses(m)) == most]
+
+
+def _answering_channels(bus, model):
+    """The leading channels of ``model`` whose expanders answer on the bus.
+
+    ``SOUKRFMixerlessModule.__init__`` raises on the first channel that does
+    not answer, which would take the working channels down with it, so
+    channels are probed first. The list stops at the first missing channel
+    rather than skipping it: the submodule numbers channels by list position,
+    so skipping one would move the next into its rf_channel and drive another
+    pipeline's RF chain.
+    """
+    present = []
+    for idx, channel in enumerate(MIXERLESS_MODULE_MODELS[model]):
+        missing = [f'{role}@0x{channel[role]:02x}'
+                   for role in ('recv', 'transmit')
+                   if not _answers(bus, channel[role])]
         if missing:
             logger.warning(
-                'SOUK mixerless module channel %d not populated (%s) -- '
-                'skipping it. If this board is meant to have %d channels, '
-                'that is a hardware fault, not a configuration choice.',
-                idx, ', '.join(missing), len(configs),
+                'SOUK mixerless module %r channel %d not answering (%s) -- '
+                'using channels before it only. A missing channel on a '
+                'module that has it is a hardware fault.',
+                model, idx, ', '.join(missing),
             )
-        else:
-            kept.append(cfg)
-    return kept
-
-
-def _mixerless_module_hw_config_list():
-    """Per-channel hw_config matching the production-board wiring of the
-    SOUK mixerless module. Mirror of souk_rf_mixerless_module.main().
-
-    The submodule's ``SOUKRFMixerlessModuleChnHWConfig.default_config()``
-    does NOT match the wired i2c addresses — do not use it here. When the
-    submodule eventually exposes the true production defaults, this helper
-    can delegate to that instead.
-    """
-    if not _HW_AVAILABLE:
-        return None
-    return [
-        SOUKRFMixerlessModuleChnHWConfig(
-            r8_r13="R8", r9_r14="R9", r12_r17="R17",
-            r18_r21="R21", r19_r22="R19", r20_r23="R23",
-            u4_type="MAX7329", u8_type="MAX7329",
-        ),
-        SOUKRFMixerlessModuleChnHWConfig(
-            r8_r13="R8", r9_r14="R14", r12_r17="R17",
-            r18_r21="R21", r19_r22="R22", r20_r23="R23",
-            u4_type="MAX7329", u8_type="MAX7329",
-        ),
-    ]
+            break
+        present.append(channel)
+    if not present:
+        matches = _models_on_bus(bus)
+        hint = (f'the bus matches {matches}: set '
+                f'rf_frontend.mixerless_module.model' if matches else
+                'card absent, unpowered or on another bus')
+        raise RuntimeError(
+            f'no channel of SOUK mixerless module {model!r} answers on i2c '
+            f'bus 0 -- {hint}')
+    return present
 
 
 # ---------------------------------------------------------------------
@@ -229,6 +259,7 @@ class RFPeripheralController:
         self.pipeline_id = pipeline_id
         self._attenuator = None
         self._mixerless_module = None
+        self._bypass_paths = ()
         self.runtime_state = {
             'attenuator': {},
             'bypass_amps': {},
@@ -240,6 +271,8 @@ class RFPeripheralController:
 
         connected = rf_cfg.get('connected', False)
         self.hardware_id = rf_cfg.get('hardware_id')
+        self.mixerless_model = (mixerless_cfg.get('model')
+                                or DEFAULT_MIXERLESS_MODULE_MODEL)
         self._attenuator_backend = attn_cfg.get('backend') or None
         self.enabled = connected and self._attenuator_backend is not None
         self._channel = mixerless_cfg.get('rf_channel', pipeline_id)
@@ -262,6 +295,32 @@ class RFPeripheralController:
         #    instance fills whichever roles it's wired to: attenuator (when
         #    attenuator.backend == 'i2c') and/or bypass amps.
         if mixerless_connected:
+            channels = MIXERLESS_MODULE_MODELS.get(self.mixerless_model)
+            if channels is None:
+                raise ValueError(
+                    f"Unknown mixerless_module.model '{self.mixerless_model}'. "
+                    f"Known: {', '.join(MIXERLESS_MODULE_MODELS)}"
+                )
+            if not 0 <= self._channel < len(channels):
+                raise ValueError(
+                    f"rf_channel {self._channel} does not exist on mixerless "
+                    f"module '{self.mixerless_model}' "
+                    f"({len(channels)} channel(s))"
+                )
+            self._bypass_paths = channels[self._channel]['bypass_amps']
+            for path in ('tx', 'rx'):
+                if (path not in self._bypass_paths
+                        and mixerless_cfg.get(f'{path}_amp_enabled_s21_db') is None):
+                    logger.warning(
+                        "Mixerless module %r has no %s bypass amp on rf_channel "
+                        "%d, so its %s S21 is not modelled: set "
+                        "rf_frontend.mixerless_module.%s_amp_enabled_s21_db "
+                        "(and %s_input_1db_comp_dbm). Power calibration "
+                        "assumes 0 dB until then.",
+                        self.mixerless_model, path.upper(), self._channel,
+                        path.upper(), path, path,
+                    )
+
             if not _HW_AVAILABLE:
                 logger.error(
                     "mixerless_module.connected: true but smbus2 / "
@@ -272,16 +331,15 @@ class RFPeripheralController:
                 try:
                     with i2c_bus_lock(purpose='RF module init'):
                         bus = SMBus(0)
-                        present = _populated_hw_config_list(
-                            bus, _mixerless_module_hw_config_list())
-                        if not present:
+                        present = _answering_channels(bus, self.mixerless_model)
+                        if self._channel >= len(present):
                             raise RuntimeError(
-                                'no SOUK mixerless module channels responded on '
-                                'i2c bus 0 -- card absent, unpowered or on another bus')
-                        self._mixerless_module = SOUKRFMixerlessModule(bus, present)
+                                f'rf_channel {self._channel} is not answering')
+                        self._mixerless_module = SOUKRFMixerlessModule(
+                            bus, [_hw_config(ch) for ch in present])
                     logger.info(
-                        'SOUK mixerless module %r initialised, rf_channel %d',
-                        self.hardware_id, self._channel,
+                        'SOUK mixerless module %r (%s) initialised, rf_channel %d',
+                        self.hardware_id, self.mixerless_model, self._channel,
                     )
                 except Exception:
                     logger.exception(
@@ -357,8 +415,14 @@ class RFPeripheralController:
 
     @property
     def supports_bypass_amps(self):
-        """True iff the SOUK mixerless module is connected and responding."""
-        return self._mixerless_module is not None
+        """True iff the SOUK mixerless module is connected and responding and
+        this channel has a bypass amp on at least one path."""
+        return self._mixerless_module is not None and bool(self._bypass_paths)
+
+    def has_bypass_amp(self, path):
+        """True iff the ``path`` ('tx' or 'rx') amp bypass on this channel is
+        software-controllable."""
+        return self._mixerless_module is not None and path in self._bypass_paths
 
     @property
     def attenuator_backend(self):
@@ -402,7 +466,7 @@ class RFPeripheralController:
 
     def set_tx_amp_bypass(self, bypass):
         """Set TX amplifier bypass state (True = bypassed)."""
-        self._require_bypass_amps()
+        self._require_bypass_amp('tx')
         with self._i2c_lock():
             self._mixerless_module.set_amp_bypass_state(
                 self._channel, 'transmit_atten', bool(bypass),
@@ -410,8 +474,10 @@ class RFPeripheralController:
         self._sync_runtime_state('transmit_atten')
 
     def get_tx_amp_bypass(self):
-        """Get TX amplifier bypass state."""
-        self._require_bypass_amps()
+        """Get TX amplifier bypass state (False on a path with no bypass amp)."""
+        if self._mixerless_module is not None and not self.has_bypass_amp('tx'):
+            return False
+        self._require_bypass_amp('tx')
         with self._i2c_lock():
             return self._mixerless_module.get_amp_bypass_state(
                 self._channel, 'transmit_atten',
@@ -419,7 +485,7 @@ class RFPeripheralController:
 
     def set_rx_amp_bypass(self, bypass):
         """Set RX amplifier bypass state (True = bypassed)."""
-        self._require_bypass_amps()
+        self._require_bypass_amp('rx')
         with self._i2c_lock():
             self._mixerless_module.set_amp_bypass_state(
                 self._channel, 'recv_atten', bool(bypass),
@@ -427,8 +493,10 @@ class RFPeripheralController:
         self._sync_runtime_state('recv_atten')
 
     def get_rx_amp_bypass(self):
-        """Get RX amplifier bypass state."""
-        self._require_bypass_amps()
+        """Get RX amplifier bypass state (False on a path with no bypass amp)."""
+        if self._mixerless_module is not None and not self.has_bypass_amp('rx'):
+            return False
+        self._require_bypass_amp('rx')
         with self._i2c_lock():
             return self._mixerless_module.get_amp_bypass_state(
                 self._channel, 'recv_atten',
@@ -449,10 +517,12 @@ class RFPeripheralController:
         """TX path total gain/insertion-loss (dB) at the current settings."""
         if self._attenuator_backend == 'fixed':
             gain = -abs(self.get_tx_attenuation())
-            if self.supports_bypass_amps:
+            if self.has_bypass_amp('tx'):
                 gain += self._get_amp_s21('transmit_atten')
             return gain
         if self._mixerless_module is not None:
+            if not self.has_bypass_amp('tx'):
+                return None  # not the circuit the submodule models
             atten_amp = self._mixerless_module._get_atten_amp(
                 self._channel, 'transmit_atten',
             )
@@ -463,10 +533,12 @@ class RFPeripheralController:
         """RX path total gain/insertion-loss (dB) at the current settings."""
         if self._attenuator_backend == 'fixed':
             gain = -abs(self.get_rx_attenuation())
-            if self.supports_bypass_amps:
+            if self.has_bypass_amp('rx'):
                 gain += self._get_amp_s21('recv_atten')
             return gain
         if self._mixerless_module is not None:
+            if not self.has_bypass_amp('rx'):
+                return None  # not the circuit the submodule models
             atten_amp = self._mixerless_module._get_atten_amp(
                 self._channel, 'recv_atten',
             )
@@ -478,7 +550,7 @@ class RFPeripheralController:
         override = self._mixerless_module_cal_value('tx_input_1db_comp_dbm')
         if override is not None:
             return float(override)
-        if self._mixerless_module is not None:
+        if self.has_bypass_amp('tx'):
             atten_amp = self._mixerless_module._get_atten_amp(
                 self._channel, 'transmit_atten',
             )
@@ -489,9 +561,15 @@ class RFPeripheralController:
     def get_rx_input_1db_comp(self):
         """RX path input 1 dB compression point (dBm) at the current settings."""
         override = self._mixerless_module_cal_value('rx_input_1db_comp_dbm')
+        if override is not None and self.mixerless_model == 'rx_prototype':
+            # The prototype's override is measured at 0 dB RX attenuation, and
+            # its attenuator sits ahead of the stage that compresses -- -38 dBm
+            # total in at 31.5 dB stayed linear to 0.01 dB (krm4, 2026-09-23) --
+            # so the input-referred P1dB rises with the attenuation.
+            return float(override) + float(self.get_rx_attenuation())
         if override is not None:
             return float(override)
-        if self._mixerless_module is not None:
+        if self.has_bypass_amp('rx'):
             atten_amp = self._mixerless_module._get_atten_amp(
                 self._channel, 'recv_atten',
             )
@@ -513,6 +591,7 @@ class RFPeripheralController:
             'hardware': self.is_hardware,
             'controllable': self.is_controllable,
             'attenuator_backend': self.attenuator_backend,
+            'supports_bypass_amps': self.supports_bypass_amps,
             'rf_channel': self._channel,
             'tx_attenuation_db': (
                 self.get_tx_attenuation() if has_readable_attenuation else None
@@ -529,7 +608,7 @@ class RFPeripheralController:
             'tx_input_1db_comp_dbm': self.get_tx_input_1db_comp() if self.is_hardware else None,
             'rx_input_1db_comp_dbm': self.get_rx_input_1db_comp() if self.is_hardware else None,
         }
-        if self.supports_bypass_amps:
+        if self._mixerless_module is not None:
             status['tx_amp_bypass'] = self.get_tx_amp_bypass()
             status['rx_amp_bypass'] = self.get_rx_amp_bypass()
             status['tx_bypass_amp_s21_db'] = self._get_amp_s21('transmit_atten')
@@ -617,11 +696,16 @@ class RFPeripheralController:
             )
         return self._attenuator
 
-    def _require_bypass_amps(self):
+    def _require_bypass_amp(self, path):
         if self._mixerless_module is None:
             raise RuntimeError(
                 'Bypass amps not available: the SOUK mixerless module is not '
                 'connected or did not initialise.'
+            )
+        if path not in self._bypass_paths:
+            raise RuntimeError(
+                f'Mixerless module {self.mixerless_model!r} has no '
+                f'{path.upper()} bypass amp on rf_channel {self._channel}.'
             )
 
     def _set_attenuation(self, dev_name, attenuation_db):
@@ -659,12 +743,12 @@ class RFPeripheralController:
         if dev_name == 'transmit_atten':
             if self.is_hardware:
                 attn_state['tx_value_db'] = self.get_tx_attenuation()
-            if self.supports_bypass_amps:
+            if self._mixerless_module is not None:
                 bypass_state['tx_amp_bypass'] = self.get_tx_amp_bypass()
         elif dev_name == 'recv_atten':
             if self.is_hardware:
                 attn_state['rx_value_db'] = self.get_rx_attenuation()
-            if self.supports_bypass_amps:
+            if self._mixerless_module is not None:
                 bypass_state['rx_amp_bypass'] = self.get_rx_amp_bypass()
 
     def _sync_runtime_state_from_hardware(self):
@@ -686,7 +770,12 @@ class RFPeripheralController:
         ~16 dB optimistic on TX (and ~5 dB pessimistic on RX).  The config
         overrides ``{tx,rx}_amp_{enabled,bypassed}_s21_db`` are measured at
         this same plane and take priority over this model.
+
+        ``None`` on a path with no bypass amp, which is not the circuit the
+        model describes.
         """
+        if not self.has_bypass_amp('tx' if dev_name == 'transmit_atten' else 'rx'):
+            return None
         level = self._mixerless_module._get_atten_amp(
             self._channel, dev_name).atten_amp_level
         return level.total_gain_il - level.variable_atten.total_gain_il
@@ -759,13 +848,29 @@ class RFPeripheralController:
 # Generic attenuator discovery
 # ---------------------------------------------------------------------
 
+def _detected_module(bus):
+    """``(model, channels, SOUKRFMixerlessModule)`` for the module on ``bus``.
+
+    Discovery has no config to name the model, so it is read off the bus;
+    ``(None, [], None)`` when no single model matches what answers.
+    """
+    matches = _models_on_bus(bus)
+    if len(matches) != 1:
+        print(f'No single SOUK mixerless module model matches i2c bus 0 '
+              f'(matches: {matches or "none"}).')
+        return None, [], None
+    channels = MIXERLESS_MODULE_MODELS[matches[0]]
+    return (matches[0], channels,
+            SOUKRFMixerlessModule(bus, [_hw_config(ch) for ch in channels]))
+
+
 def find_attenuators(include_state=False):
     """Discover all connected programmable attenuators.
 
     Searches for:
     - Mini-Circuits RUDAT USB attenuators (via pyusb)
     - I2C attenuators on the SOUK mixerless module (via smbus2) — both
-      TX and RX paths on each of the module's two channels.
+      TX and RX paths on each of the module's channels.
 
     If ``include_state=True``, each entry also reports the current
     attenuation level in dB (key: ``attenuation_db``).
@@ -805,10 +910,10 @@ def find_attenuators(include_state=False):
         try:
             with i2c_bus_lock(purpose='attenuator discovery'):
                 bus = SMBus(0)
-                mod = SOUKRFMixerlessModule(bus, _mixerless_module_hw_config_list())
+                model, channels, mod = _detected_module(bus)
                 # Each channel has two independent MAX7329-driven attenuators —
                 # one on the TX path and one on the RX path. Probe both.
-                for ch in range(2):
+                for ch in range(len(channels)):
                     for path, label in (('transmit_atten', 'TX'),
                                         ('recv_atten', 'RX')):
                         try:
@@ -820,7 +925,7 @@ def find_attenuators(include_state=False):
                                 'address': hex(atten_amp.atten_amp.addr),
                                 'channel': ch,
                                 'path': label,
-                                'model': f'SOUK RF Mixerless Module ch{ch} {label}',
+                                'model': f'SOUK RF Mixerless Module ({model}) ch{ch} {label}',
                             }
                             if include_state:
                                 try:
@@ -842,8 +947,9 @@ def find_attenuators(include_state=False):
 def find_bypass_amps(include_state=False):
     """Discover bypassable amplifiers.
 
-    Currently only the SOUK mixerless module has bypass amps — one per
-    TX/RX path per channel, sharing the MAX7329 GPIO with the attenuator.
+    Currently only the SOUK mixerless module has bypass amps — up to one per
+    TX/RX path per channel (see ``MIXERLESS_MODULE_MODELS``), sharing the
+    MAX7329 GPIO with the attenuator.
 
     If ``include_state=True``, each entry reports the current bypass
     state (key: ``bypassed`` — True means the amp is bypassed).
@@ -856,10 +962,12 @@ def find_bypass_amps(include_state=False):
         try:
             with i2c_bus_lock(purpose='bypass-amp discovery'):
                 bus = SMBus(0)
-                mod = SOUKRFMixerlessModule(bus, _mixerless_module_hw_config_list())
-                for ch in range(2):
+                model, channels, mod = _detected_module(bus)
+                for ch, channel in enumerate(channels):
                     for path, label in (('transmit_atten', 'TX'),
                                         ('recv_atten', 'RX')):
+                        if label.lower() not in channel['bypass_amps']:
+                            continue
                         try:
                             atten_amp = mod._get_atten_amp(ch, path)
                             entry = {
@@ -868,7 +976,7 @@ def find_bypass_amps(include_state=False):
                                 'address': hex(atten_amp.atten_amp.addr),
                                 'channel': ch,
                                 'path': label,
-                                'model': f'SOUK RF Mixerless Module ch{ch} {label} bypass amp',
+                                'model': f'SOUK RF Mixerless Module ({model}) ch{ch} {label} bypass amp',
                             }
                             if include_state:
                                 try:

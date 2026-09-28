@@ -117,14 +117,26 @@ class LNAService:
                 self._cache_time.pop(chn, None)
 
     def poll_loop(self):
-        """Refresh every channel's status on a slow cadence."""
+        """Refresh every channel's status on a slow cadence.
+
+        Channels are read one at a time, releasing the hardware lock between
+        them. A full sweep takes ~18 s on a v2 board (~1.3 s per channel), and
+        holding the lock for all of it made a request arriving mid-sweep wait
+        for the whole sweep.
+        """
         while not self._stop.is_set():
-            try:
-                with self._hw_lock:
-                    statuses = self._controller.get_lna_bias_status_all()
-                self._store(statuses)
-            except Exception:
-                logger.exception('LNA status poll failed')
+            for chn in range(1, NUM_LNA_CHANNELS + 1):
+                try:
+                    with self._hw_lock:
+                        status = self._controller.get_lna_bias_status(
+                            channel=chn)
+                    self._store({chn: status})
+                except Exception:
+                    logger.exception('LNA status poll failed on channel %d', chn)
+                # Pause before taking the lock again: Lock is not fair, and
+                # re-acquiring at once can keep a waiting request out.
+                if self._stop.wait(0.05):
+                    return
             self._stop.wait(self.poll_interval_s)
 
     def stop(self):

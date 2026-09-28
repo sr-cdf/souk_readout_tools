@@ -1680,11 +1680,14 @@ def _plot_single_fit_trace(ax1, ax2, fit, format,
             e_mag = _magnitude_error_units(
                 data_mag, e_mag,
                 _magnitude_error_unit_key(format, units, mag_deembed))
-            _, e_phase = _propagate_errors_mag(
-                z_data_phase.real, z_data_phase.imag, ei_phase, eq_phase)
             ax1.fill_between(
                 f_mhz, data_mag - e_mag, data_mag + e_mag,
                 color=data_style['color'], **ERROR_FILL_STYLE)
+        # The phase axis can take the fit-derived deembed+rotate path, which
+        # drops the I/Q errors, while the magnitude axis keeps them.
+        if has_errors and ei_phase is not None and np.any(ei_phase != 0):
+            _, e_phase = _propagate_errors_mag(
+                z_data_phase.real, z_data_phase.imag, ei_phase, eq_phase)
             ax2.fill_between(
                 f_mhz, data_phase - e_phase, data_phase + e_phase,
                 color=data_style['color'], **ERROR_FILL_STYLE)

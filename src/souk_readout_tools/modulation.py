@@ -38,6 +38,7 @@ Physics caveats:
 """
 
 import copy
+import os
 import warnings
 
 import numpy as np
@@ -130,7 +131,37 @@ def _first_or_default(values, default=0):
     return values[0]
 
 
+def _regular_cycle_indices(points, settling, N, include_settling):
+    """
+    Sample indices of every complete cycle as an ``(n_cycles, N, dwell)``
+    array, or ``None`` when the dwell is not the same at every point of every
+    complete cycle (``group_cycles`` then walks the samples instead).
+
+    Cycles are found as the walk finds them: over the non-zero points, a new
+    cycle starts wherever the point index drops. Within a cycle the point
+    index only rises, so a complete cycle's kept samples are already in
+    point-major order and reshape straight to ``(N, dwell)``.
+    """
+    active = np.flatnonzero(points != 0)
+    if not len(active):
+        return None
+    p = points[active]
+    if p.min() < 1 or p.max() > N:
+        return None                 # let the walk raise on bad point indices
+    cycle = np.concatenate(([0], np.cumsum(p[1:] < p[:-1])))
+    keep = np.ones(len(active), dtype=bool) if include_settling else settling[active] == 0
+    kept, kept_cycle = active[keep], cycle[keep]
+    counts = np.bincount(kept_cycle * N + p[keep] - 1,
+                         minlength=(cycle[-1] + 1) * N).reshape(-1, N)
+    complete = np.all(counts > 0, axis=1)
+    if not complete.any() or np.any(counts[complete] != counts[complete][0, 0]):
+        return None
+    return kept[complete[kept_cycle]].reshape(-1, N, counts[complete][0, 0])
+
+
 def _stack_or_empty(items, shape, dtype=float):
+    if isinstance(items, np.ndarray):    # already stacked (group_cycles fast path)
+        return items
     if items:
         return np.stack(items, axis=0)
     return np.empty(shape, dtype=dtype)
@@ -756,34 +787,56 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
                     cur_meta[p][key] = []
         cur_rev.clear()
 
-    # Walk the stream once. The point index ramps up within a cycle (1..N) and
-    # wraps back down at the next cycle, which is how cycle boundaries are found.
-    for k in range(len(points)):
-        p = int(points[k])
-        if p == 0:               # not modulating
-            continue
-        if prev_p is not None and p < prev_p:   # wrapped -> cycle boundary
-            _flush()
-        if int(settling[k]) and not include_settling:
-            # settling transient: advance the point marker but don't accumulate
-            prev_p = p
-            continue
-        # accumulate this sample into its point bucket, with aligned metadata
-        cur[p].append(z[k])
-        cur_meta[p]['sample_index'].append(int(sample_index[k]))
-        cur_meta[p]['sample_present'].append(bool(sample_present[k]))
-        cur_meta[p]['packet_missing'].append(bool(missing_meta[k]))
-        cur_meta[p]['packet_counter'].append(int(pc_meta[k]))
-        cur_meta[p]['telescope_time'].append(int(tt_meta[k]))
-        cur_meta[p]['packet_error'].append(int(err_meta[k]))
-        cur_meta[p]['modulation_point'].append(int(points[k]))
-        cur_meta[p]['modulation_settling'].append(int(settling[k]))
-        cur_meta[p]['modulation_revision'].append(int(revisions[k]))
+    # Fast path (reduce=None, same dwell everywhere -- the normal case): gather
+    # the complete cycles directly instead of walking the samples.
+    regular = (_regular_cycle_indices(points, settling, N, include_settling)
+               if reduce is None else None)
+    if regular is not None:
+        cycles_z = z[regular]
+        cycles_sample_index = sample_index[regular]
+        cycles_sample_present = np.asarray(sample_present, dtype=bool)[regular]
+        cycles_packet_missing = missing_meta[regular]
+        cycles_packet_counter = pc_meta[regular]
+        cycles_telescope_time = tt_meta[regular]
+        cycles_packet_error = err_meta[regular]
+        cycles_mod_point = points[regular]
+        cycles_mod_settling = settling[regular]
+        cycles_mod_revision = revisions[regular]
         for name in flag_meta:
-            cur_meta[p]['stream_flags'][name].append(flag_meta[name][k])
-        cur_rev.append(int(revisions[k]))
-        prev_p = p
-    _flush()
+            cycles_flags[name] = flag_meta[name][regular]
+        cycles_used = np.full((len(regular), N), regular.shape[2], dtype=int)
+        rev = revisions[regular].reshape(len(regular), -1)
+        cycles_rev = [int(r[0]) if np.all(r == r[0]) else int(np.bincount(r).argmax())
+                      for r in rev]
+    else:
+        # Walk the stream once. The point index ramps up within a cycle (1..N) and
+        # wraps back down at the next cycle, which is how cycle boundaries are found.
+        for k in range(len(points)):
+            p = int(points[k])
+            if p == 0:               # not modulating
+                continue
+            if prev_p is not None and p < prev_p:   # wrapped -> cycle boundary
+                _flush()
+            if int(settling[k]) and not include_settling:
+                # settling transient: advance the point marker but don't accumulate
+                prev_p = p
+                continue
+            # accumulate this sample into its point bucket, with aligned metadata
+            cur[p].append(z[k])
+            cur_meta[p]['sample_index'].append(int(sample_index[k]))
+            cur_meta[p]['sample_present'].append(bool(sample_present[k]))
+            cur_meta[p]['packet_missing'].append(bool(missing_meta[k]))
+            cur_meta[p]['packet_counter'].append(int(pc_meta[k]))
+            cur_meta[p]['telescope_time'].append(int(tt_meta[k]))
+            cur_meta[p]['packet_error'].append(int(err_meta[k]))
+            cur_meta[p]['modulation_point'].append(int(points[k]))
+            cur_meta[p]['modulation_settling'].append(int(settling[k]))
+            cur_meta[p]['modulation_revision'].append(int(revisions[k]))
+            for name in flag_meta:
+                cur_meta[p]['stream_flags'][name].append(flag_meta[name][k])
+            cur_rev.append(int(revisions[k]))
+            prev_p = p
+        _flush()
 
     # Stack the per-cycle lists into output arrays (empty-safe): one row per
     # completed cycle, with the metadata axis matching the chosen `reduce`.
@@ -800,9 +853,7 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
     mod_point_out = _stack_or_empty(cycles_mod_point, meta_shape, dtype=int)
     mod_settling_out = _stack_or_empty(cycles_mod_settling, meta_shape, dtype=int)
     mod_revision_out = _stack_or_empty(cycles_mod_revision, meta_shape, dtype=int)
-    samples_used_out = (
-        np.stack(cycles_used, axis=0) if cycles_used
-        else np.empty((0, N), dtype=int))
+    samples_used_out = _stack_or_empty(cycles_used, (0, N), dtype=int)
     stream_flags_out = {
         name: _stack_or_empty(items, meta_shape, dtype=flag_meta[name].dtype)
         for name, items in cycles_flags.items()
@@ -849,7 +900,7 @@ def group_cycles(data_dict, tone_modulation_state, reduce='mean',
     z_out_shape = (0, N, n_tones) if reduce == 'mean' else (0, N, 0, n_tones)
 
     return {
-        'z': np.stack(cycles_z, axis=0) if cycles_z else np.empty(z_out_shape, dtype=complex),
+        'z': _stack_or_empty(cycles_z, z_out_shape, dtype=complex),
         'offsets_hz': offsets_hz,
         'freq_hz': freq_hz,
         'tone_metadata': tone_metadata,
@@ -1083,10 +1134,20 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
     ``f_center - f_resonance``.  ``resonance_shift_hz`` is the opposite sign,
     useful when reading detector resonance motion.
 
+    The simplest call takes the capture directly::
+
+        ts = demodulate_timestream(data)            # parse_samples dict
+        ts = demodulate_timestream('path/to/stream') # saved stream basename
+
     Parameters
     ----------
-    grouped : dict
-        Output from ``group_cycles(data, state, reduce=None)``.  Mean-reduced
+    grouped : dict or str or os.PathLike
+        A parsed sample dict (``parse_samples`` / ``parse_stream``), a saved
+        stream basename (read with ``ReadoutClient.parse_stream``), or the
+        output of ``group_cycles(data, state, reduce=None)``.  The first two
+        are grouped here with the modulation state from ``data['info']`` and
+        ``include_settling=True``, and also serve as ``data_dict``; call
+        ``group_cycles`` yourself for other grouping options.  Mean-reduced
         grouped data cannot recover the original per-sample stream and raises a
         ``ValueError``.
     offsets : numpy.ndarray or None, optional
@@ -1157,6 +1218,19 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
     """
     if method not in ('accurate', 'model', 'fast'):
         raise ValueError(f"method must be 'accurate', 'model' or 'fast', got {method!r}")
+    # Accept a stream file or a parsed capture as well as group_cycles output.
+    if isinstance(grouped, (str, os.PathLike)):
+        from .client.readout_client import ReadoutClient
+        grouped = ReadoutClient.parse_stream(grouped)
+    if 'z' not in grouped:
+        state = active_modulation_state(grouped.get('info'))
+        if state is None:
+            raise ValueError('capture has no modulation state in its info; '
+                             'was modulation enabled when it was taken?')
+        if data_dict is None:
+            data_dict = grouped
+        grouped = group_cycles(grouped, state, reduce=None,
+                               include_settling=True)
     if isinstance(fill_settling, str):
         fill_mode = fill_settling.lower()
     else:
@@ -1712,16 +1786,18 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
     Two bases are supported:
 
     - **Model-free** (no ``calibration``): work on the raw I/Q phase. The local
-      phase slope, curvature, frequency shift and a leading-order detuning are
-      estimated directly. Detuning/`needs_update` then require ``linewidth_hz``,
-      and dissipation is unavailable (NaN). The raw phase still carries the cable
-      delay and an off-origin circle, so it is less well conditioned.
+      phase slope, curvature and frequency shift are estimated directly.
+      Detuning/`needs_update` then require ``linewidth_hz``, and dissipation is
+      unavailable (NaN). The raw phase is taken about the origin, not the
+      resonance-circle centre, so the detuning reads 13x to 25x high near
+      resonance (worse for very shallow dips). Only its sign and zero are
+      meaningful.
     - **Calibrated / centred** (``calibration`` supplied): each probe point is
       de-embedded (cable delay removed at its absolute frequency) and
       phase-centred using a per-tone
       :class:`souk_readout_tools.resonator.ResonatorCalibration` (from
       :func:`params_from_sweep`). In this basis the phase is well conditioned,
-      and the **exact Möbius inversion** yields probe detuning
+      and the **exact Möbius inversion** yields the absolute frequency shift
       ``f_probe - f_r`` and
       matched-scale ``Delta(1 / (2 * Qi))`` dissipation quadrature (no
       linewidth argument needed — the calibration carries ``fr``/``Ql``).
@@ -1729,6 +1805,14 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
       analytic inverse maps the recovered circle coordinate back to probe
       detuning. Resonator detuning relative to the probe has the opposite sign.
       This is the recommended basis.
+
+    In both bases ``detuning_*`` is measured from the phase inflection
+    (``d2phi/df2 = 0``, the steepest point) as
+    ``x = -d2phi_df2 / (2 dphi_df |dphi_df|)`` linewidths, the exact inverse of
+    the centred notch phase ``-2 atan(2x)``; the linewidth only converts it to
+    Hz. For a linear notch the
+    inflection is ``fr``; for a driven one it is the max-SNR operating point
+    :func:`params_from_sweep` centres on, not ``fr``.
 
     Parameters
     ----------
@@ -1772,9 +1856,9 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
         metadata copied from :func:`group_cycles` when available:
         ``packet_counter``, ``telescope_time``, ``packet_error``,
         ``packet_missing``, ``sample_index``, ``stream_flags``. In the
-        calibrated basis ``freq_shift_hz`` / ``detuning_hz`` are the centre
-        tone's probe detuning ``f_probe - f_r`` (Hz) and ``dissipation`` is
-        ``Delta(1 / (2 * Qi))``.
+        calibrated basis ``freq_shift_hz`` is the centre tone's probe detuning
+        ``f_probe - f_r`` (Hz) and ``dissipation`` is ``Delta(1 / (2 * Qi))``;
+        ``detuning_*`` is from the phase inflection in either basis.
     """
     z = np.asarray(grouped['z'])
     if z.ndim == 4:                      # (n_cycles, N, n_used, n_tones) -> average dwell
@@ -1858,18 +1942,14 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
             phi = np.unwrap(np.angle(zc), axis=1)
             df_pts, dd_pts = cal.convert_centered_iq(zc)      # (n_cycles, N) each
             lw_t = cal.fr / cal.Ql                            # linewidth (Hz) from the fit
-            # Calibrated: df_pts is the ABSOLUTE detuning of the centre probe from
-            # the fitted fr, so freq_shift and detuning are the same quantity and
-            # detuning-in-linewidths is just that over the linewidth.
-            absolute_detuning_hz = df_pts[:, ci]
-            out['freq_shift_hz'][:, t] = absolute_detuning_hz
-            out['detuning_hz'][:, t] = absolute_detuning_hz
-            out['detuning_linewidths'][:, t] = absolute_detuning_hz / lw_t
-            out['needs_update'][:, t] = np.abs(absolute_detuning_hz / lw_t) > threshold_linewidths
+            # Calibrated: freq_shift is the ABSOLUTE detuning of the centre probe
+            # from the fitted fr. Detuning (below) is from the phase inflection.
+            out['freq_shift_hz'][:, t] = df_pts[:, ci]
             out['dissipation'][:, t] = dd_pts[:, ci]
         else:
             # Model-free basis: raw I/Q phase.
             phi = np.unwrap(np.angle(zt), axis=1)
+            lw_t = None if lw is None else lw[t]
 
         # Local slope / curvature from the chosen phase basis.
         if method == 'fast':
@@ -1906,29 +1986,29 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
         if cal is None or freq_hz is None:
             # Model-free: no de-embedding, so the raw phase has an unknown offset
             # (cable delay, electronics, the unknown true fr) and we cannot read an
-            # absolute detuning directly. Two separate quantities are produced.
-
-            # 1) freq_shift_hz is RELATIVE motion: the centre-point phase referenced
-            #    to a baseline (mean over cycles, or supplied), divided by the local
-            #    slope. It tracks how the resonance moves, NOT where it sits.
+            # absolute frequency directly.
+            # freq_shift_hz is RELATIVE motion: the centre-point phase referenced
+            # to a baseline (mean over cycles, or supplied), divided by the local
+            # slope. It tracks how the resonance moves, NOT where it sits.
             phase_reference = (np.mean(phi[:, ci]) if phase_baseline is None
                                else np.asarray(phase_baseline, dtype=float)[t])
             with np.errstate(divide='ignore', invalid='ignore'):
                 out['freq_shift_hz'][:, t] = (phi[:, ci] - phase_reference) / slope
 
-            # 2) detuning is ABSOLUTE: the curvature d2phi/df2 crosses zero at
-            #    resonance regardless of the unknown phase offset, so the ratio
-            #    curvature/slope is a self-referenced detuning estimate. The -(.)/8
-            #    factor and linewidth scaling assume a near-ideal Lorentzian/arctan
-            #    phase, so this is approximate; pass a fit (calibrated branch above)
-            #    for a model-consistent absolute detuning instead.
-            if lw is not None and N >= 3:
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    curvature_over_slope_per_hz = d2 / slope
-                detuning_linewidths = -(curvature_over_slope_per_hz * lw[t]) / 8.0
-                out['detuning_linewidths'][:, t] = detuning_linewidths
-                out['detuning_hz'][:, t] = detuning_linewidths * lw[t]
-                out['needs_update'][:, t] = np.abs(detuning_linewidths) > threshold_linewidths
+        # Detuning from the phase inflection: d2phi/df2 crosses zero there
+        # whatever the phase offset. On the circle-centred phase a notch is
+        # exactly -2 atan(2x), which inverts to x = -phi'' / (2 phi' |phi'|) --
+        # linewidths from slope and curvature alone; lw only converts to Hz.
+        # The raw phase is taken about the origin, not the circle centre, and
+        # reads 13x to 25x high near resonance (worse for very shallow dips):
+        # only its sign and zero mean anything, so it needs an explicit
+        # linewidth_hz as an opt-in.
+        if lw_t is not None and N >= 3:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                detuning_linewidths = -d2 / (2.0 * slope * np.abs(slope))
+            out['detuning_linewidths'][:, t] = detuning_linewidths
+            out['detuning_hz'][:, t] = detuning_linewidths * lw_t
+            out['needs_update'][:, t] = np.abs(detuning_linewidths) > threshold_linewidths
 
     return out
 
@@ -2023,8 +2103,9 @@ def params_from_sweep(sweep, *, n_points=None, point_sequence=None,
     :func:`_max_snr_operating_point`. Because the demod's ``freq_shift_hz`` is
     referenced to ``fr``, it reads ``center - fr`` (also returned in
     ``reference_freqs['offset_from_fr_hz']``) as a constant baseline at the
-    operating point rather than ~0; subtract it in the tracking/``needs_update``
-    logic.
+    operating point rather than ~0. ``detuning_*`` / ``needs_update`` are
+    measured from the centred-phase inflection, which is this operating point,
+    so they read ~0 there with no subtraction.
 
     This package does **not** fit resonators itself (so no fit options have to be
     threaded through it). With ``deembed=True`` (default) you must therefore pass

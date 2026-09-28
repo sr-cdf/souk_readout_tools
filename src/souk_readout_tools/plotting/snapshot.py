@@ -15,7 +15,8 @@ from ._common import (_get_pyplot, _compute_mag_phase, _dual_panels,
                        _apply_deembed, _apply_phase_center,
                        _normalise_iq, _compute_mag_phase_units, UNITS)
 from ._psd import check_psd_units, psd_display_values
-from ..timeseries import (carrier_power, compute_psd, compute_psd_averaged,
+from ..timeseries import (FREQ_DISS_FORMATS, _linewidth_scale, carrier_power,
+                          compute_psd, compute_psd_averaged,
                           compute_psd_concatenated)
 
 
@@ -66,7 +67,7 @@ def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
                                reference_tone_frequency, smooth_window_hz,
                                conversion_method, calibrations,
                                deembed, phase_center, units, fig, label,
-                               sharex=False, sharey=False,
+                               sharex=False, sharey=False, linewidths=False,
                                **kwargs):
     """Time-domain fractional frequency/dissipation panel for snapshots."""
     if sweep_data is None:
@@ -83,14 +84,17 @@ def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
     acc_len = _snapshot_acc_len(snapshot_data, sweep_data)
     ts_like = {'info': snapshot_data.get('info')}
 
+    scale = _linewidth_scale(calibrations, tone_index) if linewidths else 1.0
+
     def _ff_fd(z):
-        """Fractional frequency/dissipation for a complex snapshot trace ``z``."""
-        return _compute_freq_diss(
+        """Frequency/dissipation (fractional, or in linewidths) for trace ``z``."""
+        ff, fd = _compute_freq_diss(
             ts_like, tone_index, z.real, z.imag, sweep_data,
             reference_tone_frequency=reference_tone_frequency,
             smooth_window_hz=smooth_window_hz,
             conversion_method=conversion_method,
             calibrations=calibrations)
+        return scale * ff, scale * fd
 
     # Snapshots are pre-accumulation; scale to match summed sweep I/Q.
     if repetitions == 'concatenate':
@@ -117,8 +121,12 @@ def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
         ax1.plot(t, ff, linewidth=0.5, label=trace_label, **kwargs)
         ax2.plot(t, fd, linewidth=0.5, label=trace_label, **kwargs)
 
-    ax1.set_ylabel('Fractional resonator-frequency motion')
-    ax2.set_ylabel(_dissipation_axis_label(conversion_method))
+    if linewidths:
+        ax1.set_ylabel('Resonator-frequency motion (linewidths)')
+        ax2.set_ylabel(r'Dissipation $Q_r\,\Delta(1/2Q_i)$')
+    else:
+        ax1.set_ylabel('Fractional resonator-frequency motion')
+        ax2.set_ylabel(_dissipation_axis_label(conversion_method))
     ax2.set_xlabel('Time (µs)')
     _legend(ax1)
     _legend(ax2)
@@ -145,7 +153,9 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             A single-tone batch_snapshots() dict is also accepted; for
             several tones pass one of them, e.g.
             ``batch_data['results'][3]``.
-        format: 'iq' | 'iq_vs_t' | 'magphase' | 'freq_diss'
+        format: 'iq' | 'iq_vs_t' | 'magphase' | 'freq_diss' | 'linewidths'
+            (``'freq_diss'`` times Qr from ``calibrations``; see
+            ``plot_timestream``).
         repetitions: How to handle multiple snapshots:
             'concatenate': join all end-to-end
             'overlay': plot each snapshot as a separate trace
@@ -205,7 +215,7 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
     info = system_info or snapshot_data.get('info')
     calibration_cache = {}
 
-    if format == 'freq_diss':
+    if format in FREQ_DISS_FORMATS:
         return _plot_snapshots_freq_diss(
             snapshot_data, snapshots, sample_rate, tone_index, n_snap,
             repetitions=repetitions, sweep_data=sweep_data,
@@ -215,7 +225,8 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             calibrations=calibrations,
             deembed=deembed, phase_center=phase_center,
             units=units, fig=fig, label=label,
-            sharex=sharex, sharey=sharey, **kwargs)
+            sharex=sharex, sharey=sharey,
+            linewidths=(format == 'linewidths'), **kwargs)
 
     # Normalise I/Q label setup
     if units != 'raw':
@@ -334,7 +345,7 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
         snapshot_data: dict from get_accumulator_snapshots(). A single-tone
             batch_snapshots() dict is also accepted; for several tones pass
             one of them, e.g. ``batch_data['results'][3]``.
-        format: 'iq' | 'magphase' | 'freq_diss'
+        format: 'iq' | 'magphase' | 'freq_diss' | 'linewidths'
             Selects which quantity to compute PSD of.  Two panels:
             I/Q, magnitude/phase, or fractional frequency/dissipation.
         method: 'averaged' (per-rep PSD then mean, with error bars from
@@ -380,8 +391,8 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
     psd_kw = psd_kwargs or {}
     n_snap = snapshots.shape[0]
 
-    if format == 'freq_diss' and sweep_data is None:
-        raise ValueError("sweep_data is required for format='freq_diss'")
+    if format in FREQ_DISS_FORMATS and sweep_data is None:
+        raise ValueError(f"sweep_data is required for format={format!r}")
     check_psd_units(psd_units, format)
 
     if format == 'iq':
@@ -390,7 +401,7 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
     elif format == 'magphase':
         data_top = np.abs(snapshots)
         data_bot = np.unwrap(np.angle(snapshots), axis=-1)
-    elif format == 'freq_diss':
+    elif format in FREQ_DISS_FORMATS:
         from .timestream import _compute_freq_diss
         # Snapshots are pre-accumulation; sweep I/Q are sums over acc_len
         # samples. Scale up so both are in the same units.
@@ -409,17 +420,19 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
                 calibrations=calibrations)
             frac_f_list.append(ff)
             frac_d_list.append(fd)
-        data_top = np.array(frac_f_list)
-        data_bot = np.array(frac_d_list)
+        scale = (_linewidth_scale(calibrations, tone_index)
+                 if format == 'linewidths' else 1.0)
+        data_top = scale * np.array(frac_f_list)
+        data_bot = scale * np.array(frac_d_list)
     else:
         raise ValueError(
             f"Unknown format '{format}'. "
-            "Use 'iq', 'magphase', or 'freq_diss'.")
+            "Use 'iq', 'magphase', 'freq_diss' or 'linewidths'.")
 
     if sharey is None:
         # The freq/diss panels are both fractional, so one scale compares them
         # directly; I/Q and magnitude/phase panels are not in the same units.
-        sharey = (format == 'freq_diss')
+        sharey = (format in FREQ_DISS_FORMATS)
     fig, ax1, ax2 = _dual_panels(fig, sharex=sharex, sharey=sharey)
 
     trace_label = _resolve_label(ax1, label)

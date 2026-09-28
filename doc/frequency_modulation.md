@@ -216,8 +216,7 @@ point against its cycle's local slope and reference, giving sample-aligned
 standard plotting helpers:
 
 ```python
-grouped = mod.group_cycles(data, state, reduce=None, include_settling=True)
-ts = mod.demodulate_timestream(grouped, data_dict=data)
+ts = mod.demodulate_timestream(data)          # parsed capture, or a stream file basename
 
 plot_timestream(ts, format='freq_diss')
 plot_timestream_psd(ts, format='freq_diss')     # no sweep needed
@@ -426,11 +425,21 @@ Enable modulation (default `engine='fw'`).
 - Result: `{'revision', ..., 'needs_recenter'}` (fw also reports `mode`/`n_slots`/`n_dwell`).
 
 ### `update_modulation(offsets=None, center=None, samples_per_point=None, n_settle=None, engine=None, mode=None, force=False, ...)`
-Seamless live update (no dropped data), riding the armed bins. `engine=None`
-updates whichever engine is active. **fw:** the new combs are loaded into the
-inactive ping-pong buffer and flipped in one step. **sw:** the per-point words are
-swapped in place. A move beyond bin coverage is rejected (fw: `force=True` or
-disable+enable; sw: `on_map_change='recenter'`).
+With no requested settings change, the RFSoC server uses its latest sweep
+held in memory to fit resonator calibrations, then estimates **calibrated phase
+curvature** from its live, settling-excluded I/Q accumulator. No client file
+lookup or independent stream capture is needed. A valid server-side sweep must
+exist; each correction is capped at half a fitted linewidth, and tones without
+usable fits are reported as skipped. This is a one-step local correction;
+repeat only after inspecting the new curvature.
+
+With explicit `center=` or `offsets=`, the method sends those values to the
+active engine. `engine=None` selects the active engine. **fw:** the new combs
+are loaded into the inactive ping-pong buffer and flipped in one step. **sw:**
+the per-point words are swapped in place. A move beyond bin coverage is
+rejected (fw: `force=True` or disable+enable; sw:
+`on_map_change='recenter'`). Every applied update changes the modulation
+revision; restart demodulated live viewers with fresh metadata.
 
 ### `set_modulation_slot(slot)`  — firmware-slot, manual mode
 Select the live LO slot; it goes live after the next accumulation. `slot` must be a
@@ -761,13 +770,17 @@ Per-cycle, per-tone demodulation in one of two bases (see [De-embedding](#de-emb
 
 ### `demodulate_timestream(grouped, *, method='accurate', calibration=None, reference_z=None, data_dict=None, n_samples=None, fill_settling=True, use_settling_for_fit=False, threshold_linewidths=0.1)`
 Sample-aligned demodulation for the case where every modulation point is a useful
-resonator probe and you do not want to lose integration time. Use it with
-`group_cycles(..., reduce=None)` so the individual sample indices are retained:
+resonator probe and you do not want to lose integration time:
 
 ```python
-grouped = mod.group_cycles(data, state, reduce=None, include_settling=True)
-ts = mod.demodulate_timestream(grouped, data_dict=data)
+ts = mod.demodulate_timestream(data)                 # parse_samples / parse_stream dict
+ts = mod.demodulate_timestream('captures/stream_01') # saved stream basename
 ```
+
+Either form reads the modulation state from `data['info']` and groups with
+`group_cycles(data, state, reduce=None, include_settling=True)`. Pass your own
+`group_cycles` output (plus `data_dict=data`) instead when you need other
+grouping options such as `on_missing='fill'`.
 
 Returns `(n_samples, n_tones)` arrays such as `freq_shift_hz`,
 `resonance_shift_hz`, `z_demod`, `mag`, `phase_rad`, `phase_unwrapped_rad`,

@@ -24,4 +24,5 @@
 lna_service:
   host: "10.11.11.11"      # RFSoC wired to the LNA bias board
   port: 10500              # must match the service's --port
-  timeout_s: 15.0          # per-request timeout; a remote set can take seconds
+  timeout_s: 180.0         # per-request timeout; a remote-method set steps the DAC
+                           # ~1 s per tap and can take ~2 min for one channel

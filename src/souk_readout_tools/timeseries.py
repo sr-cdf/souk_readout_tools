@@ -29,6 +29,7 @@ fit tau_qp to individual glitch pulses        ``fit_glitch_pulses``
 measure noise common to freq and dissipation  ``cross_psd``
 combine both quadratures into one estimate    ``combine_quadratures``
 measure the responsivity ratio beta           ``estimate_beta``
+get frequency noise in linewidths             any of the above, ``format='linewidths'``
 predict beta with no measurement at all       ``beta_from_kernels``
 get absolute responsivity from a load ladder  ``signal_direction_from_loads``
 see how long you can usefully integrate       ``allan_deviation``
@@ -98,7 +99,32 @@ PSD_PANELS = {
     'iq': ('i', 'q'),
     'magphase': ('magnitude', 'phase'),
     'freq_diss': ('frequency', 'dissipation'),
+    'linewidths': ('frequency', 'dissipation'),
 }
+
+# Formats whose rows are the frequency/dissipation pair.  'freq_diss' is
+# fractional; 'linewidths' is the same pair multiplied by each tone's loaded
+# Q, so the frequency row is the shift in linewidths (fr / Qr).
+FREQ_DISS_FORMATS = ('freq_diss', 'linewidths')
+
+
+def _linewidth_scale(calibrations, tone_idx):
+    """Loaded Q of one tone, the factor taking fractional rows to linewidths.
+
+    Both rows are scaled by the same Qr, so ``Qr * delta_tilde`` stays one
+    complex coordinate: frequency in linewidths, and dissipation
+    ``Qr * Im(delta_tilde) = Qr * Delta(1 / 2Qi)`` on the same scale.  Their
+    ratio (beta) is unchanged.
+    """
+    from .resonator import calibration_for_tone
+    calibration = calibration_for_tone(calibrations, int(tone_idx))
+    Ql = float(getattr(calibration, 'Ql', np.nan))
+    if not (np.isfinite(Ql) and Ql > 0.0):
+        raise ValueError(
+            f"linewidth units need calibrations (fit results or "
+            f"ResonatorCalibration; --calibrations for souk-live-plot) giving "
+            f"a loaded Q for tone {int(tone_idx)}")
+    return Ql
 
 
 def fill_gaps(samples, method='nan', *, max_missing=1_000_000,
@@ -260,6 +286,7 @@ def compute_psd(data, sample_rate, method='welch', nperseg=None,
                 window='hann', noverlap=None, scaling='density'):
     """
     Compute power spectral density of a 1D signal.
+    Use ``timestream_psds`` to compute PSDs from parsed sample dictionaries.
 
     Args:
         data: 1D array (real or complex).
@@ -929,8 +956,12 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
         real arrays. Plain arrays require ``sample_rate`` and support
         ``format='iq'`` and ``'magphase'`` only, since the other options read
         capture metadata.
-    format : {'iq', 'magphase', 'freq_diss'}, optional
+    format : {'iq', 'magphase', 'freq_diss', 'linewidths'}, optional
         Quantity whose PSD is computed. Default ``'iq'``.
+        ``'linewidths'`` is ``'freq_diss'`` with both rows multiplied by the
+        tone's loaded Q from ``calibrations``: frequency in linewidths
+        (``delta_f / (fr / Qr)``), dissipation ``Qr * Delta(1 / 2Qi)`` on the
+        same scale.
     tones : sequence of int, optional
         Tone indices to include. ``None`` (default) selects tone 0 only.
     sweep_data : dict, optional
@@ -958,7 +989,8 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
         returns the radial proxy in the dissipation row.
     calibrations : optional
         Per-tone resonator calibrations or fit results, required by
-        ``conversion_method='mobius'`` and ``'circle'``.
+        ``conversion_method='mobius'`` and ``'circle'`` and by
+        ``format='linewidths'`` (for Qr).
     include_dc_point : bool, optional
         Keep the zero-frequency PSD point. Default ``False``.
     log_bin : bool, optional
@@ -1082,8 +1114,9 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
         keep_idx, psd_sample_rate = _nonsettling_decimation(ts_data, capture_rate)
 
     precomputed_freq_diss = _has_precomputed_freq_diss(ts_data)
-    if format == 'freq_diss' and sweep_data is None and not precomputed_freq_diss:
-        raise ValueError("sweep_data is required for format='freq_diss'")
+    if (format in FREQ_DISS_FORMATS and sweep_data is None
+            and not precomputed_freq_diss):
+        raise ValueError(f"sweep_data is required for format={format!r}")
     if not isinstance(decorrelate_modes, (int, np.integer)):
         raise TypeError("decorrelate_modes must be an integer")
     if decorrelate_modes < 0:
@@ -1094,9 +1127,10 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
         raise ValueError("blind_tone_modes must be non-negative")
     if format not in PSD_PANELS:
         raise ValueError(
-            f"Unknown format '{format}'. Use 'iq', 'magphase', or 'freq_diss'.")
+            f"Unknown format '{format}'. Use 'iq', 'magphase', 'freq_diss' "
+            "or 'linewidths'.")
     if ((decorrelate_modes or blind_tone_modes)
-            and format == 'freq_diss' and sweep_data is None):
+            and format in FREQ_DISS_FORMATS and sweep_data is None):
         raise ValueError(
             "SVD and blind-tone cleaning require sweep_data; precomputed "
             "modulation demodulation can be used only without these "
@@ -1104,9 +1138,12 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
     # With cleaning modes active the freq/diss is recomputed from raw I/Q, so
     # the conversion knobs do apply; otherwise a precomputed (demodulated)
     # timestream is used as-is and they cannot.
-    if (format == 'freq_diss' and precomputed_freq_diss
+    if (format in FREQ_DISS_FORMATS and precomputed_freq_diss
             and not (decorrelate_modes or blind_tone_modes)):
-        _warn_ignored_conversion_args(conversion_method, calibrations)
+        # 'linewidths' still reads the loaded Q from calibrations.
+        _warn_ignored_conversion_args(
+            conversion_method,
+            calibrations if format == 'freq_diss' else None)
     if conversion_method is None:
         conversion_method = 'linearized'
 
@@ -1206,8 +1243,10 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
                     smooth_window_hz=smooth_window_hz,
                     conversion_method=conversion_method,
                     calibrations=calibrations)
-            raw_rows[0].append(_psd(frac_f, key, 'frequency'))
-            raw_rows[1].append(_psd(frac_d, key, 'dissipation'))
+            scale = (_linewidth_scale(calibrations, tone_index)
+                     if format == 'linewidths' else 1.0)
+            raw_rows[0].append(_psd(scale * frac_f, key, 'frequency'))
+            raw_rows[1].append(_psd(scale * frac_d, key, 'dissipation'))
 
             if cleaning_on:
                 if tone_index not in cleaned:
@@ -1215,8 +1254,8 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
                         f"Tone {tone_index} selected for analysis is not in "
                         "the cleaned tone set")
                 clean_f, clean_d = cleaned[tone_index]
-                cf, cp = compute_psd(clean_f, psd_sample_rate, **psd_kw)
-                df, dp = compute_psd(clean_d, psd_sample_rate, **psd_kw)
+                cf, cp = compute_psd(scale * clean_f, psd_sample_rate, **psd_kw)
+                df, dp = compute_psd(scale * clean_d, psd_sample_rate, **psd_kw)
                 cleaned_rows[0].append(_prepare_psd_for_log_plot(
                     cf, cp, include_dc_point, log_bin, bins_per_decade))
                 cleaned_rows[1].append(_prepare_psd_for_log_plot(
@@ -1237,13 +1276,14 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
         'carrier': np.asarray(carriers, dtype=float),
         # Tagged so a later consumer can tell a real dissipation row from the
         # radial proxy Delta(rho) that conversion_method='circle' returns.
-        'conversion_method': conversion_method if format == 'freq_diss' else None,
+        'conversion_method': (
+            conversion_method if format in FREQ_DISS_FORMATS else None),
         # The responsivity each row was referred to, recorded per tone so that
         # a later on/off subtraction can check both used the same one.
         'reference_tone_frequency': (
             _referred_frequencies(ts_data, tone_indices,
                                   reference_tone_frequency)
-            if format == 'freq_diss' else None),
+            if format in FREQ_DISS_FORMATS else None),
         'cleaning': {
             'decorrelate_modes': int(decorrelate_modes),
             'decorrelate_tones': decorrelate_tones,
@@ -2149,8 +2189,12 @@ def snapshot_psds(snapshot_data, format='iq', tones=None, sweep_data=None,
         A ``batch_snapshots()`` dict (several tones), a single
         ``get_accumulator_snapshots()`` dict, or a complex array of shape
         ``(n_blocks, len_snapshot)``. Arrays require ``sample_rate``.
-    format : {'iq', 'magphase', 'freq_diss'}, optional
+    format : {'iq', 'magphase', 'freq_diss', 'linewidths'}, optional
         Quantity whose PSD is computed. Default ``'iq'``.
+        ``'linewidths'`` is ``'freq_diss'`` with both rows multiplied by the
+        tone's loaded Q from ``calibrations``: frequency in linewidths
+        (``delta_f / (fr / Qr)``), dissipation ``Qr * Delta(1 / 2Qi)`` on the
+        same scale.
     tones : sequence of int, optional
         Tone indices to include. ``None`` (default) takes every tone present.
     sweep_data : dict, optional
@@ -2176,7 +2220,8 @@ def snapshot_psds(snapshot_data, format='iq', tones=None, sweep_data=None,
     conversion_method : {'linearized', 'mobius', 'circle'}, optional
         Freq/diss conversion. ``None`` (default) means ``'linearized'``.
     calibrations : optional
-        Per-tone calibrations, required by ``'mobius'`` and ``'circle'``.
+        Per-tone calibrations, required by ``'mobius'`` and ``'circle'``
+        and by ``format='linewidths'`` (for Qr).
     include_dc_point : bool, optional
         Keep the zero-frequency point. Default ``False``.
     log_bin : bool, optional
@@ -2272,8 +2317,8 @@ def snapshot_psds(snapshot_data, format='iq', tones=None, sweep_data=None,
     if method not in ('concatenated', 'averaged'):
         raise ValueError(
             f"unknown method {method!r}; use 'concatenated' or 'averaged'")
-    if format == 'freq_diss' and sweep_data is None:
-        raise ValueError("sweep_data is required for format='freq_diss'")
+    if format in FREQ_DISS_FORMATS and sweep_data is None:
+        raise ValueError(f"sweep_data is required for format={format!r}")
 
     blocks, rate, info = _as_snapshot_blocks(snapshot_data, sample_rate, tones)
     if not blocks:
@@ -2354,11 +2399,11 @@ def snapshot_psds(snapshot_data, format='iq', tones=None, sweep_data=None,
         'psd_std': ({name: _stack(s) for name, s in zip(panels, stds)}
                     if method == 'averaged' else None),
         'carrier': np.asarray(carriers, dtype=float),
-        'conversion_method': conversion if format == 'freq_diss' else None,
+        'conversion_method': conversion if format in FREQ_DISS_FORMATS else None,
         'reference_tone_frequency': (
             _referred_frequencies({'info': info}, tone_indices,
                                   reference_tone_frequency)
-            if format == 'freq_diss' else None),
+            if format in FREQ_DISS_FORMATS else None),
         'f_resolution': float(rate) / len_snapshot,
         'bin_oversampling': float(oversampling),
         'n_avg': int(n_avg),
@@ -2396,7 +2441,9 @@ def _snapshot_panel_data(snaps, format, tone_index, info, sweep_data,
             conversion_method=conversion_method, calibrations=calibrations)
         top.append(ff)
         bot.append(fd)
-    return np.asarray(top), np.asarray(bot)
+    scale = (_linewidth_scale(calibrations, tone_index)
+             if format == 'linewidths' else 1.0)
+    return scale * np.asarray(top), scale * np.asarray(bot)
 
 
 # ---------------------------------------------------------------------------
@@ -2659,10 +2706,11 @@ def subtract_psds(on, off, f=None, *, clip='positive', export=None):
     f_off, off_rows, off_panels, off_tones, meta_off = _subtract_operand(
         off, f, False, 'off')
 
-    if panels != off_panels:
+    if panels != off_panels or meta_on.get('format') != meta_off.get('format'):
         raise ValueError(
-            f"on and off hold different panels ({panels} vs {off_panels}); "
-            "compute both with the same format=")
+            f"on and off hold different panels ({panels} vs {off_panels}) "
+            f"or formats ({meta_on.get('format')!r} vs "
+            f"{meta_off.get('format')!r}); compute both with the same format=")
     if f_on.shape != f_off.shape or not np.allclose(
             f_on, f_off, equal_nan=True):
         raise ValueError(
@@ -4590,8 +4638,10 @@ def _panel_time_rows(ts_data, format, tones, sweep_data, sample_rate,
                     reference_tone_frequency=reference_tone_frequency,
                     smooth_window_hz=smooth_window_hz,
                     conversion_method=conversion, calibrations=calibrations)
-            rows[0].append(np.asarray(frac_f, dtype=float))
-            rows[1].append(np.asarray(frac_d, dtype=float))
+            scale = (_linewidth_scale(calibrations, idx)
+                     if format == 'linewidths' else 1.0)
+            rows[0].append(scale * np.asarray(frac_f, dtype=float))
+            rows[1].append(scale * np.asarray(frac_d, dtype=float))
 
     stacked = {name: np.vstack(r) for name, r in zip(panels, rows)}
     return stacked, panels, np.asarray(tone_indices, dtype=int), float(rate)
@@ -4633,8 +4683,12 @@ def allan_deviation(data, format='freq_diss', tones=None, sweep_data=None,
         A `parse_samples` dict, a complex array of shape ``(n_tones,
         n_samples)`` or ``(n_samples,)``, or an ``(i, q)`` pair. Plain arrays
         require ``sample_rate`` and support ``format='iq'`` and ``'magphase'``.
-    format : {'iq', 'magphase', 'freq_diss'}, optional
+    format : {'iq', 'magphase', 'freq_diss', 'linewidths'}, optional
         Quantity to analyse. Default ``'freq_diss'``.
+        ``'linewidths'`` is ``'freq_diss'`` with both rows multiplied by the
+        tone's loaded Q from ``calibrations``: frequency in linewidths
+        (``delta_f / (fr / Qr)``), dissipation ``Qr * Delta(1 / 2Qi)`` on the
+        same scale.
     tones : sequence of int, optional
         Tone indices. ``None`` (default) selects tone 0.
     sweep_data : dict, optional
@@ -4820,8 +4874,12 @@ def timestream_stats(data, format='freq_diss', tones=None, sweep_data=None,
     ----------
     data : dict or ndarray or tuple of ndarray
         As in `allan_deviation`.
-    format : {'iq', 'magphase', 'freq_diss'}, optional
+    format : {'iq', 'magphase', 'freq_diss', 'linewidths'}, optional
         Quantity to summarise. Default ``'freq_diss'``.
+        ``'linewidths'`` is ``'freq_diss'`` with both rows multiplied by the
+        tone's loaded Q from ``calibrations``: frequency in linewidths
+        (``delta_f / (fr / Qr)``), dissipation ``Qr * Delta(1 / 2Qi)`` on the
+        same scale.
     tones : sequence of int, optional
         Tone indices. ``None`` (default) selects tone 0.
     sweep_data : dict, optional

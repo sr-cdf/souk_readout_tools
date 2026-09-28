@@ -3,8 +3,8 @@ Server-side FFM tone tracking: watch demodulated detunings, issue corrections.
 
 With fast frequency modulation running, this module keeps every modulated
 tone at its operating point during long observations: a lean vectorised
-estimator turns whole modulation cycles from the stream into per-tone
-detunings, a controller filters them, applies a deadband + confirmation
+estimator turns whole modulation cycles from the stream, circle-centred with
+per-tone sweep fits, into per-tone detunings, a controller filters them, applies a deadband + confirmation
 logic, and stages small centre corrections that are committed through the
 server's normal ``update_modulation`` machinery (the frame producer stays
 the sole owner of modulation hardware writes). Every committed correction is
@@ -263,12 +263,40 @@ def average_cycles(z, blocks):
     return z[:usable].reshape(blocks, per, *z.shape[1:]).mean(axis=1)
 
 
+def center_iq(z, freq_hz, calibrations):
+    """De-embed and circle-centre ``(..., N, n_tones)`` I/Q, one calibration per tone.
+
+    The curvature/slope detuning needs the phase taken about the resonance-circle
+    centre, where a notch is exactly ``-2 atan(2x)``. About the raw origin it
+    reads ``x (1 + b + b**2)`` near resonance, ``b = 1 / (1 - Ql/Qc)``: 3x for a
+    shallow dip, ~100x for a deep one.
+
+    Parameters
+    ----------
+    z : numpy.ndarray
+        Complex I/Q, last two axes ``(N, n_tones)``.
+    freq_hz : numpy.ndarray
+        ``(N, n_tones)`` absolute probe frequencies (centre + offset), Hz.
+    calibrations : dict
+        ``{tone_index: ResonatorCalibration}``. Tones without one come back NaN.
+
+    Returns
+    -------
+    numpy.ndarray
+        Centred I/Q, same shape as ``z``.
+    """
+    out = np.full(np.shape(z), np.nan + 0j)
+    for t, cal in calibrations.items():
+        out[..., t] = cal.transform_raw_iq(freq_hz[:, t], z[..., t])
+    return out
+
+
 def estimate_detunings(z, offsets, linewidth_hz):
-    """Model-free per-cycle detuning estimate, vectorised across all tones.
+    """Per-cycle detuning from the phase slope and curvature, all tones at once.
 
     The maths of :func:`souk_readout_tools.modulation.demodulate`'s
-    model-free ``method='fast'`` path -- finite-difference phase slope and
-    curvature, detuning from their ratio -- on the lowest, middle and highest
+    ``method='fast'`` path -- finite-difference phase slope and curvature --
+    on the lowest, middle and highest
     probe offsets of each tone, whatever order the slots are in. Points that
     share an offset are averaged coherently first, so the firmware default
     ``[-d, 0, +d, 0]`` uses both centre dwells. (Taking the first, middle and
@@ -280,15 +308,21 @@ def estimate_detunings(z, offsets, linewidth_hz):
     there is no unwrap: they are small whenever the probe offsets are small
     against the linewidth, which the estimate assumes anyway.
 
+    On the circle-centred phase (:func:`center_iq`) a notch is exactly
+    ``phi = -2 atan(2x)``, which inverts to ``x = -phi'' / (2 phi' |phi'|)``:
+    the detuning in linewidths from the slope and curvature alone, no
+    linewidth needed and no compression (within ~1% at +/-0.1 lw offsets,
+    ~5% low at +/-0.25). The linewidth only converts to Hz. Raw,
+    uncentred I/Q reads 13x to 25x high or worse.
+
     Parameters
     ----------
     z : numpy.ndarray
-        ``(n_cycles, N, n_tones)`` complex per-point means.
+        ``(n_cycles, N, n_tones)`` complex per-point means, circle-centred.
     offsets : numpy.ndarray
         ``(N, n_tones)`` per-point probe offsets in Hz.
     linewidth_hz : numpy.ndarray
-        ``(n_tones,)`` per-tone resonator linewidths in Hz (NaN/0 disables a
-        tone's estimate).
+        ``(n_tones,)`` per-tone resonator linewidths in Hz, for ``detuning_hz``.
 
     Returns
     -------
@@ -299,14 +333,12 @@ def estimate_detunings(z, offsets, linewidth_hz):
 
     Examples
     --------
-    A tone 0.05 linewidths above an arctan-phase resonance reads about
-    x / (1 + 4 x**2) = 0.0495, the documented compression (a little less
-    here, from the finite +/-2 kHz differences):
+    A tone 0.3 linewidths above a centred arctan-phase resonance:
 
-    >>> lw = np.array([5e4]); off = np.array([-2e3, 0, 2e3, 0])[:, None]
-    >>> z = np.exp(-2j * np.arctan(2 * (0.05 * lw + off) / lw))[None]
-    >>> round(float(estimate_detunings(z, off, lw)['detuning_linewidths'][0, 0]), 4)
-    0.0493
+    >>> lw = np.array([5e4]); off = np.array([-5e3, 0, 5e3, 0])[:, None]
+    >>> z = np.exp(-2j * np.arctan(2 * (0.3 * lw + off) / lw))[None]
+    >>> round(float(estimate_detunings(z, off, lw)['detuning_linewidths'][0, 0]), 3)
+    0.296
     """
     n_cycles, N, n_tones = z.shape
     if N < 3:
@@ -334,7 +366,7 @@ def estimate_detunings(z, offsets, linewidth_hz):
         # Second difference for (possibly) unequal spacing; for a symmetric
         # pattern it is (phi_hi - 2 phi_mid + phi_lo) / half**2.
         d2 = 2.0 * (d_hi / (f_hi - f_mid) - d_lo / (f_mid - f_lo)) / (f_hi - f_lo)
-        detuning_linewidths = -(d2 / slope * lw) / 8.0
+        detuning_linewidths = -d2 / (2.0 * slope * np.abs(slope))
     bad = ~np.isfinite(detuning_linewidths)
     detuning_linewidths = np.where(bad, np.nan, detuning_linewidths)
     return {
@@ -448,8 +480,8 @@ class TrackingController:
     linewidth_hz : array-like
         Per-tone linewidths, full ``(n_tones,)`` (NaN for untracked tones).
     threshold_linewidths : float
-        Deadband on the *filtered* detuning (default 0.3 -- deliberately
-        wider than ``demodulate``'s 0.1 ``needs_update``).
+        Deadband on the *filtered* detuning (default 0.05, inside
+        ``demodulate``'s 0.1 ``needs_update``).
     confirm_windows : int
         Consecutive decision windows over threshold before staging (default 3).
     gain : float
@@ -461,7 +493,7 @@ class TrackingController:
     """
 
     def __init__(self, n_tones, mod_indices, linewidth_hz,
-                 threshold_linewidths=0.3, confirm_windows=3, gain=1.0,
+                 threshold_linewidths=0.05, confirm_windows=3, gain=1.0,
                  max_step_linewidths=0.5, enable_mask=None,
                  min_detuning_snr=1.0):
         self.n_tones = int(n_tones)
@@ -839,11 +871,18 @@ class TrackingRuntime:
     params : dict
         Resolved ``enable_tracking`` parameters (see
         ``ReadoutServer._tracking_defaults``).
+    calibrations : dict
+        ``{tone_index: ResonatorCalibration}`` used to circle-centre the I/Q
+        before estimating. Modulated tones without one are never corrected.
     """
 
-    def __init__(self, server, params):
+    def __init__(self, server, params, calibrations):
         self.server = server
         self.params = params
+        if not calibrations:
+            raise ValueError('tracking needs a calibration for at least one '
+                             'modulated tone to centre the I/Q')
+        self.calibrations = calibrations
         # Engine: whichever modulation engine is armed (they are mutually
         # exclusive). 'fw' slots and 'sw' points tag frames identically, so
         # the estimator is shared; only the commit path differs.
@@ -873,19 +912,22 @@ class TrackingRuntime:
 
         # Per-tone linewidths: enable_tracking argument wins, else the ones
         # optionally supplied to enable_modulation (params_from_sweep's
-        # linewidth_hz), else error -- tracking requires them.
+        # linewidth_hz), else fr/Ql from the calibrations.
         linewidth = params.get('linewidth_hz')
         if linewidth is None:
             linewidth = cfg.get('linewidth_hz')
         if linewidth is None:
-            raise ValueError(
-                'tracking requires per-tone linewidth_hz: pass it to '
-                'enable_tracking, or to enable_modulation (params_from_sweep '
-                "supplies it as 'linewidth_hz')")
+            linewidth = [calibrations[t].fr / calibrations[t].Ql
+                         if t in calibrations else np.nan
+                         for t in self.mod_indices]
         self.linewidth_hz = self._expand_per_tone(linewidth)
 
         # Full (N, n_tones) offsets for the estimator.
         self.offsets = self._full_offsets(cfg)
+        # The live plot applies the server-reported RX flattening factors
+        # before calibrated demodulation; match that phase basis here.
+        self.readout_correction = modulation.readout_correction_factors(
+            {'modulation': state}, self.n_tones)
 
         sample_rate = float(state.get('sample_rate_hz') or 0.0)
         cycle_rate = float(state.get('cycle_rate_hz') or 0.0)
@@ -953,6 +995,7 @@ class TrackingRuntime:
         self.consume_ms = self.consume_ms_max = 0.0
         self.stage_ms = {}
         self.snapshot_ms = self.commit_ms = 0.0
+        self.commit_stage_ms = {}       # prepare/apply/announce split of the last commit
         # Comparing against modulation.demodulate is a diagnostic, not free:
         # it loops over tones in Python, so at 1000 tones method='accurate'
         # costs 1064 ms and 'fast' 537 ms on this ARM -- held GIL, which loses
@@ -981,13 +1024,18 @@ class TrackingRuntime:
         self.cycles_seen = 0
         self.last_filtered_lw = np.full(self.n_tones, np.nan)
         self.last_estimate_ts = None
+        # Requested by update_modulation() with no arguments. Calculated from
+        # the same deembedded phase basis as the Mobius live plot, off-loop.
+        self.phase_calibrations = None
+        self.phase_estimate_requested = False
+        self.last_phase_estimate = None
 
         # Per-tone running health statistics (exponentially weighted over
         # cycles, ~20-cycle memory). Written by process_window and read by
         # tone_health()/_build_snapshot -- all in the consumer's off-loop
         # to_thread, so the sole writer is also the sole reader and there is
-        # no cross-thread race. The model-free detuning estimate COMPRESSES
-        # at large shifts (~x/2/(1+x^2), saturating near 0.25 linewidths),
+        # no cross-thread race. Far off resonance the phase is flat and the
+        # detuning estimate is noise, not a reliably large reading,
         # so a lost resonance is detected by the phase slope collapsing
         # toward zero and by invalid (NaN) cycles -- not by big readings.
         self._stats_alpha = 0.05
@@ -1179,7 +1227,7 @@ class TrackingRuntime:
             acc64[:] = 0
         return z, revision, n_frames
 
-    def process_window(self, window):
+    def process_window(self, window, centers=None):
         """Estimate from the averaged I/Q. Runs off the loop.
 
         The coherent average is already complete -- the stream task did it
@@ -1192,10 +1240,54 @@ class TrackingRuntime:
         blocks, revision, n_frames = self.window_iq(window)
         self.stage_ms['window_iq'] = 1e3 * (_t() - _t0); _t0 = _t()
         n_cycles = n_frames // self.num_points
-        estimate = estimate_detunings(blocks, self.offsets, self.linewidth_hz)
+        if self.phase_estimate_requested and self.phase_calibrations:
+            if centers is None:
+                centers = np.asarray(self._mod_cfg()['center'], dtype=float)
+            indices = [t for t in self.mod_indices
+                       if t in self.phase_calibrations]
+            if indices:
+                try:
+                    local_cals = {j: self.phase_calibrations[t]
+                                  for j, t in enumerate(indices)}
+                    local_offsets = self.offsets[:, indices]
+                    phase_blocks = blocks[..., indices]
+                    if self.readout_correction is not None:
+                        phase_blocks = (phase_blocks *
+                                        self.readout_correction[:, indices][None, :, :])
+                    phase = modulation.demodulate(
+                        {'z': phase_blocks,
+                         'offsets_hz': local_offsets,
+                         'freq_hz': centers[indices][None, :] + local_offsets},
+                        method='fast', calibration=local_cals)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore', RuntimeWarning)
+                        slope = np.nanmedian(phase['dphi_df'], axis=0)
+                        curvature = np.nanmedian(phase['d2phi_df2'], axis=0)
+                    self.last_phase_estimate = {
+                        'revision': int(revision or 0),
+                        'indices': indices,
+                        'centers': np.asarray(centers, dtype=float).copy(),
+                        'slope': slope,
+                        'curvature': curvature,
+                        'timestamp': time.time(),
+                    }
+                    self.phase_estimate_requested = False
+                except Exception as e:
+                    self.last_phase_estimate = {
+                        'error': f'{type(e).__name__}: {e}'}
+                    self.phase_estimate_requested = False
+        if centers is None:
+            centers = np.asarray(self._mod_cfg()['center'], dtype=float)
+        z = blocks
+        if self.readout_correction is not None:
+            z = z * self.readout_correction[None, :, :]
+        z = center_iq(z, np.asarray(centers, dtype=float)[None, :] + self.offsets,
+                      self.calibrations)
+        self.stage_ms['center'] = 1e3 * (_t() - _t0); _t0 = _t()
+        estimate = estimate_detunings(z, self.offsets, self.linewidth_hz)
         self.stage_ms['estimate'] = 1e3 * (_t() - _t0); _t0 = _t()
         if self.estimator_compare_tones:
-            self.estimator_diff = self._compare_estimators(blocks, estimate)
+            self.estimator_diff = self._compare_estimators(z, estimate)
         filtered = self.filter.update(estimate['detuning_linewidths'])
         self.stage_ms['filter'] = 1e3 * (_t() - _t0); _t0 = _t()
         self._update_stats(estimate, n_cycles)
@@ -1263,7 +1355,7 @@ class TrackingRuntime:
         no live server modulation state beyond the benign, commit-revalidated
         headroom pre-check.
         """
-        result = self.process_window(window)
+        result = self.process_window(window, centers)
         if result is None:
             return False
         applied = self._applied_revision()
@@ -1451,6 +1543,7 @@ class TrackingRuntime:
                 else:
                     self.commits[klass] += 1
                     self.last_commit_ts[klass] = time.time()
+                    self.commit_stage_ms = result.get('timing_ms', {})
                 results.append(result)
             except Exception as e:
                 self.commit_errors += 1
@@ -1679,6 +1772,7 @@ class TrackingRuntime:
             'consume_ms_max': round(self.consume_ms_max, 2),
             'snapshot_ms': round(self.snapshot_ms, 2),
             'commit_ms': round(self.commit_ms, 2),
+            'commit_stage_ms': dict(self.commit_stage_ms),   # last commit, fw engine
             'acc_peak': self.acc_peak,               # largest |accumulated sum|
             'acc_headroom': (2**63 / self.acc_peak) if self.acc_peak else None,
             'estimator_diff': self.estimator_diff,
@@ -1696,4 +1790,11 @@ class TrackingRuntime:
         fresh build (tests)."""
         # Asking for it marks it stale, so the next poll rebuilds it off-loop.
         self._snapshot_wanted = True
-        return self._snapshot
+        snap = self._snapshot
+        # The age must be taken now, not when the snapshot was built, or it
+        # reads frozen between rebuilds (and through a long commit).
+        if snap is not None and self.last_estimate_ts is not None:
+            snap = dict(snap)
+            snap['summary'] = dict(snap['summary'],
+                                   last_estimate_age_s=time.time() - self.last_estimate_ts)
+        return snap

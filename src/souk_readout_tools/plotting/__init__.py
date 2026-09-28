@@ -52,3 +52,5 @@ from ..timeseries import (
     compute_psd_concatenated,
     log_bin_psd,
 )
+
+from .live import LivePlot, Panel, plot_live

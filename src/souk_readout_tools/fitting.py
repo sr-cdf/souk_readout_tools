@@ -162,6 +162,14 @@ Auto-find and fit resonances in a full sweep dictionary:
         window_fwhm=10.0, use_error_weights=True, subsample=True,
         find_resonances=True,
     )
+
+Save fits with their sweep metadata, and load them back later:
+
+    from souk_readout_tools.fitting import export_fits, load_fits
+
+    export_fits(fits, "fits.npz", sweep_data=sweep_data)
+    fits = load_fits("fits.npz")          # FitResult list, e.g. for plot_fits
+    Qi = np.load("fits.npz")["Qi"]        # or just the numbers, no pickle
 """
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -2729,3 +2737,229 @@ def fit_result_summary_row(
     if include_message:
         row["message"] = getattr(fit, "message", "")
     return row
+
+
+# FitResult fields export_fits stores as padded per-point arrays, and the ones
+# it handles specially or leaves out (the optimiser objects are debug-only and
+# not portable; power_sweep strips the same ones before persisting).
+_EXPORT_TRACE_FIELDS = (
+    "f_data", "z_data", "z_err_data", "optimizer_z_err_data", "z_fit",
+    "z_data_deembed", "z_fit_deembed",
+    "z_data_deembed_rotated", "z_fit_deembed_rotated",
+    "z_data_deembed_phase_centered", "z_fit_deembed_phase_centered",
+)
+_EXPORT_SPECIAL_FIELDS = (
+    "parameter_names", "parameter_covariance", "parameter_uncertainties",
+    "p", "initial_guess", "linear_sufficiency",
+    "opt", "opt_linear", "opt_nonlinear", "optimizer_result",
+    "optimizer_result_linear", "optimizer_result_nonlinear",
+    "linear_fit_result",
+)
+
+
+def _json_default(value):
+    """Make NumPy values and other odd metadata JSON-writable."""
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return str(value)
+
+
+def export_fits(fits, path, sweep_data=None, metadata=None):
+    """Save fits (e.g. from :func:`batch_fit`) and their metadata to a ``.npz``.
+
+    The file loads without pickle, with plain ``np.load(path)``, and every
+    array has one row per fit, in the order given:
+
+    - every scalar ``FitResult`` field (``tone_index``, ``is_blind``, ``fr``,
+      ``Qi``, ``Qc``, ``Ql``, ``phi``, ``a``, ``alpha``, ``tau``, ``anl``,
+      ``Qe``, the ``empirical_*`` estimates, ``success``, ``message``,
+      ``reduced_chi2``, ``sweep_direction``, ...), one array each;
+    - ``<name>_err`` 1-sigma uncertainties for ``fr, Qi, Qc, phi, a, alpha,
+      tau, anl`` and ``Ql`` (NaN when not fitted or not available);
+    - ``covariance`` ``(n_fits, 8, 8)`` in the order of ``covariance_names``,
+      ``initial_guess`` ``(n_fits, 8)`` in the same order, and
+      ``parameter_names`` (the comma-separated parameters each fit used);
+    - the traces ``f_data``, ``z_data``, ``z_fit``, ``z_err_data`` and the
+      de-embedded variants, as ``(n_fits, max_points)`` NaN-padded arrays;
+      fit ``i`` is ``d['z_data'][i, :d['n_points'][i]]``;
+    - ``_metadata_json``: package version, UTC export time, the sweep's
+      ``info`` and ``tone_metadata`` when ``sweep_data`` is passed, your own
+      ``metadata``, and each fit's ``linear_sufficiency`` diagnostics.
+
+    The optimiser objects (``opt*``, ``optimizer_result*``,
+    ``linear_fit_result``) are not saved. :func:`load_fits` rebuilds the
+    ``FitResult`` list, so the reloaded fits work with ``plot_fits`` and
+    anything else that takes ``batch_fit`` output.
+
+    Parameters
+    ----------
+    fits : FitResult or sequence of FitResult
+        For example the list returned by :func:`batch_fit` or
+        :func:`fit_sweep_stack`.
+    path : str or pathlib.Path
+        Destination. ``.npz`` is appended if absent.
+    sweep_data : dict or None, optional
+        The sweep the fits came from; its ``info`` and ``tone_metadata``
+        (tone powers, attenuations, board state, blind tones) are saved in the
+        metadata. The sweep arrays themselves are not duplicated.
+    metadata : dict or None, optional
+        Anything else to record (e.g. temperature, run name). Stored as JSON;
+        NumPy values become lists/numbers, anything else becomes a string.
+
+    Returns
+    -------
+    str
+        The path actually written.
+
+    See Also
+    --------
+    load_fits : read it back as ``FitResult`` objects.
+    extract_parameters : the fitted parameters as a dict of arrays in memory.
+
+    Examples
+    --------
+    >>> import numpy as np, os, tempfile
+    >>> f = np.linspace(999.9e6, 1000.1e6, 201)
+    >>> z = s21_model(f, 1e9, 5e4, 5e4, 0.1, 1.0, 0.3, 0.0)
+    >>> fits = [fit_resonance(f, z, nonlinear=False)]
+    >>> path = export_fits(fits, os.path.join(tempfile.mkdtemp(), "fits"),
+    ...                    metadata={"t_bath_k": 0.1})
+    >>> d = np.load(path)
+    >>> round(float(d["Qi"][0]) / 1e4, 1), int(d["n_points"][0])
+    (5.0, 201)
+    >>> back, meta = load_fits(path, metadata=True)
+    >>> meta["metadata"]["t_bath_k"], back[0].z_fit.shape
+    (0.1, (201,))
+    """
+    import datetime
+    import json
+    from dataclasses import fields as dataclass_fields
+    from . import __version__
+
+    fits = [fits] if isinstance(fits, FitResult) else list(fits)
+    n_fits = len(fits)
+    path = str(path)
+    if not path.endswith(".npz"):
+        path += ".npz"
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    arrays = {}
+    for fld in dataclass_fields(FitResult):
+        if fld.name in _EXPORT_TRACE_FIELDS or fld.name in _EXPORT_SPECIAL_FIELDS:
+            continue
+        arrays[fld.name] = np.array([getattr(fit, fld.name) for fit in fits])
+
+    for name in NONLINEAR_NAMES + ("Ql",):
+        arrays[f"{name}_err"] = np.array([
+            float((fit.parameter_uncertainties or {}).get(name, np.nan))
+            for fit in fits
+        ])
+    covariance = np.full((n_fits, len(NONLINEAR_NAMES), len(NONLINEAR_NAMES)), np.nan)
+    initial_guess = np.full((n_fits, len(NONLINEAR_NAMES)), np.nan)
+    for i, fit in enumerate(fits):
+        idx = [NONLINEAR_NAMES.index(name) for name in fit.parameter_names]
+        if fit.parameter_covariance is not None:
+            covariance[i][np.ix_(idx, idx)] = fit.parameter_covariance
+        if fit.initial_guess is not None:
+            initial_guess[i, idx] = fit.initial_guess
+    arrays["covariance"] = covariance
+    arrays["initial_guess"] = initial_guess
+    arrays["covariance_names"] = np.array(NONLINEAR_NAMES)
+    arrays["parameter_names"] = np.array(
+        [",".join(fit.parameter_names) for fit in fits], dtype=str)
+
+    n_points = np.array([0 if fit.f_data is None else len(fit.f_data) for fit in fits])
+    arrays["n_points"] = n_points
+    max_points = int(n_points.max()) if n_fits else 0
+    for name in _EXPORT_TRACE_FIELDS:
+        values = [getattr(fit, name) for fit in fits]
+        if all(v is None for v in values):
+            continue
+        dtype = float if name == "f_data" else complex
+        padded = np.full((n_fits, max_points), np.nan, dtype=dtype)
+        for i, v in enumerate(values):
+            if v is not None:
+                padded[i, :len(v)] = v
+        arrays[name] = padded
+
+    info = {
+        "kind": "souk_fit_results",
+        "souk_readout_tools_version": __version__,
+        "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "n_fits": n_fits,
+        "sweep_info": None if sweep_data is None else sweep_data.get("info"),
+        "tone_metadata": None if sweep_data is None else sweep_data.get("tone_metadata"),
+        "metadata": metadata,
+        "linear_sufficiency": [fit.linear_sufficiency for fit in fits],
+    }
+    arrays["_metadata_json"] = np.asarray(json.dumps(info, default=_json_default))
+    np.savez_compressed(path, **arrays)
+    return path
+
+
+def load_fits(path, metadata=False):
+    """Read fits written by :func:`export_fits` back as ``FitResult`` objects.
+
+    Loads with ``allow_pickle=False``. For just the numbers, ``np.load(path)``
+    works directly; see :func:`export_fits` for the keys.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        The ``.npz`` written by :func:`export_fits`.
+    metadata : bool, optional
+        Also return the metadata dict (package version, export time,
+        ``sweep_info``, ``tone_metadata``, your ``metadata``). Default
+        ``False``.
+
+    Returns
+    -------
+    fits : list of FitResult
+        In the saved order, with ``tone_index`` preserved; the optimiser
+        objects are ``None``.
+    info : dict
+        Only when ``metadata=True``.
+
+    Examples
+    --------
+    See :func:`export_fits`.
+    """
+    import json
+    from dataclasses import fields as dataclass_fields
+
+    with np.load(str(path), allow_pickle=False) as handle:
+        raw = {k: handle[k] for k in handle.files}
+    info = json.loads(str(raw.pop("_metadata_json")))
+
+    fits = []
+    for i in range(int(info["n_fits"])):
+        kw = {}
+        for fld in dataclass_fields(FitResult):
+            if fld.name in raw and fld.name not in _EXPORT_TRACE_FIELDS \
+                    and fld.name not in _EXPORT_SPECIAL_FIELDS:
+                kw[fld.name] = raw[fld.name][i].item()
+        names = tuple(n for n in str(raw["parameter_names"][i]).split(",") if n)
+        idx = [NONLINEAR_NAMES.index(name) for name in names]
+        kw["parameter_names"] = names
+
+        covariance = raw["covariance"][i][np.ix_(idx, idx)]
+        if np.isfinite(covariance).any():
+            kw["parameter_covariance"] = covariance
+            kw["parameter_uncertainties"] = {
+                name: float(raw[f"{name}_err"][i]) for name in names + ("Ql",)}
+        guess = raw["initial_guess"][i, idx]
+        if np.isfinite(guess).any():
+            kw["initial_guess"] = guess
+        if not kw.get("noise_only", False) and names:
+            kw["p"] = np.array([kw[name] for name in names], dtype=float)
+        kw["linear_sufficiency"] = info["linear_sufficiency"][i]
+
+        n = int(raw["n_points"][i])
+        for name in _EXPORT_TRACE_FIELDS:
+            if name in raw and n:
+                row = raw[name][i, :n]
+                kw[name] = row if np.isfinite(row).any() else None
+        fits.append(FitResult(**kw))
+    return (fits, info) if metadata else fits

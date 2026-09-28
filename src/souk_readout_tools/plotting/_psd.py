@@ -16,7 +16,7 @@ def check_psd_units(psd_units, format):
     if psd_units not in PSD_UNITS:
         raise ValueError(
             f"psd_units must be one of {PSD_UNITS}, got {psd_units!r}")
-    if psd_units == 'dbc' and format == 'freq_diss':
+    if psd_units == 'dbc' and format in ('freq_diss', 'linewidths'):
         raise ValueError(
             "psd_units='dbc' references a carrier; fractional "
             "frequency/dissipation rows are already relative, so use "

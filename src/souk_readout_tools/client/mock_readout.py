@@ -1401,39 +1401,72 @@ class MockReadoutServer:
             'info': info,
         }
 
-    def receive_stream(self, num_tones=None, filename=None, print_data=False):
+    def receive_stream(self, num_tones=None, filename=None, print_data=False, duration=None,
+                       info=None, frame_callback=None, stop_event=None, write_to_file=True,
+                       overwrite=False):
         """Mock implementation of continuous binary stream capture.
 
-        ``num_tones``, ``filename`` and ``print_data`` mean the same as in
-        :py:meth:`ReadoutClient.receive_stream`.
+        Arguments have the same meaning as :py:meth:`ReadoutClient.receive_stream`.
+        Generated frames are paced at the sample rate, and ``duration=None``
+        continues until interrupted or ``stop_event`` is set.
         """
-        iq_data = None
-        if filename is None:
-            filename = os.path.join(os.getcwd(), 'tmp_stream')
-            print(f"No filename specified, writing to {filename}")
-        if not os.path.exists(os.path.dirname(os.path.abspath(filename))):
-            os.makedirs(os.path.dirname(os.path.abspath(filename)))
+        if duration is not None:
+            duration = float(duration)
+            if not np.isfinite(duration) or duration <= 0:
+                raise ValueError("duration must be a positive finite number of seconds")
+        if frame_callback is not None and not callable(frame_callback):
+            raise TypeError("frame_callback must be callable or None")
+        if stop_event is not None and not callable(getattr(stop_event, 'is_set', None)):
+            raise TypeError("stop_event must provide an is_set() method")
+        if num_tones is not None and (
+                isinstance(num_tones, (bool, np.bool_))
+                or not isinstance(num_tones, (int, np.integer))
+                or not 0 <= num_tones <= 2048):
+            raise ValueError("num_tones must be an integer between 0 and 2048")
 
         if num_tones is None:
             num_tones = len(self.tone_frequencies)
-        info = self.info('all')
+        num_tones = int(num_tones)
+        if info is None:
+            info = self.info('all')
         metadata = self.stream_metadata(num_tones, info)
+        metadata['frame_bytes'] = 8 * num_tones + 40
+        metadata['tone_updates_subscribed'] = False
 
-        with open(filename+'.json', 'w') as file:
-            json.dump(metadata, file, indent=4)
+        if write_to_file:
+            from souk_readout_tools.client.readout_client import _stream_output_filename
+            filename = _stream_output_filename(filename, overwrite)
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            with open(filename+'.json', 'w') as file:
+                json.dump(metadata, file, indent=4)
+        else:
+            filename = None
 
-        with open(filename, 'wb') as file:
-            print(f"MOCK: Writing data to {filename}")
-            t0 = time.time()
+        from contextlib import nullcontext
+        with (open(filename, 'wb') if write_to_file else nullcontext(None)) as file:
+            if write_to_file:
+                print(f"MOCK: Writing data to {filename}")
+            t0 = time.monotonic()
+            deadline = None if duration is None else t0 + duration
             count = 0
             # Throttle each frame to the accumulator period so the mock writes
             # at roughly the hardware rate rather than as fast as possible.
             frame_period = 1.0 / self.sample_rate if self.sample_rate > 0 else 0.0
-            while True:
+            while deadline is None or time.monotonic() < deadline:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                callback_running = False
                 try:
-                    t0_frame = time.time()
-                    frame = self.stream_frame(num_tones)
-                    file.write(frame)
+                    t0_frame = time.monotonic()
+                    frame = bytes(self.stream_frame(num_tones))
+                    if len(frame) != metadata['frame_bytes']:
+                        raise ValueError("Mock stream frame shape changed during reception")
+                    if file is not None:
+                        file.write(frame)
+                    if frame_callback is not None:
+                        callback_running = True
+                        frame_callback(frame, metadata)
+                        callback_running = False
                     count += 1
 
                     if print_data:
@@ -1448,21 +1481,31 @@ class MockReadoutServer:
                         print(f"MOCK: Received IQ data: err={err} cnt={cnt} "
                               f"tt={tt} {iq_data.tolist()}\r", end='', flush=True)
 
-                    this_frame_time = time.time() - t0_frame
+                    this_frame_time = time.monotonic() - t0_frame
                     if this_frame_time < frame_period:
-                        time.sleep(frame_period - this_frame_time)
+                        delay = frame_period - this_frame_time
+                        if deadline is not None:
+                            delay = min(delay, max(0, deadline - time.monotonic()))
+                        if stop_event is not None and callable(getattr(stop_event, 'wait', None)):
+                            stop_event.wait(delay)
+                        else:
+                            time.sleep(delay)
                 except KeyboardInterrupt:
+                    if callback_running:
+                        raise
                     break
                 except Exception as e:
+                    if frame_callback is not None or not write_to_file or isinstance(e, ValueError):
+                        raise
                     print(f"MOCK: Error receiving stream data: {e}")
                     print(traceback.format_exc())
                     break
 
-        t1 = time.time()
+        t1 = time.monotonic()
         print()
         print(f"MOCK: Received {count} samples in ~{t1-t0} seconds "
               f"(~{count/(t1-t0)} samples per second)")
-        return iq_data
+        return filename
 
     def receive_stream_g3(self, num_tones=None, filename=None, print_data=False,
                           kid_stream_id='UNSET', duration=30):

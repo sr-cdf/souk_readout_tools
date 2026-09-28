@@ -1251,9 +1251,14 @@ def _legend(ax, max_rows=8, **kwargs):
     postage-stamp plot surrounded by whitespace.  ``set_in_layout(False)``
     keeps the legend out of that calculation, and spilling a long legend into
     extra (smaller) columns stops it blanketing the data it labels.
+
+    Past four full columns (e.g. hundreds of tones) no legend is readable, so
+    none is drawn at all rather than one covering half the figure.
     """
     handles, labels = ax.get_legend_handles_labels()
-    if not handles:
+    if not handles or len(handles) > 4 * max_rows:
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
         return None
     kwargs.setdefault('fontsize', 'small')
     if len(handles) > max_rows:

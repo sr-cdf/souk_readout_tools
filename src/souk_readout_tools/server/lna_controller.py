@@ -59,6 +59,9 @@ except ImportError:
     _HW_AVAILABLE = False
     REFDES_LNA_MONITOR_CHN_MAP = {}
     REFDES_OE_CHN_MAP = {}
+    # Stand-in base so _BiasMonitor below still defines; it is never
+    # instantiated without the hardware imports.
+    SOUKLNABiasControlMonitor = object
 
 
 class _I2CRetryWarningFilter(logging.Filter):
@@ -203,30 +206,51 @@ def _soft_off_message(chn, voltage_v):
     )
 
 
-# A populated, biased LNA draws several mA. A reading of <0.5 mA together
-# with a remote voltage near mid-rail (~Vref/2) is the signature of an
-# unconnected LNA on the channel.
+# A populated, biased LNA draws several mA, so <0.5 mA with the output on
+# means nothing is drawing current. The remote sense can never read above the
+# local voltage that feeds it: a reading above both that and 2 V is a
+# floating (open) sense line sitting near the ADC reference (2.5 V).
 _OPEN_CIRCUIT_BIAS_CURRENT_A = 0.5e-3
 _OPEN_CIRCUIT_V_REMOTE_V = 2.0
 
 
-def _open_circuit_message(chn, current_a, remote_v):
-    """Open-circuit hint string when readings match the unconnected-LNA
-    signature; empty string otherwise."""
-    try:
-        i = float(current_a)
-        v = float(remote_v)
-    except (TypeError, ValueError):
-        return ''
+def _lna_health(chn, current_a, remote_v, local_v, output_enabled):
+    """Classify one channel's readings as ``(state, message)``.
+
+    ``state`` is 'unconfigured', 'no_current', 'sense_open' or 'ok', and
+    ``message`` is empty for 'ok'. ``output_enabled`` is None on v1 boards,
+    which have no output switch. A channel whose output is switched off is
+    'ok' -- drawing no current is then expected -- unless its sense line is
+    open, which is a wiring fault whatever the output state.
+    """
+    def _num(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return float('nan')
+    i, v, vl = _num(current_a), _num(remote_v), _num(local_v)
     if not (math.isfinite(i) and math.isfinite(v)):
-        return ''
-    if i < _OPEN_CIRCUIT_BIAS_CURRENT_A and v > _OPEN_CIRCUIT_V_REMOTE_V:
-        return (
-            f'LNA on channel {chn} appears to be disconnected '
-            f'(bias current {i * 1e3:.3f} mA, '
-            f'remote voltage {v:.3f} V — open-circuit signature).'
+        return 'unconfigured', f'LNA monitor for channel {chn} is not configured.'
+
+    sense_open = (v > _OPEN_CIRCUIT_V_REMOTE_V
+                  and (not math.isfinite(vl) or v > vl))
+    # With no output switch (v1) a low current alone may be a soft-off, so
+    # also require the floating sense reading, as the original check did.
+    if (output_enabled is not False and i < _OPEN_CIRCUIT_BIAS_CURRENT_A
+            and (output_enabled or sense_open)):
+        return 'no_current', (
+            f'LNA on channel {chn} draws no bias current '
+            f'({i * 1e3:.3f} mA{" with its output on" if output_enabled else ""})'
+            f' — the LNA is disconnected or its supply line is open.'
         )
-    return ''
+    if sense_open:
+        return 'sense_open', (
+            f'Channel {chn} remote sense reads {v:.3f} V, above the local '
+            f'{vl:.3f} V that feeds it: the sense line is open. Its remote '
+            f"voltage is meaningless; bias it with method='local' and the "
+            f'bias current.'
+        )
+    return 'ok', ''
 
 
 _LNA_REFDES = [f"M{i}" for i in range(17, 31)]
@@ -917,7 +941,7 @@ class LNABiasController:
                 message = result[chn][1]
                 success = _lna_set_succeeded(message)
                 if not success and 'Cannot set remote voltage' in message:
-                    message = self._augment_with_open_circuit_hint(chn, message)
+                    message = self._augment_with_cause_hint(chn, message)
                 out = {
                     'channel': chn,
                     'voltage_v': result[chn][0],
@@ -1037,7 +1061,7 @@ class LNABiasController:
                     message = result[chn][1]
                     success = _lna_set_succeeded(message)
                     if not success and 'Cannot set remote voltage' in message:
-                        message = self._augment_with_open_circuit_hint(chn, message)
+                        message = self._augment_with_cause_hint(chn, message)
                     out[chn] = {
                         'channel': chn,
                         'voltage_v': result[chn][0],
@@ -1101,7 +1125,8 @@ class LNABiasController:
             status = self._monitor.read_lna_status(chn=[chn])
         s = status[chn]
         message = self._check_status_health(
-            chn, s['remote voltage'], s['bias current'],
+            chn, s['remote voltage'], s['bias current'], s['local voltage'],
+            _output_enabled_value(s.get('output enable')),
         )
         return {
             'channel': chn,
@@ -1146,6 +1171,8 @@ class LNABiasController:
                     chn,
                     status[chn]['remote voltage'],
                     status[chn]['bias current'],
+                    status[chn]['local voltage'],
+                    _output_enabled_value(status[chn].get('output enable')),
                 ),
             }
             for chn in channels
@@ -1396,51 +1423,48 @@ class LNABiasController:
             out[chn] = entry
         return out
 
-    def _augment_with_open_circuit_hint(self, chn, message):
-        """Append an open-circuit hint when bias current is near zero and
-        v_remote is sitting at the unconnected mid-rail voltage."""
+    def _augment_with_cause_hint(self, chn, message):
+        """Append the likely cause when the remote method gives up on a
+        channel -- output switched off, open sense line, or no LNA current --
+        and where it left the local voltage."""
         try:
             s = self._monitor.read_lna_status(chn=[chn])[chn]
         except Exception:
             return message
-        hint = _open_circuit_message(chn, s['bias current'], s['remote voltage'])
-        return f'{message} {hint}' if hint else message
+        output_enabled = _output_enabled_value(s.get('output enable'))
+        _, hint = _lna_health(chn, s['bias current'], s['remote voltage'],
+                              s['local voltage'], output_enabled)
+        if output_enabled is False:
+            hint = (f'Channel {chn} output is off, and the remote method '
+                    f'needs it on (set_lna_output_enabled). {hint}').strip()
+        return (f'{message} {hint} The local voltage is now '
+                f"{s['local voltage']:.3f} V.")
 
-    def _check_status_health(self, chn, remote_v, current_a):
+    def _check_status_health(self, chn, remote_v, current_a, local_v,
+                             output_enabled):
         """Classify a channel's readings and log only on state transitions.
 
         Returns the message string to surface in the status response. State
-        is one of 'ok', 'open', 'unconfigured'."""
-        try:
-            i = float(current_a) if current_a is not None else float('nan')
-            v = float(remote_v) if remote_v is not None else float('nan')
-        except (TypeError, ValueError):
-            i, v = float('nan'), float('nan')
-
-        if not (math.isfinite(i) and math.isfinite(v)):
-            state = 'unconfigured'
-            message = f'LNA monitor for channel {chn} is not configured.'
-        elif i < _OPEN_CIRCUIT_BIAS_CURRENT_A and v > _OPEN_CIRCUIT_V_REMOTE_V:
-            state = 'open'
-            message = _open_circuit_message(chn, i, v)
-        else:
-            state = 'ok'
-            message = ''
-
+        is one of 'ok', 'no_current', 'sense_open', 'unconfigured' (see
+        _lna_health)."""
+        state, message = _lna_health(chn, current_a, remote_v, local_v,
+                                     output_enabled)
         prev = self._last_lna_state.get(chn)
         if state != prev:
             self._last_lna_state[chn] = state
-            if state == 'open':
+            if state in ('no_current', 'sense_open'):
                 logger.warning(message)
             elif state == 'unconfigured' and prev is not None:
                 # Don't bark on the first read of an unpopulated channel —
                 # only when a previously-healthy channel goes silent.
                 logger.warning(message)
-            elif state == 'ok' and prev in ('open', 'unconfigured'):
+            elif state == 'ok' and prev is not None:
                 logger.info(
-                    'LNA channel %d now reads healthy '
-                    '(bias current %.3f mA, remote voltage %.3f V).',
-                    chn, i * 1e3, v,
+                    'LNA channel %d no longer shows a fault '
+                    '(bias current %.3f mA, remote voltage %.3f V, '
+                    'output enabled %s).',
+                    chn, float(current_a) * 1e3, float(remote_v),
+                    output_enabled,
                 )
         return message
 
