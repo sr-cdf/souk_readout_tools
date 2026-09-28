@@ -45,8 +45,11 @@ def main():
     parser.add_argument('--duration', type=float, default=None,
                         help='Capture duration in seconds; default waits until interrupted')
 
-    parser.add_argument('--subscribe_tone_updates', action='store_true',
-                        help='Save in-stream snapshots and tone updates alongside IQ data')
+    parser.add_argument('--subscribe_tone_updates', action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help='Save in-stream snapshots and tone updates alongside IQ data '
+                             '(default: on, so tracking commits and recentres can be '
+                             'followed offline; --no-subscribe_tone_updates to disable)')
 
     args  = parser.parse_args()
 

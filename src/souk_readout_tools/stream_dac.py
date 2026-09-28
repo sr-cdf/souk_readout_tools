@@ -4,10 +4,12 @@ Real-time stream -> analog DAC output for KID frequency-shift readout.
 This module supports the ``souk-stream-to-dac`` client script
 (:mod:`souk_readout_tools.client.client_scripts.stream_to_dac`): it receives
 the readout server's continuous TCP stream, converts a chosen tone's IQ into
-a scalar (magnitude, phase, or frequency shift via this package's resonator
-calibrations) and drives an analog output -- a USB DAC (LabJack T-series) or a
-sound card via ALSA -- so external instruments (e.g. the TOPTICA cw-THz control
-software) can record a live voltage proportional to the KID response.
+a scalar (magnitude, phase, or any resonance quantity of
+``resonator.QUANTITIES``) and drives an analog output -- a USB DAC (LabJack
+T-series) or a sound card via ALSA -- so external instruments (e.g. the
+TOPTICA cw-THz control software) can record a live voltage proportional to
+the KID response. The conversions are ``resonator``'s own (same names, signs
+and maths as offline analysis); this module only feeds them live frames.
 
 Signal chain::
 
@@ -20,22 +22,27 @@ Contents
   length-prefixed TCP framing used by ``ReadoutClient.receive_stream``).
 - Frame sources: :class:`SocketFrameSource` (live server),
   :class:`MockFrameSource` (``ReadoutClient(mock=True)``),
-  :class:`ReplayFrameSource` (recorded stream file + JSON sidecar).
+  :class:`ReplayFrameSource` (recorded stream file + JSON sidecar, with its
+  tone updates replayed in place).
 - Readout correction: :class:`ReadoutCorrection` applies the same software
-  readout-flattening factors as ``parse_samples(apply_readout_correction=True)``
-  so stream IQ matches the units of parsed sweep data used for calibrations.
+  readout-flattening factors as ``parse_samples(apply_readout_correction=True)``,
+  each revision's own once announced, so stream IQ matches the units of
+  parsed sweep data used for calibrations.
 - Converters: :class:`MagnitudeConverter`, :class:`PhaseConverter`,
-  :class:`DfModelFreeConverter`, :class:`DfCalibratedConverter`, and
-  :class:`FfmConverter` (live fast-frequency-modulation demodulation with
-  recenter-proof absolute output; see ``doc/frequency_modulation.md``).
+  :class:`DfModelFreeConverter`, :class:`QuantityConverter` (fixed tone,
+  calibrated) and :class:`FfmConverter` (live three-point demodulation with
+  recentre-proof output; see ``doc/frequency_modulation.md``).
 - DAC backends: :class:`DummyDac` (default, no hardware),
   :class:`LabJackDac` (T-series, optional ``labjack-ljm`` dependency),
   :class:`LabJackU12Dac` (U12, optional ``LabJackPython`` + Exodriver) and
   :class:`AlsaDac` (sound card, optional ``pyalsaaudio`` -- AC-coupled, so
   characterise it with :func:`alsa_selftest` before trusting a slow scan).
-- Calibration persistence: :func:`save_calibrations`,
-  :func:`load_calibrations`, :func:`calibrations_from_sweep`.
 - The application: :class:`StreamToDac`.
+
+Calibrations are saved and loaded with ``resonator.save_calibrations`` /
+``load_calibrations`` / ``calibrations_from_sweep`` (re-exported here), or
+pushed to the server with ``ReadoutClient.set_resonator_calibrations``, which
+the calibrated modes pick up from the stream's info without a file.
 
 See ``doc/stream_to_dac.md`` for wiring, configuration and the calibration
 workflow.
@@ -50,6 +57,11 @@ import time
 from collections import deque
 
 import numpy as np
+
+from . import resonator
+from .modulation import CYCLE_FIELDS, active_modulation_state
+# Calibration files are resonator's; re-exported for existing scripts.
+from .resonator import calibrations_from_sweep, load_calibrations, save_calibrations  # noqa: F401
 
 # Number of int32 trailer words at the end of every stream frame:
 # flag0..flag5, tt_msb, tt_lsb, cnt, err.
@@ -195,10 +207,12 @@ class SocketFrameSource:
         one-line JSON subscribe message is sent, and the server then
         interleaves SNAPSHOT / TONE_UPDATE JSON frames (nonzero type in the
         length-prefix top byte) with the data stream. Decoded typed frames
-        are appended to :attr:`typed_frames` for the consumer to drain
-        (e.g. :class:`StreamToDac` logs them to a JSONL sidecar). Legacy
-        servers simply never send any, so this is safe to enable against
-        either.
+        are appended to :attr:`typed_frames` as ``(type, payload,
+        sample_index)`` -- the index being the number of data frames before
+        it, as ``ReadoutClient.receive_stream`` records -- for the consumer
+        to drain (e.g. :class:`StreamToDac` logs them to a JSONL sidecar).
+        Legacy servers simply never send any, so this is safe to enable
+        against either.
     """
 
     def __init__(self, address, port, timeout=0.5, subscribe_updates=False):
@@ -206,10 +220,11 @@ class SocketFrameSource:
         self.port = int(port)
         self.timeout = float(timeout)
         self.subscribe_updates = bool(subscribe_updates)
-        self.typed_frames = deque()   # decoded (type, dict) typed frames
+        self.typed_frames = deque()   # decoded (type, dict, sample_index)
         self._sock = None
         self._assembler = FrameAssembler()
         self._pending = deque()
+        self._data_frames = 0         # data frames assembled so far
 
     def open(self):
         """Connect to the stream server (and subscribe, if requested)."""
@@ -242,10 +257,12 @@ class SocketFrameSource:
             for frame_type, payload in self._assembler.feed(chunk):
                 if frame_type == FRAME_TYPE_DATA:
                     self._pending.append(payload)
+                    self._data_frames += 1
                 else:
                     try:
                         self.typed_frames.append(
-                            (frame_type, json.loads(payload.decode())))
+                            (frame_type, json.loads(payload.decode()),
+                             self._data_frames))
                     except Exception as exc:
                         print(f'WARNING: undecodable typed frame '
                               f'(type {frame_type}): {exc}')
@@ -306,8 +323,12 @@ class ReplayFrameSource:
     Reads a binary recording produced by ``ReadoutClient.receive_stream`` (or
     by :class:`StreamToDac` itself) together with its JSON metadata sidecar
     (``<filename>.json``), and emits one frame payload per sample period.
-    Replay plus the dummy DAC backend gives a full end-to-end test with zero
-    hardware.
+    A recording's tone updates (``<filename>.updates.jsonl``) are replayed
+    as typed frames just before the frame they preceded (their
+    ``sample_index``; records without one, from older recordings, at the
+    start), so recentres and per-revision readout correction replay as they
+    happened. Replay plus the dummy DAC backend gives a full end-to-end test
+    with zero hardware.
 
     Parameters
     ----------
@@ -332,11 +353,32 @@ class ReplayFrameSource:
         self.loop = bool(loop)
         self._file = None
         self._next_time = None
+        self._updates = []
+        updates_path = filename + '.updates.jsonl'
+        if os.path.exists(updates_path):
+            with open(updates_path) as f:
+                self._updates = [json.loads(line) for line in f if line.strip()]
+        self.subscribe_updates = bool(self._updates)
+        self.typed_frames = deque()   # (type, dict, sample_index), as live
+        self._next_update = 0
+        self._frames_read = 0
 
     def open(self):
         """Open the recording."""
         self._file = open(self.filename, 'rb')
         self._next_time = time.monotonic()
+        self._next_update = 0
+        self._frames_read = 0
+
+    def _queue_updates(self):
+        """Queue the recorded typed frames that preceded the next frame."""
+        while self._next_update < len(self._updates):
+            record = self._updates[self._next_update]
+            if int(record.get('sample_index', 0)) > self._frames_read:
+                break
+            self.typed_frames.append((record.get('frame_type', 0),
+                                      record['payload'], self._frames_read))
+            self._next_update += 1
 
     def read(self):
         """Return the next recorded frame payload, paced at the sample rate.
@@ -350,9 +392,13 @@ class ReplayFrameSource:
         if len(payload) < self.frame_bytes:
             if self.loop and self._file.tell() > 0:
                 self._file.seek(0)
+                self._next_update = 0
+                self._frames_read = 0
                 payload = self._file.read(self.frame_bytes)
             if len(payload) < self.frame_bytes:
                 raise StreamEnded(f'end of recording {self.filename}')
+        self._queue_updates()
+        self._frames_read += 1
         if self.speed > 0:
             now = time.monotonic()
             if now < self._next_time:
@@ -374,10 +420,14 @@ class ReadoutCorrection:
     calibrations has the per-(point, tone) software readout-flattening
     factors applied (``parse_samples(apply_readout_correction=True)``; the
     filterbank compensation's RX half cannot land in hardware). This class
-    applies the same factors to stream frames, selected per sample via the
-    flag5 modulation-point tag, so converted values match the calibration's
-    units. It is the identity when no modulation state (and hence no
-    correction) is present -- i.e. for plain unmodulated streams.
+    applies the same factors (``resonator.readout_correction_factors``) to
+    stream frames, selected per sample via the flag5 modulation-point tag, so
+    converted values match the calibration's units. A tracking commit or
+    recentre moves the probes across the filterbank and so changes the
+    factors: each revision's own are used once announced (:meth:`note_state`,
+    fed from the typed tone-update frames), the startup ones otherwise. It is
+    the identity when no modulation state (and hence no correction) is
+    present -- i.e. for plain unmodulated streams.
 
     Parameters
     ----------
@@ -388,16 +438,25 @@ class ReadoutCorrection:
     """
 
     def __init__(self, info, num_tones):
-        from .modulation import readout_correction_factors
         self.num_tones = int(num_tones)
-        self.factors = readout_correction_factors(info, num_tones)
+        self.factors = resonator.readout_correction_factors(info, num_tones)
+        self._by_revision = {}
 
-    def apply(self, iq, point):
-        """Return corrected IQ for one frame tagged with modulation ``point``."""
-        if self.factors is None:
+    def note_state(self, revision, state):
+        """Use a revision's factors, from its announced ``modulation_state``."""
+        factors = resonator.readout_correction_factors(
+            {'modulation': state}, self.num_tones)
+        if factors is not None:
+            self._by_revision[int(revision) & 0x7FFF] = factors
+
+    def apply(self, iq, point, revision=None):
+        """Return corrected IQ for one frame tagged with modulation ``point``
+        (and ``revision``: its own factors when announced)."""
+        factors = self._by_revision.get(revision, self.factors)
+        if factors is None:
             return iq
-        if 1 <= point <= self.factors.shape[0]:
-            return iq * self.factors[point - 1, :len(iq)]
+        if 1 <= point <= factors.shape[0]:
+            return iq * factors[point - 1, :len(iq)]
         return iq
 
 
@@ -451,16 +510,22 @@ class PhaseConverter(StreamConverter):
 
 
 class DfModelFreeConverter(PhaseConverter):
-    """``x = phase / dphi_df`` in Hz: model-free frequency shift.
+    """``x = -phase / dphi_df`` in Hz: a model-free resonance shift.
+
+    Positive when the resonance moves up (``resonator``'s resonator-side
+    sign; the probe-side ``+phase / dphi_df`` is its negative). ``dphi_df``
+    must be the slope of the same raw phase -- about the I/Q origin -- at the
+    operating point, e.g. from the calibration sweep. About the origin the
+    phase also moves with loss, so this reads some dissipation as frequency:
+    a quick look. ``df_calibrated`` and ``ffm`` separate the two.
 
     Parameters
     ----------
     reference_iq : complex
         Reference IQ point (see :class:`PhaseConverter`).
     dphi_df : float
-        Phase-vs-frequency slope at the operating point, in rad/Hz
-        (e.g. from :func:`souk_readout_tools.modulation.demodulate`'s
-        ``dphi_df`` or a sweep's local phase slope).
+        Slope of the raw phase against probe frequency at the operating
+        point, in rad/Hz (negative for a notch).
     """
 
     units = 'Hz'
@@ -473,113 +538,180 @@ class DfModelFreeConverter(PhaseConverter):
         self._dphi_df = dphi_df
 
     def convert(self, iq):
-        return super().convert(iq) / self._dphi_df
+        return -super().convert(iq) / self._dphi_df
 
 
-class DfCalibratedConverter(StreamConverter):
-    """Calibrated Mobius conversion to probe detuning (Hz) or dissipation.
+def _check_output(output, calibration, cycle=False):
+    """The canonical name of a converter ``output``, checked against what
+    the conversion can deliver for this tone.
 
-    Wraps ``ResonatorCalibration.tone_converter(f_tone)``: raw IQ is
-    deembedded, phase-centered and inverted exactly, giving probe detuning
-    ``f_probe - fr`` in Hz (``output='frequency'``) or the matched
-    dissipation quadrature ``Delta(1/(2*Qi))`` (``output='dissipation'``).
+    ``resonator.express`` is the one place that knows which quantities need a
+    calibration (or its Qi), so the check is a trial call on zeros.
+    """
+    name = resonator.canonical_quantity(output)
+    if cycle and name in CYCLE_FIELDS:
+        if name.startswith('center_detuning') and calibration is None:
+            raise ValueError(
+                f'output {name!r} needs a calibration for the tone (about the '
+                'raw I/Q origin the detuning reads 13x-100x high)')
+        return name
+    try:
+        resonator.express(name, 0.0, 0.0, frequency_hz=1.0,
+                          calibration=calibration, reference_resonance_hz=0.0)
+    except ValueError as exc:
+        raise ValueError(f'output {output!r}: {exc}') from None
+    return name
+
+
+class QuantityConverter(StreamConverter):
+    """Any resonance quantity of one fixed tone, by ``resonator``'s conversions.
+
+    ``resonator.prepare_conversion`` once, then per update
+    ``resonator.convert_iq`` and ``resonator.express`` -- the functions
+    ``resonator.convert_samples`` uses offline, so the DAC reads what an
+    analysis of the recording would. The shift is relative to the
+    calibration sweep's I/Q at the tone when the sweep is given (the
+    resonator's state during the sweep), else to the fitted state.
 
     Parameters
     ----------
-    calibration : ResonatorCalibration
-        Calibration for this resonator (see :func:`load_calibrations`).
-    f_tone : float
+    frequency_hz : float
         The tone (probe) frequency in Hz.
-    output : {'frequency', 'dissipation'}, optional
-        Which coordinate to return (default 'frequency').
+    output : str, optional
+        A ``resonator.QUANTITIES`` resonance quantity or alias (default
+        ``'resonance_shift_hz'``, positive = resonance moved up).
+    method : str, optional
+        One of ``resonator.CONVERSION_METHODS`` (default ``'mobius'``, the
+        exact fitted inversion; ``'linearized'`` and ``'lookup'`` need the
+        sweep).
+    calibration : ResonatorCalibration or None, optional
+        This tone's calibration (needed by all but the sweep-only methods).
+    sweep_f, sweep_z : array-like or None, optional
+        This tone's calibration sweep: frequencies (Hz) and complex I/Q.
+    gain : float, optional
+        Data over calibration RX amplitude (``resonator.resolve_rx_gain``),
+        divided out first (default 1).
+    smooth_window_hz : float, optional
+        Sweep smoothing for the sweep-based methods (default 1000).
     """
 
-    def __init__(self, calibration, f_tone, output='frequency'):
-        if output not in ('frequency', 'dissipation'):
-            raise ValueError("output must be 'frequency' or 'dissipation'")
-        self._converter = calibration.tone_converter(float(f_tone))
-        self._output = output
-        self.units = 'Hz' if output == 'frequency' else 'd(1/2Qi)'
+    def __init__(self, frequency_hz, output='resonance_shift_hz',
+                 method='mobius', *, calibration=None, sweep_f=None,
+                 sweep_z=None, gain=1.0, smooth_window_hz=1000):
+        self.output = _check_output(output, calibration)
+        self.units = resonator.QUANTITIES[self.output][1]
+        self.frequency_hz = float(frequency_hz)
+        self.calibration = calibration
+        self.gain = float(gain)
+        self._prepared = resonator.prepare_conversion(
+            self.frequency_hz, method, calibration=calibration,
+            sweep_f=sweep_f, sweep_z=sweep_z,
+            smooth_window_hz=smooth_window_hz)
 
     def convert(self, iq):
-        df, dd = self._converter(iq)
-        return df if self._output == 'frequency' else dd
+        shift, dissipation = resonator.convert_iq(self._prepared, iq,
+                                                  gain=self.gain)
+        return resonator.express(self.output, shift, dissipation,
+                                 frequency_hz=self.frequency_hz,
+                                 calibration=self.calibration)
 
 
 class FfmConverter(StreamConverter):
-    """Live FFM demodulation: linearised frequency shift for one tone (Hz).
+    """Live three-point (FFM) demodulation of one tone.
 
-    Unlike the fixed-tone converters this one consumes the modulated
-    stream frame-by-frame (``wants_frames = True``): samples are grouped
-    into modulation cycles by the flag5 point tag (settling excluded,
-    incomplete cycles dropped), each cycle's phase-vs-offset slope gives a
-    **live** ``dphi_df`` -- the modulation measures its own responsivity,
-    no prior calibration needed -- and the centre-point phase referenced to
-    a startup-captured baseline, divided by that slope, gives the
-    linearised probe-side shift (as
-    :func:`souk_readout_tools.modulation.demodulate`'s model-free
-    ``freq_shift_hz``). The linearisation is valid while the tone stays in
-    the linear part of the phase-frequency curve -- which is exactly what
-    server-side tone tracking (``enable_tracking``) maintains.
+    Consumes the modulated stream frame by frame (``wants_frames = True``):
+    samples are grouped into modulation cycles by the flag5 point tag
+    (settling excluded, incomplete cycles dropped), and each cycle's point
+    means go through the kernel that ``modulation.demodulate`` and the
+    server's tracker use:
 
-    Recentering provenance: a tracking (or client) recenter changes the
-    tone centre and bumps the modulation revision stamped in every frame.
-    Per-revision centres are registered via :meth:`note_center` (fed from
-    the SNAPSHOT / TONE_UPDATE typed frames by :class:`StreamToDac`), and
-    the output is the absolute **resonator** frequency shift since startup
-    (detector-side sign: positive = resonance moved up):
+    - ``resonator.phase_derivatives`` (any slot order; points sharing an
+      offset averaged coherently) gives a live ``dphi_df`` -- the modulation
+      measures its own responsivity every cycle -- and the phase curvature,
+      hence the centre detuning (resonance minus modulation centre);
+    - the centre point against a reference -- its mean over the first
+      ``baseline_cycles`` cycles, so the output starts from zero -- gives
+      the resonance shift and matched dissipation. With a ``calibration``
+      this happens in its circle-centred basis, by
+      ``resonator.phase_shift_and_dissipation`` on the live slope (the
+      preferred conversion); without one, on the raw I/Q, by the
+      tangent/normal projection on the live gradient.
 
-        x = (center[rev] - center[rev0]) - probe_side_freq_shift
+    A tracking (or client) recentre moves the probe and bumps the revision
+    stamped in every frame. Each revision's centre and offsets are
+    registered with :meth:`note_center` (:class:`StreamToDac` feeds it the
+    SNAPSHOT / TONE_UPDATE typed frames) and the output stays the
+    resonator's own motion since the reference, by the reconstruction
+    identity of ``doc/tone_tracking.md``::
 
-    (the reconstruction formula of ``doc/tone_tracking.md``, with
-    demodulate's probe-side ``freq_shift_hz`` sign-flipped to the
-    detector side). A recenter therefore does not step the analog output.
-    Without a typed-frame subscription the output is centre-relative only
-    and every recenter appears as a step of the recenter size.
+        resonance shift = (center[rev] - center[ref]) + shift about the reference
 
-    The startup phase baseline absorbs the documented ``center - fr``
-    operating-point offset (see ``modulation.params_from_sweep``), so the
-    output reads zero at the startup state by construction.
+    The centred basis depends only on the detuning, so this is exact to
+    first order in the detuning excursion, which tracking keeps small. On the
+    raw I/Q the cable delay's phase also moves with the probe and reads as
+    about ``2 pi tau / |dphi_df|`` hertz per hertz of recentre (well under 1%
+    for typical delays and linewidths). Once typed frames are arriving, the
+    cycles of a revision not yet announced are held back; without them every
+    recentre reads as a step of the recentre size.
 
     Parameters
     ----------
     offsets_hz : array-like
-        This tone's per-point probe offsets (Hz), in point order (from
-        ``info['modulation']['tones'][i]['offsets_hz']``). Needs >= 2
-        distinct offsets; the point nearest 0 Hz is the centre point.
+        This tone's per-point probe offsets (Hz), in slot order (from
+        ``info['modulation']['tones'][i]['offsets_hz']``); >= 2 distinct.
     center_hz : float or None, optional
-        The tone centre at startup (defines ``center[rev0]``); ``None``
-        adopts the first centre registered via :meth:`note_center`.
+        The modulation centre at startup; ``None`` adopts the first centre
+        registered via :meth:`note_center`.
     average_cycles : int, optional
-        Boxcar over the last N per-cycle outputs (default 1 = latest
-        cycle).
+        Boxcar over the last N per-cycle outputs (default 1 = latest cycle).
     baseline_cycles : int, optional
-        Cycles averaged (circularly) into the startup phase baseline
-        (default 20). The output is NaN until the baseline is set.
+        Cycles averaged into the reference (default 20). Outputs that need it
+        are NaN (the DAC holds) until it is set.
+    calibration : ResonatorCalibration or None, optional
+        This tone's calibration: the centred basis, and the absolute and
+        linewidth outputs.
+    output : str, optional
+        A ``resonator.QUANTITIES`` resonance quantity or alias (default
+        ``'resonance_shift_hz'``, positive = resonance moved up), or a
+        per-cycle estimate of ``modulation.CYCLE_FIELDS``
+        (``'center_detuning_hz'``, ``'dphi_df'``, ...).
+    demod_method : {'fast', 'accurate'}, optional
+        ``'fast'`` (default, the tracker's): finite differences of the
+        lowest, central and highest offsets; ``'accurate'``: a quadratic fit
+        of phase against offset, every point counting.
+    gain : float, optional
+        Data over calibration RX amplitude (``resonator.resolve_rx_gain``),
+        divided out in the centred basis (default 1).
     """
 
-    units = 'Hz'
     wants_frames = True
 
     def __init__(self, offsets_hz, center_hz=None, average_cycles=1,
-                 baseline_cycles=20):
+                 baseline_cycles=20, calibration=None,
+                 output='resonance_shift_hz', demod_method='fast', gain=1.0):
         offsets = np.asarray(offsets_hz, dtype=float)
         if len(offsets) < 2 or np.ptp(offsets) == 0:
             raise ValueError('ffm mode needs >= 2 distinct probe offsets '
                              'for this tone (is it modulated?)')
-        self._offsets = offsets
+        if demod_method not in ('fast', 'accurate'):
+            raise ValueError("demod_method must be 'fast' or 'accurate'")
+        self.output = _check_output(output, calibration, cycle=True)
+        self.units = resonator.QUANTITIES[self.output][1]
+        self.calibration = calibration
+        self.hold_unannounced = False     # set once typed frames arrive
+        self._kernel = 'fast' if demod_method == 'fast' else 'fit'
+        self._gain = float(gain)
         self._num_points = len(offsets)
-        self._center_index = int(np.argmin(np.abs(offsets)))
-        self._span = float(offsets[-1] - offsets[0])
-        if self._span == 0:
-            raise ValueError('first and last probe offsets are equal; '
-                             'cannot form the slope estimate')
-        self._center0 = None if center_hz is None else float(center_hz)
-        self._center_by_revision = {}
-        self._center_offset_hz = 0.0
-        self._baseline = None
-        self._baseline_phasors = []
+        self._states = {}                 # revision -> (centre Hz, offsets)
+        self._last_state = (None if center_hz is None else float(center_hz),
+                            offsets)
+        self._basis_key = None            # the state _basis was built for
+        self._basis = None
+        self._baseline = []               # centre points for the reference
+        self._baseline_key = None
         self._baseline_cycles = max(1, int(baseline_cycles))
+        self._reference = None            # (centre-point I/Q, centre Hz)
+        self.reference_resonance_hz = np.nan
         self._outputs = deque(maxlen=max(1, int(average_cycles)))
         # Current-cycle accumulators (per-point complex sums + counts).
         self._sums = np.zeros(self._num_points, dtype=complex)
@@ -589,12 +721,22 @@ class FfmConverter(StreamConverter):
         self.cycles = 0
         self.last_dphi_df = np.nan
 
-    def note_center(self, revision, center_hz):
-        """Register this tone's centre for a modulation ``revision``
-        (fed from SNAPSHOT / TONE_UPDATE typed frames)."""
-        self._center_by_revision[int(revision)] = float(center_hz)
-        if self._center0 is None:
-            self._center0 = float(center_hz)
+    def note_center(self, revision, center_hz=None, offsets_hz=None):
+        """Register this tone's centre (and offsets) for a modulation
+        ``revision`` (fed from SNAPSHOT / TONE_UPDATE typed frames). ``None``
+        keeps the latest registered value, for a revision that moved other
+        tones only."""
+        center = self._last_state[0] if center_hz is None else float(center_hz)
+        offsets = self._last_state[1] if offsets_hz is None \
+            else np.asarray(offsets_hz, dtype=float)
+        if len(offsets) != self._num_points:
+            print(f'WARNING: revision {revision} has {len(offsets)} probe '
+                  f'points, not {self._num_points}; restart stream-to-dac '
+                  'to follow it')
+            return
+        state = (center, offsets)
+        self._states[int(revision) & 0x7FFF] = state
+        self._last_state = state
 
     def add_frame(self, iq, point, settling, revision):
         """Feed one stream sample (this tone's corrected IQ + flag5 tags)."""
@@ -614,33 +756,91 @@ class FfmConverter(StreamConverter):
         self._counts = np.zeros(self._num_points, dtype=int)
         if np.any(counts == 0):
             return                        # incomplete cycle (drops): skip
+        state = self._states.get(self._revision)
+        if state is None:
+            if self.hold_unannounced:
+                return                    # its announcement is still in flight
+            state = self._last_state
+        center, offsets = state
+        if center is None and (self.calibration is not None
+                               or self.output not in CYCLE_FIELDS):
+            return                        # no probe frequency to work at yet
         z = sums / counts
-        phi = np.unwrap(np.angle(z))
-        slope = (phi[-1] - phi[0]) / self._span
+        if self.calibration is not None:
+            key = (center, offsets.tobytes())
+            if key != self._basis_key:
+                self._basis_key = key
+                self._basis = resonator.basis_coefficients(
+                    self.calibration, center + offsets, 'centered_rotated',
+                    gain=self._gain)
+            z = self._basis[0] * z + self._basis[1]
+        d = resonator.phase_derivatives(z[:, None], offsets[:, None],
+                                        method=self._kernel, per_point=True)
+        slope = float(d['dphi_df'][0])
         if not np.isfinite(slope) or slope == 0.0:
             return
         self.cycles += 1
         self.last_dphi_df = slope
-        phase_center = phi[self._center_index]
-        if self._baseline is None:
-            # Circular mean over the first baseline_cycles centre phases.
-            self._baseline_phasors.append(np.exp(1j * phase_center))
-            if len(self._baseline_phasors) >= self._baseline_cycles:
-                self._baseline = float(np.angle(np.mean(
-                    self._baseline_phasors)))
-                self._baseline_phasors = []
+        curvature = float(d['d2phi_df2'][0])
+
+        if self.output in CYCLE_FIELDS:
+            cycle = {'dphi_df': slope, 'd2phi_df2': curvature,
+                     'curvature_over_slope': curvature / slope}
+            if self.calibration is not None:
+                detuning = float(resonator.detuning_from_derivatives(
+                    slope, curvature))
+                cycle['center_detuning_linewidths'] = detuning
+                cycle['center_detuning_hz'] = (
+                    detuning * self.calibration.fr / self.calibration.Ql)
+            self._push(cycle[self.output])
             return
-        # Probe-side shift (demodulate's freq_shift_hz convention) ...
-        probe_shift = (phase_center - self._baseline) / slope
-        center = self._center_by_revision.get(self._revision)
-        if center is not None and self._center0 is not None:
-            self._center_offset_hz = center - self._center0
-        # ... combined detector-side: resonator motion since startup.
-        self._outputs.append(self._center_offset_hz - probe_shift)
+
+        # The centre point (its dwells averaged) and its local slope/gradient.
+        mid_offset = float(d['center_offset_hz'][0])
+        mid = offsets == mid_offset
+        first = int(np.flatnonzero(mid)[0])
+        z_mid = complex(np.mean(z[mid]))
+        if self._reference is None:
+            key = (center, offsets.tobytes())
+            if key != self._baseline_key:   # restart across a recentre
+                self._baseline, self._baseline_key = [], key
+            self._baseline.append(z_mid)
+            if len(self._baseline) >= self._baseline_cycles:
+                reference = complex(np.mean(self._baseline))
+                self._reference = (reference, center)
+                self._baseline = []
+                if self.calibration is not None:
+                    # Where the resonance (inflection) was at the reference.
+                    cal = self.calibration
+                    probe_detuning = float(cal.convert_centered_iq(reference)[0])
+                    self.reference_resonance_hz = (
+                        center + mid_offset - probe_detuning
+                        + resonator.operating_point_hz(cal) - cal.fr)
+            return
+        reference, reference_center = self._reference
+        if self.calibration is not None:
+            local_slope = float(d['local_dphi_df'][first, 0])
+            if not np.isfinite(local_slope):
+                local_slope = slope
+            shift, dissipation_hz = resonator.phase_shift_and_dissipation(
+                z_mid, reference, local_slope)
+        else:
+            shift, dissipation_hz = resonator.project_iq_tangent_normal(
+                reference, d['dz_df'][first, 0], z_mid)
+        probe_hz = center + mid_offset
+        shift = float(shift) + (center - reference_center)
+        self._push(float(resonator.express(
+            self.output, shift, float(dissipation_hz) / probe_hz,
+            frequency_hz=probe_hz, calibration=self.calibration,
+            reference_resonance_hz=self.reference_resonance_hz)))
+
+    def _push(self, value):
+        if np.isfinite(value):
+            self._outputs.append(value)
 
     def value(self):
         """Latest output (mean of the last ``average_cycles`` cycles), or
-        NaN before the baseline is established."""
+        NaN before the reference is established."""
         if not self._outputs:
             return float('nan')
         return float(np.mean(self._outputs))
@@ -1215,83 +1415,6 @@ def make_dac_backend(backend, options=None, print_writes=False):
 
 
 # ---------------------------------------------------------------------------
-# Calibration persistence
-# ---------------------------------------------------------------------------
-
-# The ResonatorCalibration constructor arguments serialised to npz. The
-# group-delay calibration table is not serialised (from_fit never sets it;
-# the scalar tau carries the fitted cable delay).
-_CAL_FIELDS = ('fr', 'Ql', 'tau', 'center', 'radius', 'rotation_angle',
-               'gain_amplitude', 'gain_phase', 'frequency_origin_fraction',
-               'anl')
-
-
-def save_calibrations(filename, calibrations):
-    """Save per-tone resonator calibrations to a ``.npz`` file.
-
-    Parameters
-    ----------
-    filename : str
-        Output path (``.npz`` appended by numpy if missing).
-    calibrations : dict
-        ``{tone_index: ResonatorCalibration}``.
-    """
-    indices = sorted(calibrations)
-    arrays = {'tone_indices': np.asarray(indices, dtype=int)}
-    for field in _CAL_FIELDS:
-        arrays[field] = np.asarray(
-            [getattr(calibrations[i], field) for i in indices])
-    np.savez(filename, **arrays)
-
-
-def load_calibrations(filename):
-    """Load ``{tone_index: ResonatorCalibration}`` saved by
-    :func:`save_calibrations`."""
-    from .resonator import ResonatorCalibration
-    with np.load(filename) as data:
-        indices = data['tone_indices'].astype(int)
-        fields = {field: data[field] for field in _CAL_FIELDS}
-    calibrations = {}
-    for j, tone_index in enumerate(indices):
-        kwargs = {field: fields[field][j] for field in _CAL_FIELDS}
-        center = complex(kwargs.pop('center'))
-        calibrations[int(tone_index)] = ResonatorCalibration(
-            kwargs.pop('fr'), kwargs.pop('Ql'), kwargs.pop('tau'),
-            center, kwargs.pop('radius'), kwargs.pop('rotation_angle'),
-            **{k: float(v) for k, v in kwargs.items()})
-    return calibrations
-
-
-def calibrations_from_sweep(sweep_data, tone_indices=None, **batch_fit_kwargs):
-    """Fit a parsed sweep and return ``{tone_index: ResonatorCalibration}``.
-
-    Runs :func:`souk_readout_tools.fitting.batch_fit` on the sweep-data dict
-    and builds a calibration from each successful fit. Save the result with
-    :func:`save_calibrations` for ``mode: df_calibrated``.
-
-    Parameters
-    ----------
-    sweep_data : dict
-        Parsed sweep data (see ``ReadoutClient.parse_sweep_data``).
-    tone_indices : list of int or None, optional
-        Restrict to these tone indices; ``None`` keeps every fitted tone.
-    **batch_fit_kwargs
-        Forwarded to :func:`fitting.batch_fit`.
-    """
-    from .fitting import batch_fit
-    from .resonator import ResonatorCalibration
-    fits = batch_fit(sweep_data, **batch_fit_kwargs)
-    calibrations = {}
-    for fit in fits:
-        if tone_indices is not None and fit.tone_index not in tone_indices:
-            continue
-        if not np.isfinite(fit.fr) or getattr(fit, 'noise_only', False):
-            continue
-        calibrations[int(fit.tone_index)] = ResonatorCalibration.from_fit(fit)
-    return calibrations
-
-
-# ---------------------------------------------------------------------------
 # Output channels and the application
 # ---------------------------------------------------------------------------
 
@@ -1451,21 +1574,32 @@ class StreamToDac:
             'ordering': ('I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, '
                          'Q_tone1_sample0,..flags, tt_msb, tt_lsb, cnt, err .'),
             'info': self.info,
+            'frame_bytes': 8 * self.num_tones + 4 * STREAM_TRAILER_WORDS,
+            'tone_updates_subscribed': bool(
+                getattr(self.source, 'subscribe_updates', False)),
         }
         with open(self.recording_path + '.json', 'w') as f:
             json.dump(metadata, f, indent=4)
 
     def _drain_typed_frames(self, updates_log):
-        """Write any typed frames the source has decoded to the JSONL log."""
+        """Write any typed frames the source has decoded to the JSONL log.
+
+        Records match ``ReadoutClient.receive_stream``'s, ``sample_index``
+        (data frames before the update) included, so ``parse_stream`` and
+        ``modulation.demodulate_stream`` place every revision change.
+        """
         typed = getattr(self.source, 'typed_frames', None)
         if not typed:
             return
         while True:
             try:
-                frame_type, payload = typed.popleft()
+                item = typed.popleft()
             except IndexError:
                 break
+            frame_type, payload = item[0], item[1]
+            sample_index = item[2] if len(item) > 2 else self.frames_received
             record = {'host_time_unix': time.time(),
+                      'sample_index': int(sample_index),
                       'frame_type': frame_type, 'payload': payload}
             if updates_log is not None:
                 updates_log.write(json.dumps(record) + '\n')
@@ -1475,30 +1609,39 @@ class StreamToDac:
                 print(f'\nstream update frame: {kind} '
                       f'revision={payload.get("revision")} '
                       f'op={payload.get("op")}')
-            self._note_centers_from_payload(payload)
+            self._note_revision(payload)
 
-    def _note_centers_from_payload(self, payload):
-        """Feed per-revision tone centres from SNAPSHOT / TONE_UPDATE frames
-        to frame-consuming converters (FFM absolute-output bookkeeping)."""
+    def _note_revision(self, payload):
+        """Register a SNAPSHOT / TONE_UPDATE revision: its readout-correction
+        factors with the correction, and each channel tone's centre and
+        offsets with the frame-consuming (FFM) converters."""
         kind = payload.get('type')
-        if kind == 'SNAPSHOT':
-            revision = payload.get('revision')
-            centers = (payload.get('modulation') or {}).get('centers_hz') or {}
-        elif kind == 'TONE_UPDATE':
-            revision = payload.get('revision')
-            centers = payload.get('centers_hz') or {}
+        revision = payload.get('revision')
+        if kind not in ('SNAPSHOT', 'TONE_UPDATE') or revision is None \
+                or payload.get('op') == 'tracking_dry_run':
+            return
+        state = payload.get('modulation_state')
+        tones = {}
+        if isinstance(state, dict) and state.get('tones'):
+            if self.correction is not None:
+                self.correction.note_state(revision, state)
+            for tone in state['tones']:
+                if tone.get('center_hz') is not None:
+                    tones[int(tone['index'])] = (tone['center_hz'],
+                                                 tone.get('offsets_hz'))
         else:
-            return
-        if revision is None or not centers:
-            return
+            # Older servers announce the centres only.
+            centers = ((payload.get('modulation') or {}).get('centers_hz')
+                       if kind == 'SNAPSHOT' else payload.get('centers_hz'))
+            tones = {int(k): (v, None) for k, v in (centers or {}).items()}
         for ch in self.channels:
             converter = ch.converter
             if converter is None or \
                     not getattr(converter, 'wants_frames', False):
                 continue
-            center = centers.get(str(ch.tone_position))
-            if center is not None:
-                converter.note_center(revision, center)
+            converter.hold_unannounced = True
+            converter.note_center(revision,
+                                  *tones.get(ch.tone_position, (None, None)))
 
     def _reader(self):
         """Reader thread: source -> disk + bounded queue."""
@@ -1551,13 +1694,15 @@ class StreamToDac:
     def _request_stop(self, reason):
         if self._stop_reason is None:
             self._stop_reason = reason
+        elif reason != self._stop_reason:
+            print(f'\nalso stopping: {reason}')   # e.g. an output error after EOF
         self._stop.set()
 
     def _selected_iq(self, frame):
         """Corrected IQ values of the channels' tones for one frame."""
         iq = frame.iq
         if self.correction is not None:
-            iq = self.correction.apply(iq, frame.point)
+            iq = self.correction.apply(iq, frame.point, frame.revision)
         return [iq[ch.tone_position] for ch in self.channels]
 
     def _open_ain_log(self):
@@ -1795,6 +1940,27 @@ def resolve_tone_position(info, tone_index=None, tone_frequency_hz=None):
     return tone_index
 
 
+def _calibration_for(conversion_config, info, tone_position):
+    """``(calibration, record, sweep)`` for one tone; Nones when there is none.
+
+    The configured ``calibration_file`` (``resonator.save_calibrations``, with
+    its sweep when saved with one), else the calibration the server holds and
+    the stream carries (``info['resonators']``, pushed with
+    ``ReadoutClient.set_resonator_calibrations``; left out once the server
+    marks it stale).
+    """
+    path = conversion_config.get('calibration_file')
+    if path:
+        record, sweep = resonator.load_calibration_record(path)
+    else:
+        record, sweep = resonator.calibration_from_data({'info': info}), None
+    if record is None:
+        return None, None, None
+    calibration = resonator.calibrations_from_record(
+        record, [tone_position]).get(tone_position)
+    return calibration, record, sweep
+
+
 def build_converter(mode, conversion_config, info, tone_position,
                     reference_iq=None):
     """Build a :class:`StreamConverter` from config.
@@ -1804,9 +1970,15 @@ def build_converter(mode, conversion_config, info, tone_position,
     mode : {'magnitude', 'phase', 'df_modelfree', 'df_calibrated', 'ffm'}
         Conversion mode.
     conversion_config : dict
-        The config file's ``conversion`` section.
+        The config file's ``conversion`` section: ``output`` (a
+        ``resonator.QUANTITIES`` name or alias, default
+        ``'resonance_shift_hz'``), ``method`` (df_calibrated: a
+        ``resonator.CONVERSION_METHODS`` method, default ``'mobius'``),
+        ``demod_method`` (ffm: ``'fast'`` or ``'accurate'``),
+        ``calibration_file`` and the per-mode keys.
     info : dict
-        System info (for the tone frequency in calibrated mode).
+        System info: tone frequencies, the modulation state and, when one was
+        pushed, the server's resonator calibration.
     tone_position : int
         Stream position of the tone (user order).
     reference_iq : complex or None, optional
@@ -1817,6 +1989,7 @@ def build_converter(mode, conversion_config, info, tone_position,
     configured_ref = conversion_config.get('reference_iq')
     if configured_ref is not None:
         reference_iq = complex(configured_ref[0], configured_ref[1])
+    output = conversion_config.get('output') or 'resonance_shift_hz'
     if mode == 'magnitude':
         return MagnitudeConverter()
     if mode == 'phase':
@@ -1832,25 +2005,33 @@ def build_converter(mode, conversion_config, info, tone_position,
                              '(rad/Hz)')
         return DfModelFreeConverter(reference_iq, dphi_df)
     if mode == 'df_calibrated':
-        calibration_file = conversion_config.get('calibration_file')
-        if calibration_file is None:
-            raise ValueError('df_calibrated mode needs '
-                             'conversion.calibration_file')
-        calibrations = load_calibrations(calibration_file)
-        if tone_position not in calibrations:
-            raise ValueError(f'calibration file {calibration_file} has no '
-                             f'entry for tone {tone_position} '
-                             f'(has {sorted(calibrations)})')
+        calibration, record, sweep = _calibration_for(
+            conversion_config, info, tone_position)
+        method = conversion_config.get('method') or 'mobius'
+        sweep_f = sweep_z = None
+        if sweep is not None:
+            sweep_f, sweep_i, sweep_q = resonator.sweep_trace(sweep, tone_position)
+            sweep_z = sweep_i + 1j * sweep_q
+        if calibration is None and (sweep_f is None
+                                    or method not in ('linearized', 'lookup')):
+            raise ValueError(
+                f'df_calibrated mode has no calibration for tone '
+                f'{tone_position}: set conversion.calibration_file, or push '
+                'one to the server (ReadoutClient.set_resonator_calibrations)')
         frequencies = info.get('tones', {}).get('frequencies_hz')
         if frequencies is None:
             raise ValueError('info has no tones.frequencies_hz for the '
                              'calibrated converter tone frequency')
         f_tone = float(np.asarray(frequencies, dtype=float)[tone_position])
-        return DfCalibratedConverter(
-            calibrations[tone_position], f_tone,
-            output=conversion_config.get('output', 'frequency'))
+        if output == 'frequency':
+            print("Note: conversion.output 'frequency' is the resonance shift "
+                  '(resonance_shift_hz, positive = resonance up); the old '
+                  'probe detuning f_tone - fr is -detuning_hz')
+        return QuantityConverter(
+            f_tone, output, method, calibration=calibration,
+            sweep_f=sweep_f, sweep_z=sweep_z,
+            gain=resonator.resolve_rx_gain('auto', record, info))
     if mode == 'ffm':
-        from .modulation import active_modulation_state
         state = active_modulation_state(info)
         if not isinstance(state, dict) or not state.get('tones'):
             raise ValueError(
@@ -1865,15 +2046,25 @@ def build_converter(mode, conversion_config, info, tone_position,
         if not np.any(offsets != 0.0):
             raise ValueError(f'tone {tone_position} is not modulated '
                              '(all probe offsets are zero)')
+        calibration, record, _ = _calibration_for(
+            conversion_config, info, tone_position)
+        if calibration is None:
+            print(f'ffm: no calibration for tone {tone_position}, so raw I/Q '
+                  'and the tangent/normal projection; push one '
+                  '(set_resonator_calibrations) or set '
+                  'conversion.calibration_file for the centred basis')
         converter = FfmConverter(
             offsets,
             center_hz=entry.get('center_hz'),
             average_cycles=conversion_config.get('average_cycles', 1),
-            baseline_cycles=conversion_config.get('baseline_cycles', 20))
-        # Seed the current revision's centre so the absolute output is
-        # anchored even before the first typed frame arrives.
+            baseline_cycles=conversion_config.get('baseline_cycles', 20),
+            calibration=calibration, output=output,
+            demod_method=conversion_config.get('demod_method') or 'fast',
+            gain=resonator.resolve_rx_gain('auto', record, info))
+        # Seed the current revision so the output is anchored even before
+        # the first typed frame arrives.
         revision = state.get('applied_revision')
         if revision is not None and entry.get('center_hz') is not None:
-            converter.note_center(revision, entry['center_hz'])
+            converter.note_center(revision, entry['center_hz'], offsets)
         return converter
     raise ValueError(f"unknown conversion mode '{mode}'")

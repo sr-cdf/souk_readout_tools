@@ -4,8 +4,8 @@
 Stream a chosen KID tone's response to an analog DAC output in real time.
 
 Receives the readout server's continuous TCP stream, converts one or more
-tones' IQ into a scalar (magnitude / phase / frequency shift) and drives an
-analog output (LabJack USB DAC, a sound card via ALSA, or a no-hardware dummy
+tones' IQ into a scalar (magnitude / phase / any resonance quantity of
+resonator.QUANTITIES, e.g. the resonance shift) and drives an analog output (LabJack USB DAC, a sound card via ALSA, or a no-hardware dummy
 backend) so external instruments can record a live analog voltage proportional
 to the KID response. See doc/stream_to_dac.md and
 src/souk_readout_tools/data/config/template_stream_to_dac_config.yaml.
@@ -32,7 +32,8 @@ DEFAULT_CONFIG = {
     'connection': {'config_file': None, 'address': None, 'request_port': None},
     'conversion': {'mode': 'magnitude', 'reference_iq': None,
                    'reference_samples': 100, 'dphi_df': None,
-                   'calibration_file': None, 'output': 'frequency',
+                   'calibration_file': None, 'output': 'resonance_shift_hz',
+                   'method': 'mobius', 'demod_method': 'fast',
                    'average_cycles': 1, 'baseline_cycles': 20},
     'channels': [{'dac_channel': 'DAC0', 'tone_index': 0,
                   'tone_frequency_hz': None, 'gain': 1.0, 'x_offset': 0.0,
@@ -292,7 +293,10 @@ def main():
         apply_readout_correction=config['stream']['apply_readout_correction'],
         max_updates=args.max_updates)
 
-    print(f'stream-to-dac: mode={mode} backend={config["dac"]["backend"]} '
+    output = (f' output={config["conversion"].get("output")}'
+              if mode in ('df_calibrated', 'ffm') else '')
+    print(f'stream-to-dac: mode={mode}{output} '
+          f'backend={config["dac"]["backend"]} '
           f'update_rate={config["dac"]["update_rate_hz"]} Hz '
           f'boxcar N={app.navg} '
           f'tones={[ch.tone_position for ch in channels]}')

@@ -2674,7 +2674,19 @@ def phase_derivatives(z_points, offsets, method='fast', per_point=False):
         unwrapped phase against offset (a line with two distinct offsets), so
         every point counts -- e.g. both centre dwells of ``[0, +d, 0, -d]``.
     per_point : bool, optional
-        Also return the phase slope and complex I/Q gradient at every point.
+        Also return the complex I/Q gradient and the phase slope at every
+        point, for converting the samples there. These are exact for a
+        response that is a Mobius function of frequency -- a resonance
+        circle, in any affine basis -- whatever ``method``: with the
+        difference quotients ``D_ab = (z_b - z_a) / (f_b - f_a)`` of the
+        lowest, central and highest offsets' mean I/Q,
+        ``dz/df = D_lm D_mh / D_lh`` at the centre (the harmonic mean of the
+        two one-sided quotients), ``D_lm D_lh / D_mh`` at the lowest offset
+        and ``D_mh D_lh / D_lm`` at the highest; linear in offset between
+        them, and the chord ``D_lh`` with only two distinct offsets. A central
+        difference would read the circle's chord for its tangent, 4% low at
+        +/-0.1 linewidth offsets and 20% at +/-0.25, scaling every
+        converted shift by as much.
 
     Returns
     -------
@@ -2682,8 +2694,13 @@ def phase_derivatives(z_points, offsets, method='fast', per_point=False):
         ``dphi_df`` (rad/Hz) and ``d2phi_df2`` (rad/Hz**2), shape
         ``(..., n_tones)``, at ``center_offset_hz`` (the offset nearest the
         middle of the span, ``(n_tones,)``). NaN where not estimable; the
-        curvature needs three distinct offsets. With ``per_point``:
-        ``local_dphi_df`` and ``dz_df``, shape ``(..., N, n_tones)``.
+        curvature needs three distinct offsets. These are the ``method``'s
+        finite-difference or fitted estimates, the inputs of
+        :func:`detuning_from_derivatives`: robust, but low by
+        ``atan(u) / u``, ``u = 2 * offset / linewidth``, on resonance (1.3%
+        at +/-0.1 linewidth). With ``per_point``: ``dz_df`` and
+        ``local_dphi_df = Im(dz_df / z)`` (the exact phase slope about the
+        basis origin), shape ``(..., N, n_tones)``.
 
     Examples
     --------
@@ -2704,40 +2721,30 @@ def phase_derivatives(z_points, offsets, method='fast', per_point=False):
     f_hi = offsets.max(axis=0)
     f_mid = offsets[np.argmin(np.abs(offsets - 0.5 * (f_lo + f_hi)), axis=0),
                     np.arange(n_tones)]
+    three = (f_lo < f_mid) & (f_mid < f_hi)
     out = {'center_offset_hz': f_mid}
-    if method == 'fast':
-        def mean_at(f):
-            w = (offsets == f).astype(float)
-            return np.einsum('...nt,nt->...t', z, w / w.sum(axis=0))
 
-        z_lo, z_mid, z_hi = mean_at(f_lo), mean_at(f_mid), mean_at(f_hi)
+    def mean_at(f):
+        """Coherent mean of the points at offset ``f`` (per tone)."""
+        w = (offsets == f).astype(float)
+        return np.einsum('...nt,nt->...t', z, w / w.sum(axis=0))
+
+    z_lo, z_mid, z_hi = mean_at(f_lo), mean_at(f_mid), mean_at(f_hi)
+    if method == 'fast':
         d_lo = np.angle(z_mid * np.conj(z_lo))          # phi_mid - phi_lo
         d_hi = np.angle(z_hi * np.conj(z_mid))          # phi_hi - phi_mid
-        three = (f_lo < f_mid) & (f_mid < f_hi)
         with np.errstate(divide='ignore', invalid='ignore'):
             slope = (d_lo + d_hi) / (f_hi - f_lo)
             # Second difference for (possibly) unequal spacing; for a symmetric
             # pattern it is (phi_hi - 2 phi_mid + phi_lo) / half**2.
             curvature = 2.0 * (d_hi / (f_hi - f_mid) - d_lo / (f_mid - f_lo)) / (f_hi - f_lo)
-            if per_point:
-                dz_mid = (z_hi - z_lo) / (f_hi - f_lo)
-                d2z = 2.0 * ((z_hi - z_mid) / (f_hi - f_mid)
-                             - (z_mid - z_lo) / (f_mid - f_lo)) / (f_hi - f_lo)
         slope = np.where(f_hi > f_lo, slope, np.nan)
         curvature = np.where(three, curvature, np.nan)
-        if per_point:
-            shift = offsets - f_mid                     # (N, n_tones)
-            curvature_or_0 = np.where(np.isfinite(curvature), curvature, 0.0)
-            out['local_dphi_df'] = slope[..., None, :] + curvature_or_0[..., None, :] * shift
-            d2z = np.where(three, d2z, 0.0)
-            out['dz_df'] = dz_mid[..., None, :] + d2z[..., None, :] * shift
     elif method == 'fit':
         lead = z.shape[:-2]
         flat = z.reshape(-1, N, n_tones)
         slope = np.full((flat.shape[0], n_tones), np.nan)
         curvature = np.full_like(slope, np.nan)
-        local = np.full(flat.shape, np.nan)
-        dz_df = np.full(flat.shape, np.nan + 0j)
         for t in range(n_tones):
             x = offsets[:, t] - f_mid[t]
             order = np.argsort(x)
@@ -2747,24 +2754,31 @@ def phase_derivatives(z_points, offsets, method='fast', per_point=False):
             deg = 2 if distinct >= 3 else 1
             phi = np.unwrap(np.angle(flat[:, order, t]), axis=1)
             c = np.polyfit(x[order], phi.T, deg)          # highest power first
-            zc = np.polyfit(x[order], flat[:, order, t].T, deg)
             slope[:, t] = c[-2]
             if deg == 2:
                 curvature[:, t] = 2.0 * c[0]
-                local[:, :, t] = c[1][:, None] + 2.0 * c[0][:, None] * x[None, :]
-                dz_df[:, :, t] = zc[1][:, None] + 2.0 * zc[0][:, None] * x[None, :]
-            else:
-                local[:, :, t] = c[0][:, None]
-                dz_df[:, :, t] = zc[0][:, None]
         slope = slope.reshape(lead + (n_tones,))
         curvature = curvature.reshape(lead + (n_tones,))
-        if per_point:
-            out['local_dphi_df'] = local.reshape(z.shape)
-            out['dz_df'] = dz_df.reshape(z.shape)
     else:
         raise ValueError(f"method must be 'fast' or 'fit', got {method!r}")
     out['dphi_df'] = slope
     out['d2phi_df2'] = curvature
+
+    if per_point:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            d_lm = (z_mid - z_lo) / (f_mid - f_lo)
+            d_mh = (z_hi - z_mid) / (f_hi - f_mid)
+            d_lh = (z_hi - z_lo) / (f_hi - f_lo)
+            # Exact for a circle (see per_point above); the chord otherwise.
+            g_lo = np.where(three, d_lm * d_lh / d_mh, d_lh)[..., None, :]
+            g_mid = np.where(three, d_lm * d_mh / d_lh, d_lh)[..., None, :]
+            g_hi = np.where(three, d_mh * d_lh / d_lm, d_lh)[..., None, :]
+            below = g_lo + (g_mid - g_lo) * (offsets - f_lo) / (f_mid - f_lo)
+            above = g_mid + (g_hi - g_mid) * (offsets - f_mid) / (f_hi - f_mid)
+            dz_df = np.where(three, np.where(offsets <= f_mid, below, above),
+                             d_lh[..., None, :])
+            out['dz_df'] = dz_df
+            out['local_dphi_df'] = np.imag(dz_df / z)
     return out
 
 

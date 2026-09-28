@@ -24,30 +24,45 @@ connection:
 # mode:
 #   magnitude     |IQ| in raw counts (zero-calibration first-light mode)
 #   phase         phase relative to a reference IQ point, in rad
-#   df_modelfree  phase / dphi_df, in Hz (needs dphi_df)
-#   df_calibrated exact Mobius conversion via a ResonatorCalibration, in Hz
-#                 (needs calibration_file; see doc/stream_to_dac.md for the
-#                 sweep -> batch_fit -> calibration-file workflow)
-#   ffm           live FFM demodulation, in Hz: needs frequency modulation
-#                 running (enable_modulation + enable_stream). Each cycle's
-#                 phase slope gives a live dphi_df (self-calibrating), and
-#                 with tone tracking recentering the tone the output stays
-#                 an absolute response via the per-revision centres in the
-#                 typed tone-update frames (subscribed automatically).
+#   df_modelfree  -phase / dphi_df, the resonance shift in Hz (needs dphi_df,
+#                 the raw phase slope; reads some loss as frequency)
+#   df_calibrated a fixed tone through the resonator conversions: `output`
+#                 by `method` (default: exact Mobius inversion). Needs a
+#                 calibration: calibration_file, or one pushed to the server
+#                 with client.set_resonator_calibrations (then no file).
+#   ffm           live three-point demodulation: needs frequency modulation
+#                 running (enable_modulation + enable_stream). Each cycle
+#                 measures its own phase slope; with a calibration (file or
+#                 pushed) the conversion runs in the centred basis, else on
+#                 raw I/Q. Tracking recentres are followed through the
+#                 per-revision state in the typed tone-update frames
+#                 (subscribed automatically).
+# output: what x is, a resonator.QUANTITIES name (df_calibrated and ffm):
+#   resonance_shift_hz (default; positive = resonance moved up),
+#   resonance_frequency_hz, detuning_hz (resonance - tone),
+#   matched_dissipation_shift (Delta(1/2Qi)), *_linewidths variants, ...;
+#   ffm also offers center_detuning_hz, center_detuning_linewidths, dphi_df.
+#   The old 'frequency' is resonance_shift_hz and 'dissipation' is
+#   matched_dissipation_shift.
+# method: df_calibrated only -- mobius, phase, linearized, lookup or circle
+#   (linearized and lookup need a calibration file saved with its sweep).
+# demod_method: ffm only -- fast (the tracker's finite differences) or
+#   accurate (quadratic fit of phase against offset).
 # reference_iq: [I, Q] reference point for the phase modes; null captures
 #   the average of reference_samples stream samples at startup instead.
-# output: 'frequency' or 'dissipation' (df_calibrated only).
-# average_cycles / baseline_cycles: ffm only — boxcar over the last N
-#   per-cycle outputs, and cycles averaged into the startup phase baseline.
+# average_cycles / baseline_cycles: ffm only -- boxcar over the last N
+#   per-cycle outputs, and cycles averaged into the startup reference.
 conversion:
   mode: magnitude
   reference_iq: null
   reference_samples: 100
   dphi_df: null            # rad/Hz, for df_modelfree
-  calibration_file: null   # .npz from stream_dac.save_calibrations
-  output: frequency
+  calibration_file: null   # .npz from resonator.save_calibrations
+  output: resonance_shift_hz
+  method: mobius           # df_calibrated
+  demod_method: fast       # ffm
   average_cycles: 1        # ffm: boxcar over per-cycle outputs
-  baseline_cycles: 20      # ffm: startup phase-baseline cycles
+  baseline_cycles: 20      # ffm: startup reference cycles
 
 # --- Output channels ---
 # One entry per DAC channel. Select the tone by user-order index

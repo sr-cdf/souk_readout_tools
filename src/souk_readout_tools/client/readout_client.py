@@ -5743,7 +5743,7 @@ class ReadoutClient:
 
 
     def receive_stream(self, num_tones=None, filename=None, print_data=False, info=None,
-                       duration=None, subscribe_tone_updates=False,
+                       duration=None, subscribe_tone_updates=None,
                        frame_callback=None, stop_event=None, write_to_file=True,
                        overwrite=False, update_callback=None):
         """Receive continuous stream frames, optionally saving and/or consuming them.
@@ -5770,9 +5770,13 @@ class ReadoutClient:
             stream socket connects and the output file opens. ``None`` waits
             until Ctrl+C or disconnect. Incomplete frames are discarded.
 
-        subscribe_tone_updates : bool, optional
+        subscribe_tone_updates : bool or None, optional
             Opt in to SNAPSHOT and TONE_UPDATE frames. Save their JSON payloads
-            to ``filename + '.updates.jsonl'`` (default False).
+            to ``filename + '.updates.jsonl'``. ``None`` (default) subscribes
+            unless the client is a mock: every tracking commit or recentre
+            changes the modulation state, and offline demodulation
+            (``modulation.demodulate_stream``) and ``parse_stream``'s
+            per-revision readout correction need these records to follow it.
 
         frame_callback : callable or None, optional
             Called synchronously as ``frame_callback(payload, metadata)`` for
@@ -5819,6 +5823,8 @@ class ReadoutClient:
                 or not isinstance(num_tones, (int, np.integer))
                 or not 0 <= num_tones <= 2048):
             raise ValueError("num_tones must be an integer between 0 and 2048")
+        if subscribe_tone_updates is None:
+            subscribe_tone_updates = not self.mock
         if self.mock and subscribe_tone_updates:
             raise NotImplementedError("Mock binary capture does not generate tone updates")
         if self.mock:
@@ -6524,14 +6530,18 @@ class ReadoutClient:
         The date is preserved from the capture metadata.
         Subscribed captures also contain ``tone_updates`` (ordered records with
         payload, frame_type, host_time_unix and sample_index, the number of IQ
-        frames saved before the event), and ``tone_centers_by_revision`` (integer
-        revision -> tone-keyed centre frequencies in Hz). Match the latter to
+        frames saved before the event), ``tone_centers_by_revision`` (integer
+        revision -> tone-keyed centre frequencies in Hz) and
+        ``readout_correction_by_revision`` (revision -> ``(num_points,
+        num_tones)`` factors, from the announced states). Match them to
         ``modulation_revision``; absent revisions/tones are unknown. Repeated
         revision IDs use the latest announcement; use ordered records for
-        captures spanning revision resets/wraps. These records do not silently
-        change the initial correction factors or the analysis configuration.
+        captures spanning revision resets/wraps. The readout correction uses
+        each announced revision's own factors (a tracking commit moves the
+        probes across the filterbank), the initial ones otherwise.
 
         """
+        from souk_readout_tools import resonator
         filename = os.fspath(filename)
         with open(filename+'.json','r') as file:
             metadata = json.load(file)
@@ -6569,9 +6579,11 @@ class ReadoutClient:
         q_data = data[1:2*num_tones:2]
 
         ReadoutClient._warn_on_dropped_accumulations(cnt, 'parse_stream')
+        # Corrected below, once the tone updates can supply each revision's
+        # own factors.
         result = ReadoutClient._parsed_timestream(
             i_data.T, q_data.T, cnt, err, tt, flags.T, sample_rate, info,
-            date, apply_readout_correction)
+            date, False)
 
         if metadata.get('tone_updates_subscribed', False):
             with open(filename + '.updates.jsonl') as file:
@@ -6582,6 +6594,7 @@ class ReadoutClient:
             # updates change only the listed tones; snapshots replace the map.
             centers = {}
             by_revision = {}
+            factors_by_revision = {}
             for record in updates:
                 payload = record['payload']
                 if payload.get('type') == 'SNAPSHOT':
@@ -6594,7 +6607,14 @@ class ReadoutClient:
                 revision = payload.get('revision')
                 if revision is not None:
                     by_revision[int(revision)] = dict(centers)
+                    factors = resonator.readout_correction_factors(
+                        {'modulation': payload.get('modulation_state')}, num_tones)
+                    if factors is not None:
+                        factors_by_revision[int(revision) & 0x7FFF] = factors
             result['tone_centers_by_revision'] = by_revision
+            result['readout_correction_by_revision'] = factors_by_revision
+        if apply_readout_correction:
+            result = resonator.with_readout_correction(result, True)
         return result
 
     @staticmethod
