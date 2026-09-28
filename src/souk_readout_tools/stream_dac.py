@@ -720,6 +720,9 @@ class FfmConverter(StreamConverter):
         self._revision = None
         self.cycles = 0
         self.last_dphi_df = np.nan
+        # resonator.calibration_fit of the cycles (smoothed): 1 while the
+        # calibration's circle still fits this tone; the status line shows it.
+        self.calibration_fit = np.nan
 
     def note_center(self, revision, center_hz=None, offsets_hz=None):
         """Register this tone's centre (and offsets) for a modulation
@@ -790,6 +793,10 @@ class FfmConverter(StreamConverter):
             # resonators, where the curvature form reads ~2x) and the loss.
             detuning_hz = float(resonator.mobius_center_detuning(z, offsets, cal))
             loss = float(np.nanmean(cal.convert_centered_iq(z)[1]))
+            fit = resonator.calibration_fit(z, cal)
+            if np.isfinite(fit):
+                self.calibration_fit = (fit if not np.isfinite(self.calibration_fit)
+                                        else 0.95 * self.calibration_fit + 0.05 * fit)
 
         if self.output in CYCLE_FIELDS:
             cycle = {'dphi_df': slope, 'd2phi_df2': curvature,
@@ -1884,8 +1891,13 @@ class StreamToDac:
         ch = self.channels[0]
         loop_ms = 1e3 * float(np.mean(self.loop_times)) if self.loop_times \
             else 0.0
+        fit = getattr(ch.converter, 'calibration_fit', np.nan)
+        fit_text = ''
+        if np.isfinite(fit):
+            low, high = resonator.CALIBRATION_FIT_RANGE
+            fit_text = f'fit={fit:.2f}{"" if low <= fit <= high else "!"}  '
         print(f'x={ch.last_x:+.4g} {ch.converter.units}  '
-              f'V={ch.last_volts:+.4f}  '
+              f'V={ch.last_volts:+.4f}  {fit_text}'
               f'frames={self.frames_received}  '
               f'updates={self.updates_written}  '
               f'dropped(frames/queue)={self.frames_dropped}/'

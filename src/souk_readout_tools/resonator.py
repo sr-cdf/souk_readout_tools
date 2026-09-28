@@ -2135,6 +2135,44 @@ def calibrations_from_record(record, tones=None):
     return out
 
 
+def calibration_record_subset(record, tones):
+    """A calibration record cut to ``tones``: its per-tone lists keep only
+    those tones; schema, provenance and the shared group-delay table stay."""
+    keep = {int(t) for t in tones}
+    rows = [j for j, t in enumerate(record['tone_indices']) if int(t) in keep]
+    n = len(record['tone_indices'])
+    out = {}
+    for key, value in record.items():
+        if (key not in ('schema', 'provenance', 'group_delay_cal')
+                and isinstance(value, (list, tuple)) and len(value) == n):
+            out[key] = [value[j] for j in rows]
+        else:
+            out[key] = value
+    return out
+
+
+def stale_calibration_tones(record, tone_frequencies_hz, max_linewidths=5.0):
+    """``{tone: reason}`` for the tones a calibration record no longer covers.
+
+    A tone is stale when it is not active (no finite frequency at its index
+    in ``tone_frequencies_hz``) or is tuned more than ``max_linewidths`` of its
+    linewidths from its calibrated operating point: its resonance, and so its
+    calibration, has moved on. Per tone -- the rest of the record stays good.
+    """
+    freqs = (None if tone_frequencies_hz is None
+             else np.asarray(tone_frequencies_hz, dtype=float))
+    stale = {}
+    for j, tone in enumerate(record['tone_indices']):
+        tone = int(tone)
+        if freqs is None or not 0 <= tone < freqs.size or not np.isfinite(freqs[tone]):
+            stale[tone] = 'not active'
+        elif (abs(freqs[tone] - record['operating_point_hz'][j])
+              > max_linewidths * record['linewidth_hz'][j]):
+            stale[tone] = (f'{abs(freqs[tone] - record["operating_point_hz"][j]) / 1e3:.1f} kHz '
+                           f'(over {max_linewidths:g} linewidths) from its calibrated resonance')
+    return stale
+
+
 def save_calibrations(filename, calibrations, sweep_data=None, **provenance):
     """Save calibrations -- and the sweep they came from -- to one ``.npz``.
 
@@ -2245,6 +2283,10 @@ def calibration_from_data(data):
     return None
 
 
+# Calibration fit beyond this range: re-sweep and push again.
+CALIBRATION_FIT_RANGE = (0.85, 1.15)
+
+
 def calibration_fit(z_centered, calibration):
     """How well a calibration's circle still fits a tone's data: 1 when it does.
 
@@ -2266,7 +2308,7 @@ def calibration_fit(z_centered, calibration):
 
 def calibration_quality(calibrations, sweep_data=None, samples=None, *,
                         max_linewidth_ratio=2.0, max_neighbour_ratio=3.0, neighbours=10,
-                        max_anl=0.6, min_dip_depth_db=3.0, fit_range=(0.85, 1.15)):
+                        max_anl=0.6, min_dip_depth_db=3.0, fit_range=CALIBRATION_FIT_RANGE):
     """Per-tone checks of a calibration, and the tones that fail them.
 
     For choosing the tones to track, ``enable_tracking(enable_mask=result['good'])``,

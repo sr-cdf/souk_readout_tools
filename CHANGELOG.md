@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Calibration health per tone**: `resonator.calibration_fit` (median
+  |z_c| / r, 1 while the circle fits) in the tracker's per-tone health and
+  summary (`median_calibration_fit`, `n_poor_calibration_fit`) and the DAC
+  status (`fit=`); `resonator.calibration_quality` checks a calibration and
+  returns `good` / `poor` tones with reasons (krm4: 44% of tones off 0.9-1.1
+  three hours into a cooldown). Staleness is per tone (`stale_tones`; the
+  tracker's `stale` state) instead of one drifted tone voiding the record.
+  Optional guard `freeze_unresponsive` (off): freeze tones whose readings
+  ignore their own moves (`move_response`).
+
 - **stream-to-DAC `ffm` no longer steps at tracking commits**: with a
   calibration every cycle is absolute (centre + Möbius centre detuning, the
   reconstruction identity), so recentres need no join. Converting about one

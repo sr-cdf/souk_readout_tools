@@ -842,27 +842,30 @@ class MockReadoutServer:
         return {'ready': True, 'calibration_files': list(self.calibration_files)}
 
     def _info_resonators(self):
-        """Mock ``get_info('resonators')``: the pushed calibration record, valid
-        while each calibrated tone is active and within five linewidths of it
-        (as the real server works it out)."""
+        """Mock ``get_info('resonators')``: the pushed calibration record cut to
+        the tones it still covers, stale ones listed (as the real server works
+        it out)."""
+        from souk_readout_tools.resonator import (calibration_record_subset,
+                                                  stale_calibration_tones)
         pushed = self._resonator_calibration
         if pushed is None:
             return {'ready': False, 'valid': False, 'source': None,
                     'invalid_reason': 'no calibration pushed', 'record': None}
         record = pushed['record']
-        tones = np.asarray(self.tone_frequencies, dtype=float)
-        reasons = []
-        for j, tone in enumerate(record['tone_indices']):
-            if not 0 <= int(tone) < tones.size:
-                reasons.append(f'tone {tone} is not active')
-            elif (abs(tones[int(tone)] - record['operating_point_hz'][j])
-                  > 5 * record['linewidth_hz'][j]):
-                reasons.append(f'tone {tone} is over five linewidths from its '
-                               'calibrated resonance')
-        return {'ready': True, 'valid': not reasons,
-                'invalid_reason': '; '.join(reasons[:5]) or None,
+        stale = stale_calibration_tones(record, np.asarray(self.tone_frequencies, dtype=float))
+        usable = calibration_record_subset(
+            record, [t for t in record['tone_indices'] if int(t) not in stale])
+        n = len(record['tone_indices'])
+        reason = None
+        if stale:
+            reason = (f'{len(stale)} of {n} calibrated tones stale: '
+                      + '; '.join(f'tone {t} {why}' for t, why in list(stale.items())[:5]))
+        return {'ready': True, 'valid': bool(usable['tone_indices']),
+                'invalid_reason': reason,
+                'stale_tones': {str(t): why for t, why in stale.items()},
+                'n_pushed_tones': n,
                 'source': 'client', 'pushed_unix': pushed['pushed_unix'],
-                'record': record}
+                'record': usable}
 
     def _info_registers(self):
         return {'ready': False, 'available': False, 'dump': None}

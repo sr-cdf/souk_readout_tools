@@ -2633,29 +2633,33 @@ class ReadoutServer:
 
         ``set_resonator_calibrations`` stores it; every stream sidecar records
         ``get_info('all')``, so it travels with each recording and the analysis
-        tools use it by default (``resonator.calibration_from_data``). Validity
-        is worked out afresh on each read, never cached: every calibrated tone
-        must still be active and within five linewidths of its calibrated
-        resonance.
+        tools use it by default (``resonator.calibration_from_data``).
+        Staleness is per tone and worked out afresh on each read, never
+        cached: a tone no longer active, or tuned over five linewidths from
+        its calibrated resonance, is dropped from the served ``record`` and
+        listed in ``stale_tones``; the rest stays valid.
         """
+        from souk_readout_tools.resonator import (calibration_record_subset,
+                                                  stale_calibration_tones)
         pushed = getattr(self, 'resonator_calibration', None)
         if pushed is None:
             return {'ready': False, 'valid': False, 'source': None,
                     'invalid_reason': 'no calibration pushed', 'record': None}
         record = pushed['record']
-        tones = self._current_tone_frequencies()
-        reasons = []
-        for j, tone in enumerate(record['tone_indices']):
-            if tones is None or not 0 <= int(tone) < len(tones):
-                reasons.append(f'tone {tone} is not active')
-            elif (abs(tones[int(tone)] - record['operating_point_hz'][j])
-                  > 5 * record['linewidth_hz'][j]):
-                reasons.append(f'tone {tone} is over five linewidths from its '
-                               'calibrated resonance')
-        return {'ready': True, 'valid': not reasons,
-                'invalid_reason': '; '.join(reasons[:5]) or None,
+        stale = stale_calibration_tones(record, self._current_tone_frequencies())
+        usable = calibration_record_subset(
+            record, [t for t in record['tone_indices'] if int(t) not in stale])
+        n = len(record['tone_indices'])
+        reason = None
+        if stale:
+            reason = (f'{len(stale)} of {n} calibrated tones stale: '
+                      + '; '.join(f'tone {t} {why}' for t, why in list(stale.items())[:5]))
+        return {'ready': True, 'valid': bool(usable['tone_indices']),
+                'invalid_reason': reason,
+                'stale_tones': {str(t): why for t, why in stale.items()},
+                'n_pushed_tones': n,
                 'source': 'client', 'pushed_unix': pushed['pushed_unix'],
-                'record': record}
+                'record': usable}
 
     def _chain_info(self):
         """The RX chain state (for recorded_rx_gain_ratio), or None."""
@@ -6545,6 +6549,10 @@ class ReadoutServer:
         # rotation-free, needs three distinct offsets; reads ~2x on driven
         # tones, where a gain-1 loop jumps from side to side).
         'detuning_estimator': 'mobius',
+        # Guard, off by default: freeze a tone whose reading changed by less
+        # than 0.5x or more than 1.5x its own move after two commits running
+        # (its calibration no longer describes it: it would walk or swing).
+        'freeze_unresponsive': False,
     }
 
     async def _commit_tracking_update(self, engine, klass, corrections,

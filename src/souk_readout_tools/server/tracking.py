@@ -54,10 +54,19 @@ from collections import deque
 import numpy as np
 
 from souk_readout_tools import modulation
-from souk_readout_tools.resonator import (basis_coefficients,
+from souk_readout_tools.resonator import (CALIBRATION_FIT_RANGE,
+                                          basis_coefficients,
                                           detuning_from_derivatives,
                                           mobius_center_detuning,
+                                          operating_point_hz,
                                           phase_derivatives)
+
+# A calibration no longer covers a tone tuned further than this from its
+# calibrated operating point (the server's per-tone staleness rule too).
+STALE_LINEWIDTHS = 5.0
+# freeze_unresponsive: a tone whose reading, after a commit, changed by less
+# than or more than this multiple of its own move, twice running.
+RESPONSE_RANGE = (0.5, 1.5)
 
 # Number of int32 trailer words at the end of every stream frame
 # (flags 0-5, tt_msb, tt_lsb, cnt, err) -- matches prepare_frame.
@@ -1059,6 +1068,30 @@ class TrackingRuntime:
         self.stat_abs_slope = np.full(self.n_tones, np.nan)     # |dphi_df|
         self.stat_invalid_frac = np.full(self.n_tones, np.nan)
 
+        # Calibration health per tone: where each calibration was made, the
+        # latest window's calibration fit (resonator.calibration_fit: the
+        # median |z_c| / r, 1 while the circle still fits), and how each
+        # tone's reading answered its last commit (the change of the reading
+        # over the move: ~1 when the calibration still describes it). With
+        # freeze_unresponsive (off by default) a tone answering outside
+        # RESPONSE_RANGE twice running is frozen: never corrected again until
+        # tracking is re-enabled.
+        self._calibrated_op_hz = np.full(self.n_tones, np.nan)
+        self._radius = np.full(self.n_tones, np.nan)
+        for t, cal in self.calibrations.items():
+            self._calibrated_op_hz[t] = operating_point_hz(cal)
+            self._radius[t] = cal.radius
+        self._cal_linewidth_hz = np.full(self.n_tones, np.nan)
+        for t, cal in self.calibrations.items():
+            self._cal_linewidth_hz[t] = cal.fr / cal.Ql
+        self.last_fit = np.full(self.n_tones, np.nan)
+        self.last_response = np.full(self.n_tones, np.nan)
+        self._last_centers = None
+        self._pending_response = {}        # tone -> (reading lw, move lw)
+        self._unresponsive = np.zeros(self.n_tones, dtype=int)
+        self.freeze_unresponsive = bool(params.get('freeze_unresponsive', False))
+        self.frozen = {}                   # tone -> reason
+
         # Cached get_info('tracking') snapshot, rebuilt off-loop by the
         # consumer each poll (see _build_snapshot / status). Primed here so a
         # health poll before the first consumer iteration still returns a
@@ -1333,6 +1366,9 @@ class TrackingRuntime:
                     self.phase_estimate_requested = False
         A, B = self._basis
         z = blocks * A[None] + B[None]         # de-embedded, circle-centred
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            self.last_fit = np.nanmedian(np.abs(z), axis=(0, 1)) / self._radius
         self.stage_ms['center'] = 1e3 * (_t() - _t0); _t0 = _t()
         if self.detuning_estimator == 'curvature':
             estimate = estimate_detunings(z, self.offsets, self.linewidth_hz)
@@ -1448,9 +1484,12 @@ class TrackingRuntime:
             return False
         if not self.filter.settled:
             return False
+        self._last_centers = np.asarray(centers, dtype=float)
+        self._check_responses(result['filtered_linewidths'])
         # Tones reading noise never reach the controller: they would stage a
         # correction every window, which is both wrong (the estimate is
-        # meaningless off resonance) and expensive.
+        # meaningless off resonance) and expensive. Nor do tones their
+        # calibration no longer covers, or frozen ones.
         # Headroom is a per-tone Python loop (12.6 ms at 1000 tones) and is
         # only needed to classify tones that have passed confirmation, which
         # is normally none -- so pass the callable and let decide() call it
@@ -1459,8 +1498,8 @@ class TrackingRuntime:
         _t0 = _t()
         self.controller.decide(result['filtered_linewidths'],
                                centers, self._lo_headroom_hz,
-                               unlocked=self.unlocked_mask(
-                                   result['filtered_linewidths']),
+                               unlocked=(self.unlocked_mask(result['filtered_linewidths'])
+                                         | self.stale_mask() | self.frozen_mask()),
                                sigma_lw=np.sqrt(self.stat_detuning_var))
         self.stage_ms['decide'] = 1e3 * (_t() - _t0)
         self.stage_ms['headroom'] = round(self.controller.headroom_ms, 2)
@@ -1600,6 +1639,7 @@ class TrackingRuntime:
             if klass not in taken:
                 continue
             corrections = taken[klass]
+            before = np.asarray(self._mod_cfg()['center'], dtype=float).copy()
             if self.dry_run:
                 self.server._announce_tracking_dry_run(klass, corrections,
                                                        self.controller)
@@ -1622,6 +1662,11 @@ class TrackingRuntime:
                     self.commits[klass] += 1
                     self.last_commit_ts[klass] = time.time()
                     self.commit_stage_ms = result.get('timing_ms', {})
+                    for tone, new_center in corrections.items():
+                        reading = self.controller.staged_detunings.get(tone)
+                        move = (new_center - before[tone]) / self.linewidth_hz[tone]
+                        if reading is not None and np.isfinite(move) and move != 0.0:
+                            self._pending_response[tone] = (float(reading), float(move))
                 results.append(result)
             except Exception as e:
                 self.commit_errors += 1
@@ -1673,6 +1718,45 @@ class TrackingRuntime:
             bad |= np.isfinite(filtered) & (np.abs(filtered) > float(unlock_lw))
         return bad
 
+    def stale_mask(self):
+        """``(n_tones,)`` bool: tones tuned over ``STALE_LINEWIDTHS`` from where
+        their calibration was made -- it no longer covers them, so they are
+        not corrected (the server drops them from the served calibration)."""
+        if self._last_centers is None:
+            return np.zeros(self.n_tones, dtype=bool)
+        with np.errstate(invalid='ignore'):
+            return (np.abs(self._last_centers - self._calibrated_op_hz)
+                    > STALE_LINEWIDTHS * self._cal_linewidth_hz)
+
+    def frozen_mask(self):
+        """``(n_tones,)`` bool: tones frozen by ``freeze_unresponsive``."""
+        mask = np.zeros(self.n_tones, dtype=bool)
+        mask[list(self.frozen)] = True
+        return mask
+
+    def _check_responses(self, filtered):
+        """Compare each committed tone's first settled reading with its move.
+
+        Resonance minus centre should fall by the move: the ratio of the
+        change to the move is ~1 while the calibration describes the tone,
+        ~0 when its reading ignores its own moves (a fit that no longer
+        applies: it walks), ~2 when it over-reads them (it oscillates).
+        """
+        for tone, (reading, move) in list(self._pending_response.items()):
+            now = float(filtered[tone])
+            if not np.isfinite(now):
+                continue
+            del self._pending_response[tone]
+            response = (reading - now) / move
+            self.last_response[tone] = response
+            if RESPONSE_RANGE[0] <= response <= RESPONSE_RANGE[1]:
+                self._unresponsive[tone] = 0
+                continue
+            self._unresponsive[tone] += 1
+            if self.freeze_unresponsive and self._unresponsive[tone] >= 2:
+                self.frozen[tone] = (f'its reading changed by {response:.2f}x its own '
+                                     'move, twice running')
+
     def tone_health(self):
         """Per-tone tracking health and a lock state for each tracked tone.
 
@@ -1717,8 +1801,9 @@ class TrackingRuntime:
         pending = np.zeros(self.n_tones, dtype=bool)
         pending[list(staged_bin)] = True
         over = finite & (np.abs(filtered) > self.controller.threshold_linewidths)
-        names = ('unlocked', 'recenter_pending', 'drifting', 'locked')
-        state = np.select([self.unlocked_mask(filtered), pending, over, finite],
+        names = ('frozen', 'stale', 'unlocked', 'recenter_pending', 'drifting', 'locked')
+        state = np.select([self.frozen_mask(), self.stale_mask(),
+                           self.unlocked_mask(filtered), pending, over, finite],
                           names, 'no_data')
         idx = np.flatnonzero(self.controller.enable_mask)
         state = state[idx]
@@ -1732,10 +1817,10 @@ class TrackingRuntime:
                     for x, ok in zip(v.tolist(), np.isfinite(v).tolist())]
 
         tones = {}
-        for i, s, f, sd, sr, inv in zip(idx.tolist(), state.tolist(),
-                                        column(filtered), column(std),
-                                        column(slope_ratio),
-                                        column(self.stat_invalid_frac)):
+        for i, s, f, sd, sr, inv, fit, resp in zip(
+                idx.tolist(), state.tolist(), column(filtered), column(std),
+                column(slope_ratio), column(self.stat_invalid_frac),
+                column(self.last_fit), column(self.last_response)):
             staged = staged_lo.get(i, staged_bin.get(i))
             tones[i] = {
                 'state': s,
@@ -1743,8 +1828,12 @@ class TrackingRuntime:
                 'center_detuning_std_linewidths': sd,
                 'slope_ratio': sr,
                 'invalid_fraction': inv,
+                'calibration_fit': fit,
+                'move_response': resp,
                 'staged_center_hz': None if staged is None else float(staged),
             }
+            if i in self.frozen:
+                tones[i]['frozen_reason'] = self.frozen[i]
         return tones, counts
 
     def summary(self, counts=None):
@@ -1767,6 +1856,8 @@ class TrackingRuntime:
                 else np.nan
             max_hz = np.nanmax(np.abs(detuning_hz)) if filtered.size \
                 else np.nan
+            fits = self.last_fit[tracked]
+            median_fit = np.nanmedian(fits) if fits.size else np.nan
         over = np.abs(filtered) > self.controller.threshold_linewidths
         now = time.time()
         return {
@@ -1784,7 +1875,14 @@ class TrackingRuntime:
             'n_drifting': counts['drifting'],
             'n_recenter_pending': counts['recenter_pending'],
             'n_unlocked': counts['unlocked'],
+            'n_stale': counts['stale'],
+            'n_frozen': counts['frozen'],
             'n_no_data': counts['no_data'],
+            'median_calibration_fit': (None if not np.isfinite(median_fit)
+                                       else float(median_fit)),
+            'n_poor_calibration_fit': int(np.count_nonzero(
+                np.isfinite(fits) & ((fits < CALIBRATION_FIT_RANGE[0])
+                                     | (fits > CALIBRATION_FIT_RANGE[1])))),
             'n_over_threshold': int(np.count_nonzero(
                 over & np.isfinite(filtered))),
             'max_abs_center_detuning_linewidths': (None if not np.isfinite(max_lw)

@@ -68,7 +68,9 @@ Two threads, producer/consumer, matching the package's synchronous style:
   `receive_stream.py`.
 - **Diagnostics** — dropped wire frames (`cnt` gaps), queue drops, and
   output-loop timing are counted and reported; a ~1 Hz status line shows the
-  current value, volts, and drop counts (`--quiet` disables).
+  current value, volts, the channel's calibration fit (`fit=0.98`, marked
+  `!` outside 0.85–1.15: time to re-sweep and push; `ffm` with a
+  calibration) and drop counts (`--quiet` disables).
 
 ## Units: raw stream IQ vs calibration data
 

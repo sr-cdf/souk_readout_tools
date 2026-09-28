@@ -244,10 +244,20 @@ record, sweep = resonator.load_calibration_record('cal.npz')
 Pushed to the server, the record is served in `get_info('resonators')` and so
 recorded in every stream's metadata; the tracker centres with it, and the
 analysis tools, the live viewer and stream-to-DAC pick it up from any
-capture by default (`resonator.calibration_from_data`). Its validity is
-worked out afresh at every read: every calibrated tone must still be active
-and within five linewidths of its calibrated resonance, else it is marked
-stale and not used. A saved `.npz` (no pickle) holds the record and, given
+capture by default (`resonator.calibration_from_data`). Staleness is
+worked out afresh at every read, per tone: a tone no longer active, or tuned
+more than five linewidths from its calibrated resonance, is dropped from the
+served record and listed in `stale_tones`; the rest stays in use.
+
+Whether a calibration still *fits* is a separate question —
+`resonator.calibration_fit`, the median |z_c| / r of a tone's centred data,
+is 1 while its circle still fits, and leaves 1 when the resonance changes
+shape (a cooldown changes `Qi`, coupling and drive) or the levels change.
+The tracker reports it per tone and stream-to-DAC for its channel.
+`resonator.calibration_quality(record, sweep, capture)` checks a whole
+calibration — fitted vs measured linewidth, linewidth odd for its frequency
+neighbours, near bifurcation, shallow dip, and this fit on a fresh capture —
+and returns the `good` tones, e.g. for `enable_tracking(enable_mask=...)`. A saved `.npz` (no pickle) holds the record and, given
 `sweep_data`, the sweep itself, so the sweep-based methods can be redone
 from the file alone. Anywhere that takes `calibrations=` accepts fits,
 `ResonatorCalibration` objects or a record.

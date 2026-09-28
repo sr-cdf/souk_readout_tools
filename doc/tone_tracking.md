@@ -172,9 +172,12 @@ the client pushed (`set_resonator_calibrations`, reported as
 `calibration_source: 'client'`) — the same calibration the analysis of the
 recording uses, with the RX gain change since its sweep divided out
 (`rx_gain`). **The server does no fitting**: `enable_tracking` refuses
-without a valid pushed calibration (it goes stale when a tone is inactive or
-more than five linewidths from where it was made), and tones it does not
-cover are left alone. The centring coefficients, with each probe point's
+without a pushed calibration, and tones it does not cover are left alone.
+Staleness is per tone: a tone inactive, or tuned more than five linewidths
+from where its calibration was made, is dropped from the served calibration
+(`get_info('resonators')['stale_tones']`), and the tracker stops correcting
+it (state `stale`) — the rest carry on. Build the list of tones worth
+tracking with `resonator.calibration_quality` (below). The centring coefficients, with each probe point's
 de-embedding and the revision's readout correction folded in, are rebuilt
 at every applied revision (`resonator.basis_coefficients`), so a window
 costs one complex multiply-add per value. For the curvature estimator: on the
@@ -433,6 +436,7 @@ If a residual effect matters, compute it from the logged step times/sizes
 | `unlock_slope_ratio` | 0.25 | `unlocked` when the centred phase slope drops below this fraction of the calibration's on-resonance slope `4 / linewidth` (0.25 ≈ 0.9 linewidths off) |
 | `unlock_invalid_fraction` | 0.5 | `unlocked` when this fraction of recent cycles are unusable |
 | `unlock_detuning_linewidths` | 1.0 | also `unlocked` when the filtered reading exceeds this; `None` disables |
+| `freeze_unresponsive` | `False` | freeze a tone whose `move_response` falls outside 0.5–1.5 on two commits running (a calibration that no longer describes it) |
 | `detuning_estimator` | `'mobius'` | `'mobius'` (the calibration's inversion: right in scale for driven tones, works unmodulated, leans on the fitted rotation) or `'curvature'` (three-point, rotation-free, needs three distinct offsets; reads ~2× on driven tones) |
 
 Commit policies combine — first to fire wins, gated by the per-class
@@ -470,7 +474,8 @@ monitor watches:
 | field | meaning |
 |---|---|
 | `n_tracked` | tones under tracking |
-| `n_locked` / `n_drifting` / `n_recenter_pending` / `n_unlocked` / `n_no_data` | tones in each lock state (below) |
+| `n_locked` / `n_drifting` / `n_recenter_pending` / `n_unlocked` / `n_stale` / `n_frozen` / `n_no_data` | tones in each lock state (below) |
+| `median_calibration_fit`, `n_poor_calibration_fit` | the calibration fit across tracked tones, and how many sit outside 0.85–1.15 (time to re-sweep and push) |
 | `n_over_threshold` | filtered \|detuning\| past the deadband |
 | `max_abs_center_detuning_linewidths`, `median_abs_center_detuning_linewidths` | drift extrema/centre, in linewidths |
 | `max_abs_center_detuning_hz` | worst drift in Hz |
@@ -482,13 +487,24 @@ monitor watches:
 `center_detuning_linewidths`, `center_detuning_std_linewidths` (running
 spread — a noisy/unstable tone shows a large std at a small mean),
 `slope_ratio` (current centred phase slope ÷ the calibration's on-resonance
-`4 / linewidth`),
-`invalid_fraction`, and `staged_center_hz` if a correction is pending.
+`4 / linewidth`), `invalid_fraction`, `calibration_fit`
+(`resonator.calibration_fit`: the median |z_c| / r of the window's centred
+I/Q — 1 while the calibration's circle still fits the tone; on krm4, three
+hours into a cooldown, 44% of tones had left 0.9–1.1 and one at 0.45 read
+its own moves 1.37× too large), `move_response` (after a commit, how the
+reading changed over the move: ~1 while the calibration describes the tone,
+~0 for a tone whose reading ignores its moves and walks, ~2 for one that
+over-reads them and swings), `staged_center_hz` if a correction is pending,
+and `frozen_reason` for a frozen tone.
 
 **Lock states**: `locked` (inside deadband), `drifting` (past threshold,
 correcting/suppressed), `recenter_pending` (a `bin` correction staged),
-`no_data` (nothing usable yet), and **`unlocked`** — the resonance is
-likely lost and the loop would be tracking noise.
+`no_data` (nothing usable yet), **`unlocked`** — the resonance is
+likely lost and the loop would be tracking noise — **`stale`** (tuned more
+than five linewidths from where its calibration was made: re-sweep and push)
+and **`frozen`** (with `freeze_unresponsive=True`, off by default: its
+`move_response` fell outside 0.5–1.5 twice running, so it is no longer
+corrected until tracking is re-enabled).
 
 `unlocked` is caught three ways: the **phase slope collapsing** below
 `unlock_slope_ratio` of the calibration's on-resonance slope `4 / linewidth`
