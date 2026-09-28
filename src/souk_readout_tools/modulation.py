@@ -51,10 +51,22 @@ import numpy as np
 
 from .resonator import (ResonatorCalibration, apply_readout_correction,
                         calibration_for_tone, calibration_from_data,
-                        detuning_from_derivatives, operating_point_hz,
-                        phase_derivatives, phase_shift_and_dissipation,
-                        project_iq_tangent_normal, readout_correction_factors,
+                        detuning_from_derivatives, is_calibration_record,
+                        operating_point_hz, phase_derivatives,
+                        phase_shift_and_dissipation, project_iq_tangent_normal,
+                        readout_correction_factors, recorded_rx_gain_ratio,
                         to_basis)
+
+
+def _record_gain(calibration, info):
+    """RX amplitude ratio, data over calibration sweep, divided out before
+    centring: from the chain states a calibration record remembers and the
+    data's ``info`` (``resonator.recorded_rx_gain_ratio``); 1 when either is
+    unknown or the calibration is not a record."""
+    if not is_calibration_record(calibration):
+        return 1.0
+    ratio = recorded_rx_gain_ratio(calibration, info)
+    return 1.0 if ratio is None else float(ratio)
 
 
 def _reconstruct_contiguous(pc, points, settling, revisions, z, n_points, spp, n_settle):
@@ -1522,6 +1534,7 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         tones_info = info.get('tones', {})
         if isinstance(tones_info, dict) and tones_info.get('frequencies_hz') is not None:
             tone_frequencies_hz = np.asarray(tones_info.get('frequencies_hz'), dtype=float)
+    gain = _record_gain(calibration, info)
 
     def _center_frequency_hz(t, c_point):
         """The modulation centre (Hz): the grouped probe frequency less its
@@ -1556,7 +1569,8 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
             bases[t] = 'centered_rotated'
             z_basis = np.full_like(zt, np.nan + 1j * np.nan, dtype=complex)
             for p in range(N):
-                z_basis[:, p, :] = to_basis(zt[:, p, :], cal, tone_frequency_hz[p, t])
+                z_basis[:, p, :] = to_basis(zt[:, p, :], cal, tone_frequency_hz[p, t],
+                                            gain=gain)
         else:
             z_basis = zt
 
@@ -1876,6 +1890,7 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
         out['cycle_point_index'] = grouped['cycle_point_index']
     if n_cycles == 0:
         return out
+    gain = _record_gain(calibration, grouped.get('info'))
 
     for t in range(n_tones):
         f = offsets[:, t]                        # (N,) probe offsets for this tone
@@ -1890,7 +1905,7 @@ def demodulate(grouped, offsets=None, *, method='fast', linewidth_hz=None,
             # Calibrated basis: de-embed + circle-centre each point at its own
             # probe frequency; the phase is then well conditioned.
             probe = np.asarray(tone_frequency_hz, dtype=float)[:, t]
-            zb = to_basis(zt, cal, probe[None, :])          # (n_cycles, N)
+            zb = to_basis(zt, cal, probe[None, :], gain=gain)   # (n_cycles, N)
             linewidth = cal.fr / cal.Ql
             center_hz = probe[ci] - f[ci]
         else:
@@ -2002,6 +2017,15 @@ class StreamDemodulator:
         # The calibration given, else the one the stream carries.
         source_calibration = (self.calibration if self.calibration is not None
                               else calibration_from_data(samples))
+        # An RX gain change since the calibration sweep would mis-centre the
+        # I/Q and turn every recentre into a step: divide it out.
+        gain_note = ''
+        try:
+            rx_gain = _record_gain(source_calibration, samples.get('info'))
+        except ValueError as exc:          # PFB shift differs: not modelled
+            rx_gain, gain_note = 1.0, f'; RX gain NOT matched ({exc})'
+        if rx_gain != 1.0:
+            gain_note = f'; RX gain {20 * np.log10(rx_gain):+.2f} dB vs calibration divided out'
         keys = sorted(map(int, samples['i_data'])) if tones is None else sorted(set(tones))
         if not keys:
             raise ValueError('Select at least one tone for demodulation')
@@ -2079,7 +2103,7 @@ class StreamDemodulator:
             selected['modulation_point'] = np.where(mask[lo:hi], points[lo:hi], 0)
             for field in ('i_data', 'q_data'):
                 by_id = {int(k): v for k, v in samples[field].items()}
-                selected[field] = {f'{i:04d}': by_id[t][lo:hi]
+                selected[field] = {f'{i:04d}': by_id[t][lo:hi] / rx_gain
                                    for i, t in enumerate(keys)}
             if 'stream_flags' in samples:
                 selected['stream_flags'] = {
@@ -2207,6 +2231,7 @@ class StreamDemodulator:
             f'{missing} samples awaiting revision metadata')
         if rates and not all(np.isclose(rate, rates[0]) for rate in rates):
             output['demod_note'] += '; spectra use latest cadence'
+        output['demod_note'] += gain_note
         if source_calibration is None and self.linewidth_hz is None:
             output['demod_note'] += '; detuning needs calibrations'
         return output

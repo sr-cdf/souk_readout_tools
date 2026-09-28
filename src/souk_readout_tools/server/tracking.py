@@ -581,9 +581,12 @@ class TrackingController:
         for k, tone in enumerate(ready_idx):
             tone = int(tone)
             step = float(step_r[k])
-            base = self.staged['lo'].get(
-                tone, self.staged['bin'].get(tone, centers_hz[tone]))
-            new_center = float(base + step)      # toward the resonance
+            # The detuning was measured against the applied centre, so the
+            # target is that centre plus the step. A correction still staged
+            # (a held bin move, or one awaiting its commit interval) is
+            # replaced, not added to: stacking it applied the same detuning
+            # twice and overshot to the other side of the resonance.
+            new_center = float(centers_hz[tone] + step)      # toward the resonance
             total_shift = abs(new_center - centers_hz[tone])
             klass = 'lo' if total_shift <= lo_headroom_hz[tone] else 'bin'
             # A tone that grows beyond lo headroom moves to the bin set.
@@ -1434,8 +1437,11 @@ class TrackingRuntime:
             self.controller.reset_confirmation()
             return False
         if self.decision_revision != applied:
-            # First batch against a new revision: (re)base decisions.
+            # First batch against a new revision: (re)base decisions. The
+            # filter's older rows were measured against the previous centres
+            # (and this batch may hold the commit's transient), so start over.
             self.decision_revision = applied
+            self.filter.reset()
             self.controller.reset_confirmation()
             return False
         if not self.filter.settled:
