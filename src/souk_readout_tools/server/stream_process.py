@@ -61,8 +61,11 @@ from souk_readout_tools.server import readout_server as rs
 from souk_readout_tools.server import tracking
 
 # Control words (int64) at the start of the shared block.
+# FW_REV_BUF0/1: the revision each ping-pong LO buffer holds. A frame is tagged
+# with its accumulation's buffer's, so the tag changes on the very accumulation
+# a seamless update's flip lands on (FW_REV is published only after the flip).
 MODE, FLAGS, FW_REV, FW_N_SETTLE, TONE_GEN, PAUSE_REQ, PAUSE_ACK, LT_N, READY, STARTED, \
-    TRACK_REQ, TRACK_ACK, LOSS_N = range(13)
+    TRACK_REQ, TRACK_ACK, LOSS_N, FW_REV_BUF0, FW_REV_BUF1 = range(15)
 CTRL_WORDS = 16
 # A finished tracking window's description, written by the stream process when
 # it swaps buffers (float64 words): seq, mode (0 boxcar / 1 ewma / -1 empty),
@@ -72,6 +75,9 @@ TRACK_MAX_BN = 256
 TRACK_INFO_WORDS = 8 + 2 * TRACK_MAX_BN
 MODE_IDLE, MODE_PLAIN, MODE_FW = 0, 1, 2
 MODE_NAMES = {MODE_IDLE: 'idle', MODE_PLAIN: 'plain', MODE_FW: 'fw'}
+
+# Typed frames larger than this go through /dev/shm, not the pipe (send_typed).
+TYPED_VIA_PIPE_BYTES = 16 * 1024
 
 PAUSE_TIMEOUT_S = 2.0      # the loop checks for a pause every frame, or 10 ms idle
 # Before its frame loop first runs the process is still importing (seconds on
@@ -171,6 +177,7 @@ class StreamProcess:
         self._next_id = 0
         self._pending = {}                 # request id -> future
         self.snapshot_frame = None         # callable -> SNAPSHOT typed-frame bytes
+        self._typed_seq = 0                # names the /dev/shm files of large typed frames
 
     def start(self, paused):
         """Spawn the process; ``paused`` while the fabric is not known good."""
@@ -196,6 +203,9 @@ class StreamProcess:
             if self.proc.is_alive():
                 self.proc.terminate()
         self.block.unlink()
+        import glob
+        for path in glob.glob(f'{self.path}_typed_*'):     # frames never picked up
+            os.unlink(path)
 
     def alive(self):
         return self.proc is not None and self.proc.is_alive()
@@ -219,10 +229,13 @@ class StreamProcess:
 
     # -- state the frame loop reads every frame --------------------------------
 
-    def publish(self, streaming, fw, flags, fw_rev, fw_n_settle):
-        """The stream mode, the flag bits and the fw revision, as of now."""
+    def publish(self, streaming, fw, flags, fw_rev, fw_n_settle, fw_buffer_revs=None):
+        """The stream mode, the flag bits and the fw revision, as of now.
+        ``fw_buffer_revs`` is the revision each ping-pong LO buffer holds
+        (both ``fw_rev`` when not given)."""
         c = self.ctrl
         c[FLAGS] = flags
+        c[FW_REV_BUF0], c[FW_REV_BUF1] = fw_buffer_revs or (fw_rev, fw_rev)
         c[FW_REV] = fw_rev
         c[FW_N_SETTLE] = fw_n_settle
         c[MODE] = MODE_IDLE if not streaming else (MODE_FW if fw else MODE_PLAIN)
@@ -278,8 +291,22 @@ class StreamProcess:
         self._send((kind,) + args)
 
     def send_typed(self, frame_bytes, client_id=None):
-        """A typed frame for every subscribed client, or for one."""
-        self._send(('typed', client_id, frame_bytes))
+        """A typed frame for every subscribed client, or for one.
+
+        A large frame goes through a file in /dev/shm, and only its name through
+        the pipe. A pipe holds 64 kB, and ``recv`` waits for a whole message:
+        handed a TONE_UPDATE (~150 kB with 380 tones) the frame loop sat in
+        ``recv`` while this process wrote the rest, and lost ~4 accumulations
+        on every tracking commit (2026-09-29 overnight run).
+        """
+        if len(frame_bytes) <= TYPED_VIA_PIPE_BYTES:
+            self._send(('typed', client_id, frame_bytes))
+            return
+        self._typed_seq += 1
+        path = f'{self.path}_typed_{self._typed_seq}'
+        with open(path, 'wb') as file:
+            file.write(frame_bytes)
+        self._send(('typed_file', client_id, path))
 
     async def request(self, kind, *args, timeout=2.0):
         self._next_id += 1
@@ -504,7 +531,8 @@ class Streamer:
                         # A new arm or update: restart the settling edge tracker.
                         self._mod_dwell_tag, self._mod_dwell_pos, rev_seen = -1, 0, rev
                     payload, cnt, err = self.prepare_frame(
-                        self.fp, fw_modulation=True, revision=rev, fw_n_settle=c[FW_N_SETTLE])
+                        self.fp, fw_modulation=True, revision=rev, fw_n_settle=c[FW_N_SETTLE],
+                        buffer_revisions=(c[FW_REV_BUF0], c[FW_REV_BUF1]))
                 else:
                     payload, cnt, err = self.prepare_frame(self.fp)
                 self._write_to_stream_clients(payload)
@@ -613,8 +641,13 @@ class Streamer:
         kind = msg[0]
         if kind == 'tones':
             self.active_tone_indices, self.tone_gen = msg[2], msg[1]
-        elif kind == 'typed':
+        elif kind in ('typed', 'typed_file'):
             _, client_id, frame = msg
+            if kind == 'typed_file':
+                path = frame
+                with open(path, 'rb') as file:
+                    frame = file.read()
+                os.unlink(path)
             if client_id is None:
                 self._write_typed_update_frame(frame)
             else:

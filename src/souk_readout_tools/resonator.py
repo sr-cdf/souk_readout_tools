@@ -1261,12 +1261,9 @@ class ResonatorCalibration:
         cal = ResonatorCalibration.from_fit(fit_result)
         cal = ResonatorCalibration.from_sweep(f, z, fr=..., Ql=...)
 
-    For real-time readout at a fixed tone frequency, use a ToneConverter
-    to reduce per-sample work to one complex multiply + one add + the
-    Möbius inversion:
-
-        convert = cal.tone_converter(f_tone)
-        df, dd = convert(z)     # z is raw IQ, scalar or array
+    For readout at a fixed tone, use :func:`prepare_conversion` once and
+    :func:`convert_iq` per sample: the conversion contract's signs, RX gain
+    handling and sweep reference.
     """
 
     __slots__ = ('fr', 'Ql', 'Qi', 'tau', 'center', 'radius', 'gain_amplitude',
@@ -1693,108 +1690,6 @@ class ResonatorCalibration:
             frequency, reference_s21, method=method)
         return reference_df - df, dd - reference_dd
 
-    # -- Fixed-tone converter ------------------------------------------------
-
-    def tone_converter(self, f_tone, *, method='mobius'):
-        """
-        Return a ToneConverter for a fixed tone frequency.
-
-        Pre-combines cable delay + centering + rotation into a single
-        complex multiply and add, minimising per-sample work for
-        real-time readout or tracking loops.
-
-        Args:
-            f_tone: Tone frequency (Hz).
-
-        Returns:
-            ToneConverter callable: df, dd = converter(z_raw)
-        """
-        return ToneConverter(self, f_tone, method=method)
-
-
-class ToneConverter:
-    """
-    Optimised IQ to probe-detuning/loss coordinates for one fixed tone.
-
-    Pre-combines cable delay removal and phase centering into a single
-    complex multiply and add, so each call is:
-        z_d = z * _multiply - _offset      (1 complex mul + 1 complex sub)
-        x   = Re[-j*(r - z_d) / (2*Ql*(r + z_d))]  (Möbius inversion)
-        df  = (x - x_at_fr) * fr
-
-    Construct via ResonatorCalibration.tone_converter(f_tone).
-    """
-
-    __slots__ = ('_multiply', '_offset', '_fr', '_Ql', '_radius',
-                 '_frequency_origin_fraction', '_anl', '_method', '_correct')
-
-    def __init__(self, cal, f_tone, method='mobius'):
-        # Combine cable delay, gain removal, and rotation into one phasor.
-        self._multiply = (
-            cal.deembedding_calibration.multiplier(f_tone)
-            * cal._rotation_phasor)
-        self._offset = cal.center * cal._rotation_phasor
-        self._fr = cal.fr
-        self._Ql = cal.Ql
-        self._radius = cal.radius
-        self._frequency_origin_fraction = cal.frequency_origin_fraction
-        self._anl = cal.anl
-        if method not in ('mobius', 'circle'):
-            raise ValueError("method must be 'mobius' or 'circle'")
-        self._method = method
-        self._correct = cal.correct_probe_detuning
-
-    def __call__(self, z):
-        """
-        Convert raw IQ to (df, dd).
-
-        Args:
-            z: Raw complex IQ data (scalar or array).
-
-        Returns:
-            df: Probe detuning relative to the fitted resonance,
-                ``f_probe - fr`` (Hz). Resonator detuning relative to the probe
-                has the opposite sign.
-            dd: ``Delta(1 / (2 * Qi))`` for ``method='mobius'`` or the radial
-                circle-departure proxy for ``method='circle'``.
-        """
-        z_d = z * self._multiply - self._offset
-        r = self._radius
-        coordinate = mobius_coordinate(z_d, r, self._Ql)
-        matched_dissipation = -coordinate.imag
-        x = physical_frequency_fraction(
-            coordinate.real,
-            self._Ql,
-            anl=self._anl,
-            frequency_origin_fraction=self._frequency_origin_fraction,
-            matched_dissipation=matched_dissipation,
-            method=self._method,
-        )
-        df = x * self._fr
-        if self._method == 'mobius':
-            df = self._correct(df)
-        dd = (
-            np.abs(z_d) / r - 1.0
-            if self._method == 'circle' else matched_dissipation
-        )
-        return df, dd
-
-    def deembed(self, z):
-        """
-        Phase-center raw IQ without converting to frequency/dissipation.
-
-        Applies cable delay removal + centering + rotation in a single
-        step.  Useful when you want the phase-centered circle for
-        plotting.
-
-        Args:
-            z: Raw complex IQ data (scalar or array).
-
-        Returns:
-            Complex phase-centered IQ.
-        """
-        return z * self._multiply - self._offset
-
 
 # ===========================================================================
 # The conversion contract
@@ -2176,6 +2071,7 @@ def _sweep_provenance(sweep_data):
         'sweep_date': sweep_data.get('date') if isinstance(sweep_data, Mapping) else None,
         'rx_chain_gain_db': gain_db,
         'pfb_fftshift': json.loads(json.dumps(fftshift, default=_json_safe)),
+        'acc_len': _acc_len(info),
         'readout_correction_applied': bool(
             isinstance(sweep_data, Mapping)
             and sweep_data.get('readout_correction_applied', False)),
@@ -2989,27 +2885,55 @@ def recorded_rx_gain_ratio(calibration, data_info):
     """RX amplitude ratio, data over calibration, from recorded chain states.
 
     ``calibration`` is a calibration record (its provenance keeps the sweep's
-    chain state) or the sweep data itself (its ``info``). Returns ``None`` when
-    either side's chain state is unknown; raises when their PFB shifts differ
-    (its per-stage gain is not modelled). Divide the data's I/Q by the ratio to
-    put it on the calibration's scale.
+    chain state) or any capture with an ``info`` -- a sweep, or another parsed
+    stream, to compare two streams. Two parts, each used when both sides
+    record it:
+
+    - the analog chain gain (RF frontend and ADC DSA);
+    - the accumulation length: the accumulator sums ``acc_len`` spectra, so
+      the I/Q scale with it, and data at acc_len 480 are twice as large as a
+      sweep at 240.
+
+    Returns ``None`` when neither part is known on both sides (records made
+    before acc_len was kept have only the analog part); raises when the PFB
+    shifts differ (its per-stage gain is not modelled). Divide the data's I/Q
+    by the ratio to put it on the calibration's scale.
     """
     if is_calibration_record(calibration):
         provenance = calibration.get('provenance') or {}
         cal_db, cal_shift = provenance.get('rx_chain_gain_db'), provenance.get('pfb_fftshift')
+        cal_acc = provenance.get('acc_len')
     elif isinstance(calibration, Mapping):
         cal_db, cal_shift = _rx_chain_gain_db(calibration.get('info'))
+        cal_acc = _acc_len(calibration.get('info'))
     else:
         return None
     data_db, data_shift = _rx_chain_gain_db(data_info)
-    if cal_db is None or data_db is None:
+    data_acc = _acc_len(data_info)
+    analog_known = cal_db is not None and data_db is not None
+    acc_known = cal_acc is not None and data_acc is not None
+    if not analog_known and not acc_known:
         return None
-    if json.dumps(cal_shift, default=_json_safe) != json.dumps(data_shift, default=_json_safe):
+    if analog_known and (json.dumps(cal_shift, default=_json_safe)
+                         != json.dumps(data_shift, default=_json_safe)):
         raise ValueError(
             f'PFB fftshift differs between the calibration and the data '
             f'({cal_shift} vs {data_shift}); its per-stage gain is not modelled. '
             'Match the RX scale explicitly (match_rx_gain=<ratio>).')
-    return float(10.0 ** ((float(data_db) - float(cal_db)) / 20.0))
+    ratio = 10.0 ** ((float(data_db) - float(cal_db)) / 20.0) if analog_known else 1.0
+    if acc_known:
+        ratio *= float(data_acc) / float(cal_acc)
+    return float(ratio)
+
+
+def _acc_len(info):
+    """The accumulation length a capture's info records, or None."""
+    pipeline = info.get('pipeline') if isinstance(info, Mapping) else None
+    try:
+        acc_len = float(pipeline['acc_len'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return acc_len if acc_len > 0 else None
 
 
 def resolve_rx_gain(match_rx_gain, calibration, data_info):
@@ -3026,8 +2950,8 @@ def resolve_rx_gain(match_rx_gain, calibration, data_info):
         if ratio is None or np.isclose(ratio, 1.0, rtol=1e-6):
             return 1.0
         warnings.warn(
-            f'RX chain gain differs by {20 * np.log10(ratio):+.2f} dB between the '
-            'calibration and the data; the data I/Q is rescaled to the '
+            f'RX scale (chain gain and acc_len) differs by {20 * np.log10(ratio):+.2f} dB '
+            'between the calibration and the data; the data I/Q is rescaled to the '
             "calibration's scale (match_rx_gain=False to disable).", stacklevel=3)
         return ratio
     return float(match_rx_gain)

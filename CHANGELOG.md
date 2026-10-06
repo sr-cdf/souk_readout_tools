@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+- **`match_rx_gain` on every timestream and snapshot plotter**, and on
+  `timestream_psds`, `snapshot_psds`, `allan_deviation`, `timestream_stats`,
+  `cross_psd`, `estimate_beta`: `'auto'` (default, recorded RX chain states),
+  `True` (carrier ratio), `False`, or a ratio. `plot_timestream_on_resonance`
+  now matches the RX scale too (it didn't before).
+
+- **Snapshots no longer double-correct acc_len** in RX gain matching: after
+  scaling to the sweep's acc_len they were divided by the acc_len ratio again.
+
+- **`ReadoutClient.sweep_spans(n_tones, calibration)`**: per-tone sweep spans
+  of 10 fitted linewidths from a calibration record or `cal.npz` path; median
+  for uncovered tones, 300 kHz with no calibration.
+
+- **`receive_stream` writes from a background thread**: a slow disk no longer
+  stops socket reads, so the server doesn't drop the capture. Peak lag saved as
+  `write_backlog_peak_bytes`; stops past 4 GiB behind.
+
+- **Server stream drain timeout 2 s → 10 s** (`STREAM_DRAIN_TIMEOUT_S`).
+
+- **Removed `ToneConverter` / `ResonatorCalibration.tone_converter()`**: old
+  sign (probe − resonance), no RX gain correction, not sweep-referenced. Use
+  `prepare_conversion` + `convert_iq`.
+
+- **`stream_file`: read huge stream captures in chunks**:
+  `read_stream_chunk` reads a sample range with a subset of tones and header
+  fields, in the `parse_stream` format plus `sample_index` / `time_s`.
+  `concatenate_stream_chunks` joins chunks, and `stream_file_info` gives the
+  size of a capture. Reads are sequential and blocked, with progress and a
+  memory check made before reading. `stream_time_model` / `find_sample` /
+  `sample_times` give real time from the packet counter and the capture's clock
+  readings, and warn when the TT was never loaded, is offset, jumps, or the
+  sample clock is off frequency.
+
+- **Telescope time: the data carries the accumulator's TT**: the sync checks
+  read the sync block's copy, which read correct on 2026-09-29 while the
+  accumulator's was 626 296 s behind. `get_info('sync')` and
+  `set_telescope_time` now report `acc_tt_ok` / `acc_tt_offset_s`.
+  `firmware_lib.read_time_anchor` gives server clock + count + TT, carried as
+  `time_anchor` in SNAPSHOT / TONE_UPDATE frames. `receive_stream` saves
+  `first_frame` / `last_frame` host-clock anchors in the `.json`.
+
+- **Tracking commits (fw engine), fixed for `dry_run=False`**: frames are
+  tagged with the revision of the LO buffer their accumulation used
+  (the last cycle before each edge was measured at the new combs). Large typed
+  frames reach the stream process through `/dev/shm`, not the pipe, where
+  each ~150 kB TONE_UPDATE cost ~4 accumulations. Not yet hardware-tested.
+
+- **`demodulate_stream(gaps=...)`**: `'raise'` (default, now says where and
+  what to do), `'nan'` or `'interpolate'` (same probe point only). Filled rows
+  are listed in `gap_fill` and marked in `packet_missing`; `timeseries.fill_gaps`
+  gives the same `gap_fill` and handles `sample_index` / `time_s`. Revision
+  epochs open at the previous announcement: new-revision frames arriving
+  before their record are no longer dropped.
+
+- **`get_samples` time anchors**: server clock + count + TT (+ modulation
+  revision) read just before and after each capture (`get_time_anchor`
+  request), kept in `time_anchors`; a revision change during the capture warns.
+  `stream_file.capture_time_model` gives real times and TT checks for any
+  capture in memory.
+
+- **RX gain matching includes acc_len**: `recorded_rx_gain_ratio` scales by the
+  acc_len ratio (the accumulator sums), so sweeps and streams, or two streams,
+  at different acc_len compare directly. New records keep `acc_len` in their
+  provenance. Older ones match analog gain only.
+
 - **Sweep tables: calibrated frequencies come off the calibration sweep**: a
   record made with its sweep (`sweep_data=`) carries per-tone
   `frequency_correction_*` (`resonator.sweep_frequency_correction`), applied in

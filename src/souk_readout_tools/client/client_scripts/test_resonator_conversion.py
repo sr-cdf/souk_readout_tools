@@ -85,8 +85,7 @@ check('diagnostic radial proxy remains separately available',
 
 
 print('2) Fixed-tone and explicit timestream transforms')
-converter = cal.tone_converter(frequencies[1])
-df_tone, dd_tone = converter(z[1])
+df_tone, dd_tone = cal.convert_raw_iq(frequencies[1], z[1])
 check('fixed-tone conversion matches array conversion',
       np.allclose([df_tone, dd_tone], [df[1], dd[1]], atol=1e-9))
 try:
@@ -132,7 +131,7 @@ check('Duffing frequency recovered with simultaneous loss',
       np.allclose(df_nonlinear_loss, offsets, atol=1e-6))
 check('Duffing fixed-tone conversion matches array conversion',
       np.isclose(
-          cal_nonlinear.tone_converter(frequencies[3])(z_nonlinear[3])[0],
+          cal_nonlinear.convert_raw_iq(frequencies[3], z_nonlinear[3])[0],
           df_nonlinear[3],
           atol=1e-6,
       ))

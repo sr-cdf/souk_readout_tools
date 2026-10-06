@@ -279,8 +279,10 @@ STREAM_YIELD_MAX_BYTES = 65536
 STREAM_YIELD_MAX_SECONDS = 0.002
 
 # A stream client that stays backed up this long is dropped rather than waited
-# for (see _drain_stream_clients): a vanished peer never drains.
-STREAM_DRAIN_TIMEOUT_S = 2.0
+# for (see _drain_stream_clients): a vanished peer never drains. The frame loop
+# is paused while it waits, so this is also the longest a dead peer can stall
+# every other client. 2 s dropped live captures during client disk stalls.
+STREAM_DRAIN_TIMEOUT_S = 10.0
 
 # How often an *idle* stream client's handler wakes to send its zero-length
 # heartbeat and poll for a subscribe line. The client blocks in recv(4) with no
@@ -2262,7 +2264,23 @@ class ReadoutServer:
         state = 'never_synced' if not synced else ('aligned' if aligned else 'drifted')
         drift_ppm, tt_loaded_unix_s, tt_loaded_utc, time_since_tt_load_s = \
             self._instant_drift(align['pps_boundary_offset_s'], align['last_pps_unix_s'])
+        # Everything above is the sync block's PPS-latched TT; streams carry the
+        # accumulator's, which can be far off while the sync block looks fine.
+        anchor = self._time_anchor()
+        if anchor is None:
+            anchor = {'tt_unix_s': None, 'tt_offset_s': None, 'tt_ok': None}
+        acc_tt = {
+            'acc_tt_unix_s': anchor['tt_unix_s'],
+            'acc_tt_utc': unix_to_iso(anchor['tt_unix_s']),
+            'acc_tt_offset_s': anchor['tt_offset_s'],
+            'acc_tt_ok': anchor['tt_ok'],
+        }
+        if anchor['tt_ok'] is False:
+            acc_tt['acc_tt_warning'] = (
+                f"accumulator TT (the one streams carry) is {anchor['tt_offset_s']:+.1f} s "
+                'off the server clock')
         return {
+            **acc_tt,
             'available': True,
             'state': state,
             'ever_synced': ever_synced,
@@ -2840,6 +2858,13 @@ class ReadoutServer:
                 elif request == 'health_check':
                     result = self.health_check()
                     await self.send_response(writer, {'status': 'success', 'data': result})
+
+                elif request == 'get_time_anchor':
+                    # Server clock + accumulation count + accumulator TT, read
+                    # together (firmware_lib.read_time_anchor): a few register
+                    # reads, cheap enough to bracket every capture.
+                    await self.send_response(writer, {'status': 'success',
+                                                      'result': self._time_anchor()})
 
                 elif request == 'get_timing_status':
                     result = get_timing_status()
@@ -3871,7 +3896,7 @@ class ReadoutServer:
                         cfg['linewidth_hz'] = c.get('linewidth_hz')
                         rev = self._next_fw_modulation_revision(cfg)
                         previous_center = np.asarray(c['center'], dtype=float)
-                        await self.to_thread(self._update_fw_modulation, bundle, cfg)
+                        await self.to_thread(self._update_fw_modulation, bundle, cfg, rev)
                         self.fw_modulation_params = bundle
                         self.fw_modulation_cfg = cfg
                         state['enabled'] = self.e_fw_modulation_enabled.is_set()
@@ -4852,7 +4877,23 @@ class ReadoutServer:
                    fw=bool(fw is not None and fw.is_set()),
                    flags=flags,
                    fw_rev=int(state['applied_revision']) if state else 0,
-                   fw_n_settle=int(cfg.get('n_settle', 0)) if cfg else 0)
+                   fw_n_settle=int(cfg.get('n_settle', 0)) if cfg else 0,
+                   fw_buffer_revs=self._fw_buffer_revisions())
+
+    def _fw_buffer_revisions(self):
+        """The revision each ping-pong LO buffer holds, ``(buffer 0, buffer 1)``.
+
+        Frames are tagged with the revision of the buffer their accumulation
+        used (``prepare_frame``'s ``buffer_revisions``), so a seamless update is
+        tagged from the accumulation its flip lands on. After an arm both
+        buffers hold the applied revision.
+        """
+        held = getattr(self, '_fw_buffer_revision_held', None)
+        if held is not None:
+            return tuple(held)
+        state = getattr(self, '_fw_modulation_state', None)
+        rev = int(state['applied_revision']) if state else 0
+        return (rev, rev)
 
     def _stream_running(self):
         """Streaming is enabled and a frame loop is alive to do it."""
@@ -5069,6 +5110,26 @@ class ReadoutServer:
             snapshot['applied_revision'] = int(revision)
         return snapshot
 
+    def _time_anchor(self):
+        """Server clock + accumulation count + accumulator TT, read together, for
+        the typed frames: a recording can then place its samples in time even when
+        the TT was never loaded (``firmware_lib.read_time_anchor``). None if the
+        firmware cannot be read."""
+        if getattr(self, 'r_fast', None) is None or getattr(self, '_clock_fault', None):
+            return None
+        try:
+            anchor = firmware_lib.read_time_anchor(self.r_fast)
+        except Exception:
+            return None
+        # The modulation revision applied now (either engine), so two anchors
+        # around a capture show whether a commit landed inside it.
+        for state in (getattr(self, '_fw_modulation_state', None),
+                      getattr(self, 'modulation_state', None)):
+            if isinstance(state, dict) and state.get('applied_revision') is not None:
+                anchor['modulation_revision'] = int(state['applied_revision'])
+                break
+        return anchor
+
     def _tone_update_snapshot(self):
         """Build the SNAPSHOT payload sent to a newly subscribed client.
 
@@ -5076,7 +5137,8 @@ class ReadoutServer:
         mutually exclusive), matching ``get_info('modulation')``'s
         resolution order.
         """
-        payload = {'type': 'SNAPSHOT', 'ts': time.time()}
+        payload = {'type': 'SNAPSHOT', 'ts': time.time(),
+                   'time_anchor': self._time_anchor()}
         fw_on = self.e_fw_modulation_enabled.is_set()
         sw_on = self.e_modulation_enabled.is_set()
         if (fw_on or (self.fw_modulation_cfg is not None and not sw_on)) \
@@ -5156,7 +5218,8 @@ class ReadoutServer:
             if self.stream_process is None and not any(
                     getattr(c, 'typed_updates', False) for c in self.stream_clients):
                 return
-            payload = {'type': 'TONE_UPDATE', 'ts': time.time(), 'op': op}
+            payload = {'type': 'TONE_UPDATE', 'ts': time.time(), 'op': op,
+                       'time_anchor': self._time_anchor()}
             if cmd is not None:
                 cfg = cmd['cfg']
                 state = cmd['state']
@@ -5644,7 +5707,7 @@ class ReadoutServer:
 
     def prepare_frame(self, fast_read_params, mod_point=0, settling=False, revision=0,
                       fw_modulation=False, fw_n_settle=0,
-                      sw_buf_point_map=None, sw_n_settle=0):
+                      sw_buf_point_map=None, sw_n_settle=0, buffer_revisions=None):
         """
         Prepare a frame for sending to a client.
 
@@ -5670,6 +5733,10 @@ class ReadoutServer:
         The two schemes share the one tag word and so are mutually exclusive.
         Decode it as **unsigned** on the client. When not modulating the word
         keeps its legacy ``stream_flags[5]`` boolean meaning.
+
+        ``buffer_revisions`` (firmware-slot only): the revision each ping-pong
+        LO buffer holds; the frame is tagged with its buffer's instead of
+        ``revision``.
         """
         num_headers = 10
         t_enter = time.perf_counter()
@@ -5692,6 +5759,10 @@ class ReadoutServer:
             if fw_modulation:
                 tag_index = int(slot_id)                        # live LO slot
                 n_settle = int(fw_n_settle)
+                if buffer_revisions is not None:
+                    # The revision of the LO buffer this accumulation used
+                    # (see _fw_buffer_revisions), not the one published last.
+                    revision = int(buffer_revisions[int(buf_id) & 1])
             else:
                 tag_index = sw_buf_point_map.get(int(buf_id))   # live ping-pong buffer -> point
                 n_settle = int(sw_n_settle)
@@ -5943,7 +6014,8 @@ class ReadoutServer:
                 aligned = False
                 while emitted < num_samples:
                     payload, cnt, err = self.prepare_frame(
-                        fast_read_params, fw_modulation=True, revision=rev, fw_n_settle=n_settle)
+                        fast_read_params, fw_modulation=True, revision=rev, fw_n_settle=n_settle,
+                        buffer_revisions=self._fw_buffer_revisions())
                     if not aligned:
                         if (self._mod_dwell_tag == 0 and self._mod_dwell_pos == 0) \
                                 or skip_budget <= 0:
@@ -6647,7 +6719,7 @@ class ReadoutServer:
         previous_center = np.asarray(c['center'], dtype=float)
         t1 = time.perf_counter()
         if klass == 'lo':
-            await self.to_thread(self._update_fw_modulation, bundle, cfg)
+            await self.to_thread(self._update_fw_modulation, bundle, cfg, rev)
         else:
             await self.to_thread(self._apply_fw_modulation, bundle, cfg)
         t2 = time.perf_counter()
@@ -7052,6 +7124,7 @@ class ReadoutServer:
         caller to drive further switches via ``set_fw_modulation_slot``.
         """
         firmware_lib.load_fw_modulation(self.r_fast, bundle)
+        self._fw_buffer_revision_held = None     # both buffers: the applied revision
         self.active_tone_indices = np.asarray(bundle['tone_indices'])
         # Restart the settling tracker so the first switch after (re)arming is
         # detected cleanly.
@@ -7062,14 +7135,26 @@ class ReadoutServer:
         else:
             firmware_lib.set_fw_modulation_slot(self.r_fast, 0)
 
-    def _update_fw_modulation(self, bundle, cfg):
+    def _update_fw_modulation(self, bundle, cfg, revision=None):
         """
         Seamless live update (hardware writes; run in a thread). Loads the new slot
         combs into the inactive ping-pong buffer and flips to them in one step --
         no sync, the running slot cycle swaps combs glitch-free. Rides the same
         armed channel maps (bundle prepared with ``armed``). Applies a changed
         dwell in auto mode.
+
+        ``revision`` is the update's: recorded against the inactive buffer and
+        published *before* the flip, so the frames tag it from the first
+        accumulation made with the new combs. (Published after, as it used to
+        be, the last cycle before the tag change was measured at the new
+        frequencies: ~3 kHz off on the 2026-09-29 overnight run.)
         """
+        if revision is not None:
+            inactive = firmware_lib.get_next_buffer_idx(self.r_fast)
+            held = list(self._fw_buffer_revisions())
+            held[inactive] = int(revision)
+            self._fw_buffer_revision_held = held
+            self._publish_stream_state()
         firmware_lib.modify_fw_modulation(self.r_fast, bundle)
         self.active_tone_indices = np.asarray(bundle['tone_indices'])
         if cfg['mode'] == 'auto':
@@ -7413,7 +7498,8 @@ class ReadoutServer:
                            if self.fw_modulation_state else 0)
                     n_settle = int(self.fw_modulation_cfg.get('n_settle', 0)) if self.fw_modulation_cfg else 0
                     payload, cnt, err = self.prepare_frame(
-                        fast_read_params, fw_modulation=True, revision=rev, fw_n_settle=n_settle)
+                        fast_read_params, fw_modulation=True, revision=rev, fw_n_settle=n_settle,
+                        buffer_revisions=self._fw_buffer_revisions())
                     self._write_to_stream_clients(payload)
                     if self._yield_due(len(payload)):
                         await self._drain_stream_clients()

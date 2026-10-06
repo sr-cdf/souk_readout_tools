@@ -12549,12 +12549,72 @@ def timed_sync_alignment(r_fast):
     }
 
 
+# The acc-block TT may differ from real time by up to one accumulation period
+# (plus the read) and still be right; beyond this it is wrong.
+ACC_TT_TOLERANCE_S = 1.0
+
+
+def read_time_anchor(r_fast, attempts=5):
+    """
+    The server's clock, the accumulation count and the accumulator's telescope time,
+    read together: a time anchor for recorded streams.
+
+    The stream stamps every sample with the **accumulator's** TT (``acc_tt_msb/lsb``,
+    what :func:`read_tt_fast` reads), not the sync block's PPS-latched one that
+    :func:`timed_sync_alignment` reports, and the two can disagree: on 2026-09-29 the
+    sync block read a freshly loaded TT while the accumulator's was 626296 s behind.
+    So anything that checks the TT the data carries must read it here.
+
+    The TT and count belong to the last completed accumulation, so the accumulation
+    ``acc_cnt`` ended at most one accumulation period before ``server_time_unix``. The
+    reads are repeated if an accumulation completes between them.
+
+    :param r_fast: fast (local=True, /dev/mem) readout interface.
+    :return: dict -- ``server_time_unix`` (Linux clock, mid-read), ``acc_cnt``,
+        ``telescope_time`` (raw ticks), ``clk_hz``, ``tt_unix_s`` (TT in UNIX seconds, if
+        it was loaded), ``tt_offset_s`` (``tt_unix_s - server_time_unix``) and ``tt_ok``
+        (``abs(tt_offset_s) < ACC_TT_TOLERANCE_S``).
+    """
+    acc = r_fast.accumulators[0]
+    transport = acc.host.transport
+    mm = transport.axil_mm
+    cnt_addr = transport._get_device_address(f'{acc.prefix}acc_cnt')
+    msb_addr = transport._get_device_address(f'{acc.prefix}acc_tt_msb')
+    lsb_addr = transport._get_device_address(f'{acc.prefix}acc_tt_lsb')
+
+    def word(address):
+        return struct.unpack('<I', mm[address:address + 4])[0]
+
+    for _ in range(attempts):
+        t0 = time.time()
+        cnt = word(cnt_addr)
+        tt = (word(msb_addr) << 32) + word(lsb_addr)
+        again = word(cnt_addr)
+        t1 = time.time()
+        if again == cnt:          # no accumulation completed mid-read (nor a torn count)
+            break
+    clk_hz = int(round(r_fast.adc_clk_hz / 8))
+    server_time = 0.5 * (t0 + t1)
+    tt_unix_s = tt / clk_hz
+    return {
+        'server_time_unix': server_time,
+        'acc_cnt': cnt,
+        'telescope_time': tt,
+        'clk_hz': clk_hz,
+        'tt_unix_s': tt_unix_s,
+        'tt_offset_s': tt_unix_s - server_time,
+        'tt_ok': bool(abs(tt_unix_s - server_time) < ACC_TT_TOLERANCE_S),
+    }
+
+
 def set_telescope_time(r_fast):
     """
     Load the firmware telescope time (TT) on this pipeline and confirm it aligns to
     the PPS edge. The operator-facing "set the TT" call: it stages the next integer
     second and the firmware latches it into the TT counter on the next PPS edge, so
-    ``telescope_time`` tracks real (PTP-disciplined) UNIX time.
+    the TT should track real (PTP-disciplined) UNIX time. The result checks both the
+    sync block's copy (``aligned``) and the accumulator's, which the data carries
+    (``acc_tt_ok``; see :func:`read_time_anchor`).
 
     Wraps ``Sync.update_internal_time`` (see also: scripts/timed_sync/03_set_tt.py).
     BLOCKS ~3-4 s while it waits on PPS edges to measure the period and latch the
@@ -12585,6 +12645,15 @@ def set_telescope_time(r_fast):
     result = timed_sync_alignment(r_fast)
     result['loaded'] = True
     result['aligned'] = bool(abs(result['pps_boundary_offset_s']) < DEFAULT_ALIGN_TOL_S)
+    # The sync block's TT is not the one the stream carries: check the accumulator's.
+    anchor = read_time_anchor(r_fast)
+    result['acc_tt_unix_s'] = anchor['tt_unix_s']
+    result['acc_tt_offset_s'] = anchor['tt_offset_s']
+    result['acc_tt_ok'] = anchor['tt_ok']
+    if not anchor['tt_ok']:
+        result['warning'] = (
+            f"the load reached the sync block but the accumulator's TT (the one "
+            f"streams carry) is {anchor['tt_offset_s']:+.3f} s off the server clock")
     return result
 
 

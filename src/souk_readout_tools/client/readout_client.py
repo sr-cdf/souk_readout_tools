@@ -73,6 +73,8 @@ import ast
 import base64
 import io
 import logging
+import queue
+import threading
 
 # so3g / spt3g provide the G3 (.g3) stream file format. They are not available
 # as pre-built wheels on PyPI and are difficult to build on Windows (spt3g needs
@@ -170,6 +172,17 @@ def _unused_stream_filename(base):
     return filename
 
 
+def _frame_time_anchor(host_time_unix, frame):
+    """The host clock at a stream frame's arrival, with its counter and raw TT.
+
+    Header words are unsigned (see ReadoutServer.prepare_frame): ... tt_msb,
+    tt_lsb, cnt, err at the end of the frame.
+    """
+    tt_msb, tt_lsb, cnt, _ = struct.unpack('<4I', frame[-16:])
+    return {'host_time_unix': host_time_unix, 'packet_counter': cnt,
+            'telescope_time': (tt_msb << 32) + tt_lsb}
+
+
 def _stream_output_filename(filename, overwrite):
     """Resolve ``receive_stream``'s output path without clobbering old captures.
 
@@ -185,6 +198,64 @@ def _stream_output_filename(filename, overwrite):
             f"{filename} (or its .json) already exists; pass overwrite=True to "
             f"replace it, or choose another filename")
     return filename
+
+
+class _BackgroundWriter:
+    """Writes to files from a separate thread, so a slow disk never stalls the socket.
+
+    The server drops a stream client that stops reading for STREAM_DRAIN_TIMEOUT_S;
+    with the writes queued here, a disk stall only grows the queue in RAM.
+    """
+
+    MAX_BACKLOG_BYTES = 4 * 2**30
+
+    def __init__(self):
+        self._queue = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self.backlog_bytes = 0
+        self.peak_backlog_bytes = 0
+        self.error = None
+        self._thread = threading.Thread(target=self._run, name='stream-writer', daemon=True)
+        self._thread.start()
+
+    def write(self, file, data, flush=False):
+        if self.error is not None:
+            raise OSError(f"stream file writer failed: {self.error!r}") from self.error
+        with self._lock:
+            self.backlog_bytes += len(data)
+            self.peak_backlog_bytes = max(self.peak_backlog_bytes, self.backlog_bytes)
+            backlog = self.backlog_bytes
+        if backlog > self.MAX_BACKLOG_BYTES:
+            raise OSError(f"disk has fallen {backlog / 2**30:.1f} GiB behind the stream")
+        self._queue.put((file, data, flush))
+
+    def close(self):
+        """Wait until everything queued has been written."""
+        if self._thread.is_alive():
+            self._queue.put(None)
+            self._thread.join()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            file, data, flush = item
+            try:
+                if self.error is None:
+                    file.write(data)
+                    if flush:
+                        file.flush()
+            except Exception as e:
+                self.error = e
+            with self._lock:
+                self.backlog_bytes -= len(data)
 
 
 def _check_center_separation(centers, min_separation=1.0):
@@ -1281,8 +1352,9 @@ class ReadoutClient:
         """Load the firmware telescope time (TT) on the pipeline from the PPS-disciplined clock.
 
         Stages the next integer second and lets the firmware latch it into the TT counter
-        on the next PPS edge, so ``telescope_time`` reflects real (PTP-disciplined) UNIX
-        time. BLOCKS a few seconds (it waits on PPS edges). The server refuses unless PTP is
+        on the next PPS edge, so the TT should read real (PTP-disciplined) UNIX time --
+        check ``acc_tt_ok`` in the result: the data carries the accumulator's copy of
+        the TT, which has failed to follow a load. BLOCKS a few seconds (it waits on PPS edges). The server refuses unless PTP is
         locked to a grandmaster and the TSU 1-PPS strobe is healthy; pass ``force=True`` to
         try anyway. This is the one-shot "set the clock" you run once the timing system is
         up; to arm a deterministic (multi-board) resync at a chosen future second use
@@ -1303,6 +1375,10 @@ class ReadoutClient:
                 boundary; no live internal-TT readback exists).
             last_pps_utc : str -- last_pps_unix_s as an ISO-8601 UTC string.
             clk_hz : int -- fabric/DSP clock rate (ticks per second), ~307.2e6.
+            acc_tt_unix_s, acc_tt_offset_s, acc_tt_ok -- the **accumulator's** TT
+                (the one the data carries) against the server clock. Everything
+                above reads the sync block's copy, which has read correct while
+                the accumulator's was days off; ``warning`` says so when it is.
         """
         response = self.send_request({'request': 'set_telescope_time', 'force': bool(force)})
         if response['status'] == 'success':
@@ -1584,8 +1660,30 @@ class ReadoutClient:
         """Return the accumulator sample rate in Hz."""
         return self.get_parameter('sample_rate_hz')
 
+    def get_time_anchor(self):
+        """The server clock, accumulation count and accumulator TT, read together.
+
+        Pairs real (server, PTP-disciplined) time with the packet counter every
+        sample carries, so a capture can be placed in time whatever its TT says
+        (``stream_file.capture_time_model``). ``get_samples`` takes one before
+        and one after each capture. Returns ``None`` if the server cannot
+        provide one (older servers, firmware not ready).
+        """
+        if self.mock:
+            return None
+        try:
+            response = self.send_request({'request': 'get_time_anchor'})
+        except ConnectionError:
+            return None
+        if response.get('status') != 'success':
+            return None
+        return response.get('result')
+
     def get_telescope_time(self):
-        """Return the latest telescope timestamp reported by the server."""
+        """Return the accumulator's telescope time (raw fabric ticks), the TT the
+        data is stamped with. Not the sync block's PPS-latched copy that
+        ``get_info('sync')['last_pps_*']`` reports; the two can disagree, see
+        ``get_info('sync')['acc_tt_ok']``."""
         return self.get_parameter('telescope_time')
 
     def set_tone_frequencies(self, tone_frequencies, autosync=False, mrst=False,
@@ -3587,6 +3685,8 @@ class ReadoutClient:
             return self._mock_server.get_samples(num_samples, incl_system_info, burst)
 
         self._warn_zero_phases()
+        # Real time for the capture: server clock + counter before and after.
+        time_anchors = [self.get_time_anchor()]
         # Pre-allocate the receive buffer (conservative upper bound) BEFORE
         # sending the request. Filling it takes ~190 ms for 30 000 samples;
         # done after the request, the server's send buffer (capped by
@@ -3649,6 +3749,15 @@ class ReadoutClient:
                 raise RuntimeError(
                     f'get_samples received {frames_received}/{num_samples} frames. '
                     'The server likely rejected or closed the capture; check the server log.')
+            time_anchors.append(self.get_time_anchor())
+            revisions = [a.get('modulation_revision') for a in time_anchors if a]
+            if len(set(revisions)) > 1:
+                import warnings
+                warnings.warn(
+                    f'the modulation revision changed during this capture ({revisions[0]} -> '
+                    f'{revisions[-1]}; a tracking commit?): frames are tagged with their '
+                    "revision, and get_info('modulation') after the capture has the states",
+                    stacklevel=2)
             if incl_system_info:
                 info = self.get_info('all')
                 self._warn_modulation_state(info.get('modulation'), stacklevel=2)
@@ -3658,7 +3767,8 @@ class ReadoutClient:
             # Trim buffer to actual data received
             data_raw = data_raw[:write_offset]
             sample_data = {'data_raw':data_raw,'sample_rate':sample_rate,
-                           'info':info,'frame_bytes':frame_bytes}
+                           'info':info,'frame_bytes':frame_bytes,
+                           'time_anchors':[a for a in time_anchors if a is not None]}
             return sample_data
 
 
@@ -3833,9 +3943,30 @@ class ReadoutClient:
             tt[j] = (int(hdr[-4]) << 32) + int(hdr[-3])
             flags[j] = hdr[-10:-4]
         ReadoutClient._warn_on_dropped_accumulations(cnt, 'parse_samples')
-        return ReadoutClient._parsed_timestream(
+        result = ReadoutClient._parsed_timestream(
             i_data, q_data, cnt, err, tt, flags, sample_rate, info,
             time.strftime('%Y-%m-%d %H:%M:%S UTC%z'), apply_readout_correction)
+        if 'time_anchors' in sample_data:
+            # Server clock + counter around the capture: stream_file.capture_time_model.
+            result['time_anchors'] = sample_data['time_anchors']
+        return result
+
+    @staticmethod
+    def _decode_modulation_flag(flag5):
+        """``(point, settling, revision)`` int arrays from the flag5 words.
+
+        The fast-modulation tag lives in flag5 (frame[-5]); decode it as
+        UNSIGNED because the revision (bits 17..31) can set the int32 sign bit:
+          bits 0..15  = active point (0 = modulation off, 1..N = the point)
+          bit 16      = settling/transient marker
+          bits 17..31 = config revision
+        Plain (non-modulated) streams leave flag5 = 0, so these decode to
+        zeros and remain fully backward compatible.
+        """
+        f5 = np.asarray(flag5).astype(np.uint32)
+        return ((f5 & 0xFFFF).astype(int),
+                ((f5 >> 16) & 0x1).astype(int),
+                ((f5 >> 17) & 0x7FFF).astype(int))
 
     @staticmethod
     def _parsed_timestream(i_data, q_data, cnt, err, tt, flags, sample_rate,
@@ -3851,17 +3982,8 @@ class ReadoutClient:
         if tone_indices is None:
             tone_indices, total_tones = np.arange(num_tones), num_tones
         tone_indices = np.asarray(tone_indices, dtype=int)
-        # Fast-modulation tag lives in flag5 (frame[-5]); decode as UNSIGNED
-        # because the revision (bits 17..31) can set the int32 sign bit:
-        #   bits 0..15  = active point (0 = modulation off, 1..N = the point)
-        #   bit 16      = settling/transient marker
-        #   bits 17..31 = config revision
-        # Plain (non-modulated) streams leave flag5 = 0, so these decode to zeros
-        # and remain fully backward compatible.
-        f5 = flags[:, 5].astype(np.uint32)
-        modulation_point = (f5 & 0xFFFF).astype(int)
-        modulation_settling = ((f5 >> 16) & 0x1).astype(int)
-        modulation_revision = ((f5 >> 17) & 0x7FFF).astype(int)
+        modulation_point, modulation_settling, modulation_revision = \
+            ReadoutClient._decode_modulation_flag(flags[:, 5])
         info = ReadoutClient._normalise_modulated_sample_info(
             info, modulation_point, total_tones)
 
@@ -5079,6 +5201,46 @@ class ReadoutClient:
         else:
             raise ValueError(f"Unsupported file_format '{file_format}'. Use 'npy' or 'json'.")
 
+    @staticmethod
+    def sweep_spans(n_tones, calibration=None, linewidths=10, fallback_hz=300e3):
+        """Per-tone sweep spans of ``linewidths`` x each tone's fitted linewidth.
+
+        Parameters
+        ----------
+        n_tones : int
+            Number of tones (length of the returned array).
+        calibration : dict, str, os.PathLike or None, optional
+            A calibration record (``resonator.calibration_record``), or the
+            path of a ``cal.npz`` (``resonator.save_calibrations``). A path
+            that does not exist yet (the first session) is treated as None.
+        linewidths : float, optional
+            Span in linewidths (default 10).
+        fallback_hz : float, optional
+            Span for every tone when there is no calibration (default 300 kHz).
+
+        Returns
+        -------
+        numpy.ndarray
+            Spans (Hz). Tones the calibration does not cover (blind tones,
+            failed fits) get ``linewidths`` x the median fitted linewidth.
+        """
+        from souk_readout_tools import resonator
+        if isinstance(calibration, (str, os.PathLike)):
+            if os.path.exists(calibration):
+                calibration = resonator.load_calibration_record(calibration)[0]
+            else:
+                print(f"No calibration at {calibration}; spans are {fallback_hz / 1e3:g} kHz")
+                calibration = None
+        spans = np.full(int(n_tones), float(fallback_hz))
+        if calibration is None or not len(calibration['tone_indices']):
+            return spans
+        widths = dict(zip(calibration['tone_indices'], calibration['linewidth_hz']))
+        spans[:] = linewidths * np.nanmedian(list(widths.values()))
+        for tone, width in widths.items():
+            if 0 <= tone < len(spans) and np.isfinite(width):
+                spans[tone] = linewidths * width
+        return spans
+
     def perform_sweep(self, centers, spans, points, samples_per_point,
                       direction='up', phases=None, refresh_adc_cal=True,
                       adc_cal_settle_time=2.0, wait=False, autosync=False,
@@ -5875,6 +6037,7 @@ class ReadoutClient:
         metadata['ordering'] = 'I_tone0_sample_0, Q_tone0_sample0, I_tone1_sample0, Q_tone1_sample0,..flags, tt_msb, tt_lsb, cnt, err .'
         metadata['info'] = info
         metadata['tone_updates_subscribed'] = bool(subscribe_tone_updates)
+        metadata['host_time_unix'] = time.time()
 
         if write_to_file:
             os.makedirs(os.path.dirname(filename), exist_ok=True)
@@ -5899,7 +6062,8 @@ class ReadoutClient:
             from contextlib import nullcontext
             with (open(filename, 'wb') if write_to_file else nullcontext(None)) as file, (
                     open(filename + '.updates.jsonl', 'w')
-                    if write_to_file and subscribe_tone_updates else nullcontext(None)) as updates_file:
+                    if write_to_file and subscribe_tone_updates else nullcontext(None)) as updates_file, (
+                    _BackgroundWriter() if write_to_file else nullcontext(None)) as writer:
                 if subscribe_tone_updates:
                     s.sendall(b'{"subscribe": ["tone_updates"]}\n')
                 if write_to_file:
@@ -5907,6 +6071,7 @@ class ReadoutClient:
                 t0=time.monotonic()
                 deadline = None if duration is None else t0 + duration
                 count=0
+                last_frame = None
                 ppid = os.getppid()
                 # Apply the remaining deadline to every read, including
                 # fragmented TCP headers and stalled partial payloads.
@@ -5957,8 +6122,7 @@ class ReadoutClient:
                                 'payload': json.loads(payload.decode('utf-8')),
                             }
                             if updates_file is not None:
-                                updates_file.write(json.dumps(record) + '\n')
-                                updates_file.flush()
+                                writer.write(updates_file, json.dumps(record) + '\n', flush=True)
                             if update_callback is not None:
                                 callback_running = True
                                 update_callback(record)
@@ -5976,6 +6140,8 @@ class ReadoutClient:
                                 f"Stream frame has {frame_num_tones} tones; expected "
                                 f"{expected_num_tones}. Restart reception after changing tones.")
                         if count == 0:
+                            metadata['first_frame'] = _frame_time_anchor(
+                                time.time(), bytes(view[:datalen]))
                             expected_num_tones = frame_num_tones
                             metadata['num_tones'] = frame_num_tones
                             metadata['frame_bytes'] = datalen
@@ -5990,8 +6156,9 @@ class ReadoutClient:
 
                         # Write entire frame (already only active tones in user order)
                         payload = bytes(view[:datalen])
+                        last_frame = (time.time(), payload)
                         if file is not None:
-                            file.write(payload)
+                            writer.write(file, payload)
                         if frame_callback is not None:
                             callback_running = True
                             frame_callback(payload, metadata)
@@ -6025,6 +6192,20 @@ class ReadoutClient:
                 t1=time.monotonic()
                 print()
                 print(f"Received {count} samples in ~{t1-t0} seconds (~{count/(t1-t0)} samples per second)")
+                if writer is not None:
+                    writer.close()
+                    metadata['write_backlog_peak_bytes'] = writer.peak_backlog_bytes
+                    print(f"Disk writes lagged the stream by at most "
+                          f"{writer.peak_backlog_bytes / 2**20:.1f} MiB")
+                    if writer.error is not None:
+                        print(f"Error writing stream data: {writer.error!r}")
+                if write_to_file and last_frame is not None:
+                    # A second host-clock anchor, so the sample rate and the
+                    # TT can be checked against the clock over the capture.
+                    metadata['last_frame'] = _frame_time_anchor(*last_frame)
+                    metadata['last_frame']['sample_index'] = count - 1
+                    with open(filename + '.json', 'w') as metadata_file:
+                        json.dump(metadata, metadata_file, indent=4)
         return filename
 
 
@@ -6546,6 +6727,10 @@ class ReadoutClient:
         each announced revision's own factors (a tracking commit moves the
         probes across the filterbank), the initial ones otherwise.
 
+        This loads the whole capture into memory. For captures too large for
+        that, :func:`souk_readout_tools.stream_file.read_stream_chunk` reads a
+        sample range and a subset of tones in the same format.
+
         """
         from souk_readout_tools import resonator
         filename = os.fspath(filename)
@@ -6594,34 +6779,45 @@ class ReadoutClient:
         if metadata.get('tone_updates_subscribed', False):
             with open(filename + '.updates.jsonl') as file:
                 updates = [json.loads(line) for line in file if line.strip()]
+            # Keep complete records (including dry runs and unknown frame types).
             result['tone_updates'] = updates
-            # Keep complete records (including dry runs and unknown frame types)
-            # and a cumulative centre map for each announced revision. Sparse
-            # updates change only the listed tones; snapshots replace the map.
-            centers = {}
-            by_revision = {}
-            factors_by_revision = {}
-            for record in updates:
-                payload = record['payload']
-                if payload.get('type') == 'SNAPSHOT':
-                    centers = dict((payload.get('modulation') or {}).get('centers_hz', {}))
-                elif (payload.get('type') == 'TONE_UPDATE'
-                      and payload.get('op') != 'tracking_dry_run'):
-                    centers.update(payload.get('centers_hz', {}))
-                else:
-                    continue
-                revision = payload.get('revision')
-                if revision is not None:
-                    by_revision[int(revision)] = dict(centers)
-                    factors = resonator.readout_correction_factors(
-                        {'modulation': payload.get('modulation_state')}, num_tones)
-                    if factors is not None:
-                        factors_by_revision[int(revision) & 0x7FFF] = factors
-            result['tone_centers_by_revision'] = by_revision
-            result['readout_correction_by_revision'] = factors_by_revision
+            (result['tone_centers_by_revision'],
+             result['readout_correction_by_revision']) = \
+                ReadoutClient._tone_update_tables(updates, num_tones)
         if apply_readout_correction:
             result = resonator.with_readout_correction(result, True)
         return result
+
+    @staticmethod
+    def _tone_update_tables(updates, num_tones):
+        """Per-revision centre maps and readout factors from tone-update records.
+
+        Returns ``(tone_centers_by_revision, readout_correction_by_revision)``
+        as :py:meth:`parse_stream` documents them. The centre map is
+        cumulative: sparse updates change only the listed tones, snapshots
+        replace the map, so ``updates`` must start at the capture's start.
+        """
+        from souk_readout_tools import resonator
+        centers = {}
+        by_revision = {}
+        factors_by_revision = {}
+        for record in updates:
+            payload = record['payload']
+            if payload.get('type') == 'SNAPSHOT':
+                centers = dict((payload.get('modulation') or {}).get('centers_hz', {}))
+            elif (payload.get('type') == 'TONE_UPDATE'
+                  and payload.get('op') != 'tracking_dry_run'):
+                centers.update(payload.get('centers_hz', {}))
+            else:
+                continue
+            revision = payload.get('revision')
+            if revision is not None:
+                by_revision[int(revision)] = dict(centers)
+                factors = resonator.readout_correction_factors(
+                    {'modulation': payload.get('modulation_state')}, num_tones)
+                if factors is not None:
+                    factors_by_revision[int(revision) & 0x7FFF] = factors
+        return by_revision, factors_by_revision
 
     @staticmethod
     def export_stream_data(filename,data_dict,file_format=None):

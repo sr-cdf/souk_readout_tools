@@ -868,7 +868,7 @@ for r in nl_results[:5]:
 - [ ] `verbose=True` prints compact progress with throughput and cumulative `nfev`
 - [ ] `sweep_direction='down'` produces different `anl` values at high power
 
-### 4.5c  ResonatorCalibration and ToneConverter (introduced in v1.1.0, updated in v1.3.0)
+### 4.5c  ResonatorCalibration and fixed-tone conversion (introduced in v1.1.0, updated in v1.3.0)
 
 ```python
 from souk_readout_tools.resonator import ResonatorCalibration
@@ -884,19 +884,21 @@ z_de = cal.deembed_sweep(fit_results[0].f_data, fit_results[0].z_data)
 df, dd = cal.to_frequency_dissipation(z_de)
 print(f"df range: {np.min(df):.0f} to {np.max(df):.0f} Hz")
 
-# Build a ToneConverter for real-time readout
-convert = cal.tone_converter(fit_results[0].fr)
+# Fixed-tone conversion: prepare once per tone, then convert samples
+from souk_readout_tools.resonator import prepare_conversion, convert_iq
+prepared = prepare_conversion(fit_results[0].fr, 'mobius', calibration=cal,
+                              sweep_f=fit_results[0].f_data, sweep_z=fit_results[0].z_data)
 ts = c.get_samples(num_samples=100)
 parsed = c.parse_samples(ts)
 key = sorted(parsed['i_data'].keys())[0]
 z_raw = parsed['i_data'][key] + 1j * parsed['q_data'][key]
-df_ts, dd_ts = convert(z_raw)
+shift_ts, dissipation_ts = convert_iq(prepared, z_raw)
 ```
 - [ ] `ResonatorCalibration.from_fit()` builds without error
 - [ ] `ResonatorCalibration.from_sweep()` builds from raw data
 - [ ] `deembed_sweep()` produces a centered, rotated resonance circle
 - [ ] `to_frequency_dissipation()` returns sensible df, dd values
-- [ ] `ToneConverter` produces same results as full deembed + convert pipeline
+- [ ] `convert_iq` gives the resonator-side shift (resonance − tone) and matched dissipation, sweep-referenced
 - [ ] `phase_center_params` property is compatible with `apply_phase_center_params()`
 
 ### 4.6  Fit quality inspection (updated in v1.3.0)

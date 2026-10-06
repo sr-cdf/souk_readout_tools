@@ -358,6 +358,23 @@ tone-control buffer writes beyond what a normal
   edge** in strict pipelines (the `TONE_UPDATE` carries the revision to cut
   on). Verify on hardware whether any residual transient is visible (see
   `buffer_reuse_delay_accs`); if so, extend the settling flag over it.
+- **First tested with `dry_run=False` on 2026-09-29** (12 h, fw engine, 718
+  commits), which showed two faults, fixed 2026-09-30 and **not yet
+  re-tested on hardware**:
+  - *fw tag one cycle late.* The stream process tagged frames with the
+    revision published after the flip, so the last cycle before each tag
+    edge was already measured at the new combs (~3 kHz off on a 2.5 kHz
+    move). Frames are now tagged with the revision of the ping-pong LO
+    buffer their accumulation used (`buffer_id`), recorded and published
+    before the flip (`_fw_buffer_revisions`).
+  - *~4 accumulations lost per commit.* A TONE_UPDATE is ~150 kB with 380
+    tones; handed to the stream process through its pipe (64 kB), the frame
+    loop waited in `recv()` for the rest. Frames over 16 kB now go through a
+    file in `/dev/shm`, with only its name on the pipe.
+  - Frames of a new revision also reach the client ~84 ms *before* its
+    `TONE_UPDATE` record; `demodulate_stream` now opens each revision's epoch
+    at the previous announcement, so those frames are no longer left
+    "awaiting revision metadata".
 - **`bin` commits** re-arm channel maps (recenter path): expect a brief
   disturbance. The `TONE_UPDATE` carries `kind: "bin"` and
   `expected_transient_cycles: 1`; consumers should mask that window plus

@@ -22,7 +22,8 @@ NIC's PHC, not a dedicated GPS/atomic appliance).
   edge). There is no separate external PPS input.
 - **Telescope time (TT)** = a firmware counter of fabric clock ticks since the
   UNIX epoch. Loaded from software on a PPS edge (`update_internal_time`), then
-  free-runs on the fabric clock.
+  free-runs on the fabric clock. **Two copies can be read, and only one is in the
+  data**: see [Which TT the data carries](#which-tt-the-data-carries).
 - **Timed sync** = a firmware reset+sync pulse armed to fire at a chosen future
   TT (`set_timed_sync`). The basis for synchronising multiple boards: every board
   arms the same target second.
@@ -99,6 +100,36 @@ bring-up above:
 3. Cosmetic: `update_internal_time`'s log lines labelled "NTP" are computed from
    the system clock (`time.time()`), not an NTP query.
 
+## Which TT the data carries
+
+Every stream frame, sample capture and sweep point is stamped with the
+**accumulator's** TT (`acc_tt_msb/lsb`, the TT of the last sample of each
+accumulation; `firmware_lib.read_tt_fast`, `client.get_telescope_time()`).
+The alignment and drift checks in this document -- `set_telescope_time`,
+`timed_sync_check`, `get_info('sync')`'s `last_pps_*` / `pps_boundary_offset_s`
+/ `system_offset_s` -- read the **sync block's** PPS-latched copy
+(`ext_sync_tt_msb/lsb`). The two are not guaranteed to agree:
+
+- 2026-09-29, `long_scan_overnight2`: the sync block read a TT loaded at
+  15:04:24 and on the right second, while the accumulator's TT in every frame
+  was a constant **626 296.39 s** (7.25 days) behind real time -- stable to
+  ±20 ms and 0.18 ppm over 12 h, so the rate was right and only the value wrong.
+- 2026-09-28, `long_scan_overnight`: TT never loaded; the accumulator's read
+  5237 s (since some reset) while the sync block's read ~548 000 s.
+
+Not known yet: when the accumulator's copy takes a load. That capture's
+sidecar shows no system sync since programming (`last_sync_tt` null), which
+fits a copy that updates only on a sync, but this has not been tested.
+
+What checks the data's TT now: `get_info('sync')` reports `acc_tt_unix_s`,
+`acc_tt_offset_s` (accumulator TT minus the server clock) and `acc_tt_ok`
+(within 1 s), with `acc_tt_warning` when not; `set_telescope_time` returns the
+same (`acc_tt_ok`, and a `warning`). `firmware_lib.read_time_anchor` reads the
+accumulator TT with the server clock and accumulation count together, and the
+server puts that anchor (`time_anchor`) in every SNAPSHOT / TONE_UPDATE frame,
+so a recording can be placed in time whatever its TT says
+(`stream_file.stream_time_model`).
+
 ## Loading the telescope time first (v7.12.1 note)
 
 On a freshly powered board the firmware TT counts from 1970 plus uptime, so
@@ -106,6 +137,8 @@ every target second is in the past and `timed_sync_ready` refuses.
 `client.set_telescope_time()` is the one-shot that fixes it: it needs PTP
 locked and the 1-PPS strobe healthy, blocks a few seconds on PPS edges, and
 leaves the TT within ~100 µs of the second boundary (116 µs, 2026-09-19).
+That figure is the sync block's copy; check `acc_tt_ok` in its result for the
+copy the data carries (see above).
 
 That call used to report its own success as a failure: it read the alignment
 back immediately, but `ext_sync_tt` holds the TT latched *at* the sync that

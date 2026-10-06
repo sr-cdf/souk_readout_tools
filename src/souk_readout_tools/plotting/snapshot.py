@@ -67,6 +67,7 @@ def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
                                reference_tone_frequency, smooth_window_hz,
                                conversion_method, calibrations,
                                deembed, phase_center, units, fig, label,
+                               match_rx_gain='auto',
                                sharex=False, sharey=False, linewidths=False,
                                **kwargs):
     """Time-domain fractional frequency/dissipation panel for snapshots."""
@@ -81,8 +82,9 @@ def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
             "deembed/phase_center are not applicable to format='freq_diss'.")
 
     from .timestream import _compute_freq_diss, _dissipation_axis_label
+    from ..timeseries import _snapshot_as_accumulated
     acc_len = _snapshot_acc_len(snapshot_data, sweep_data)
-    ts_like = {'info': snapshot_data.get('info')}
+    ts_like = _snapshot_as_accumulated(snapshot_data.get('info'), acc_len)
 
     scale = _linewidth_scale(calibrations, tone_index) if linewidths else 1.0
 
@@ -93,7 +95,7 @@ def _plot_snapshots_freq_diss(snapshot_data, snapshots, sample_rate, tone_index,
             reference_tone_frequency=reference_tone_frequency,
             smooth_window_hz=smooth_window_hz,
             conversion_method=conversion_method,
-            calibrations=calibrations)
+            calibrations=calibrations, match_rx_gain=match_rx_gain)
         return scale * ff, scale * fd
 
     # Snapshots are pre-accumulation; scale to match summed sweep I/Q.
@@ -142,7 +144,7 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
                    units='raw', config=None, system_info=None,
                    unwrap_phase=True, smooth_window_hz=1000,
                    conversion_method='linearized', calibrations=None,
-                   sharex=True, sharey=False,
+                   sharex=True, sharey=False, match_rx_gain='auto',
                    **kwargs):
     """
     Plot snapshot data for a single tone.
@@ -177,6 +179,12 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             ``'circle'`` for ``format='freq_diss'``.
         calibrations: Per-tone resonator calibrations or fit results. Required
             by ``conversion_method='mobius'`` and ``'circle'``.
+        match_rx_gain: put the snapshots on the sweep's RX scale for
+            ``format='freq_diss'``, for snapshots and sweep taken at
+            different RX attenuation or ADC DSA. ``'auto'`` (default) uses
+            the recorded RX chain states when both are known and differ
+            (with a warning); ``True`` measures the carrier ratio; ``False``
+            turns it off; a number is the snapshot/sweep amplitude ratio.
         fig: Existing figure.
         label: Legend label. If None, uses an auto-incrementing index.
         units: Unit for I/Q normalisation.  One of:
@@ -224,7 +232,7 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             conversion_method=conversion_method,
             calibrations=calibrations,
             deembed=deembed, phase_center=phase_center,
-            units=units, fig=fig, label=label,
+            units=units, fig=fig, label=label, match_rx_gain=match_rx_gain,
             sharex=sharex, sharey=sharey,
             linewidths=(format == 'linewidths'), **kwargs)
 
@@ -331,7 +339,7 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
                        smooth_window_hz=1000,
                        conversion_method='linearized', calibrations=None,
                        psd_units='linear',
-                       sharex=True, sharey=None,
+                       sharex=True, sharey=None, match_rx_gain='auto',
                        **kwargs):
     """
     Plot PSD of snapshot data.
@@ -362,6 +370,12 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
             ``'circle'`` for ``format='freq_diss'``.
         calibrations: Per-tone resonator calibrations or fit results. Required
             by ``conversion_method='mobius'`` and ``'circle'``.
+        match_rx_gain: put the snapshots on the sweep's RX scale for
+            ``format='freq_diss'``, for snapshots and sweep taken at
+            different RX attenuation or ADC DSA. ``'auto'`` (default) uses
+            the recorded RX chain states when both are known and differ
+            (with a warning); ``True`` measures the carrier ratio; ``False``
+            turns it off; a number is the snapshot/sweep amplitude ratio.
         psd_kwargs: dict passed to compute_psd().
         show_errors: bool. For 'averaged', show std-dev error bars. In dB the
             band is asymmetric, and both edges are converted.
@@ -405,10 +419,11 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
         from .timestream import _compute_freq_diss
         # Snapshots are pre-accumulation; sweep I/Q are sums over acc_len
         # samples. Scale up so both are in the same units.
+        from ..timeseries import _snapshot_as_accumulated
         acc_len = _snapshot_acc_len(snapshot_data, sweep_data)
         scaled = snapshots * acc_len
 
-        ts_like = {'info': snapshot_data.get('info')}
+        ts_like = _snapshot_as_accumulated(snapshot_data.get('info'), acc_len)
         frac_f_list, frac_d_list = [], []
         for i in range(n_snap):
             ff, fd = _compute_freq_diss(
@@ -417,7 +432,7 @@ def plot_snapshots_psd(snapshot_data, format='iq', method='averaged',
                 reference_tone_frequency=reference_tone_frequency,
                 smooth_window_hz=smooth_window_hz,
                 conversion_method=conversion_method,
-                calibrations=calibrations)
+                calibrations=calibrations, match_rx_gain=match_rx_gain)
             frac_f_list.append(ff)
             frac_d_list.append(fd)
         scale = (_linewidth_scale(calibrations, tone_index)

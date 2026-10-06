@@ -93,6 +93,10 @@ reopens by name on its next poll.
 - chrony can also use NTP servers as fallback for Linux time.
 - the firmware `telescope_time` counter is separate. Linux time being correct
   does not automatically sync the firmware counter.
+- the data is stamped with the **accumulator's** TT, and the sync checks read
+  the sync block's copy; they have disagreed by days. Check
+  `get_info('sync')['acc_tt_ok']` before trusting recorded telescope times
+  ([which TT the data carries](tsu_strobe_and_timed_sync.md#which-tt-the-data-carries)).
 - NTP is useful fallback for Linux wall-clock time, but it is not precise
   enough for a new firmware timestamp sync.
 

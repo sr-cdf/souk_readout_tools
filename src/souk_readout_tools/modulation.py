@@ -1995,7 +1995,10 @@ class StreamDemodulator:
     """
 
     def __init__(self, method='fast', settling='none', linewidth_hz=None,
-                 calibration=None, conversion=None):
+                 calibration=None, conversion=None, gaps='raise'):
+        if gaps not in GAP_MODES:
+            raise ValueError(f'gaps must be one of {GAP_MODES}')
+        self.gaps = gaps
         if method not in ('fast', 'accurate'):
             raise ValueError('demod_method must be fast or accurate')
         if settling not in ('none', 'raw'):
@@ -2038,6 +2041,7 @@ class StreamDemodulator:
         keys = sorted(map(int, samples['i_data'])) if tones is None else sorted(set(tones))
         if not keys:
             raise ValueError('Select at least one tone for demodulation')
+        samples = _bridge_counter_gaps(samples, keys, self.gaps)
         n = int(samples['num_samples'])
         sample_index = np.asarray(samples.get('sample_index', np.arange(n)), dtype=np.int64)
         revision = np.asarray(samples['modulation_revision'], dtype=int)
@@ -2088,12 +2092,16 @@ class StreamDemodulator:
         for event_index, (begin, event_rev, state, epoch) in enumerate(events):
             if state is None:
                 continue
-            # Old-revision frames may still be queued after an announcement.
-            # The tag on each IQ frame chooses the state; only a later
-            # announcement reusing this same revision ID ends its epoch.
+            # Old-revision frames may still be queued after an announcement,
+            # and new-revision frames arrive before it (~210 samples, 84 ms, in
+            # the 2026-09-29 overnight run: the record is written after the
+            # commit). The tag on each IQ frame chooses the state, so an epoch
+            # opens at the previous announcement and only a later announcement
+            # reusing this same revision ID ends it.
+            start = events[event_index - 1][0] if event_index else begin
             stop = next((later[0] for later in events[event_index + 1:]
                          if later[1] == event_rev), 1 << 62)
-            mask = ((sample_index >= begin) & (sample_index < stop)
+            mask = ((sample_index >= start) & (sample_index < stop)
                     & (points > 0))
             if event_rev is not None:
                 mask &= revision == event_rev
@@ -2211,6 +2219,10 @@ class StreamDemodulator:
                              for i, tone in enumerate(keys)}
         output['z_demod'] = z_demod
         output['modulation_demodulated'] = True
+        if 'packet_filled' in samples:
+            output['packet_missing'] = (np.asarray(samples['packet_missing'], dtype=bool)
+                                        | samples['packet_filled'])
+
         if rates:
             common_rate = all(np.isclose(rate, rates[0]) for rate in rates)
             selected_parts = spectra_parts if common_rate else spectra_parts[-1:]
@@ -2241,6 +2253,11 @@ class StreamDemodulator:
         if rates and not all(np.isclose(rate, rates[0]) for rate in rates):
             output['demod_note'] += '; spectra use latest cadence'
         output['demod_note'] += gain_note
+        if 'gap_fill' in samples:
+            fill = samples['gap_fill']
+            output['demod_note'] += (
+                f"; {fill['inserted_rows'].size} lost accumulation(s) in "
+                f"{len(fill['gaps'])} gap(s) filled ({fill['mode']}), rows in gap_fill")
         if source_calibration is None and self.linewidth_hz is None:
             output['demod_note'] += '; detuning needs calibrations'
         return output
@@ -2353,18 +2370,38 @@ class StreamDemodulator:
         return result
 
 
+GAP_MODES = ('raise', 'nan', 'interpolate')
+
+
 def demodulate_stream(samples, tones=None, *, method='accurate', settling='none',
-                      linewidth_hz=None, calibration=None, conversion=None):
+                      linewidth_hz=None, calibration=None, conversion=None,
+                      gaps='raise'):
     """Demodulate a whole modulated recording across its revisions.
 
     The offline form of the live viewer's demodulation
     (:class:`StreamDemodulator`): ``samples`` from ``ReadoutClient.parse_stream``
-    (with its tone-update records, recorded with ``subscribe_tone_updates``)
-    or a stream basename. Every tracking commit or recentre is split out and
-    joined back onto one physical reference, so ``resonance_shift_hz`` is the
-    resonator's own motion across the whole recording. ``calibration``
-    defaults to the one the recording carries (``info['resonators']``).
-    Returns the parsed dict with per-tone fields added (see
+    or ``stream_file.read_stream_chunk`` (with its tone-update records,
+    recorded with ``subscribe_tone_updates``) or a stream basename. Every
+    tracking commit or recentre is split out and joined back onto one physical
+    reference, so ``resonance_shift_hz`` is the resonator's own motion across
+    the whole recording. ``calibration`` defaults to the one the recording
+    carries (``info['resonators']``).
+
+    ``gaps`` says what to do with lost accumulations (steps in
+    ``packet_counter``). A lost accumulation shifts the modulation cycle by a
+    slot, so the cycles cannot simply be read on across it:
+
+    - ``'raise'`` (default): refuse, saying where the gaps are;
+    - ``'nan'``: insert a NaN placeholder for each lost accumulation (its
+      probe point worked out from the slot cadence), so the output is evenly
+      sampled and the cycles touching a gap come out NaN;
+    - ``'interpolate'``: as ``'nan'``, then fill each placeholder linearly from
+      the received samples at the **same probe point** (never across points),
+      so every cycle demodulates. Inserted samples are marked in
+      ``packet_missing`` either way.
+
+    Returns the parsed dict (one row per accumulation, lost ones included,
+    when gaps are filled) with per-tone fields added (see
     :func:`demodulate_timestream` for their meaning), ``cycle_spectra`` /
     ``cycle_rate`` for the per-cycle estimates and a ``demod_note``.
     """
@@ -2372,7 +2409,118 @@ def demodulate_stream(samples, tones=None, *, method='accurate', settling='none'
         from .client.readout_client import ReadoutClient
         samples = ReadoutClient.parse_stream(samples, apply_readout_correction=False)
     return StreamDemodulator(method, settling, linewidth_hz, calibration,
-                             conversion)(samples, tones)
+                             conversion, gaps=gaps)(samples, tones)
+
+
+def _bridge_counter_gaps(samples, tones, gaps):
+    """Samples on a contiguous packet-counter axis, per ``gaps`` (see
+    :func:`demodulate_stream`); ``samples`` itself when nothing is lost.
+
+    The I/Q of the tones in ``tones`` only are kept. Inserted rows follow the
+    :func:`timeseries.fill_gaps` conventions -- ``packet_error`` 1, telescope
+    time 0 (unknown), stream flags -1 -- except the modulation tags, which the
+    cadence determines, ``sample_index`` (the next received sample's, so
+    tone-update records still apply from the right place) and ``time_s``
+    (interpolated).
+    """
+    counter = samples.get('packet_counter')
+    if counter is None or len(counter) < 2:
+        return samples
+    steps = np.diff(np.asarray(counter, dtype=np.int64)) % 2**32
+    lost = steps - 1
+    if not np.any(lost > 0):
+        return samples
+    if gaps == 'raise':
+        where = np.flatnonzero(lost > 0)
+        raise ValueError(
+            f'{int(lost.sum())} accumulation(s) lost in {where.size} gap(s), the first '
+            f'after sample {int(where[0])}: a lost accumulation shifts the modulation '
+            "cycle. Pass gaps='nan' (placeholders; the cycles touching a gap come out "
+            "NaN) or gaps='interpolate' (each lost sample filled from the same probe "
+            "point's neighbours), or demodulate a gap-free range.")
+    state = active_modulation_state(samples.get('info'))
+    if state is None:
+        raise ValueError('filling gaps needs the modulation state in the metadata')
+    n = len(counter)
+    pc = int(counter[0]) + np.concatenate(([0], np.cumsum(steps)))
+    z = np.column_stack([np.asarray(samples['i_data'][f'{t:04d}'], dtype=float)
+                         + 1j * np.asarray(samples['q_data'][f'{t:04d}'], dtype=float)
+                         for t in tones])
+    rebuilt = _reconstruct_contiguous(
+        pc, np.asarray(samples['modulation_point'], dtype=int),
+        np.asarray(samples['modulation_settling'], dtype=int),
+        np.asarray(samples['modulation_revision'], dtype=int), z,
+        int(state['num_points']), int(state.get('samples_per_point', 1)),
+        int(state.get('n_settle', 0)))
+    if rebuilt is None:
+        raise ValueError('cannot fill the gaps: the modulation cadence could not be '
+                         'anchored (no two consecutive received samples change point)')
+    pc2, points2, settling2, revisions2, z2, present, source = rebuilt
+    inserted = ~present
+    if gaps == 'interpolate':
+        for p in range(1, int(state['num_points']) + 1):
+            targets = (points2 == p) & inserted
+            if np.any(targets):
+                z2 = _interp_nan_targets(z2, targets, (points2 == p) & present)
+
+    def expand(values, fill):
+        values = np.asarray(values)
+        dtype = np.int64 if (fill == -1 and values.dtype.kind == 'u') else values.dtype
+        out = np.full(len(pc2), fill, dtype=dtype)
+        out[present] = values[source[present]]
+        return out
+
+    out = dict(samples)
+    for key, value in samples.items():
+        if isinstance(value, np.ndarray) and value.shape[:1] == (n,):
+            out[key] = expand(value, False if value.dtype == bool else 0)
+    out['i_data'] = {f'{t:04d}': z2[:, i].real for i, t in enumerate(tones)}
+    out['q_data'] = {f'{t:04d}': z2[:, i].imag for i, t in enumerate(tones)}
+    out['packet_counter'] = pc2 % 2**32
+    if 'packet_error' in samples:
+        out['packet_error'] = expand(samples['packet_error'], 1)
+    if 'stream_flags' in samples:
+        out['stream_flags'] = {key: expand(value, -1)
+                               for key, value in samples['stream_flags'].items()}
+    out['modulation_point'] = points2
+    out['modulation_settling'] = settling2
+    out['modulation_revision'] = revisions2
+    positions = np.flatnonzero(present)
+    if 'sample_index' in samples:
+        received = np.asarray(samples['sample_index'])
+        out['sample_index'] = received[source[positions[
+            np.searchsorted(positions, np.arange(len(pc2)))]]]
+    if 'time_s' in samples:
+        out['time_s'] = np.interp(np.arange(len(pc2)), positions,
+                                  np.asarray(samples['time_s'], dtype=float))
+    # Interpolated rows are demodulated like received ones; NaN rows are
+    # missing. Either way packet_filled marks them, and the demodulator puts
+    # them back into packet_missing on its output.
+    prior = expand(np.asarray(samples.get('packet_missing', np.zeros(n, dtype=bool)),
+                              dtype=bool), False)
+    out['packet_missing'] = prior if gaps == 'interpolate' else prior | inserted
+    out['packet_filled'] = inserted
+    out['num_samples'] = len(pc2)
+    out['gap_fill'] = _gap_fill_record(gaps, inserted, z2)
+    return out
+
+
+def _gap_fill_record(mode, inserted, z):
+    """What a gap fill did, as row indices of the filled output.
+
+    ``inserted_rows`` are the placeholders; of those, ``interpolated_rows`` got
+    values and ``nan_rows`` stayed NaN (no same-point neighbour to interpolate
+    from, or ``mode='nan'``). ``gaps`` lists ``(first_inserted_row, n_lost)``.
+    """
+    rows = np.flatnonzero(inserted)
+    finite = np.all(np.isfinite(np.atleast_2d(np.asarray(z).T).T[rows]), axis=-1) \
+        if rows.size else np.zeros(0, dtype=bool)
+    starts = rows[np.r_[True, np.diff(rows) > 1]] if rows.size else rows
+    lengths = np.diff(np.r_[np.flatnonzero(np.r_[True, np.diff(rows) > 1]), rows.size]) \
+        if rows.size else rows
+    return {'mode': mode, 'inserted_rows': rows,
+            'interpolated_rows': rows[finite], 'nan_rows': rows[~finite],
+            'gaps': [(int(s), int(n)) for s, n in zip(starts, lengths)]}
 
 
 def _measured_reference_freqs(f_tone, z_tone):

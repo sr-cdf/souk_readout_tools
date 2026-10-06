@@ -22,7 +22,7 @@ from ._common import (_get_pyplot, _compute_mag_phase, _dual_panels,
 from ._psd import check_psd_units, psd_display_values
 from ..resonator import sweep_trace, with_readout_correction
 from ..timeseries import (FREQ_DISS_FORMATS, _compute_freq_diss, _get_tone_data,
-                          _has_precomputed_freq_diss, _linewidth_scale,
+                          _has_precomputed_freq_diss, _linewidth_scale, _rx_gain,
                           _precomputed_freq_diss,
                           _prepare_psd_for_log_plot,
                           _warn_ignored_conversion_args, timestream_psds)
@@ -161,8 +161,12 @@ def _apply_tone_transforms(z, tone_idx, deembed, phase_center, *,
                            sweep_data=None, tone_frequency=None,
                            units='raw', info=None, config=None,
                            reference_plane='adc_input',
-                           calibration_cache=None):
-    """Apply timestream transforms, using sweep-derived params when possible."""
+                           calibration_cache=None, rx_gain=1.0):
+    """Apply timestream transforms, using sweep-derived params when possible.
+
+    ``rx_gain`` (timestream/sweep RX amplitude ratio) is divided out of ``z``
+    when the sweep supplies the transform, so both share the sweep's scale.
+    """
     d_params = None
     pc_params = None
     sweep_f = None
@@ -179,6 +183,7 @@ def _apply_tone_transforms(z, tone_idx, deembed, phase_center, *,
                 reference_plane=reference_plane, frequencies=sweep_f,
                 calibration_cache=calibration_cache)
         z_sweep = sw_i + 1j * sw_q
+        z = z / rx_gain
 
     if deembed:
         if deembed is True:
@@ -265,7 +270,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     x_axis='time', unwrap_phase=True,
                     smooth_window_hz=1000, conversion_method=None,
                     calibrations=None, apply_readout_correction=True,
-                    sharex=True, sharey=False,
+                    sharex=True, sharey=False, match_rx_gain='auto',
                     **kwargs):
     """
     Plot timestream data in various formats.
@@ -314,6 +319,17 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             by ``conversion_method='mobius'`` and ``'circle'``, and by
             ``format='linewidths'`` for each tone's Qr. Otherwise ignored for
             already-demodulated timestreams (see ``conversion_method``).
+        match_rx_gain: put the timestream on the sweep's RX scale, for a
+            timestream and sweep taken at different RX attenuation, ADC DSA
+            or acc_len. Applies to ``freq_diss``/``linewidths``, and to the
+            I/Q views when ``deembed``/``phase_center`` take their
+            parameters from ``sweep_data`` (a raw I/Q view is left alone).
+            ``'auto'`` (default) uses the recorded RX chain states when
+            both are known and differ (with a warning); ``True`` measures
+            the carrier ratio (assumes the resonance did not move);
+            ``False`` turns it off; a number is the timestream/sweep
+            amplitude ratio. RX only: a different tone power needs a new
+            sweep.
         fig: Existing figure. If None, create new.
         label: Legend label. If None, uses an auto-incrementing index.
         units: Unit for I/Q normalisation.  One of:
@@ -369,6 +385,13 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
     sweep_data = with_readout_correction(sweep_data, apply_readout_correction)
     custom_title = kwargs.pop('title', None)
     selected = _get_tone_data(ts_data, tones)
+
+    def _sweep_frame_rx_gain(key):
+        # Only when the sweep supplies the I/Q transform: a raw view has no
+        # sweep scale to match.
+        if sweep_data is None or not (deembed is True or phase_center is True):
+            return 1.0
+        return _rx_gain(match_rx_gain, ts_data, sweep_data, calibrations, int(key))
     # Frequency/dissipation always converts the recorded I/Q, which is what the
     # sweep and calibrations describe; units only rescale the I/Q panels.
     recorded_iq = {key: (i_arr, q_arr) for key, i_arr, q_arr in selected}
@@ -444,7 +467,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                 sweep_data=sweep_data, tone_frequency=_tone_frequency(key),
                 units=units, info=info, config=config,
                 reference_plane=reference_plane,
-                calibration_cache=calibration_cache)
+                calibration_cache=calibration_cache,
+                rx_gain=_sweep_frame_rx_gain(key))
             trace_label = _resolve_label(ax, label,
                                          suffix=f'Tone {key}' if len(selected) > 1 else None)
             ax.plot(z.real, z.imag, '.', markersize=1,
@@ -473,7 +497,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                 sweep_data=sweep_data, tone_frequency=_tone_frequency(key),
                 units=units, info=info, config=config,
                 reference_plane=reference_plane,
-                calibration_cache=calibration_cache)
+                calibration_cache=calibration_cache,
+                rx_gain=_sweep_frame_rx_gain(key))
             ax1.plot(x_values, z.real, label=trace_label, **kwargs)
             ax2.plot(x_values, z.imag, label=trace_label, **kwargs)
             ax1.set_ylabel(f'I {iq_label}'.strip())
@@ -486,7 +511,8 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                 sweep_data=sweep_data, tone_frequency=tone_f,
                 units=units, info=info, config=config,
                 reference_plane=reference_plane,
-                calibration_cache=calibration_cache)
+                calibration_cache=calibration_cache,
+                rx_gain=_sweep_frame_rx_gain(key))
             mag_db, phase = _compute_mag_phase_units(
                 z, units, info=info, config=config,
                 reference_plane=reference_plane, frequencies=tone_f,
@@ -507,7 +533,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
                     reference_tone_frequency=reference_tone_frequency,
                     smooth_window_hz=smooth_window_hz,
                     conversion_method=conversion_method,
-                    calibrations=calibrations)
+                    calibrations=calibrations, match_rx_gain=match_rx_gain)
             if format == 'linewidths':
                 scale = _linewidth_scale(calibrations, key)
                 ax1.plot(x_values, scale * frac_f, label=trace_label, **kwargs)
@@ -564,6 +590,7 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
                         blind_tones=None,
                         exclude_settling=False,
                         apply_readout_correction=True,
+                        match_rx_gain='auto',
                         sharex=True,
                         sharey=None,
                         return_data=False,
@@ -603,6 +630,15 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
             by ``conversion_method='mobius'`` and ``'circle'``, and by
             ``format='linewidths'`` for each tone's Qr. Otherwise ignored for
             already-demodulated timestreams (see ``conversion_method``).
+        match_rx_gain: put the timestream on the sweep's RX scale for the
+            frequency/dissipation formats, for a timestream and sweep taken
+            at different RX attenuation, ADC DSA or acc_len.
+            ``'auto'`` (default) uses the recorded RX chain states when
+            both are known and differ (with a warning); ``True`` measures
+            the carrier ratio (assumes the resonance did not move);
+            ``False`` turns it off; a number is the timestream/sweep
+            amplitude ratio. RX only: a different tone power needs a new
+            sweep.
         psd_kwargs: dict of kwargs passed to compute_psd().
         precomputed_psd: dict mapping tone_key -> (f_psd, psd_values).
             If provided, skip computation.
@@ -698,7 +734,8 @@ def plot_timestream_psd(ts_data, format='iq', tones=None,
         decorrelate_tones=decorrelate_tones,
         blind_tone_modes=blind_tone_modes, blind_tones=blind_tones,
         exclude_settling=exclude_settling,
-        apply_readout_correction=apply_readout_correction)
+        apply_readout_correction=apply_readout_correction,
+        match_rx_gain=match_rx_gain)
 
     f = result['f']
     panel1, panel2 = result['panels']
@@ -781,7 +818,8 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
                                   hide_modulation_settling_points=False,
                                   fig=None, label=None,
                                   units='raw', config=None,
-                                  apply_readout_correction=True, **kwargs):
+                                  apply_readout_correction=True,
+                                  match_rx_gain='auto', **kwargs):
     """
     Overplot timestream I/Q points on the resonance circle from sweep data.
 
@@ -821,6 +859,16 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
             factors, applied consistently to the timestream samples and the
             sweep trace. Toggles already-parsed data either way when the
             factors are available.
+        match_rx_gain: put the timestream points on the sweep's RX scale,
+            for a timestream and sweep taken at different RX attenuation,
+            ADC DSA or acc_len. Not applied to a demodulated timestream,
+            which was matched when it was demodulated.
+            ``'auto'`` (default) uses the recorded RX chain states when
+            both are known and differ (with a warning); ``True`` measures
+            the carrier ratio (assumes the resonance did not move);
+            ``False`` turns it off; a number is the timestream/sweep
+            amplitude ratio. RX only: a different tone power needs a new
+            sweep.
         **kwargs: Passed to plot calls.
 
     Returns:
@@ -894,6 +942,8 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
                 "frequency.",
                 stacklevel=2)
 
+    if not demodulated:
+        z_ts = z_ts / _rx_gain(match_rx_gain, ts_data, sweep_data, None, tone_index)
     # Deembedding is shared across all panels; apply it once at each trace's
     # probe frequencies. For a demodulated timestream the transform goes on the
     # sweep only -- the timestream is already in that basis.
@@ -1036,7 +1086,7 @@ def plot_allan_deviation(data, format='freq_diss', tones=None, sweep_data=None,
                         'smooth_window_hz', 'conversion_method',
                         'calibrations', 'decorrelate_modes',
                         'decorrelate_tones', 'blind_tone_modes',
-                        'blind_tones')})
+                        'blind_tones', 'match_rx_gain')})
     panels = result['panels']
     fig, ax1, ax2 = _dual_panels(fig, sharex=True, sharey=False)
     tau = result['tau']
@@ -1101,7 +1151,7 @@ def plot_timestream_histogram(data, format='freq_diss', tones=None,
                             'smooth_window_hz', 'conversion_method',
                             'calibrations', 'decorrelate_modes',
                             'decorrelate_tones', 'blind_tone_modes',
-                            'blind_tones')}
+                            'blind_tones', 'match_rx_gain')}
     rows, panels, tone_idx, _ = _panel_time_rows(
         data, format, tones, sweep_data,
         passthrough.get('sample_rate'),
@@ -1112,7 +1162,8 @@ def plot_timestream_histogram(data, format='freq_diss', tones=None,
         passthrough.get('decorrelate_modes', 0),
         passthrough.get('decorrelate_tones'),
         passthrough.get('blind_tone_modes', 0),
-        passthrough.get('blind_tones'))
+        passthrough.get('blind_tones'),
+        passthrough.get('match_rx_gain', 'auto'))
     stats = timestream_stats(data, format=format, tones=tones,
                              sweep_data=sweep_data, **passthrough)
 
@@ -1182,7 +1233,7 @@ def plot_coherence(data, other=None, sample_rate=None, tones=None,
                               if k in ('psd_kwargs', 'panels',
                                        'reference_tone_frequency',
                                        'smooth_window_hz', 'conversion_method',
-                                       'calibrations',
+                                       'calibrations', 'match_rx_gain',
                                        'apply_readout_correction')})
     fig, ax1, ax2 = _dual_panels(fig, sharex=True, sharey=False)
     f = result['f']

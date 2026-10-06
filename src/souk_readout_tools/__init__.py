@@ -24,6 +24,7 @@ _SUBMODULES = [
     "fitting",
     "noise",
     "timeseries",
+    "stream_file",
     "timing",
     "plotting",
 ]

@@ -697,6 +697,13 @@ The firmware attaches a 64-bit telescope timestamp to each accumulation. This ti
 tt = client.get_telescope_time()
 
 ```
+
+This reads the accumulator's TT, the one in the data. It is only real time if
+the TT was loaded *and* reached the accumulator: check
+`client.get_info('sync')['acc_tt_ok']` (see
+[which TT the data carries](tsu_strobe_and_timed_sync.md#which-tt-the-data-carries)).
+For a recording, `stream_file.stream_time_model(path)` works out the real time
+of each sample and says whether the recorded TT can be trusted.
 To check whether the RFSoC is locked to the PTP grandmaster:
 
 ```python
@@ -758,6 +765,35 @@ or use the plotting tool:
 ```
 plot_timestream(data,x_axis='telescope_time')
 ```
+
+`parse_stream` loads the whole capture. For a capture too large for memory,
+read a sample range and only the tones and header fields you need, in the
+same format, and join chunks back together:
+
+```python
+from souk_readout_tools import stream_file
+layout = stream_file.stream_file_info('run1')      # num_samples, duration_s, ...
+rate = layout['sample_rate']
+first = stream_file.read_stream_chunk('run1', 0, int(600 * rate), tones=[1, 5])
+later = stream_file.read_stream_chunk('run1', int(3600 * rate), int(4200 * rate), tones=[1, 5])
+data = stream_file.concatenate_stream_chunks([first, later])
+
+model = stream_file.stream_time_model('run1')     # real time of each sample; checks the TT
+start = stream_file.find_sample('run1', '2026-09-30T02:00:00Z', model)
+chunk = stream_file.read_stream_chunk('run1', start, start + int(600 * rate), tones=1)
+t_unix = stream_file.sample_times(chunk, model)
+```
+
+`sample_index / sample_rate` is not real time: lost accumulations shift it
+(149 in the first hour of a 2026-09-29 overnight run), and the recorded
+telescope time may be unloaded or wrong. `stream_time_model` fits the packet
+counter to every clock reading in the capture (tone-update records, the
+`first_frame` / `last_frame` host times, the server time in its `info`) and
+warns when the TT disagrees, jumps, or the sample clock is off frequency.
+
+Each read shows its progress and refuses up front to use more than 80% of
+the free memory. Chunks carry the absolute `sample_index`, so
+`demodulate_stream` and the joins line up.
 
 ### G3 Stream Output (so3g)
 

@@ -63,7 +63,7 @@ from .noise import (fractional_frequency_and_dissipation_timestreams,
 from .resonator import (CONVERSION_METHODS, ResonatorCalibration,
                         calibration_for_tone, convert_iq, is_calibration_record,
                         prepare_conversion, resolve_rx_gain,
-                        resolve_tone_frequency, sweep_trace, tone_column,
+                        resolve_tone_frequency, rx_gain_ratio, sweep_trace, tone_column,
                         with_readout_correction)
 
 __all__ = [
@@ -162,6 +162,9 @@ def fill_gaps(samples, method='nan', *, max_missing=1_000_000,
     dict
         Deep copy with expanded I/Q, counters, metadata and ``num_samples``.
         ``packet_missing`` marks inserted samples (including earlier fills).
+        ``gap_fill`` lists this fill's rows: ``inserted_rows``, of which
+        ``interpolated_rows`` got values and ``nan_rows`` stayed NaN (for
+        every tone), and ``gaps`` as ``(first_inserted_row, n_lost)``.
         Missing ``packet_error`` entries are 1, telescope timestamps are 0
         (unknown), and stream flags/modulation tags are -1 (unknown). These
         metadata values are never interpolated. Other metadata is copied.
@@ -274,9 +277,28 @@ def fill_gaps(samples, method='nan', *, max_missing=1_000_000,
         result['packet_counter'] = counters
     else:
         result['packet_counter'] = counter.copy()
+    # A stream_file chunk's absolute sample_index (inserted rows take the next
+    # received sample's, as tone-update records do) and time_s (interpolated).
+    if 'sample_index' in samples and missing_count:
+        received = np.asarray(samples['sample_index'])
+        result['sample_index'] = received[np.searchsorted(positions, np.arange(size))]
+    if 'time_s' in samples and missing_count:
+        result['time_s'] = np.interp(np.arange(size), positions,
+                                     np.asarray(samples['time_s'], dtype=float))
     prior_missing = np.asarray(samples.get('packet_missing', np.zeros(n, dtype=bool)))
     result['packet_missing'] = expand(prior_missing, 'packet_missing', True).astype(bool)
     result['num_samples'] = size
+    rows = np.flatnonzero(inserted)
+    finite = np.ones(rows.size, dtype=bool)
+    for tone in result['i_data']:
+        finite &= np.isfinite(np.asarray(result['i_data'][tone], dtype=float)[rows])
+    new_gap = np.r_[True, np.diff(rows) > 1] if rows.size else np.zeros(0, dtype=bool)
+    starts = np.flatnonzero(new_gap)
+    result['gap_fill'] = {
+        'mode': method, 'inserted_rows': rows,
+        'interpolated_rows': rows[finite] if method != 'nan' else rows[:0],
+        'nan_rows': rows[~finite] if method != 'nan' else rows,
+        'gaps': [(int(rows[s]), int(n)) for s, n in zip(starts, np.diff(np.r_[starts, rows.size]))]}
     return result
 
 
@@ -529,14 +551,15 @@ def _get_tone_data(ts_data, tones=None):
 
 def _compute_freq_diss(ts_data, tone_key, i_arr, q_arr, sweep_data,
                        reference_tone_frequency=None, smooth_window_hz=1000,
-                       conversion_method='linearized', calibrations=None):
+                       conversion_method='linearized', calibrations=None,
+                       match_rx_gain='auto'):
     """Fractional resonance shift and matched dissipation of one tone's I/Q.
 
     A capture-level wrapper round ``resonator.prepare_conversion`` /
     ``resonator.convert_iq`` (see there for the methods): both rows relative
     to the sweep's I/Q at the tone, the shift resonator-side. The capture is
-    brought onto the calibration's RX scale when both recorded RX chain
-    states are known and differ.
+    brought onto the calibration's RX scale as ``match_rx_gain`` says (see
+    :func:`_rx_gain`).
     """
     tone_idx = int(tone_key)
     method = conversion_method or 'linearized'
@@ -551,16 +574,30 @@ def _compute_freq_diss(ts_data, tone_key, i_arr, q_arr, sweep_data,
     if calibration is None and method in ('phase', 'mobius', 'circle'):
         raise ValueError(
             f"conversion_method={method!r} requires a calibration for tone {tone_idx}")
-    source = calibrations if is_calibration_record(calibrations) else sweep_data
-    info = ts_data.get('info') if isinstance(ts_data, Mapping) else None
+    gain = _rx_gain(match_rx_gain, ts_data, sweep_data, calibrations, tone_idx)
     prepared = prepare_conversion(
         tone_freq, method, calibration=calibration, sweep_f=sweep_f,
         sweep_z=np.asarray(sweep_i) + 1j * np.asarray(sweep_q),
         smooth_window_hz=smooth_window_hz)
     shift_hz, frac_d = convert_iq(
         prepared, np.asarray(i_arr, dtype=float) + 1j * np.asarray(q_arr, dtype=float),
-        resolve_rx_gain('auto', source, info))
+        gain)
     return shift_hz / tone_freq, frac_d
+
+
+def _rx_gain(match_rx_gain, ts_data, sweep_data, calibrations, tone_idx):
+    """Timestream/calibration RX amplitude ratio for one tone.
+
+    ``'auto'``: from the recorded RX chain states when both are known and
+    differ (with a warning), else 1. ``True``: measured from the carrier
+    (``resonator.rx_gain_ratio``; assumes the resonance did not move).
+    ``False``/``None``: 1. A number: that ratio.
+    """
+    if match_rx_gain is True:
+        return float(rx_gain_ratio(sweep_data, ts_data, tones=[tone_idx])['ratio'][0])
+    source = calibrations if is_calibration_record(calibrations) else sweep_data
+    info = ts_data.get('info') if isinstance(ts_data, Mapping) else None
+    return resolve_rx_gain(match_rx_gain, source, info)
 
 
 def _has_precomputed_freq_diss(ts_data):
@@ -676,7 +713,7 @@ def _compute_cleaned_freq_diss(
         ts_data, sweep_data, plotted_tones, decorrelate_modes,
         decorrelate_tones, blind_tone_modes, blind_tones,
         reference_tone_frequency, smooth_window_hz, conversion_method,
-        calibrations):
+        calibrations, match_rx_gain='auto'):
     """Return reusable raw rows and sequentially cleaned freq/diss rows."""
     analysis_tones = plotted_tones
     if decorrelate_modes:
@@ -709,6 +746,7 @@ def _compute_cleaned_freq_diss(
         smooth_window_hz=smooth_window_hz,
         method=conversion_method,
         calibrations=calibrations,
+        match_rx_gain=match_rx_gain,
     )
     if decorrelate_modes:
         frequency = remove_common_modes_svd(
@@ -840,7 +878,8 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
                     blind_tone_modes=0,
                     blind_tones=None,
                     exclude_settling=False,
-                    apply_readout_correction=True, export=None):
+                    apply_readout_correction=True, match_rx_gain='auto',
+                    export=None):
     """
     Power spectral densities of every selected tone in a timestream capture.
 
@@ -916,6 +955,14 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
     apply_readout_correction : bool, optional
         Apply the stored readout correction to samples and sweep. Default
         ``True``.
+    match_rx_gain : {'auto', True, False} or float, optional
+        Put the timestream on the sweep's (or calibration's) RX scale, for a
+        sweep and timestream taken at different RX attenuation, ADC DSA or
+        acc_len. ``'auto'`` (default) uses the recorded RX chain states when
+        both are known and differ, with a warning; ``True`` measures the
+        carrier ratio (assumes the resonance did not move); ``False`` turns it
+        off; a number is the timestream/sweep amplitude ratio. RX only: a
+        different tone power needs a new sweep.
 
     export : str or pathlib.Path, optional
         Write the result to this path with `export_psds` and return it
@@ -1121,6 +1168,7 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
                 smooth_window_hz,
                 conversion_method,
                 calibrations,
+                match_rx_gain,
             )
 
         for key, i_arr, q_arr in selected:
@@ -1141,7 +1189,7 @@ def timestream_psds(ts_data, format='iq', tones=None, sweep_data=None,
                     reference_tone_frequency=reference_tone_frequency,
                     smooth_window_hz=smooth_window_hz,
                     conversion_method=conversion_method,
-                    calibrations=calibrations)
+                    calibrations=calibrations, match_rx_gain=match_rx_gain)
             scale = (_linewidth_scale(calibrations, tone_index)
                      if format == 'linewidths' else 1.0)
             raw_rows[0].append(_psd(scale * frac_f, key, 'frequency'))
@@ -1945,6 +1993,19 @@ def _snapshot_acc_len(snapshot_data, sweep_data):
         "Provide sweep_data with 'info.pipeline.acc_len' set.")
 
 
+def _snapshot_as_accumulated(info, acc_len):
+    """A timestream-like dict for snapshots already scaled by ``acc_len``.
+
+    The scaling put them on the sweep's acc_len, so their info must say so:
+    RX-gain matching would otherwise divide by an acc_len ratio a second time.
+    """
+    if not isinstance(info, Mapping):
+        return {'info': info}
+    pipeline = dict(info.get('pipeline') or {})
+    pipeline['acc_len'] = acc_len
+    return {'info': {**info, 'pipeline': pipeline}}
+
+
 def _single_tone_snapshot(snapshot_data, func_name):
     """
     Return the single-tone snapshot dict these functions expect.
@@ -2073,7 +2134,7 @@ def snapshot_psds(snapshot_data, format='iq', tones=None, sweep_data=None,
                   calibrations=None,
                   include_dc_point=False,
                   log_bin=False,
-                  bins_per_decade=20, export=None):
+                  bins_per_decade=20, match_rx_gain='auto', export=None):
     """
     Power spectral densities of pre-accumulation snapshot blocks.
 
@@ -2122,6 +2183,9 @@ def snapshot_psds(snapshot_data, format='iq', tones=None, sweep_data=None,
     calibrations : optional
         Per-tone calibrations, required by ``'phase'``, ``'mobius'`` and
         ``'circle'`` and by ``format='linewidths'`` (for Qr).
+    match_rx_gain : {'auto', True, False} or float, optional
+        RX-scale matching of the snapshots to the sweep, as in
+        `timestream_psds`.
     include_dc_point : bool, optional
         Keep the zero-frequency point. Default ``False``.
     log_bin : bool, optional
@@ -2261,7 +2325,7 @@ def snapshot_psds(snapshot_data, format='iq', tones=None, sweep_data=None,
         top, bot = _snapshot_panel_data(
             snaps, format, tone_index, info, sweep_data,
             reference_tone_frequency, smooth_window_hz, conversion,
-            calibrations, snapshot_data)
+            calibrations, snapshot_data, match_rx_gain)
 
         for slot, data2d in enumerate((top, bot)):
             # Per-block mean scatter against within-block scatter: how much of
@@ -2320,7 +2384,7 @@ def snapshot_psds(snapshot_data, format='iq', tones=None, sweep_data=None,
 
 def _snapshot_panel_data(snaps, format, tone_index, info, sweep_data,
                          reference_tone_frequency, smooth_window_hz,
-                         conversion_method, calibrations, snapshot_data):
+                         conversion_method, calibrations, snapshot_data, match_rx_gain='auto'):
     """The two (n_blocks, len_snapshot) panel arrays for one tone."""
     if format == 'iq':
         return snaps.real, snaps.imag
@@ -2331,14 +2395,15 @@ def _snapshot_panel_data(snaps, format, tone_index, info, sweep_data,
     # so scale up to put both in the same units before converting.
     acc_len = _snapshot_acc_len(snapshot_data, sweep_data)
     scaled = snaps * acc_len
-    ts_like = {'info': info}
+    ts_like = _snapshot_as_accumulated(info, acc_len)
     top, bot = [], []
     for block in range(scaled.shape[0]):
         ff, fd = _compute_freq_diss(
             ts_like, tone_index, scaled[block].real, scaled[block].imag,
             sweep_data, reference_tone_frequency=reference_tone_frequency,
             smooth_window_hz=smooth_window_hz,
-            conversion_method=conversion_method, calibrations=calibrations)
+            conversion_method=conversion_method, calibrations=calibrations,
+            match_rx_gain=match_rx_gain)
         top.append(ff)
         bot.append(fd)
     scale = (_linewidth_scale(calibrations, tone_index)
@@ -4478,7 +4543,7 @@ def _summary_rows(label, result, tones, fields):
 def _panel_time_rows(ts_data, format, tones, sweep_data, sample_rate,
                      reference_tone_frequency, smooth_window_hz,
                      conversion_method, calibrations, decorrelate_modes,
-                     decorrelate_tones, blind_tone_modes, blind_tones):
+                     decorrelate_tones, blind_tone_modes, blind_tones, match_rx_gain='auto'):
     """The same rows `timestream_psds` would spectrum, before any PSD.
 
     Shares the conversion and cleaning path so a time-domain view and a PSD of
@@ -4523,7 +4588,7 @@ def _panel_time_rows(ts_data, format, tones, sweep_data, sample_rate,
                 ts_data, sweep_data, tone_indices, decorrelate_modes,
                 decorrelate_tones, blind_tone_modes, blind_tones,
                 reference_tone_frequency, smooth_window_hz, conversion,
-                calibrations)
+                calibrations, match_rx_gain)
         for key, i_arr, q_arr in selected:
             idx = int(key)
             if cleaning_on and idx in cleaned:
@@ -4537,7 +4602,8 @@ def _panel_time_rows(ts_data, format, tones, sweep_data, sample_rate,
                     ts_data, key, i_arr, q_arr, sweep_data,
                     reference_tone_frequency=reference_tone_frequency,
                     smooth_window_hz=smooth_window_hz,
-                    conversion_method=conversion, calibrations=calibrations)
+                    conversion_method=conversion, calibrations=calibrations,
+                    match_rx_gain=match_rx_gain)
             scale = (_linewidth_scale(calibrations, idx)
                      if format == 'linewidths' else 1.0)
             rows[0].append(scale * np.asarray(frac_f, dtype=float))
@@ -4563,7 +4629,7 @@ def allan_deviation(data, format='freq_diss', tones=None, sweep_data=None,
                     reference_tone_frequency=None, smooth_window_hz=1000,
                     conversion_method=None, calibrations=None,
                     decorrelate_modes=0, decorrelate_tones=None,
-                    blind_tone_modes=0, blind_tones=None, export=None):
+                    blind_tone_modes=0, blind_tones=None, match_rx_gain='auto', export=None):
     """
     Allan deviation of the rows `timestream_psds` would take a spectrum of.
 
@@ -4601,7 +4667,7 @@ def allan_deviation(data, format='freq_diss', tones=None, sweep_data=None,
         lower scatter at long tau. ``'standard'`` uses disjoint bins.
     sample_rate : float, optional
         Sample rate in Hz. Required for plain arrays.
-    reference_tone_frequency, smooth_window_hz, conversion_method, calibrations
+    reference_tone_frequency, smooth_window_hz, conversion_method, calibrations, match_rx_gain
         Freq/diss conversion, as in `timestream_psds`.
     decorrelate_modes, decorrelate_tones, blind_tone_modes, blind_tones
         Cleaning, as in `timestream_psds`.
@@ -4678,7 +4744,7 @@ def allan_deviation(data, format='freq_diss', tones=None, sweep_data=None,
         data, format, tones, sweep_data, sample_rate,
         reference_tone_frequency, smooth_window_hz, conversion_method,
         calibrations, decorrelate_modes, decorrelate_tones, blind_tone_modes,
-        blind_tones)
+        blind_tones, match_rx_gain)
 
     n_samples = rows[panels[0]].shape[1]
     if taus is None:
@@ -4762,7 +4828,7 @@ def timestream_stats(data, format='freq_diss', tones=None, sweep_data=None,
                      reference_tone_frequency=None, smooth_window_hz=1000,
                      conversion_method=None, calibrations=None,
                      decorrelate_modes=0, decorrelate_tones=None,
-                     blind_tone_modes=0, blind_tones=None, export=None):
+                     blind_tone_modes=0, blind_tones=None, match_rx_gain='auto', export=None):
     """
     Per-tone summary statistics of a timestream, including robust ones.
 
@@ -4788,7 +4854,7 @@ def timestream_stats(data, format='freq_diss', tones=None, sweep_data=None,
         Threshold in robust sigma for the outlier count. Default 5.
     sample_rate : float, optional
         Required for plain arrays.
-    reference_tone_frequency, smooth_window_hz, conversion_method, calibrations
+    reference_tone_frequency, smooth_window_hz, conversion_method, calibrations, match_rx_gain
         Freq/diss conversion, as in `timestream_psds`.
     decorrelate_modes, decorrelate_tones, blind_tone_modes, blind_tones
         Cleaning, as in `timestream_psds`.
@@ -4838,7 +4904,7 @@ def timestream_stats(data, format='freq_diss', tones=None, sweep_data=None,
         data, format, tones, sweep_data, sample_rate,
         reference_tone_frequency, smooth_window_hz, conversion_method,
         calibrations, decorrelate_modes, decorrelate_tones, blind_tone_modes,
-        blind_tones)
+        blind_tones, match_rx_gain)
 
     keys = ('mean', 'std', 'ptp', 'median', 'mad_std', 'skew', 'kurtosis',
             'n_outliers', 'outlier_fraction', 'drift', 'drift_fraction')
@@ -5167,7 +5233,7 @@ def signal_direction_from_loads(load_k, fr, Qi, power_w=None,
 def estimate_beta(data, other=None, sample_rate=None, tones=None,
                   f_range=None, sweep_data=None, psd_kwargs=None,
                   reference_tone_frequency=None, conversion_method=None,
-                  calibrations=None, beta_range=(1.5, 20.0), export=None):
+                  calibrations=None, beta_range=(1.5, 20.0), match_rx_gain='auto', export=None):
     """
     Measure the responsivity ratio ``beta`` by in-band regression.
 
@@ -5192,7 +5258,7 @@ def estimate_beta(data, other=None, sample_rate=None, tones=None,
         ``(lo, hi)`` band to regress over. Choose one where a real signal
         dominates both channels; in a band of pure uncorrelated noise the
         regression measures nothing and the answer is meaningless.
-    sweep_data, reference_tone_frequency, conversion_method, calibrations, psd_kwargs
+    sweep_data, reference_tone_frequency, conversion_method, calibrations, psd_kwargs, match_rx_gain
         As in `cross_psd`, when a raw capture is given.
     beta_range : tuple of float, optional
         Plausible range for the sanity check. Default ``(1.5, 20.0)``, wide
@@ -5281,7 +5347,7 @@ def estimate_beta(data, other=None, sample_rate=None, tones=None,
                        sweep_data=sweep_data, psd_kwargs=psd_kwargs,
                        reference_tone_frequency=reference_tone_frequency,
                        conversion_method=conversion_method,
-                       calibrations=calibrations)
+                       calibrations=calibrations, match_rx_gain=match_rx_gain)
 
     f = np.asarray(cx['f'], dtype=float)
     sel = np.isfinite(f) & (f > 0)
@@ -5557,7 +5623,7 @@ def _combine_rows(s_xx, s_dd, s_xd, beta, weights, band):
 
 def _freq_diss_rows(ts_data, sweep_data, tones, reference_tone_frequency,
                     smooth_window_hz, conversion_method, calibrations,
-                    apply_readout_correction):
+                    apply_readout_correction, match_rx_gain='auto'):
     """Frequency and dissipation rows for a capture, as ``(n_tones, n_samples)``.
 
     Shares every conversion helper with `timestream_psds`, so the rows here are
@@ -5594,7 +5660,8 @@ def _freq_diss_rows(ts_data, sweep_data, tones, reference_tone_frequency,
                 ts_data, key, i_arr, q_arr, sweep_data,
                 reference_tone_frequency=reference_tone_frequency,
                 smooth_window_hz=smooth_window_hz,
-                conversion_method=method, calibrations=calibrations)
+                conversion_method=method, calibrations=calibrations,
+                match_rx_gain=match_rx_gain)
         freq.append(np.asarray(ff, dtype=float))
         diss.append(np.asarray(dd, dtype=float))
         idx.append(int(key))
@@ -5635,7 +5702,7 @@ def cross_psd(data, other=None, sample_rate=None, tones=None, sweep_data=None,
               psd_kwargs=None, panels=('frequency', 'dissipation'),
               reference_tone_frequency=None, smooth_window_hz=1000,
               conversion_method=None, calibrations=None,
-              apply_readout_correction=True, coherence_warn_segments=30, export=None):
+              apply_readout_correction=True, coherence_warn_segments=30, match_rx_gain='auto', export=None):
     """
     Cross spectrum and coherence between two timestream quantities.
 
@@ -5670,7 +5737,7 @@ def cross_psd(data, other=None, sample_rate=None, tones=None, sweep_data=None,
     panels : tuple of str, optional
         Names for the two channels in the output. Default
         ``('frequency', 'dissipation')``.
-    reference_tone_frequency, smooth_window_hz, conversion_method, calibrations
+    reference_tone_frequency, smooth_window_hz, conversion_method, calibrations, match_rx_gain
         As for `timestream_psds`. ``conversion_method='circle'`` is rejected.
     apply_readout_correction : bool, optional
         Default ``True``.
@@ -5786,7 +5853,7 @@ def cross_psd(data, other=None, sample_rate=None, tones=None, sweep_data=None,
         rows_x, rows_y, idx, rate, method, info = _freq_diss_rows(
             data, sweep_data, tones, reference_tone_frequency,
             smooth_window_hz, conversion_method, calibrations,
-            apply_readout_correction)
+            apply_readout_correction, match_rx_gain)
     else:
         if other is None:
             raise ValueError(
