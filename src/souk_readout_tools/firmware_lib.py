@@ -1681,6 +1681,7 @@ def initialise_pipeline_resources(r,r_fast,config_dict):
     if acc_len is not None:
         r.mixer.set_acc_len(acc_len)  # v7.11: acc_len lives in the mixer
         r.sync.sw_sync(mrst=True)     # acc_len change needs a master-reset + sync
+        refresh_acc_tt_correction(r_fast, source='pipeline init')  # WORKAROUND
     if dac_duc_mixer_frequency_hz is not None:
         r.rfdc.core.set_fine_mixer_freq(dac0_tile,dac0_block,r.rfdc.core.DAC_TILE,dac_duc_mixer_frequency_hz/1e6)
         r.rfdc.core.set_fine_mixer_freq(dac1_tile,dac1_block,r.rfdc.core.DAC_TILE,dac_duc_mixer_frequency_hz/1e6)
@@ -10397,7 +10398,9 @@ def get_fast_read_params(r_fast, zdma=None):
               'buffer_id_addr':buffer_id_addr,
               'acc_cnt_addr':acc_cnt_addr,
               'zdma':reader,
-              'phys_base':phys_base}
+              'phys_base':phys_base,
+              # WORKAROUND: live acc_tt correction (see refresh_acc_tt_correction)
+              'tt_correction':_acc_tt_correction_for(r_fast)}
 
     return params
 
@@ -10415,7 +10418,9 @@ def read_tt_fast(fast_read_params):
     tt_lsb_addr = fast_read_params['tt_lsb_addr']
     (msb,) = struct.unpack('<I', mm[tt_msb_addr:tt_msb_addr+4])
     (lsb,) = struct.unpack('<I', mm[tt_lsb_addr:tt_lsb_addr+4])
-    return (msb << 32) + lsb
+    # WORKAROUND: subtract the measured acc_tt error (see refresh_acc_tt_correction)
+    correction = fast_read_params.get('tt_correction')
+    return (msb << 32) + lsb - (int(correction[0]) if correction is not None else 0)
 
 
 def read_acc_cnt_fast(fast_read_params):
@@ -12784,6 +12789,152 @@ def timed_sync_alignment(r_fast):
 ACC_TT_TOLERANCE_S = 1.0
 
 
+# ---------------------------------------------------------------------------
+# WORKAROUND (2026-10-08): accumulator TT correction.
+# REMOVE when realtimeradio confirm how acc_tt is meant to behave.
+#
+# On fw v7.12.1 (souk_dual_pipeline_krm_2026-07-22_1653) the accumulator's latched
+# TT (pN_acc0_acc_tt, the per-accumulation stamp every sample carries) does not
+# follow the documented sync flow, while the sync block's TT (ext_sync_tt) and the
+# mixer's live TT (pN_mix_tt) are right:
+#   after pipeline init's sw_sync(mrst)          acc_tt = TT - (secs from programming to that reset)
+#   after update_internal_time (TT load)         keeps that offset
+#   after set_timed_sync(mrst=True) fires        acc_tt = TT + (UNIX time the TT counter started)
+# The error K = acc_tt - TT is constant between such events, so it is measured
+# against pN_mix_tt and subtracted from every acc_tt read (read_tt_fast,
+# read_time_anchor). K sits in a small /dev/shm file per pipeline, so the stream
+# process (which reads acc_tt for every frame) sees a new value as soon as the
+# server measures one. The server re-measures after a TT load, a waited timed
+# sync, pipeline init and at startup, and checks it once a second
+# (check_acc_tt_correction), so a sync from any other path is caught within ~1 s.
+ACC_TT_CORRECTION_FILE = '/dev/shm/souk_acc_tt_correction_p{pipeline_id}'
+# The 1 Hz check re-measures when a corrected stamp does not trail the live mix_tt by
+# 0..one accumulation period, give or take this margin. A TT reload moves K by the
+# drift it corrects (0.32 ms on 2026-10-08), so a 1 ms threshold would miss it.
+ACC_TT_RECHECK_MARGIN_S = 50e-6
+ACC_TT_EDGES = 16          # accumulation edges per measurement (one per period)
+
+
+_ACC_TT_CORRECTION_VIEWS = {}   # path -> mapped view; the file itself is the live value
+
+
+def _acc_tt_correction_view(pipeline_id):
+    """A live int64 view of this pipeline's correction file (created as 0 if absent)."""
+    path = ACC_TT_CORRECTION_FILE.format(pipeline_id=pipeline_id)
+    if path in _ACC_TT_CORRECTION_VIEWS:
+        return _ACC_TT_CORRECTION_VIEWS[path]
+    if not os.path.exists(path) or os.path.getsize(path) != 8:
+        with open(path, 'wb') as f:
+            f.write(b'\0' * 8)
+        os.chmod(path, 0o644)
+    import mmap
+    with open(path, 'r+b') as f:
+        mm = mmap.mmap(f.fileno(), 8)
+    # One aligned 8-byte load/store on aarch64: a reader never sees half a write.
+    view = _ACC_TT_CORRECTION_VIEWS[path] = np.frombuffer(mm, dtype='<i8')
+    return view
+
+
+def _acc_tt_correction_for(r_fast):
+    """The correction view for this interface's pipeline, or None without one."""
+    pipeline_id = getattr(r_fast, 'pipeline_id', None)
+    return None if pipeline_id is None else _acc_tt_correction_view(pipeline_id)
+
+
+def _read_live_tt(mm, msb_addr, lsb_addr):
+    """A running 64-bit TT counter (pN_mix_tt), re-read if the low word wrapped."""
+    while True:
+        msb = struct.unpack('<I', mm[msb_addr:msb_addr + 4])[0]
+        lsb = struct.unpack('<I', mm[lsb_addr:lsb_addr + 4])[0]
+        if struct.unpack('<I', mm[msb_addr:msb_addr + 4])[0] == msb:
+            return (msb << 32) + lsb
+
+
+def measure_acc_tt_error(r_fast, edges=ACC_TT_EDGES, timeout_s=1.0):
+    """
+    K = (latched acc_tt) - (true TT of that accumulation), in clock ticks, measured
+    against the mixer's live TT (pN_mix_tt) at accumulation edges.
+
+    For each edge: poll [mix_tt, acc_cnt] until acc_cnt moves; the mix_tt read just
+    before the poll that saw the change was taken within one poll (~5 us) of the
+    edge, and acc_tt now holds that accumulation's stamp. Returns the median K and
+    the spread over ``edges`` edges.
+    """
+    acc = r_fast.accumulators[0]
+    transport = acc.host.transport
+    mm = transport.axil_mm
+    cnt_addr = transport._get_device_address(f'{acc.prefix}acc_cnt')
+    acc_msb = transport._get_device_address(f'{acc.prefix}acc_tt_msb')
+    acc_lsb = transport._get_device_address(f'{acc.prefix}acc_tt_lsb')
+    mix_msb = transport._get_device_address(f'{r_fast.mixer.prefix}tt_msb')
+    mix_lsb = transport._get_device_address(f'{r_fast.mixer.prefix}tt_lsb')
+
+    def word(address):
+        return struct.unpack('<I', mm[address:address + 4])[0]
+
+    ks = []
+    deadline = time.time() + timeout_s
+    while len(ks) < edges and time.time() < deadline:
+        c0 = word(cnt_addr)
+        while time.time() < deadline:
+            mix = _read_live_tt(mm, mix_msb, mix_lsb)
+            if word(cnt_addr) != c0:
+                break
+        else:
+            break
+        acc_tt = (word(acc_msb) << 32) + word(acc_lsb)
+        ks.append(acc_tt - mix)
+    if not ks:
+        raise RuntimeError('no accumulation edges within the timeout (accumulator not running?)')
+    ks.sort()
+    return {'k_ticks': int(ks[len(ks) // 2]), 'spread_ticks': int(ks[-1] - ks[0]),
+            'edges': len(ks)}
+
+
+def refresh_acc_tt_correction(r_fast, source=''):
+    """Measure K and publish it for every acc_tt reader of this pipeline. Returns the
+    measurement (with ``correction_s``), or None if this firmware has no mix_tt."""
+    try:
+        m = measure_acc_tt_error(r_fast)
+    except Exception as e:
+        _firmware_log(f'acc_tt correction not measured ({source}): {type(e).__name__}: {e}',
+                      source='tt')
+        return None
+    clk_hz = int(round(r_fast.adc_clk_hz / 8))
+    view = _acc_tt_correction_view(r_fast.pipeline_id)
+    previous = int(view[0])
+    view[0] = m['k_ticks']
+    m['correction_s'] = m['k_ticks'] / clk_hz
+    m['previous_correction_s'] = previous / clk_hz
+    _firmware_log(
+        f'acc_tt correction ({source}): {m["correction_s"]:+.6f} s '
+        f'(was {m["previous_correction_s"]:+.6f} s; spread {m["spread_ticks"] / clk_hz * 1e6:.1f} us '
+        f'over {m["edges"]} accumulations) [workaround, see firmware_lib]', source='tt')
+    return m
+
+
+def check_acc_tt_correction(r_fast):
+    """The 1 Hz check: one corrected acc_tt against the live mix_tt; re-measure if the
+    stamp does not trail it by 0..one accumulation period (+-ACC_TT_RECHECK_MARGIN_S).
+    Returns the refresh result, or None."""
+    acc = r_fast.accumulators[0]
+    transport = acc.host.transport
+    mm = transport.axil_mm
+    a = transport._get_device_address
+    acc_tt = ((struct.unpack('<I', mm[a(f'{acc.prefix}acc_tt_msb'):a(f'{acc.prefix}acc_tt_msb') + 4])[0] << 32)
+              + struct.unpack('<I', mm[a(f'{acc.prefix}acc_tt_lsb'):a(f'{acc.prefix}acc_tt_lsb') + 4])[0])
+    mix = _read_live_tt(mm, a(f'{r_fast.mixer.prefix}tt_msb'), a(f'{r_fast.mixer.prefix}tt_lsb'))
+    clk_hz = int(round(r_fast.adc_clk_hz / 8))
+    # The mixer's acc_len register holds the accumulation period in clock ticks.
+    period_s = struct.unpack('<I', mm[a(f'{r_fast.mixer.prefix}acc_len'):a(f'{r_fast.mixer.prefix}acc_len') + 4])[0] / clk_hz
+    lag_s = (mix - (acc_tt - int(_acc_tt_correction_view(r_fast.pipeline_id)[0]))) / clk_hz
+    if not -ACC_TT_RECHECK_MARGIN_S <= lag_s <= period_s + ACC_TT_RECHECK_MARGIN_S:
+        return refresh_acc_tt_correction(
+            r_fast, source=f'1 Hz check, stamp {lag_s * 1e6:+.0f} us behind mix_tt')
+    return None
+# --------------------------------------------------------------- end WORKAROUND
+
+
 def read_time_anchor(r_fast, attempts=5):
     """
     The server's clock, the accumulation count and the accumulator's telescope time,
@@ -12825,11 +12976,17 @@ def read_time_anchor(r_fast, attempts=5):
             break
     clk_hz = int(round(r_fast.adc_clk_hz / 8))
     server_time = 0.5 * (t0 + t1)
+    # WORKAROUND: the same correction read_tt_fast applies (see refresh_acc_tt_correction)
+    view = _acc_tt_correction_for(r_fast)
+    correction = int(view[0]) if view is not None else 0
+    tt_raw, tt = tt, tt - correction
     tt_unix_s = tt / clk_hz
     return {
         'server_time_unix': server_time,
         'acc_cnt': cnt,
         'telescope_time': tt,
+        'telescope_time_raw': tt_raw,
+        'acc_tt_correction_s': correction / clk_hz,
         'clk_hz': clk_hz,
         'tt_unix_s': tt_unix_s,
         'tt_offset_s': tt_unix_s - server_time,
@@ -12875,11 +13032,14 @@ def set_telescope_time(r_fast):
     result = timed_sync_alignment(r_fast)
     result['loaded'] = True
     result['aligned'] = bool(abs(result['pps_boundary_offset_s']) < DEFAULT_ALIGN_TOL_S)
+    # WORKAROUND: the load changes the accumulator's TT error; re-measure it.
+    refresh_acc_tt_correction(r_fast, source='set_telescope_time')
     # The sync block's TT is not the one the stream carries: check the accumulator's.
     anchor = read_time_anchor(r_fast)
     result['acc_tt_unix_s'] = anchor['tt_unix_s']
     result['acc_tt_offset_s'] = anchor['tt_offset_s']
     result['acc_tt_ok'] = anchor['tt_ok']
+    result['acc_tt_correction_s'] = anchor['acc_tt_correction_s']
     if not anchor['tt_ok']:
         result['warning'] = (
             f"the load reached the sync block but the accumulator's TT (the one "
@@ -13062,6 +13222,11 @@ def timed_sync_arm(r_fast, target_unix_s=None, seconds_from_now=None,
     sync.set_timed_sync(target_tt_value, wait=wait, mrst=True)
     # After wait=True this has elapsed to ~0; after wait=False it is roughly the lead.
     countdown_remaining_s = sync.get_time_to_sync() / clk_hz
+    if wait:
+        # WORKAROUND: the sync changes the accumulator's TT error; re-measure it.
+        # (Without wait, the server's 1 Hz check picks the change up after it fires.)
+        time.sleep(0.01)
+        refresh_acc_tt_correction(r_fast, source='timed sync')
 
     return {
         'target_tt_unix_s': float(target_sec),

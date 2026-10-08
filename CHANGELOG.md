@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **WORKAROUND, accumulator TT correction** (remove when realtimeradio confirm
+  how `acc_tt` should behave). On fw 7.12.1 the accumulator's latched TT is off
+  after the documented sync flow (TT − 9 s after pipeline init, TT + the
+  programming time after a timed sync) while the mixer's live `tt` is right.
+  The server measures K = `acc_tt − mix_tt` at accumulation edges (after a TT
+  load, a waited timed sync, pipeline init, server start, and a 1 Hz check) and
+  every `acc_tt` read subtracts it; `get_info('sync')` shows
+  `acc_tt_correction_s`. Reproduction for realtimeradio:
+  `scripts/timed_sync/10_acc_tt_report.py`.
 - **The server reaches its own tcpborphserver at `127.0.0.1`, not
   `localhost`.** With an empty `/etc/hosts`, `localhost` went to DNS and resolved
   to the other board: krm4-cdf's server programmed and initialised krm4-mcr's

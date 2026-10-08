@@ -288,6 +288,7 @@ STREAM_DRAIN_TIMEOUT_S = 10.0
 # a trip from any cause -- a level change, a crest-factor peak after a retune
 # -- is logged with its time and accumulation count (firmware_lib).
 ADC_OVERVOLTAGE_MONITOR_S = 1.0
+ACC_TT_MONITOR_S = 1.0          # WORKAROUND: acc_tt correction check period
 
 # How often an *idle* stream client's handler wakes to send its zero-length
 # heartbeat and poll for a subscribe line. The client blocks in recv(4) with no
@@ -1545,6 +1546,13 @@ class ReadoutServer:
                     source='init',
                 )
 
+        if self.r_fast is not None:
+            # WORKAROUND: measure the accumulator TT correction for this start.
+            try:
+                firmware_lib.refresh_acc_tt_correction(self.r_fast, source='server start')
+            except Exception as e:
+                _server_log(f'warning: acc_tt correction not measured: {e}', source='init')
+
         if self.r is not None:
             #see if we can succesfully load system information
             try:
@@ -2061,6 +2069,24 @@ class ReadoutServer:
                 pass
         return context
 
+    async def _acc_tt_monitor(self):
+        """WORKAROUND (remove with firmware_lib's acc_tt correction): once a second,
+        check the corrected accumulator TT against the mixer's live TT and re-measure
+        the correction if a sync or reset has changed it."""
+        last_error = None
+        while True:
+            await asyncio.sleep(ACC_TT_MONITOR_S)
+            if self.r_fast is None or not hasattr(self.r_fast, 'accumulators'):
+                continue
+            try:
+                firmware_lib.check_acc_tt_correction(self.r_fast)
+                last_error = None
+            except Exception as e:
+                message = f'{type(e).__name__}: {e}'
+                if message != last_error:
+                    print(f'acc_tt monitor: {message}')
+                last_error = message
+
     async def _adc_overvoltage_monitor(self):
         """Read the ADC over-voltage flag every ADC_OVERVOLTAGE_MONITOR_S, logging trips.
 
@@ -2373,6 +2399,9 @@ class ReadoutServer:
             'acc_tt_utc': unix_to_iso(anchor['tt_unix_s']),
             'acc_tt_offset_s': anchor['tt_offset_s'],
             'acc_tt_ok': anchor['tt_ok'],
+            # WORKAROUND: the measured acc_tt error already subtracted from the above
+            # and from every stamp (firmware_lib.refresh_acc_tt_correction)
+            'acc_tt_correction_s': anchor.get('acc_tt_correction_s'),
         }
         if anchor['tt_ok'] is False:
             acc_tt['acc_tt_warning'] = (
@@ -8237,6 +8266,7 @@ class ReadoutServer:
         self.stream_task = asyncio.create_task(self.stream_data())
         self.triggered_stream_task = asyncio.create_task(self.triggered_stream())
         self.adc_overvoltage_task = asyncio.create_task(self._adc_overvoltage_monitor())
+        self.acc_tt_task = asyncio.create_task(self._acc_tt_monitor())  # WORKAROUND
         
         async with request_server, stream_server:
             await asyncio.gather(
