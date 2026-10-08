@@ -12812,7 +12812,11 @@ ACC_TT_TOLERANCE_S = 1.0
 # acc_tt read (read_tt_fast, read_time_anchor):
 #   K_am = acc_tt - mix_tt  at accumulation edges   (measure_acc_tt_error)
 #   E    = mix_tt - TT      at a PPS edge            (measure_mix_tt_error)
-# K = K_am + E sits in a small /dev/shm file per pipeline, so the stream process
+# The mixer's TT deliberately runs pipeline_latency (15036 clocks, 48.95 us) behind
+# the sync block's, so a stamp refers to when its signal entered the ADC; that
+# offset is kept (L below): the stamps are the mixer's TT, as acc_tt should be.
+#   K = K_am + E + L
+# K sits in a small /dev/shm file per pipeline, so the stream process
 # (which reads acc_tt for every frame) sees a new value as soon as the server
 # measures one. The server re-measures after a TT load, a waited timed sync,
 # pipeline init and at startup, and checks both parts once a second
@@ -12831,7 +12835,7 @@ _ACC_TT_CORRECTION_VIEWS = {}   # path -> mapped view; the file itself is the li
 
 def _acc_tt_correction_view(pipeline_id):
     """A live int64 view of this pipeline's correction file (created as 0 if absent):
-    [K (what readers subtract), K_am, E] in clock ticks."""
+    [K (what readers subtract), K_am, E (measured)] in clock ticks."""
     path = ACC_TT_CORRECTION_FILE.format(pipeline_id=pipeline_id)
     if path in _ACC_TT_CORRECTION_VIEWS:
         return _ACC_TT_CORRECTION_VIEWS[path]
@@ -12862,19 +12866,44 @@ def _read_live_tt(mm, msb_addr, lsb_addr):
             return (msb << 32) + lsb
 
 
-def measure_acc_tt_error(r_fast, edges=ACC_TT_EDGES, max_polls=5000):
-    """
-    K = (latched acc_tt) - (true TT of that accumulation), in clock ticks, measured
-    against the mixer's live TT (pN_mix_tt) at accumulation edges.
+# An edge is accepted only if its whole bracket is short: from the mix_tt read before
+# the last unchanged read to the mix_tt read after the first changed one. A pause
+# inside it (another thread holding the GIL, an interrupt) widens it and the edge is
+# retried. Without this, a pause between two reads made the estimate late while the
+# reads either side still looked 2 us apart: E came out +162 us instead of -48 us on
+# 2026-10-08, when the 1 Hz check and a timed-sync re-measure ran at the same time.
+ACC_TT_MAX_BRACKET_S = 15e-6
+_ACC_TT_LOCK = threading.RLock()     # one measurement at a time, per process
 
-    For each edge, a tight loop reads only the two low words, acc_tt then mix_tt
-    (~2 us each over devmem), until acc_tt changes. The edge lies between the last
-    acc_tt read that saw the old value and the first that saw the new one, and the
-    mix_tt read made between those two sits in the middle of that interval: it is
-    the edge to within half a loop (~2-3 us), unbiased. (The first version timed edges with a slower
-    loop that read 64-bit values and the clock every pass: it put stamps 100-160 us
-    late, differently on each board, 2026-10-08.) Returns the median K, the spread,
-    and the mean loop period (the resolution) over ``edges`` edges.
+
+def _time_change(mm, watch_addr, mix_addr, deadline):
+    """Wait for the low word at ``watch_addr`` to change, reading mix_tt's low word
+    between reads. Returns (new watched value, mix_tt low word between the last old
+    and the first new read, bracket width in ticks), or None at the deadline."""
+    unpack = struct.Struct('<I').unpack
+    w0 = unpack(mm[watch_addr:watch_addr + 4])[0]
+    m_prev = m = unpack(mm[mix_addr:mix_addr + 4])[0]
+    n = 0
+    while True:
+        w = unpack(mm[watch_addr:watch_addr + 4])[0]
+        if w != w0:
+            m_after = unpack(mm[mix_addr:mix_addr + 4])[0]
+            return w, m, (m_after - m_prev) & 0xFFFFFFFF
+        m_prev, m = m, unpack(mm[mix_addr:mix_addr + 4])[0]
+        n += 1
+        if n % 1000 == 0 and time.time() > deadline:
+            return None
+
+
+def measure_acc_tt_error(r_fast, edges=ACC_TT_EDGES, timeout_s=1.0):
+    """
+    K_am = (latched acc_tt) - (mix_tt at that accumulation edge), in clock ticks.
+
+    For each edge, a tight loop reads the low words of acc_tt and mix_tt until
+    acc_tt changes; the mix_tt read between the last old and the first new acc_tt
+    read is the edge (see _time_change). Edges whose bracket is wider than
+    ACC_TT_MAX_BRACKET_S are discarded. Returns the median over ``edges`` accepted
+    edges, the spread, the median bracket (``loop_ticks``) and the number rejected.
     """
     acc = r_fast.accumulators[0]
     transport = acc.host.transport
@@ -12883,44 +12912,40 @@ def measure_acc_tt_error(r_fast, edges=ACC_TT_EDGES, max_polls=5000):
     acc_lsb = transport._get_device_address(f'{acc.prefix}acc_tt_lsb')
     mix_msb = transport._get_device_address(f'{r_fast.mixer.prefix}tt_msb')
     mix_lsb = transport._get_device_address(f'{r_fast.mixer.prefix}tt_lsb')
+    max_bracket = ACC_TT_MAX_BRACKET_S * r_fast.adc_clk_hz / 8
     unpack = struct.Struct('<I').unpack
-
-    ks, loops = [], []
-    for _ in range(edges):
-        a0 = unpack(mm[acc_lsb:acc_lsb + 4])[0]
-        m_before = unpack(mm[mix_lsb:mix_lsb + 4])[0]
-        for _ in range(max_polls):
-            a = unpack(mm[acc_lsb:acc_lsb + 4])[0]
-            m = unpack(mm[mix_lsb:mix_lsb + 4])[0]
-            if a != a0:
-                break
-            m_before = m
-        else:
-            continue                       # no edge within max_polls; try again
-        loop = (m - m_before) & 0xFFFFFFFF                 # one pass, in ticks
-        edge_lsb = m_before            # read between the last old and first new acc_tt
+    deadline = time.time() + timeout_s
+    ks, brackets, rejected = [], [], 0
+    while len(ks) < edges:
+        change = _time_change(mm, acc_lsb, mix_lsb, deadline)
+        if change is None:
+            break
+        a, m_edge, bracket = change
+        if bracket > max_bracket:
+            rejected += 1
+            continue
         # Full 64-bit values: the latched acc_tt is steady for a whole accumulation;
-        # the edge is mix_tt now minus the (small) ticks elapsed since edge_lsb.
+        # the edge is mix_tt now minus the (small) ticks elapsed since m_edge.
         acc_tt = (unpack(mm[acc_msb:acc_msb + 4])[0] << 32) + a
         mix_now = _read_live_tt(mm, mix_msb, mix_lsb)
-        edge = mix_now - ((mix_now - edge_lsb) & 0xFFFFFFFF)
-        ks.append(acc_tt - edge)
-        loops.append(loop)
+        ks.append(acc_tt - (mix_now - ((mix_now - m_edge) & 0xFFFFFFFF)))
+        brackets.append(bracket)
     if not ks:
-        raise RuntimeError('no accumulation edges seen (accumulator not running?)')
+        raise RuntimeError(f'no clean accumulation edges ({rejected} disturbed; '
+                           f'accumulator not running?)')
     ks.sort()
     return {'k_ticks': int(ks[len(ks) // 2]), 'spread_ticks': int(ks[-1] - ks[0]),
-            'loop_ticks': int(np.mean(loops)), 'edges': len(ks)}
+            'loop_ticks': int(np.median(brackets)), 'edges': len(ks), 'rejected': rejected}
 
 
-def measure_mix_tt_error(r_fast, timeout_s=1.5 * PPS_PERIOD_S):
+def measure_mix_tt_error(r_fast, timeout_s=2.5 * PPS_PERIOD_S):
     """
-    E = mix_tt - (sync block TT), in clock ticks, at the next PPS edge.
+    E = mix_tt - (sync block TT), in clock ticks, at a PPS edge.
 
-    The sync block latches its TT into ext_sync_tt at each PPS. A tight loop reads
-    the low words of ext_sync_tt and mix_tt until ext_sync_tt changes; the mix_tt
-    read made between the last old and the first new value is the PPS edge to
-    within half a loop (~2-3 us). Waits up to one PPS period.
+    The sync block latches its TT into ext_sync_tt at each PPS; the PPS is timed
+    against mix_tt the same way as an accumulation edge (_time_change), retrying at
+    the next PPS if the bracket was disturbed. E is about -49 us after a timed sync
+    (the mixer's pipeline_latency, 15036 clocks) and anything after a master reset.
     """
     transport = r_fast.accumulators[0].host.transport
     mm = transport.axil_mm
@@ -12928,42 +12953,63 @@ def measure_mix_tt_error(r_fast, timeout_s=1.5 * PPS_PERIOD_S):
     ext_lsb = transport._get_device_address(f'{r_fast.sync.prefix}ext_sync_tt_lsb')
     mix_msb = transport._get_device_address(f'{r_fast.mixer.prefix}tt_msb')
     mix_lsb = transport._get_device_address(f'{r_fast.mixer.prefix}tt_lsb')
-    unpack = struct.Struct('<I').unpack
+    max_bracket = ACC_TT_MAX_BRACKET_S * r_fast.adc_clk_hz / 8
     deadline = time.time() + timeout_s
-    e0 = unpack(mm[ext_lsb:ext_lsb + 4])[0]
-    m_before = unpack(mm[mix_lsb:mix_lsb + 4])[0]
+    rejected = 0
     while True:
-        for _ in range(1000):
-            e = unpack(mm[ext_lsb:ext_lsb + 4])[0]
-            m = unpack(mm[mix_lsb:mix_lsb + 4])[0]
-            if e != e0:
-                break
-            m_before = m
-        if e != e0:
-            break
-        if time.time() > deadline:
-            raise RuntimeError('no PPS within the timeout (is the TSU strobe running?)')
-    ext_tt = _read_live_tt(mm, ext_msb, ext_lsb)          # latched: steady for a second
-    mix_now = _read_live_tt(mm, mix_msb, mix_lsb)
-    edge = mix_now - ((mix_now - m_before) & 0xFFFFFFFF)  # mix_tt at the PPS
-    return {'e_ticks': int(edge - ext_tt), 'loop_ticks': int((m - m_before) & 0xFFFFFFFF)}
+        change = _time_change(mm, ext_lsb, mix_lsb, deadline)
+        if change is None:
+            raise RuntimeError(f'no clean PPS edge within {timeout_s:.1f} s ({rejected} '
+                               f'disturbed; is the TSU strobe running?)')
+        _, m_edge, bracket = change
+        if bracket > max_bracket:
+            rejected += 1
+            continue
+        ext_tt = _read_live_tt(mm, ext_msb, ext_lsb)          # latched: steady for a second
+        mix_now = _read_live_tt(mm, mix_msb, mix_lsb)
+        edge = mix_now - ((mix_now - m_edge) & 0xFFFFFFFF)    # mix_tt at the PPS
+        return {'e_ticks': int(edge - ext_tt), 'loop_ticks': int(bracket), 'rejected': rejected}
+
+
+_ACC_TT_LAST_FAILURE = [None]   # the last "not measured" reason, so repeats log once
 
 
 def refresh_acc_tt_correction(r_fast, source=''):
     """Measure K = K_am + E and publish it for every acc_tt reader of this pipeline.
-    Returns the measurement (with ``correction_s``), or None if it could not be made."""
+    Returns the measurement (with ``correction_s``), or None if it could not be made
+    (e.g. during a timed-sync countdown, when the pipeline is held in reset)."""
+    with _ACC_TT_LOCK:
+        try:
+            m = measure_acc_tt_error(r_fast)
+            m_e = measure_mix_tt_error(r_fast)
+        except Exception as e:
+            reason = f'{type(e).__name__}: {e}'
+            if reason != _ACC_TT_LAST_FAILURE[0]:
+                _firmware_log(f'acc_tt correction not measured ({source}): {reason}', source='tt')
+            _ACC_TT_LAST_FAILURE[0] = reason
+            return None
+        _ACC_TT_LAST_FAILURE[0] = None
+        return _publish_acc_tt_correction(r_fast, m, m_e, source)
+
+
+def _pipeline_latency_ticks(r_fast):
+    """The mixer's pipeline_latency register (clock ticks), or 0 if this firmware has none."""
+    transport = r_fast.accumulators[0].host.transport
     try:
-        m = measure_acc_tt_error(r_fast)
-        m_e = measure_mix_tt_error(r_fast)
-    except Exception as e:
-        _firmware_log(f'acc_tt correction not measured ({source}): {type(e).__name__}: {e}',
-                      source='tt')
-        return None
+        address = transport._get_device_address(f'{r_fast.mixer.prefix}pipeline_latency')
+    except Exception:
+        return 0
+    return struct.unpack('<I', transport.axil_mm[address:address + 4])[0]
+
+
+def _publish_acc_tt_correction(r_fast, m, m_e, source):
+    """Write K = K_am + E + L for every reader, and log it."""
     clk_hz = int(round(r_fast.adc_clk_hz / 8))
     view = _acc_tt_correction_view(r_fast.pipeline_id)
     previous = int(view[0])
     m['k_am_ticks'], m['e_ticks'] = m['k_ticks'], m_e['e_ticks']
-    m['k_ticks'] = m['k_am_ticks'] + m['e_ticks']
+    m['latency_ticks'] = _pipeline_latency_ticks(r_fast)
+    m['k_ticks'] = m['k_am_ticks'] + m['e_ticks'] + m['latency_ticks']
     view[1], view[2] = m['k_am_ticks'], m['e_ticks']
     view[0] = m['k_ticks']                    # what every reader subtracts; written last
     m['correction_s'] = m['k_ticks'] / clk_hz
@@ -12971,8 +13017,10 @@ def refresh_acc_tt_correction(r_fast, source=''):
     _firmware_log(
         f'acc_tt correction ({source}): {m["correction_s"]:+.6f} s '
         f'(was {m["previous_correction_s"]:+.6f} s; acc - mix {m["k_am_ticks"] / clk_hz:+.6f} s, '
-        f'mix - sync TT {m["e_ticks"] / clk_hz:+.6f} s; edges timed to '
-        f'+-{max(m["loop_ticks"], m_e["loop_ticks"]) / 2 / clk_hz * 1e6:.1f} us) '
+        f'mix - sync TT {m["e_ticks"] / clk_hz:+.6f} s, of which pipeline latency '
+        f'{-m["latency_ticks"] / clk_hz * 1e6:+.2f} us is kept; edges timed to '
+        f'+-{max(m["loop_ticks"], m_e["loop_ticks"]) / 2 / clk_hz * 1e6:.1f} us, '
+        f'{m["rejected"] + m_e["rejected"]} disturbed edges rejected) '
         f'[workaround, see firmware_lib]', source='tt')
     return m
 
@@ -12984,6 +13032,11 @@ def check_acc_tt_correction(r_fast):
         which catches a reset that moved the mixer's copy along with the acc's.
     Either out of range (+-ACC_TT_RECHECK_MARGIN_S): re-measure. Returns ``lag_s``
     (stamp behind mix_tt), ``since_pps_s`` and ``refreshed`` (the new measurement, or None)."""
+    with _ACC_TT_LOCK:
+        return _check_acc_tt_correction(r_fast)
+
+
+def _check_acc_tt_correction(r_fast):
     acc = r_fast.accumulators[0]
     transport = acc.host.transport
     mm = transport.axil_mm
