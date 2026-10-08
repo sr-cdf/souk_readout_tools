@@ -2073,13 +2073,29 @@ class ReadoutServer:
         """WORKAROUND (remove with firmware_lib's acc_tt correction): once a second,
         check the corrected accumulator TT against the mixer's live TT and re-measure
         the correction if a sync or reset has changed it."""
+        _server_log(f'acc_tt monitor running (every {ACC_TT_MONITOR_S:g} s)', source='tt')
         last_error = None
+        last_skip = None
+        checks = 0
         while True:
             await asyncio.sleep(ACC_TT_MONITOR_S)
-            if self.r_fast is None or not hasattr(self.r_fast, 'accumulators'):
+            skip = ('no fast interface' if self.r_fast is None else
+                    'fast interface has no accumulators' if not hasattr(self.r_fast, 'accumulators')
+                    else None)
+            if skip != last_skip and skip is not None:
+                _server_log(f'acc_tt monitor: skipping checks ({skip})', source='tt')
+            last_skip = skip
+            if skip is not None:
                 continue
             try:
-                firmware_lib.check_acc_tt_correction(self.r_fast)
+                # In a worker thread: a re-measure waits for a PPS (up to 1 s).
+                result = await asyncio.get_running_loop().run_in_executor(
+                    None, firmware_lib.check_acc_tt_correction, self.r_fast)
+                checks += 1
+                if checks == 1:
+                    _server_log(f'acc_tt monitor: first check, stamp {result["lag_s"] * 1e6:+.0f} us '
+                                f'behind mix_tt, mix_tt {result["since_pps_s"]:.3f} s after '
+                                f'the last PPS', source='tt')
                 last_error = None
             except Exception as e:
                 message = f'{type(e).__name__}: {e}'
@@ -2093,6 +2109,8 @@ class ReadoutServer:
         Read-only: a trip is logged (firmware_lib.adc_overvoltage_events and
         the journal), never released here.
         """
+        _server_log(f'ADC over-voltage monitor running (every {ADC_OVERVOLTAGE_MONITOR_S:g} s)',
+                    source='rfdc')
         last_error = None
         while True:
             await asyncio.sleep(ADC_OVERVOLTAGE_MONITOR_S)
@@ -8238,6 +8256,10 @@ class ReadoutServer:
         if sp_mod.wanted(self.config):
             # The stream port, and every frame, belong to the stream process.
             await self._start_stream_process()
+            # The monitors run in this (request) process in both modes; this branch
+            # used to return without starting them (found 2026-10-08).
+            self.adc_overvoltage_task = asyncio.create_task(self._adc_overvoltage_monitor())
+            self.acc_tt_task = asyncio.create_task(self._acc_tt_monitor())  # WORKAROUND
             request_server = await asyncio.start_server(self.handle_request_client, self.server_address, self.request_server_port)
             _server_log(
                 f'request server listening on '
