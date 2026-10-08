@@ -28,7 +28,7 @@ SAMPLES = 10
 INTERVAL_S = 3.0
 
 print("building the readout connection interface (local=True, /dev/mem)...")
-sync = SoukMkidReadout("localhost", configfile=FW_CONFIG,
+sync = SoukMkidReadout("127.0.0.1", configfile=FW_CONFIG,
                        pipeline_id=PIPELINE_ID, local=True).sync
 print(f"connected (pipeline {PIPELINE_ID}); clk_hz = {CLK_HZ}\n")
 

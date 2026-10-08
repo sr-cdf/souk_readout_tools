@@ -872,9 +872,17 @@ def _local_transport(device):
         casperfpga.LocalMemTransport = original
 
 
+# The katcp server (tcpborphserver) runs on this board: reach it by the loopback
+# address, never the name 'localhost'. With an empty /etc/hosts, 'localhost' goes to
+# DNS, and on 2026-10-08 the router answered with the OTHER board's address (both
+# had registered the DHCP hostname "localhost"): krm4-cdf's server programmed and
+# initialised krm4-mcr's FPGA over katcp while its fast path read its own blank one.
+LOCAL_FPGA_HOST = '127.0.0.1'
+
+
 def create_standard_readout_interface(fw_config_file,pipeline_id=0):
     try:
-        r = SoukMkidReadout('localhost',configfile=fw_config_file,pipeline_id=pipeline_id)
+        r = SoukMkidReadout(LOCAL_FPGA_HOST,configfile=fw_config_file,pipeline_id=pipeline_id)
     except NameError:
         raise RuntimeError('souk_mkid_readout module not imported, cannot create readout interface')
     return r
@@ -889,9 +897,9 @@ def create_fast_readout_interface(fw_config_file,pipeline_id=0,uio=False):
     try:
         if uio:
             with _local_transport(uio if isinstance(uio, str) else UIO_AXIL_DEVICE):
-                return SoukMkidReadout('localhost',configfile=fw_config_file,
+                return SoukMkidReadout(LOCAL_FPGA_HOST,configfile=fw_config_file,
                                        local=True,pipeline_id=pipeline_id)
-        return SoukMkidReadout('localhost',configfile=fw_config_file,local=True,pipeline_id=pipeline_id)
+        return SoukMkidReadout(LOCAL_FPGA_HOST,configfile=fw_config_file,local=True,pipeline_id=pipeline_id)
     except NameError:
         raise RuntimeError('souk_mkid_readout module not imported, cannot create readout interface')
 
@@ -1520,6 +1528,17 @@ def reload_firmware(config_dict, r=None):
         r.program()
         time.sleep(1)
         r_fast = create_fast_readout_interface(fw_config_file,pipeline_id=pipeline_id)
+        # r.program() only reports what the katcp server said. Confirm this board's
+        # own fabric now runs the design: the fast interface reads it directly and
+        # builds no blocks if its clock reads 0 ("FPGA is not clocking"). Without
+        # this, a load that went elsewhere or silently failed carried on into
+        # shared/pipeline init and a server reporting "ready" (2026-10-08).
+        if not getattr(r_fast, 'blocks', None):
+            raise RuntimeError(
+                'FPGA programming reported success, but this board\'s fabric is not '
+                'running the design (fast interface: fabric clock 0, no blocks). '
+                'Check the kernel log for "writing tcpborphserver.bin" and that '
+                f'{LOCAL_FPGA_HOST} is this board\'s tcpborphserver.')
         fw_type = r.fpga.get_firmware_type()
         if fw_type==2:
             if pipeline_id!=0:
@@ -1889,7 +1908,8 @@ def fpga_programmed(r):
     (doc/v712-notes.md, test 12). A register read cannot answer this safely:
     reading an unprogrammed or unclocked fabric hangs the processor.
     """
-    local = r is not None and getattr(getattr(r.fpga, 'host', None), 'host', None) == 'localhost'
+    local = (r is not None and getattr(getattr(r.fpga, 'host', None), 'host', None)
+             in (LOCAL_FPGA_HOST, 'localhost'))
     if local and os.path.exists(FPGA_MANAGER_STATE):
         with open(FPGA_MANAGER_STATE) as f:
             return f.read().strip() == 'operating'

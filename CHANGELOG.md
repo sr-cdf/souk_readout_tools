@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **The server reaches its own tcpborphserver at `127.0.0.1`, not
+  `localhost`.** With an empty `/etc/hosts`, `localhost` went to DNS and resolved
+  to the other board: krm4-cdf's server programmed and initialised krm4-mcr's
+  FPGA (2026-10-08).
+- **Programming is verified on this board's fabric.** If the fast interface
+  sees no running design after `r.program()`, programming raises instead of
+  carrying on to init and "ready".
 - **chrony waits for ptp4l at boot.** New drop-in
   `chrony.service.d/10-wait-for-ptp4l.conf` (installed by
   `install_timing_services.sh`) holds chrony until ptp4l is SLAVE, 90 s max.

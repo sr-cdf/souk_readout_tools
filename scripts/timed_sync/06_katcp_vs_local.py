@@ -34,7 +34,7 @@ def bench(local):
     label = "local (/dev/mem)" if local else "KATCP (localhost)"
     print(f"\n=== {label} ===")
     print(f"  building interface (local={local})...")
-    sync = SoukMkidReadout("localhost", configfile=FW_CONFIG,
+    sync = SoukMkidReadout("127.0.0.1", configfile=FW_CONFIG,
                            pipeline_id=PIPELINE_ID, local=local).sync
 
     # per-register read latency: time Sync.read_uint('ext_sync_tt_lsb')

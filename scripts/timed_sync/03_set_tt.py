@@ -34,7 +34,7 @@ CLK_HZ = 307_200_000
 
 print("building the readout connection interface "
       "(KATCP + parsing .fpg + building blocks, a few seconds)...")
-sync = SoukMkidReadout("localhost", configfile=FW_CONFIG, pipeline_id=PIPELINE_ID).sync
+sync = SoukMkidReadout("127.0.0.1", configfile=FW_CONFIG, pipeline_id=PIPELINE_ID).sync
 print(f"connected (pipeline {PIPELINE_ID}); clk_hz = {CLK_HZ}\n")
 
 print("loading telescope time (update_internal_time, forcing 1 s period)...")
