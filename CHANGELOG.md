@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **ADC over-voltage trips can no longer pass unseen.** A trip holds the ADC DSA
+  at 15 dB (absolute) while `get_dsa` reads the programmed value; on krm4-mcr the
+  hold lasts while the RTS flag is latched and clearing the flag releases it.
+  - Routine checks (`health_check`, `get_info`, `check_input_saturation` without
+    a config, the diagnostics in `get_info('all')` / `get_samples` /
+    `receive_stream`) only read the flag; they used to clear it silently.
+  - `release_adc_overvoltage` is the one place it is cleared, with the event
+    logged. Level-changing requests (RX/TX attenuation and amp bypass, DSA,
+    tone amplitudes/powers, `maximise_tx_power`, blind tones) watch for a trip
+    for 1 s, release once and warn; the RX policies and maximise/fix/optimise
+    routines release too. New `client.release_adc_overvoltage()`.
+  - A server monitor reads the flag once a second and logs trips (time,
+    accumulation count, DSA, RF settings) to `get_info('rfdc')` and the
+    journal. `health_check` and `get_adc_dsa` report the effective DSA.
+  - Captures save the events in the `.json`; `parse_stream`, `read_stream_chunk`
+    and the live buffer give a per-sample `adc_overvoltage` mask.
+    `stream_file.add_adc_overvoltage_events` / `parse_overvoltage_journal`
+    attach them afterwards.
+  - RX gain matching uses the effective DSA, and warns about trips.
+  - `rx_policy='compensate'` now always runs the saturation check.
+
 - **`match_rx_gain` on every timestream and snapshot plotter**, and on
   `timestream_psds`, `snapshot_psds`, `allan_deviation`, `timestream_stats`,
   `cross_psd`, `estimate_beta`: `'auto'` (default, recorded RX chain states),

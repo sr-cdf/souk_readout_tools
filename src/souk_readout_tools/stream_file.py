@@ -59,7 +59,8 @@ HEADER_FIELDS = ('packet_counter', 'packet_error', 'telescope_time', 'stream_fla
                  'modulation_point', 'modulation_settling', 'modulation_revision')
 
 # The per-sample entries of a parsed chunk: arrays, and dicts of arrays.
-_PER_SAMPLE_ARRAYS = HEADER_FIELDS[:3] + HEADER_FIELDS[4:] + ('sample_index', 'time_s')
+_PER_SAMPLE_ARRAYS = (HEADER_FIELDS[:3] + HEADER_FIELDS[4:]
+                      + ('sample_index', 'time_s', 'adc_overvoltage'))
 _PER_SAMPLE_DICTS = ('i_data', 'q_data', 'stream_flags')
 
 # Refuse a read that would need more than this fraction of the free memory.
@@ -257,6 +258,8 @@ def read_stream_chunk(filename, start=0, stop=None, tones=None, fields=None, *,
         result['packet_counter'] = unsigned[:, column_of['cnt']].astype(np.int64)
         ReadoutClient._warn_on_dropped_accumulations(result['packet_counter'],
                                                      'read_stream_chunk')
+        result['adc_overvoltage'], result['adc_overvoltage_events'] = \
+            capture_adc_overvoltage(metadata, result['packet_counter'])
     if 'packet_error' in fields:
         result['packet_error'] = unsigned[:, column_of['err']]
     if 'telescope_time' in fields:
@@ -398,6 +401,101 @@ TT_LOADED_AFTER_UNIX = 1e9
 # Warn when the counter's rate or the TT's drift is further off than these.
 RATE_TOLERANCE_PPM = 50.0
 TT_DRIFT_TOLERANCE_PPM = 5.0
+
+
+def adc_overvoltage_events_in_capture(events, first_frame, last_frame):
+    """The ADC over-voltage events (``firmware_lib.adc_overvoltage_events``) in a capture.
+
+    Matched by accumulation count against the capture's ``first_frame`` /
+    ``last_frame`` anchors (its ``.json``); an event without a count is
+    matched by time instead.
+    """
+    if not first_frame or not last_frame:
+        return []
+    c0 = int(first_frame['packet_counter'])
+    span = (int(last_frame['packet_counter']) - c0) % 2**32
+    kept = []
+    for event in events:
+        if 'acc_cnt' in event:
+            if (int(event['acc_cnt']) - c0) % 2**32 <= span:
+                kept.append(event)
+        elif first_frame['host_time_unix'] <= event['server_time_unix'] <= last_frame['host_time_unix']:
+            kept.append(event)
+    return kept
+
+
+def adc_overvoltage_mask(packet_counter, events, latched_at_start=False, counter0=None):
+    """Per sample: whether the ADC's over-voltage protection was engaged.
+
+    While engaged the ADC's DSA is held at 15 dB (the RX scale differs from the
+    rest of the capture). A ``'trip'`` event starts an engaged interval; a
+    ``'release'`` (that did not trip again) or ``'cleared'`` ends it.
+    ``latched_at_start`` is the state when the capture began (its
+    ``info['rfdc']['adc_overvoltage_latched']``). The monitor polls once a
+    second, so an interval starts up to a second after the trip itself.
+    ``counter0`` is the capture's first packet counter (default: this
+    array's first), so a chunk from mid-capture gets the right state.
+    """
+    counter = np.asarray(packet_counter, dtype=np.int64)
+    mask = np.full(len(counter), bool(latched_at_start))
+    if not len(counter):
+        return mask
+    c0 = int(counter[0] if counter0 is None else counter0)
+    relative = (counter - c0) % 2**32
+    timed = [e for e in events if 'acc_cnt' in e]
+    for event in sorted(timed, key=lambda e: (int(e['acc_cnt']) - c0) % 2**32):
+        start = int(np.searchsorted(relative, (int(event['acc_cnt']) - c0) % 2**32))
+        if event['kind'] == 'trip':
+            mask[start:] = True
+        elif event['kind'] in ('release', 'cleared') and not event.get('still_over_voltage'):
+            mask[start:] = False
+    return mask
+
+
+def capture_adc_overvoltage(metadata, packet_counter):
+    """``(mask, events)`` for samples of a capture, from its ``.json`` metadata."""
+    events = list(metadata.get('adc_overvoltage_events') or [])
+    rfdc = (metadata.get('info') or {}).get('rfdc') or {}
+    first = metadata.get('first_frame') or {}
+    mask = adc_overvoltage_mask(packet_counter, events,
+                                latched_at_start=bool(rfdc.get('adc_overvoltage_latched')),
+                                counter0=first.get('packet_counter'))
+    return mask, events
+
+
+def parse_overvoltage_journal(lines):
+    """Events from the server's ``ADC_OVERVOLTAGE {json}`` journal lines.
+
+    For a capture whose receiver could not fetch the server's log at the end,
+    e.g. ``journalctl -u readout_server_0 | grep ADC_OVERVOLTAGE``.
+    """
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+    events = []
+    for line in lines:
+        if 'ADC_OVERVOLTAGE ' in line:
+            events.append(json.loads(line.split('ADC_OVERVOLTAGE ', 1)[1]))
+    return events
+
+
+def add_adc_overvoltage_events(filename, events):
+    """Attach over-voltage events to a capture's ``.json``; returns those that fit.
+
+    Events outside the capture are ignored, and ones already there are not
+    duplicated.
+    """
+    with open(f'{filename}.json') as handle:
+        metadata = json.load(handle)
+    inside = adc_overvoltage_events_in_capture(
+        events, metadata.get('first_frame'), metadata.get('last_frame'))
+    existing = list(metadata.get('adc_overvoltage_events') or [])
+    seen = {(e.get('kind'), e.get('server_time_unix')) for e in existing}
+    added = [e for e in inside if (e.get('kind'), e.get('server_time_unix')) not in seen]
+    metadata['adc_overvoltage_events'] = sorted(
+        existing + added, key=lambda e: e.get('server_time_unix', 0.0))
+    with open(f'{filename}.json', 'w') as handle:
+        json.dump(metadata, handle, indent=4)
+    return added
 
 
 def stream_time_model(filename, progress=True):

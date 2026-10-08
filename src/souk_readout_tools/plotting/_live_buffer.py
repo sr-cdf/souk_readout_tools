@@ -317,4 +317,8 @@ class StreamBuffer:
         result['packet_missing'] = missing
         result['packet_discontinuity'] = discontinuity
         result['tone_updates'] = updates
+        # The over-voltage state recorded in the stream's info (as parse_samples).
+        from souk_readout_tools.stream_file import capture_adc_overvoltage
+        result['adc_overvoltage'], result['adc_overvoltage_events'] = \
+            capture_adc_overvoltage({'info': info}, result['packet_counter'])
         return result

@@ -284,6 +284,11 @@ STREAM_YIELD_MAX_SECONDS = 0.002
 # every other client. 2 s dropped live captures during client disk stalls.
 STREAM_DRAIN_TIMEOUT_S = 10.0
 
+# How often the server reads the ADC over-voltage flag (never clearing it), so
+# a trip from any cause -- a level change, a crest-factor peak after a retune
+# -- is logged with its time and accumulation count (firmware_lib).
+ADC_OVERVOLTAGE_MONITOR_S = 1.0
+
 # How often an *idle* stream client's handler wakes to send its zero-length
 # heartbeat and poll for a subscribe line. The client blocks in recv(4) with no
 # socket timeout and needs the heartbeat to get control back. While frames are
@@ -2039,6 +2044,85 @@ class ReadoutServer:
             return _dispatch(sections)
         return [_dispatch(s) for s in sections if s in dispatchers]
 
+    def _rf_context(self):
+        """RF frontend settings to log with an over-voltage event, or {}."""
+        rf = getattr(self, 'rf_peripherals', None)
+        context = {}
+        if rf is None or not getattr(rf, 'enabled', False):
+            return context
+        for key, getter in (('rx_attenuation_db', 'get_rx_attenuation'),
+                            ('tx_attenuation_db', 'get_tx_attenuation'),
+                            ('rx_amp_bypass', 'get_rx_amp_bypass'),
+                            ('tx_amp_bypass', 'get_tx_amp_bypass')):
+            try:
+                context[key] = getattr(rf, getter)()
+            except Exception:
+                pass
+        return context
+
+    async def _adc_overvoltage_monitor(self):
+        """Read the ADC over-voltage flag every ADC_OVERVOLTAGE_MONITOR_S, logging trips.
+
+        Read-only: a trip is logged (firmware_lib.adc_overvoltage_events and
+        the journal), never released here.
+        """
+        last_error = None
+        while True:
+            await asyncio.sleep(ADC_OVERVOLTAGE_MONITOR_S)
+            if self.r is None or self.config is None or not hasattr(self.r, 'rfdc'):
+                continue
+            try:
+                _, flags = firmware_lib.check_rfdc_rts_events(self.r)
+                if not flags.get('rts_available'):
+                    continue
+                latched = bool(flags.get('rts_over_voltage', False))
+                changed = latched != firmware_lib.adc_overvoltage_logged_latched()
+                firmware_lib.note_adc_overvoltage(
+                    self.r, self.config, self.r_fast, 'monitor', latched=latched,
+                    context=self._rf_context() if changed else None)
+                last_error = None
+            except Exception as e:
+                message = f'{type(e).__name__}: {e}'
+                if message != last_error:
+                    print(f'ADC over-voltage monitor: {message}')
+                last_error = message
+
+    async def _overvoltage_after_change(self, source, wait=True):
+        """After a level change: watch for an ADC over-voltage trip, release it once.
+
+        Returns fields to merge into the response: ``adc_overvoltage`` (the
+        release event) and a ``warning``, or ``{}`` when nothing tripped. A trip
+        that recurs after the release is left to the hardware protection and
+        reported (``still_over_voltage``); the settings are not reverted.
+        """
+        try:
+            if wait:
+                await asyncio.sleep(firmware_lib.ADC_OVERVOLTAGE_WATCH_S)
+            context = self._rf_context()
+            event = firmware_lib.release_adc_overvoltage(
+                self.r, self.config, source, watch_s=0.0, r_fast=self.r_fast,
+                context=context)
+            if event is None:
+                return {}
+            await asyncio.sleep(firmware_lib.ADC_OVERVOLTAGE_WATCH_S)
+            still = firmware_lib.note_adc_overvoltage(
+                self.r, self.config, self.r_fast, f'{source} (after release)',
+                context=context)
+            event['still_over_voltage'] = bool(still)
+            if still:
+                warning = (f'ADC over-voltage after {source}: released, but it tripped again, so '
+                           f'the ADC DSA is held at {firmware_lib.ADC_OVERVOLTAGE_DSA_DB} dB '
+                           '(get_dsa does not show this). Reduce the input level '
+                           '(more RX attenuation or less TX power).')
+            else:
+                warning = (f'ADC over-voltage tripped after {source}; released (the DSA was '
+                           'rewritten) and it has not recurred. The input is close to the limit.')
+            print(f'WARNING: {warning}')
+            return {'adc_overvoltage': event, 'warning': warning}
+        except Exception as e:
+            print(f'ADC over-voltage check after {source} failed: {type(e).__name__}: {e}')
+            return {}
+
     def health_check(self):
         """Compact health summary for intermittent polling."""
         # Initialisation level
@@ -2078,12 +2162,20 @@ class ReadoutServer:
             except Exception:
                 pass
 
-        # RTS events
+        # RTS events (read only: never cleared here)
         rts_any = False
+        overvoltage = None
+        dsa_programmed = dsa_effective = None
         try:
-            rts_any, _ = firmware_lib.check_rfdc_rts_events(self.r, clear=False)
+            rts_any, rts_flags = firmware_lib.check_rfdc_rts_events(self.r, clear=False)
+            if rts_flags.get('rts_available'):
+                overvoltage = bool(rts_flags.get('rts_over_voltage', False))
+                tile, block = firmware_lib._adc_tile_block(self.config)
+                dsa_programmed = int(self.r.rfdc.core.get_dsa(tile, block)['dsa'])
+                dsa_effective = firmware_lib.effective_adc_dsa_db(dsa_programmed, overvoltage)
         except Exception:
             pass
+        overvoltage_events = firmware_lib.adc_overvoltage_events()
 
         # Tone count
         tone_count = 0
@@ -2122,6 +2214,12 @@ class ReadoutServer:
             'modulation_streaming': self.e_modulation_enabled.is_set(),
             'sweeping': self.sweep_task is not None and not self.sweep_task.done(),
             'rts_events': rts_any,
+            # A latched trip holds the ADC DSA at 15 dB, unseen by get_dsa.
+            'adc_overvoltage': overvoltage,
+            'adc_dsa_programmed_db': dsa_programmed,
+            'adc_dsa_effective_db': dsa_effective,
+            'adc_overvoltage_events': len(overvoltage_events),
+            'adc_overvoltage_last': overvoltage_events[-1] if overvoltage_events else None,
             'adc_saturated': adc_sat,
             'dac_saturated': dac_sat,
             'dsp_overflow': dsp_ovf,
@@ -3127,7 +3225,8 @@ class ReadoutServer:
                         self.stream_flags[FLAG_SET_AMPS].clear()
                         self.stream_flags[FLAG_SET_FREQS].clear()
                     await asyncio.sleep(0)
-                    await self.send_response(writer, {'status': 'success', 'result': result})
+                    checked = await self._overvoltage_after_change('set_blind_tones')
+                    await self.send_response(writer, {'status': 'success', 'result': result, **checked})
 
                 elif request == 'remove_blind_tones':
                     self._begin_exclusive_frequency_operation('remove_blind_tones')
@@ -3292,7 +3391,8 @@ class ReadoutServer:
                         self._invalidate_modulation('tone amplitudes changed')
                         self.stream_flags[FLAG_SET_AMPS].clear()
                         await asyncio.sleep(0)
-                        response = {'status': 'success'}
+                        response = {'status': 'success',
+                                    **(await self._overvoltage_after_change('set_tone_amplitudes'))}
                     
                     elif param_name == 'tone_phases':
                         self._begin_exclusive_frequency_operation('set_tone_phases')
@@ -3348,7 +3448,8 @@ class ReadoutServer:
                         self._invalidate_modulation('tone powers changed')
                         self.stream_flags[FLAG_SET_AMPS].clear()
                         await asyncio.sleep(0)
-                        response = {'status': 'success', 'result': result}
+                        response = {'status': 'success', 'result': result,
+                                    **(await self._overvoltage_after_change('set_tone_powers'))}
 
 
                     elif param_name == 'cal_freeze':
@@ -4199,7 +4300,8 @@ class ReadoutServer:
                         result['tx_compression'] = dac['tx_compression']
                     if isinstance(dac, dict) and 'rx_compression' in dac:
                         result['rx_compression'] = dac['rx_compression']
-                    await self.send_response(writer, {'status': 'success', 'result': result})
+                    checked = await self._overvoltage_after_change('maximise_tx_power')
+                    await self.send_response(writer, {'status': 'success', 'result': result, **checked})
 
                 elif request == 'maximise_rx_power':
                     rf_cfg = self.config.get('rf_frontend', {}) or {}
@@ -4315,7 +4417,8 @@ class ReadoutServer:
                     value = float(message.get('value'))
                     self.rf_peripherals.set_tx_attenuation(value)
                     result = {'tx_attenuation_db': self.rf_peripherals.get_tx_attenuation()}
-                    await self.send_response(writer, {'status': 'success', 'result': result})
+                    checked = await self._overvoltage_after_change('set_tx_attenuation')
+                    await self.send_response(writer, {'status': 'success', 'result': result, **checked})
 
                 elif request == 'get_tx_attenuation':
                     result = {'tx_attenuation_db': self.rf_peripherals.get_tx_attenuation()}
@@ -4325,7 +4428,8 @@ class ReadoutServer:
                     value = float(message.get('value'))
                     self.rf_peripherals.set_rx_attenuation(value)
                     result = {'rx_attenuation_db': self.rf_peripherals.get_rx_attenuation()}
-                    await self.send_response(writer, {'status': 'success', 'result': result})
+                    checked = await self._overvoltage_after_change('set_rx_attenuation')
+                    await self.send_response(writer, {'status': 'success', 'result': result, **checked})
 
                 elif request == 'get_rx_attenuation':
                     result = {'rx_attenuation_db': self.rf_peripherals.get_rx_attenuation()}
@@ -4335,17 +4439,34 @@ class ReadoutServer:
                     value = float(message.get('value'))
                     applied = firmware_lib.set_adc_dsa_db(self.r, self.config, value)
                     result = {'adc_dsa_db': applied}
-                    await self.send_response(writer, {'status': 'success', 'result': result})
+                    checked = await self._overvoltage_after_change('set_adc_dsa')
+                    await self.send_response(writer, {'status': 'success', 'result': result, **checked})
+
+                elif request == 'release_adc_overvoltage':
+                    checked = await self._overvoltage_after_change(
+                        'release_adc_overvoltage', wait=False)
+                    await self.send_response(writer, {
+                        'status': 'success', 'released': bool(checked), **checked})
 
                 elif request == 'get_adc_dsa':
-                    result = {'adc_dsa_db': firmware_lib.get_adc_dsa_db(self.r, self.config)}
+                    programmed = firmware_lib.get_adc_dsa_db(self.r, self.config)
+                    # get_dsa cannot see a latched over-voltage trip's 15 dB.
+                    latched = firmware_lib.note_adc_overvoltage(
+                        self.r, self.config, self.r_fast, 'get_adc_dsa')
+                    result = {'adc_dsa_db': programmed,
+                              'adc_overvoltage': latched,
+                              'adc_dsa_effective_db': firmware_lib.effective_adc_dsa_db(
+                                  programmed, bool(latched)),
+                              'adc_dsa_effective_uncertain': firmware_lib.effective_adc_dsa_uncertain(
+                                  programmed, bool(latched))}
                     await self.send_response(writer, {'status': 'success', 'result': result})
 
                 elif request == 'set_tx_amp_bypass':
                     bypass = bool(message.get('bypass'))
                     self.rf_peripherals.set_tx_amp_bypass(bypass)
                     result = {'tx_amp_bypass': self.rf_peripherals.get_tx_amp_bypass()}
-                    await self.send_response(writer, {'status': 'success', 'result': result})
+                    checked = await self._overvoltage_after_change('set_tx_amp_bypass')
+                    await self.send_response(writer, {'status': 'success', 'result': result, **checked})
 
                 elif request == 'get_tx_amp_bypass':
                     result = {'tx_amp_bypass': self.rf_peripherals.get_tx_amp_bypass()}
@@ -4355,7 +4476,8 @@ class ReadoutServer:
                     bypass = bool(message.get('bypass'))
                     self.rf_peripherals.set_rx_amp_bypass(bypass)
                     result = {'rx_amp_bypass': self.rf_peripherals.get_rx_amp_bypass()}
-                    await self.send_response(writer, {'status': 'success', 'result': result})
+                    checked = await self._overvoltage_after_change('set_rx_amp_bypass')
+                    await self.send_response(writer, {'status': 'success', 'result': result, **checked})
 
                 elif request == 'get_rx_amp_bypass':
                     result = {'rx_amp_bypass': self.rf_peripherals.get_rx_amp_bypass()}
@@ -8113,6 +8235,7 @@ class ReadoutServer:
         
         self.stream_task = asyncio.create_task(self.stream_data())
         self.triggered_stream_task = asyncio.create_task(self.triggered_stream())
+        self.adc_overvoltage_task = asyncio.create_task(self._adc_overvoltage_monitor())
         
         async with request_server, stream_server:
             await asyncio.gather(

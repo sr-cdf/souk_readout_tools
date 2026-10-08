@@ -599,10 +599,12 @@ def fractional_frequency_and_dissipation_timestreams(
         resolve_rx_gain,
         resolve_tone_frequency,
         sweep_trace,
+        warn_adc_overvoltage,
     )
 
     if method not in CONVERSION_METHODS:
         raise ValueError(f"method must be one of {CONVERSION_METHODS}")
+    warn_adc_overvoltage(samples=ts_data)
 
     tone_keys = sorted(ts_data["i_data"])
     if tones is None:

@@ -4,7 +4,9 @@ This module provides a set of functions that are used by the readout server to i
 
 """
 
+import collections
 import contextlib
+import json
 import warnings
 import inspect
 import numpy as np
@@ -1673,6 +1675,8 @@ def initialise_pipeline_resources(r,r_fast,config_dict):
     _set_mixer_scales(r, config_dict, dac=dac_mixer_scale_1p0, adc=adc_mixer_scale_1p0)
     if dsa is not None:
         r.rfdc.core.set_dsa(adc_tile, adc_block, int(dsa))
+        # Start clean: a configured DSA does not lift a latched over-voltage hold.
+        _release_after_dsa_write(r, config_dict, r_fast, 'initialise_pipeline_resources')
     if vop is not None:
         r.rfdc.core.set_vop(dac0_tile, dac0_block, vop)
         r.rfdc.core.set_vop(dac1_tile, dac1_block, vop)
@@ -1947,13 +1951,20 @@ def info_rfdc(r, config_dict):
         }
 
     rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
+    programmed_dsa = r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa']
+    overvoltage = bool(rts_details.get('rts_over_voltage', False))
     inverse_sinc_mode_dac0 = r.rfdc.core.get_invsinc_fir(
         dac0_tile, dac0_block)
     inverse_sinc_mode_dac1 = r.rfdc.core.get_invsinc_fir(
         dac1_tile, dac1_block)
     return {
         'ready': True,
-        'dsa': r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'],
+        'dsa': programmed_dsa,
+        # A latched over-voltage trip holds the DSA at 15 dB, unseen by get_dsa.
+        'adc_overvoltage_latched': overvoltage,
+        'dsa_effective_db': effective_adc_dsa_db(programmed_dsa, overvoltage),
+        'dsa_effective_uncertain': effective_adc_dsa_uncertain(programmed_dsa, overvoltage),
+        'adc_overvoltage_events': adc_overvoltage_events(),
         'vop_dac0': r.rfdc.core.get_output_current(dac0_tile, dac0_block)['current'],
         'vop_dac1': r.rfdc.core.get_output_current(dac1_tile, dac1_block)['current'],
         'dac_duc_mixer_frequency_hz': float(r.rfdc.core.get_mixer_settings(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE)['Freq']) * 1e6,
@@ -2475,6 +2486,8 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
         if dsa is not None:
             print(f'apply_config: setting dsa = {dsa}')
             r.rfdc.core.set_dsa(adc_tile, adc_block, int(dsa))
+            # Start clean: a configured DSA does not lift a latched over-voltage hold.
+            _release_after_dsa_write(r, new_config_dict, r_fast, 'apply_config')
 
     if changed('vop'):
         vop = defaults.get('vop')
@@ -6746,7 +6759,8 @@ def chanselect_get_channel_outmap(r, descramble_input=None):
 
 
 def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation_bits,
-                           threshold=SATURATION_THRESHOLD_FRAC,check_rts=True,verbose=True):
+                           threshold=SATURATION_THRESHOLD_FRAC,check_rts=True,verbose=True,
+                           config_dict=None, watch_s=0.0, source='check_input_saturation'):
     """
     Check to see if the input ADC is saturating.
 
@@ -6781,6 +6795,17 @@ def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation
     r : readout interface, optional
         Katcp readout interface, needed for RFDC RTS checks.
         If None, RTS checks are skipped.
+    config_dict : dict, optional
+        Without it the check only reads: a latched over-voltage trip is
+        reported (``overvoltage_latched``, saturated) and left latched. With
+        it, a latched trip is released first (:func:`release_adc_overvoltage`)
+        and the window then shows whether it recurs. Over-voltage is never
+        cleared without that release.
+    watch_s : float, optional
+        Extra time to watch the sticky flags after the snapshots, for inputs
+        with occasional peaks (default 0).
+    source : str, optional
+        Names the caller in logged over-voltage events.
     """
     if r is None:
         check_rts = False
@@ -6801,8 +6826,15 @@ def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation
     # iterations themselves provide a natural observation window (much
     # longer than a fixed sleep) for intermittent spikes to trigger the
     # hardware flags.
+    # Over-range is discarded as stale; a latched over-voltage is not stale --
+    # the hidden 15 dB DSA it set is still engaged -- so it is released (with
+    # config_dict) or kept and reported, never cleared.
     rts_available = False
+    released = None
     if check_rts:
+        if config_dict is not None:
+            released = release_adc_overvoltage(r, config_dict, source, watch_s=0.0,
+                                               r_fast=r_fast)
         _, rts_stale = check_rfdc_rts_events(r, clear=True)
         rts_available = rts_stale.get('rts_available', False)
 
@@ -6836,11 +6868,19 @@ def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation
     # Read RTS flags *after* the snapshot window — any flag that latched
     # during the captures indicates the condition is still active.
     if check_rts and rts_available:
+        if watch_s:
+            time.sleep(watch_s)
         rts_event, rts_details = check_rfdc_rts_events(r)
         details.update(rts_details)
-        if rts_details.get('rts_over_voltage', False):
+        latched = bool(rts_details.get('rts_over_voltage', False))
+        note_adc_overvoltage(r, config_dict, r_fast, source, latched=latched)
+        details['overvoltage_latched'] = latched
+        if released is not None:
+            details['overvoltage_released'] = released
+        if latched:
             if verbose:
-                print('ERROR: ADC RTS over-voltage flag set — signal far exceeded input range')
+                print('ERROR: ADC RTS over-voltage flag set — signal far exceeded input range; '
+                      f'the ADC DSA is held at {ADC_OVERVOLTAGE_DSA_DB} dB until released')
             rts_saturation = True
         elif rts_details.get('rts_over_range', False):
             if verbose:
@@ -6920,7 +6960,7 @@ def check_output_saturation(r_fast,iterations=25,saturation_bits=dac_saturation_
     return any_saturation, details
 
 
-def check_rfdc_rts_events(r, clear=True):
+def check_rfdc_rts_events(r, clear=False, clear_overvoltage=False):
     """
     Check the RFDC Real-Time Status (RTS) sticky event flags.
 
@@ -6942,12 +6982,19 @@ def check_rfdc_rts_events(r, clear=True):
         rts_over_cm_over_voltage  : common-mode voltage too high
         rts_over_cm_under_voltage : common-mode voltage too low
 
+    An over-voltage trip also sets the ADC's DSA to 15 dB, which the driver's
+    ``get_dsa`` does not show, and the flag is the only sign of it. So
+    ``clear=True`` resets over-range only; over-voltage is reset only with
+    ``clear_overvoltage=True``, which :func:`release_adc_overvoltage` passes
+    after writing the DSA.
+
     Parameters
     ----------
     r : readout interface
     clear : bool
-        If True, reset the sticky over_range and over_voltage flags
-        after reading them.
+        If True, reset the sticky over_range flag after reading it.
+    clear_overvoltage : bool
+        Also reset over_voltage. Only for :func:`release_adc_overvoltage`.
 
     Returns
     -------
@@ -6967,13 +7014,170 @@ def check_rfdc_rts_events(r, clear=True):
     details.update(flags)
     any_event = any(flags.values())
 
-    if clear:
+    if clear or clear_overvoltage:
         try:
-            r.rfdc.reset_rts_flags(over_range=True, over_voltage=True)
+            r.rfdc.reset_rts_flags(over_range=bool(clear),
+                                   over_voltage=bool(clear_overvoltage))
         except AttributeError:
             pass
 
     return any_event, details
+
+
+# ADC over-voltage protection. A trip sets the ADC's DSA to 15 dB -- an absolute
+# setting, so the extra attenuation is 15 dB minus the programmed DSA -- while the
+# driver's get_dsa keeps reporting the programmed value. Measured on krm4-mcr
+# pipeline 0 (2026-10-07): the hold lasts while the sticky RTS over_voltage flag is
+# latched, clearing the flag releases it, and a DSA write while it is latched does
+# not. The flag is the only sign of the hold, so routine checks only read it and
+# release_adc_overvoltage is the one place it is cleared, with the event logged.
+ADC_OVERVOLTAGE_DSA_DB = 15
+ADC_OVERVOLTAGE_WATCH_S = 1.0
+ADC_DSA_MAX_DB = 27
+_ADC_OVERVOLTAGE_EVENTS = collections.deque(maxlen=100)
+_ADC_OVERVOLTAGE_STATE = {'latched': False}
+
+
+def effective_adc_dsa_db(programmed_db, overvoltage_latched):
+    """The DSA the ADC applies: a latched over-voltage trip holds it at 15 dB.
+
+    Above 15 dB the trip's effect is unmeasured, so the programmed value is
+    returned (see ``effective_adc_dsa_uncertain``).
+    """
+    programmed_db = float(programmed_db)
+    if overvoltage_latched and programmed_db < ADC_OVERVOLTAGE_DSA_DB:
+        return float(ADC_OVERVOLTAGE_DSA_DB)
+    return programmed_db
+
+
+def effective_adc_dsa_uncertain(programmed_db, overvoltage_latched):
+    """True when a trip is latched at a programmed DSA its effect is unknown for."""
+    return bool(overvoltage_latched) and float(programmed_db) >= ADC_OVERVOLTAGE_DSA_DB
+
+
+def adc_overvoltage_events():
+    """The last 100 ADC over-voltage events, oldest first.
+
+    ``kind`` is ``'trip'`` (the flag latched), ``'release'`` (the DSA was
+    rewritten and the flag cleared) or ``'cleared'`` (the flag went away
+    without a release -- something outside this code cleared it). Trips and
+    releases bound the intervals the hidden 15 dB DSA was engaged; ``acc_cnt``
+    places each in a capture (it is the stream's packet counter).
+    """
+    return [dict(event) for event in _ADC_OVERVOLTAGE_EVENTS]
+
+
+def _release_after_dsa_write(r, config_dict, r_fast, source):
+    """release_adc_overvoltage at configuration time, never failing the caller."""
+    try:
+        release_adc_overvoltage(r, config_dict, source, watch_s=0.0, r_fast=r_fast)
+    except Exception as e:
+        print(f'{source}: ADC over-voltage check failed ({type(e).__name__}: {e})')
+
+
+def adc_overvoltage_logged_latched():
+    """Whether the last logged over-voltage state is latched (edge detection)."""
+    return _ADC_OVERVOLTAGE_STATE['latched']
+
+
+def _adc_tile_block(config_dict):
+    return int(config_dict['firmware']['adc_tile']), int(config_dict['firmware']['adc_block'])
+
+
+def _log_adc_overvoltage_event(kind, r=None, config_dict=None, r_fast=None, **fields):
+    """Record an over-voltage event, and print it as one parseable journal line."""
+    event = {'kind': kind, 'server_time_unix': time.time(),
+             'server_time_utc': unix_to_iso(time.time())}
+    if r_fast is not None:
+        try:
+            anchor = read_time_anchor(r_fast)
+            event['acc_cnt'] = int(anchor['acc_cnt'])
+            event['telescope_time'] = int(anchor['telescope_time'])
+        except Exception:
+            pass
+    if r is not None and config_dict is not None and 'programmed_dsa_db' not in fields:
+        try:
+            tile, block = _adc_tile_block(config_dict)
+            fields['programmed_dsa_db'] = int(r.rfdc.core.get_dsa(tile, block)['dsa'])
+        except Exception:
+            pass
+    if kind == 'trip' and 'programmed_dsa_db' in fields:
+        fields.setdefault('effective_dsa_db', effective_adc_dsa_db(
+            fields['programmed_dsa_db'], True))
+    event.update(fields)
+    _ADC_OVERVOLTAGE_EVENTS.append(event)
+    print('ADC_OVERVOLTAGE ' + json.dumps(event, default=str), flush=True)
+    return event
+
+
+def note_adc_overvoltage(r, config_dict=None, r_fast=None, source='', latched=None,
+                         context=None):
+    """Read the over-voltage flag (never clearing it) and log a new trip or clear.
+
+    Returns the flag (``None`` if the RTS flags are unavailable). Logs a
+    ``'trip'`` the first time it is seen set, and a ``'cleared'`` if it went
+    away without :func:`release_adc_overvoltage`.
+    """
+    if latched is None:
+        _, flags = check_rfdc_rts_events(r)
+        if not flags.get('rts_available'):
+            return None
+        latched = bool(flags.get('rts_over_voltage', False))
+    was = _ADC_OVERVOLTAGE_STATE['latched']
+    if latched and not was:
+        _log_adc_overvoltage_event('trip', r, config_dict, r_fast, source=source,
+                                   **(context or {}))
+        print(f'WARNING: ADC over-voltage trip ({source}): the ADC DSA is now held at '
+              f'{ADC_OVERVOLTAGE_DSA_DB} dB whatever get_dsa reports', flush=True)
+    elif was and not latched:
+        _log_adc_overvoltage_event('cleared', r, config_dict, r_fast, source=source,
+                                   **(context or {}))
+    _ADC_OVERVOLTAGE_STATE['latched'] = bool(latched)
+    return bool(latched)
+
+
+def release_adc_overvoltage(r, config_dict, source, watch_s=ADC_OVERVOLTAGE_WATCH_S,
+                            r_fast=None, context=None):
+    """Release a latched over-voltage trip: the one place its flag is cleared.
+
+    Clears the flags -- which releases the hold -- then rewrites the DSA as a
+    fallback (27 dB, or 26 if it is already 27, then the programmed value
+    back), waits ``watch_s`` and reads the flag again. Returns ``None`` if
+    nothing was latched, else the logged ``'release'`` event, whose
+    ``still_over_voltage`` says the input tripped again (the hardware
+    protection is then back on, and the input level needs reducing).
+    """
+    latched = note_adc_overvoltage(r, config_dict, r_fast, source, context=context)
+    if not latched:
+        return None
+    tile, block = _adc_tile_block(config_dict)
+    programmed = int(r.rfdc.core.get_dsa(tile, block)['dsa'])
+    # Clearing the flag is what releases the hold (measured); a DSA write while
+    # it is latched does not. The rewrite after it is a fallback for hardware
+    # that only releases on a write -- and it must come after the clear, so a
+    # trip that recurs because the input is still too hot latches the flag
+    # again where it can be seen.
+    check_rfdc_rts_events(r, clear=True, clear_overvoltage=True)
+    _ADC_OVERVOLTAGE_STATE['latched'] = False
+    # The first write changes the value, so the fallback never relies on an
+    # unchanged write: max attenuation, or 1 dB less when already at max.
+    first = ADC_DSA_MAX_DB if programmed != ADC_DSA_MAX_DB else ADC_DSA_MAX_DB - 1
+    r.rfdc.core.set_dsa(tile, block, first)
+    time.sleep(0.1)
+    r.rfdc.core.set_dsa(tile, block, programmed)
+    time.sleep(0.1)
+    if watch_s:
+        time.sleep(watch_s)
+    _, flags = check_rfdc_rts_events(r)
+    still = bool(flags.get('rts_over_voltage', False))
+    event = _log_adc_overvoltage_event(
+        'release', r, config_dict, r_fast, source=source, programmed_dsa_db=programmed,
+        effective_dsa_before_db=effective_adc_dsa_db(programmed, True),
+        still_over_voltage=still, watch_s=float(watch_s or 0.0), **(context or {}))
+    if still:
+        note_adc_overvoltage(r, config_dict, r_fast, f'{source} (tripped again)',
+                             latched=True, context=context)
+    return event
 
 
 def check_dsp_overflow(r, duration_s=0.1, verbose=True):
@@ -8125,6 +8329,7 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
     adc_block = int(config_dict['firmware']['adc_block'])
     DSA_MAX = 27
     has_rf = allow_rf and _rf_has_controllable_attenuator(rf_peripherals)
+    compensation = None
 
     # --- Compensate mode: proactively mirror TX change onto RX path ---
     if rx_policy == 'compensate' and tx_power_change_db is not None:
@@ -8193,7 +8398,7 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                 parts.append(f'DSA {dsa_change:+.0f} dB')
             action = f'compensate: {", ".join(parts)} (TX changed {tx_power_change_db:+.1f} dB)'
             print(f'    rx_policy: {action}')
-            return {
+            compensation = {
                 'policy': 'compensate',
                 'saturated': False,
                 'action': action,
@@ -8201,15 +8406,16 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                 'dsa_change_db': dsa_change if dsa_change != 0.0 else None,
             }
 
-        # Even in compensate mode, fall through to saturation check
-        # in case the compensation was insufficient or rounding left
-        # a residual.
+        # Always fall through to the saturation check: the compensation can be
+        # short, rounding leaves a residual, and a TX change can trip the ADC's
+        # over-voltage protection (released and caught by the check).
 
     # --- Saturation check (protect, raise, or compensate fallback) ---
-    saturated, levels = check_input_saturation(r, r_fast, iterations=250,
-                                               check_rts=rts_as_saturation, verbose=False)
+    saturated, levels = check_input_saturation(r, r_fast, config_dict=config_dict, source='_apply_rx_policy', iterations=250,
+                                               check_rts=rts_as_saturation, verbose=False,
+                                               watch_s=ADC_OVERVOLTAGE_WATCH_S)
     if not saturated:
-        return None
+        return compensation
     why = _sat_reason(levels)
 
     if rx_policy == 'raise':
@@ -8232,7 +8438,7 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
                 atten_max)
             rf_peripherals.set_rx_attenuation(current_atten)
             time.sleep(0.1)
-            saturated, _ = check_input_saturation(r, r_fast, iterations=250,
+            saturated, _ = check_input_saturation(r, r_fast, config_dict=config_dict, source='_apply_rx_policy', iterations=250,
                                                   check_rts=rts_as_saturation, verbose=False)
 
     if allow_digital and not force_dsa and saturated:
@@ -8241,7 +8447,7 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
             current_dsa = min(current_dsa + dsa_step_db, DSA_MAX)
             r.rfdc.core.set_dsa(adc_tile, adc_block, int(round(current_dsa)))
             time.sleep(0.1)
-            saturated, _ = check_input_saturation(r, r_fast, iterations=250,
+            saturated, _ = check_input_saturation(r, r_fast, config_dict=config_dict, source='_apply_rx_policy', iterations=250,
                                                   check_rts=rts_as_saturation, verbose=False)
     elif saturated and force_dsa:
         print('    rx_policy: ADC DSA fixed; skipping DSA protection step')
@@ -8263,6 +8469,8 @@ def _apply_rx_policy(r, r_fast, config_dict, rf_peripherals, rx_policy,
     else:
         action = f'protect: {", ".join(parts)}' if parts else 'protect: no action needed'
         print(f'    rx_policy: {action}')
+    if compensation is not None:
+        action = f"{compensation['action']}; then {action}"
 
     return {
         'policy': rx_policy,
@@ -9451,20 +9659,21 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=DEFAULT_ADC_HEADROOM_D
 
     # --- Handle RTS over-voltage (hidden firmware DSA) ---
     rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
-    if allow_digital and rts_details.get('rts_over_voltage', False):
-        print('  step 0: RTS over-voltage — clearing hidden firmware DSA')
-        _set_dsa(DSA_MAX)
-        check_rfdc_rts_events(r, clear=True)
-        time.sleep(0.1)
-    elif rts_details.get('rts_over_voltage', False):
-        print('  step 0: RTS over-voltage detected — rf_only=True leaves DSA unchanged')
-        check_rfdc_rts_events(r, clear=True)
+    if rts_details.get('rts_over_voltage', False):
+        if allow_digital:
+            print('  step 0: RTS over-voltage — releasing the hidden firmware DSA, DSA to maximum')
+            _set_dsa(DSA_MAX)
+        else:
+            print('  step 0: RTS over-voltage — releasing the hidden firmware DSA '
+                  '(rf_only=True keeps the programmed DSA)')
+        release_adc_overvoltage(r, config_dict, 'maximise_rx_power', watch_s=0.0,
+                                r_fast=r_fast)
     elif rts_details.get('rts_over_range', False):
         print('  step 0: RTS over-range — clearing')
         check_rfdc_rts_events(r, clear=True)
 
     # --- If saturated, fix first ---
-    saturated, levels = check_input_saturation(r, r_fast, iterations=250,
+    saturated, levels = check_input_saturation(r, r_fast, config_dict=config_dict, source='maximise_rx_power', iterations=250,
                                                check_rts=rts_as_saturation, verbose=False)
     peak_db = _peak_dbfs(levels)
     print(f'  step 1: initial check — saturated={saturated}, peak={peak_db:.1f} dBFS')
@@ -9483,7 +9692,7 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=DEFAULT_ADC_HEADROOM_D
         print('  step 2: reduce DSA')
         current_dsa = _get_dsa()
         if current_dsa > 0:
-            _, levels = check_input_saturation(r, r_fast, iterations=250,
+            _, levels = check_input_saturation(r, r_fast, config_dict=config_dict, source='maximise_rx_power', iterations=250,
                                                check_rts=rts_as_saturation, verbose=False)
             peak_db = _peak_dbfs(levels)
             headroom_available = -peak_db - headroom_db
@@ -9496,14 +9705,14 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=DEFAULT_ADC_HEADROOM_D
                 # saturation by construction and pays a step-back for it.
                 new_dsa = _set_dsa(np.ceil(current_dsa - decrease))
                 print(f'    DSA {current_dsa} -> {new_dsa} dB')
-                sat, levels = check_input_saturation(r, r_fast, iterations=250,
+                sat, levels = check_input_saturation(r, r_fast, config_dict=config_dict, source='maximise_rx_power', iterations=250,
                                                      check_rts=rts_as_saturation, verbose=False)
                 # Step back at the 1 dB DSA resolution rather than dsa_step_db:
                 # recovery should give back as little gain as it has to.
                 while sat and new_dsa < current_dsa:
                     new_dsa = _set_dsa(new_dsa + 1)
                     print(f'    DSA step back to {new_dsa} dB ({_sat_reason(levels)})')
-                    sat, levels = check_input_saturation(r, r_fast, iterations=250,
+                    sat, levels = check_input_saturation(r, r_fast, config_dict=config_dict, source='maximise_rx_power', iterations=250,
                                                          check_rts=rts_as_saturation, verbose=False)
     else:
         reason = 'fixed' if dsa_fixed else 'rf_only=True'
@@ -9517,7 +9726,7 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=DEFAULT_ADC_HEADROOM_D
         if current_atten <= atten_min:
             print(f'    RX atten already at minimum ({current_atten:.1f} dB)')
             return
-        _, levels = check_input_saturation(r, r_fast, iterations=250,
+        _, levels = check_input_saturation(r, r_fast, config_dict=config_dict, source='maximise_rx_power', iterations=250,
                                            check_rts=rts_as_saturation, verbose=False)
         peak_db = _peak_dbfs(levels)
         headroom_available = -peak_db - headroom_db
@@ -9550,14 +9759,14 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=DEFAULT_ADC_HEADROOM_D
         # little gain as it has to.  A 3 dB step-back from a 0.2 dB overshoot
         # left the ADC 2.8 dB short of the target with the attenuator still
         # 20 dB up.
-        sat, levels = check_input_saturation(r, r_fast, iterations=250,
+        sat, levels = check_input_saturation(r, r_fast, config_dict=config_dict, source='maximise_rx_power', iterations=250,
                                              check_rts=rts_as_saturation, verbose=False)
         while sat and new_atten < current_atten:
             new_atten = min(new_atten + atten_step, rf_peripherals.ATTEN_MAX)
             rf_peripherals.set_rx_attenuation(new_atten)
             time.sleep(0.1)
             print(f'    RX atten step back to {new_atten:.1f} dB ({_sat_reason(levels)})')
-            sat, levels = check_input_saturation(r, r_fast, iterations=250,
+            sat, levels = check_input_saturation(r, r_fast, config_dict=config_dict, source='maximise_rx_power', iterations=250,
                                                  check_rts=rts_as_saturation, verbose=False)
         # Same step-back shape again, for the constraint the ADC cannot see:
         # the attenuator sits after the preamp, so every dB taken out of it
@@ -9596,7 +9805,7 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=DEFAULT_ADC_HEADROOM_D
         only saturate, so it gets bypassed again and the ADC settles several dB
         short of full scale with no control left to recover them.
         """
-        _, levels = check_input_saturation(r, r_fast, iterations=250,
+        _, levels = check_input_saturation(r, r_fast, config_dict=config_dict, source='maximise_rx_power', iterations=250,
                                            check_rts=rts_as_saturation, verbose=False)
         headroom_available = -_peak_dbfs(levels) - headroom_db
         prev_atten = rf_peripherals.get_rx_attenuation()
@@ -9631,7 +9840,7 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=DEFAULT_ADC_HEADROOM_D
             _revert(f'RX amp has no effect in model (S21 bypass={s21_bypassed:.1f}, '
                     f'enabled={s21_enabled:.1f} dB)')
             return
-        sat, levels = check_input_saturation(r, r_fast, iterations=250,
+        sat, levels = check_input_saturation(r, r_fast, config_dict=config_dict, source='maximise_rx_power', iterations=250,
                                              check_rts=rts_as_saturation, verbose=False)
         if sat:
             _revert(f'RX amp saturates at {rf_peripherals.get_rx_attenuation():.1f} dB '
@@ -9672,7 +9881,7 @@ def maximise_rx_power(r, r_fast, config_dict, headroom_db=DEFAULT_ADC_HEADROOM_D
 
     # --- Final assessment ---
     print('  step 5: final assessment and PFB fftshift')
-    saturated, levels = check_input_saturation(r, r_fast, iterations=250,
+    saturated, levels = check_input_saturation(r, r_fast, config_dict=config_dict, source='maximise_rx_power', iterations=250,
                                                check_rts=rts_as_saturation, verbose=False)
     best_dsa = _get_dsa()
     best_rx_atten = rf_peripherals.get_rx_attenuation() if rf_available else None
@@ -9765,7 +9974,7 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
     def _make_result():
         check_rfdc_rts_events(r, clear=True)
         time.sleep(0.1)
-        sat, lvls = check_input_saturation(r, r_fast, iterations=500,
+        sat, lvls = check_input_saturation(r, r_fast, config_dict=config_dict, source='fix_adc_saturation', iterations=500,
                                            check_rts=rts_as_saturation, verbose=False)
         d = float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
         ra = rf_peripherals.get_rx_attenuation() if has_rf else None
@@ -9777,23 +9986,24 @@ def fix_adc_saturation(r, r_fast, config_dict, rf_peripherals=None,
         """Returns (saturated, why) — 'why' names the condition for the logs."""
         check_rfdc_rts_events(r, clear=True)
         time.sleep(0.1)
-        sat, lvls = check_input_saturation(r, r_fast, iterations=500,
+        sat, lvls = check_input_saturation(r, r_fast, config_dict=config_dict, source='fix_adc_saturation', iterations=500,
                                            check_rts=rts_as_saturation, verbose=False)
         return sat, _sat_reason(lvls)
 
     # --- Handle RTS over-voltage (hidden firmware DSA) ---
     rts_event, rts_details = check_rfdc_rts_events(r, clear=False)
     if allow_digital and not dsa_fixed and rts_details.get('rts_over_voltage', False):
-        print('fix_adc_saturation: RTS over-voltage — clearing hidden firmware DSA')
+        print('fix_adc_saturation: RTS over-voltage — releasing the hidden firmware DSA, DSA to maximum')
         r.rfdc.core.set_dsa(adc_tile, adc_block, int(DSA_MAX))
         time.sleep(0.1)
-        check_rfdc_rts_events(r, clear=True)
-        time.sleep(0.1)
+        release_adc_overvoltage(r, config_dict, 'fix_adc_saturation', watch_s=0.0,
+                                r_fast=r_fast)
     elif rts_details.get('rts_over_voltage', False):
         reason = 'force_adc_dsa_db set' if dsa_fixed else 'rf_only=True'
-        print(f'fix_adc_saturation: RTS over-voltage detected; {reason} leaves DSA unchanged')
-        check_rfdc_rts_events(r, clear=True)
-        time.sleep(0.1)
+        print(f'fix_adc_saturation: RTS over-voltage; releasing the hidden firmware DSA '
+              f'({reason} keeps the programmed DSA)')
+        release_adc_overvoltage(r, config_dict, 'fix_adc_saturation', watch_s=0.0,
+                                r_fast=r_fast)
     else:
         check_rfdc_rts_events(r, clear=True)
         time.sleep(0.1)
@@ -9951,7 +10161,7 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None,
 
     def _sat_check():
         """Returns (saturated, why) — 'why' names the condition for the logs."""
-        s, lvls = check_input_saturation(r, r_fast, iterations=250,
+        s, lvls = check_input_saturation(r, r_fast, config_dict=config_dict, source='optimise_rx_snr', iterations=250,
                                          check_rts=rts_as_saturation, verbose=False)
         return s, _sat_reason(lvls)
 
@@ -10089,7 +10299,7 @@ def optimise_rx_snr(r, r_fast=None, config_dict=None,
         print(f'  step 3: PFB fftshift unchanged ({reason}): '
               f'{format(best_fftshift, "#016b")}')
 
-    _, levels = check_input_saturation(r, r_fast, iterations=250,
+    _, levels = check_input_saturation(r, r_fast, config_dict=config_dict, source='optimise_rx_snr', iterations=250,
                                        check_rts=rts_as_saturation, verbose=False)
     print(f'  done: PFB fftshift={format(best_fftshift, "#016b")}')
     return best_fftshift, check_dsp_overflow(r, 0.1, verbose=False)[1], levels

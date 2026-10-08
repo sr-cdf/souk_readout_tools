@@ -712,7 +712,11 @@ class ReadoutClient:
                 return None
 
             # print(f'received: {response_data}')
-            return json.loads(response_data.decode())
+            response = json.loads(response_data.decode())
+            if isinstance(response, dict) and response.get('adc_overvoltage'):
+                print(bcolors.WARNING + f"{message.get('request')}: "
+                      f"{response.get('warning', 'ADC over-voltage tripped')}" + bcolors.ENDC)
+            return response
 
     def _initialise_server(self,config_file=None):
         """Ask the server process to initialise itself from a config file."""
@@ -2712,8 +2716,21 @@ class ReadoutClient:
         return self.send_request({'request': 'set_adc_dsa', 'value': float(value_db)})
 
     def get_adc_dsa(self):
-        """Return the current ADC digital step attenuator setting in dB."""
+        """Return the ADC DSA: programmed and effective (dB), and whether an
+        over-voltage trip is latched -- a trip holds the DSA at 15 dB, which the
+        programmed value does not show."""
         return self.send_request({'request': 'get_adc_dsa'})
+
+    def release_adc_overvoltage(self):
+        """Release a latched ADC over-voltage trip, and say whether it recurs.
+
+        A trip holds the ADC DSA at 15 dB until released; ``health_check()``
+        and ``get_info('rfdc')`` report it (``adc_overvoltage``) but leave it
+        latched. The response has ``released`` and, if there was a trip, the
+        logged event (``adc_overvoltage``, with ``still_over_voltage`` when the
+        input is still too hot and the hardware protection is back on).
+        """
+        return self.send_request({'request': 'release_adc_overvoltage'})
 
     def set_tx_amp_bypass(self, bypass=True):
         """Enable or disable the TX amplifier bypass path."""
@@ -3946,6 +3963,10 @@ class ReadoutClient:
         result = ReadoutClient._parsed_timestream(
             i_data, q_data, cnt, err, tt, flags, sample_rate, info,
             time.strftime('%Y-%m-%d %H:%M:%S UTC%z'), apply_readout_correction)
+        # No event log for a sample capture: the state recorded in its info.
+        from souk_readout_tools.stream_file import capture_adc_overvoltage
+        result['adc_overvoltage'], result['adc_overvoltage_events'] = \
+            capture_adc_overvoltage({'info': info}, cnt)
         if 'time_anchors' in sample_data:
             # Server clock + counter around the capture: stream_file.capture_time_model.
             result['time_anchors'] = sample_data['time_anchors']
@@ -5910,6 +5931,19 @@ class ReadoutClient:
         return sweep_dict
 
 
+    def _capture_overvoltage_events(self, metadata):
+        """The server's ADC over-voltage events within a capture, or None if unavailable."""
+        from souk_readout_tools.stream_file import adc_overvoltage_events_in_capture
+        try:
+            section = self.get_info('rfdc')
+            events = section['adc_overvoltage_events']
+        except Exception as e:
+            print(f'Could not fetch the ADC over-voltage log ({type(e).__name__}: {e}); '
+                  'attach it later with stream_file.add_adc_overvoltage_events')
+            return None
+        return adc_overvoltage_events_in_capture(
+            events, metadata.get('first_frame'), metadata.get('last_frame'))
+
     def receive_stream(self, num_tones=None, filename=None, print_data=False, info=None,
                        duration=None, subscribe_tone_updates=None,
                        frame_callback=None, stop_event=None, write_to_file=True,
@@ -6204,6 +6238,14 @@ class ReadoutClient:
                     # TT can be checked against the clock over the capture.
                     metadata['last_frame'] = _frame_time_anchor(*last_frame)
                     metadata['last_frame']['sample_index'] = count - 1
+                    events = self._capture_overvoltage_events(metadata)
+                    if events is not None:
+                        metadata['adc_overvoltage_events'] = events
+                        trips = sum(event.get('kind') == 'trip' for event in events)
+                        if trips:
+                            print(bcolors.WARNING + f'ADC over-voltage tripped {trips} time(s) '
+                                  'during this capture; see samples["adc_overvoltage"]'
+                                  + bcolors.ENDC)
                     with open(filename + '.json', 'w') as metadata_file:
                         json.dump(metadata, metadata_file, indent=4)
         return filename
@@ -6775,6 +6817,9 @@ class ReadoutClient:
         result = ReadoutClient._parsed_timestream(
             i_data.T, q_data.T, cnt, err, tt, flags.T, sample_rate, info,
             date, False)
+        from souk_readout_tools.stream_file import capture_adc_overvoltage
+        result['adc_overvoltage'], result['adc_overvoltage_events'] = \
+            capture_adc_overvoltage(metadata, cnt)
 
         if metadata.get('tone_updates_subscribed', False):
             with open(filename + '.updates.jsonl') as file:

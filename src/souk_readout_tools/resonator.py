@@ -2775,7 +2775,9 @@ def _rx_chain_gain_db(info):
         return None, None
     try:
         total = float(frontend['rx_total_gain_db'])
-        dsa = float(rfdc.get('dsa', 0.0))
+        # A latched ADC over-voltage trip holds the DSA at 15 dB, which the
+        # programmed 'dsa' does not show (firmware_lib.effective_adc_dsa_db).
+        dsa = float(rfdc.get('dsa_effective_db', rfdc.get('dsa', 0.0)))
     except (KeyError, TypeError, ValueError):
         return None, None
     pipeline = info.get('pipeline')
@@ -2881,6 +2883,32 @@ def rx_gain_ratio(sweep_data, ts_data, method="carrier", *, tones=None):
             "method": method}
 
 
+def warn_adc_overvoltage(info=None, samples=None, label='data'):
+    """Warn about an ADC over-voltage trip in a capture's recorded state.
+
+    ``info``: latched when recorded, so the effective DSA (15 dB) is used in
+    place of the programmed one. ``samples``: a parsed capture whose
+    ``adc_overvoltage`` mask changes part-way, so no one RX scale fits it.
+    """
+    rfdc = info.get('rfdc') if isinstance(info, Mapping) else None
+    if isinstance(rfdc, Mapping) and rfdc.get('adc_overvoltage_latched'):
+        note = (' (the trip\'s effect above 15 dB is unmeasured)'
+                if rfdc.get('dsa_effective_uncertain') else '')
+        warnings.warn(
+            f"ADC over-voltage protection was engaged for the {label}: its DSA was "
+            f"{rfdc.get('dsa_effective_db')} dB, not the programmed {rfdc.get('dsa')} dB; "
+            f"the RX scale uses the effective value{note}.", stacklevel=3)
+    mask = samples.get('adc_overvoltage') if isinstance(samples, Mapping) else None
+    if mask is not None and len(mask):
+        mask = np.asarray(mask, dtype=bool)
+        if mask.any() and not mask.all():
+            warnings.warn(
+                f'ADC over-voltage protection engaged for {int(mask.sum())} of {len(mask)} '
+                f'samples of the {label} (samples["adc_overvoltage"]): the ADC DSA was held '
+                'at 15 dB there, so those samples are on a different RX scale from the rest.',
+                stacklevel=3)
+
+
 def recorded_rx_gain_ratio(calibration, data_info):
     """RX amplitude ratio, data over calibration, from recorded chain states.
 
@@ -2908,6 +2936,9 @@ def recorded_rx_gain_ratio(calibration, data_info):
         cal_acc = _acc_len(calibration.get('info'))
     else:
         return None
+    warn_adc_overvoltage(data_info, label='data')
+    if isinstance(calibration, Mapping) and not is_calibration_record(calibration):
+        warn_adc_overvoltage(calibration.get('info'), label='calibration')
     data_db, data_shift = _rx_chain_gain_db(data_info)
     data_acc = _acc_len(data_info)
     analog_known = cal_db is not None and data_db is not None

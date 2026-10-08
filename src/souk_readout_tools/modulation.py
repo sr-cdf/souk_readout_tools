@@ -2408,6 +2408,8 @@ def demodulate_stream(samples, tones=None, *, method='accurate', settling='none'
     if isinstance(samples, (str, os.PathLike)):
         from .client.readout_client import ReadoutClient
         samples = ReadoutClient.parse_stream(samples, apply_readout_correction=False)
+    from .resonator import warn_adc_overvoltage
+    warn_adc_overvoltage(samples=samples, label='recording')
     return StreamDemodulator(method, settling, linewidth_hz, calibration,
                              conversion, gaps=gaps)(samples, tones)
 

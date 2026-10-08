@@ -63,7 +63,7 @@ from .noise import (fractional_frequency_and_dissipation_timestreams,
 from .resonator import (CONVERSION_METHODS, ResonatorCalibration,
                         calibration_for_tone, convert_iq, is_calibration_record,
                         prepare_conversion, resolve_rx_gain,
-                        resolve_tone_frequency, rx_gain_ratio, sweep_trace, tone_column,
+                        resolve_tone_frequency, rx_gain_ratio, warn_adc_overvoltage, sweep_trace, tone_column,
                         with_readout_correction)
 
 __all__ = [
@@ -270,6 +270,14 @@ def fill_gaps(samples, method='nan', *, max_missing=1_000_000,
             flag: expand(values, f'stream_flags[{flag}]', -1)
             for flag, values in samples['stream_flags'].items()
         }
+    if 'adc_overvoltage' in samples:
+        # An inserted sample takes the protection state of the one before it.
+        state = expand(samples['adc_overvoltage'], 'adc_overvoltage', -1)
+        known = np.flatnonzero(state >= 0)
+        if len(known):
+            before = np.searchsorted(known, np.arange(len(state)), side='right') - 1
+            state = state[known[np.clip(before, 0, None)]]
+        result['adc_overvoltage'] = state.astype(bool)
     if missing_count:
         counters = (int(pc[0]) + np.arange(size, dtype=np.int64)) % (2**32)
         if np.any(pc < 0) or counter.dtype == np.dtype('int32'):
@@ -593,6 +601,7 @@ def _rx_gain(match_rx_gain, ts_data, sweep_data, calibrations, tone_idx):
     (``resonator.rx_gain_ratio``; assumes the resonance did not move).
     ``False``/``None``: 1. A number: that ratio.
     """
+    warn_adc_overvoltage(samples=ts_data)
     if match_rx_gain is True:
         return float(rx_gain_ratio(sweep_data, ts_data, tones=[tone_idx])['ratio'][0])
     source = calibrations if is_calibration_record(calibrations) else sweep_data
