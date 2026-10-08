@@ -12850,45 +12850,55 @@ def _read_live_tt(mm, msb_addr, lsb_addr):
             return (msb << 32) + lsb
 
 
-def measure_acc_tt_error(r_fast, edges=ACC_TT_EDGES, timeout_s=1.0):
+def measure_acc_tt_error(r_fast, edges=ACC_TT_EDGES, max_polls=5000):
     """
     K = (latched acc_tt) - (true TT of that accumulation), in clock ticks, measured
     against the mixer's live TT (pN_mix_tt) at accumulation edges.
 
-    For each edge: poll [mix_tt, acc_cnt] until acc_cnt moves; the mix_tt read just
-    before the poll that saw the change was taken within one poll (~5 us) of the
-    edge, and acc_tt now holds that accumulation's stamp. Returns the median K and
-    the spread over ``edges`` edges.
+    For each edge, a tight loop reads only the two low words, acc_tt then mix_tt
+    (~2 us each over devmem), until acc_tt changes. The edge lies between the last
+    acc_tt read that saw the old value and the first that saw the new one, and the
+    mix_tt read made between those two sits in the middle of that interval: it is
+    the edge to within half a loop (~2-3 us), unbiased. (The first version timed edges with a slower
+    loop that read 64-bit values and the clock every pass: it put stamps 100-160 us
+    late, differently on each board, 2026-10-08.) Returns the median K, the spread,
+    and the mean loop period (the resolution) over ``edges`` edges.
     """
     acc = r_fast.accumulators[0]
     transport = acc.host.transport
     mm = transport.axil_mm
-    cnt_addr = transport._get_device_address(f'{acc.prefix}acc_cnt')
     acc_msb = transport._get_device_address(f'{acc.prefix}acc_tt_msb')
     acc_lsb = transport._get_device_address(f'{acc.prefix}acc_tt_lsb')
     mix_msb = transport._get_device_address(f'{r_fast.mixer.prefix}tt_msb')
     mix_lsb = transport._get_device_address(f'{r_fast.mixer.prefix}tt_lsb')
+    unpack = struct.Struct('<I').unpack
 
-    def word(address):
-        return struct.unpack('<I', mm[address:address + 4])[0]
-
-    ks = []
-    deadline = time.time() + timeout_s
-    while len(ks) < edges and time.time() < deadline:
-        c0 = word(cnt_addr)
-        while time.time() < deadline:
-            mix = _read_live_tt(mm, mix_msb, mix_lsb)
-            if word(cnt_addr) != c0:
+    ks, loops = [], []
+    for _ in range(edges):
+        a0 = unpack(mm[acc_lsb:acc_lsb + 4])[0]
+        m_before = unpack(mm[mix_lsb:mix_lsb + 4])[0]
+        for _ in range(max_polls):
+            a = unpack(mm[acc_lsb:acc_lsb + 4])[0]
+            m = unpack(mm[mix_lsb:mix_lsb + 4])[0]
+            if a != a0:
                 break
+            m_before = m
         else:
-            break
-        acc_tt = (word(acc_msb) << 32) + word(acc_lsb)
-        ks.append(acc_tt - mix)
+            continue                       # no edge within max_polls; try again
+        loop = (m - m_before) & 0xFFFFFFFF                 # one pass, in ticks
+        edge_lsb = m_before            # read between the last old and first new acc_tt
+        # Full 64-bit values: the latched acc_tt is steady for a whole accumulation;
+        # the edge is mix_tt now minus the (small) ticks elapsed since edge_lsb.
+        acc_tt = (unpack(mm[acc_msb:acc_msb + 4])[0] << 32) + a
+        mix_now = _read_live_tt(mm, mix_msb, mix_lsb)
+        edge = mix_now - ((mix_now - edge_lsb) & 0xFFFFFFFF)
+        ks.append(acc_tt - edge)
+        loops.append(loop)
     if not ks:
-        raise RuntimeError('no accumulation edges within the timeout (accumulator not running?)')
+        raise RuntimeError('no accumulation edges seen (accumulator not running?)')
     ks.sort()
     return {'k_ticks': int(ks[len(ks) // 2]), 'spread_ticks': int(ks[-1] - ks[0]),
-            'edges': len(ks)}
+            'loop_ticks': int(np.mean(loops)), 'edges': len(ks)}
 
 
 def refresh_acc_tt_correction(r_fast, source=''):
@@ -12909,7 +12919,8 @@ def refresh_acc_tt_correction(r_fast, source=''):
     _firmware_log(
         f'acc_tt correction ({source}): {m["correction_s"]:+.6f} s '
         f'(was {m["previous_correction_s"]:+.6f} s; spread {m["spread_ticks"] / clk_hz * 1e6:.1f} us '
-        f'over {m["edges"]} accumulations) [workaround, see firmware_lib]', source='tt')
+        f'over {m["edges"]} accumulations, edge timed to +-{m["loop_ticks"] / 2 / clk_hz * 1e6:.1f} us) '
+        f'[workaround, see firmware_lib]', source='tt')
     return m
 
 
