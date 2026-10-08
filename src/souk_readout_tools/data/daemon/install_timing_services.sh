@@ -143,6 +143,9 @@ install_config "${TIMING_DIR}/ptp4l.conf" "/etc/linuxptp/ptp4l.conf" 644
 install_config "${TIMING_DIR}/ptp-phc.conf" "/etc/chrony/conf.d/ptp-phc.conf" 644
 apply_phc_offset "/etc/chrony/conf.d/ptp-phc.conf"
 install_service "${BASE_DIR}/daemon/ptp4l.service" "${SERVICE_DIR}/ptp4l.service" 644
+# Hold chrony until ptp4l has set the PHC, or chrony can sample the stale boot-time
+# PHC, reject it as a falseticker and stay on NTP (see the file's comments).
+install_service "${TIMING_DIR}/10-wait-for-ptp4l.conf" "${SERVICE_DIR}/chrony.service.d/10-wait-for-ptp4l.conf" 644
 install_service "${BASE_DIR}/daemon/timing-monitor.service" "${SERVICE_DIR}/timing-monitor.service" 644
 
 systemctl daemon-reload

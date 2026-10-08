@@ -379,6 +379,16 @@ Design choices:
   be allowed to reject PHC and select NTP.
 - NTP is retained as fallback for Linux time, not as the precision source for a
   new firmware sync.
+- chrony starts only after ptp4l reaches SLAVE (systemd drop-in
+  `chrony.service.d/10-wait-for-ptp4l.conf`, from `data/timing/`, installed by
+  `install_timing_services.sh`; it gives up after 90 s with no GM). The boards
+  boot with a wrong date and so does the PHC; ptp4l steps the PHC ~40 s after
+  boot. Without the wait chrony can sample the stale PHC first, see it jump when
+  ptp4l steps it, mark `PHC0` a falseticker and stay on NTP (`#? PHC0` in
+  `chronyc sources`) until restarted -- krm4-mcr on 2026-10-08. `makestep`
+  does not help: the steps happen, it is the falseticker verdict that sticks.
+  Recover with `sudo chronyc reset sources`. `ready_for_firmware_sync` is false
+  while chrony is not on `PHC0`.
 
 ### `chronyc tracking`
 

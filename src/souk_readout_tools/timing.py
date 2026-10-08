@@ -478,7 +478,8 @@ def report_sync_readiness(summary: dict[str, Any]) -> dict[str, Any]:
 
     Preconditions:
       ptp_ready  -- PTP is locked to a grandmaster (``state == 'locked_to_gm'``) and
-                    the monitor reports ``ready_for_firmware_sync``. Without it, the
+                    the monitor reports ``ready_for_firmware_sync`` (stable lock, and
+                    chrony disciplining Linux time from the PHC). Without it, the
                     telescope time the firmware disciplines to may be wrong.
       pps_active -- the TSU 1-PPS strobe is healthy. Without a PPS the firmware has
                     nothing to align its telescope time to (the load latches on a PPS
@@ -493,7 +494,14 @@ def report_sync_readiness(summary: dict[str, Any]) -> dict[str, Any]:
     pps_active = bool(summary.get("strobe_healthy"))
 
     reasons = []
-    if not ptp_ready:
+    if not ptp_ready and state == "locked_to_gm" and summary.get("active_source_type") != "phc":
+        reasons.append(
+            "PTP is locked but chrony is not using the PHC (Linux time is on "
+            f"{summary.get('active_source_type')} {summary.get('active_source_name')!r}); "
+            "on the board run `sudo chronyc reset sources` and wait for '#* PHC0' "
+            "in `chronyc sources`."
+        )
+    elif not ptp_ready:
         reasons.append(
             f"PTP not ready for a firmware sync (state={state}, "
             f"ready_for_firmware_sync={summary.get('ready_for_firmware_sync')}); "

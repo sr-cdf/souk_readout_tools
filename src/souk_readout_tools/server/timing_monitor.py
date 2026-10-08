@@ -1001,8 +1001,13 @@ class TimingMonitor:
             s.seconds_since_selected_source_seen = s.seconds_since_any_sync
             s.ptp_lock_observed = self._last_ptp_lock_time is not None
 
-            # Firmware timestamp sync requires sustained good PTP lock.
-            s.ready_for_firmware_sync = s.ptp_quality_stable
+            # Firmware timestamp sync requires sustained good PTP lock AND chrony
+            # disciplining Linux time from the PHC. PTP can be locked while chrony
+            # has rejected PHC0 and runs on NTP (it sampled the PHC before ptp4l
+            # set it at boot; see data/timing/10-wait-for-ptp4l.conf). The TT load
+            # and every server timestamp read Linux time, which is then only good
+            # to ~ms and wanders.
+            s.ready_for_firmware_sync = s.ptp_quality_stable and chrony_phc_selected
 
             # TSU strobe status, read from the strobe daemon's status file.
             self._read_strobe_status(s, now)

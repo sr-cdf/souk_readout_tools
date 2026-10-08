@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **chrony waits for ptp4l at boot.** New drop-in
+  `chrony.service.d/10-wait-for-ptp4l.conf` (installed by
+  `install_timing_services.sh`) holds chrony until ptp4l is SLAVE, 90 s max.
+  Without it chrony could sample the stale boot-time PHC, reject `PHC0` as a
+  falseticker and stay on NTP (krm4-mcr, 2026-10-08).
+- **`ready_for_firmware_sync` needs chrony on the PHC**, not just a stable PTP
+  lock; the timed-sync readiness reason says so and how to recover.
+
 - **ADC over-voltage trips can no longer pass unseen.** A trip holds the ADC DSA
   at 15 dB (absolute) while `get_dsa` reads the programmed value; on krm4-mcr the
   hold lasts while the RTS flag is latched and clearing the flag releases it.

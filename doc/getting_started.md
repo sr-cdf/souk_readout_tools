@@ -1231,7 +1231,8 @@ print(raw.get("ptp_port_state"), raw.get("chrony_source_type"))
 
 Common states include `locked_to_gm`, `ptp_holdover`, `phc_free_run`,
 `ntp_synced`, `ntp_holdover`, `free_run`, `initializing`, and `unavailable`.
-`ready_for_firmware_sync` is true only when PTP is fresh, locked, and stable.
+`ready_for_firmware_sync` is true only when PTP is fresh, locked, and stable,
+and chrony is disciplining Linux time from the PHC (`PHC0` selected).
 
 On the RFSoC, local timing checks are available with:
 
