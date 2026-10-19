@@ -98,7 +98,8 @@
   tagged with the revision of the LO buffer their accumulation used
   (the last cycle before each edge was measured at the new combs). Large typed
   frames reach the stream process through `/dev/shm`, not the pipe, where
-  each ~150 kB TONE_UPDATE cost ~4 accumulations. Not yet hardware-tested.
+  each ~150 kB TONE_UPDATE cost ~4 accumulations. Run with `dry_run=False`
+  in the spectral, holography and HWP scans.
 
 - **`demodulate_stream(gaps=...)`**: `'raise'` (default, now says where and
   what to do), `'nan'` or `'interpolate'` (same probe point only). Filled rows
