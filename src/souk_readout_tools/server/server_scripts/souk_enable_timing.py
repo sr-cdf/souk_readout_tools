@@ -20,11 +20,11 @@ def main():
         "--phc-offset",
         "--offset",
         type=float,
-        default=0.0,
+        default=-37.0,
         help=(
-            "Chrony PHC refclock offset in seconds. Default is 0 for a "
-            "production UTC grandmaster; use --offset=-37 for the current lab "
-            "software grandmaster."
+            "Chrony PHC refclock offset in seconds. Default is -37: the PHC runs "
+            "on the PTP timescale (TAI), 37 s ahead of UTC. Use 0 only for a "
+            "grandmaster serving the ARB timescale (ptpTimescale 0)."
         ),
     )
     args = parser.parse_args()

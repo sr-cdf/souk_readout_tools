@@ -4,7 +4,7 @@
 #
 # Usage:
 #   sudo ./install_timing_services.sh                    # install configs and services
-#   sudo ./install_timing_services.sh --phc-offset=-37   # lab software GM
+#   sudo ./install_timing_services.sh --phc-offset=0     # ARB-timescale GM only
 #   sudo ./install_timing_services.sh --preserve-config  # update services only
 
 set -e
@@ -13,7 +13,7 @@ BASE_DIR="/home/casper/.souk_readout_tools"
 TIMING_DIR="${BASE_DIR}/timing"
 SERVICE_DIR="/etc/systemd/system"
 PRESERVE_CONFIG=0
-PHC_OFFSET=0
+PHC_OFFSET=-37
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
             echo "  Default: install packaged /etc timing config files and service units."
             echo "  Existing files are backed up before replacement."
             echo "  --phc-offset, --offset: chrony PHC refclock offset in seconds."
-            echo "    Default is 0. Use --offset=-37 for the current lab software GM."
+            echo "    Default is -37 (PHC on TAI). Use 0 only for an ARB-timescale GM (ptpTimescale 0)."
             echo "  --preserve-config: keep existing /etc timing config files and update service units only."
             exit 0
             ;;

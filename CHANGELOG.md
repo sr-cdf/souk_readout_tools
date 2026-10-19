@@ -25,6 +25,12 @@
   falseticker and stay on NTP (krm4-mcr, 2026-10-08).
 - **`ready_for_firmware_sync` needs chrony on the PHC**, not just a stable PTP
   lock; the timed-sync readiness reason says so and how to recover.
+- **chrony PHC refclock `offset -37` is the packaged default.** A production
+  grandmaster (issue #18) confirmed it is required for a standard GM: PTP serves
+  TAI, and chrony does not apply `currentUtcOffset` itself. The docs,
+  `ptp-phc.conf` and the `souk-enable-timing` / `install_timing_services.sh`
+  defaults reflect this; `--offset=0` is only for an ARB-timescale GM
+  (`ptpTimescale 0`). Re-run `souk-enable-timing` to apply.
 
 - **ADC over-voltage trips can no longer pass unseen.** A trip holds the ADC DSA
   at 15 dB (absolute) while `get_dsa` reads the programmed value; on krm4-mcr the

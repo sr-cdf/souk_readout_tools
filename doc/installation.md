@@ -393,14 +393,10 @@ Install the packaged SOUK timing config and restart the services:
 souk-enable-timing
 ```
 
-For the current lab software grandmaster only, use the PHC offset workaround:
-
-```bash
-souk-enable-timing --offset=-37
-```
-
-Do not use `--offset=-37` with a production grandmaster that serves UTC
-correctly.
+The packaged chrony PHC refclock uses `offset -37`: PTP serves TAI, which runs
+37 s ahead of UTC, and the offset puts Linux time on UTC. Only a grandmaster
+serving the ARB timescale (`ptpTimescale 0`) needs `souk-enable-timing
+--offset=0`. Details in [timing.md](timing.md#installation).
 
 Check the timing services:
 

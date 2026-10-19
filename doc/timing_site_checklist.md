@@ -72,8 +72,10 @@ timeTraceable             1
 ptpTimescale              1
 ```
 
-If `currentUtcOffsetValid` is `1`, keep the default `offset 0`. Do not install
-the lab-only `offset -37` workaround at site.
+With `ptpTimescale 1`, keep the packaged chrony PHC refclock `offset -37`; it
+must equal minus `currentUtcOffset`. Use `souk-enable-timing --offset=0` only if
+the GM reports `ptpTimescale 0` (ARB). Then check `chronyc sources -v` shows
+`#* PHC0` (selected), not `#x PHC0` at a whole number of seconds.
 
 ## Final End-to-End Check
 
@@ -128,5 +130,5 @@ Save a short site note with:
 - NTP fallback sources
 - Typical `master_offset` range
 - Timing-monitor holdover window and drift-rate settings
-- Whether any UTC offset workaround is in use
+- GM `ptpTimescale` and `currentUtcOffset`, and the chrony PHC refclock offset in use
 - Tested PTP loss and reacquisition behaviour

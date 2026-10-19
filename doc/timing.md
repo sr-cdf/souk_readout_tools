@@ -119,18 +119,20 @@ timing config and systemd units into `/etc`, backs up existing files before
 replacing them, reloads systemd, enables the services, and restarts `ptp4l`,
 chrony, and `timing-monitor`.
 
-The packaged chrony PHC refclock uses `offset 0`, which is the expected setting
-for a production grandmaster that serves UTC correctly.
-
-The current lab hardware (PHC) grandmaster serves TAI-like PHC time and does not
-assert a valid UTC offset. For that lab setup only:
+The packaged chrony PHC refclock uses `offset -37`. PTP serves TAI (the PTP
+timescale), and ptp4l keeps the PHC on it, 37 s ahead of UTC. chrony does not
+read the TAI-UTC offset from ptp4l, so the refclock applies it to steer Linux time
+to UTC. This holds for any standard grandmaster, whatever it announces in
+`currentUtcOffsetValid`. Only a grandmaster serving the ARB timescale
+(`ptpTimescale 0`, see [`GET TIME_PROPERTIES_DATA_SET`](#ptp-ptp4l-and-pmc))
+needs a different value:
 
 ```bash
-souk-enable-timing --offset=-37
+souk-enable-timing --offset=0
 ```
 
-Keeping `offset -37` with a proper site grandmaster would make Linux time wrong
-by 37 seconds.
+The PHC itself, and so the TSU strobe's `tsu_sec`, stays on TAI either way; the
+offset only changes Linux time.
 
 To update service units while deliberately keeping the existing `/etc` timing
 config files:
@@ -191,9 +193,9 @@ sudo systemctl restart chrony
 
 Review `/etc/linuxptp/ptp4l.conf` for the local grandmaster profile, especially
 `domainNumber`, `network_transport`, and `delay_mechanism`. Review
-`/etc/chrony/conf.d/ptp-phc.conf` before enabling the PHC refclock; for a
-normal UTC grandmaster keep `offset 0`, and only use `offset -37` for the
-specific lab hardware GM described above. If the laptop has no PHC, leave the
+`/etc/chrony/conf.d/ptp-phc.conf` before enabling the PHC refclock; keep
+`offset -37`, since the PHC runs on TAI (see [Installation](#installation)).
+If the laptop has no PHC, leave the
 PHC drop-in out and let chrony use normal NTP sources.
 
 With a PHC-capable interface, run `ptp4l` in the foreground on the chosen
@@ -345,7 +347,7 @@ not advancing, treat `gmPresent` and `master_offset` as stale.
 - `currentUtcOffset`: current TAI-UTC offset, currently 37 seconds
 - `currentUtcOffsetValid`: whether the GM says the offset is valid
 - `timeTraceable`: whether time is traceable to a primary reference
-- `ptpTimescale`: whether PTP timescale is in use
+- `ptpTimescale`: `1` if the GM serves the PTP timescale (TAI), `0` for ARB
 
 For a normal production GM, prefer:
 
@@ -356,7 +358,9 @@ timeTraceable             1
 ptpTimescale              1
 ```
 
-With a valid production GM, keep the chrony PHC refclock at `offset 0`.
+With `ptpTimescale 1` the PHC runs `currentUtcOffset` seconds ahead of UTC, so
+the chrony PHC refclock needs `offset -37` (minus `currentUtcOffset`). chrony
+reads neither field from ptp4l; the refclock offset is the only conversion.
 
 ## Chrony: PHC and NTP
 
@@ -368,11 +372,14 @@ Chrony disciplines Linux `CLOCK_REALTIME`. In this setup it has:
 The packaged PHC line is:
 
 ```text
-refclock PHC /dev/ptp-end0 poll 0 dpoll -2 offset 0 prefer
+refclock PHC /dev/ptp-end0 poll 0 dpoll -2 offset -37 prefer
 ```
 
 Design choices:
 
+- `offset -37` puts `PHC0` on UTC. The PHC follows the GM on TAI; without the
+  offset chrony sees `PHC0` 37 s away from its NTP sources and marks it a
+  falseticker (`#x PHC0 -37.0s` in `chronyc sources`).
 - `prefer` makes PHC win when it agrees with real time.
 - the PHC is not marked `trust`, because it keeps ticking when no GM is
   present. If a board starts with no GM and an incorrect PHC epoch, chrony must
@@ -477,9 +484,12 @@ chronyc waitsync 30 0.001
 `CLOCK_REALTIME`, for example:
 
 ```bash
-sudo phc2sys -s /dev/ptp-end0 -c CLOCK_REALTIME -O 0
+sudo phc2sys -s /dev/ptp-end0 -c CLOCK_REALTIME -O -37
 sudo phc2sys -a -r
 ```
+
+`-O` is sink minus source time (`phc2sys(8)`): UTC minus TAI here. With `-a`
+or `-w` instead, phc2sys takes the offset from ptp4l.
 
 The SOUK packaged setup does not use `phc2sys`. Chrony already reads
 `/dev/ptp-end0` as `PHC0` and steers Linux time. Running `phc2sys` as well would
@@ -793,7 +803,7 @@ The packaged `ptp4l.conf` contains:
 | `delay_filter moving_median` | Delay filter type. |
 | `delay_filter_length 10` | Number of samples in the delay filter. |
 | `phc_index -1` | Let linuxptp choose the PHC associated with the interface. |
-| `utc_offset 37` | Commented fallback for GMs that do not announce valid UTC offset. Prefer a GM that announces this correctly. |
+| `utc_offset 37` | Commented out. The TAI-UTC offset ptp4l announces when it is itself the GM; no effect on this `clientOnly` port. |
 
 At site, review `domainNumber`, `network_transport`, `delay_mechanism`, and
 `clock_class_threshold` against the grandmaster profile. The lab default:
@@ -810,7 +820,7 @@ the expected GM clock class.
 Packaged line:
 
 ```text
-refclock PHC /dev/ptp-end0 poll 0 dpoll -2 offset 0 prefer
+refclock PHC /dev/ptp-end0 poll 0 dpoll -2 offset -37 prefer
 ```
 
 Fields:
@@ -819,7 +829,10 @@ Fields:
 - `/dev/ptp-end0`: PHC disciplined by `ptp4l`
 - `poll 0`: poll the refclock every 1 second
 - `dpoll -2`: driver poll interval of 2^-2 seconds, i.e. 0.25 s
-- `offset 0`: apply no PHC-to-UTC correction for a proper UTC GM
+- `offset -37`: PHC (TAI) to UTC correction, minus the GM's `currentUtcOffset`;
+  the PHC example in `chrony.conf(5)` uses the same value. `0` only for an
+  ARB-timescale GM. chrony's `tai` refclock option with `leapsectz right/UTC`
+  is equivalent and follows future leap seconds from the tz database.
 - `prefer`: prefer PHC when it agrees with other sources
 
 The file also contains:
@@ -862,8 +875,8 @@ Important unit settings:
 `souk-enable-timing` arguments:
 
 - `--phc-offset SECONDS`, `--offset SECONDS`: set the chrony PHC refclock offset
-  while installing config. Default is `0`. Use `--offset=-37` only for the
-  current lab hardware GM.
+  while installing config. Default is `-37` (the PHC runs on TAI). Use
+  `--offset=0` only for a GM serving the ARB timescale (`ptpTimescale 0`).
 - `--preserve-config`: keep existing `/etc/linuxptp/ptp4l.conf` and
   `/etc/chrony/conf.d/ptp-phc.conf`, but update service units and restart
   services.
@@ -1006,7 +1019,7 @@ from a working lab grandmaster (`user`/`host`/paths masked).
    background it or give it its own terminal/service:
 
    ```console
-   user@gm:~$ sudo phc2sys -s CLOCK_REALTIME -c /dev/ptp0 -O 0 -w -m
+   user@gm:~$ sudo phc2sys -s CLOCK_REALTIME -c /dev/ptp0 -O 37 -m
    phc2sys[172887.397]: /dev/ptp0 sys offset 7886173603 s0 freq      -0 delay    850
    phc2sys[172888.397]: /dev/ptp0 sys offset 7886219499 s1 freq  +45876 delay    867
    phc2sys[172889.398]: /dev/ptp0 sys offset        31 s2 freq  +45907 delay    913
@@ -1015,9 +1028,11 @@ from a working lab grandmaster (`user`/`host`/paths masked).
    ```
 
    The servo state goes `s0` (unlocked) → `s1` (first step) → `s2` (locked); once in
-   `s2` the offset settles to tens of nanoseconds. `-O 0` applies no offset between
-   the two clocks (so the PHC carries UTC; see the UTC-offset note below) and `-w`
-   waits for the source to be ready. Inspect or set the PHC by hand with
+   `s2` the offset settles to tens of nanoseconds. `-O 37` holds the PHC 37 s
+   ahead of the system clock, i.e. on TAI, the timescale PTP serves (`-O` is sink
+   minus source; this is the domain-server example in `phc2sys(8)`). Replacing
+   `-O 37` with `-w` takes the offset from ptp4l instead, once ptp4l (step 3) is
+   running. Inspect or set the PHC by hand with
    `phc_ctl /dev/ptp0 get` / `set` if needed. This is the one place `phc2sys` *is*
    wanted — on the RFSoC slaves it is deliberately not used (see the
    [`phc2sys`](#phc2sys) section).
@@ -1084,10 +1099,10 @@ rather than left in terminals — separate from the RFSoC-side `ptp4l.service`:
   system (NTP-disciplined) clock act as the reference. This is the service-mode
   equivalent of the explicit `-s CLOCK_REALTIME -c /dev/ptp0` form shown above.
 
-**UTC offset.** With `phc2sys -O 0` the PHC carries UTC while PTP normally expects a
-TAI timescale, and this kind of GM does not assert a valid UTC offset. That is the
-lab setup described under [Installation](#installation): the RFSoCs compensate with
-`souk-enable-timing --offset=-37`. With a proper UTC grandmaster, keep `offset 0`.
+**UTC offset.** Both forms put TAI on the GM's PHC: `-O 37` explicitly, `-a`
+from ptp4l's `utc_offset` (default 37). The GM's ptp4l announces that value as
+`currentUtcOffset`, the same as a dedicated hardware GM. The RFSoCs' packaged
+chrony `offset -37` turns it back into UTC (see [Installation](#installation)).
 
 ### Software-timestamping mode (no PHC — did not work in lab testing)
 

@@ -531,10 +531,11 @@ def format_timing_status(status: dict[str, Any]) -> str:
     The TAI line is the one that surprises people. PTP runs on TAI
     (``ptpTimescale 1``), so the PHC -- and the TSU strobe's ``tsu_sec`` that
     follows it -- sit ``currentUtcOffset`` seconds ahead of UTC (37 s at
-    present). chrony compares PHC0 against UTC-based NTP servers, sees that
-    offset and marks it a falseticker. That is correct behaviour, not a fault,
-    and it is why a board can be genuinely locked to a grandmaster while chrony
-    reports ``ntp`` as the active source.
+    present). chrony's PHC0 refclock applies ``offset -37`` so that the system
+    clock is UTC; the PHC and ``tsu_sec`` stay on TAI. A refclock without that
+    offset sits 37 s from the UTC-based NTP servers, chrony marks PHC0 a
+    falseticker, and a board genuinely locked to a grandmaster reports ``ntp``
+    as the active source.
 
     ``telescope_time`` in the frame headers is a **different clock** and is not
     covered by that offset: it is the firmware TT counter, in fabric-clock ticks
@@ -584,7 +585,7 @@ def format_timing_status(status: dict[str, Any]) -> str:
 
     # The TAI/UTC discrepancy, stated rather than left to be rediscovered.
     #
-    # Key this off the TSU, NOT off chrony's PHC offset. Setting `offset=-37` on
+    # Key this off the TSU, NOT off chrony's PHC offset. The `offset -37` on
     # chrony's PHC0 refclock fixes the *system* clock but leaves the PHC -- and
     # so the TSU, and so tsu_sec -- on TAI. Keying off the chrony offset would
     # make this warning vanish exactly when it is still needed.
