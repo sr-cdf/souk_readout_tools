@@ -206,6 +206,12 @@ Software only: firmware v7.12.1, as v1.8.0 and v1.8.1. **On each board, re-run
 
 **Analysis and plotting**
 
+- **`fitting.duffing_y` wrong roots fixed** (present since nonlinear fitting
+  arrived, 2026-03-30): Cardano cancelled near `y0 = ±sqrt(3)/2` and returned
+  y off by up to ~6000 linewidths (+: any `anl`; −: above bifurcation). On the
+  02_room power sweep 5.5 % of fits evaluated a wrong root; 16 of 6144 change
+  basin (`anl` vs collapse to 0), ~21 had uncertainties off >2×. Precision
+  1e-6 → 1e-14; nonlinear fits 7.5 % faster.
 - **`match_rx_gain` on every timestream and snapshot plotter** and on
   `timestream_psds`, `snapshot_psds`, `allan_deviation`, `timestream_stats`,
   `cross_psd`, `estimate_beta`: `'auto'` (default, recorded RX chain states),

@@ -422,17 +422,20 @@ def duffing_y(y0, anl, sweep_direction="up"):
     A, B, C, D = 4.0, -4.0 * y0, 1.0, -y0 - anl
     D0 = B * B - 3.0 * A * C
     D1 = 2.0 * B**3 - 9.0 * A * B * C + 27.0 * A * A * D
-    Ct = 0.5 * (D1 + np.emath.sqrt(D1**2 - 4.0 * D0**3))
+    S = np.emath.sqrt(D1**2 - 4.0 * D0**3)
+    # Take the sign of S that adds to D1. D1 + S cancels to zero near
+    # y0 = sqrt(3)/2 (where D0 -> 0 with D1 < 0) and the roots come out as garbage.
+    Ct = 0.5 * (D1 + np.where(D1 * S.real < 0.0, -S, S))
     Ct = np.where(np.abs(Ct) < 1e-48, 1e-24 + 0j, Ct)
     Cc, xi = Ct ** (1.0 / 3.0), -0.5 + 0.5j * np.sqrt(3.0)
-    r1 = -(B + Cc + D0 / Cc) / (3.0 * A)
-    r2 = -(B + xi * Cc + D0 / (xi * Cc)) / (3.0 * A)
-    r3 = -(B + xi * xi * Cc + D0 / (xi * xi * Cc)) / (3.0 * A)
+    Q = D0 / Cc                       # 1/xi = xi**2, so D0/(xi*Cc) = xi**2 * Q
+    r1 = -(B + Cc + Q) / (3.0 * A)
+    r2 = -(B + xi * Cc + xi * xi * Q) / (3.0 * A)
+    r3 = -(B + xi * xi * Cc + xi * Q) / (3.0 * A)
     if sweep_direction == "up":
-        return np.where(np.isclose(r1.imag, 0.0, atol=1e-12),
-                        r1.real, np.maximum(r2.real, r3.real))
+        return np.where(np.abs(r1.imag) <= 1e-12, r1.real, np.maximum(r2.real, r3.real))
     if sweep_direction == "down":
-        real23 = np.isclose(r2.imag, 0.0, atol=1e-12) | np.isclose(r3.imag, 0.0, atol=1e-12)
+        real23 = (np.abs(r2.imag) <= 1e-12) | (np.abs(r3.imag) <= 1e-12)
         return np.where(real23, np.maximum(r2.real, r3.real), r1.real)
     raise ValueError('sweep_direction must be "up" or "down"')
 
