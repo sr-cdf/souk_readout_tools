@@ -244,7 +244,8 @@ modulation revision. The viewer subscribes to in-band `SNAPSHOT` and
 revision boundary, and joins the revisions onto one reference
 (`modulation.StreamDemodulator`), so a tracking commit or recentre never
 reads as a resonator move: calibrated tones through their absolute resonance
-(`f_res = f_centre + d_centre`), uncalibrated ones by carrying the reference
+(`f_res = f_centre + d_centre`) and absolute loss (dissipation is not re-zeroed
+per revision), uncalibrated ones by carrying the reference
 along the measured I/Q gradient. An unknown revision stays blank until its
 full state arrives. A recorded file needs its `.updates.jsonl` sidecar
 (`receive_stream` writes it by default) for this reconstruction.

@@ -202,14 +202,16 @@ f_res(t) = f_centre[rev(t)] + d_centre(t)
 `modulation.demodulate_stream` (offline) and the live viewer demodulate each
 revision with its own state and join them onto one reference, so
 `resonance_shift_hz` is the resonator's own motion and never steps at a
-commit: a calibrated tone through its absolute resonance, each revision's
-reference inverted with the calibration (exact, free of the finite-difference
-bias, as long as the calibration's frequency scale is right: a fit off by
-`k` near the operating point steps by `(1 − k)` × the move, which is what the
-[sweep table](#the-sweep-table) takes out); an uncalibrated tone by carrying
-the reference I/Q along the measured gradient by the probe move (first order
-in the accumulated move: for drifts approaching a linewidth, use a
-calibration). Stream-to-DAC keeps one
+commit: a calibrated tone through its absolute resonance, and its
+`matched_dissipation_shift` through the same inversion's absolute loss, each
+revision's reference inverted with the calibration (exact, free of the
+finite-difference bias, as long as the calibration's frequency scale is right:
+a fit off by `k` near the operating point steps by `(1 − k)` × the move, which
+is what the [sweep table](#the-sweep-table) takes out); an uncalibrated tone by
+carrying the reference I/Q along the measured gradient by the probe move (first
+order in the accumulated move: for drifts approaching a linewidth, use a
+calibration). Nothing is matched across a join, so a real change at a commit is
+kept. Stream-to-DAC keeps one
 reference and adds the centre steps, `(f_centre[rev] − f_centre[ref]) +
 shift about the reference` — exact to first order in the centred basis,
 which depends on the detuning alone.

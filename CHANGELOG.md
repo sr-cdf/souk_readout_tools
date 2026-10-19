@@ -126,7 +126,13 @@ Software only: firmware v7.12.1, as v1.8.0 and v1.8.1. **On each board, re-run
 
 - **Revisions joined onto one reference**: `modulation.demodulate_stream` /
   `StreamDemodulator` demodulate each revision with its own state and join
-  calibrated tones through the absolute resonance (recentre residual 27 Hz → 0).
+  calibrated tones through the absolute resonance (recentre residual 27 Hz → 0)
+  and the absolute loss (`reference_matched_dissipation`). Nothing is matched
+  across a join. Dissipation was re-zeroed per revision: a real step at a
+  commit was erased and a slow drift became a sawtooth (synthetic, 0.3 lw move:
+  2e-7 step → 0; 8e-9 drift → −1.9e-7 step). On the 2026-10-02 bandpass FFM
+  captures, DC dissipation against the no-mod run went from r −0.13…−0.48 to
+  0.95–0.99. Keep one `StreamDemodulator` per capture when reading in chunks.
 - **`demodulate_stream(gaps=)`**: `'raise'` (default; says where and what to
   do), `'nan'` or `'interpolate'` (same probe point only). Filled rows in
   `gap_fill`, marked in `packet_missing`; `timeseries.fill_gaps` gives the same

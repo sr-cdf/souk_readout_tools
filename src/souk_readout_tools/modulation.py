@@ -1257,8 +1257,10 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
         ``modulation_offset_hz``. Per tone: ``conversion`` and ``basis`` (lists),
         ``point_reference_z``, ``point_gradient`` (mean ``dz/df`` per point),
         ``reference_center_detuning_hz``,
-        ``reference_resonance_frequency_hz`` and
-        ``dissipation_reference_frequency_hz``. Metadata arrays ``cycle_index``,
+        ``reference_resonance_frequency_hz``,
+        ``reference_matched_dissipation`` (the reference's absolute
+        ``Delta(1/(2 Qi))`` against the calibration's Qi; calibrated tones only)
+        and ``dissipation_reference_frequency_hz``. Metadata arrays ``cycle_index``,
         ``modulation_point``, ``modulation_settling``, ``sample_present``,
         ``sample_used_in_cycle`` and packet/telescope fields are included when
         available.
@@ -1526,6 +1528,7 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
     dissipation_reference_frequency_hz = np.full(n_tones, np.nan)
     reference_center_detuning = np.full(n_tones, np.nan)
     reference_resonance = np.full(n_tones, np.nan)
+    reference_dissipation = np.full(n_tones, np.nan)
     conversions = [None] * n_tones
     bases = ['raw'] * n_tones
 
@@ -1628,6 +1631,9 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
             reference_resonance[t] = _reference_resonance_hz(
                 cal, ref_center, center_hz + c_offset)
             reference_center_detuning[t] = reference_resonance[t] - center_hz
+            # The reference's absolute loss, Delta(1/(2 Qi)) from the
+            # calibration's Qi: what joins revisions in demodulate_stream.
+            reference_dissipation[t] = cal.convert_centered_iq(ref_center)[1]
 
         # z_demod: rotate/scale every sample onto the centre-point reference, so
         # each probe point reads as if measured at the centre.
@@ -1764,6 +1770,7 @@ def demodulate_timestream(grouped, offsets=None, *, method='accurate',
     out['center_point_index'] = center_point_index
     out['reference_center_detuning_hz'] = reference_center_detuning
     out['reference_resonance_frequency_hz'] = reference_resonance
+    out['reference_matched_dissipation'] = reference_dissipation
     out['dissipation_reference_frequency_hz'] = dissipation_reference_frequency_hz
     return out
 
@@ -1983,7 +1990,10 @@ class StreamDemodulator:
     - a calibrated tone is joined through its absolute resonance frequency,
       ``f_res = f_centre + d_centre`` (the reconstruction identity), with the
       centre detuning of each revision's reference from the calibration's
-      inversion (exact, unlike the finite-difference detuning);
+      inversion (exact, unlike the finite-difference detuning), and its
+      dissipation through the same inversion's absolute loss. Nothing is
+      matched across a join: a real step at a commit stays, and so does a
+      calibration error (as a step proportional to the move);
     - an uncalibrated tone carries its per-point reference I/Q across each
       move along the measured I/Q gradient (first order in the move, which
       tracking keeps small).
@@ -2017,6 +2027,7 @@ class StreamDemodulator:
         self._epoch_references = {}
         self._last_reference = {}           # tone -> the latest epoch's entry
         self._baseline_resonance = {}       # tone -> f_res of the first reference
+        self._baseline_dissipation = {}     # tone -> its absolute loss
 
     @property
     def references(self):
@@ -2191,6 +2202,8 @@ class StreamDemodulator:
                             result['reference_resonance_frequency_hz'][i]):
                         self._baseline_resonance[tone] = float(
                             result['reference_resonance_frequency_hz'][i])
+                        self._baseline_dissipation[tone] = float(
+                            result['reference_matched_dissipation'][i])
             for field in ('i_data', 'q_data'):
                 for i in range(len(keys)):
                     iq[field][global_idx, i] = result[field][f'{i:04d}'][local_idx]
@@ -2198,12 +2211,18 @@ class StreamDemodulator:
                 if field in result:
                     merged[field][global_idx] = result[field][local_idx]
             # Calibrated tones join the revisions through the absolute
-            # resonance frequency; carried references need nothing more.
+            # resonance frequency and the absolute loss, each from the
+            # calibration's inversion of the revision's own reference; nothing
+            # is matched across the join. Carried references need nothing more.
             for i, tone in enumerate(keys):
                 if i in calibration and tone in self._baseline_resonance:
                     merged['resonance_shift_hz'][global_idx, i] = (
                         result['resonance_frequency_hz'][local_idx, i]
                         - self._baseline_resonance[tone])
+                    merged['matched_dissipation_shift'][global_idx, i] = (
+                        result['matched_dissipation_shift'][local_idx, i]
+                        + result['reference_matched_dissipation'][i]
+                        - self._baseline_dissipation[tone])
             if 'z_demod' in result:
                 z_demod[global_idx] = result['z_demod'][local_idx]
             spectra_parts.append(result['cycle_spectra'])

@@ -849,8 +849,9 @@ modulation state mid-stream; each revision is demodulated with its own
 offsets and readout correction and the pieces are joined onto one physical
 reference, so `resonance_shift_hz` is the resonator's own motion, never a
 probe move: calibrated tones through their absolute resonance
-(`f_res = f_centre + d_centre`, each revision's reference inverted with the
-calibration), uncalibrated ones by carrying the reference along the measured
+(`f_res = f_centre + d_centre`) and, for the dissipation, the absolute loss,
+each revision's reference inverted with the calibration; uncalibrated ones by
+carrying the reference along the measured
 I/Q gradient. Needs the recording's tone updates (`receive_stream`
 subscribes by default); `calibration` defaults to the one the recording
 carries (`info['resonators']`, pushed with `set_resonator_calibrations`).
