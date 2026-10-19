@@ -288,6 +288,10 @@ Software only: firmware v7.12.1, as v1.8.0 and v1.8.1. **On each board, re-run
 
 **Docs**: new `doc/compatibility.md` (which software, firmware, OS image and
 boot files go together), `doc/conversions.md`, `doc/live_plotting.md`.
+`doc/resonator_math_derivations.ipynb` rebuilt around the conformal Möbius map
+(complex detuning, ten-step inversion, coordinate net, one-matrix chain,
+matched scale, Duffing non-conformality); asymmetry now in the fitter's
+numerator-phase convention.
 
 ## v1.8.1
 

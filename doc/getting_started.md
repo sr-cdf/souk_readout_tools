@@ -1527,11 +1527,10 @@ The default fitted and historical linearized converters return
 the matched-scale dissipation quadrature `Delta(1 / (2 * Qi))`. Double that
 quadrature for the commonly reported physical `Delta(1 / Qi)`.
 
-The established nonlinear fit branch uses a real loaded-linewidth denominator,
-so with non-zero `phi` its `anl -> 0` limit is not identical to the asymmetric
-linear branch. Changing that convention would require a separate fit-model
-migration. For the complete derivation, plots, and loss-coordinate
-normalization, see
+Both fit branches use the numerator-phase convention (only `Re(1/Qe)` in the
+denominator), so `anl -> 0` reproduces the linear branch exactly, including
+for non-zero `phi`. For the complete derivation (the conformal Möbius map from
+IQ to frequency and dissipation), plots, and loss-coordinate normalization, see
 [`resonator_math_derivations.ipynb`](resonator_math_derivations.ipynb).
 
 ### Targeted Resonance Finding
