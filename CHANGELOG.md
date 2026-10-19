@@ -76,6 +76,11 @@ Software only: firmware v7.12.1, as v1.8.0 and v1.8.1. **On each board, re-run
   default `conversion='phase'`.
 - **`operating_point_hz` memoises a driven fit's grid solve**: 3.5 ms → 73 µs
   per call at anl 0.3 (`mobius_center_detuning` calls it every time).
+- **Fixed-tone `mobius`/`circle` precompute the multiply-add**: `prepare_conversion`
+  keeps `basis_coefficients` `(A, B)` and the converted sweep reference, so
+  `convert_iq` no longer rebuilds the de-embedding per call: 220 → 12 µs per
+  16-sample call with a group-delay table (90 → 12 µs scalar delay), 1.7–2.3×
+  on 1e5 samples; same numbers.
 - **Fixes**: `plot_timestream` freq/diss on already-scaled I/Q (units); `noise`
   Möbius with RX-gain matching; `phase_center=True` without a sweep raises; a
   live-viewer probe recentre no longer reads as a resonator move.

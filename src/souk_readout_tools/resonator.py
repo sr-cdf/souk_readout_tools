@@ -3355,9 +3355,16 @@ def prepare_conversion(frequency_hz, method='linearized', *, calibration=None,
             calibration, frequency_hz, sweep_f if have_sweep else None,
             sweep_z if have_sweep else None, smooth_window_hz)
     else:
+        # De-embedding, centring and rotation at this tone are one complex
+        # multiply-add, so convert_iq only has to invert the circle.
+        A, B = basis_coefficients(calibration, frequency_hz, 'centered_rotated')
+        prepared['A'], prepared['B'] = complex(A), complex(B)
         prepared['calibration'] = calibration
-        prepared['reference_iq'] = (interpolate_complex_trace(sweep_f, sweep_z, frequency_hz)
-                                    if have_sweep else None)
+        prepared['reference'] = None
+        if have_sweep:
+            reference = interpolate_complex_trace(sweep_f, sweep_z, frequency_hz)
+            prepared['reference'] = calibration.convert_centered_iq(
+                A * reference + B, method=method)
     return prepared
 
 
@@ -3395,13 +3402,14 @@ def convert_iq(prepared, z, gain=1.0):
             z * prepared['A'] + prepared['B'], prepared['reference'], prepared['dphi_df'])
         return shift, dissipation_hz / frequency_hz
     calibration = prepared['calibration']
-    reference = prepared['reference_iq']
+    probe_detuning, loss = calibration.convert_centered_iq(
+        z * prepared['A'] + prepared['B'], method=method)
+    reference = prepared['reference']
     if reference is not None:
-        return calibration.convert_referenced_raw_iq(
-            frequency_hz, z, reference, method=method)
+        # Relative to the sweep's I/Q at the tone, resonator-side sign.
+        return reference[0] - probe_detuning, loss - reference[1]
     # No sweep: relative to the fitted state, where the probe detuning is
     # f - fr and the loss coordinate is zero.
-    probe_detuning, loss = calibration.convert_raw_iq(frequency_hz, z, method=method)
     return (frequency_hz - calibration.fr) - probe_detuning, loss
 
 
