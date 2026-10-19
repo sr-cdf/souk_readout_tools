@@ -2,357 +2,281 @@
 
 ## Unreleased
 
-- **WORKAROUND, accumulator TT correction** (remove when realtimeradio confirm
-  how `acc_tt` should behave). On fw 7.12.1 the accumulator's latched TT is off
-  after the documented sync flow (TT − 9 s after pipeline init, TT + the
-  programming time after a timed sync) while the mixer's live `tt` is right.
-  The server measures K = `acc_tt − mix_tt` at accumulation edges (after a TT
-  load, a waited timed sync, pipeline init, server start, and a 1 Hz check) and
-  every `acc_tt` read subtracts it; `get_info('sync')` shows
-  `acc_tt_correction_s`. Reproduction for realtimeradio:
-  `scripts/timed_sync/10_acc_tt_report.py`.
-- **The server reaches its own tcpborphserver at `127.0.0.1`, not
-  `localhost`.** With an empty `/etc/hosts`, `localhost` went to DNS and resolved
-  to the other board: krm4-cdf's server programmed and initialised krm4-mcr's
-  FPGA (2026-10-08).
-- **Programming is verified on this board's fabric.** If the fast interface
-  sees no running design after `r.program()`, programming raises instead of
-  carrying on to init and "ready".
-- **chrony waits for ptp4l at boot.** New drop-in
-  `chrony.service.d/10-wait-for-ptp4l.conf` (installed by
-  `install_timing_services.sh`) holds chrony until ptp4l is SLAVE, 90 s max.
-  Without it chrony could sample the stale boot-time PHC, reject `PHC0` as a
-  falseticker and stay on NTP (krm4-mcr, 2026-10-08).
-- **`ready_for_firmware_sync` needs chrony on the PHC**, not just a stable PTP
-  lock; the timed-sync readiness reason says so and how to recover.
-- **chrony PHC refclock `offset -37` is the packaged default.** A production
-  grandmaster (issue #18) confirmed it is required for a standard GM: PTP serves
-  TAI, and chrony does not apply `currentUtcOffset` itself. The docs,
-  `ptp-phc.conf` and the `souk-enable-timing` / `install_timing_services.sh`
-  defaults reflect this; `--offset=0` is only for an ARB-timescale GM
-  (`ptpTimescale 0`). Re-run `souk-enable-timing` to apply.
+Software only: firmware v7.12.1, as v1.8.0 and v1.8.1. **On each board, re-run
+`souk-enable-timing`** (chrony `offset -37`, chrony waits for ptp4l; see Timing).
 
-- **ADC over-voltage trips can no longer pass unseen.** A trip holds the ADC DSA
-  at 15 dB (absolute) while `get_dsa` reads the programmed value; on krm4-mcr the
-  hold lasts while the RTS flag is latched and clearing the flag releases it.
-  - Routine checks (`health_check`, `get_info`, `check_input_saturation` without
-    a config, the diagnostics in `get_info('all')` / `get_samples` /
-    `receive_stream`) only read the flag; they used to clear it silently.
-  - `release_adc_overvoltage` is the one place it is cleared, with the event
-    logged. Level-changing requests (RX/TX attenuation and amp bypass, DSA,
-    tone amplitudes/powers, `maximise_tx_power`, blind tones) watch for a trip
-    for 1 s, release once and warn; the RX policies and maximise/fix/optimise
-    routines release too. New `client.release_adc_overvoltage()`.
-  - A server monitor reads the flag once a second and logs trips (time,
-    accumulation count, DSA, RF settings) to `get_info('rfdc')` and the
-    journal. `health_check` and `get_adc_dsa` report the effective DSA.
-  - Captures save the events in the `.json`; `parse_stream`, `read_stream_chunk`
-    and the live buffer give a per-sample `adc_overvoltage` mask.
-    `stream_file.add_adc_overvoltage_events` / `parse_overvoltage_journal`
-    attach them afterwards.
-  - RX gain matching uses the effective DSA, and warns about trips.
-  - `rx_policy='compensate'` now always runs the saturation check.
+**Breaking and behaviour changes**
 
-- **`match_rx_gain` on every timestream and snapshot plotter**, and on
-  `timestream_psds`, `snapshot_psds`, `allan_deviation`, `timestream_stats`,
-  `cross_psd`, `estimate_beta`: `'auto'` (default, recorded RX chain states),
-  `True` (carrier ratio), `False`, or a ratio. `plot_timestream_on_resonance`
-  now matches the RX scale too (it didn't before).
+- **One sign convention, new names.** Resonance shift is positive when the
+  resonance moves up; detuning = resonance − tone (`center_detuning_*` for
+  demodulated data).
+  - `demodulate*`: `freq_shift_hz` → `resonance_shift_hz`, `dissipation` →
+    `matched_dissipation_shift`, `detuning_*` → `center_detuning_hz` /
+    `_linewidths`; new `resonance_frequency_hz`. `group_cycles`: `freq_hz` →
+    `tone_frequency_hz`.
+  - Tracking status and announce keys `*center_detuning*`;
+    `new_center = center + gain * center_detuning_hz`.
+  - stream-to-DAC: `QuantityConverter` (`conversion.output`,
+    `conversion.method`) replaces `DfCalibratedConverter`; `df_calibrated`
+    `frequency` is now `resonance_shift_hz` (old probe detuning =
+    `-detuning_hz`); `df_modelfree` sign flipped.
+- **Removed `ToneConverter` / `ResonatorCalibration.tone_converter()`** (old
+  sign, no RX gain correction, not sweep-referenced). Use `prepare_conversion` +
+  `convert_iq`.
+- **Tracking and argument-less `update_modulation()` need a pushed calibration**
+  (`ReadoutClient.set_resonator_calibrations`) and refuse without one. The
+  server no longer fits (`_calibrations_from_latest_sweep` removed).
+- **`receive_stream` returns the capture path** (was the last printed IQ frame)
+  and never overwrites: with no filename it writes the first unused
+  `tmp_stream[_N]`; an existing capture raises `FileExistsError` unless
+  `overwrite=True` (`souk-receive-stream --overwrite`). It subscribes to tone
+  updates by default.
+- **`parse_stream` applies the readout correction by default**, per revision
+  (`readout_correction_by_revision`; `apply_readout_correction=False` for raw
+  I/Q), normalises tone frequencies to modulation centres and returns the same
+  modulation fields as `parse_samples`.
+- **Plots and PSD functions match RX gain by default** (`match_rx_gain='auto'`,
+  see Analysis).
 
-- **Snapshots no longer double-correct acc_len** in RX gain matching: after
-  scaling to the sweep's acc_len they were divided by the acc_len ratio again.
+**Conversions and calibration** (`doc/conversions.md`)
 
-- **`ReadoutClient.sweep_spans(n_tones, calibration)`**: per-tone sweep spans
-  of 10 fitted linewidths from a calibration record or `cal.npz` path; median
-  for uncovered tones, 300 kHz with no calibration.
-
-- **`receive_stream` writes from a background thread**: a slow disk no longer
-  stops socket reads, so the server doesn't drop the capture. Peak lag saved as
-  `write_backlog_peak_bytes`; stops past 4 GiB behind.
-
-- **Server stream drain timeout 2 s → 10 s** (`STREAM_DRAIN_TIMEOUT_S`).
-
-- **Removed `ToneConverter` / `ResonatorCalibration.tone_converter()`**: old
-  sign (probe − resonance), no RX gain correction, not sweep-referenced. Use
-  `prepare_conversion` + `convert_iq`.
-
-- **`stream_file`: read huge stream captures in chunks**:
-  `read_stream_chunk` reads a sample range with a subset of tones and header
-  fields, in the `parse_stream` format plus `sample_index` / `time_s`.
-  `concatenate_stream_chunks` joins chunks, and `stream_file_info` gives the
-  size of a capture. Reads are sequential and blocked, with progress and a
-  memory check made before reading. `stream_time_model` / `find_sample` /
-  `sample_times` give real time from the packet counter and the capture's clock
-  readings, and warn when the TT was never loaded, is offset, jumps, or the
-  sample clock is off frequency.
-
-- **Telescope time: the data carries the accumulator's TT**: the sync checks
-  read the sync block's copy, which read correct on 2026-09-29 while the
-  accumulator's was 626 296 s behind. `get_info('sync')` and
-  `set_telescope_time` now report `acc_tt_ok` / `acc_tt_offset_s`.
-  `firmware_lib.read_time_anchor` gives server clock + count + TT, carried as
-  `time_anchor` in SNAPSHOT / TONE_UPDATE frames. `receive_stream` saves
-  `first_frame` / `last_frame` host-clock anchors in the `.json`.
-
-- **Tracking commits (fw engine), fixed for `dry_run=False`**: frames are
-  tagged with the revision of the LO buffer their accumulation used
-  (the last cycle before each edge was measured at the new combs). Large typed
-  frames reach the stream process through `/dev/shm`, not the pipe, where
-  each ~150 kB TONE_UPDATE cost ~4 accumulations. Run with `dry_run=False`
-  in the spectral, holography and HWP scans.
-
-- **`demodulate_stream(gaps=...)`**: `'raise'` (default, now says where and
-  what to do), `'nan'` or `'interpolate'` (same probe point only). Filled rows
-  are listed in `gap_fill` and marked in `packet_missing`; `timeseries.fill_gaps`
-  gives the same `gap_fill` and handles `sample_index` / `time_s`. Revision
-  epochs open at the previous announcement: new-revision frames arriving
-  before their record are no longer dropped.
-
-- **`get_samples` time anchors**: server clock + count + TT (+ modulation
-  revision) read just before and after each capture (`get_time_anchor`
-  request), kept in `time_anchors`; a revision change during the capture warns.
-  `stream_file.capture_time_model` gives real times and TT checks for any
-  capture in memory.
-
-- **RX gain matching includes acc_len**: `recorded_rx_gain_ratio` scales by the
-  acc_len ratio (the accumulator sums), so sweeps and streams, or two streams,
-  at different acc_len compare directly. New records keep `acc_len` in their
-  provenance. Older ones match analog gain only.
-
-- **Sweep tables: calibrated frequencies come off the calibration sweep**: a
-  record made with its sweep (`sweep_data=`) carries per-tone
-  `frequency_correction_*` (`resonator.sweep_frequency_correction`), applied in
-  the Möbius inversion and `operating_point_hz`. Fit frequency-scale error near
-  the operating point 2.1% -> 0.19% (krm4 hold-out); it stepped the tracked
-  resonance by that times every commit's move. `calibration_quality` adds
-  `frequency_scale` and flags tones with no table or >20% out. See
-  `doc/conversions.md` (The sweep table).
-
-- **Calibration health per tone**: `resonator.calibration_fit` (median
-  |z_c| / r, 1 while the circle fits) in the tracker's per-tone health and
-  summary (`median_calibration_fit`, `n_poor_calibration_fit`) and the DAC
-  status (`fit=`); `resonator.calibration_quality` checks a calibration and
-  returns `good` / `poor` tones with reasons (krm4: 44% of tones off 0.9-1.1
-  three hours into a cooldown). Staleness is per tone (`stale_tones`; the
-  tracker's `stale` state) instead of one drifted tone voiding the record.
-  Optional guard `freeze_unresponsive` (off): freeze tones whose readings
-  ignore their own moves (`move_response`).
-
-- **stream-to-DAC `ffm` no longer steps at tracking commits**: with a
-  calibration every cycle is absolute (centre + Möbius centre detuning, the
-  reconstruction identity), so recentres need no join. Converting about one
-  startup reference through the live slope stepped by ~25% of each move on
-  driven krm4 tones (e.g. +6.86 kHz move -> -1.77 kHz step). Fixed-tone modes
-  on a modulated stream now average whole modulation cycles (they followed
-  the probe slots above ~700 Hz updates: 4.9 kHz p-p).
-
-- **Möbius is the default detuning estimator**: on tones driven to anl ~0.3
-  (krm4, 2026-09-28) the curvature form `phi''/(2 phi'|phi'|)` read 2x (fit:
-  3-3.5x) and the gain-1 tracker jumped +/-0.24 lw every commit.
-  `resonator.mobius_center_detuning` (measured gain 0.98) now drives
-  `enable_tracking` (`detuning_estimator='mobius'`; `'curvature'` optional),
-  argument-less `update_modulation()`, and the calibrated `center_detuning_*`
-  of `demodulate*`, the live viewer and stream-to-DAC `ffm`.
-
-- **Tracker overshoot fixes**: a staged correction is replaced, not added to
-  (held bin moves applied the same detuning twice); the detuning filter
-  restarts at each revision; `demodulate*` / `StreamDemodulator` divide out the
-  RX gain change since the calibration (unmatched, 1 dB made a 5 kHz recentre
-  read as a -1.3 kHz step).
-
-- **stream-to-dac drift high-pass**: `channels[].highpass_s` (s) subtracts a
-  running EMA baseline of `x` before the gain/clip (`OutputChannel(highpass_s=)`),
-  so ffm drift no longer rails the output. Off by default. See
-  `doc/stream_to_dac.md` (df → volts mapping).
-
-- **One conversion contract in `resonator.py`**: every I/Q -> quantity
-  conversion now lives there and `timeseries`, `noise`, `modulation`, the live
-  viewer, the tracker and `stream_dac` call it: `QUANTITIES` (+ aliases,
-  `canonical_quantity`), `express`, `convert_samples`,
-  `prepare_conversion`/`convert_iq` (`linearized`, `phase`, `mobius`,
-  `lookup`, `circle`), `basis_coefficients`/`to_basis`, `phase_derivatives`,
+- **One conversion contract in `resonator.py`**, used by `timeseries`, `noise`,
+  `modulation`, the live viewer, the tracker and `stream_dac`: `QUANTITIES`
+  (+ aliases, `canonical_quantity`), `express`, `convert_samples`,
+  `prepare_conversion` / `convert_iq` (`linearized`, `phase`, `mobius`,
+  `lookup`, `circle`), `basis_coefficients` / `to_basis`, `phase_derivatives`,
   `detuning_from_derivatives`, `phase_shift_and_dissipation`,
-  `operating_point_hz`. Maths and workflow: `doc/conversions.md`.
-
-- **One sign convention, new names (breaking)**: resonance shift positive when
-  the resonance moves up; detuning = resonance - tone (`center_detuning_*` for
-  demodulated data). `demodulate*`: `resonance_shift_hz`,
-  `matched_dissipation_shift`, `resonance_frequency_hz`, `center_detuning_hz` /
-  `_linewidths` (were `freq_shift_hz`, `dissipation`, `detuning_*`);
-  `group_cycles` `freq_hz` -> `tone_frequency_hz`; tracking status and
-  announce keys `*center_detuning*`, `new_center = center + gain *
-  center_detuning_hz`. stream-to-DAC: `df_calibrated` `frequency` is now
-  `resonance_shift_hz` (old probe detuning = `-detuning_hz`); `df_modelfree`
-  sign flipped.
-
+  `operating_point_hz`.
 - **Calibrations travel with the data**: `calibration_record` (JSON-safe,
   `souk-resonator-calibration/1`); `save_calibrations(..., sweep_data=)` keeps
   the sweep in the same `.npz` (old `stream_dac` files load);
-  `ReadoutClient.set_resonator_calibrations` -> `get_info('resonators')` with
-  live validity (tones active, within 5 lw), so every stream sidecar carries it
-  and analysis, live view and DAC use it by default (`calibration_from_data`).
-  RX gain matched from recorded chain states (`match_rx_gain='auto'`).
-
-- **No fitting on the ARM**: tracking and argument-less `update_modulation()`
-  use the pushed calibration only and refuse without one
-  (`_calibrations_from_latest_sweep` removed). Tracker refreshes offsets,
-  readout correction and centring per revision; lock health against the fit's
-  `4/lw` (`unlock_detuning_linewidths` default 1.0); `detuning_estimator=
-  'mobius'` tracks unmodulated; status adds `calibration_source`, `rx_gain`.
-
+  `set_resonator_calibrations` → `get_info('resonators')` with live validity
+  (tones active, within 5 lw). Every stream sidecar carries it, and analysis,
+  live view and DAC use it by default (`calibration_from_data`).
+- **Sweep tables correct the frequency scale**: a record made with
+  `sweep_data=` carries per-tone `frequency_correction_*`
+  (`resonator.sweep_frequency_correction`), applied in the Möbius inversion and
+  `operating_point_hz`. Error near the operating point 2.1% → 0.19% (krm4
+  hold-out). See `doc/conversions.md` (The sweep table).
+- **Calibration health per tone**: `resonator.calibration_fit` (median
+  |z_c| / r, 1 while the circle fits) and `resonator.calibration_quality`
+  (`good` / `poor` tones with reasons, `frequency_scale`, flags tones with no
+  table or >20% out). krm4: 44% of tones off 0.9–1.1 three hours into a
+  cooldown. Staleness is per tone (`stale_tones`).
+- **Möbius is the default detuning estimator**
+  (`resonator.mobius_center_detuning`, measured gain 0.98): `enable_tracking`,
+  argument-less `update_modulation()`, calibrated `center_detuning_*` of
+  `demodulate*`, the live viewer and stream-to-DAC `ffm`. On tones driven to
+  anl ~0.3 the curvature form read 2× (fit: 3–3.5×).
+  `detuning_estimator='curvature'` remains, now on circle-centred I/Q with an
+  exact inversion (raw phase read 3–100× high).
 - **Three-point kernel**: any slot order (lowest/central/highest offsets,
-  coherently averaged); per-point gradients exact for a resonance circle
-  (central difference read the chord 3.8% low at +/-0.1 lw, 20% at +/-0.25,
-  scaling every converted shift); calibrated default `conversion='phase'`,
-  `w = ln(z_c/z_ref)` over the live slope.
+  coherently averaged); per-point gradients exact on the resonance circle
+  (central difference read 3.8% low at ±0.1 lw, 20% at ±0.25); calibrated
+  default `conversion='phase'`.
+- **`operating_point_hz` memoises a driven fit's grid solve**: 3.5 ms → 73 µs
+  per call at anl 0.3 (`mobius_center_detuning` calls it every time).
+- **Fixes**: `plot_timestream` freq/diss on already-scaled I/Q (units); `noise`
+  Möbius with RX-gain matching; `phase_center=True` without a sweep raises; a
+  live-viewer probe recentre no longer reads as a resonator move.
+
+**Tone tracking**
+
+- **Tracking commits (fw engine) work with `dry_run=False`**: frames are tagged
+  with the LO-buffer revision their accumulation used; large typed frames reach
+  the stream process through `/dev/shm` (through the pipe, each ~150 kB
+  TONE_UPDATE cost ~4 accumulations). Run in the spectral, holography and HWP
+  scans.
+- **Commits 32 s → ms**: the `path_group_delay_ns` CSV (~220k rows) is parsed
+  once per (path, mtime, size), not on every modulation prepare.
+  `get_info('tracking')['commit_stage_ms']` splits prepare/apply/announce.
+- **No overshoot**: a staged correction replaces the previous one instead of
+  adding to it; the detuning filter restarts at each revision; `demodulate*` /
+  `StreamDemodulator` divide out the RX gain change since the calibration
+  (unmatched, 1 dB made a 5 kHz recentre read as a −1.3 kHz step).
+  `threshold_linewidths` 0.3 → 0.05.
+- **Per-revision state and unmodulated tracking**: offsets, readout correction
+  and centring refreshed per revision; lock health against the fit's `4/lw`
+  (`unlock_detuning_linewidths` 1.0); `detuning_estimator='mobius'` tracks
+  unmodulated tones. Status adds `calibration_source`, `rx_gain`,
+  `median_calibration_fit`, `n_poor_calibration_fit` and a per-tone `stale`
+  state. Optional `freeze_unresponsive` (off) freezes tones whose readings
+  ignore their own moves (`move_response`).
+- **`get_info('tracking')['summary']['last_estimate_age_s']` is live** (stamped
+  when served); it froze between snapshot rebuilds.
+- **Server restart stops orphaned fw modulation** (slot 0, dwell 1 at attach).
+  It was reported as not modulating, and `disable_modulation()` took the sw
+  path.
+
+**Stream-to-DAC**
+
+- **On the conversion core**: `FfmConverter` reads the fw default
+  `[-d, 0, +d, 0]` two-sided and accepts `[0, -d, +d, 0]`, follows per-revision
+  state and correction, and holds unannounced revisions; recordings carry
+  `sample_index` and replay their updates.
+- **`ffm` no longer steps at tracking commits**: with a calibration every cycle
+  is absolute (a +6.86 kHz move gave a −1.77 kHz step on driven krm4 tones).
+  Fixed-tone modes on a modulated stream average whole modulation cycles (they
+  followed the probe slots above ~700 Hz updates: 4.9 kHz p-p).
+- **Drift high-pass**: `channels[].highpass_s` (`OutputChannel(highpass_s=)`)
+  subtracts a running EMA baseline before the gain/clip. Off by default.
+  `doc/stream_to_dac.md`.
+
+**Demodulation**
 
 - **Revisions joined onto one reference**: `modulation.demodulate_stream` /
-  `StreamDemodulator` (live viewer) demodulate each revision with its own state;
-  calibrated tones joined through the absolute resonance (recentre residual
-  27 Hz -> 0). `parse_stream` corrects each revision with its own factors
-  (`readout_correction_by_revision`); `receive_stream` subscribes to tone
-  updates by default.
+  `StreamDemodulator` demodulate each revision with its own state and join
+  calibrated tones through the absolute resonance (recentre residual 27 Hz → 0).
+- **`demodulate_stream(gaps=)`**: `'raise'` (default; says where and what to
+  do), `'nan'` or `'interpolate'` (same probe point only). Filled rows in
+  `gap_fill`, marked in `packet_missing`; `timeseries.fill_gaps` gives the same
+  `gap_fill`. New-revision frames arriving before their record are kept.
+- **`demodulate_timestream(data)`** takes a parsed capture or a stream file
+  basename directly.
+- **Faster grouping**: `group_cycles(reduce=None)` uses one reshape for a
+  uniform dwell. Live demod refresh 1.5 s → 0.13 s per 10 s of 2500 Hz history
+  (4 of 380 tones).
 
-- **stream-to-DAC on the core**: `QuantityConverter` (`conversion.output`,
-  `conversion.method`) replaces `DfCalibratedConverter`; `FfmConverter` reads
-  the fw default `[-d, 0, +d, 0]` two-sided and accepts `[0, -d, +d, 0]`,
-  centres with the pushed or file calibration, follows per-revision state and
-  correction, holds unannounced revisions; recordings carry `sample_index` and
-  replay their updates.
+**Stream capture**
 
-- **Conversion fixes**: `plot_timestream` freq/diss on already-scaled I/Q
-  (units); `noise` Möbius with RX-gain matching; `phase_center=True` without a
-  sweep raises; a live-viewer probe recentre no longer reads as a resonator
-  move.
+- **`receive_stream(duration=)`** records for that long (`souk-receive-stream
+  --duration`). It writes from a background thread, so a slow disk no longer
+  stops socket reads and gets the capture dropped (`write_backlog_peak_bytes`;
+  stops past 4 GiB behind). In-memory callbacks and cooperative stop.
+- **Tone updates saved with the capture**: SNAPSHOT / TONE_UPDATE frames go to
+  `<capture>.updates.jsonl` with host timestamps and IQ sample positions;
+  `parse_stream` returns `tone_updates` and `tone_centers_by_revision`
+  (`souk-receive-stream --subscribe_tone_updates`). Not in mock mode.
+- **Chunked reads of huge captures** (`stream_file`): `read_stream_chunk`
+  (sample range, tone subset, `parse_stream` format plus `sample_index` /
+  `time_s`), `concatenate_stream_chunks`, `stream_file_info`; memory checked
+  before reading.
+- **`souk-receive-stream` is registered** (documented, but missing from
+  `setup.py`).
+- **Server stream drain timeout 2 s → 10 s** (`STREAM_DRAIN_TIMEOUT_S`).
 
-- **Tracking detuning on circle-centred I/Q, exact inversion**: raw-phase
-  curvature/slope read 3-100x high (sim: loop limit-cycled or parked 0.5-0.8 lw
-  off). The window's I/Q is de-embedded + circle-centred and the centre
-  detuning inverts the centred notch phase exactly (~1% at +/-0.1 lw offsets;
-  was `x/(1+4x^2)`). `TrackingRuntime(server, params, calibrations)`.
-  `threshold_linewidths` default 0.3 -> 0.05. `demodulate` with `calibration`:
-  detuning from the inflection (max-SNR point). Live plot: `--calibrations`
-  centres per-cycle detuning for any `--conversion`.
+**Telescope time**
 
-- **Server restart stops orphaned fw modulation**: firmware-slot switching left
-  running by a previous server (reported as not modulating, and
-  `disable_modulation()` took the sw path) is now rested at attach
-  (`_create_firmware_interfaces`: slot 0, dwell 1).
+- **The data carries the accumulator's TT, now checked**: the sync checks read
+  the sync block's copy, which read correct on 2026-09-29 while the
+  accumulator's was 626 296 s behind. `get_info('sync')` and
+  `set_telescope_time` report `acc_tt_ok` / `acc_tt_offset_s`.
+- **WORKAROUND, accumulator TT correction** (remove when realtimeradio confirm
+  how `acc_tt` should behave). On fw 7.12.1 `acc_tt` is TT − 9 s after pipeline
+  init and TT + the programming time after a timed sync; the mixer's `tt` is
+  right. The server measures K = `acc_tt − mix_tt` at accumulation edges (after
+  a TT load, a waited timed sync, pipeline init, server start, and a 1 Hz
+  check) and subtracts it from every `acc_tt` read
+  (`get_info('sync')['acc_tt_correction_s']`). Reproduction:
+  `scripts/timed_sync/10_acc_tt_report.py`.
+- **Real time for every sample**: `stream_time_model` / `find_sample` /
+  `sample_times` from the packet counter and the capture's clock readings, with
+  warnings when the TT was never loaded, is offset, jumps, or the sample clock
+  is off frequency. `get_samples` keeps server clock + count + TT (+ revision)
+  anchors from just before and after each capture (`time_anchors`,
+  `get_time_anchor`); `stream_file.capture_time_model` for any capture in memory.
+  `receive_stream` saves `first_frame` / `last_frame` anchors; SNAPSHOT /
+  TONE_UPDATE frames carry `time_anchor` (`firmware_lib.read_time_anchor`).
+  Capture dates kept; telescope timestamps unsigned 64-bit.
 
-- **`get_info('tracking')['summary']['last_estimate_age_s']` is live**: stamped
-  when served (`TrackingRuntime.status`), not when the cached snapshot was built,
-  so it no longer freezes between rebuilds or during a long commit.
+**Live viewer** (`doc/live_plotting.md`)
 
-- **Tracking commits 32 s -> ms**: `load_group_delay_calibration` re-parsed the
-  `path_group_delay_ns` CSV (~220k rows) on every modulation prepare; now parsed
-  once per (path, mtime, size). New `get_info('tracking')['commit_stage_ms']`
-  (prepare/apply/announce split of the last fw commit).
+- **`souk-live-plot` / `plot_live`**: live Matplotlib time/PSD/ASD viewer with
+  selectable tones, one to four panels, bounded rolling history,
+  pause/follow/autoscale, calibrated frequency/dissipation, fast-demodulation
+  and cycle-rate detuning panels; inspects or follows a file without hardware
+  (`--stream-file PATH --follow`). `--calibrations` centres per-cycle detuning
+  for any `--conversion`; `--format linewidths`.
+- **Receives in a separate process** (`LivePlot.start_process(connect)`): the
+  receiver thread was GIL-starved to ~200 frames/s until the server dropped the
+  client. `start(client)` / `plot_live` keep the thread.
+  `StreamBuffer.snapshot(tones)` copies only displayed tones (0.97 s → 0.06 s,
+  3 of 380 tones, 60 s at 2500 Hz).
 
-- **`modulation.demodulate_timestream(data)`**: also takes a parsed capture or a
-  stream file basename directly (state from `data['info']`, grouped with
-  `reduce=None, include_settling=True`); `group_cycles` output still accepted.
+**Analysis and plotting**
 
-- **Faster modulation grouping**: `group_cycles(reduce=None)` gathers complete
-  cycles with one reshape when the dwell is uniform (walk kept as fallback;
-  identical output), and the live demodulator's cycle check is vectorised.
-  Live demod refresh 1.5 s -> 0.13 s per 10 s of 2500 Hz history (4 of 380 tones).
+- **`match_rx_gain` on every timestream and snapshot plotter** and on
+  `timestream_psds`, `snapshot_psds`, `allan_deviation`, `timestream_stats`,
+  `cross_psd`, `estimate_beta`: `'auto'` (default, recorded RX chain states),
+  `True` (carrier ratio), `False`, or a ratio. It includes acc_len
+  (`recorded_rx_gain_ratio`), so captures at different acc_len compare directly;
+  older records match analog gain only. `plot_timestream_on_resonance` now
+  matches too.
+- **Snapshots no longer double-correct acc_len** in RX gain matching.
+- **`format='linewidths'`**: freq/diss times each tone's loaded Q from
+  `calibrations=` (dissipation `Qr * Delta(1/2Qi)`; beta unchanged), in
+  `timestream_psds`, `snapshot_psds`, `allan_deviation`, `timestream_stats` and
+  the plots; `subtract_psds` refuses mixed formats.
+- **`fitting.export_fits` / `load_fits`**: pickle-free `.npz` with every scalar
+  `FitResult` field, `<name>_err`, covariance, traces and the sweep's `info` /
+  `tone_metadata`.
+- **Power-sweep down sweeps**: `plot_power_sweep` draws each down sweep as its
+  down fit; `find_best_power(anl_fit_use_down_sweeps=True)` adds `anl_down` to
+  the log(anl) fit (`fit_sweep_indices_down`), shown in `plot_best_power`.
+- **`ReadoutClient.sweep_spans(n_tones, calibration)`**: per-tone spans of 10
+  fitted linewidths; median for uncovered tones, 300 kHz with no calibration.
+- **The resonance finder measures each dip in a local window** (`mkid_finder_app`,
+  as `peak_finder.find_mkid_resonances`); whole-trace shoulders inflated the
+  depth and let widths run for MHz.
 
-- **`souk-live-plot` receives in a separate process**: the in-process receiver
-  thread was GIL-starved by slow refreshes (~200 frames/s) until the server
-  dropped the client. New `LivePlot.start_process(connect)`; `start(client)` /
-  `plot_live` keep the thread. Snapshots copy only displayed tones
-  (`StreamBuffer.snapshot(tones)`; 0.97 s -> 0.06 s for 3 of 380 tones, 60 s at 2500 Hz).
+**Board, RF and LNA**
 
-- **`souk-receive-stream` console script**: `client_scripts/receive_stream.py`
-  was documented under that name but never registered in `setup.py`.
-
-- **`receive_stream` no longer overwrites captures**: with no filename it writes
-  the first unused `tmp_stream`, `tmp_stream_1`, ...; a given filename that
-  already holds a capture raises `FileExistsError` unless `overwrite=True`.
-  `souk-receive-stream` gains `--overwrite` (its `-f` default is now the same
-  unused `tmp_stream[_N]`).
-
-- **`format='linewidths'`**: the freq/diss pair times each tone's loaded Q from
-  `calibrations=` (fits or `ResonatorCalibration`): frequency in linewidths,
-  dissipation `Qr * Delta(1/2Qi)` on the same scale (beta unchanged). In
-  `timestream_psds`, `snapshot_psds`, `allan_deviation`, `timestream_stats`
-  and the timestream/snapshot plots; `subtract_psds` refuses mixed formats.
-  `souk-live-plot --format linewidths` (signals `frequency_linewidths`,
-  `dissipation_linewidths`; needs `--calibrations`).
-
-- **Power sweep down-sweep data in plots and the ANL fit**: `plot_power_sweep`
-  draws each down sweep as its down fit (x markers, dotted model) in the fit's
-  own frame, not a `plot_sweep` re-estimate; parameter trends overlay the down
-  fits. `find_best_power(anl_fit_use_down_sweeps=True)` adds `anl_down` to the
-  log(anl) fit (`fit_sweep_indices_down`), shown in `plot_best_power`.
-
-- **Save fits: `fitting.export_fits` / `load_fits`**: pickle-free `.npz` with
-  every scalar `FitResult` field, `<name>_err`, covariance, traces and the
-  sweep's `info`/`tone_metadata`; `load_fits` rebuilds the `FitResult` list.
-
-- **Live Matplotlib time/PSD/ASD viewer**: `souk-live-plot` / `plot_live`,
-  selectable tones and one-to-four panels, bounded rolling history, pause,
-  follow and autoscale controls, calibrated frequency/dissipation, and file
-  inspection/following (`--stream-file PATH --follow`) without hardware.
-  `receive_stream` gains in-memory callbacks and cooperative stop.
-  Raw/sample-aligned fast demodulation, frequency/dissipation and cycle-rate
-  detuning panels; explicit settling policy and opt-in display reduction.
-  See [live plotting](doc/live_plotting.md).
-
-- Binary `receive_stream(subscribe_tone_updates=True)` now subscribes to
-  SNAPSHOT/TONE_UPDATE frames and saves them in `<capture>.updates.jsonl`,
-  with host timestamps and IQ sample positions. `parse_stream` bundles the
-  records as `tone_updates` and cumulative centres as `tone_centers_by_revision`.
-  The receiver CLI accepts `--subscribe_tone_updates`. Mock subscription is
-  explicitly unsupported; ordinary mock captures are unchanged.
-
-- `parse_stream` now returns the same modulation fields as `parse_samples`,
-  normalises tone frequencies to modulation centres, and applies the same
-  readout correction by default (`apply_readout_correction=False` for raw I/Q).
-  Capture dates are retained and telescope timestamps remain unsigned 64-bit.
-
-- `receive_stream(duration=30)` records for 30 seconds and returns the absolute
-  capture path for `parse_stream(path)`, with metadata at `path + '.json'`.
-  Omitting duration still records until interrupted or disconnected. The return
-  value is now the path instead of the last printed IQ frame (usually `None`).
-  Also supported in mock mode and by the receiver CLI's `--duration` option.
-
-- **RF mixerless module selected by config: `rf_frontend.mixerless_module.model`**
-  (`cardiff_dual` default, `manchester_single`, `rx_prototype`; table
-  `MIXERLESS_MODULE_MODELS` in `server/rf_peripherals.py`, by expander address,
-  replacing `_mixerless_module_hw_config_list`). `rx_prototype` = one channel,
-  RX 0x3D / TX 0x38 (measured; 0x3C's bypass bit cuts RX by 47 dB), TX bypass only; its RX reads as never bypassed and takes S21/P1dB
-  from `rx_amp_enabled_s21_db` / `rx_input_1db_comp_dbm` only (warning while unset);
-  its `rx_input_1db_comp_dbm` is taken at 0 dB RX attenuation and the current
-  attenuation is added (`get_rx_input_1db_comp`).
-  Per-path `has_bypass_amp(path)`; `get_info('rf_frontend')` adds
-  `mixerless_module_model`, `bypass_amp_paths`. See doc/rf_peripherals.md.
-
-- **A missing RF module channel ends the channel list instead of being skipped**,
-  so channel 1 can no longer take channel 0's place and drive another
+- **ADC over-voltage trips can no longer pass unseen.** A trip holds the ADC
+  DSA at 15 dB (absolute) while `get_dsa` reads the programmed value; clearing
+  the flag releases it (krm4-mcr).
+  - Routine checks (`health_check`, `get_info`, `check_input_saturation`
+    without a config, the `get_info('all')` / `get_samples` /
+    `receive_stream` diagnostics) only read the flag; they cleared it silently.
+  - `release_adc_overvoltage` (also on the client) is the one place it is
+    cleared, logged. Level-changing requests watch 1 s for a trip, release once
+    and warn; RX policies and maximise/fix/optimise release too.
+  - A 1 Hz server monitor logs trips to `get_info('rfdc')` and the journal;
+    `health_check`, `get_adc_dsa` and RX gain matching use the effective DSA.
+  - Captures save the events: `parse_stream`, `read_stream_chunk` and the live
+    buffer give a per-sample `adc_overvoltage` mask
+    (`stream_file.add_adc_overvoltage_events` / `parse_overvoltage_journal`
+    afterwards). `rx_policy='compensate'` always runs the saturation check.
+- **The server reaches its own tcpborphserver at `127.0.0.1`**: with an empty
+  `/etc/hosts`, `localhost` resolved to the other board and krm4-cdf's server
+  programmed krm4-mcr's FPGA (2026-10-08). Programming now raises if no running
+  design is seen on this board's fabric.
+- **RF mixerless module selected by config**
+  (`rf_frontend.mixerless_module.model`): `cardiff_dual` (default),
+  `manchester_single`, `rx_prototype` (`MIXERLESS_MODULE_MODELS` in
+  `server/rf_peripherals.py`). `rx_prototype`: one channel, RX 0x3D / TX 0x38
+  (0x3C's bypass bit cuts RX by 47 dB), TX bypass only, S21/P1dB from
+  `rx_amp_enabled_s21_db` / `rx_input_1db_comp_dbm` (P1dB at 0 dB attenuation;
+  the current attenuation is added).
+  `has_bypass_amp(path)`; `get_info('rf_frontend')` adds
+  `mixerless_module_model`, `bypass_amp_paths`. `doc/rf_peripherals.md`.
+- **A missing RF module channel ends the channel list** instead of being
+  skipped, so channel 1 can't take channel 0's place and drive another
   pipeline's RF chain.
+- **`get_rf_peripheral_status()` includes `supports_bypass_amps`**: the
+  client's config snapshot recorded both bypass states as `None`.
+- **LNA service**: polls one channel at a time (a request waits ~1.3 s, not a
+  whole ~18 s v2 sweep); request timeout 15 s → 180 s
+  (`DEFAULT_LNA_SERVICE_TIMEOUT_S`, `lna_service.timeout_s`; a remote-method set
+  measured 46.5 s). Health messages tell an open sense line from a missing LNA
+  and no longer call a switched-off v2 channel disconnected.
+  `server/lna_controller.py` imports without `smbus2` (remote backend from a
+  host PC).
 
-- **LNA service polls one channel at a time**, releasing the hardware lock
-  between channels (`LNAService.poll_loop`): a request no longer waits behind a
-  whole ~18 s sweep of a v2 board, only one ~1.3 s channel read.
+**Timing**
 
-- **LNA health messages tell an open sense line from a missing LNA**
-  (`_lna_health` in `server/lna_controller.py`). A remote reading above both
-  2 V and the local voltage is reported as an open sense line (use
-  `method='local'`); "draws no bias current" needs the output on (v2). A v2
-  channel switched off is no longer reported as disconnected. A failed
-  remote-method set now says if the output was off and where the local
-  voltage was left.
+- **chrony PHC refclock `offset -37` is the packaged default.** PTP serves TAI
+  and chrony does not apply `currentUtcOffset` itself (confirmed with a
+  production grandmaster, issue #18). `ptp-phc.conf`, `souk-enable-timing`,
+  `install_timing_services.sh`; `--offset=0` only for an ARB-timescale GM
+  (`ptpTimescale 0`).
+- **chrony waits for ptp4l at boot** (`chrony.service.d/10-wait-for-ptp4l.conf`):
+  held until ptp4l is SLAVE, 90 s max. It could sample the stale boot-time PHC,
+  reject `PHC0` as a falseticker and stay on NTP (krm4-mcr, 2026-10-08).
+- **`ready_for_firmware_sync` needs chrony on the PHC**, not just a stable PTP
+  lock; the readiness reason says how to recover.
 
-- **LNA service request timeout 15 s -> 180 s** (`DEFAULT_LNA_SERVICE_TIMEOUT_S`,
-  `lna_service.timeout_s` in site.yaml): a remote-method set of one channel
-  measured 46.5 s on krm4.
-
-- **`server/lna_controller.py` imports without `smbus2`**, so the `remote`
-  backend works from a host PC.
-
-- **`get_rf_peripheral_status()` now includes `supports_bypass_amps`**: without
-  it the client's config snapshot always recorded both bypass states as `None`.
+**Docs**: new `doc/compatibility.md` (which software, firmware, OS image and
+boot files go together), `doc/conversions.md`, `doc/live_plotting.md`.
 
 ## v1.8.1
 
