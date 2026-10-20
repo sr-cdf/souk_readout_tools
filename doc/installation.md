@@ -39,7 +39,7 @@ Detailed installation instructions for SOUK Readout Tools.
 
 - Xilinx RFSoC board with CASPER Linux image
 - Python 3.12 environment (the CASPER image includes a virtual environment at `/home/casper/py3.12-venv/`)
-- `souk_mkid_readout` library from the [souk-firmware](https://github.com/realtimeradio/souk-firmware) repository
+- [souk-firmware](https://github.com/realtimeradio/souk-firmware) v7.12.1: its `souk_mkid_readout` library (`software/control_sw`) and casperfpga, and the matching boot files ([compatibility.md](compatibility.md), [Upgrading](#upgrading))
 - Root/sudo access for `/dev/mem` and systemd operations
 
 ---
@@ -830,6 +830,28 @@ OSError: [Errno 98] Address already in use
 ---
 
 ## Upgrading
+
+Read the [CHANGELOG](../CHANGELOG.md) section of every version you move past.
+It says when a release needs more than new software (v1.8.2: re-run
+`souk-enable-timing` on each board) and which config keys and API names
+changed. Then diff each pipeline config against a fresh
+`copy_template_config(...)` and push it.
+
+### Across a firmware generation
+
+From v1.8 the minor version tracks the firmware generation (v1.8 = v7.12.1);
+[compatibility.md](compatibility.md) maps earlier releases to their firmware.
+When the generation changes, update the board before the software:
+
+1. `souk-firmware` at the matching tag (v7.12.1 is on its `v7.12` branch, not
+   `main`) with its `software/casperfpga` submodule, and install both
+   casperfpga and `software/control_sw` into `/home/casper/py3.12-venv`.
+   `control_sw` refuses to initialise against a different bitstream version.
+2. Any boot files the generation needs. v7.12 needs `BOOT.BIN`, `boot.scr`,
+   `image.ub` and `/lib/firmware/top.bit`; the in-place procedure is in
+   [v712-notes.md](v712-notes.md#installing-v712). A bad `BOOT.BIN` stops the
+   board booting from SD, so have someone at the board or a spare card.
+3. The server and client steps below.
 
 ### Client
 

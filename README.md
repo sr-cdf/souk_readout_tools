@@ -185,10 +185,16 @@ For full installation details (including server setup, SD card imaging, and daem
 | [Installation Guide](doc/installation.md) | Full client and server installation, SD card setup, daemon configuration |
 | [Getting Started](doc/getting_started.md) | Configuration, usage guide, and worked examples for all features |
 | [Fast Frequency Modulation](doc/frequency_modulation.md) | Real-time IQ → frequency/dissipation conversion and resonator tracking via per-tone probe-point modulation |
+| [Tone Tracking](doc/tone_tracking.md) | Server-side FFM auto-recentering: state machine, settings, staged commits, health monitoring and cost |
+| [Conversions](doc/conversions.md) | I/Q to resonator quantities: conventions, conversion methods, three-point modulation and how calibrations travel with the data |
+| [Timeseries Analysis](doc/timeseries_analysis.md) | Timestream and PSD tools: detector-noise workflow, estimator biases, glitches, `tau_qp`, combining quadratures |
 | [Calibration](doc/calibration.md) | Power calibration model and RF signal-chain configuration |
+| [Filterbank Compensation](doc/filterbank_compensation.md) | Channel-response correction for tones away from their bin centre, and how to measure it |
 | [Tone Power Notes](doc/tone_power_notes.md) | Dynamic-range, VACC, crest-factor, and blind-tone power guidance |
 | [Resonator Noise Workflow](doc/resonator_noise_workflow.md) | Drive-power tuning, blackbody-load directory layout, and on/off-resonance noise captures |
 | [Parameter-Series Measurements](doc/measurements.md) | Repeating any measurement across an external parameter (attenuation, temperature, time, ...) with run directories, resume, and live summaries |
+| [Resonance Matching](doc/resonance_matching.md) | Matching resonance lists between sweeps |
+| [Stream to DAC](doc/stream_to_dac.md) | Live analog output of KID response through a LabJack or sound card |
 | [RF Peripherals](doc/rf_peripherals.md) | RF attenuator, bypass amplifier, and discovery tooling |
 | [LNA Bias](doc/lna_bias.md) | Cryostat LNA bias control, soft-off, and status monitoring |
 | [Dual Pipeline](doc/dual_pipeline.md) | Dual-pipeline setup, initialisation model, and multi-server operation |
@@ -198,6 +204,7 @@ For full installation details (including server setup, SD card imaging, and daem
 | [Timing Site Checklist](doc/timing_site_checklist.md) | Site commissioning checks for PTP GM, chrony, monitor state, and holdover behaviour |
 | [TSU Strobe and Timed Sync](doc/tsu_strobe_and_timed_sync.md) | 1-PPS TSU strobe, firmware timed-sync bring-up for multi-board timestamp alignment, and test scripts |
 | [v7.9 Multitone Notes](doc/v79-multitone-notes.md) | VACC multitone design notes and constraints |
+| [Firmware v7.12 Notes](doc/v712-notes.md) | Installing v7.12 (boot files, casperfpga, control_sw), what limits streaming, measured rates, and KRM board setup |
 | [Version Compatibility](doc/compatibility.md) | Which software runs on which firmware, OS image/kernel/boot-file changes, and supported boards, by version |
 | [Changelog](CHANGELOG.md) | Version history, feature list, and roadmap |
 
@@ -211,5 +218,5 @@ See [Getting Started - Configuration](doc/getting_started.md#configuration) for 
 
 ## Requirements
 
-- **Client:** Python >= 3.10. Tested on Linux (Python 3.10, 3.12) and Windows (Python 3.12). Dependencies: numpy, scipy, matplotlib, pyyaml, ipython, pyqt5.
-- **Server:** Python >= 3.10 on the Xilinx/RFSoC CASPER Linux image. Requires `souk_mkid_readout` from the [souk-firmware](https://github.com/realtimeradio/souk-firmware) repository.
+- **Client:** Python >= 3.10. Tested on Linux (Python 3.10, 3.12) and Windows (Python 3.12). Dependencies: numpy, scipy, matplotlib, pyyaml, ipython, pyqt5, pyserial. `pip install .[g3]` adds so3g for `.g3` stream files (not available on Windows).
+- **Server:** Python >= 3.10 on the Xilinx/RFSoC CASPER Linux image, with [souk-firmware](https://github.com/realtimeradio/souk-firmware) v7.12.1: its `souk_mkid_readout` (`software/control_sw`) and casperfpga installed in the board's venv, and the matching boot files. See [Version Compatibility](doc/compatibility.md).

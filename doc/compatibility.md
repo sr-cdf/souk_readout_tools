@@ -47,7 +47,7 @@ that, the two numbering schemes are unrelated.
 | **v1.7.10** | 2026-09-14 | **v7.12** code support (v7.11 still works) | For v7.12: **`BOOT.BIN`, `boot.scr`, `image.ub`, `top.bit`**, casperfpga `a89480c`, control_sw `7.12.1` | Reorder-map word width taken from the firmware. On v7.12, tones set through the fast path land in the wrong bin until v1.8.1 (see below). |
 | **v1.8.0** | 2026-09-14 | **v7.12.1** validated on hardware | as v1.7.10 | First release whose minor version tracks the firmware generation. |
 | **v1.8.1** | 2026-09-22 | v7.12.1 — **use this or later on v7.12** | + optional `souk-enable-tuning` (CPU isolation, `souk-rt-kernel.service`, per-core TX queues), `/dev/ptp-end0` udev name | Fixes the v7.12 PSB reorder-map pair swap: every tone set through the fast path on v7.12 before 2026-09-16 landed in its pair-neighbour's bin. v7.11 data is unaffected. |
-| *Unreleased* | — | v7.12.1 | as v1.8.1 | RF mixerless module selected by `rf_frontend.mixerless_module.model`. |
+| v1.8.2 | 2026-10-20 | v7.12.1 | as v1.8.1; re-run `souk-enable-timing` (chrony `offset -37`, waits for ptp4l) | RF mixerless module selected by `rf_frontend.mixerless_module.model`. Breaking: `demodulate*` keys renamed to one sign convention; tracking needs a calibration pushed from the client. |
 
 **Minimum software per firmware**, read from the table:
 
@@ -182,7 +182,7 @@ v1.6.x).
 | LNA bias board **v2** (per-channel output enable), centralised `souk-lna-service` | v1.7.0 |
 | ALSA sound-card DAC output | v1.7.8 |
 | KRM board management controller over USB serial | v1.7.9 |
-| RF module models `cardiff_dual` / `manchester_single` / `rx_prototype` | Unreleased |
+| RF module models `cardiff_dual` / `manchester_single` / `rx_prototype` | v1.8.2 |
 
 ---
 
