@@ -44,8 +44,9 @@ parameters. ``fit_resonance(..., nonlinear=True)`` delegates to
 ``fit_resonance_nonlinear`` first performs a linear fit on the full sweep to
 seed the Duffing fit. The refinement is scored against that seed at the end: a
 Duffing fit cannot legitimately be worse than it (``anl -> 0`` reproduces it), so
-when it is, the fit is redone with ``anl`` pinned at the floor and
-``linear_seed_guard`` is set on the result. The nonlinear ``anl`` parameter is optimized internally
+when it is, the fit is redone from the linear solution with ``anl`` free and with
+``anl`` pinned at the floor, the cheaper kept, and ``linear_seed_guard`` is set
+on the result. The nonlinear ``anl`` parameter is optimized internally
 as ``log(anl)`` for stable per-decade sensitivity, then converted back to
 linear units in the returned result. For strongly bistable/high-drive shapes,
 ``try_harder`` and ``try_even_harder`` probe extra ``(fr, Qi, anl)`` seeds and
@@ -1971,10 +1972,13 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
 
     # A Duffing refinement cannot legitimately be worse than the linear seed it
     # started from: anl -> 0 reproduces that fit. When it is worse, the
-    # optimiser has wandered out of the basin -- deep bistable dips can strand
-    # it at a large spurious anl -- so refit with anl pinned at the floor, which
-    # recovers linear-quality residuals while still returning an eight-parameter
-    # nonlinear result. Only the fits that need it pay for the extra refinement.
+    # optimiser has wandered out of the basin -- typically its first step from
+    # the asymmetry seed overshoots past the bifurcation, where cliffs in the
+    # cost strand it at a large spurious anl. Refit from the linear solution
+    # with anl free, which usually walks straight to the nonlinear optimum, and
+    # with anl pinned at the floor, which recovers linear-quality residuals if
+    # that strands too; keep the cheapest. Only the fits that need it pay for
+    # the extra refinements.
     seed_guard = False
     anl_is_user_fixed = "anl" in (_parameter_dict(param_fixed) or {})
     if not anl_is_user_fixed:
@@ -1985,12 +1989,13 @@ def fit_resonance_nonlinear(f, z, z_err=None, sweep_direction="up",
             # Seed from the linear solution itself, not from nl_guess: the
             # asymmetry seed's fr override is what pushed the refinement out of
             # the basin in the first place. User guesses are still honoured.
-            fallback = _refine(_select_names(guess, NONLINEAR_NAMES) or {},
-                               extra_fixed={"anl": _ANL_MIN})
-            total_nonlinear_duration += float(getattr(fallback, "duration_s", 0.0))
-            total_nonlinear_nfev += int(getattr(fallback, "nfev", 0))
-            if np.isfinite(fallback.cost) and not (fallback.cost >= opt.cost):
-                opt, seed_guard = fallback, True
+            user_nl_guess = _select_names(guess, NONLINEAR_NAMES) or {}
+            for fallback in (_refine(user_nl_guess),
+                             _refine(user_nl_guess, extra_fixed={"anl": _ANL_MIN})):
+                total_nonlinear_duration += float(getattr(fallback, "duration_s", 0.0))
+                total_nonlinear_nfev += int(getattr(fallback, "nfev", 0))
+                if np.isfinite(fallback.cost) and not (fallback.cost >= opt.cost):
+                    opt, seed_guard = fallback, True
     opt.total_nonlinear_duration_s = total_nonlinear_duration
     opt.total_nonlinear_nfev = total_nonlinear_nfev
     # Refinements deferred their uncertainties; compute them once on the winner.

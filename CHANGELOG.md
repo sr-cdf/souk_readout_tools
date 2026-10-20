@@ -212,6 +212,13 @@ Software only: firmware v7.12.1, as v1.8.0 and v1.8.1. **On each board, re-run
   02_room power sweep 5.5 % of fits evaluated a wrong root; 16 of 6144 change
   basin (`anl` vs collapse to 0), ~21 had uncertainties off >2×. Precision
   1e-6 → 1e-14; nonlinear fits 7.5 % faster.
+- **Seed guard refits with `anl` free, not only pinned**: a Duffing refinement
+  that strands worse than its linear seed (first step from the asymmetry seed
+  overshoots past the bifurcation) is redone from the linear solution with
+  `anl` free and pinned at the floor; the cheaper is kept. 02_room: 57 of the
+  103 guarded fits improve, 16 by >2× in cost (`anl` 1e-8 → median 0.11, `fr`
+  up to 0.76 lw), none worse; +1.5 % evaluations, no measurable time; fits
+  flipped by a 1e-7 data perturbation 11 → 5.
 - **`match_rx_gain` on every timestream and snapshot plotter** and on
   `timestream_psds`, `snapshot_psds`, `allan_deviation`, `timestream_stats`,
   `cross_psd`, `estimate_beta`: `'auto'` (default, recorded RX chain states),
