@@ -272,7 +272,7 @@ Use the highest-level helper that matches the operation:
 | Helper | Purpose | Important defaults |
 |---|---|---|
 | `set_tone_powers()` | Apply calibrated per-tone target powers while preserving their relative differences | `optimise_dynamic_range=True`, `rx_policy='protect'`, `headroom_db=1.0` |
-| `maximise_tx_power()` | Raise TX output until the selected limit is reached | `headroom_db=1.0`, `reference_plane='detector'`, `rx_policy='protect'` |
+| `maximise_tx_power()` | Raise TX output until the selected limit is reached | `dac_headroom_db=1.0`, `reference_plane='detector'`, `rx_policy='protect'` |
 | `maximise_rx_power()` | Move RX level toward ADC full scale while retaining margin | `headroom_db=1.0` |
 | `optimise_tx_snr()` | Improve TX SNR without intentionally changing the requested output powers | `headroom_db=1.0`, `reference_plane='detector'` |
 | `optimise_rx_snr()` | Improve RX SNR using RX controls while avoiding saturation | `headroom_db=1.0` |
@@ -296,9 +296,11 @@ limits at different points in the chain and are not interchangeable:
 | `compression_headroom_db` | RF frontend P1dB compression | `psb_scale` on TX; the RX amp and attenuator on RX, against the modelled frontend input power |
 
 On the single-converter routines the margin is just `headroom_db`, since the
-function name already says which converter it means — `maximise_tx_power()` and
-`set_tone_powers()` take `headroom_db` for the DAC, `maximise_rx_power()` and
-`optimise_rx_snr()` for the ADC. The names above are what the entry points that
+function name already says which converter it means — `set_tone_powers()`,
+`optimise_tx_snr()` and `fix_dac_saturation()` take `headroom_db` for the DAC,
+`maximise_rx_power()` and `optimise_rx_snr()` for the ADC. `maximise_tx_power()`
+is the exception: it takes `dac_headroom_db` (the old `headroom_db` raises),
+since it also sets an `adc_headroom_db`. The names above are what the entry points that
 touch both converters use (`wideband_sweep()`, `run_power_sweep()`), plus
 `adc_headroom_db` on the TX routines, where it sets the margin the `rx_policy`
 works to. The same rule gives `wideband_sweep()` its
@@ -352,7 +354,7 @@ config; an explicit value applies whether or not compensation is enabled, which
 is how to reserve modulation room without turning compensation on:
 
 ```python
-client.maximise_tx_power(headroom_db=1.0, filterbank_headroom_db=1.0)
+client.maximise_tx_power(dac_headroom_db=1.0, filterbank_headroom_db=1.0)
 ```
 
 Both margins are forwarded by the higher-level entry points, so a sweep does

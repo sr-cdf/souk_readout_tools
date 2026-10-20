@@ -521,11 +521,11 @@ from souk_readout_tools.calibration import CalibrationChain  # or equivalent
 ### 2.6b  Power optimisation with RF frontend (updated in v1.1.0)
 
 ```python
-# maximise_tx_power now accepts headroom_db and uses exponential ramp-up
-result = c.maximise_tx_power(headroom_db=2.0)
+# maximise_tx_power takes dac_headroom_db (headroom_db until v1.7.4) and uses exponential ramp-up
+result = c.maximise_tx_power(dac_headroom_db=2.0)
 print(result)
 ```
-- [ ] `maximise_tx_power(headroom_db=2.0)` completes without error
+- [ ] `maximise_tx_power(dac_headroom_db=2.0)` completes without error
 - [ ] Headroom parameter is respected (2 dB margin below saturation)
 - [ ] If DAC saturation exists at start, auto-fixes instead of raising ValueError
 - [ ] Per-bin scaling applied when tones share FFT bins (check print output)
@@ -1042,9 +1042,9 @@ analysis = ps.analyse_power_sweep(
     loaded,
     nonlinear=True,
     n_jobs=1,
-    target_anl=0.01,
     fit_kwargs={'min_dip_depth_db': None},
-    plot=False,
+    plot_fits=False,
+    plot_best=False,
     verbose=False,
 )
 ```

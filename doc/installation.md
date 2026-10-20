@@ -407,11 +407,14 @@ souk-test-timing-monitor stream 10
 ```
 
 For firmware timestamp sync, the `end0` TSU/PHC PPS strobe must also be
-enabled. At present this is provided by the `souk-firmware` helper:
+running. Install it as a service (it calls `sudo` internally):
 
 ```bash
-sudo python3 ~/souk-firmware/software/rfsoc_scripts/ptp/run_strobe.py
+souk-tsu-strobe-install
+souk-tsu-strobe-status
 ```
+
+See [TSU Strobe and Timed Sync](tsu_strobe_and_timed_sync.md).
 
 See [timing.md](timing.md) for the full timing setup, standalone laptop
 monitoring, site checks, lab UTC offset notes, and firmware sync caveats.
@@ -802,7 +805,7 @@ PermissionError: [Errno 13] Permission denied: '/dev/mem'
 ModuleNotFoundError: No module named 'souk_mkid_readout'
 ```
 
-- The `souk_mkid_readout` library should already be installed on the CASPER image. If not, install from the souk-firmware repository (see [step 1](#1-rfsoc-initial-setup))
+- The `souk_mkid_readout` library should already be installed on the CASPER image. If not, install from the souk-firmware repository (see [step 1](#1-processing-system-linux) and [Upgrading](#upgrading))
 - Ensure you're using the correct Python environment: `sudo /home/casper/py3.12-venv/bin/python -c "import souk_mkid_readout"`
 
 #### FPGA programming fails

@@ -13,9 +13,9 @@ This is a **board-level setting** — it affects both pipelines. If running dual
 - [Overview](#overview)
 - [Checking Clock Status](#checking-clock-status)
 - [Setting the Clock Source](#setting-the-clock-source)
-  - [Via the Client API](#via-the-client-api)
-  - [Via the Config File](#via-the-config-file)
-  - [Manually on the RFSoC](#manually-on-the-rfsoc)
+  - [Via the Config File (recommended)](#via-the-config-file-recommended)
+  - [Programmatically](#programmatically-disruptive--resets-both-pipelines)
+  - [Manually on the RFSoC](#manually-on-the-rfsoc-1)
 - [How It Works](#how-it-works)
 - [Troubleshooting](#troubleshooting)
 

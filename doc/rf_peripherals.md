@@ -462,7 +462,7 @@ print(result['power_error_db'])  # per-tone error vs target
 
 ```python
 result = client.maximise_tx_power(
-    headroom_db=2.0,
+    dac_headroom_db=2.0,
     reference_plane='detector',
     compression_headroom_db=10.0,
 )

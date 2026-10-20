@@ -20,6 +20,7 @@ SOUK Readout Tools is a Python package with tools for operating the MKID (Microw
 - [Resonance Finding](#resonance-finding)
 - [Retuning](#retuning)
 - [Fast Frequency Modulation](#fast-frequency-modulation)
+- [Tone Tracking](#tone-tracking)
 - [Power Calibration & Optimisation](#power-calibration--optimisation)
 - [Clock Source](#clock-source)
 - [Timing Status](#timing-status)
@@ -28,10 +29,11 @@ SOUK Readout Tools is a Python package with tools for operating the MKID (Microw
 - [Resonator Analysis](#resonator-analysis)
 - [Parameter Space Measurements](#parameter-space-measurements)
 - [Dual-Pipeline Operation](#dual-pipeline-operation)
+- [Board Management](#board-management)
 - [Mock Server Mode](#mock-server-mode)
 - [CLI Tools](#cli-tools)
-- [Changelog & Feature List](#changelog--feature-list)
-- [Future Developments](#future-developments)
+- [Changelog & Feature List](../CHANGELOG.md)
+- [Future Developments](../CHANGELOG.md#future-developments)
 
 ---
 
@@ -79,13 +81,25 @@ Default ports: pipeline 0 uses 10000/20000, pipeline 1 uses 10001/20001.
 |--------|-------------|
 | `readout_client.py` | Client interface for remote control and data acquisition |
 | `readout_server.py` | Async TCP server running on the RFSoC ARM processor |
+| `server/tracking.py` | Server-side tone tracking from the modulated stream |
+| `server/stream_process.py` | Optional stream loop in its own (real-time) process |
 | `timing.py` | Client helpers for the local RFSoC timing monitor |
 | `firmware_lib.py` | FPGA firmware interface: register access, tone management, sweeps |
 | `calibration.py` | RF power/amplitude calibration chain (DAC to detector) |
 | `peak_finder.py` | MKID resonance detection algorithms |
-| `fitting.py` | Nonlinear resonator model fitting (Khalil notch model) |
-| `resonator.py` | Resonator S21 transforms: RF deembedding and phase centering |
-| `plotting/` | Plotting library for sweep, timestream, and snapshot data |
+| `fitting.py` | Linear and Duffing resonator fitting (notch model) |
+| `resonator.py` | S21 transforms (deembedding, phase centering) and the one I/Q → frequency/dissipation conversion |
+| `modulation.py` | Fast frequency modulation: set-up from a sweep, grouping and demodulation |
+| `noise.py` | Noise utilities for calibrated multi-tone timestreams |
+| `timeseries.py` | Timestream and PSD analysis |
+| `power_sweep.py` | Power sweeps, fits, best-power choice and tone-power allocation |
+| `measurement.py` | Repeat any measurement across an external parameter |
+| `resonance_matching.py` | Match resonance lists between sweeps |
+| `stream_file.py` | Chunked reads and real sample times for large stream captures |
+| `stream_dac.py` | Live analog output of a tone's response (`souk-stream-to-dac`) |
+| `board_management.py` | KRM board management controller over USB serial |
+| `config_utils.py` | Config templates and the per-machine `site.yaml` |
+| `plotting/` | Plotting library for sweep, timestream, snapshot and live data |
 | `mkid_finder_app.py` | PyQt5 GUI for interactive resonance finding |
 | `tone_list_tools.py` | Tone list file I/O utilities |
 
@@ -371,8 +385,8 @@ config only by an explicit sync/capture call.
 The `get_info()` method returns structured system information organised into named sections:
 
 ```python
-# Default sections (fast — server, versions, clock, timing, fpga, rfdc,
-# pipeline, tones, rf_frontend, lna)
+# Default sections (fast — server, versions, clock, timing, sync, fpga, rfdc,
+# pipeline, tones, rf_frontend, lna, rfsoc_sensors)
 info = client.get_info()
 
 # Specific sections only; list input returns a list in the same order
@@ -381,7 +395,8 @@ tones, rfdc = client.get_info(['tones', 'rfdc'])
 # A single section name returns that section directly
 pipeline = client.get_info('pipeline')
 
-# Everything including diagnostics, config, calibrations
+# Everything, adding diagnostics, config, calibrations, resonators, registers,
+# modulation, tracking, loop_timing and control_shadow
 info = client.get_info('all')
 
 # Each section has a 'ready' flag and section-specific keys
@@ -394,11 +409,12 @@ For quick periodic monitoring, use `health_check()`:
 
 ```python
 health = client.health_check()
-# Returns compact pass/fail bools:
-#   initialisation_level, clock_locked, timing_state, timing_ready,
-#   streaming, sweeping, adc_saturated, dac_saturated, dsp_overflow,
+# Returns compact flags and counts, including:
+#   initialisation_level, clock_locked, reset_required, timing_state,
+#   timing_ready, streaming, modulation_streaming, sweeping, adc_saturated,
+#   adc_overvoltage, adc_dsa_effective_db, dac_saturated, dsp_overflow,
 #   rts_events, tone_count, client_count, rf_frontend_available,
-#   lna_available
+#   lna_available, resonators_tracking, max_detuning_hz
 ```
 
 ---
@@ -734,13 +750,26 @@ client.enable_stream()
 
 ### Record to Disk
 
-In a separate terminal, run the stream receiver script:
+From Python, `receive_stream` records until stopped, or for `duration`
+seconds, and returns the capture's path. With no `filename` it writes the
+first unused `tmp_stream`, `tmp_stream_1`, ... so an earlier capture is never
+overwritten:
 
-```bash
-python -m souk_readout_tools.client.client_scripts.receive_stream -p -n 2
+```python
+path = client.receive_stream(duration=60)
 ```
 
-The `-p` flag prints live data to the terminal. The `-n` flag limits the number of tones saved to disk (to avoid wasting space on unused channels). Use `-d` and `-f` for custom output directory and filename.
+Or from a separate terminal:
+
+```bash
+souk-receive-stream -C my_config.yaml -n 2 --duration 60
+```
+
+`-n` limits the number of tones saved (to avoid wasting space on unused
+channels), `-d` and `-f` set the output directory (default `./tmp`) and
+filename, `-p` prints live data, and `--overwrite` replaces an existing
+capture. Tone updates (modulation revisions, tracking commits) are saved to
+`<capture>.updates.jsonl` by default, so the analysis can follow them.
 
 ### Stop the Stream
 
@@ -748,12 +777,13 @@ The `-p` flag prints live data to the terminal. The `-n` flag limits the number 
 client.disable_stream()
 ```
 
-The receiver script can be stopped with `Ctrl-C` or left running for the next stream.
+The receiver stops after `--duration`, or with `Ctrl-C`; without a duration it
+can be left running for the next stream.
 
 ### Parse and Plot Stream Data
 
 ```python
-data = client.parse_stream('tmp_stream')
+data = client.parse_stream(path)
 t = np.arange(len(data['packet_counter'])) / data['sample_rate']
 z0 = data['i_data']['0000'] + 1j * data['q_data']['0000']
 plt.plot(t, np.abs(z0))
@@ -795,6 +825,19 @@ Each read shows its progress and refuses up front to use more than 80% of
 the free memory. Chunks carry the absolute `sample_index`, so
 `demodulate_stream` and the joins line up.
 
+### Live Viewing
+
+`souk-live-plot` follows a capture while it is being written, with time, PSD
+and ASD panels for one, several or all tones:
+
+```bash
+souk-live-plot --stream-file ./tmp/tmp_stream --follow --history 60 --span 10
+```
+
+It can also start its own receiver from connection details and show
+calibrated frequency/dissipation or fast-demodulation panels; see
+[Live Plotting](live_plotting.md).
+
 ### G3 Stream Output (so3g)
 
 For OCS / Simons Observatory data pipelines, streams can be recorded directly
@@ -823,10 +866,11 @@ The output file contains:
 - one closing `Observation` frame at the end.
 
 A standalone receiver script is provided as
-`receive_stream_g3.py` (under `client/client_scripts/`); it is currently
-shipped as a module rather than an installed entry point, matching the
-existing `receive_stream.py` convention. It accepts either a config file
-(`-C`) or an address/port pair, plus `--duration` and `--filename`.
+`receive_stream_g3.py` (under `client/client_scripts/`). Unlike
+`souk-receive-stream` it is not an installed command: run it with
+`python -m souk_readout_tools.client.client_scripts.receive_stream_g3`. It
+accepts either a config file (`-C`) or an address/port pair, plus
+`--duration` and `--filename`.
 
 > **Note:** PTP telescope time is currently embedded in the
 > `G3SuperTimestream`, but the mapping between this package's
@@ -849,6 +893,19 @@ client.disable_triggered_stream()
 ```
 
 The packet counter increments every sample regardless of trigger, so trigger times can be inferred from counter gaps. Each streamed frame also includes the PTP telescope timestamp (`telescope_time`).
+
+### Analog Output (Stream to DAC)
+
+`souk-stream-to-dac` turns one tone's live response (magnitude, phase, or a
+frequency shift, including the demodulated FFM shift) into a voltage on a
+LabJack or a sound card, for recording on an external analog logger:
+
+```bash
+souk-stream-to-dac --mock --mode magnitude --rate 100        # no hardware, dummy DAC
+souk-stream-to-dac -C my_config.yaml --config my_stream_to_dac.yaml
+```
+
+See [Stream to DAC](stream_to_dac.md).
 
 ---
 
@@ -1040,32 +1097,61 @@ new_freqs = client.get_tone_frequencies()
 
 ### Tracking Loop
 
-*Not yet implemented.* A continuous tracking loop that periodically retunes tones to follow drifting resonances is planned for a future release.
+A retune is a one-off. To follow drifting resonances continuously, use
+[Tone Tracking](#tone-tracking), which recentres tones from the modulated
+stream without interrupting it.
 
 ---
 
 ## Fast Frequency Modulation
 
-Fast frequency modulation rapidly dithers each tone across a few probe frequencies (2 or 3 points) and streams the result as ordinary, tagged data, so you can measure each resonator's local `dφ/df` (and, with calibration, dissipation) in real time and track its operating point. Derive the configuration from a sweep, arm it, capture or stream, and demodulate:
+Fast frequency modulation steps each tone through a few probe frequencies and streams the result as ordinary, tagged data, so you can measure each resonator's local `dφ/df` (and, with calibration, dissipation) in real time and track its operating point. The default firmware-slot engine cycles four hardware LO slots, switching on accumulation edges, so give it a four-entry pattern (`engine='sw'` takes any number of points). Derive the configuration from a sweep, arm it, capture or stream, and demodulate:
 
 ```python
 from souk_readout_tools import modulation as mod, fitting
 
 sweep = client.parse_sweep_data(client.get_sweep_data())
 fits = fitting.batch_fit(sweep, verbose=False)
-cfg = mod.params_from_sweep(sweep, n_points=3, samples_per_point=4, fits=fits)
-# Optional repeated centre point: point_sequence=(1, 2, 3, 2)
-# Optional exact offsets in linewidths: offset_linewidths=(-0.25, 0, 0.25, 0)
+# point_sequence=(1, 2, 3, 2) gives offsets [-delta, 0, +delta, 0], 0.1 linewidths by default.
+# Exact offsets in linewidths instead: offset_linewidths=(-0.25, 0, 0.25, 0)
+cfg = mod.params_from_sweep(sweep, point_sequence=(1, 2, 3, 2), samples_per_point=4, fits=fits)
+client.disable_stream()                                   # loading rewrites channel maps
 client.enable_modulation(center=cfg['center'], offsets=cfg['offsets'],
                          mod_indices=cfg['mod_indices'],
-                         samples_per_point=cfg['samples_per_point'], n_settle=cfg['n_settle'])
+                         samples_per_point=cfg['samples_per_point'], n_settle=cfg['n_settle'],
+                         linewidth_hz=cfg['linewidth_hz'])
 data = client.parse_samples(client.get_samples(3000))     # frames tagged with the cycle step
 grouped = mod.group_cycles(data, client.get_modulation_state())
-result = mod.demodulate(grouped, calibration=cfg['calibration'])   # centred fitted-model frequency/dissipation
+result = mod.demodulate(grouped, calibration=cfg['calibration'])
+result['resonance_shift_hz']                              # (n_cycles, n_tones); + = resonance moved up
 client.disable_modulation()
 ```
 
 See **[doc/frequency_modulation.md](frequency_modulation.md)** for the full user guide, API reference, and internals.
+
+---
+
+## Tone Tracking
+
+With modulation running, the server can follow each resonance and recentre its
+tones itself, with seamless LO-buffer commits that never interrupt the stream.
+It centres the I/Q with a calibration fitted on the client (the server does no
+fitting): push the fits with the sweep they came from, then start in dry run,
+which only stages the corrections it would make:
+
+```python
+client.set_resonator_calibrations(fits, sweep_data=sweep)
+client.enable_tracking()                         # dry_run=True
+state = client.get_tracking_state()
+state['filtered_center_detuning_linewidths']     # per-tone filtered detuning
+state['controller']['staged']                    # what it WOULD correct
+client.enable_tracking(dry_run=False)            # apply corrections
+```
+
+Per-tone lock health is in `get_info('tracking')`. Every commit is
+revision-stamped and recorded with the capture, and `demodulate_stream` joins
+the revisions onto one reference. See [Tone Tracking](tone_tracking.md) for
+the settings, the closed-loop response and the recipe.
 
 ---
 
@@ -1095,12 +1181,14 @@ client.fix_dac_saturation()    # Auto-fix DAC clipping
 client.fix_adc_saturation()    # Auto-fix ADC clipping
 ```
 
-Every one of these accepts a `headroom_db` parameter setting the margin below
-**true full scale**, defaulting to `1.0 dB` on both TX and RX:
+The TX and RX routines take a margin below **true full scale**, defaulting to
+`1.0 dB`: `dac_headroom_db` on `maximise_tx_power`, and `headroom_db` on the
+single-converter routines (`maximise_rx_power`, `optimise_tx_snr`,
+`optimise_rx_snr`, `fix_dac_saturation`, `set_tone_powers`):
 
 ```python
-client.maximise_tx_power(headroom_db=3.0)   # DAC 3 dB below full scale
-client.maximise_rx_power(headroom_db=1.0)   # ADC 1 dB below full scale
+client.maximise_tx_power(dac_headroom_db=3.0)   # DAC 3 dB below full scale
+client.maximise_rx_power(headroom_db=1.0)       # ADC 1 dB below full scale
 ```
 
 The saturation detectors trip at 90% of full scale, which is already 0.92 dB of
@@ -1457,75 +1545,62 @@ CLI: `souk-find-resonances -C config.yaml --fit -f resonances.txt -P`
 
 ### Frequency and Dissipation Conversion
 
-Use the local linearized estimate for compatibility with older analysis, or
-build fitted calibrations for exact Möbius conversion. Parse the sweep once and
-use `batch_fit()` so tone indices and blind-tone metadata are preserved:
+Every conversion in the package goes through one contract in `resonator.py`;
+[Conversions](conversions.md) is the reference. One sign convention runs
+through it: the resonance shift is positive when the resonance moves up, and
+detuning is resonance minus tone. The dissipation row is the matched
+quadrature `Delta(1 / (2 * Qi))`; double it for the commonly reported
+`Delta(1 / Qi)`.
 
-> **Frequency-sign convention.** The low-level fitted `method='mobius'` and
-> diagnostic `method='circle'` conversions return probe detuning relative to
-> the fitted resonance: `f_probe - f_r`. Positive values mean that the probe is
-> above resonance. The more familiar resonator detuning relative to a fixed
-> probe is `f_r - f_probe`, with the opposite sign. The high-level timestream
-> helper below returns changes in that resonator-side convention so it can be
-> compared directly with the historical linearized noise quadrature.
+Fit the calibration sweep on the client. Parse it once and use `batch_fit()` so
+tone indices and blind-tone metadata are preserved. Pushing the fits to the
+server makes every later capture carry them, so the analysis, the live viewer
+and the tracker all find the same calibration:
 
 ```python
-from souk_readout_tools import fitting
-from souk_readout_tools.noise import (
-    fractional_frequency_and_dissipation_timestreams,
-)
-from souk_readout_tools.resonator import (
-    ResonatorCalibration,
-    interpolate_complex_trace,
-)
+from souk_readout_tools import fitting, resonator
 
 sweep = client.parse_sweep_data(client.get_sweep_data())
 fits = fitting.batch_fit(sweep, nonlinear=True, verbose=False)
-calibrations = {
-    fit.tone_index: ResonatorCalibration.from_fit(fit)
-    for fit in fits if fit.success
-}
-
-linearized = fractional_frequency_and_dissipation_timestreams(
-    parsed_samples, sweep, method='linearized')
-mobius = fractional_frequency_and_dissipation_timestreams(
-    parsed_samples, sweep, method='mobius', calibrations=calibrations)
-circle = fractional_frequency_and_dissipation_timestreams(
-    parsed_samples, sweep, method='circle', calibrations=calibrations)
-
-# The plotting helpers expose the same switch.
-fig = plot_timestream(
-    parsed_samples, format='freq_diss', sweep_data=sweep,
-    conversion_method='mobius', calibrations=calibrations)
+client.set_resonator_calibrations(fits, sweep_data=sweep)
 ```
 
-For one fixed tone, the canonical low-level fitted conversion is:
+Named quantities from a parsed capture, per tone (`resonator.QUANTITIES`
+lists them):
 
 ```python
-cal = calibrations[tone_index]
-probe_detuning_hz, matched_dissipation = cal.convert_raw_iq(
-    tone_frequency, z_ts)
-tone_sweep_f = sweep['sweep_f'][:, tone_index]
-tone_sweep_z = sweep['sweep_i'][:, tone_index] + 1j * sweep['sweep_q'][:, tone_index]
-reference_z = interpolate_complex_trace(tone_sweep_f, tone_sweep_z, tone_frequency)
-detector_df_hz, delta_matched_dissipation = cal.convert_referenced_raw_iq(
-    tone_frequency, z_ts, reference_z)
+q = resonator.convert_samples(
+    parsed_samples, ['resonance_shift_hz', 'matched_dissipation_shift'],
+    method='mobius', calibrations=fits, sweep_data=sweep)
+q['resonance_shift_hz']['0000']        # one value per sample
+
+# The plotting and PSD helpers take the same switch.
+fig = plot_timestream(
+    parsed_samples, format='freq_diss', sweep_data=sweep,
+    conversion_method='mobius', calibrations=fits)
 ```
 
-Here `probe_detuning_hz` is the absolute fitted `f_probe - f_r` coordinate.
-`detector_df_hz` is the reference-subtracted resonator motion with the opposite
-sign, suitable for fixed-tone noise analysis.
+With no `calibrations=`, `convert_samples` uses the calibration the capture
+carries. The methods:
 
-The asymmetric linear notch inversion is exact. For fits with non-zero
-`anl`, the default path follows the circle inversion with an analytic Duffing
-inverse. Use `method='circle'` only when you explicitly want the driven-circle
-coordinate and change in signed radial proxy
-`Delta(abs(z_centered) / radius - 1)` for diagnostics. The high-level
-timestream helper references all three methods to the sweep IQ at the fixed
-probe tone, and reports detector resonance motion with the historical sign.
-The default fitted and historical linearized converters return
-the matched-scale dissipation quadrature `Delta(1 / (2 * Qi))`. Double that
-quadrature for the commonly reported physical `Delta(1 / Qi)`.
+- `'linearized'` (default): projection on the sweep's local gradient. Needs
+  only the sweep; first order.
+- `'mobius'`: exact inversion of the fitted model, Duffing included.
+- `'phase'` and `'lookup'`: the fixed-tone form of the three-point conversion,
+  and an inversion of the sweep's whole phase curve that follows large
+  signals; see [Conversions](conversions.md).
+- `'circle'`: diagnostic. Its dissipation row is a radial proxy, not the
+  matched dissipation.
+
+For one fixed tone, prepare the conversion once and apply it to any number of
+samples:
+
+```python
+fit = next(f for f in fits if f.tone_index == tone_index)
+cal = resonator.ResonatorCalibration.from_fit(fit)
+p = resonator.prepare_conversion(tone_frequency, 'mobius', calibration=cal)
+shift_hz, dissipation = resonator.convert_iq(p, z_ts)
+```
 
 Both fit branches use the numerator-phase convention (only `Re(1/Qe)` in the
 denominator), so `anl -> 0` reproduces the linear branch exactly, including
@@ -1547,6 +1622,40 @@ print(f"Tones with multiple resonances: {result['flagged_tones']}")
 for t, ress in enumerate(result['per_tone']):
     print(f"Tone {t}: {len(ress)} resonance(s)")
 ```
+
+### Resonance Matching
+
+To say which resonance in one sweep is which device in another, when the
+lists differ in length and the frequencies have moved:
+
+```python
+from souk_readout_tools import resonance_matching as rm
+
+idx = rm.match_index(resonances_a, resonances_b)   # -1 where a device has no match
+```
+
+Both arguments can be frequency lists, `.resonances` files, fit summaries,
+power-sweep run directories or parsed sweeps. `rm.match_resonances` returns the
+same match with diagnostics, plots and hand edits. See
+[Resonance Matching](resonance_matching.md).
+
+### Timestream and PSD Analysis
+
+The `timeseries` module is a flat set of tools on plain arrays or parsed
+captures, each returning a dict of arrays:
+
+```python
+from souk_readout_tools import timeseries as ts
+
+psd = ts.timestream_psds(parsed_samples, format='freq_diss', sweep_data=sweep,
+                         conversion_method='mobius', calibrations=fits)
+levels = ts.psd_band_levels(psd, bands=[(1, 10), (10, 100)])
+model = ts.fit_psd_model(psd)                      # S(f) = A f^-alpha + W per tone
+```
+
+[Timeseries Analysis](timeseries_analysis.md) has a task-to-function table,
+the on/off-resonance noise workflow, `tau_qp` fits, combining the two
+quadratures, and the estimator biases to know about.
 
 ---
 
@@ -1582,7 +1691,6 @@ analysis = ps.analyse_power_sweep(
     loaded,
     nonlinear=True,
     n_jobs=-1,
-    target_anl=0.01,
 )
 
 best_power = analysis["best_power"]
@@ -1662,6 +1770,40 @@ DAC0 is the primary DAC used in normal operation. DAC1 is only used in dual-DAC 
 - `ensure_ready()` on one pipeline will not disrupt the other unless a firmware reprogram is actually required.
 - `hard_reset()` on either pipeline wipes both, so run `ensure_ready()` on both afterwards.
 
+### High-Rate Streaming (KRM)
+
+Streaming both pipelines at 2000–2500 Hz with 1000 tones each needs the board
+set up for it. On the RFSoC, `souk-enable-tuning` gives each pipeline's stream
+loop its own core and a real-time process (`souk-tuning-status` shows what is
+applied, `souk-disable-tuning` undoes it), and each pipeline config should read
+the accumulator by DMA, with its own buffer and channel:
+
+```yaml
+firmware:
+  zdma: true
+  zdma_udmabuf: "udmabuf0"   # "udmabuf1" for pipeline 1 (quoted: a string)
+  zdma_channel: 0            # 1 for pipeline 1
+```
+
+Measured rates, and what to avoid while recording, are in
+[Firmware v7.12 Notes](v712-notes.md#setting-up-a-krm-board-for-these-rates).
+
+---
+
+## Board Management
+
+The KRM carrier's board management controller is reachable over the board's
+USB serial cable from the control PC, so you can check a board and switch its
+power without logging in to it:
+
+```bash
+souk-find-boards                          # which USB serial port is which board
+souk-board-status --board 01449C3F        # read-only health check (auto-selects if one board)
+souk-board-power status --board 01449C3F  # on / off / cycle need the board named and confirmed
+```
+
+See [Board Management](board_management.md).
+
 ---
 
 ## Mock Server Mode
@@ -1712,12 +1854,17 @@ The following command-line tools are installed with the client:
 
 | Command | Description |
 |---------|-------------|
-| `souk-connection-test` | Test connectivity to the readout server |
+| `souk-connection-test` | Test connectivity to the readout server (`-C config.yaml` or `-a address`) |
 | `souk-wideband_sweep` | Perform a wideband frequency sweep from the command line |
 | `souk-batch-snapshots` | Acquire pre-accumulator snapshots across multiple tones |
 | `souk-find-resonances` | Find and optionally fit resonances in sweep data |
-| `souk-mkid-finder-app` | Launch the MKID resonance finder GUI |
-| `souk-mkid-finder` | Same as above (GUI shortcut) |
+| `souk-mkid-finder-app` | Launch the MKID resonance finder GUI (also `souk-mkid-finder`) |
+| `souk-receive-stream` | Record the stream to disk (`--duration`; tone updates saved alongside; `--overwrite` to replace a capture) |
+| `souk-live-plot` | View live or recorded streams as time/PSD/ASD panels ([Live Plotting](live_plotting.md)) |
+| `souk-stream-to-dac` | Live analog output of a tone's response ([Stream to DAC](stream_to_dac.md)) |
+| `souk-find-boards` | List attached RFSoC USB serial bridges and identify the board-management port |
+| `souk-board-status` | Read and health-check the board management controller (read-only) |
+| `souk-board-power` | Report or change the RFSoC board power state via the BMC |
 
 Server-side commands (installed on the RFSoC):
 
@@ -1731,5 +1878,15 @@ Server-side commands (installed on the RFSoC):
 | `souk-restart-daemon` | Restart selected pipeline systemd daemon(s), default pipeline 0 |
 | `souk-restart-daemons` | Restart both pipeline systemd daemons |
 | `souk-enable-timing` | Install and restart the packaged `ptp4l`, chrony PHC, and timing-monitor setup |
+| `souk-enable-tuning` | KRM only: CPU layout, real-time stream processes and network tuning for both pipelines (`souk-disable-tuning` undoes it, `souk-tuning-status` shows it) |
 | `souk-timing-monitor` | Run the local PTP/NTP timing monitor |
+| `souk-timing-monitor-start` | Start the timing-monitor service (`-stop`/`-restart`/`-status`) |
 | `souk-test-timing-monitor` | Query or stream status from `/run/timing-monitor.sock` |
+| `souk-tsu-strobe` | Run the TSU 1-PPS strobe loop (normally run by its service) |
+| `souk-tsu-strobe-install` | Install and start the TSU strobe service (`-start`/`-stop`/`-restart`/`-status`/`-remove`) |
+| `souk-find-attenuators` | Discover RUDAT and SOUK mixerless-module attenuators (`--status` for live values) |
+| `souk-find-bypass-amps` | Discover SOUK mixerless-module bypass amplifiers (`--status` for bypass state) |
+| `souk-find-lnas` | Discover populated LNA bias monitors (`--status` for voltage/current readings) |
+| `souk-rf-peripherals-status` | Combined attenuator, bypass-amplifier, and LNA status report |
+| `souk-lna-service` | Run the LNA bias service (slot-1 board of each telescope rack only) |
+| `souk-lna-service-install` | Install and start the LNA bias service (`-start`/`-stop`/`-restart`/`-status`/`-remove`) |

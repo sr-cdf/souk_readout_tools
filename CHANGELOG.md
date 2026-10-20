@@ -1,5 +1,20 @@
 # Changelog & Feature List
 
+## Unreleased
+
+**Docs brought up to date with v1.8.2** (no code change).
+- `doc/getting_started.md`: every CLI command; new Tone Tracking, Live
+  Viewing, Stream to DAC, Resonance Matching, Timestream and PSD Analysis,
+  High-Rate Streaming and Board Management sections; the conversion section on
+  `prepare_conversion` / `convert_iq` / `convert_samples`; current `get_info`
+  sections and `health_check` keys.
+- Examples use `maximise_tx_power(dac_headroom_db=)` (`headroom_db` raises
+  since v1.7.4): `getting_started.md`, `tone_power_notes.md`,
+  `rf_peripherals.md`, `test_plan.md`.
+- README: capabilities and CLI table for the features since v1.6, and an
+  install/upgrade pointer. `doc/installation.md`: the TSU strobe as a service
+  (`souk-tsu-strobe-install`). Broken anchors fixed.
+
 ## v1.8.2
 
 Software only: firmware v7.12.1, as v1.8.0 and v1.8.1. **On each board, re-run
@@ -1824,7 +1839,6 @@ Forward-ported the `jl_ocs_devel` branch (PR #10) plus follow-on hardening.
 
 Planned for upcoming releases:
 - Quick on/off resonance switching for noise characterisation.  
-- Automated resonator tracking (~~continuous retune loop with drift correction~~ using d2phi/df2 from frequency modulated timestreams).
 - More interactive plotting features (eg step to next resonance, flag as good/bad)
 - ADC calibration via loopback measurement.
 - Improved VACC tone backfilling for more efficient LO slot usage.
