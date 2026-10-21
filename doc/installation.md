@@ -122,10 +122,10 @@ ssh casper@10.11.11.11
 
 Network settings can be updated by modifying ```/etc/network/interfaces.d/end0``` and running `ifdown`/`ifup`.
 
-A debug serial interface is also available via the micro-USB connector on the board. The single USB cable provides two serial ports — the first (`/dev/ttyUSB0`) is for board management, and the second (`/dev/ttyUSB1`) is the boot console and Linux terminal. This is useful for initial setup or recovering from network issues:
+A debug serial interface is also available via the micro-USB connector on the board. The single USB cable provides two serial ports — the first (`/dev/ttyUSB0`) is the boot console and Linux terminal, and the second (`/dev/ttyUSB1`) is for board management (BMC). The numbering can shift if other USB serial devices are present; see [board_management.md](board_management.md). The console is useful for initial setup or recovering from network issues:
 
 ```bash
-picocom -b 115200 /dev/ttyUSB1
+picocom -b 115200 /dev/ttyUSB0
 ```
 
 The default Python environment on the board is `/home/casper/py3.12-venv/` and the bash shell should activate this virtual environment automatically on login, as indicated by the `(py3.12-venv) casper@host:~$` prompt. All server-side `python` and `pip install` commands should use this environment.
