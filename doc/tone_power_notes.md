@@ -391,6 +391,13 @@ converters. ADC snapshots only fill 15 of their 16 bits, so before this was
 normalised an ADC at 88% of full scale read `0.44` and looked like it had
 plenty of margin.
 
+Alongside the peaks, both checks report each component's mean (DC offset) and
+RMS over the same samples: `imean_fs`, `irms_fs`, `qmean_fs`, `qrms_fs` for the
+ADC, and `i0mean_fs` ... `q1rms_fs` for the two DACs. A comb of a few hundred
+tones is close to Gaussian at the converters, so its peak over the default 25
+snapshots sits at ~4.5 x RMS (4.32-5.00 measured on 6a) and moves from one check
+to the next. The RMS is the steady measure of how hard a converter is loaded.
+
 ## Blind Tones
 
 Blind tones are ordinary active firmware tones used for off-resonance

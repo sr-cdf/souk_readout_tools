@@ -6962,8 +6962,14 @@ def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation
         level_saturation = False
     rts_saturation = False
     any_saturation = level_saturation
+    # Mean (DC offset) and RMS over the same samples.  A dense comb is close to
+    # Gaussian at the ADC, so its peak over a capture this size is ~4.5 x RMS and
+    # moves with every capture; the RMS is the steady measure of the loading.
+    imean, qmean = float(np.mean(ss.real)), float(np.mean(ss.imag))
+    irms, qrms = float(np.sqrt(np.mean(ss.real**2))), float(np.sqrt(np.mean(ss.imag**2)))
     integration_time = ss.size/r_fast.adc_clk_hz
     details = {'imax_fs':imax,'imin_fs':imin,'qmax_fs':qmax,'qmin_fs':qmin,
+               'imean_fs':imean,'qmean_fs':qmean,'irms_fs':irms,'qrms_fs':qrms,
                'integration_time':integration_time,
                'threshold':threshold}
 
@@ -7003,6 +7009,7 @@ def check_input_saturation(r,r_fast,iterations=25,saturation_bits=adc_saturation
             status = 'SATURATING' if any_saturation else 'OK'
         print(f'ADC input saturation check: {status}')
         print(f'  I range: [{imin:.3f}, {imax:.3f}] FS  |  Q range: [{qmin:.3f}, {qmax:.3f}] FS  (threshold: {threshold:.0%})')
+        print(f'  I mean {imean:+.4f} rms {irms:.4f} FS  |  Q mean {qmean:+.4f} rms {qrms:.4f} FS')
         if check_rts and rts_available:
             print(f'  RTS Over-Range: {rts_details.get("rts_over_range", False)}, RTS Over-Voltage: {rts_details.get("rts_over_voltage", False)}')
 
@@ -7044,9 +7051,16 @@ def check_output_saturation(r_fast,iterations=25,saturation_bits=dac_saturation_
     any0_saturation = i0_over|i0_under|q0_over|q0_under
     any1_saturation = i1_over|i1_under|q1_over|q1_under
     any_saturation = bool(any0_saturation|any1_saturation)
+    # Mean (DC offset) and RMS over the same samples, per DAC and component.
+    stats = {}
+    for n, ss in (('0', ss0), ('1', ss1)):
+        for c, x in (('i', ss.real), ('q', ss.imag)):
+            stats[f'{c}{n}mean_fs'] = float(np.mean(x))
+            stats[f'{c}{n}rms_fs'] = float(np.sqrt(np.mean(x**2)))
     integration_time = ss0.size/r_fast.adc_clk_hz
     details = {'i0max_fs':i0max,'i0min_fs':i0min,'q0max_fs':q0max,'q0min_fs':q0min,
                'i1max_fs':i1max,'i1min_fs':i1min,'q1max_fs':q1max,'q1min_fs':q1min,
+               **stats,
                'integration_time':integration_time,
                'threshold':threshold}
 
@@ -7056,7 +7070,11 @@ def check_output_saturation(r_fast,iterations=25,saturation_bits=dac_saturation_
         dac1_status = 'SATURATING' if any1_saturation else 'OK'
         print(f'DAC output saturation check: {status}')
         print(f'  DAC0 ({dac0_status}): I range: [{i0min:.3f}, {i0max:.3f}] FS  |  Q range: [{q0min:.3f}, {q0max:.3f}] FS')
+        print(f'        I mean {stats["i0mean_fs"]:+.4f} rms {stats["i0rms_fs"]:.4f} FS  |  '
+              f'Q mean {stats["q0mean_fs"]:+.4f} rms {stats["q0rms_fs"]:.4f} FS')
         print(f'  DAC1 ({dac1_status}): I range: [{i1min:.3f}, {i1max:.3f}] FS  |  Q range: [{q1min:.3f}, {q1max:.3f}] FS')
+        print(f'        I mean {stats["i1mean_fs"]:+.4f} rms {stats["i1rms_fs"]:.4f} FS  |  '
+              f'Q mean {stats["q1mean_fs"]:+.4f} rms {stats["q1rms_fs"]:.4f} FS')
         print(f'  Threshold: {threshold:.0%}')
 
     return any_saturation, details

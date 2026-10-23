@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**Saturation checks report mean and RMS alongside the peaks**
+- `check_input_saturation`: `imean_fs`, `irms_fs`, `qmean_fs`, `qrms_fs`;
+  `check_output_saturation`: the same per DAC (`i0mean_fs` ... `q1rms_fs`).
+  Same samples and full-scale units as the peaks; also in
+  `get_info('diagnostics')` (`adc_saturation`, `dac_saturation`). See
+  `doc/tone_power_notes.md`.
+
 **Config keys are checked against the template** (issue #22: a pre-v1.1.1
 config silently disabled the attenuators).
 - `config_utils.check_config_keys()`: moved/dropped keys with their
