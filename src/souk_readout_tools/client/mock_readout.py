@@ -148,8 +148,7 @@ class MockReadoutServer:
     def _init_tone_state(self):
         defaults = (self.config or {}).get('firmware', {}).get('defaults', {})
         freqs = (
-            defaults.get('tone_frequencies')
-            or defaults.get('frequencies')
+            defaults.get('frequencies')
             or defaults.get('blind_frequencies')
             or [2.1e9]
         )
@@ -173,10 +172,10 @@ class MockReadoutServer:
         self.acc_len = int(acc_len)
         self.tone_frequencies = freqs
         self.tone_amplitudes = self._per_tone_list(
-            defaults.get('tone_amplitudes', defaults.get('amplitudes', 1.0)),
+            defaults.get('amplitudes', 1.0),
             n_tones, 1.0)
         self.tone_phases = self._per_tone_list(
-            defaults.get('tone_phases', defaults.get('phases', 0.0)),
+            defaults.get('phases', 0.0),
             n_tones, 0.0)
         self.tone_powers_dbm = self._per_tone_list(
             defaults.get('tone_powers_dbm', defaults.get('powers_dbm', -60.0)),
@@ -800,10 +799,10 @@ class MockReadoutServer:
             'hardware_available': False,
             'controllable': True,
             'backend': 'mock',
-            'lna_channel': lna_cfg.get('channel'),
-            'bias_voltage_v': lna_cfg.get('voltage_v'),
+            'lna_channel': lna_cfg.get('lna_channel'),
+            'bias_voltage_v': lna_cfg.get('bias_voltage_v'),
             'soft_off': False,
-            'method': lna_cfg.get('method', 'target_current'),
+            'method': lna_cfg.get('method', 'local'),
             'blind': lna_cfg.get('blind', False),
             'lna_model': cryo_cfg.get('lna_model'),
             'hw_version': None,

@@ -195,7 +195,7 @@ def plot_snapshots(snapshot_data, format='iq_vs_t', repetitions='concatenate',
             'dbm' - estimated ADC input power in dBm.
             All options except 'raw' and 'peak' require system_info.
             Ignored for ``format='freq_diss'`` (must be 'raw').
-        config: Config dict (needed for 'dbm' and non-default rx_mix_scale).
+        config: Config dict (needed for 'dbm').
         system_info: structured info dict.  Looked up from
             snapshot_data['info'] if not provided.
         unwrap_phase: bool, optional.  Unwrap the phase in

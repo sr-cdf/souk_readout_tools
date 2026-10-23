@@ -2380,21 +2380,64 @@ def info_calibrations(r, r_fast, config_dict):
     return info
 
 
-def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
-    """
-    Apply configuration changes to hardware.
+# Readback resolution used when apply_config compares a config with the
+# hardware: differences within these are not written.
+_LIVE_TOLERANCE = {
+    'dac_duc_mixer_frequency_hz': 0.01,  # Hz; the RFDC NCO step is ~10 uHz
+    'adc_ddc_mixer_frequency_hz': 0.01,
+    'psb_scale': 2**-8,                  # UFix16.8 register
+    'vop': 50,                           # uA; the RFDC driver rounds VOP to its own step
+}
+TONE_FREQUENCY_TOLERANCE_HZ = 0.01       # LO phase step is ~1.4e-4 Hz
+TONE_AMPLITUDE_TOLERANCE = 2**-8         # 8-bit LO scale (1.0 saturates to 255/256)
+TONE_PHASE_TOLERANCE_RAD = 1e-6          # 31-bit LO phase offset
 
-    If prev_config_dict is None, applies all values from new_config_dict.
-    If prev_config_dict is provided, only applies values that have changed.
+
+def _live_mixer_scale_1p0(core, tile, block, tile_type):
+    """A fine-mixer scale read back as its config value.
+
+    True for 1P0 and False for what ``False`` programs (AUTO on a DAC, 0P7 on
+    the ADC; see _set_mixer_scales). Anything else is None, so it never matches.
+    """
+    scale = core.get_mixer_settings(tile, block, tile_type)['FineMixerScale']
+    false_scale = (core.MIX_SCALE_AUTO if tile_type == core.DAC_TILE
+                   else core.MIX_SCALE_0P7)
+    if scale == core.MIX_SCALE_1P0:
+        return True
+    return False if scale == false_scale else None
+
+
+def _inverse_sinc_mode(core, enabled, nyquist_zone):
+    """The RFDC inverse-sinc FIR mode for an enabled flag and Nyquist zone."""
+    if not enabled:
+        return core.INVSINC_FIR_DISABLED
+    return core.INVSINC_FIR_NYQUIST1 if nyquist_zone == 1 else core.INVSINC_FIR_NYQUIST2
+
+
+def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None, tones=True):
+    """
+    Apply a config to the hardware, writing only what differs.
+
+    Every setting the config gives is compared with what the hardware holds
+    now (within the readback resolution, ``_LIVE_TOLERANCE`` and the TONE_*
+    tolerances) and written only if it differs. Settings the config leaves out
+    (missing, None or an empty list) are left as they are. So a push restores
+    anything changed at runtime, and leaves alone what already matches.
 
     Parameters
     ----------
     new_config_dict : dict
-        The new configuration dictionary to apply
+        The configuration dictionary to apply.
     r : object
-        The readout object with hardware access
+        The readout object with hardware access.
+    r_fast : object, optional
+        The fast interface (tone reads and writes go through it when given).
     prev_config_dict : dict, optional
-        The previous configuration dictionary for comparison
+        The previously applied config. Only used to warn about settings a push
+        cannot change (tiles/blocks, firmware file, rfsoc_host).
+    tones : bool, optional
+        False leaves the tones alone (the server passes it while modulation or
+        tracking is driving them).
     """
     fwconf = new_config_dict['firmware']
     defaults = fwconf.get('defaults', {})
@@ -2403,13 +2446,7 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
     if not prev_config_dict:
         prev_config_dict = None
 
-    # Get previous config for comparison
-    if prev_config_dict is not None:
-        prev_fwconf = prev_config_dict.get('firmware', {})
-        prev_defaults = prev_fwconf.get('defaults', {})
-    else:
-        prev_fwconf = {}
-        prev_defaults = {}
+    prev_fwconf = prev_config_dict.get('firmware', {}) if prev_config_dict else {}
 
     # Check for tile/block changes that require re-initialisation
     reinit_keys = ['dac0_tile', 'dac0_block', 'dac1_tile', 'dac1_block', 'adc_tile', 'adc_block', 'fw_config_file', 'pipeline_id']
@@ -2434,12 +2471,6 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
     # a pure clock check (classify_clock_status) and only ever runs krc-utils
     # init from the deprogram-first reload_firmware sequence (issue #14).
 
-    # Helper to check if a value changed
-    def changed(key):
-        if prev_config_dict is None:
-            return key in defaults
-        return defaults.get(key) != prev_defaults.get(key)
-
     # Get tile/block config for RFDC operations
     dac0_tile = fwconf['dac0_tile']
     dac0_block = fwconf['dac0_block']
@@ -2448,115 +2479,168 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
     adc_tile = fwconf['adc_tile']
     adc_block = fwconf['adc_block']
 
-    # Apply changed parameters
-    if changed('sync_delay'):
-        sync_delay = defaults.get('sync_delay')
-        if sync_delay is not None:
-            _warn_sync_delay_deprecated(sync_delay)  # v7.11: mixer owns RX/TX delay
+    # What the hardware holds now, one value per converter. Read only for the
+    # settings the config gives.
+    def dacs(get):
+        return [get(dac0_tile, dac0_block), get(dac1_tile, dac1_block)]
 
+    def mixer_freq_hz(tile, block, tile_type):
+        return float(r.rfdc.core.get_mixer_settings(tile, block, tile_type)['Freq']) * 1e6
+
+    live = {
+        'acc_len': lambda: [r.mixer.get_acc_len()],
+        'dac_duc_mixer_frequency_hz': lambda: dacs(
+            lambda t, b: mixer_freq_hz(t, b, r.rfdc.core.DAC_TILE)),
+        'adc_ddc_mixer_frequency_hz': lambda: [
+            mixer_freq_hz(adc_tile, adc_block, r.rfdc.core.ADC_TILE)],
+        'nyquist_zone': lambda: [
+            r.rfdc.core.get_nyquist_zone(adc_tile, adc_block, r.rfdc.core.ADC_TILE)] + dacs(
+            lambda t, b: r.rfdc.core.get_nyquist_zone(t, b, r.rfdc.core.DAC_TILE)),
+        'dac_mixer_scale_1p0': lambda: dacs(
+            lambda t, b: _live_mixer_scale_1p0(r.rfdc.core, t, b, r.rfdc.core.DAC_TILE)),
+        'adc_mixer_scale_1p0': lambda: [
+            _live_mixer_scale_1p0(r.rfdc.core, adc_tile, adc_block, r.rfdc.core.ADC_TILE)],
+        'dsa': lambda: [r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa']],
+        'vop': lambda: dacs(lambda t, b: r.rfdc.core.get_output_current(t, b)['current']),
+        'internal_loopback': lambda: [r.input.loopback_enabled()],
+        'psb_scale': lambda: [r.psbscale.get_scale()],
+        'psb_fftshift': lambda: [r.psb.get_fftshift()],
+        'pfb_fftshift': lambda: [r.pfb.get_fftshift()],
+    }
+
+    def differs(key, want):
+        """True when the config gives ``want`` and the hardware differs from it."""
+        if want is None:
+            return False
+        tol = _LIVE_TOLERANCE.get(key, 0)
+        return any(have is None or abs(float(want) - float(have)) > tol
+                   for have in live[key]())
+
+    def changed(key):
+        return differs(key, defaults.get(key))
+
+    if defaults.get('sync_delay') is not None:
+        _warn_sync_delay_deprecated(defaults['sync_delay'])  # v7.11: mixer owns RX/TX delay
+
+    # An unchanged acc_len must not be rewritten: the master reset it needs
+    # moves the accumulator's TT and grid (2026-10-08).
     if changed('acc_len'):
-        acc_len = defaults.get('acc_len')
-        # Compare with the hardware: after a server restart there is no previous
-        # config, so every push looked like a change, and the master reset below
-        # moved the accumulator's TT and grid for nothing (2026-10-08).
-        if acc_len is not None and r.mixer.get_acc_len() != acc_len:
-            print(f'apply_config: setting acc_len = {acc_len}')
-            r.mixer.set_acc_len(acc_len)  # v7.11: acc_len lives in the mixer
-            r.sync.sw_sync(mrst=True)     # acc_len change needs a master-reset + sync
-            if r_fast is not None:
-                refresh_acc_tt_correction(r_fast, source='apply_config acc_len')  # WORKAROUND
+        acc_len = defaults['acc_len']
+        print(f'apply_config: setting acc_len = {acc_len}')
+        r.mixer.set_acc_len(acc_len)  # v7.11: acc_len lives in the mixer
+        r.sync.sw_sync(mrst=True)     # acc_len change needs a master-reset + sync
+        if r_fast is not None:
+            refresh_acc_tt_correction(r_fast, source='apply_config acc_len')  # WORKAROUND
 
-    if changed('dac_duc_mixer_frequency_hz'):
-        dac_duc_mixer_frequency_hz = defaults.get('dac_duc_mixer_frequency_hz')
-        if dac_duc_mixer_frequency_hz is not None:
-            print(f'apply_config: setting dac_duc_mixer_frequency_hz = {dac_duc_mixer_frequency_hz}')
-            r.rfdc.core.set_fine_mixer_freq(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE, dac_duc_mixer_frequency_hz/1e6)
-            r.rfdc.core.set_fine_mixer_freq(dac1_tile, dac1_block, r.rfdc.core.DAC_TILE, dac_duc_mixer_frequency_hz/1e6)
+    dac_mixer_written = changed('dac_duc_mixer_frequency_hz')
+    if dac_mixer_written:
+        dac_duc_mixer_frequency_hz = defaults['dac_duc_mixer_frequency_hz']
+        print(f'apply_config: setting dac_duc_mixer_frequency_hz = {dac_duc_mixer_frequency_hz}')
+        r.rfdc.core.set_fine_mixer_freq(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE, dac_duc_mixer_frequency_hz/1e6)
+        r.rfdc.core.set_fine_mixer_freq(dac1_tile, dac1_block, r.rfdc.core.DAC_TILE, dac_duc_mixer_frequency_hz/1e6)
 
-    def changed_any(*keys):
-        return any(changed(key) for key in keys)
+    adc_ddc_mixer_frequency_hz = defaults.get(
+        'adc_ddc_mixer_frequency_hz', defaults.get('adc_ddc_mix_frequency_hz'))
+    adc_mixer_written = differs('adc_ddc_mixer_frequency_hz', adc_ddc_mixer_frequency_hz)
+    if adc_mixer_written:
+        print(f'apply_config: setting adc_ddc_mixer_frequency_hz = {adc_ddc_mixer_frequency_hz}')
+        r.rfdc.core.set_fine_mixer_freq(adc_tile, adc_block, r.rfdc.core.ADC_TILE, adc_ddc_mixer_frequency_hz/1e6)
 
-    if changed_any('adc_ddc_mixer_frequency_hz', 'adc_ddc_mix_frequency_hz'):
-        adc_ddc_mixer_frequency_hz = defaults.get(
-            'adc_ddc_mixer_frequency_hz',
-            defaults.get('adc_ddc_mix_frequency_hz'),
-        )
-        if adc_ddc_mixer_frequency_hz is not None:
-            print(f'apply_config: setting adc_ddc_mixer_frequency_hz = {adc_ddc_mixer_frequency_hz}')
-            r.rfdc.core.set_fine_mixer_freq(adc_tile, adc_block, r.rfdc.core.ADC_TILE, adc_ddc_mixer_frequency_hz/1e6)
+    # A zone change rewrites the mixer frequencies, and the inverse-sinc mode
+    # follows the zone, so the filter is rewritten with it. Its on/off state
+    # comes from the config, or stays as it was when the config leaves it out.
+    inv_sinc = defaults.get('dac_inverse_sinc_filter_enabled')
+    zone_written = changed('nyquist_zone')
+    if zone_written:
+        if inv_sinc is None:
+            inv_sinc = (r.rfdc.core.get_invsinc_fir(dac0_tile, dac0_block)
+                        != r.rfdc.core.INVSINC_FIR_DISABLED)
+        nyquist_zone = defaults['nyquist_zone']
+        print(f'apply_config: setting nyquist_zone = {nyquist_zone}')
+        set_nyquist_zone(r, new_config_dict, nyquist_zone)
+    if inv_sinc is not None:
+        zone = r.rfdc.core.get_nyquist_zone(dac0_tile, dac0_block, r.rfdc.core.DAC_TILE)
+        want_mode = _inverse_sinc_mode(r.rfdc.core, inv_sinc, zone)
+        if zone_written or any(mode != want_mode for mode in dacs(r.rfdc.core.get_invsinc_fir)):
+            print(f'apply_config: setting dac_inverse_sinc_filter_enabled = {inv_sinc}')
+            set_dac_inverse_sinc_filter(r, new_config_dict, inv_sinc=inv_sinc,
+                                        nyquist_zone=zone)
 
-    if changed('nyquist_zone'):
-        nyquist_zone = defaults.get('nyquist_zone')
-        if nyquist_zone is not None:
-            print(f'apply_config: setting nyquist_zone = {nyquist_zone}')
-            set_nyquist_zone(r, new_config_dict, nyquist_zone)
+    # Mixer scales are programmed after any write that retunes the same mixer
+    # (Nyquist zone, fine mixer frequency), to be sure the configured value is
+    # what is left in the hardware.
+    mixer_retuned = zone_written or dac_mixer_written or adc_mixer_written
+    dac_scale = defaults.get('dac_mixer_scale_1p0')
+    if not (mixer_retuned or changed('dac_mixer_scale_1p0')):
+        dac_scale = None  # None leaves that converter alone
+    adc_scale = defaults.get('adc_mixer_scale_1p0')
+    if not (mixer_retuned or changed('adc_mixer_scale_1p0')):
+        adc_scale = None
+    if dac_scale is not None or adc_scale is not None:
+        _set_mixer_scales(r, new_config_dict, dac=dac_scale, adc=adc_scale)
 
-    if changed_any('nyquist_zone', 'dac_inverse_sinc_filter_enabled'):
-        inv_sinc = defaults.get('dac_inverse_sinc_filter_enabled', True)
-        print(f'apply_config: setting dac_inverse_sinc_filter_enabled = {inv_sinc}')
-        set_dac_inverse_sinc_filter(r, new_config_dict, inv_sinc=None)
-
-    # Mixer scales are re-applied whenever the Nyquist zone or a fine mixer
-    # frequency changes, not just when the scale key itself changes: those
-    # writes retune the same mixer, so the scale is programmed after them to be
-    # sure the configured value is what is left in the hardware.
-    if changed_any('dac_mixer_scale_1p0', 'adc_mixer_scale_1p0', 'nyquist_zone',
-                   'dac_duc_mixer_frequency_hz', 'adc_ddc_mixer_frequency_hz',
-                   'adc_ddc_mix_frequency_hz'):
-        _set_mixer_scales(r, new_config_dict,
-                          dac=defaults.get('dac_mixer_scale_1p0'),
-                          adc=defaults.get('adc_mixer_scale_1p0'))
-
-    if changed('dsa'):
-        dsa = defaults.get('dsa')
-        if dsa is not None:
-            print(f'apply_config: setting dsa = {dsa}')
-            r.rfdc.core.set_dsa(adc_tile, adc_block, int(dsa))
-            # Start clean: a configured DSA does not lift a latched over-voltage hold.
-            _release_after_dsa_write(r, new_config_dict, r_fast, 'apply_config')
+    if differs('dsa', None if defaults.get('dsa') is None else int(defaults['dsa'])):
+        dsa = int(defaults['dsa'])  # set_dsa takes whole dB
+        print(f'apply_config: setting dsa = {dsa}')
+        r.rfdc.core.set_dsa(adc_tile, adc_block, dsa)
+        # Start clean: a configured DSA does not lift a latched over-voltage hold.
+        _release_after_dsa_write(r, new_config_dict, r_fast, 'apply_config')
 
     if changed('vop'):
-        vop = defaults.get('vop')
-        if vop is not None:
-            print(f'apply_config: setting vop = {vop}')
-            r.rfdc.core.set_vop(dac0_tile, dac0_block, vop)
-            r.rfdc.core.set_vop(dac1_tile, dac1_block, vop)
+        vop = defaults['vop']
+        print(f'apply_config: setting vop = {vop}')
+        r.rfdc.core.set_vop(dac0_tile, dac0_block, vop)
+        r.rfdc.core.set_vop(dac1_tile, dac1_block, vop)
 
     if changed('internal_loopback'):
-        internal_loopback = defaults.get('internal_loopback')
-        if internal_loopback is not None:
-            print(f'apply_config: setting internal_loopback = {internal_loopback}')
-            if internal_loopback:
-                r.input.enable_loopback()
-            else:
-                r.input.disable_loopback()
+        internal_loopback = defaults['internal_loopback']
+        print(f'apply_config: setting internal_loopback = {internal_loopback}')
+        if internal_loopback:
+            r.input.enable_loopback()
+        else:
+            r.input.disable_loopback()
 
     if changed('psb_scale'):
-        psb_scale = defaults.get('psb_scale')
-        if psb_scale is not None:
-            print(f'apply_config: setting psb_scale = {psb_scale}')
-            r.psbscale.set_scale(psb_scale)
+        psb_scale = defaults['psb_scale']
+        print(f'apply_config: setting psb_scale = {psb_scale}')
+        r.psbscale.set_scale(psb_scale)
 
     if changed('psb_fftshift'):
-        psb_fftshift = defaults.get('psb_fftshift')
-        if psb_fftshift is not None:
-            print(f'apply_config: setting psb_fftshift = {psb_fftshift}')
-            r.psb.set_fftshift(psb_fftshift)
+        psb_fftshift = defaults['psb_fftshift']
+        print(f'apply_config: setting psb_fftshift = {psb_fftshift}')
+        r.psb.set_fftshift(psb_fftshift)
 
     if changed('pfb_fftshift'):
-        pfb_fftshift = defaults.get('pfb_fftshift')
-        if pfb_fftshift is not None:
-            print(f'apply_config: setting pfb_fftshift = {pfb_fftshift}')
-            r.pfb.set_fftshift(pfb_fftshift)
+        pfb_fftshift = defaults['pfb_fftshift']
+        print(f'apply_config: setting pfb_fftshift = {pfb_fftshift}')
+        r.pfb.set_fftshift(pfb_fftshift)
 
+    # Tones: the config's tone plan against the tones on the hardware. A tone
+    # write needs amplitudes and phases too; when the config gives none, the
+    # live ones are kept (or the plan's defaults if the tone count changes).
     tone_plan = get_configured_tone_plan(new_config_dict)
-    tone_frequencies_changed = changed_any('frequencies', 'blind_frequencies')
-    tone_amplitudes_changed = changed_any('amplitudes', 'blind_amplitudes')
-    tone_phases_changed = changed_any('phases', 'blind_phases')
-
-    if tone_frequencies_changed:
+    if tones and tone_plan['num_tones'] > 0:
         frequencies = tone_plan['frequencies']
-        if len(frequencies) > 0:
+        live_frequencies = np.asarray(
+            get_tone_frequencies(r, r_fast, new_config_dict), dtype=float)
+        same_count = len(live_frequencies) == len(frequencies)
+        amplitudes_given = (_is_present_config_value(defaults.get('amplitudes'))
+                            or _is_present_config_value(defaults.get('blind_amplitudes')))
+        phases_given = (_is_present_config_value(defaults.get('phases'))
+                        or _is_present_config_value(defaults.get('blind_phases')))
+        amplitudes, phases = tone_plan['amplitudes'], tone_plan['phases']
+        if same_count:
+            live_amplitudes = np.asarray(
+                get_tone_amplitudes(r, r_fast, new_config_dict), dtype=float)
+            live_phases = np.asarray(
+                get_tone_phases(r, r_fast, new_config_dict), dtype=float)
+            if not amplitudes_given:
+                amplitudes = live_amplitudes
+            if not phases_given:
+                phases = live_phases
+
+        if not same_count or np.any(
+                np.abs(frequencies - live_frequencies) > TONE_FREQUENCY_TOLERANCE_HZ):
             print(f'apply_config: setting frequencies ({len(frequencies)} tones, '
                   f'{tone_plan["num_blind_tones"]} blind)')
             try:
@@ -2564,25 +2648,22 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None):
                 r_fast.mixer.host.transport._get_device_address
                 set_tone_frequencies_fast(
                     r, r_fast, new_config_dict, frequencies,
-                    tone_amplitudes=tone_plan['amplitudes'],
-                    tone_phases=tone_plan['phases'])
+                    tone_amplitudes=amplitudes, tone_phases=phases)
             except AttributeError:
                 set_tone_frequencies(
                     r, new_config_dict, frequencies,
-                    tone_amplitudes=tone_plan['amplitudes'],
-                    tone_phases=tone_plan['phases'])
-
-    if tone_amplitudes_changed and not tone_frequencies_changed:
-        amplitudes = tone_plan['amplitudes']
-        if amplitudes is not None and len(amplitudes) > 0:
-            print(f'apply_config: setting amplitudes ({len(amplitudes)} values)')
-            set_tone_amplitudes(r, new_config_dict, amplitudes, r_fast=r_fast)
-
-    if tone_phases_changed and not tone_frequencies_changed:
-        phases = tone_plan['phases']
-        if phases is not None and len(phases) > 0:
-            print(f'apply_config: setting phases ({len(phases)} values)')
-            set_tone_phases(r, new_config_dict, phases, r_fast=r_fast)
+                    tone_amplitudes=amplitudes, tone_phases=phases)
+        else:
+            # Filterbank compensation scales a static tone's word by <= ~0.01 dB,
+            # inside the amplitude tolerance, so the raw words compare directly.
+            if amplitudes_given and np.any(np.abs(amplitudes - live_amplitudes)
+                                           > TONE_AMPLITUDE_TOLERANCE):
+                print(f'apply_config: setting amplitudes ({len(amplitudes)} values)')
+                set_tone_amplitudes(r, new_config_dict, amplitudes, r_fast=r_fast)
+            if phases_given and np.any(np.abs(np.angle(np.exp(1j * (phases - live_phases))))
+                                       > TONE_PHASE_TOLERANCE_RAD):
+                print(f'apply_config: setting phases ({len(phases)} values)')
+                set_tone_phases(r, new_config_dict, phases, r_fast=r_fast)
 
 
 def read_parameter(r, param_name):
@@ -2708,14 +2789,14 @@ def set_nyquist_zone(r,config_dict,nyquist_zone):
     return
 
 
-def set_dac_inverse_sinc_filter(r, config_dict, inv_sinc=None):
+def set_dac_inverse_sinc_filter(r, config_dict, inv_sinc=None, nyquist_zone=None):
     """
     Enable or disable the inverse-sinc FIR on both configured DACs.
 
     When ``inv_sinc`` is None, the setting is read from
     ``firmware.defaults.dac_inverse_sinc_filter_enabled`` and defaults to
-    enabled when the key is absent. The enabled RFDC mode follows the
-    configured Nyquist zone.
+    enabled when the key is absent. The enabled RFDC mode follows the Nyquist
+    zone: ``nyquist_zone``, or the configured one when None.
     """
     fwconf = config_dict['firmware']
     defaults = fwconf.get('defaults', {})
@@ -2723,7 +2804,8 @@ def set_dac_inverse_sinc_filter(r, config_dict, inv_sinc=None):
     dac0_block = int(fwconf['dac0_block'])
     dac1_tile = int(fwconf['dac1_tile'])
     dac1_block = int(fwconf['dac1_block'])
-    nyquist_zone = defaults.get('nyquist_zone')
+    if nyquist_zone is None:
+        nyquist_zone = defaults.get('nyquist_zone')
 
     if nyquist_zone not in [1, 2]:
         raise ValueError(
@@ -2734,13 +2816,7 @@ def set_dac_inverse_sinc_filter(r, config_dict, inv_sinc=None):
     if not isinstance(inv_sinc, (bool, np.bool_)):
         raise ValueError('dac_inverse_sinc_filter_enabled must be a boolean')
 
-    if not inv_sinc:
-        mode = r.rfdc.core.INVSINC_FIR_DISABLED
-    elif nyquist_zone == 1:
-        mode = r.rfdc.core.INVSINC_FIR_NYQUIST1
-    else:
-        mode = r.rfdc.core.INVSINC_FIR_NYQUIST2
-
+    mode = _inverse_sinc_mode(r.rfdc.core, inv_sinc, nyquist_zone)
     r.rfdc.core.set_invsinc_fir(dac0_tile, dac0_block, mode)
     r.rfdc.core.set_invsinc_fir(dac1_tile, dac1_block, mode)
     return bool(inv_sinc)
@@ -3524,8 +3600,8 @@ def get_tone_frequencies(r, r_fast, config_dict, detailed_output=False):
     """
     #config
     udc_connected = config_dict['rf_frontend']['connected']
-    udc_lo_frequency = config_dict['rf_frontend']['tx_mixer_lo_frequency_hz']
-    udc_sideband = config_dict['rf_frontend']['tx_mixer_sideband']
+    udc_lo_frequency = config_dict['rf_frontend'].get('tx_mixer_lo_frequency_hz')
+    udc_sideband = config_dict['rf_frontend'].get('tx_mixer_sideband')
     udc_connected = False if not udc_connected else udc_connected
     udc_lo_frequency = 0 if not udc_lo_frequency else float(udc_lo_frequency)
     udc_sideband = 1 if not udc_sideband else int(udc_sideband)
@@ -3799,8 +3875,8 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
     """
     #config
     udc_connected = config_dict['rf_frontend']['connected']
-    udc_lo_frequency = config_dict['rf_frontend']['tx_mixer_lo_frequency_hz']
-    udc_sideband = config_dict['rf_frontend']['tx_mixer_sideband']
+    udc_lo_frequency = config_dict['rf_frontend'].get('tx_mixer_lo_frequency_hz')
+    udc_sideband = config_dict['rf_frontend'].get('tx_mixer_sideband')
     udc_connected = False if not udc_connected else udc_connected
     udc_lo_frequency = 0 if not udc_lo_frequency else float(udc_lo_frequency)
     udc_sideband = 1 if not udc_sideband else int(udc_sideband)
@@ -4076,8 +4152,8 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
     """
     #config
     udc_connected = config_dict['rf_frontend']['connected']
-    udc_lo_frequency = config_dict['rf_frontend']['tx_mixer_lo_frequency_hz']
-    udc_sideband = config_dict['rf_frontend']['tx_mixer_sideband']
+    udc_lo_frequency = config_dict['rf_frontend'].get('tx_mixer_lo_frequency_hz')
+    udc_sideband = config_dict['rf_frontend'].get('tx_mixer_sideband')
     udc_connected = False if not udc_connected else udc_connected
     udc_lo_frequency = 0 if not udc_lo_frequency else float(udc_lo_frequency)
     udc_sideband = 1 if not udc_sideband else int(udc_sideband)
@@ -4320,8 +4396,8 @@ def _rf_to_digital_baseband(r, config_dict, tone_frequencies):
 
     # --- analog up/down conversion (external mixer, if fitted) ---
     udc_connected = config_dict['rf_frontend']['connected']
-    udc_lo_frequency = config_dict['rf_frontend']['tx_mixer_lo_frequency_hz']
-    udc_sideband = config_dict['rf_frontend']['tx_mixer_sideband']
+    udc_lo_frequency = config_dict['rf_frontend'].get('tx_mixer_lo_frequency_hz')
+    udc_sideband = config_dict['rf_frontend'].get('tx_mixer_sideband')
     udc_connected = False if not udc_connected else udc_connected
     udc_lo_frequency = 0 if not udc_lo_frequency else float(udc_lo_frequency)
     udc_sideband = 1 if not udc_sideband else int(udc_sideband)
@@ -4920,8 +4996,8 @@ def prepare_sweep_settings_fast(r_fast, config_dict, sweep_frequencies,
 
     #config
     udc_connected = config_dict['rf_frontend']['connected']
-    udc_lo_frequency = config_dict['rf_frontend']['tx_mixer_lo_frequency_hz']
-    udc_sideband = config_dict['rf_frontend']['tx_mixer_sideband']
+    udc_lo_frequency = config_dict['rf_frontend'].get('tx_mixer_lo_frequency_hz')
+    udc_sideband = config_dict['rf_frontend'].get('tx_mixer_sideband')
     udc_connected = False if not udc_connected else udc_connected
     udc_lo_frequency = 0 if not udc_lo_frequency else float(udc_lo_frequency)
     udc_sideband = 1 if not udc_sideband else int(udc_sideband)
@@ -5839,7 +5915,7 @@ def set_tone_amplitudes(r, config_dict, tone_amplitudes,autosync=False, mrst=Fal
     scaling_tx_full = np.zeros(r.mixer.n_chans, dtype=float)
     scaling_rx_full = np.zeros(r.mixer.n_chans, dtype=float)
     scaling_tx_full[psb_tones_active] = tone_amplitudes
-    scaling_rx_full[psb_tones_active] = 1.0
+    scaling_rx_full[psb_tones_active] = calibration.RX_LO_SCALE
 
     if r_fast is not None:
         v, rows = prepare_control_buffer_data_fast(r_fast, 0, {'tx': {'scaling': scaling_tx_full},
@@ -7496,33 +7572,26 @@ def _gather_tx_chain_params(r, r_fast, config_dict, rf_peripherals=None):
     dac_fs_bits = config_dict['firmware']['dac_fullscale_bits']
     vop_current_fs = config_dict['firmware']['vop_current_fullscale']
 
-    has_rf = _rf_has_readable_attenuator(rf_peripherals)
-    has_live_rf = has_rf and getattr(rf_peripherals, 'is_hardware', False)
-
     # Resolve calibration values (scalar / file / array → per-tone)
     dac_dbfs_to_dbm = _resolve_cal_value(config_dict['firmware']['dac0_dbfs_to_dbm'], analog_freq)
-    tx_combiner_loss_db = _resolve_cal_value(config_dict['rf_frontend']['tx_combiner_loss_db'], analog_freq)
+    # Unset RF path terms are 0 dB (no loss), as on the RX side.
+    tx_combiner_loss_db = _resolve_cal_value(config_dict['rf_frontend'].get('tx_combiner_loss_db'), analog_freq)
 
-    # TX attenuator: read live hardware state when available, else config, else 0.
-    tx_attenuator_value_db = None
-    if has_live_rf:
-        tx_attenuator_value_db = rf_peripherals.get_tx_attenuation()
-    if tx_attenuator_value_db is None:
-        tx_attenuator_value_db = config_dict['rf_frontend'].get('attenuator', {}).get('tx_value_db')
-    if tx_attenuator_value_db is None:
-        tx_attenuator_value_db = 0
+    rf_connected = config_dict['rf_frontend']['connected']
+    cryo_connected = config_dict['cryostat']['connected']
 
-    tx_if_s21_db = _resolve_cal_value(config_dict['rf_frontend']['tx_if_s21_db'], analog_freq)
-    tx_mixer_conversion_loss_db = _resolve_cal_value(config_dict['rf_frontend']['tx_mixer_conversion_loss_db'], analog_freq)
-    tx_rf_s21_db = _resolve_cal_value(config_dict['rf_frontend']['tx_rf_s21_db'], rf_freq)
+    # NaN when unknown (an attenuator is configured but cannot be read).
+    tx_attenuator_value_db = (
+        _attenuator_value_db(config_dict, rf_peripherals, 'tx') if rf_connected else 0)
+
+    tx_if_s21_db = _resolve_cal_value(config_dict['rf_frontend'].get('tx_if_s21_db'), analog_freq)
+    tx_mixer_conversion_loss_db = _resolve_cal_value(config_dict['rf_frontend'].get('tx_mixer_conversion_loss_db'), analog_freq)
+    tx_rf_s21_db = _resolve_cal_value(config_dict['rf_frontend'].get('tx_rf_s21_db'), rf_freq)
 
     tx_bypass_amp_s21_db = _gather_bypass_amp_s21(
         config_dict, rf_peripherals, 'tx', rf_freq)
 
-    cryostat_input_s21_db = _resolve_cal_value(config_dict['cryostat']['input_s21_db'], rf_freq)
-
-    rf_connected = config_dict['rf_frontend']['connected']
-    cryo_connected = config_dict['cryostat']['connected']
+    cryostat_input_s21_db = _resolve_cal_value(config_dict['cryostat'].get('input_s21_db'), rf_freq)
 
     if not rf_connected:
         tx_combiner_loss_db = 0
@@ -7752,6 +7821,41 @@ def _rf_has_readable_attenuator(rf_peripherals):
             or getattr(rf_peripherals, 'attenuator_backend', None) == 'fixed'
         )
     )
+
+
+def _attenuator_value_db(config_dict, rf_peripherals, path):
+    """The TX or RX attenuation (dB) in the RF path, for the power model.
+
+    The live reading when the attenuator answers; the config value for a
+    ``fixed`` backend; 0 dB when no attenuator backend is configured (there is
+    none in the path). Otherwise the setting is unknown and this is NaN, never
+    an assumed 0 dB: powers past the attenuator come out NaN, and the callers
+    that report or act on them raise (_require_known_attenuation).
+    """
+    attn_cfg = (config_dict.get('rf_frontend') or {}).get('attenuator') or {}
+    backend = attn_cfg.get('backend')
+    if not backend:
+        return 0.0
+    if backend == 'fixed':
+        value = attn_cfg.get(f'{path}_value_db')
+    elif rf_peripherals is not None and getattr(rf_peripherals, 'is_hardware', False):
+        value = (rf_peripherals.get_tx_attenuation() if path == 'tx'
+                 else rf_peripherals.get_rx_attenuation())
+    else:
+        value = None
+    return np.nan if value is None else float(value)
+
+
+def _require_known_attenuation(value_db, path):
+    """Raise if the attenuation from _attenuator_value_db is unknown (NaN)."""
+    if np.all(np.isfinite(value_db)):
+        return
+    raise RuntimeError(
+        f'{path.upper()} attenuation is unknown: rf_frontend.attenuator.backend is '
+        f'set but the attenuator is not answering (see the server log), or with '
+        f"backend 'fixed' rf_frontend.attenuator.{path}_value_db is blank. Powers "
+        f"past the attenuator cannot be computed; fix that, or use "
+        f"reference_plane='dac'.")
 
 
 def _validate_control_scope(digital_only=False, rf_only=False):
@@ -11729,10 +11833,10 @@ def get_tone_powers(r, r_fast, config_dict, detailed_output=False, reference_pla
 
     need_rx = reference_plane in RX_PLANES or detailed_output
 
-    has_rf = _rf_has_readable_attenuator(rf_peripherals)
-
     # ---- TX chain ----
     p = _gather_tx_chain_params(r, r_fast, config_dict, rf_peripherals=rf_peripherals)
+    if reference_plane != 'dac':
+        _require_known_attenuation(p['tx_attenuator_value_db'], 'tx')
     freqs = p['freqs']
     freq_details = p['freq_details']
 
@@ -11765,7 +11869,7 @@ def get_tone_powers(r, r_fast, config_dict, detailed_output=False, reference_pla
         adc_dbm_to_dbfs = config_dict['firmware'].get('adc_dbm_to_dbfs', 3.0)
         pfb_fftshift = r.pfb.get_fftshift()
         acc_len = r.mixer.get_acc_len()
-        rx_mix_scale = config_dict['firmware'].get('rx_mix_scale', 1.0)
+        rx_mix_scale = calibration.RX_LO_SCALE
 
         # ADC DSA (RFDC digital step attenuator, before ADC)
         adc_dsa_db = float(r.rfdc.core.get_dsa(adc_tile, adc_block)['dsa'])
@@ -11784,14 +11888,11 @@ def get_tone_powers(r, r_fast, config_dict, detailed_output=False, reference_pla
         rx_combiner_loss_db = _resolve_cal_value(
             config_dict['rf_frontend'].get('rx_combiner_loss_db', 0),
             rx_if_freq)
-        has_live_rf = has_rf and getattr(rf_peripherals, 'is_hardware', False)
-        rx_attenuator_value_db = None
-        if has_live_rf:
-            rx_attenuator_value_db = rf_peripherals.get_rx_attenuation()
-        if rx_attenuator_value_db is None:
-            rx_attenuator_value_db = config_dict['rf_frontend'].get('attenuator', {}).get('rx_value_db', None)
-        if rx_attenuator_value_db is None:
-            rx_attenuator_value_db = 0
+        rx_attenuator_value_db = (
+            _attenuator_value_db(config_dict, rf_peripherals, 'rx')
+            if p['rf_connected'] else 0)
+        if reference_plane in RX_PLANES:
+            _require_known_attenuation(rx_attenuator_value_db, 'rx')
         rx_if_s21_db = _resolve_cal_value(
             config_dict['rf_frontend'].get('rx_if_s21_db', 0),
             rx_if_freq)
@@ -11986,6 +12087,7 @@ def set_tone_powers(r, r_fast, config_dict, powers_dbm, reference_plane='detecto
     # ---- Phase 1: GATHER ----
     p = _gather_tx_chain_params(r, r_fast, config_dict, rf_peripherals=rf_peripherals)
     cal = _mask_cal_for_reference_plane(p, reference_plane)
+    _require_known_attenuation(cal['tx_attenuator_value_db'], 'tx')  # 0 when masked ('dac')
 
     # Bin sharing factor
     bin_indices = np.array(p['freq_details']['tx']['filterbank_bins'])

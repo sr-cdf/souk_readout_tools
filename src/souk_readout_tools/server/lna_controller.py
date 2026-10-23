@@ -643,7 +643,9 @@ class LNABiasController:
         # setups where the cryostat RF path is intentionally disconnected.
         self.cryostat_connected = bool(cryo_cfg.get('connected', False))
         config_enabled = lna_cfg.get('enabled', False)
-        self._backend = lna_cfg.get('backend', 'i2c') or None
+        # 'remote' (the LNA bias service) is the normal deployment; 'i2c'
+        # would make this process a second owner of the bias board.
+        self._backend = lna_cfg.get('backend', 'remote') or None
         self.enabled = bool(config_enabled) and self._backend is not None
         if not self.enabled:
             if config_enabled:

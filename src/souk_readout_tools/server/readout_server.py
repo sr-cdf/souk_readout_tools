@@ -45,7 +45,7 @@ import numpy as np
 import base64
 
 from importlib.resources import files as importlib_files
-from souk_readout_tools.config_utils import copy_template_config
+from souk_readout_tools.config_utils import copy_template_config, check_config_keys
 from souk_readout_tools.timing import get_timing_summary, get_timing_status, report_sync_readiness, unix_to_iso, format_duration_s, DEFAULT_ALIGN_TOL_S
 from souk_readout_tools.server import tracking as tone_tracking
 import argparse
@@ -1301,6 +1301,9 @@ class ReadoutServer:
             _server_log(f"accumulator reads may use ZDMA via "
                         f"{firmware_lib.ZDMA_UDMABUF}, channel "
                         f"{firmware_lib.ZDMA_CHANNEL}", source='firmware')
+        else:
+            # A push with zdma: false turns it back off.
+            firmware_lib.ZDMA_ENABLED = False
 
         # Advise when the interface did not come up against the loaded image.
         # _require_clocks_locked above already ruled out a PLL/reference fault, so
@@ -1504,6 +1507,8 @@ class ReadoutServer:
 
         #load config
         self.load_config(config_file, log_source='init')
+        for w in check_config_keys(self.config):
+            _server_log(f'warning: {w}', source='config')
         self.server_address = '0.0.0.0'
         self.request_server_port = self.config['rfsoc_host']['request_port']
         self.stream_server_port = self.config['rfsoc_host']['stream_port']
@@ -1866,6 +1871,27 @@ class ReadoutServer:
                 f"the board to change this.")
             host['stream_port'] = launch['stream_port']
 
+        identity_warnings += check_config_keys(config_contents)
+
+        # The stream process (and its DMA channel) is set up when the server
+        # starts, so a push cannot change it: say so rather than ignore it.
+        from souk_readout_tools.server import stream_process as sp_mod
+        sp = self.stream_process
+        fw = config_contents.get('firmware', {})
+        if sp_mod.wanted(config_contents) != (sp is not None):
+            identity_warnings.append(
+                'firmware.stream_process only takes effect when the server starts '
+                '(or SOUK_STREAM_PROCESS overrides it); restart the server to apply it.')
+        elif sp is not None and (
+                bool(fw.get('zdma')), fw.get('zdma_udmabuf', 'udmabuf0'),
+                int(fw.get('zdma_channel', 0))) != (
+                sp.settings['zdma'], sp.settings['zdma_udmabuf'],
+                sp.settings['zdma_channel']):
+            identity_warnings.append(
+                "firmware.zdma / zdma_udmabuf / zdma_channel are the stream "
+                "process's and only take effect when the server starts; restart "
+                "the server to apply them.")
+
         for w in identity_warnings:
             _server_log(w, source='config')
 
@@ -1918,7 +1944,19 @@ class ReadoutServer:
                 self.applied_config = copy.deepcopy(self.config)
                 self.update_active_tone_indices()
             else:
-                firmware_lib.apply_config(config_contents, self.r, self.r_fast, self.applied_config)
+                # While modulation or tracking drives the tones, the live tone
+                # words are theirs (slot offsets, tracked centres): leave them.
+                tones_busy = (self.e_fw_modulation_enabled.is_set()
+                              or self.e_modulation_enabled.is_set()
+                              or (self.tracking is not None and self.tracking.enabled))
+                if tones_busy and firmware_lib.get_configured_tone_plan(
+                        config_contents)['num_tones'] > 0:
+                    msg = ('tones not applied: modulation or tracking is driving them; '
+                           'stop it and push again to apply the config\'s tones.')
+                    _server_log(msg, source='config')
+                    identity_warnings.append(msg)
+                firmware_lib.apply_config(config_contents, self.r, self.r_fast,
+                                          self.applied_config, tones=not tones_busy)
                 self.applied_config = copy.deepcopy(config_contents)
                 self.update_active_tone_indices()
                 self.ensure_ready(config_file=filename, level="pipeline", log_source='config')
@@ -1948,6 +1986,12 @@ class ReadoutServer:
         except Exception as e:
             _server_log(f'warning: bias re-init failed: {e}', source='lna')
             self.lna_controller = None
+
+        # Read when a trigger wait starts, so a pushed pin applies from the next one.
+        self.trigger_source_pin = self.config.get('firmware', {}).get(
+            'trigger_source_pin',
+            self.config.get('rfsoc_host', {}).get('trigger_source_pin', 0)
+        )
 
         if default:
             self._make_config_default(filename, source='config')

@@ -8,7 +8,7 @@ import warnings
 import numpy as np
 
 from souk_readout_tools import config_utils
-from souk_readout_tools.calibration import ADC_FULL_SCALE
+from souk_readout_tools.calibration import ADC_FULL_SCALE, RX_LO_SCALE
 
 
 # Supported units for normalisation. ``s21`` is kept as a backwards-compatible
@@ -408,9 +408,18 @@ def _rx_chain_gain_db(frequencies, info, config, calibration_cache=None):
         rx_combiner = _cal_or_zero(_first_present(
             rf.get('rx_combiner_loss_db'), cal_info.get('rx_combiner_loss_db'),
             rf_info.get('rx_combiner_loss_db')), frequencies)
-        rx_atten_raw = _first_present(
-            rf_info.get('rx_attenuation_db'),
-            (rf.get('attenuator', {}) or {}).get('rx_value_db'))
+        # The recorded reading; else the config value of a 'fixed' attenuator;
+        # 0 dB only when there is no attenuator. One that was not read is
+        # unknown, not 0 dB (then no calibrated plane past the ADC).
+        attn_cfg = rf.get('attenuator', {}) or {}
+        backend = _first_present(rf_info.get('attenuator_backend'), attn_cfg.get('backend'))
+        rx_atten_raw = rf_info.get('rx_attenuation_db')
+        if rx_atten_raw is None and backend == 'fixed':
+            rx_atten_raw = attn_cfg.get('rx_value_db')
+        if rx_atten_raw is None and backend in (None, 'none'):
+            rx_atten_raw = 0.0
+        if rx_atten_raw is None and rx_dynamic_gain is None:
+            return None
         rx_atten = 0.0 if rx_atten_raw is None else float(rx_atten_raw)
     if cryo_connected:
         cryo_output_s21 = _cal_or_zero(_first_present(
@@ -418,8 +427,10 @@ def _rx_chain_gain_db(frequencies, info, config, calibration_cache=None):
             cal_info.get('cryostat_output_s21_db')), frequencies)
 
     rfdc_info = _info_section(info, 'rfdc')
-    adc_dsa_raw = _first_present((info or {}).get('dsa'), rfdc_info.get('dsa'), 0)
-    adc_dsa_db = 0.0 if adc_dsa_raw is None else float(adc_dsa_raw)
+    adc_dsa_raw = _first_present((info or {}).get('dsa'), rfdc_info.get('dsa'))
+    if adc_dsa_raw is None:
+        return None  # the DSA always exists; unrecorded is unknown, not 0 dB
+    adc_dsa_db = float(adc_dsa_raw)
 
     result = (
         cryo_output_s21
@@ -615,23 +626,20 @@ def _digital_gain(info, config=None, pre_accumulation=False,
     Args:
         info: structured info dict (from sweep_data or ts_data) with at
             least a 'pipeline' section.
-        config: Optional config dict.  Only needed when rx_mix_scale != 1.
+        config: Unused (the RX LO scale is fixed); kept for callers.
         pre_accumulation: True for snapshot data (no acc_len contribution).
     """
     cache_key = ('digital_gain', bool(pre_accumulation))
     if calibration_cache is not None and cache_key in calibration_cache:
         return calibration_cache[cache_key]
 
-    config = _effective_config(config, info, calibration_cache)
     pipeline = info.get('pipeline', {}) if info else {}
     pfb_fftshift = pipeline.get('pfb_fftshift', 0) or 0
     pfb_gain = 2 ** (13 - bin(pfb_fftshift).count('1'))
 
-    rx_mix_scale = 0.7
-    if config is not None:
-        rx_mix_scale = config.get('firmware', {}).get('rx_mix_scale', 1.0)
-    if rx_mix_scale is None:
-        rx_mix_scale = 0.7
+    # The RFDC DDC scale (adc_mixer_scale_1p0) is applied separately, by the
+    # caller, from info['rfdc'].
+    rx_mix_scale = RX_LO_SCALE
 
     if pre_accumulation:
         acc_gain = 1.0
@@ -786,7 +794,7 @@ def _normalise_iq(si, sq, units, info=None, config=None,
             'dbfs', 'dbm', 'volts', and 'watts'; ignored for 'raw' and
             'peak'.
         config: Config dict (needed when the sweep ``info`` does not contain
-            the run config, or for non-default rx_mix_scale in older data).
+            the run config).
         pre_accumulation: True for snapshot data.
         ei, eq: Optional error arrays (scaled identically for linear units).
         reference_plane: One of VALID_REFERENCE_PLANES. ``'adc_input'``

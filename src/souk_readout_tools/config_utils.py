@@ -67,6 +67,148 @@ def get_template_config_path():
 
 
 # ---------------------------------------------------------------------
+# Config key check
+# ---------------------------------------------------------------------
+# A config is checked against the template's keys so that a key the code no
+# longer reads (an old config, or a typo) is reported instead of silently
+# ignored (issue #22).
+
+# Keys that have moved or gone, with what to use instead. Found by diffing the
+# template's history; add a line here whenever a key is renamed or dropped.
+RETIRED_CONFIG_KEYS = {
+    'rfsoc_host.clock_source':
+        'firmware.clock_source (still read from here for now)',
+    'rfsoc_host.trigger_source_pin':
+        'firmware.trigger_source_pin (still read from here for now)',
+    'firmware.defaults.adc_ddc_mix_frequency_hz':
+        'firmware.defaults.adc_ddc_mixer_frequency_hz (still read for now)',
+    'firmware.defaults.tone_frequencies': 'firmware.defaults.frequencies',
+    'firmware.defaults.tone_phases': 'firmware.defaults.phases',
+    'firmware.defaults.tone_powers':
+        'firmware.defaults.amplitudes (DAC amplitudes, not dBm)',
+    'rf_frontend.attenuator_backend': 'rf_frontend.attenuator.backend',
+    'rf_frontend.tx_attenuator_value_db': 'rf_frontend.attenuator.tx_value_db',
+    'rf_frontend.rx_attenuator_value_db': 'rf_frontend.attenuator.rx_value_db',
+    'rf_frontend.tx_bypass_amp_s21_db':
+        'rf_frontend.mixerless_module.tx_amp_enabled_s21_db / _bypassed_s21_db',
+    'rf_frontend.rx_bypass_amp_s21_db':
+        'rf_frontend.mixerless_module.rx_amp_enabled_s21_db / _bypassed_s21_db',
+    'rf_frontend.bypass_amps.tx_s21_db':
+        'rf_frontend.mixerless_module.tx_amp_enabled_s21_db / _bypassed_s21_db',
+    'rf_frontend.bypass_amps.rx_s21_db':
+        'rf_frontend.mixerless_module.rx_amp_enabled_s21_db / _bypassed_s21_db',
+    'rf_frontend.mixerless_module.enabled': 'rf_frontend.mixerless_module.connected',
+    'rf_frontend.mixerless_module.channel': 'rf_frontend.mixerless_module.rf_channel',
+    'rf_frontend.mixerless_module.attenuator_backend': 'rf_frontend.attenuator.backend',
+    'rf_frontend.mixerless_module.tx_amp_bypass': 'rf_frontend.bypass_amps.tx_amp_bypass',
+    'rf_frontend.mixerless_module.rx_amp_bypass': 'rf_frontend.bypass_amps.rx_amp_bypass',
+    'rf_frontend.mixerless_module.i2c_bus': None,  # always SMBus(0)
+    'cryostat.lna_bias.i2c_bus': 'cryostat.lna_bias.i2c.bus',
+    'firmware.rx_mix_scale': None,  # fixed by the code: calibration.RX_LO_SCALE
+}
+
+# Keys the code reads that the template leaves out or comments out.
+OPTIONAL_CONFIG_KEYS = {
+    'firmware.dac0_calibration_file',
+    'firmware.dac1_calibration_file',
+    'firmware.adc_calibration_file',
+    'firmware.rf_impedance_ohm',
+    'firmware.adc_input_impedance_ohm',
+    'firmware.defaults.sync_delay',  # deprecated, warned about where it is read
+    'firmware.defaults.dac_duc_mixer_frequency_hz',
+    'firmware.defaults.adc_ddc_mixer_frequency_hz',
+    'firmware.defaults.filterbank_group_delay_override_ns',
+    'rf_frontend.impedance_ohm',
+    'cryostat.lna_bias.host',
+    'cryostat.lna_bias.request_port',
+    'cryostat.lna_bias.timeout_s',
+    'cryostat.lna_bias.hw_version',
+}
+
+# Free-form sections: any keys allowed, none required.
+_FREE_FORM_KEYS = ('config', 'comments')
+
+
+def check_config_keys(config, template=None):
+    """Compare a config's keys with the template's.
+
+    Parameters
+    ----------
+    config : dict
+        A loaded pipeline config.
+    template : dict, optional
+        The config to compare against. Defaults to the bundled
+        ``template_config.yaml``.
+
+    Returns
+    -------
+    list of str
+        Warnings, empty if none: one per key that has moved or gone (with its
+        replacement), then one listing keys the template does not have (so
+        the code ignores them, e.g. a typo), then one listing keys the
+        template sets but the config leaves out (so the code's own default
+        applies instead). Keys left blank in the template are optional and
+        are not reported missing.
+
+    Examples
+    --------
+    >>> template = {'rf_frontend': {'attenuator': {'backend': 'i2c'},
+    ...                             'mixerless_module': {'connected': True}}}
+    >>> config = {'rf_frontend': {'attenuator_backend': 'i2c', 'conected': True}}
+    >>> for w in check_config_keys(config, template):
+    ...     print(w)
+    rf_frontend.attenuator_backend is no longer used: use rf_frontend.attenuator.backend
+    unknown keys, ignored (typo, or not in this software version): rf_frontend.conected
+    keys not set, so the code default applies (see template_config.yaml): rf_frontend.mixerless_module
+    """
+    if template is None:
+        import yaml
+        with open(get_template_config_path()) as f:
+            template = yaml.safe_load(f)
+
+    retired, unknown, missing = [], [], []
+
+    def has_value(t):
+        if isinstance(t, dict):
+            return any(has_value(v) for v in t.values())
+        return t is not None
+
+    def walk(cfg, tmpl, prefix):
+        for key, value in cfg.items():
+            path = f'{prefix}{key}'
+            if path in RETIRED_CONFIG_KEYS:
+                retired.append(path)
+            elif key in _FREE_FORM_KEYS or path in OPTIONAL_CONFIG_KEYS:
+                continue
+            elif key not in tmpl:
+                unknown.append(path)
+            elif isinstance(tmpl[key], dict) and (value is None
+                                                  or isinstance(value, dict)):
+                walk(value or {}, tmpl[key], f'{path}.')
+        for key, t in tmpl.items():
+            if key not in _FREE_FORM_KEYS and key not in cfg and has_value(t):
+                missing.append(f'{prefix}{key}')
+
+    walk(config or {}, template, '')
+    warnings = []
+    for path in retired:
+        new = RETIRED_CONFIG_KEYS[path]
+        warnings.append(f'{path} is no longer used' + (f': use {new}' if new else ''))
+    # A missing key whose old spelling is in the config is reported above.
+    moved_to = [RETIRED_CONFIG_KEYS[p].split()[0] for p in retired
+                if RETIRED_CONFIG_KEYS[p]]
+    missing = [p for p in missing
+               if not any(m == p or m.startswith(p + '.') for m in moved_to)]
+    if unknown:
+        warnings.append('unknown keys, ignored (typo, or not in this software '
+                        'version): ' + ', '.join(unknown))
+    if missing:
+        warnings.append('keys not set, so the code default applies (see '
+                        'template_config.yaml): ' + ', '.join(missing))
+    return warnings
+
+
+# ---------------------------------------------------------------------
 # Site file
 # ---------------------------------------------------------------------
 # Board-wide settings that are the same for every pipeline on a machine, and

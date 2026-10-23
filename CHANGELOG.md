@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+**Config keys are checked against the template** (issue #22: a pre-v1.1.1
+config silently disabled the attenuators).
+- `config_utils.check_config_keys()`: moved/dropped keys with their
+  replacement (`RETIRED_CONFIG_KEYS`, from the template's history), unknown
+  keys, and keys the template sets but the config omits. Run on
+  `push_config` (returned as client `WARNING:` lines, older clients included)
+  and at server start.
+- Attenuator errors name the missing key (`rf_frontend.attenuator.backend`,
+  `mixerless_module.connected`) instead of "check server logs for hardware
+  errors".
+
+**Push compares with the hardware, not the last push**
+- `firmware_lib.apply_config` reads back each setting the config gives and
+  writes only those that differ (`_LIVE_TOLERANCE`, `TONE_*_TOLERANCE`:
+  0.01 Hz, 1/256, 1e-6 rad, VOP 50 uA). Was: diff against `applied_config`,
+  so a runtime change survived an identical push.
+- Settings the config omits are never written: no `amplitudes` keeps the live
+  ones (also when tones move); no `dac_inverse_sinc_filter_enabled` keeps the
+  live filter state, including across a Nyquist zone change.
+- Mixer scales compare as programmed: DAC False = AUTO, ADC False = 0P7 (an
+  ADC left at AUTO is now set to 0P7).
+- `tones=False` while fw/sw modulation or tracking runs (`set_config` warns).
+- `set_dac_inverse_sinc_filter(nyquist_zone=)`.
+
+**Unknown attenuation is no longer assumed to be 0 dB**
+- Power model (`_attenuator_value_db`): live reading; `backend: fixed` config
+  value; 0 dB only with no attenuator backend. An attenuator that is configured
+  but not answering (or a blank fixed value) is NaN, and `get_tone_powers`
+  (any plane past the DAC) / `set_tone_powers` raise. Was: config value, else 0.
+- Plotting `_rx_chain_gain_db`: same rule, plus an unrecorded ADC DSA is
+  unknown; calibrated planes then fall back to `adc_input` with a warning.
+
+**Config defaults and push/sync parity**
+- TX power model reads unset `rf_frontend.tx_*` / `cryostat.input_s21_db` as
+  0 dB, as RX already did (was a KeyError when absent).
+- `firmware.rx_mix_scale` dropped: the RX LO scale is fixed
+  (`calibration.RX_LO_SCALE = 1.0`, written by `set_tone_amplitudes`).
+  Plotting's no-config fallback of 0.7 counted the DDC 1/sqrt(2) twice (-3 dB).
+- `cryostat.lna_bias.backend` falls back to `remote`, not `i2c`.
+- Push: `trigger_source_pin` applies without a restart; `zdma: false` turns
+  ZDMA off; warns that `stream_process` / its `zdma*` need a restart.
+- `sync_config_from_system` reads back `firmware.clock_source` and drops the
+  deprecated `sync_delay`.
+- Mock LNA info reads `lna_channel` / `bias_voltage_v`; mock drops the retired
+  `tone_*` keys.
+
 **Docs brought up to date with v1.8.2** (no code change).
 - `doc/getting_started.md`: every CLI command; new Tone Tracking, Live
   Viewing, Stream to DAC, Resonance Matching, Timestream and PSD Analysis,

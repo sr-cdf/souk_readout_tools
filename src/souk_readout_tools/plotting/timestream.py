@@ -345,8 +345,7 @@ def plot_timestream(ts_data, format='iq_vs_t', tones=None,
             All options except 'raw' and 'peak' require
             'info' in ts_data.
         config: Config dict (needed when the timestream metadata does not
-            include the run config, or for non-default rx_mix_scale in older
-            data).
+            include the run config).
         reference_plane: Reference plane for calibrated magnitude plotting.
             Use 'adc_input' (default), 'cryostat_output', or 'detector'.
             'cryostat_output'/'detector' deembed the RX analog chain using
@@ -853,7 +852,8 @@ def plot_timestream_on_resonance(ts_data, sweep_data, tone_index,
             'raw' (default) - accumulator codes, no normalisation.
             'peak' - normalise to the peak magnitude of the data.
             'adc_fs' - fraction of ADC full-scale (linear voltage).
-        config: Config dict (needed for non-default rx_mix_scale).
+        config: Config dict (only used when the timestream metadata does not
+            include the run config).
         apply_readout_correction: bool, plot with (True, default) or without
             (False) the filterbank compensation's software readout-flattening
             factors, applied consistently to the timestream samples and the

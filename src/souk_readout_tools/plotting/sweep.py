@@ -759,7 +759,7 @@ def plot_sweep(sweep_data, format='magphase', tones=None, deembed=False,
             non-ADC reference planes use 'info' or ``config`` when calibration
             is required.
         config: Config dict (needed when the sweep metadata does not include
-            the run config, or for non-default rx_mix_scale in older data).
+            the run config).
         reference_plane: Reference plane for calibrated magnitude plotting.
             Use 'adc_input' (default), 'cryostat_output', or 'detector'.  The
             latter two remove the RX analog-chain gain using frequency-

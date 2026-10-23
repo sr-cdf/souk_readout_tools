@@ -297,7 +297,11 @@ This means calibration file paths in the config are portable: `push_config` reso
 
 ### Pushing Configuration to the RFSoC
 
-`push_config()` sends the client's current in-memory config dictionary to the server, which saves it, applies any hardware parameter changes, and calls `ensure_ready()` so that any initialisation steps required by the changes are performed. The pushed config becomes the new default (persists across power cycles).
+`push_config()` sends the client's current in-memory config dictionary to the server, which saves it, applies it to the hardware, and calls `ensure_ready()` so that any initialisation steps required by the changes are performed. The pushed config becomes the new default (persists across power cycles).
+
+Each setting the config gives is compared with what the hardware holds now and written only if it differs (within the readback resolution: e.g. 1/256 for tone amplitudes, the RFDC driver's VOP step). A push therefore restores anything changed at runtime, and leaves alone whatever already matches; an unchanged `acc_len` in particular is never rewritten, since that needs a master reset. Settings the config leaves out (missing, blank or `[]`) are left as they are, so a config without `amplitudes` keeps the live tone amplitudes. While modulation or tone tracking is running the tones are left alone, with a warning. `sync_config_from_system()` is the reverse: it reads the same settings back into the config.
+
+The server checks the pushed config's keys against its own `template_config.yaml` and returns a `WARNING:` line (also in the server log, and at server start for the default config) for keys that have moved or been dropped (with the new name), keys it does not know (typos, or a newer config on older software), and keys the template sets but the config leaves out (the code default applies). An old config produces a list of these; the quickest fix is a fresh `copy_template_config()` with your values carried over. `config_utils.check_config_keys(config)` runs the same check locally.
 
 Config parameters can be modified directly on the client instance before pushing:
 

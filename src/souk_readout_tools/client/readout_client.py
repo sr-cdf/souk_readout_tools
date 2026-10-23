@@ -1428,7 +1428,7 @@ class ReadoutClient:
         if self.config is None:
             raise RuntimeError('No config loaded. Use pull_config() or load a config file first.')
 
-        sections = ['server', 'pipeline', 'rfdc', 'tones']
+        sections = ['server', 'pipeline', 'rfdc', 'tones', 'clock']
         info_list = self.get_info(sections)
         if not isinstance(info_list, list) or len(info_list) != len(sections):
             raise RuntimeError(f'Failed to get info: {info_list}')
@@ -1440,11 +1440,16 @@ class ReadoutClient:
         rfdc = info.get('rfdc', {})
         tones = info.get('tones', {})
 
+        clock_source = (info.get('clock') or {}).get('source')
+        if clock_source in ('internal', 'external'):
+            self.config.setdefault('firmware', {})['clock_source'] = clock_source
+
         defaults = self.config.setdefault('firmware', {}).setdefault('defaults', {})
+        # sync_delay can no longer be set (v7.11: the mixer owns RX/TX delay).
+        defaults.pop('sync_delay', None)
 
         # Direct mappings: (source_section, source_key) -> defaults key
         DIRECT_MAPS = [
-            (pipeline, 'sync_delay',                'sync_delay'),
             (pipeline, 'acc_len',                   'acc_len'),
             (pipeline, 'internal_loopback',         'internal_loopback'),
             (pipeline, 'psb_scale',                 'psb_scale'),

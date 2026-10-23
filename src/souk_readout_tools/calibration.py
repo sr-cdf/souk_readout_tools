@@ -10,6 +10,13 @@ import numpy as np
 ADC_FULL_SCALE = 0.5
 DAC_FULL_SCALE = 1.0
 
+# Amplitude scale of the firmware mixer's RX LO (the rx_mix_scale stage of the
+# power model, after the PFB; not the RFDC DDC scale, adc_mixer_scale_1p0).
+# set_tone_amplitudes always writes it as this value and sets TX power on the TX
+# LO only. Before 91bfb65 (2026-06-01) the RX LO was written with each tone's
+# TX amplitude instead.
+RX_LO_SCALE = 1.0
+
 
 def calc_tone_powers(amps,
                      psb_fftshift,

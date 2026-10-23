@@ -691,6 +691,19 @@ class RFPeripheralController:
                 raise RuntimeError(
                     'Fixed attenuator backend is not controllable.'
                 )
+            if self._attenuator_backend is None:
+                raise RuntimeError(
+                    'No attenuator backend configured: set '
+                    'rf_frontend.attenuator.backend (and, for i2c, '
+                    'rf_frontend.mixerless_module.connected: true).'
+                )
+            if (self._attenuator_backend == 'i2c'
+                    and not (self.config.get('rf_frontend', {})
+                             .get('mixerless_module') or {}).get('connected')):
+                raise RuntimeError(
+                    "attenuator.backend is 'i2c' but "
+                    'rf_frontend.mixerless_module.connected is not true.'
+                )
             raise RuntimeError(
                 'Attenuator not initialised — check server logs for hardware errors.'
             )
