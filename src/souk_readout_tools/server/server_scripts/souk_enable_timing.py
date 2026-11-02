@@ -27,7 +27,21 @@ def main():
             "grandmaster serving the ARB timescale (ptpTimescale 0)."
         ),
     )
+    parser.add_argument(
+        "--ptp-lock-threshold-us",
+        type=float,
+        default=None,
+        help=(
+            "Largest |PTP master offset|, in microseconds, that the timing monitor "
+            "counts as a good lock; a timed sync needs 5 good polls in a row. "
+            "Default: the monitor's own 1 us. A lab grandmaster through an ordinary "
+            "switch can sit near 1 us RMS; 20 is still 20x under one 2500 Hz sample. "
+            "Without this flag a previous setting is removed, unless --preserve-config."
+        ),
+    )
     args = parser.parse_args()
+    if args.ptp_lock_threshold_us is not None and not args.ptp_lock_threshold_us > 0:
+        parser.error("--ptp-lock-threshold-us must be positive")
 
     try:
         from souk_readout_tools.server.readout_server import ensure_pipeline_dirs
@@ -39,6 +53,8 @@ def main():
     cmd.extend(["--phc-offset", str(args.phc_offset)])
     if args.preserve_config:
         cmd.append("--preserve-config")
+    if args.ptp_lock_threshold_us is not None:
+        cmd.extend(["--ptp-lock-threshold-us", str(args.ptp_lock_threshold_us)])
     sys.exit(subprocess.call(cmd))
 
 

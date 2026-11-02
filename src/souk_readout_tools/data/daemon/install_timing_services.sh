@@ -6,6 +6,7 @@
 #   sudo ./install_timing_services.sh                    # install configs and services
 #   sudo ./install_timing_services.sh --phc-offset=0     # ARB-timescale GM only
 #   sudo ./install_timing_services.sh --preserve-config  # update services only
+#   sudo ./install_timing_services.sh --ptp-lock-threshold-us 20  # relaxed PTP lock gate
 
 set -e
 
@@ -14,6 +15,8 @@ TIMING_DIR="${BASE_DIR}/timing"
 SERVICE_DIR="/etc/systemd/system"
 PRESERVE_CONFIG=0
 PHC_OFFSET=-37
+PTP_LOCK_THRESHOLD_US=""
+USAGE="Usage: sudo $0 [--phc-offset SECONDS] [--ptp-lock-threshold-us US] [--preserve-config]"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -33,22 +36,42 @@ while [[ $# -gt 0 ]]; do
             PHC_OFFSET="${1#*=}"
             shift
             ;;
+        --ptp-lock-threshold-us)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: $1 requires a value in microseconds"
+                exit 1
+            fi
+            PTP_LOCK_THRESHOLD_US="$2"
+            shift 2
+            ;;
+        --ptp-lock-threshold-us=*)
+            PTP_LOCK_THRESHOLD_US="${1#*=}"
+            shift
+            ;;
         --help|-h)
-            echo "Usage: sudo $0 [--phc-offset SECONDS] [--preserve-config]"
+            echo "$USAGE"
             echo "  Default: install packaged /etc timing config files and service units."
             echo "  Existing files are backed up before replacement."
             echo "  --phc-offset, --offset: chrony PHC refclock offset in seconds."
             echo "    Default is -37 (PHC on TAI). Use 0 only for an ARB-timescale GM (ptpTimescale 0)."
+            echo "  --ptp-lock-threshold-us: largest |PTP master offset| the timing monitor counts"
+            echo "    as a good lock. Default: the monitor's 1 us. Without it a previous setting"
+            echo "    is removed, unless --preserve-config."
             echo "  --preserve-config: keep existing /etc timing config files and update service units only."
             exit 0
             ;;
         *)
             echo "Error: unknown argument '$1'"
-            echo "Usage: sudo $0 [--phc-offset SECONDS] [--preserve-config]"
+            echo "$USAGE"
             exit 1
             ;;
     esac
 done
+
+if [[ -n "$PTP_LOCK_THRESHOLD_US" ]] && ! [[ "$PTP_LOCK_THRESHOLD_US" =~ ^[0-9]*[.]?[0-9]+$ && "$PTP_LOCK_THRESHOLD_US" =~ [1-9] ]]; then
+    echo "Error: --ptp-lock-threshold-us must be a positive number, got '$PTP_LOCK_THRESHOLD_US'"
+    exit 1
+fi
 
 if [[ "$EUID" -ne 0 ]]; then
     echo "Error: This script must be run as root."
@@ -147,6 +170,23 @@ install_service "${BASE_DIR}/daemon/ptp4l.service" "${SERVICE_DIR}/ptp4l.service
 # PHC, reject it as a falseticker and stay on NTP (see the file's comments).
 install_service "${TIMING_DIR}/10-wait-for-ptp4l.conf" "${SERVICE_DIR}/chrony.service.d/10-wait-for-ptp4l.conf" 644
 install_service "${BASE_DIR}/daemon/timing-monitor.service" "${SERVICE_DIR}/timing-monitor.service" 644
+
+# The monitor's PTP lock threshold, as a drop-in so the packaged unit stays as
+# it is. It repeats the unit's ExecStart with --ptp-lock-offset-threshold-ns.
+# No flag: back to the monitor's 1 us default, unless --preserve-config.
+THRESHOLD_DROPIN="${SERVICE_DIR}/timing-monitor.service.d/20-ptp-threshold.conf"
+if [[ -n "$PTP_LOCK_THRESHOLD_US" ]]; then
+    threshold_ns=$(awk -v us="$PTP_LOCK_THRESHOLD_US" 'BEGIN { printf "%d", us * 1000 + 0.5 }')
+    exec_start=$(grep -m1 '^ExecStart=' "${BASE_DIR}/daemon/timing-monitor.service")
+    mkdir -p "$(dirname "$THRESHOLD_DROPIN")"
+    printf '# Written by install_timing_services.sh --ptp-lock-threshold-us %s\n[Service]\nExecStart=\n%s --ptp-lock-offset-threshold-ns %s\n' \
+        "$PTP_LOCK_THRESHOLD_US" "$exec_start" "$threshold_ns" > "$THRESHOLD_DROPIN"
+    chmod 644 "$THRESHOLD_DROPIN"
+    echo "Timing monitor PTP lock threshold: ${PTP_LOCK_THRESHOLD_US} us (${THRESHOLD_DROPIN})"
+elif [[ -f "$THRESHOLD_DROPIN" && "$PRESERVE_CONFIG" -eq 0 ]]; then
+    rm "$THRESHOLD_DROPIN"
+    echo "Removed ${THRESHOLD_DROPIN}: timing monitor back to its default PTP lock threshold (1 us)"
+fi
 
 systemctl daemon-reload
 systemctl enable ptp4l.service

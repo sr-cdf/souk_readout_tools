@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**Relaxable PTP lock threshold** (`souk-enable-timing --ptp-lock-threshold-us US`)
+- Writes a `timing-monitor.service.d/20-ptp-threshold.conf` drop-in
+  (`--ptp-lock-offset-threshold-ns`); default stays 1 µs, and a run without the
+  flag removes it unless `--preserve-config`. For lab grandmasters near 1 µs
+  RMS, where sync readiness otherwise flaps. See `doc/timing.md`.
+
 **`souk-find-boards` no longer labels the ARM console `bmc`**
 - `_probe_role` needs a `KRM-...` reply to `krm4:2` (or `unknown command`);
   half-printed `login` output (e.g. `'Login t�'`) now gives `unknown`,

@@ -141,6 +141,23 @@ config files:
 souk-enable-timing --preserve-config
 ```
 
+The timing monitor counts a PTP poll as good when |master offset| is under
+1 µs, and a timed sync needs 5 good polls in a row. A lab grandmaster (a
+desktop through an ordinary switch) can sit near 1 µs RMS, so readiness flaps
+every few minutes and `set_telescope_time` / `timed_sync_arm` get refused. Where
+microseconds don't matter, relax it (20 µs is still 20× under one 2500 Hz
+sample):
+
+```bash
+souk-enable-timing --preserve-config --ptp-lock-threshold-us 20
+```
+
+This writes `/etc/systemd/system/timing-monitor.service.d/20-ptp-threshold.conf`,
+which adds `--ptp-lock-offset-threshold-ns` to the monitor's command line; the
+packaged unit is unchanged. A later `souk-enable-timing` without the flag
+removes it (back to 1 µs) unless `--preserve-config` is given. Check the value
+in force with `client.get_timing_status()['ptp_lock_offset_threshold_ns']`.
+
 ## Standalone Laptop Monitoring
 
 The timing monitor can also be used as a standalone PTP/NTP status tool on a
@@ -877,9 +894,13 @@ Important unit settings:
 - `--phc-offset SECONDS`, `--offset SECONDS`: set the chrony PHC refclock offset
   while installing config. Default is `-37` (the PHC runs on TAI). Use
   `--offset=0` only for a GM serving the ARB timescale (`ptpTimescale 0`).
-- `--preserve-config`: keep existing `/etc/linuxptp/ptp4l.conf` and
-  `/etc/chrony/conf.d/ptp-phc.conf`, but update service units and restart
-  services.
+- `--ptp-lock-threshold-us US`: the timing monitor's PTP lock threshold, written
+  as a `timing-monitor.service.d/20-ptp-threshold.conf` drop-in. Default: the
+  monitor's 1 µs; without the flag an existing drop-in is removed, unless
+  `--preserve-config`.
+- `--preserve-config`: keep existing `/etc/linuxptp/ptp4l.conf`,
+  `/etc/chrony/conf.d/ptp-phc.conf` and any lock-threshold drop-in, but update
+  service units and restart services.
 
 The underlying root script is:
 
@@ -891,6 +912,7 @@ Script arguments are the same:
 
 - `--phc-offset SECONDS`
 - `--offset SECONDS`
+- `--ptp-lock-threshold-us US`
 - `--preserve-config`
 - `--help`
 
