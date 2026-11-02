@@ -4497,14 +4497,57 @@ def _rf_to_digital_baseband(r, config_dict, tone_frequencies):
 # Intermodulation and clipping products then fall on multiples of the
 # accumulation rate, where the accumulator nulls them, and the comb has one
 # fixed crest factor instead of a peak that keeps growing with time watched.
-# Applied by the tone preparers and the server's modulation setup; sweeps are
-# not snapped (their steps are finer than the grid). Switch: firmware
-# defaults ``snap_tones_to_acc_grid`` (default True).
+# Applied by the tone preparers and the server's modulation setup. Switch:
+# firmware defaults ``snap_tones_to_acc_grid`` (default True). Sweeps are only
+# snapped on request (``snap_sweeps_to_acc_grid``, default False), because
+# their steps can be finer than the grid; see :func:`sweep_frequencies`.
 # ---------------------------------------------------------------------------
 
 def snap_tones_enabled(config_dict):
     """The ``snap_tones_to_acc_grid`` switch (firmware defaults, default True)."""
     return bool(config_dict['firmware']['defaults'].get('snap_tones_to_acc_grid', True))
+
+
+def snap_sweeps_enabled(config_dict):
+    """The ``snap_sweeps_to_acc_grid`` switch (firmware defaults, default False)."""
+    return bool(config_dict['firmware']['defaults'].get('snap_sweeps_to_acc_grid', False))
+
+
+def sweep_frequencies(r, config_dict, centers, spans, points, direction='up', snap=None):
+    """
+    Sweep frequencies, shape (num_tones, points): ``points`` evenly spaced
+    frequencies across each tone's span, reversed for ``direction='down'``.
+
+    Snapped (``snap=True``, or ``snap=None`` with ``snap_sweeps_to_acc_grid``
+    on), each centre goes through :func:`snap_to_acc_grid` and each step is
+    rounded to a whole number of grid steps, at least one, so every point is
+    on the grid and every point's comb repeats each accumulation. A tone's
+    span is then (points - 1) x its rounded step: close to the request when
+    the step is several grid steps, wider when it was under one. With an even
+    number of points the extra point is on the high side of the centre.
+
+    Returns ``(frequencies, grid_hz)``; ``grid_hz`` is None when not snapped.
+    """
+    centers = np.atleast_1d(np.asarray(centers, dtype=float))
+    spans = np.atleast_1d(np.asarray(spans, dtype=float))
+    num_points = int(points)
+    grid_hz = None
+    if snap or (snap is None and snap_sweeps_enabled(config_dict)):
+        grid_hz = acc_grid_hz(r)
+    if grid_hz:
+        steps = np.maximum(1, np.round(spans / max(num_points - 1, 1) / grid_hz)) * grid_hz
+        widened = steps * (num_points - 1) > 1.5 * spans
+        if np.any(widened):
+            print(f'sweep snapped to the {grid_hz:.2f} Hz grid: {int(np.sum(widened))} tone(s) '
+                  f'step under a grid step, span widened to {(num_points - 1) * grid_hz:.0f} Hz')
+        j = np.arange(num_points) - (num_points - 1) // 2
+        freqs = snap_to_acc_grid(r, config_dict, centers, grid_hz=grid_hz)[:, None] + steps[:, None] * j
+    else:
+        freqs = np.array([np.linspace(cf - sp / 2., cf + sp / 2., num_points)
+                          for cf, sp in zip(centers, spans)]).reshape(len(centers), num_points)
+    if direction == 'down':
+        freqs = freqs[:, ::-1]
+    return freqs, grid_hz
 
 
 def acc_grid_hz(r):
@@ -11475,7 +11518,7 @@ def read_accumulated_data_fast(fast_read_params, num_tones=None, tone_indices=No
 def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_point,
                   direction, autosync=False, setup_sync=True, mrst=False,
                   setup_mrst=False, settle_accumulations=4,
-                  chanmap_settle_accumulations=4):
+                  chanmap_settle_accumulations=4, snap=None):
     """
     A blocking call to perform a frequency sweep of the RFSOC.
     An asynchronous version of this function is available in the readout_server code.
@@ -11486,6 +11529,8 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
     ``chanmap_settle_accumulations`` controls how many accumulations are waited
     immediately after a PSB/PFB channel-map update, before the new mixer control
     buffer is written and made active.
+    ``snap`` puts every point on the accumulation-rate grid (see
+    :func:`sweep_frequencies`); None follows ``snap_sweeps_to_acc_grid``.
 
     """
     centers = np.atleast_1d(centers)
@@ -11505,13 +11550,8 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
 
     num_tones = len(centers)
     channels = np.arange(num_tones,dtype=int)
-    sweepfreqs = np.zeros((num_tones,num_points),dtype=float)
-    for t in range(num_tones):
-        cf=centers[t]
-        sp=spans[t]
-        sweepfreqs[t] = np.linspace(cf-sp/2.,cf+sp/2.,num_points)
-        if direction=='down':
-            sweepfreqs[t] = sweepfreqs[t][::-1]
+    sweepfreqs, sweep_grid_hz = sweep_frequencies(
+        r_fast, config_dict, centers, spans, num_points, direction, snap=snap)
 
     acc_counts = np.zeros((num_points,samples_per_point),dtype=int)
     sweep_data = np.zeros((num_tones,num_points,samples_per_point),dtype=complex)
@@ -11588,7 +11628,8 @@ def perform_sweep(r, r_fast, config_dict, centers, spans, points, samples_per_po
         'chanmap_settle_accumulations': chanmap_settle_accumulations,
         'samples_per_second': get_sample_rate(r_fast),
         'accumulation_counts': acc_counts,
-        'accumulation_errors': acc_errs
+        'accumulation_errors': acc_errs,
+        'acc_grid_hz': sweep_grid_hz
         }
     return results
 
@@ -11596,7 +11637,7 @@ def perform_retune(r, r_fast,config_dict, centers, spans, points,
                    samples_per_point, direction, method, smooth_len=3,
                    freq_offsets=None, autosync=False, setup_sync=True, mrst=False,
                    setup_mrst=False, settle_accumulations=4,
-                   chanmap_settle_accumulations=4):
+                   chanmap_settle_accumulations=4, snap=None):
     """
     A blocking call to perform a frequency retune of the RFSOC.
     SImply performs a sweep and then retunes to the frequencies of maximum gradient or minimum magnitude.
@@ -11604,7 +11645,7 @@ def perform_retune(r, r_fast,config_dict, centers, spans, points,
     if freq_offsets is given, it is added to the retune frequencies before setting them.
     ``autosync`` / ``setup_sync`` are forwarded to :func:`perform_sweep`.
     ``settle_accumulations`` is forwarded to :func:`perform_sweep`.
-    ``chanmap_settle_accumulations`` is forwarded to :func:`perform_sweep`.
+    ``chanmap_settle_accumulations`` and ``snap`` are forwarded to :func:`perform_sweep`.
     """
     if freq_offsets is None:
         freq_offsets = np.zeros_like(centers)
@@ -11620,7 +11661,7 @@ def perform_retune(r, r_fast,config_dict, centers, spans, points,
         r, r_fast, config_dict, centers, spans, points, samples_per_point,
         direction, autosync=autosync, setup_sync=setup_sync, mrst=mrst,
         setup_mrst=setup_mrst, settle_accumulations=settle_accumulations,
-        chanmap_settle_accumulations=chanmap_settle_accumulations)
+        chanmap_settle_accumulations=chanmap_settle_accumulations, snap=snap)
 
     if method == 'max_gradient':
         retune_freqs = np.zeros_like(results['sweep_frequencies'])

@@ -152,12 +152,12 @@ def _format_request_log(message):
         'batch_dac_snapshots': ('num_snapshots',),
         'sweep': ('centers', 'spans', 'points', 'samples_per_point',
                   'settle_accumulations', 'chanmap_settle_accumulations',
-                  'direction', 'autosync', 'setup_sync', 'mrst', 'setup_mrst'),
+                  'direction', 'autosync', 'setup_sync', 'mrst', 'setup_mrst', 'snap'),
         'retune': (
             'centers', 'spans', 'points', 'samples_per_point',
             'settle_accumulations', 'chanmap_settle_accumulations',
             'direction', 'method', 'autosync', 'setup_sync', 'mrst',
-            'setup_mrst'),
+            'setup_mrst', 'snap'),
         'refresh_adc_cal': ('adc_cal_settle_time',),
         'enable_modulation': ('mod_indices', 'samples_per_point', 'n_settle',
                               'buffer_reuse_delay_accs', 'autosync', 'setup_sync',
@@ -4779,6 +4779,7 @@ class ReadoutServer:
                             compensate_filterbank = message.get('compensate_filterbank')
                             if compensate_filterbank is not None:
                                 compensate_filterbank = bool(compensate_filterbank)
+                            snap = message.get('snap')
                             self.latest_sweep_data_valid = False
                             self.sweep_progress = 0.0
                             self.sweep_state = {'state': 'running', 'message': 'Sweep in progress'}
@@ -4791,7 +4792,7 @@ class ReadoutServer:
                                            compensate_rx_ticks=compensate_rx_ticks,
                                            settle_accumulations=settle_accumulations,
                                            chanmap_settle_accumulations=chanmap_settle_accumulations,
-                                           compensate_filterbank=compensate_filterbank)
+                                           compensate_filterbank=compensate_filterbank, snap=snap)
                             )
 
                             #print('await send response')
@@ -4926,6 +4927,7 @@ class ReadoutServer:
                             compensate_filterbank = message.get('compensate_filterbank')
                             if compensate_filterbank is not None:
                                 compensate_filterbank = bool(compensate_filterbank)
+                            snap = message.get('snap')
                             self.latest_sweep_data_valid = False
                             self.sweep_progress = 0.0
                             self.sweep_state = {'state': 'running', 'message': 'Retune in progress'}
@@ -4939,7 +4941,7 @@ class ReadoutServer:
                                             compensate_rx_ticks=compensate_rx_ticks,
                                             settle_accumulations=settle_accumulations,
                                             chanmap_settle_accumulations=chanmap_settle_accumulations,
-                                            compensate_filterbank=compensate_filterbank)
+                                            compensate_filterbank=compensate_filterbank, snap=snap)
                             )
                             await self.send_response(writer, {'status': 'success', 'message': 'Retune in progress'})
                         except Exception as e:
@@ -7844,7 +7846,8 @@ class ReadoutServer:
                     refresh_adc_cal=True, adc_cal_settle_time=2.0,
                     autosync=False, setup_sync=True, mrst=False, setup_mrst=False,
                     compensate_rx_ticks=0, settle_accumulations=4,
-                    chanmap_settle_accumulations=4, compensate_filterbank=None):
+                    chanmap_settle_accumulations=4, compensate_filterbank=None,
+                    snap=None):
         """
         A coroutine that performs a frequency sweep and stores the results in self.latest_sweep_data.
 
@@ -7867,6 +7870,9 @@ class ReadoutServer:
             chanmap_settle_accumulations (int): Number of accumulations to wait
                 after a PSB/PFB channel-map update and before switching the
                 mixer control buffer. Default 0 preserves previous behavior.
+            snap (bool or None): Put every point on the accumulation-rate
+                grid (firmware_lib.sweep_frequencies). None follows the
+                ``snap_sweeps_to_acc_grid`` config switch (default off).
         """
 
         sweep_tone_amplitudes = None
@@ -7915,14 +7921,9 @@ class ReadoutServer:
             print('Preparing sweep')
             num_tones = len(centers) 
             channels = np.arange(num_tones,dtype=int)
-            sweepfreqs = np.zeros((num_points,num_tones),dtype=float)
-            for t in range(num_tones):
-                cf=centers[t]
-                sp=spans[t]
-                if direction == 'up':
-                    sweepfreqs[:,t] = np.linspace(cf-sp/2.,cf+sp/2.,num_points)
-                elif direction=='down':
-                    sweepfreqs[:,t] = np.linspace(cf-sp/2.,cf+sp/2.,num_points)[::-1]
+            sweepfreqs, sweep_grid_hz = firmware_lib.sweep_frequencies(
+                self.r_fast, self.config, centers, spans, num_points, direction, snap=snap)
+            sweepfreqs = np.ascontiguousarray(sweepfreqs.T)   # (num_points, num_tones)
 
             print('Setting initial tone frequencies')
             tone_settings = firmware_lib.set_tone_frequencies_fast(
@@ -8120,6 +8121,7 @@ class ReadoutServer:
                 'chanmap_settle_accumulations': chanmap_settle_accumulations,
                 'samples_per_second': firmware_lib.get_sample_rate(self.r_fast),
                 'direction': direction,
+                'acc_grid_hz': sweep_grid_hz,
                 'accumulation_counts': acc_counts,
                 'accumulation_errors': acc_errs,
                 'telescope_time': sweep_tt,
@@ -8188,7 +8190,8 @@ class ReadoutServer:
                      method, freq_offsets=None, refresh_adc_cal=True,
                      adc_cal_settle_time=2.0, autosync=False, setup_sync=True, mrst=False, setup_mrst=False,
                      compensate_rx_ticks=0, settle_accumulations=4,
-                     chanmap_settle_accumulations=4, compensate_filterbank=None):
+                     chanmap_settle_accumulations=4, compensate_filterbank=None,
+                     snap=None):
         """
         A coroutine that performs a frequency sweep, finds the resonance peaks using the specified method, and sets the tones to the peak frequencies.
 
@@ -8202,6 +8205,7 @@ class ReadoutServer:
             chanmap_settle_accumulations (int): Number of accumulations to wait
                 after a PSB/PFB channel-map update and before switching the
                 mixer control buffer.
+            snap (bool or None): Forwarded to :meth:`sweep`.
         """
 
         center, span = self._expand_sweep_request_for_blind(center, span)
@@ -8242,7 +8246,7 @@ class ReadoutServer:
                 compensate_rx_ticks=compensate_rx_ticks,
                 settle_accumulations=settle_accumulations,
                 chanmap_settle_accumulations=chanmap_settle_accumulations,
-                compensate_filterbank=compensate_filterbank)
+                compensate_filterbank=compensate_filterbank, snap=snap)
             if not sweep_ok:
                 if self.sweep_state.get('state') not in ('cancelled', 'error'):
                     self.sweep_progress = float(1.0)

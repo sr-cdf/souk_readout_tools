@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**Optimised tone phases** (`client.generate_optimised_phases()`)
+- `tone_list_tools.optimise_tone_phases`, `comb_crest_factor`: L_p-minimax
+  phases over one period of a snapped comb, run on the client from the live
+  TX baseband frequencies, amplitudes and grid; ~4 s at 2500 Hz. 6a: DAC peak
+  2.50 x rms vs 3.44 Newman.
+- `optimise_phases=True` on `set_tone_powers`, `maximise_tx_power`,
+  `optimise_tx_snr` (drive sized with Newman phases, then switched, synced)
+  and `perform_retune(wait=True)`. The drive is sized first because sweeps
+  peak at ~4 x rms whatever the phases. See `doc/tone_power_notes.md`.
+
 **Power sweeps can capture noise at every power** (`run_power_sweep(noise_seconds=...)`, default off)
 - After each step's sweeps, tones retune to that sweep's steepest phase slope
   (as `perform_retune(method='max_dphidf')`) and a timestream is saved as
@@ -12,7 +22,10 @@
 **Tones snap to the accumulation-rate grid** (`snap_tones_to_acc_grid`, default on)
 - Parked comb, modulation centres/offsets and tracking moves sit on whole
   multiples of 600 kHz / acc_len: intermodulation falls in the accumulator
-  nulls and the comb has a fixed crest factor. Sweeps are not snapped.
+  nulls and the comb has a fixed crest factor.
+- Sweeps only on request: `snap_sweeps_to_acc_grid` (default off), `snap=` on
+  `perform_sweep` / `perform_retune`; `firmware_lib.sweep_frequencies` rounds
+  each tone's step to whole grid steps; results gain `acc_grid_hz`.
 - `firmware_lib.snap_to_acc_grid`, `acc_grid_hz`; `snap=` on the tone
   preparers and `client.set_tone_frequencies` (per-call A/B override);
   `get_info('tones')` gains `acc_grid_hz`, `off_grid_hz`. Changing acc_len

@@ -30,7 +30,7 @@ accumulation.
 | Parked comb: `set_tone_frequencies`, the tone plan at start-up, config push, blind tones, the restore after a sweep or power sweep | `firmware_lib.prepare_tone_frequency_settings_fast` (and the katcp `prepare_tone_frequency_settings`) |
 | Modulation centres and offsets, firmware-slot and software engines | the server's modulation setup (`_snap_modulation_comb`) |
 | Tracking commits | the same modulation setup; the tracker moves in whole grid steps, and only once the move exceeds 0.6 of a step |
-| Sweeps | not snapped: their steps are finer than the grid |
+| Sweeps | off by default (`snap_sweeps_to_acc_grid`); when on, `firmware_lib.sweep_frequencies` |
 
 - A tone moves by at most half a grid step: 1250 Hz at 2500 Hz, 0.007
   linewidths median on 6a. Two tones landing on one grid point are moved to the
@@ -46,7 +46,27 @@ accumulation.
   2^k, i.e. a power-of-two acc_len (256, 512, ...). At other acc_len (240) a
   tone sits up to 1e-4 Hz off the grid. That doesn't matter for
   intermodulation (the products move by under a millihertz), but an optimised
-  crest factor drifts away over about 10 minutes.
+  crest factor (`generate_optimised_phases`) loses most of its gain within
+  half an hour.
+
+## Sweeps
+
+Sweep steps are often finer than the grid (at 401 points over 10 linewidths,
+over half the 6a tones step less than 2.5 kHz), so sweeps are not snapped
+unless asked. Snapped, each tone's centre goes on the grid and its step is
+rounded to a whole number of grid steps, at least one. The span is then
+(points - 1) x that step: within about a third of the request when the step
+was over a grid step, wider when it was under (the server prints how many
+tones widened by more than half). `sweep_frequencies` in the results are the points actually
+played, and `acc_grid_hz` says whether the sweep was snapped (None if not).
+
+What it buys: every sweep point repeats each accumulation, so the sweep's DAC
+peak is a fixed, calculable number. On 6a (10-linewidth spans, 201 points)
+the worst point is about 4.0 x rms, against 4.4 for the same sweep unsnapped,
+whatever the phases. It does not bring sweeps down to the parked comb's
+optimised crest factor, and the intermodulation that lands exactly on a tone
+changes from point to point, so it is a fixed error per point rather than
+noise that averages down.
 
 ## Turning it off
 
@@ -61,3 +81,12 @@ firmware:
 Push the config to change it. For a single call, e.g. an unsnapped A/B
 comparison, `client.set_tone_frequencies(freqs, snap=False)` (or `True`)
 overrides the switch; the `firmware_lib` tone functions take the same `snap=`.
+
+Sweeps have their own switch, off by default, and the same per-call
+override on `perform_sweep` and `perform_retune`:
+
+```yaml
+firmware:
+  defaults:
+    snap_sweeps_to_acc_grid: false   # true: sweep points on the grid too
+```

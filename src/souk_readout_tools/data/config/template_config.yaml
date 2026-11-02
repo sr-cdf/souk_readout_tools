@@ -101,8 +101,13 @@ firmware:
     # Move every tone (parked comb, modulation centres and offsets, tracking
     # moves) to a whole multiple of the accumulation rate, so intermodulation
     # lands in the accumulator nulls and the comb has a fixed crest factor
-    # (doc/tone_frequency_snapping.md). Sweeps are never snapped.
+    # (doc/tone_frequency_snapping.md).
     snap_tones_to_acc_grid: true
+    # Snap sweep points too: centres on the grid, each tone's step rounded to
+    # whole grid steps (at least one), so spans change slightly and steps
+    # finer than the grid widen. Off: sweep points are exactly as requested.
+    # perform_sweep / perform_retune snap= overrides it per call.
+    snap_sweeps_to_acc_grid: false
     # filterbank_group_delay_override_ns: 0  # TESTING/LOOPBACK ONLY: overrides
     #   the path_group_delay_ns calibration for the compensation phase term
     #   (e.g. force 0 for an amplitude-only A/B in loopback). Leave unset for

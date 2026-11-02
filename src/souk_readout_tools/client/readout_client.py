@@ -1882,8 +1882,8 @@ class ReadoutClient:
                 "This produces the worst-case crest factor because every tone's "
                 "cosine waveform peaks at the same instant, causing maximum coherent "
                 "addition and risking DAC saturation / clipping.\n"
-                "Consider calling set_tone_phases() with generate_newman_phases(freqs) "
-                "or generate_random_phases(freqs) before proceeding.",
+                "Consider calling set_tone_phases() with generate_newman_phases(freqs), "
+                "generate_random_phases(freqs) or generate_optimised_phases() before proceeding.",
                 stacklevel=3
             )
 
@@ -2098,7 +2098,8 @@ class ReadoutClient:
                         headroom_db=None, dac_saturation_threshold=None,
                         filterbank_headroom_db=None,
                         adc_headroom_db=None,
-                        verbose=True, autosync=False, mrst=False, *,
+                        verbose=True, autosync=False, mrst=False,
+                        optimise_phases=False, *,
                         force_tx_amp_bypass=None,
                         force_rx_amp_bypass=None,
                         force_tx_attenuation_db=None,
@@ -2160,6 +2161,12 @@ class ReadoutClient:
             and errors are still printed.
         autosync : bool
             If True, trigger a firmware sync (default False now under v7.10) after tone-amplitude writes.
+        optimise_phases : bool, optional
+            If True, size the drive with Newman phases, then switch to
+            optimised phases (:py:meth:`generate_optimised_phases`, ~4 s,
+            written with a sync). The gain is margin on the parked comb, not
+            more drive: a sweep at this drive still peaks like the Newman
+            comb. Default False.
         force_tx_amp_bypass, force_rx_amp_bypass : bool or None, optional
             Pin the TX/RX amplifier bypass state instead of letting the
             optimiser choose it.
@@ -2221,10 +2228,14 @@ class ReadoutClient:
             force_psb_scale=force_psb_scale,
             force_pfb_fftshift=force_pfb_fftshift,
             force_pfb_shift=force_pfb_shift)
+        if optimise_phases:
+            self._phases_for_drive_sizing()
         response = self.send_request(message)
         if response.get('status') != 'success':
             print(f"Error setting tone powers: {response.get('message')}")
             return response
+        if optimise_phases:
+            self._apply_optimised_phases(response)
         if response.get('result'):
             r = response['result']
             for w in r.get('warnings', []):
@@ -2316,7 +2327,7 @@ class ReadoutClient:
                           filterbank_headroom_db=None, adc_headroom_db=None,
                           atten_step_db=None,
                           rx_policy='protect', digital_only=False, rf_only=False,
-                          compression_check=None,
+                          compression_check=None, optimise_phases=False,
                           *, force_tx_amp_bypass=None,
                           force_rx_amp_bypass=None,
                           force_tx_attenuation_db=None,
@@ -2393,6 +2404,12 @@ class ReadoutClient:
             side under ``rx_policy='maximise'``.  It never limits TX power on
             its own -- that is ``compression_headroom_db``.  Set False to
             ignore compression entirely.
+        optimise_phases : bool, optional
+            If True, size the drive with Newman phases, then switch to
+            optimised phases (:py:meth:`generate_optimised_phases`, ~4 s,
+            written with a sync). The gain is margin on the parked comb, not
+            more drive: a sweep at this drive still peaks like the Newman
+            comb. Default False.
         force_tx_amp_bypass, force_rx_amp_bypass, force_tx_attenuation_db, force_rx_attenuation_db, force_adc_dsa_db, force_tone_amplitudes, force_tone_amplitude, force_psb_fftshift, force_psb_shift, force_psb_scale, force_pfb_fftshift, force_pfb_shift : optional
             Pin individual power-chain controls instead of optimising them; see
             :py:meth:`set_tone_powers` for the full description of each.
@@ -2426,6 +2443,9 @@ class ReadoutClient:
             msg['power_limit_dbm'] = power_limit_dbm
         if compression_headroom_db is not None:
             msg['compression_headroom_db'] = compression_headroom_db
+        if optimise_phases:
+            self._phases_for_drive_sizing()
+            return self._apply_optimised_phases(self.send_request(msg))
         return self.send_request(msg)
 
     def maximise_rx_power(self, headroom_db=None, digital_only=False, rf_only=False,
@@ -2517,7 +2537,7 @@ class ReadoutClient:
 
     def optimise_tx_snr(self, reference_plane='detector', headroom_db=None,
                         filterbank_headroom_db=None,
-                        digital_only=False, rf_only=False, *,
+                        digital_only=False, rf_only=False, optimise_phases=False, *,
                         force_tx_amp_bypass=None,
                         force_rx_amp_bypass=None,
                         force_tx_attenuation_db=None,
@@ -2546,6 +2566,12 @@ class ReadoutClient:
             If True, only firmware/RFDC parameters are adjusted.
         rf_only : bool, optional
             If True, only RF frontend attenuators and bypass amps are adjusted.
+        optimise_phases : bool, optional
+            If True, size the drive with Newman phases, then switch to
+            optimised phases (:py:meth:`generate_optimised_phases`, ~4 s,
+            written with a sync). The gain is margin on the parked comb, not
+            more drive: a sweep at this drive still peaks like the Newman
+            comb. Default False.
         force_tx_amp_bypass, force_rx_amp_bypass, force_tx_attenuation_db, force_rx_attenuation_db, force_adc_dsa_db, force_tone_amplitudes, force_tone_amplitude, force_psb_fftshift, force_psb_shift, force_psb_scale, force_pfb_fftshift, force_pfb_shift : optional
             Pin individual power-chain controls instead of optimising them; see
             :py:meth:`set_tone_powers` for the full description of each.
@@ -2572,6 +2598,9 @@ class ReadoutClient:
             force_psb_scale=force_psb_scale,
             force_pfb_fftshift=force_pfb_fftshift,
             force_pfb_shift=force_pfb_shift)
+        if optimise_phases:
+            self._phases_for_drive_sizing()
+            return self._apply_optimised_phases(self.send_request(msg))
         return self.send_request(msg)
 
     def optimise_rx_snr(self, headroom_db=None, digital_only=False, rf_only=False,
@@ -5279,7 +5308,7 @@ class ReadoutClient:
                       setup_sync=True, mrst=False, setup_mrst=False,
                       compensate_rx_ticks=0, settle_accumulations=4,
                       chanmap_settle_accumulations=4, clip_spans=True,
-                      compensate_filterbank=None):
+                      compensate_filterbank=None, snap=None):
         """
         Perform a frequency sweep.
 
@@ -5333,6 +5362,13 @@ class ReadoutClient:
                 (``filterbank_compensation``, default on); ``False`` disables
                 it for this sweep (raw channel response, no readout_correction
                 shipped with the results); ``True`` forces it on.
+            snap (bool or None): Put every sweep point on the
+                accumulation-rate grid: centres snapped, each tone's step
+                rounded to whole grid steps (at least one), so spans change
+                a little and steps under a grid step widen. ``None``
+                (default) follows the server config
+                (``snap_sweeps_to_acc_grid``, default off). See
+                ``doc/tone_frequency_snapping.md``.
         """
         centers=np.atleast_1d(centers)
         spans=np.atleast_1d(spans)
@@ -5372,6 +5408,8 @@ class ReadoutClient:
         }
         if compensate_filterbank is not None:
             message['compensate_filterbank'] = bool(compensate_filterbank)
+        if snap is not None:
+            message['snap'] = bool(snap)
         response = self.send_request(message)
         if wait:
             print(response)
@@ -5386,7 +5424,7 @@ class ReadoutClient:
                        setup_sync=True, mrst=False, setup_mrst=False,
                        compensate_rx_ticks=0, settle_accumulations=4,
                        chanmap_settle_accumulations=4, clip_spans=True,
-                       compensate_filterbank=None):
+                       compensate_filterbank=None, snap=None, optimise_phases=False):
         """
         Perform a retune sweep to find optimal tone frequencies.
 
@@ -5436,7 +5474,16 @@ class ReadoutClient:
                 filterbank rolloff compensation for the underlying sweep.
                 ``None`` (default) follows the server config; ``False``
                 disables it for this retune; ``True`` forces it on.
+            snap (bool or None): Snap the underlying sweep's points to the
+                accumulation-rate grid, as in ``perform_sweep``. ``None``
+                (default) follows the server config.
+            optimise_phases (bool): If True, switch to optimised phases once
+                the retune has set the tones (``generate_optimised_phases``,
+                ~4 s, written with a sync). Needs ``wait=True``. Default False.
         """
+        if optimise_phases and not wait:
+            raise ValueError('optimise_phases needs wait=True: the phases are '
+                             'optimised once the retune has set the tones')
         centers=np.atleast_1d(centers)
         spans=np.atleast_1d(spans)
         _check_center_separation(centers)
@@ -5494,11 +5541,15 @@ class ReadoutClient:
         }
         if compensate_filterbank is not None:
             message['compensate_filterbank'] = bool(compensate_filterbank)
+        if snap is not None:
+            message['snap'] = bool(snap)
         response = self.send_request(message)
         if wait:
             print(response)
             if response.get('status') == 'success':
-                return self.wait_for_sweep(completion_message='Retune complete')
+                response = self.wait_for_sweep(completion_message='Retune complete')
+                if optimise_phases:
+                    self._apply_optimised_phases(response)
         return response
 
     def get_sweep_progress(self):
@@ -7050,6 +7101,91 @@ class ReadoutClient:
         phases_sorted = np.pi * k**2 / n
         # Return phases in the original order
         return phases_sorted[inv_sort_idx]
+
+    def generate_optimised_phases(self, initial_phases=None, max_evaluations=42,
+                                  target='iq', detailed_output=False):
+        """
+        Phases (radians) that minimise the DAC peak of the comb now on the board.
+
+        Unlike ``generate_newman_phases`` this needs the comb as the DAC plays
+        it, so it reads it from the board instead of taking a frequency list:
+        each tone's TX digital-baseband frequency, the TX scaling words (the
+        amplitudes including filterbank compensation) and the sample rate
+        (the tone grid). The optimisation itself runs here on the client
+        (``tone_list_tools.optimise_tone_phases``), about 4 s at 2500 Hz. It
+        only pays on a comb snapped to the grid (the default); a warning says
+        when the tones are off it.
+
+        Write the result with ``set_tone_phases(phases, autosync=True)``: the
+        sync restarts every tone's LO from its written phase, which is what the
+        optimisation assumes (still to be confirmed on hardware). A later
+        frequency change without a sync (a sweep, which restores the tones
+        unsynced; a tracking commit) leaves each LO wherever it went, so the
+        comb is lost until the next sync. If the tones are back where they
+        were, ``set_tone_phases(get_tone_phases(), autosync=True)`` restores it.
+
+        Size the drive (``set_tone_powers``, ``maximise_tx_power``) before
+        switching to optimised phases, not after. The power functions size it
+        from the measured DAC peak, and a sweep plays a different comb at every
+        point, peaking at ~4x rms whatever the phases; sized on the optimised
+        comb (~2.5x rms), sweeps at that drive would clip. The gain is then
+        margin for the parked comb: fewer clip events, less intermodulation.
+
+        Parameters
+        ----------
+        initial_phases : array_like or 'current', optional
+            Starting phases. Default Newman. ``'current'`` starts from the
+            phases on the board: after a few tones moved, that with
+            ``max_evaluations=10`` recovers most of the gain in ~1.3 s.
+        max_evaluations : int, optional
+            Evaluation budget (default 42).
+        target : {'iq', 'env'}, optional
+            'iq' (default) minimises max(|I|, |Q|), what clips the DAC words;
+            'env' minimises the RF envelope.
+        detailed_output : bool, optional
+            Also return the optimiser's result dict (peak factors before and
+            after, ``gain_db``, timing).
+
+        Returns
+        -------
+        numpy.ndarray, or (numpy.ndarray, dict) with ``detailed_output=True``
+            One phase per tone, in ``get_tone_frequencies()`` order.
+        """
+        import warnings
+        from souk_readout_tools import tone_list_tools
+        details = self.get_tone_frequencies(detailed_output=True)
+        sample_rate = self.get_sample_rate()
+        if isinstance(initial_phases, str) and initial_phases == 'current':
+            initial_phases = self.get_tone_phases()
+        result = tone_list_tools.optimise_tone_phases(
+            details['tx']['digital_baseband_freq'], self.get_tone_amplitudes(), sample_rate,
+            initial_phases=initial_phases, target=target, max_evaluations=max_evaluations)
+        print(f"optimised phases: {target}_factor {result['start_' + target + '_factor']:.2f} -> "
+              f"{result[target + '_factor']:.2f} ({result['gain_db']:.1f} dB) "
+              f"in {result['elapsed_s']:.1f} s")
+        if result['max_off_grid_hz'] > 0.01:
+            warnings.warn(
+                f"tones are up to {result['max_off_grid_hz']:.3g} Hz off the {sample_rate:g} Hz "
+                "grid (snapping off?): the comb never repeats, so optimised phases give "
+                "no lasting gain. See doc/tone_frequency_snapping.md.", stacklevel=2)
+        if detailed_output:
+            return result['phases_rad'], result
+        return result['phases_rad']
+
+    def _phases_for_drive_sizing(self):
+        """``optimise_phases=True``, before a power function sizes the drive:
+        put Newman phases on, so the drive is sized on a comb that peaks like a
+        sweep does, never on an optimised one."""
+        self.set_tone_phases(self.generate_newman_phases(self.get_tone_frequencies()))
+
+    def _apply_optimised_phases(self, response):
+        """``optimise_phases=True``, once ``response`` (the power function or
+        retune) has succeeded: switch to optimised phases, written with a sync."""
+        if response.get('status') == 'success':
+            written = self.set_tone_phases(self.generate_optimised_phases(), autosync=True)
+            if written.get('status') != 'success':
+                print(f"Error setting optimised phases: {written.get('message')}")
+        return response
 
     @staticmethod
     def suggest_blind_frequencies(resonance_frequencies, count, band_hz,

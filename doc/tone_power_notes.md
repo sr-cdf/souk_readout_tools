@@ -73,6 +73,43 @@ phases = client.generate_newman_phases(freqs)
 client.set_tone_phases(phases)
 ```
 
+Optimised phases do better on a comb snapped to the accumulation-rate grid
+(the default, see [Tone Frequency Snapping](tone_frequency_snapping.md)): on
+the 6a comb the DAC peak drops from 3.44 to 2.50 x rms, 2.8 dB. The optimiser
+runs on the client, about 4 s at 2500 Hz, on the comb as the board plays it:
+
+```python
+client.set_tone_powers(powers_dbm)                 # size the drive first
+phases = client.generate_optimised_phases()
+client.set_tone_phases(phases, autosync=True)      # the sync starts each LO at its phase
+```
+
+Size the drive before switching to optimised phases. A sweep plays a
+different comb at every point and peaks at ~4 x rms whatever the phases, so a
+drive sized on the optimised comb would make sweeps at that drive clip. The
+gain is margin for the parked comb (fewer clip events, less
+intermodulation), not more drive. `optimise_phases=True` on
+`set_tone_powers`, `maximise_tx_power` and `optimise_tx_snr` does both steps
+in that order: it sizes the drive with Newman phases, then switches.
+`perform_retune(..., wait=True, optimise_phases=True)` switches once the
+retune has set the tones. `power_sweep` has no such option: it only sweeps.
+
+Re-optimise after the tones move: a retune that moves 3% of them loses most
+of the gain, and `generate_optimised_phases('current', max_evaluations=10)`
+recovers it in ~1.3 s. A common power step changes nothing. Any frequency
+change without a sync, including the unsynced restore at the end of a sweep,
+leaves the LOs where it took them; with the tones back in place,
+`client.set_tone_phases(client.get_tone_phases(), autosync=True)` restores
+the comb. Offline, the same tools take plain arrays or a recorded
+`info['tones']`:
+
+```python
+from souk_readout_tools.tone_list_tools import optimise_tone_phases, comb_crest_factor
+
+r = optimise_tone_phases(info['tones'])   # TX baseband freqs, amplitudes and grid from the record
+comb_crest_factor(info['tones'], phases_rad=r['phases_rad'])['iq_factor']
+```
+
 For an offline estimate of peak-to-average power ratio (PAPR):
 
 ```python
