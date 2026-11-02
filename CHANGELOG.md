@@ -9,8 +9,9 @@
   2.50 x rms vs 3.44 Newman.
 - `optimise_phases=True` on `set_tone_powers`, `maximise_tx_power`,
   `optimise_tx_snr` (drive sized with Newman phases, then switched, synced)
-  and `perform_retune(wait=True)`. The drive is sized first because sweeps
-  peak at ~4 x rms whatever the phases. See `doc/tone_power_notes.md`.
+  and `perform_retune(wait=True)`; `run_power_sweep(optimise_noise_phases=True)`
+  before each noise capture. The drive is sized first because sweeps peak at
+  ~4 x rms whatever the phases. See `doc/tone_power_notes.md`.
 
 **Power sweeps can capture noise at every power** (`run_power_sweep(noise_seconds=...)`, default off)
 - After each step's sweeps, tones retune to that sweep's steepest phase slope

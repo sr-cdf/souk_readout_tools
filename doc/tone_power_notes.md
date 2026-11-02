@@ -92,7 +92,8 @@ intermodulation), not more drive. `optimise_phases=True` on
 `set_tone_powers`, `maximise_tx_power` and `optimise_tx_snr` does both steps
 in that order: it sizes the drive with Newman phases, then switches.
 `perform_retune(..., wait=True, optimise_phases=True)` switches once the
-retune has set the tones. `power_sweep` has no such option: it only sweeps.
+retune has set the tones, and `run_power_sweep(noise_seconds=...,
+optimise_noise_phases=True)` before each step's noise capture.
 
 Re-optimise after the tones move: a retune that moves 3% of them loses most
 of the gain, and `generate_optimised_phases('current', max_evaluations=10)`

@@ -167,7 +167,10 @@ slope of that step's sweep and a timestream is saved as
 the calibration and the step's `noise_tone_frequencies_hz` as the tone
 frequencies. Discard steps above each tone's bifurcation power
 (`ps.hysteresis_onset`, from a `direction="both"` run), where the branch a tone lands on is undefined. At 600
-Hz, 380 tones and 10 s this adds about 12 s and 19 MB per step.
+Hz, 380 tones and 10 s this adds about 12 s and 19 MB per step. Add
+`optimise_noise_phases=True` to run each capture on optimised tone phases
+(lower DAC peak, about 4 s more per step; the sweeps and the drive sizing keep
+`phases`, see `doc/tone_power_notes.md`).
 
 Fit the saved sweeps and choose one power per resonator:
 

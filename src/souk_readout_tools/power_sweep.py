@@ -732,6 +732,7 @@ def run_power_sweep(
     capture_system_info=True,
     info_sections="all",
     noise_seconds=0.0,
+    optimise_noise_phases=False,
 ):
     """Step tone power and save each targeted sweep.
 
@@ -913,6 +914,13 @@ def run_power_sweep(
         undefined, so drop those steps using :py:func:`hysteresis_onset`.  A
         failed capture is warned and recorded as ``noise_error`` in the step
         metadata; the step's sweeps are kept.  Default ``0`` (off).
+    optimise_noise_phases : bool, optional
+        If True (with ``noise_seconds``), switch to optimised phases
+        (:py:meth:`ReadoutClient.generate_optimised_phases`, ~4 s, written with
+        a sync) after the retune and before each noise capture, for a lower
+        DAC peak during it.  The sweeps and the drive sizing keep ``phases``.
+        The capture's phases and DAC peak factor are recorded in its artifact
+        metadata (``tone_phases_rad``, ``iq_factor``).  Default False.
 
     Returns
     -------
@@ -1014,6 +1022,7 @@ def run_power_sweep(
             "search_for_center": search_for_center,
             "search_span_factor": search_span_factor,
             "noise_seconds": noise_seconds,
+            "optimise_noise_phases": bool(optimise_noise_phases),
             "tone_count": int(initial_centers.size),
         },
         "metadata": {
@@ -1168,6 +1177,13 @@ def run_power_sweep(
         )
         # Read back: the comb may snap to the accumulation-rate grid.
         tone_freqs = np.asarray(client.get_tone_frequencies(), dtype=float).ravel()
+        phase_record = {}
+        if optimise_noise_phases:
+            phases, result = client.generate_optimised_phases(detailed_output=True)
+            _require_success(client.set_tone_phases(phases, autosync=True),
+                             "set_tone_phases failed")
+            phase_record = {"tone_phases_rad": np.asarray(phases).tolist(),
+                            "iq_factor": result["iq_factor"]}
         num_samples = int(round(float(client.get_sample_rate()) * noise_seconds))
         samples = client.parse_samples(client.get_samples(num_samples))
         rel_path = f"data/step_{index:04d}_noise.npy"
@@ -1186,6 +1202,7 @@ def run_power_sweep(
                 "calibration_sweep": f"step_{index:04d}_sweep",
                 "seconds": noise_seconds,
                 "num_samples": num_samples,
+                **phase_record,
             },
             "created": _timestamp(),
         })
