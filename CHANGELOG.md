@@ -8,6 +8,12 @@
   hung on 1024 -> 1000 (counter frozen ~2 h). Re-snap now writes without the
   wait (`set_tone_frequencies_fast(wait=False)`).
 
+**`client.get_stream(num_samples)`: `get_samples` over the stream port**
+- Same return dict, so `parse_samples` reads it unchanged; read by the stream
+  process on its own core instead of the request process. Turns the stream on
+  and off around the capture unless it is already on, in which case it joins.
+- Not aligned to a modulation cycle; a running tracker is fed while it runs.
+
 **`get_samples` reads late rather than losing an accumulation** (`fast_read_params['catch_up']`)
 - Same late read as the stream loop: a capture held up by less than about a
   period reads the waiting accumulation. Plain and fw-slot captures; the sw

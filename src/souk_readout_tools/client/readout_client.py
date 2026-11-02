@@ -3828,6 +3828,105 @@ class ReadoutClient:
                            'time_anchors':[a for a in time_anchors if a is not None]}
             return sample_data
 
+    def get_stream(self, num_samples, incl_system_info=True, warmup=50, timeout=5.0):
+        """
+        Acquire num_samples samples from the continuous stream, returned in the
+        same form as :meth:`get_samples`, so ``parse_samples`` reads it unchanged.
+
+        Use this for noise captures. ``get_samples`` reads the accumulator in
+        the server's request process, which shares its CPUs with ptp4l, journald
+        and the network interrupts, and loses an accumulation whenever one of
+        them holds it up for too long (about one a minute at 586 Hz on krm4-mcr,
+        2026-11-02). The stream is read by the stream process on its own core.
+
+        If the stream is off it is turned on for the capture and off again
+        afterwards. If it is already on (another client is recording), the
+        capture joins it and leaves it running.
+
+        Unlike ``get_samples``:
+
+        - frames are not aligned to the start of a modulation cycle, so the
+          first cycle can be partial (``modulation.group_cycles`` drops it);
+        - while the stream runs, a running tracker is fed and can commit, which
+          the revision warning below reports.
+
+        Parameters
+        ----------
+        num_samples : int
+            Number of accumulator samples to return.
+        incl_system_info : bool, optional
+            Include ``get_info('all')`` in the returned data (default ``True``).
+        warmup : int, optional
+            Frames received and discarded before the first one returned
+            (default 50, as ``get_samples``).
+        timeout : float, optional
+            Seconds to wait for a frame before giving up (default 5).
+
+        Returns
+        -------
+        dict
+            ``data_raw``, ``sample_rate``, ``info``, ``frame_bytes`` and
+            ``time_anchors``, as ``get_samples``.
+        """
+        if self.mock:
+            return self._mock_server.get_samples(num_samples, incl_system_info)
+
+        self._warn_zero_phases()
+        time_anchors = [self.get_time_anchor()]
+        frames = []
+        enabled_here = False
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((self.stream_server_address, self.stream_server_port))
+            stream = s.makefile('rb', buffering=1 << 20)
+            try:
+                # Connected first, so no frame of the capture is sent before
+                # this client is there to receive it.
+                if not self.get_info('server').get('streaming'):
+                    reply = self.enable_stream()
+                    if reply.get('status') != 'success':
+                        raise RuntimeError(f'enable_stream failed: {reply}')
+                    enabled_here = True
+                t0 = time.time()
+                while len(frames) < warmup + num_samples:
+                    header = stream.read(4)
+                    if len(header) < 4:
+                        raise RuntimeError(
+                            f'stream closed after {max(0, len(frames) - warmup)}/{num_samples} frames')
+                    prefix = struct.unpack('>I', header)[0]
+                    frame_type, datalen = prefix >> 24, prefix & 0xFFFFFF
+                    frame = stream.read(datalen) if datalen else b''
+                    if frame_type or not datalen:
+                        continue        # a typed frame or the idle heartbeat
+                    frames.append(frame)
+                t1 = time.time()
+            finally:
+                if enabled_here:
+                    self.disable_stream()
+                stream.close()
+        frames = frames[warmup:]
+        print(f"Received {len(frames)} stream samples in ~{t1 - t0:.2f} seconds "
+              f"(~{(len(frames) + warmup) / max(t1 - t0, 1e-12):.1f} samples per second)")
+        if len({len(f) for f in frames}) > 1:
+            raise RuntimeError('the tone count changed during this capture')
+        time_anchors.append(self.get_time_anchor())
+        revisions = [a.get('modulation_revision') for a in time_anchors if a]
+        if len(set(revisions)) > 1:
+            import warnings
+            warnings.warn(
+                f'the modulation revision changed during this capture ({revisions[0]} -> '
+                f'{revisions[-1]}; a tracking commit?): frames are tagged with their '
+                "revision, and get_info('modulation') after the capture has the states",
+                stacklevel=2)
+        if incl_system_info:
+            info = self.get_info('all')
+            self._warn_modulation_state(info.get('modulation'), stacklevel=2)
+        else:
+            info = {}
+        return {'data_raw': bytearray(b''.join(frames)), 'sample_rate': self.get_sample_rate(),
+                'info': info, 'frame_bytes': len(frames[0]) if frames else 0,
+                'time_anchors': [a for a in time_anchors if a is not None]}
+
 
     @staticmethod
     def _modulation_center_frequencies_from_info(info, num_tones):
