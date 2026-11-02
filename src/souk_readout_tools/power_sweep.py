@@ -483,6 +483,37 @@ def _find_dip_centers(sweep_data, centers, spans, follow_min_depth_db,
     return next_centers, record
 
 
+def _steepest_phase_frequencies(sweep_data, centers):
+    """Each regular tone's steepest-phase-slope frequency in ``sweep_data``.
+
+    The same choice as ``perform_retune(method='max_dphidf')``, which is where
+    a phase readout parks; ``run_power_sweep(noise_seconds=...)`` captures
+    there.  Blind tones, and tones without a usable trace, keep ``centers``.
+    """
+    sweep_f = np.atleast_2d(np.asarray(sweep_data["sweep_f"], dtype=float))
+    sweep_i = np.atleast_2d(np.asarray(sweep_data["sweep_i"], dtype=float))
+    sweep_q = np.atleast_2d(np.asarray(sweep_data["sweep_q"], dtype=float))
+    out = np.asarray(centers, dtype=float).ravel().copy()
+    tones = (sweep_data.get("tone_metadata") or {}).get("blind_indices")
+    if tones is None:
+        tones = ((sweep_data.get("info") or {}).get("tones") or {}).get("blind_indices", [])
+    blind = {int(i) for i in tones}
+    for tone_index in range(min(out.size, sweep_f.shape[1])):
+        if tone_index in blind:
+            continue
+        f = sweep_f[:, tone_index]
+        z = sweep_i[:, tone_index] + 1j * sweep_q[:, tone_index]
+        good = np.isfinite(f) & np.isfinite(z.real) & np.isfinite(z.imag)
+        if np.count_nonzero(good) < 3:
+            continue
+        f, z = f[good], z[good]
+        order = np.argsort(f)
+        f, z = f[order], z[order]
+        dphidf = np.abs(np.gradient(np.unwrap(np.angle(z)), f))
+        out[tone_index] = f[int(np.argmax(dphidf))]
+    return out
+
+
 def _normalise_power_steps(powers_dbm, tone_count):
     """Return a list of per-tone power rows."""
     powers = np.asarray(powers_dbm, dtype=float)
@@ -700,6 +731,7 @@ def run_power_sweep(
     search_span_factor=2.0,
     capture_system_info=True,
     info_sections="all",
+    noise_seconds=0.0,
 ):
     """Step tone power and save each targeted sweep.
 
@@ -867,6 +899,20 @@ def run_power_sweep(
         Which info sections to capture, forwarded to ``client.get_info``
         (default ``"all"``).  Ignored when ``capture_system_info`` is
         ``False``.
+    noise_seconds : float, optional
+        If positive, after each step's sweeps retune every regular tone to
+        the steepest phase slope of that step's upward sweep (the point
+        ``perform_retune(method='max_dphidf')`` parks at) and capture this
+        many seconds of ``get_samples`` timestream there, saved as
+        ``data/step_XXXX_noise.npy`` in :py:meth:`ReadoutClient.export_samples`
+        format.  This measures noise against drive within each tone, for
+        choosing drive powers.  The step's own sweep is the calibration for the
+        capture (same powers, RX state and acc_len); pass the capture's tone
+        frequencies (``noise_tone_frequencies_hz`` in the step metadata) to the
+        conversion.  Above the bifurcation power the branch a tone lands on is
+        undefined, so drop those steps using :py:func:`hysteresis_onset`.  A
+        failed capture is warned and recorded as ``noise_error`` in the step
+        metadata; the step's sweeps are kept.  Default ``0`` (off).
 
     Returns
     -------
@@ -913,6 +959,9 @@ def run_power_sweep(
     search_span_factor = float(search_span_factor)
     if not np.isfinite(search_span_factor) or search_span_factor <= 0.0:
         raise ValueError("search_span_factor must be a positive finite number.")
+    noise_seconds = float(noise_seconds or 0.0)
+    if not np.isfinite(noise_seconds) or noise_seconds < 0.0:
+        raise ValueError("noise_seconds must be zero or a positive finite number.")
 
     # Newman phases are regenerated after any recentering so the phase set
     # always matches the current tone frequencies; fixed phases are reused.
@@ -964,6 +1013,7 @@ def run_power_sweep(
             ),
             "search_for_center": search_for_center,
             "search_span_factor": search_span_factor,
+            "noise_seconds": noise_seconds,
             "tone_count": int(initial_centers.size),
         },
         "metadata": {
@@ -1104,6 +1154,42 @@ def run_power_sweep(
         data["tone_metadata"] = client.get_tone_metadata()
         data["sweep_direction"] = sweep_direction
         return data
+
+    def _capture_noise(step, index, sweep_data, step_centers, requested,
+                       readback):
+        """Retune to the steepest phase slope of ``sweep_data`` and save a
+        ``noise_seconds`` timestream there as this step's noise artifact."""
+        _progress(verbose, f"  Capturing {noise_seconds:g} s of noise at the "
+                           "steepest phase slope")
+        _require_success(
+            client.set_tone_frequencies(
+                _steepest_phase_frequencies(sweep_data, step_centers)),
+            "set_tone_frequencies failed",
+        )
+        # Read back: the comb may snap to the accumulation-rate grid.
+        tone_freqs = np.asarray(client.get_tone_frequencies(), dtype=float).ravel()
+        num_samples = int(round(float(client.get_sample_rate()) * noise_seconds))
+        samples = client.parse_samples(client.get_samples(num_samples))
+        rel_path = f"data/step_{index:04d}_noise.npy"
+        client.export_samples(str(output_dir / rel_path), samples)
+        step["metadata"]["noise_tone_frequencies_hz"] = tone_freqs.tolist()
+        step["artifacts"].append({
+            "name": f"step_{index:04d}_noise",
+            "kind": "noise",
+            "path": rel_path,
+            "format": "npy",
+            "metadata": {
+                "reference_plane": reference_plane,
+                "requested_tone_powers_dbm": requested.tolist(),
+                "readback_tone_powers_dbm": readback.tolist(),
+                "tone_frequencies_hz": tone_freqs.tolist(),
+                "calibration_sweep": f"step_{index:04d}_sweep",
+                "seconds": noise_seconds,
+                "num_samples": num_samples,
+            },
+            "created": _timestamp(),
+        })
+        _progress(verbose, f"  Saved {rel_path}")
 
     try:
         # Optional center search: one discarded sweep (at the first requested
@@ -1379,6 +1465,26 @@ def run_power_sweep(
                     })
                     _progress(verbose, f"  Saved {down_path}")
 
+                # Optional noise capture at this power.  A failure here keeps
+                # the step's sweeps; the next step re-parks the tones anyway.
+                if noise_seconds > 0.0:
+                    try:
+                        _capture_noise(step, index, sweep_data, centers,
+                                       requested, readback)
+                    except FatalReadoutError:
+                        raise
+                    except Exception as exc:
+                        reason = "".join(
+                            traceback.format_exception_only(type(exc), exc)
+                        ).strip()
+                        warn_msg = (
+                            f"Noise capture at power step {index} failed; "
+                            f"the sweep is kept: {reason}"
+                        )
+                        warnings.warn(warn_msg, stacklevel=2)
+                        _progress(verbose, f"  WARNING: {warn_msg}")
+                        step["metadata"]["noise_error"] = reason
+
                 step["status"] = "success"
                 step["finished"] = _timestamp()
                 centers = next_centers
@@ -1467,7 +1573,7 @@ def _power_sweep_run_view(run):
     sweeps, files, powers, readback, centers, next_centers, steps = (
         [], [], [], [], [], [], []
     )
-    sweeps_down, files_down = [], []
+    sweeps_down, files_down, files_noise = [], [], []
     for step in manifest.get("steps", []):
         step_meta = step.get("metadata", {})
         # Each step's sweep is stored as an npz artifact; load it (or keep a
@@ -1505,6 +1611,18 @@ def _power_sweep_run_view(run):
             sweeps_down.append(None)
             files_down.append("")
             sweep_down_file = None
+        # A run taken with noise_seconds > 0 also stores a timestream per step.
+        # It is not loaded here (np.load(..., allow_pickle=True).item() reads
+        # it); only its path is recorded.
+        noise_artifact = next(
+            (art for art in step.get("artifacts", []) if art.get("kind") == "noise"),
+            None,
+        )
+        noise_file = None if noise_artifact is None else noise_artifact["path"]
+        if noise_file is not None and not Path(noise_file).is_absolute():
+            files_noise.append(str(root / noise_file))
+        else:
+            files_noise.append(noise_file or "")
         power = np.asarray(
             step.get("axis", {}).get("tone_power_dbm", []), dtype=float
         ).ravel()
@@ -1530,6 +1648,7 @@ def _power_sweep_run_view(run):
             "next_centers_hz": step_next_centers.tolist(),
             "sweep_file": sweep_file,
             "sweep_down_file": sweep_down_file,
+            "noise_file": noise_file,
             "metadata": step_meta,
         })
 
@@ -1566,6 +1685,7 @@ def _power_sweep_run_view(run):
         "sweeps_down": sweeps_down,
         "files": files,
         "files_down": files_down,
+        "files_noise": files_noise,
         "bidirectional": any(sweep is not None for sweep in sweeps_down),
         "powers_dbm": powers,
         "readback_powers_dbm": readback,

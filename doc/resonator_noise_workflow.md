@@ -160,6 +160,15 @@ protects the RX-side optimisation performed by `rx_policy="maximise"`.
 The sweep also pre-centres the first saved trace and follows resonator motion
 between power steps by default.
 
+To see how the noise itself changes with drive, pass `noise_seconds=10` (for
+example). After each step's sweeps the tones are retuned to the steepest phase
+slope of that step's sweep and a timestream is saved as
+`data/step_XXXX_noise.npy`. Convert each capture with its own step's sweep as
+the calibration and the step's `noise_tone_frequencies_hz` as the tone
+frequencies. Discard steps above each tone's bifurcation power
+(`ps.hysteresis_onset`, from a `direction="both"` run), where the branch a tone lands on is undefined. At 600
+Hz, 380 tones and 10 s this adds about 12 s and 19 MB per step.
+
 Fit the saved sweeps and choose one power per resonator:
 
 ```python

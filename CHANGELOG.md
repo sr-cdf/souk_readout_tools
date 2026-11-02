@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**Power sweeps can capture noise at every power** (`run_power_sweep(noise_seconds=...)`, default off)
+- After each step's sweeps, tones retune to that sweep's steepest phase slope
+  (as `perform_retune(method='max_dphidf')`) and a timestream is saved as
+  `data/step_XXXX_noise.npy`; the step's sweep is its calibration.
+- Step metadata `noise_tone_frequencies_hz`, `noise_error`; run view
+  `files_noise`, per-step `noise_file`. See `doc/resonator_noise_workflow.md`.
+
 **Tones snap to the accumulation-rate grid** (`snap_tones_to_acc_grid`, default on)
 - Parked comb, modulation centres/offsets and tracking moves sit on whole
   multiples of 600 kHz / acc_len: intermodulation falls in the accumulator
