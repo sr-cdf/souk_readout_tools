@@ -3424,7 +3424,7 @@ class ReadoutServer:
                         if not np.isfinite(requested) or requested <= 0:
                             raise ValueError(f'{param_name} must be finite and positive')
                         if param_name == 'sample_rate_hz':
-                            firmware_lib.set_sample_rate(self.r, requested)
+                            firmware_lib.set_sample_rate(self.r, requested, sync=False)
                         else:
                             if requested != int(requested):
                                 raise ValueError('acc_len must be an integer')
@@ -3432,7 +3432,10 @@ class ReadoutServer:
                             # of mixer channel parallelism. Keep the limits aligned.
                             acc_len = min(max(4 * ((int(param_value) + 3) // 4), 4), 65532)
                             self.r.mixer.set_acc_len(acc_len)
-                            self.r.sync.sw_sync(mrst=True)
+                        # acc_len sets the tone grid: move the comb onto the new
+                        # grid before the master-reset sync that references it all.
+                        self._resnap_comb_to_acc_grid()
+                        self.r.sync.sw_sync(mrst=True)
                         acc_len = self.r.mixer.get_acc_len()
                         sample_rate_hz = firmware_lib.get_sample_rate(self.r)
                         value = sample_rate_hz if param_name == 'sample_rate_hz' else acc_len
@@ -3457,8 +3460,9 @@ class ReadoutServer:
                             self.r, self.r_fast, self.config, param_value,
                             tone_amplitudes=amps, tone_phases=phases,
                             autosync=autosync, mrst=mrst,
-                            compensate_rx_ticks=compensate_rx_ticks)
-                        self._set_tone_state_cache(param_value, amps, phases)
+                            compensate_rx_ticks=compensate_rx_ticks,
+                            snap=message.get('snap'))
+                        self._set_tone_state_cache(tone_settings['tone_frequencies'], amps, phases)
                         self._invalidate_modulation('tone frequencies changed')
                         self._set_active_tone_indices_from_settings(tone_settings)
                         self.stream_flags[FLAG_SET_FREQS].clear()
@@ -5759,7 +5763,7 @@ class ReadoutServer:
             self.r, self.r_fast, self.config, combined_freqs,
             tone_amplitudes=combined_amps, tone_phases=combined_phases,
             autosync=autosync, mrst=mrst)
-        self._set_tone_state_cache(combined_freqs, combined_amps, combined_phases)
+        self._set_tone_state_cache(tone_settings['tone_frequencies'], combined_amps, combined_phases)
         self._invalidate_modulation('blind tones changed')
         self._set_active_tone_indices_from_settings(tone_settings)
 
@@ -5801,7 +5805,7 @@ class ReadoutServer:
                 tone_amplitudes=regular_amps,
                 tone_phases=regular_phases,
                 autosync=autosync, mrst=mrst)
-            self._set_tone_state_cache(regular_freqs, regular_amps, regular_phases)
+            self._set_tone_state_cache(tone_settings['tone_frequencies'], regular_amps, regular_phases)
         else:
             tone_settings = firmware_lib.set_tone_frequencies_fast(
                 self.r, self.r_fast, self.config, [],
@@ -6463,6 +6467,7 @@ class ReadoutServer:
         offsets = np.asarray(offsets, dtype=float)
         if offsets.ndim == 1:
             offsets = offsets[:, None]
+        center, offsets, grid_hz = self._snap_modulation_comb(center, offsets)
         num_points = offsets.shape[0]
         point_offsets = np.zeros((num_points, n_tones), dtype=float)
         if offsets.shape[1] == 1:
@@ -6482,6 +6487,7 @@ class ReadoutServer:
             group_delay_s=self._filterbank_group_delay(center))
 
         cfg = {'center': center, 'offsets': offsets, 'mod_indices': mod_indices,
+               'grid_hz': grid_hz,
                'samples_per_point': int(samples_per_point), 'n_settle': int(n_settle),
                'autosync': bool(autosync), 'setup_sync': bool(setup_sync),
                'mrst': bool(mrst), 'setup_mrst': bool(setup_mrst),
@@ -6490,6 +6496,56 @@ class ReadoutServer:
                'compensate_filterbank': compensate_filterbank}
         state = self._build_modulation_state(bundle, cfg)
         return bundle, state, cfg
+
+    def _resnap_comb_to_acc_grid(self):
+        """
+        Re-apply the parked comb after acc_len, and so the tone grid, changed.
+
+        Leaves the tones alone when snapping is off, when no comb is known, or
+        while modulation runs (its comb is re-snapped when next armed).
+        """
+        if self._tone_state_cache is None or not firmware_lib.snap_tones_enabled(self.config):
+            return
+        if self.e_modulation_enabled.is_set() or self.e_fw_modulation_enabled.is_set():
+            _server_log('warning: acc_len changed while modulating; the comb stays on the '
+                        'old tone grid until modulation is re-armed', source='tones')
+            return
+        freqs, amps, phases, metadata = self._live_tone_state()
+        if len(freqs) == 0:
+            return
+        tone_settings = firmware_lib.set_tone_frequencies_fast(
+            self.r, self.r_fast, self.config, freqs,
+            tone_amplitudes=amps, tone_phases=phases)
+        self._set_tone_state_cache(tone_settings['tone_frequencies'], amps, phases, metadata)
+        self._set_active_tone_indices_from_settings(tone_settings)
+
+    def _snap_modulation_comb(self, center, offsets):
+        """
+        Put a modulation comb on the accumulation-rate tone grid, as the tone
+        preparers do for a parked comb (doc/tone_frequency_snapping.md).
+
+        The centres are snapped and the offsets rounded to whole grid steps, so
+        every point/slot comb repeats every accumulation. A non-zero offset is
+        never rounded to zero: it keeps one step, with a warning, so a probe
+        cannot silently vanish. The returned values are what the modulation cfg
+        stores, so demodulation, tracking and the tone cache all see the
+        frequencies actually written. Returns ``(center, offsets, grid_hz)``;
+        ``grid_hz`` is None when snapping is off (the tracker then moves freely).
+        """
+        if not firmware_lib.snap_tones_enabled(self.config):
+            return center, offsets, None
+        grid_hz = firmware_lib.acc_grid_hz(self.r_fast)
+        if not grid_hz:
+            return center, offsets, None
+        center = firmware_lib.snap_to_acc_grid(self.r_fast, self.config, center, grid_hz=grid_hz)
+        steps = np.round(offsets / grid_hz)
+        raised = (steps == 0) & (offsets != 0)
+        if raised.any():
+            steps[raised] = np.sign(offsets[raised])
+            _server_log(f'warning: {int(raised.sum())} modulation offset(s) under half the '
+                        f'{grid_hz:.2f} Hz tone grid were raised to one grid step',
+                        source='modulation')
+        return center, steps * grid_hz, grid_hz
 
     def _filterbank_group_delay(self, tone_frequencies_hz):
         """
@@ -7179,6 +7235,7 @@ class ReadoutServer:
         slot_offsets = np.asarray(slot_offsets, dtype=float)
         if slot_offsets.ndim == 1:
             slot_offsets = slot_offsets[:, None]
+        center, slot_offsets, grid_hz = self._snap_modulation_comb(center, slot_offsets)
         n_slots = slot_offsets.shape[0]
         max_slots = int(self.r_fast.mixer.n_slots)
         if not 1 <= n_slots <= max_slots:
@@ -7211,6 +7268,7 @@ class ReadoutServer:
             group_delay_s=self._filterbank_group_delay(center))
 
         cfg = {'center': center, 'slot_offsets': slot_offsets, 'mod_indices': mod_indices,
+               'grid_hz': grid_hz,
                'n_dwell': int(n_dwell), 'n_settle': int(n_settle), 'mode': str(mode),
                'compensate_rx_ticks': int(compensate_rx_ticks),
                'compensate_filterbank': compensate_filterbank}
@@ -7392,7 +7450,7 @@ class ReadoutServer:
         tone_settings = firmware_lib.set_tone_frequencies_fast(
             self.r, self.r_fast, self.config, center,
             tone_indices=tone_indices, tone_amplitudes=amps, tone_phases=phases)
-        self._set_tone_state_cache(center, amps, phases)
+        self._set_tone_state_cache(tone_settings['tone_frequencies'], amps, phases)
         self._set_active_tone_indices_from_settings(tone_settings)
 
     def _invalidate_fw_modulation(self, reason=''):
@@ -7592,7 +7650,7 @@ class ReadoutServer:
                         center, tone_indices=tone_indices, autosync=autosync, mrst=mrst,
                         tone_amplitudes=amps, tone_phases=phases,
                         compensate_rx_ticks=compensate_rx_ticks)
-                    self._set_tone_state_cache(center, amps, phases)
+                    self._set_tone_state_cache(tone_settings['tone_frequencies'], amps, phases)
                     self._set_active_tone_indices_from_settings(tone_settings)
                 if self.modulation_state is not None:
                     self.modulation_state['enabled'] = self.e_modulation_enabled.is_set()
@@ -7872,7 +7930,7 @@ class ReadoutServer:
                 tone_amplitudes=sweep_tone_amplitudes,
                 tone_phases=sweep_tone_phases,
                 compensate_rx_ticks=compensate_rx_ticks)
-            self._set_tone_state_cache(centers, sweep_tone_amplitudes, sweep_tone_phases)
+            self._set_tone_state_cache(tone_settings['tone_frequencies'], sweep_tone_amplitudes, sweep_tone_phases)
             self._set_active_tone_indices_from_settings(tone_settings)
 
             print('Preparing faster sweep settings')
@@ -8035,7 +8093,7 @@ class ReadoutServer:
                 tone_amplitudes=sweep_tone_amplitudes,
                 tone_phases=sweep_tone_phases,
                 compensate_rx_ticks=compensate_rx_ticks)
-            self._set_tone_state_cache(initial_freqs, sweep_tone_amplitudes, sweep_tone_phases)
+            self._set_tone_state_cache(tone_settings['tone_frequencies'], sweep_tone_amplitudes, sweep_tone_phases)
             self._set_active_tone_indices_from_settings(tone_settings)
 
             if init_psb_scale is not None:
@@ -8090,7 +8148,7 @@ class ReadoutServer:
                 tone_amplitudes=sweep_tone_amplitudes,
                 tone_phases=sweep_tone_phases,
                 compensate_rx_ticks=compensate_rx_ticks)
-            self._set_tone_state_cache(initial_freqs, sweep_tone_amplitudes, sweep_tone_phases)
+            self._set_tone_state_cache(tone_settings['tone_frequencies'], sweep_tone_amplitudes, sweep_tone_phases)
             self._set_active_tone_indices_from_settings(tone_settings)
             if init_psb_scale is not None:
                 self.r.psbscale.set_scale(init_psb_scale)
@@ -8238,7 +8296,7 @@ class ReadoutServer:
                 tone_amplitudes=amps, tone_phases=phases,
                 autosync=autosync, mrst=mrst,
                 compensate_rx_ticks=compensate_rx_ticks)
-            self._set_tone_state_cache(retune_freqs, amps, phases)
+            self._set_tone_state_cache(tone_settings['tone_frequencies'], amps, phases)
             self._set_active_tone_indices_from_settings(tone_settings)
             self.sweep_progress = 1.0
             self.sweep_state = {'state': 'success', 'message': 'Retune complete'}

@@ -1696,18 +1696,24 @@ class ReadoutClient:
         return self.get_parameter('telescope_time')
 
     def set_tone_frequencies(self, tone_frequencies, autosync=False, mrst=False,
-                             compensate_rx_ticks=0):
+                             compensate_rx_ticks=0, snap=None):
         """Set the active ``tone_frequencies`` (array-like, Hz).
 
         ``compensate_rx_ticks`` (int): if non-zero, add a per-tone RX phase
         offset to cancel the RX-vs-TX path delay (in 307.2 MHz clock ticks)
         seen when setting tones without a sync (``autosync=False``). Pass 14336
         (the measured ~46.67 us delay) to enable.
+
+        ``snap``: the server moves the tones onto the accumulation-rate grid
+        when the config's ``snap_tones_to_acc_grid`` is on (the default; see
+        doc/tone_frequency_snapping.md). ``False``/``True`` overrides that for
+        this call only, e.g. for an unsnapped A/B comparison.
         """
         tone_frequencies = np.atleast_1d(tone_frequencies).tolist()
+        extra = {} if snap is None else {'snap': bool(snap)}
         return self.set_parameter(
             'tone_frequencies', tone_frequencies, autosync=bool(autosync), mrst=bool(mrst),
-            compensate_rx_ticks=int(compensate_rx_ticks))
+            compensate_rx_ticks=int(compensate_rx_ticks), **extra)
 
     def get_tone_frequencies(self,detailed_output=False,refresh_shadow_copy=False):
         """Return active tone frequencies; with ``detailed_output=True`` return

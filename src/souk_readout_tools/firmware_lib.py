@@ -304,7 +304,10 @@ def _format_phase_steps(phase, phase_bp, fmt='>i4'):
      """
     phase_scaled = phase / np.pi
     phase_scaled = ((phase_scaled + 1) % 2) - 1
-    phase_int = (phase_scaled * (2**phase_bp))
+    # Round to the nearest word (truncating pulled every tone towards zero by
+    # up to one LSB, 1.4e-4 Hz); +pi rounds up to 2**phase_bp, which is -pi.
+    phase_int = np.round(phase_scaled * (2**phase_bp))
+    phase_int = np.where(phase_int >= 2**phase_bp, phase_int - 2**(phase_bp + 1), phase_int)
     return phase_int.astype(fmt)
 
 def _format_phase_offsets(phase_offsets, phase_offset_bp,fmt='>i4'):
@@ -2228,10 +2231,19 @@ def info_tones(r, r_fast, config_dict, rf_peripherals=None, reference_plane='det
         tone_plan['blind_spans'].tolist()
         if metadata['metadata_matches_config'] else []
     )
+    # Distance of each realised tone from the accumulation-rate grid, read live:
+    # ~1e-4 Hz (the LO word) on a snapped comb, up to half the grid otherwise.
+    rr = r_fast if r_fast is not None else r
+    grid_hz = acc_grid_hz(rr)
+    off_grid_hz = (np.asarray(freqs) - snap_to_acc_grid(rr, config_dict, freqs, grid_hz=grid_hz)
+                   if grid_hz and len(freqs) else np.array([]))
     return {
         'ready': True,
         'count': len(freqs),
         'frequencies_hz': freqs.tolist(),
+        'snap_tones_to_acc_grid': snap_tones_enabled(config_dict),
+        'acc_grid_hz': grid_hz,
+        'off_grid_hz': off_grid_hz.tolist(),
         'amplitudes': amps.tolist(),
         'phases_rad': phases.tolist(),
         'powers_dbm': powers.tolist() if len(powers) > 0 else None,
@@ -2621,6 +2633,11 @@ def apply_config(new_config_dict, r, r_fast=None, prev_config_dict=None, tones=T
     tone_plan = get_configured_tone_plan(new_config_dict)
     if tones and tone_plan['num_tones'] > 0:
         frequencies = tone_plan['frequencies']
+        # Compare what would be written: the plan on the tone grid (which also
+        # catches an acc_len change moving the grid under unchanged tones).
+        if snap_tones_enabled(new_config_dict):
+            frequencies = snap_to_acc_grid(r_fast if r_fast is not None else r,
+                                           new_config_dict, frequencies)
         live_frequencies = np.asarray(
             get_tone_frequencies(r, r_fast, new_config_dict), dtype=float)
         same_count = len(live_frequencies) == len(frequencies)
@@ -2687,7 +2704,7 @@ def get_sample_rate(r):
     return fft_bw / acc_len
 
 
-def set_sample_rate(r,sample_rate_hz):
+def set_sample_rate(r,sample_rate_hz,sync=True):
     print(sample_rate_hz)
     fft_bw = r.adc_clk_hz / (N_RX_FFT / N_RX_OVERSAMPLE)
     acc_len = fft_bw / sample_rate_hz
@@ -2703,7 +2720,8 @@ def set_sample_rate(r,sample_rate_hz):
     acc_len = int(acc_len)
     print(f'setting acc len {acc_len} = {acc_freq} Hz')
     r.mixer.set_acc_len(acc_len)  # v7.11: acc_len lives in the mixer
-    r.sync.sw_sync(mrst=True)     # acc_len change needs a master-reset + sync
+    if sync:                      # False: the caller syncs (e.g. after re-snapping tones)
+        r.sync.sw_sync(mrst=True) # acc_len change needs a master-reset + sync
     return acc_freq
 
 
@@ -3849,7 +3867,7 @@ def _protect_tone_amplitudes_for_vacc(tone_amplitudes, max_tones_per_bin):
 
 def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indices=None,
                                     min_tone_separation=6, tone_amplitudes=None,
-                                    tone_phases=None, compensate_rx_ticks=0):
+                                    tone_phases=None, compensate_rx_ticks=0, snap=None):
     """
     Prepare the tone frequency settings for applying to the RFSOC.
 
@@ -3872,6 +3890,10 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
     compensate_rx_ticks: if non-zero, add a per-tone RX phase offset to cancel
                          the RX-vs-TX path delay (in 307.2 MHz clock ticks) seen
                          when retuning without a sync. See _rx_phase_compensation.
+    snap: move the tones onto the accumulation-rate grid first (snap_to_acc_grid).
+          None (default) follows the config's snap_tones_to_acc_grid; True
+          snaps regardless, False never. The snapped frequencies are returned
+          as 'tone_frequencies'.
     """
     #config
     udc_connected = config_dict['rf_frontend']['connected']
@@ -3887,6 +3909,8 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
 
     #constants
     tone_frequencies = np.atleast_1d(tone_frequencies)
+    if snap or (snap is None and snap_tones_enabled(config_dict)):
+        tone_frequencies = snap_to_acc_grid(r, config_dict, tone_frequencies)
     nc = r.mixer.n_chans
     fft_period_s = r.mixer._n_upstream_chans / r.mixer._upstream_oversample_factor / r.adc_clk_hz
     fft_rbw_hz = 1./fft_period_s
@@ -4056,6 +4080,7 @@ def prepare_tone_frequency_settings(r, config_dict, tone_frequencies, tone_indic
                           'chanmap_psb_inmap':chanmap_psb_inmap,
                           'chanmap_pfb':chanmap_pfb,
                           'tone_indices':tone_indices,
+                          'tone_frequencies':tone_frequencies,
                           'num_tones':num_tones}
 
 
@@ -4125,7 +4150,7 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
                                          tone_indices=None, min_tone_separation=6,
                                          detailed_output=False,
                                          tone_amplitudes=None, tone_phases=None,
-                                         compensate_rx_ticks=0):
+                                         compensate_rx_ticks=0, snap=None):
     """
     Prepare the tone frequency settings for applying to the RFSOC.
 
@@ -4149,6 +4174,10 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
     compensate_rx_ticks: if non-zero, add a per-tone RX phase offset to cancel
                          the RX-vs-TX path delay (in 307.2 MHz clock ticks) seen
                          when retuning without a sync. See _rx_phase_compensation.
+    snap: move the tones onto the accumulation-rate grid first (snap_to_acc_grid).
+          None (default) follows the config's snap_tones_to_acc_grid; True
+          snaps regardless, False never. The snapped frequencies are returned
+          as 'tone_frequencies'.
     """
     #config
     udc_connected = config_dict['rf_frontend']['connected']
@@ -4177,6 +4206,8 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
     #constants
     nc = r.mixer.n_chans
     tone_frequencies = np.atleast_1d(tone_frequencies)
+    if snap or (snap is None and snap_tones_enabled(config_dict)):
+        tone_frequencies = snap_to_acc_grid(r, config_dict, tone_frequencies)
     fft_period_s = r.mixer._n_upstream_chans / r.mixer._upstream_oversample_factor / r.adc_clk_hz
     fft_rbw_hz = 1./fft_period_s
     all_tx_bin_centers_hz = np.fft.fftfreq(2 * N_TX_FFT, 1. / r.adc_clk_hz)
@@ -4343,6 +4374,7 @@ def prepare_tone_frequency_settings_fast(r, config_dict, tone_frequencies,
                             'chanmap_psb_inmap':chanmap_psb_inmap,
                             'chanmap_pfb':chanmap_pfb,
                             'tone_indices':tone_indices,
+                            'tone_frequencies':tone_frequencies,
                             'num_tones':num_tones}
 
     if detailed_output:
@@ -4390,7 +4422,8 @@ def _rf_to_digital_baseband(r, config_dict, tone_frequencies):
         ``dbb_freqs_tx`` / ``dbb_freqs_rx`` : DBB frequencies (Hz) for the TX
         (DAC) and RX (ADC) paths; ``fft_rbw_hz`` : filterbank channel spacing
         (Hz); ``all_tx_bin_centers_hz`` / ``all_rx_bin_centers_hz`` : the full
-        TX/RX bin-centre grids the tones are snapped onto.
+        TX/RX bin-centre grids the tones are snapped onto; ``rf_per_baseband`` :
+        RF Hz per baseband Hz (the external mixer's sideband, +-1; 1 without one).
     """
     tone_frequencies = np.atleast_1d(tone_frequencies)
 
@@ -4450,7 +4483,70 @@ def _rf_to_digital_baseband(r, config_dict, tone_frequencies):
         'fft_rbw_hz': fft_rbw_hz,
         'all_tx_bin_centers_hz': all_tx_bin_centers_hz,
         'all_rx_bin_centers_hz': all_rx_bin_centers_hz,
+        'rf_per_baseband': udc_sideband if udc_connected else 1,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tone-frequency grid (doc/tone_frequency_snapping.md)
+#
+# Operating-comb tones are moved to whole multiples of the accumulation rate
+# (600 kHz / acc_len), counted in TX digital baseband. The DUC and every
+# filterbank bin centre already sit on that grid, so each LO offset becomes a
+# whole number of accumulation rates and the comb repeats every accumulation.
+# Intermodulation and clipping products then fall on multiples of the
+# accumulation rate, where the accumulator nulls them, and the comb has one
+# fixed crest factor instead of a peak that keeps growing with time watched.
+# Applied by the tone preparers and the server's modulation setup; sweeps are
+# not snapped (their steps are finer than the grid). Switch: firmware
+# defaults ``snap_tones_to_acc_grid`` (default True).
+# ---------------------------------------------------------------------------
+
+def snap_tones_enabled(config_dict):
+    """The ``snap_tones_to_acc_grid`` switch (firmware defaults, default True)."""
+    return bool(config_dict['firmware']['defaults'].get('snap_tones_to_acc_grid', True))
+
+
+def acc_grid_hz(r):
+    """The tone-frequency grid: the accumulation rate, 600 kHz / acc_len, read
+    live from the mixer. None while acc_len is unset (0)."""
+    acc_len = r.mixer.get_acc_len()
+    if not acc_len:
+        return None
+    fft_rbw_hz = r.adc_clk_hz * r.mixer._upstream_oversample_factor / r.mixer._n_upstream_chans
+    return fft_rbw_hz / acc_len
+
+
+def snap_to_acc_grid(r, config_dict, tone_frequencies, grid_hz=None):
+    """
+    Move RF tone frequencies so each sits on a whole multiple of the
+    accumulation rate in digital baseband (see the section comment above).
+
+    Two tones landing on one grid point are moved apart to the nearest free
+    points, the better-placed tone keeping its own. ``grid_hz`` defaults to
+    :func:`acc_grid_hz`; with no grid (acc_len unset) the frequencies come back
+    unchanged. Snapping an already-snapped comb returns it unchanged.
+    """
+    f = np.atleast_1d(np.asarray(tone_frequencies, dtype=float))
+    grid_hz = acc_grid_hz(r) if grid_hz is None else grid_hz
+    if not grid_hz or f.size == 0:
+        return f
+    dbb = _rf_to_digital_baseband(r, config_dict, f)
+    x = dbb['dbb_freqs_tx'] / grid_hz
+    m = np.round(x)
+    if len(np.unique(m)) < len(m):
+        taken = set()
+        for i in np.argsort(np.abs(x - m)):
+            k = 0
+            while True:
+                free = [q for q in sorted((m[i] - k, m[i] + k), key=lambda q: abs(q - x[i]))
+                        if q not in taken]
+                if free:
+                    m[i] = free[0]
+                    break
+                k += 1
+            taken.add(m[i])
+    return f + dbb['rf_per_baseband'] * (m - x) * grid_hz
 
 
 def prepare_modulation_settings_fast(r_fast, config_dict, center_frequencies, point_offsets,
@@ -5629,7 +5725,7 @@ def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, 
 def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
                          min_tone_separation=6, autosync=False, mrst=False,
                          detailed_output=False, tone_amplitudes=None,
-                         tone_phases=None, compensate_rx_ticks=0):
+                         tone_phases=None, compensate_rx_ticks=0, snap=None):
     """
     Set the tone frequencies in the RFSOC.
 
@@ -5651,6 +5747,7 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
                          (only used when tone_indices is None). Default is 6.
     autosync: if True, sync after setting tones
     detailed_output: if True, return detailed output dictionary
+    snap: accumulation-rate grid snapping, as prepare_tone_frequency_settings
 
     TODO: account for dual dac mode, for now assume all on dac 0
 
@@ -5669,7 +5766,7 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
         min_tone_separation=min_tone_separation,
         tone_amplitudes=tone_amplitudes,
         tone_phases=tone_phases,
-        compensate_rx_ticks=compensate_rx_ticks)
+        compensate_rx_ticks=compensate_rx_ticks, snap=snap)
     apply_tone_frequency_settings(r, tone_frequency_settings, autosync=autosync, mrst=mrst)
 
     if detailed_output:
@@ -5680,7 +5777,7 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
 def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
                               tone_indices=None, min_tone_separation=6,
                               autosync=False, mrst=False, tone_amplitudes=None,
-                              tone_phases=None, compensate_rx_ticks=0):
+                              tone_phases=None, compensate_rx_ticks=0, snap=None):
     """
     Set the tone frequencies in the RFSOC using the fast firmware interface.
 
@@ -5706,6 +5803,8 @@ def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
                          RX-vs-TX path delay (in 307.2 MHz clock ticks) seen when
                          retuning without a sync (e.g. autosync=False). Pass
                          firmware_lib.TX_RX_PATH_DELAY_TICKS for the measured delay.
+    snap: accumulation-rate grid snapping, as prepare_tone_frequency_settings_fast.
+          The returned settings carry the frequencies written ('tone_frequencies').
     """
     num_tones = len(np.atleast_1d(tone_frequencies))
     if tone_amplitudes is None:
@@ -5721,7 +5820,7 @@ def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
         min_tone_separation=min_tone_separation,
         tone_amplitudes=tone_amplitudes,
         tone_phases=tone_phases,
-        compensate_rx_ticks=compensate_rx_ticks)
+        compensate_rx_ticks=compensate_rx_ticks, snap=snap)
     apply_tone_frequency_settings_fast(r, r_fast, tone_frequency_settings, autosync=autosync, mrst=mrst)
 
     return tone_frequency_settings

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**Tones snap to the accumulation-rate grid** (`snap_tones_to_acc_grid`, default on)
+- Parked comb, modulation centres/offsets and tracking moves sit on whole
+  multiples of 600 kHz / acc_len: intermodulation falls in the accumulator
+  nulls and the comb has a fixed crest factor. Sweeps are not snapped.
+- `firmware_lib.snap_to_acc_grid`, `acc_grid_hz`; `snap=` on the tone
+  preparers and `client.set_tone_frequencies` (per-call A/B override);
+  `get_info('tones')` gains `acc_grid_hz`, `off_grid_hz`. Changing acc_len
+  re-applies the comb; the tracker moves in whole grid steps (past 0.6).
+- LO phase-step words round to the nearest word instead of truncating.
+  See `doc/tone_frequency_snapping.md`.
+
 **Saturation checks report mean and RMS alongside the peaks**
 - `check_input_saturation`: `imean_fs`, `irms_fs`, `qmean_fs`, `qrms_fs`;
   `check_output_saturation`: the same per DAC (`i0mean_fs` ... `q1rms_fs`).

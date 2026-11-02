@@ -484,12 +484,16 @@ class TrackingController:
         Per-decision clamp on the correction step (default 0.5).
     enable_mask : array-like of int or None
         Tones allowed to receive corrections (None = all modulated tones).
+    grid_hz : float or None
+        The accumulation-rate tone grid the commits snap centres to (the armed
+        modulation cfg's ``grid_hz``; None when snapping is off). Corrections
+        are then whole grid steps.
     """
 
     def __init__(self, n_tones, mod_indices, linewidth_hz,
                  threshold_linewidths=0.05, confirm_windows=3, gain=1.0,
                  max_step_linewidths=0.5, enable_mask=None,
-                 min_detuning_snr=1.0):
+                 min_detuning_snr=1.0, grid_hz=None):
         self.n_tones = int(n_tones)
         self.mod_indices = [int(i) for i in mod_indices]
         self.linewidth_hz = np.asarray(linewidth_hz, dtype=float)
@@ -500,6 +504,7 @@ class TrackingController:
         self.gain = float(gain)
         self.max_step_linewidths = float(max_step_linewidths)
         self.min_detuning_snr = float(min_detuning_snr)
+        self.grid_hz = float(grid_hz) if grid_hz else None
         mask = np.zeros(self.n_tones, dtype=bool)
         mask[self.mod_indices] = True
         if enable_mask is not None:
@@ -590,9 +595,18 @@ class TrackingController:
             lw_r = self.linewidth_hz[ready_idx]
             clamp_r = self.max_step_linewidths * lw_r
             step_r = np.clip(self.gain * filtered_lw[ready_idx] * lw_r, -clamp_r, clamp_r)
+            if self.grid_hz:
+                # Commits put centres on the tone grid, so move in whole grid
+                # steps, and only past 0.6 of a step: a resonance midway between
+                # two grid points stays put instead of hopping between them.
+                g = self.grid_hz
+                step_r = np.sign(step_r) * np.floor(np.abs(step_r) / g + 0.4) * g
         for k, tone in enumerate(ready_idx):
             tone = int(tone)
             step = float(step_r[k])
+            if step == 0.0:                  # under 0.6 of a grid step: nothing to move
+                self.over_count[tone] = 0
+                continue
             # The detuning was measured against the applied centre, so the
             # target is that centre plus the step. A correction still staged
             # (a held bin move, or one awaiting its commit interval) is
@@ -641,6 +655,7 @@ class TrackingController:
             'confirm_windows': self.confirm_windows,
             'gain': self.gain,
             'max_step_linewidths': self.max_step_linewidths,
+            'grid_hz': self.grid_hz,
             'enabled_tones': np.flatnonzero(self.enable_mask).tolist(),
             'staged': {k: {str(t): v for t, v in s.items()}
                        for k, s in self.staged.items()},
@@ -966,7 +981,8 @@ class TrackingRuntime:
             gain=params['gain'],
             max_step_linewidths=params['max_step_linewidths'],
             enable_mask=params.get('enable_mask'),
-            min_detuning_snr=params.get('min_detuning_snr', 1.0))
+            min_detuning_snr=params.get('min_detuning_snr', 1.0),
+            grid_hz=cfg.get('grid_hz'))
         # The filter is fed one row per averaged block, so its window counts
         # blocks and its EWMA alpha follows the block period, not the cycle.
         self.filter_blocks_per_batch = max(1, int(params.get('filter_blocks_per_batch') or 4))

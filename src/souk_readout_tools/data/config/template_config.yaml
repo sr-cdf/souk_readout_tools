@@ -98,6 +98,11 @@ firmware:
     # phase term's group delay comes from rf_frontend.path_group_delay_ns,
     # evaluated per tone.
     filterbank_compensation: true
+    # Move every tone (parked comb, modulation centres and offsets, tracking
+    # moves) to a whole multiple of the accumulation rate, so intermodulation
+    # lands in the accumulator nulls and the comb has a fixed crest factor
+    # (doc/tone_frequency_snapping.md). Sweeps are never snapped.
+    snap_tones_to_acc_grid: true
     # filterbank_group_delay_override_ns: 0  # TESTING/LOOPBACK ONLY: overrides
     #   the path_group_delay_ns calibration for the compensation phase term
     #   (e.g. force 0 for an amplitude-only A/B in loopback). Leave unset for

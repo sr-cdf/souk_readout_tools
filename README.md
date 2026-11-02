@@ -207,6 +207,7 @@ For full installation details (including server setup, SD card imaging, and daem
 | [Timeseries Analysis](doc/timeseries_analysis.md) | Timestream and PSD tools: detector-noise workflow, estimator biases, glitches, `tau_qp`, combining quadratures |
 | [Calibration](doc/calibration.md) | Power calibration model and RF signal-chain configuration |
 | [Filterbank Compensation](doc/filterbank_compensation.md) | Channel-response correction for tones away from their bin centre, and how to measure it |
+| [Tone Frequency Snapping](doc/tone_frequency_snapping.md) | Why tones sit on the accumulation-rate grid (intermodulation nulls, fixed crest factor), where it happens, and the switch |
 | [Tone Power Notes](doc/tone_power_notes.md) | Dynamic-range, VACC, crest-factor, and blind-tone power guidance |
 | [Resonator Noise Workflow](doc/resonator_noise_workflow.md) | Drive-power tuning, blackbody-load directory layout, and on/off-resonance noise captures |
 | [Parameter-Series Measurements](doc/measurements.md) | Repeating any measurement across an external parameter (attenuation, temperature, time, ...) with run directories, resume, and live summaries |
