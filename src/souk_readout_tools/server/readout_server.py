@@ -6515,9 +6515,12 @@ class ReadoutServer:
         freqs, amps, phases, metadata = self._live_tone_state()
         if len(freqs) == 0:
             return
+        # No wait for an accumulation: the acc_len change can stall the
+        # accumulator until the master-reset sync that follows this, and the
+        # wait never returned (krm4-mcr, 1024 -> 1000, 2026-11-02).
         tone_settings = firmware_lib.set_tone_frequencies_fast(
             self.r, self.r_fast, self.config, freqs,
-            tone_amplitudes=amps, tone_phases=phases)
+            tone_amplitudes=amps, tone_phases=phases, wait=False)
         self._set_tone_state_cache(tone_settings['tone_frequencies'], amps, phases, metadata)
         self._set_active_tone_indices_from_settings(tone_settings)
 

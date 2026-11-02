@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**Fixed: `set_acc_len` could hang the server** (since d47beab)
+- The comb re-snap waited for an accumulation before the master-reset sync,
+  and the acc_len change can stall the accumulator until that sync: krm4-mcr
+  hung on 1024 -> 1000 (counter frozen ~2 h). Re-snap now writes without the
+  wait (`set_tone_frequencies_fast(wait=False)`).
+
 **Relaxable PTP lock threshold** (`souk-enable-timing --ptp-lock-threshold-us US`)
 - Writes a `timing-monitor.service.d/20-ptp-threshold.conf` drop-in
   (`--ptp-lock-offset-threshold-ns`); default stays 1 µs, and a run without the

@@ -5727,7 +5727,8 @@ def apply_sweep_step_fast(r, r_fast, sweep_settings, step_index,
 
 
 
-def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, autosync=False, mrst=False):
+def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, autosync=False, mrst=False,
+                                       wait=True):
 
     v=fast_tone_frequency_settings.get('control_buffer_data_values')
     i=fast_tone_frequency_settings.get('control_buffer_data_indices')
@@ -5755,7 +5756,7 @@ def apply_tone_frequency_settings_fast(r, r_fast, fast_tone_frequency_settings, 
     set_control_buffer_idx_fast(r_fast,buf)
     if autosync:
         force_sync_fast(r_fast, autosync_time_delay, mrst=mrst)
-    if c1 or c2 or autosync:
+    if wait and (c1 or c2 or autosync):
         _wait_for_acc(r_fast,0,0.0001)
 
     # fast_write_mixer(r_fast,
@@ -5820,7 +5821,7 @@ def set_tone_frequencies(r, config_dict, tone_frequencies, tone_indices=None,
 def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
                               tone_indices=None, min_tone_separation=6,
                               autosync=False, mrst=False, tone_amplitudes=None,
-                              tone_phases=None, compensate_rx_ticks=0, snap=None):
+                              tone_phases=None, compensate_rx_ticks=0, snap=None, wait=True):
     """
     Set the tone frequencies in the RFSOC using the fast firmware interface.
 
@@ -5848,6 +5849,10 @@ def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
                          firmware_lib.TX_RX_PATH_DELAY_TICKS for the measured delay.
     snap: accumulation-rate grid snapping, as prepare_tone_frequency_settings_fast.
           The returned settings carry the frequencies written ('tone_frequencies').
+    wait: wait for an accumulation made with the new channel maps before
+          returning (default True). False when a sync follows anyway: after
+          an acc_len change the accumulator can stall until that sync, and the
+          wait (which has no timeout) then never returns.
     """
     num_tones = len(np.atleast_1d(tone_frequencies))
     if tone_amplitudes is None:
@@ -5864,7 +5869,8 @@ def set_tone_frequencies_fast(r, r_fast, config_dict, tone_frequencies,
         tone_amplitudes=tone_amplitudes,
         tone_phases=tone_phases,
         compensate_rx_ticks=compensate_rx_ticks, snap=snap)
-    apply_tone_frequency_settings_fast(r, r_fast, tone_frequency_settings, autosync=autosync, mrst=mrst)
+    apply_tone_frequency_settings_fast(r, r_fast, tone_frequency_settings, autosync=autosync, mrst=mrst,
+                                       wait=wait)
 
     return tone_frequency_settings
 
