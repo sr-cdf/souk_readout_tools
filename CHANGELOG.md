@@ -8,6 +8,12 @@
   hung on 1024 -> 1000 (counter frozen ~2 h). Re-snap now writes without the
   wait (`set_tone_frequencies_fast(wait=False)`).
 
+**`get_samples` reads late rather than losing an accumulation** (`fast_read_params['catch_up']`)
+- Same late read as the stream loop: a capture held up by less than about a
+  period reads the waiting accumulation. Plain and fw-slot captures; the sw
+  engine still reads every accumulation in turn. krm4-mcr p0 at 586 Hz lost
+  14 accumulations in 20 min before (12 events, 10 of them single).
+
 **Relaxable PTP lock threshold** (`souk-enable-timing --ptp-lock-threshold-us US`)
 - Writes a `timing-monitor.service.d/20-ptp-threshold.conf` drop-in
   (`--ptp-lock-offset-threshold-ns`); default stays 1 µs, and a run without the

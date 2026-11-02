@@ -10782,9 +10782,10 @@ def _blocking_wait_for_acc_fast(fast_read_params, poll_period_s=0.00001, timeout
     learned here, so the sleep stops ``ACC_WAKE_MARGIN_S`` short of the next one
     and the spin still resolves its arrival to the poll period.
 
-    With ``fast_read_params['catch_up']`` set (the stream loop sets it), an
-    accumulation that landed while the caller was busy and has not been read
-    yet (``acc_last_read``) is returned at once instead of waited past. It
+    With ``fast_read_params['catch_up']`` set (the stream loop and
+    ``get_samples`` set it), an accumulation that landed while the caller was
+    busy and has not been read yet (``acc_last_read``) is returned at once
+    instead of waited past. It
     stays in the accumulator until the next one lands, so a loop that comes
     back late -- by up to a period less the read time and
     ``ACC_CATCH_UP_GUARD_S`` -- reads it rather than losing it. Without this,

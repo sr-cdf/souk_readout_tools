@@ -6148,6 +6148,11 @@ class ReadoutServer:
 
             fast_read_params = firmware_lib.get_fast_read_params(self.r_fast)
             fast_read_params['sparse_read'] = sparse_read
+            # Read an accumulation that landed while this loop was held up rather
+            # than wait past it (firmware_lib.acc_due_s), as the stream loop does.
+            # The first read is still a fresh one: these params are new per call.
+            # Not for the sw engine: its scheduler reads the accumulations one by one.
+            fast_read_params['catch_up'] = not modulating
             rate = firmware_lib.get_sample_rate(self.r_fast)
 
             if modulating:
