@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**`souk-find-boards` no longer labels the ARM console `bmc`**
+- `_probe_role` needs a `KRM-...` reply to `krm4:2` (or `unknown command`);
+  half-printed `login` output (e.g. `'Login t�'`) now gives `unknown`,
+  with the reply shown on the `!` line.
+- `BoardManagementController.get_status` requires `systemstate`, so a console
+  shell's `-bash: krm4:i: command not found` no longer parses as a status;
+  error now reads "ARM console rather than the BMC interface".
+
 **Optimised tone phases** (`client.generate_optimised_phases()`)
 - `tone_list_tools.optimise_tone_phases`, `comb_crest_factor`: L_p-minimax
   phases over one period of a snapped comb, run on the client from the live

@@ -465,10 +465,12 @@ class BoardManagementController:
         """Parsed ``krm4:i`` board status."""
         text = self._send(READ_COMMANDS['status'])
         fields = _parse_fields(text)
-        if not fields:
+        # Require a BMC field: a console shell answers 'krm4:i' with
+        # '-bash: krm4:i: command not found', which also parses as fields.
+        if 'systemstate' not in fields:
             raise BoardManagementError(
                 f'no board status returned from {self.device} -- is this the '
-                'BMC interface rather than the ARM console?')
+                'ARM console rather than the BMC interface?')
         return (fields, text) if raw else fields
 
     def get_boot_options(self, raw=False):
@@ -647,6 +649,12 @@ def _probe_role(device):
     return first, which draws a login/shell prompt from the ARM console
     and nothing meaningful from the BMC. Only if that looks nothing like
     a console does it try the read-only ``krm4:2`` query.
+
+    Only a reply that looks like a board type (``KRM-...``) or the BMC's
+    ``unknown command`` counts as a BMC. Anything else is 'unknown': the
+    console's ``login`` takes ``krm4:2`` as a username, and when it is
+    interrupted or times out it prints half-written lines (seen:
+    ``'Login t\\ufffd'``) that match no console pattern either.
     """
     def _query(ser, command):
         ser.reset_input_buffer()
@@ -669,13 +677,15 @@ def _probe_role(device):
 
         reply = _query(ser, READ_COMMANDS['type'])
         low = reply.lower()
-        if reply and 'unknown command' not in low:
-            if any(p in low for p in _CONSOLE_PATTERNS):
-                return 'console', None, None
+        if any(p in low for p in _CONSOLE_PATTERNS):
+            return 'console', None, None
+        if re.fullmatch(r'KRM-\S+', reply.strip()):
             serial = _query(ser, READ_COMMANDS['serial']).strip() or None
             return 'bmc', None, {'type': reply.strip(), 'serial': serial}
         if 'unknown command' in low:
             return 'bmc', None, None
+        if reply:
+            return 'unknown', f'unrecognised reply to krm4:2: {reply!r}', None
         return 'unknown', ('no reply to a bare CR or to krm4:2 '
                            '(port opened cleanly)'), None
     except Exception as exc:

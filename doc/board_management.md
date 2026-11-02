@@ -599,7 +599,9 @@ These commands **cannot** do the dangerous things above, even by accident:
 - Ports open with DTR and RTS deasserted, and **exclusively**, so an attached
   picocom session is never fought over.
 - Probing sends a bare carriage return first, and the read-only `krm4:2` only
-  if the port looks nothing like a console. `--no-probe` skips it.
+  if the port looks nothing like a console. A port is called `bmc` only if
+  `krm4:2` returns a `KRM-...` board type (or `unknown command`). `--no-probe`
+  skips probing.
 
 ### Examples
 
@@ -718,6 +720,7 @@ The reason is printed on a `!` line:
 | *already open* | picocom/screen holds the port. Exit with `Ctrl-A Ctrl-X`. |
 | *permission denied* | Not in `dialout`; see [Permissions](#permissions-and-udev-aliases). |
 | *no reply to a bare CR or to krm4:2* | Port opened cleanly but said nothing. Normal on the console side; on the BMC side check baud rate and that the board has power. |
+| *unrecognised reply to krm4:2* | Neither a console prompt nor a `KRM-...` board type. Usually the console mid-login (the probe's `krm4:2` is taken as a username); run `souk-find-boards` again once it is back at `login:`. |
 
 An assumed role is safe to act on — every command path reads a parseable
 `krm4:i` first, so a wrong port errors out before anything is sent. To bypass
