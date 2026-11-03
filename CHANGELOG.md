@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**Fixed: a frequency write after a config push zeroed the tone phases**
+- A push without a comb resets the server's tone cache but leaves the board's
+  tones; the next `set_tone_frequencies` (e.g. `run_power_sweep`'s pre-flight)
+  then wrote phase 0 and amplitude 1.0. On krm4-mcr p0 (369 tones on the acc
+  grid) the comb went coherent: DAC crest 3.9 -> 17.7, reach 13 dB short.
+  `_tone_value_fallback` now reads the live phases/amplitudes before defaulting.
+
 **Fixed: `set_acc_len` could hang the server** (since d47beab)
 - The comb re-snap waited for an accumulation before the master-reset sync,
   and the acc_len change can stall the accumulator until that sync: krm4-mcr

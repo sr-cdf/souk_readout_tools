@@ -5499,7 +5499,16 @@ class ReadoutServer:
         return self.config.setdefault('firmware', {}).setdefault('defaults', {})
 
     def _tone_value_fallback(self, n_values, key, default_value):
-        """Return cached/configured per-tone values without touching hardware."""
+        """Return cached/configured per-tone values, else the live hardware ones.
+
+        Hardware is only read when neither the cache nor the config holds
+        ``n_values`` values.  That happens after a config push without a comb:
+        the push resets the cache but leaves the board's tones in place, and
+        falling straight to ``default_value`` there made the next frequency
+        write zero every phase (a coherent comb, DAC crest ~18) and reset the
+        amplitudes to 1.0.  ``default_value`` is only used when the board has a
+        different number of tones too, i.e. for a genuinely new comb.
+        """
         if self._tone_state_cache is not None:
             cached = self._tone_state_cache.get(key)
             if cached is not None and len(cached) == n_values:
@@ -5509,6 +5518,17 @@ class ReadoutServer:
         values = plan.get(key)
         if values is not None and len(values) == n_values:
             return np.asarray(values, dtype=float).copy()
+
+        getter = {'amplitudes': firmware_lib.get_tone_amplitudes,
+                  'phases': firmware_lib.get_tone_phases}.get(key)
+        if getter is not None:
+            try:
+                live = np.asarray(getter(self.r, self.r_fast, self.config), dtype=float)
+                if len(live) == n_values:
+                    return live
+            except Exception as e:
+                _server_log(f'could not read live tone {key}, using {default_value}: {e}',
+                            source='tones')
 
         return np.full(n_values, default_value, dtype=float)
 
